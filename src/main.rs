@@ -2,10 +2,8 @@
 //!
 //! This is the main entry point for the application.
 
-mod nginx;
-
 use anyhow::{Context, Result};
-use nginx::{discover_nginx_configs, is_nginx_installed};
+use stop_bots::nginx::{common_config_paths, discover_nginx_configs, is_nginx_installed};
 use std::io::{self, Write};
 
 fn main() -> Result<()> {
@@ -15,13 +13,10 @@ fn main() -> Result<()> {
     // Check if nginx is installed
     writeln!(handle, "Checking for NGINX installation...")?;
     if !is_nginx_installed() {
-        writeln!(
-            handle,
-            "NGINX does not appear to be installed on this system."
-        )?;
+        writeln!(handle, "NGINX does not appear to be installed on this system.")?;
         writeln!(handle)?;
         writeln!(handle, "Common NGINX configuration paths:")?;
-        for path in nginx::common_config_paths() {
+        for path in common_config_paths() {
             writeln!(handle, "  - {}", path)?;
         }
         writeln!(handle)?;
@@ -37,8 +32,8 @@ fn main() -> Result<()> {
 
     // Discover nginx configuration files
     writeln!(handle, "Discovering NGINX configuration files...")?;
-    let configs =
-        discover_nginx_configs().context("Failed to discover NGINX configuration files")?;
+    let configs = discover_nginx_configs()
+        .context("Failed to discover NGINX configuration files")?;
 
     // Print results
     writeln!(handle)?;
