@@ -1,18 +1,20 @@
-# TODO: Project name
+# Stop Bots
 
-TODO: Short description
+A TUI that helps you configure your server to stop bad bots and still allow good bots.
+
+# Installation
+
+Use cargo install.
+
+There are no packages currently available.
 
 # Usage
 
-A Terminal User Interface is available. If an interactive termnal is available, running without any
-arguments will open the TUI. Running without an interactive terminal requires using arguments to
-pass enough information. The two modes can be mixed, using the TUI for configuration and running in
-batch mode using cron.
+Simply run the binary to launch the TUI.
 
 You can exit the app at any time by hitting 'q'.
 
-You can exit any popup or submenu by hitting the Escape key. Hitting Escape in the main screen will
-also exit the app.
+You can exit any popup or submenu by hitting the Escape key. Hitting Escape in the main screen will also exit the app.
 
 ## Theme
 
@@ -22,13 +24,37 @@ the correct choice.
 
 ## Main screen
 
-The main UI screen is TODO
+The main screen gives you the overview of the current protections and the most recent overall
+metrics. The general design of the UI is this:
 
-# Installation
+--------------------------------------------------------------------------
+| System-wide setttings                                                  |
+|   - Geo-block [ ALLOWED: CH, DE ]                                      |
+|   - Scanners [ BLOCKED ]                                               |
+|   - Search Bots [ ALLOWED ]                                            |
+|   - AI Bots [ BLOCKED ]                                                |
+|                                                                        |
+| www.example.org (NGINX: /var/www/html/example.org)                     |
+|   - Geo-block [ ALLOWED: CH, DE ]                                      |
+|   - Scanners [ BLOCKED ]                                               |
+|   - Search Bots [ ALLOWED ]                                            |
+|   - AI Bots [ BLOCKED ]                                                |
+| ...                                                                    |
+--------------------------------------------------------------------------
+| Time frame                    Scanners   Search      AI                |
+--------------------------------------------------------------------------
+| Last 5 minutes                     120       15    2000                |
+| Last hour                        12312      123   41231                |
+| ...                                                                    |
+--------------------------------------------------------------------------
 
-Use cargo install.
+Using the arrow keys (or vim-hjkl navigation) you can select any of the categories. If you
+press the Enter of Space key, you can open a configuration popup for that particlar setting, e.g.
+the system wide search bot settings.
 
-There are no packages currently available.
+For example, opening the "Search Bots" setting allows you to togle "ALLOWED" and "BLOCKED" as the
+default, and then you can override each particular bot, e.g. "Google Search" can be set to
+"BLOCKED", "ALLOWED" or "DEFAULT" individually.
 
 # Contact
 
@@ -87,8 +113,7 @@ should test both happy-path and corner cases.
 
 **Tests in src/ must run in under 1 second**.
 
-Each general user flow (e.g. adding a new directory to be watched for PDFs, removing a directory,
-updating a PDF and checking that the txt file updates) should have a test in test/. These should all
+Each general user flow should have a test in test/. These should all
 be happy-path tests, they should not test errors unless the error is a general user flow.
 
 **Tests in tests/ must run in under 5 seconds.**
@@ -117,6 +142,9 @@ Some directories don't exist yet but should be created if the need arises.
         |- db/          <- The db components and specs
             |- SPECS.md <- Database specs
         |- db.rs        <- The SQLite ORM layer, stores the config
+        |- nginx.rs     <- Reading and writing NginX config and logs
+        |- iptables.rs  <- Integration with iptables
+        |- nftables.rs  <- Integration with nftables
     |- /test            <- Integration and end-to-end automated tests
     |- /benches         <- Benchmarks
     |- README.md        <- This file. Only very high level information goes here
