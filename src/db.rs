@@ -740,6 +740,7 @@ impl Database {
             (Behavioral, "Identified by behavioral analysis"),
             (ManualReport, "Manually reported by user"),
             (OfficialSource, "From official source"),
+            (Crowdsourced, "From crowdsourced/community source"),
         ];
 
         for (signal, desc) in signals {
@@ -1093,6 +1094,278 @@ impl Database {
         Ok(())
     }
 
+    // Data source operations
+
+    /// Initializes the data sources table with known sources.
+    pub fn initialize_data_sources(&mut self) -> Result<()> {
+        // Clear existing data sources first
+        self.conn.execute("DELETE FROM data_sources", [])?;
+
+        // Insert all known sources
+        for source in crate::source_fetch::KnownSources::all() {
+            self.upsert_data_source(&source)?;
+        }
+
+        Ok(())
+    }
+
+    /// Upserts a data source.
+    pub fn upsert_data_source(&self, source: &DataSource) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO data_sources 
+             (id, name, description, url, update_frequency, auto_update_enabled, last_updated, is_official, data_type) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                &source.id,
+                &source.name,
+                &source.description,
+                source.url.as_deref(),
+                source.update_frequency.as_db_str(),
+                source.auto_update_enabled as i32,
+                source.last_updated.map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64),
+                source.is_official as i32,
+                source.data_type.as_db_str(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Gets a data source by ID.
+    pub fn get_data_source(&self, id: &str) -> Result<Option<DataSource>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, url, update_frequency, auto_update_enabled, last_updated, is_official, data_type 
+             FROM data_sources WHERE id = ?1",
+        )?;
+
+        let source_row = stmt.query_row([id], |row| {
+            Ok(DataSource {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                url: row.get(3)?,
+                update_frequency: UpdateFrequency::from_db_str(&row.get::<_, String>(4)?)
+                    .unwrap_or(UpdateFrequency::Weekly),
+                auto_update_enabled: row.get::<_, i32>(5)? != 0,
+                last_updated: Self::timestamp_from_unix_opt(row.get::<_, Option<i64>>(6)?),
+                is_official: row.get::<_, i32>(7)? != 0,
+                data_type: DataSourceType::from_db_str(&row.get::<_, String>(8)?)
+                    .unwrap_or(DataSourceType::Combined),
+            })
+        });
+
+        match source_row {
+            Ok(source) => Ok(Some(source)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Gets all data sources.
+    pub fn get_all_data_sources(&self) -> Result<Vec<DataSource>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, url, update_frequency, auto_update_enabled, last_updated, is_official, data_type 
+             FROM data_sources ORDER BY is_official DESC, name",
+        )?;
+
+        let sources: Vec<DataSource> = stmt
+            .query_map([], |row| {
+                Ok(DataSource {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    url: row.get(3)?,
+                    update_frequency: UpdateFrequency::from_db_str(&row.get::<_, String>(4)?)
+                        .unwrap_or(UpdateFrequency::Weekly),
+                    auto_update_enabled: row.get::<_, i32>(5)? != 0,
+                    last_updated: Self::timestamp_from_unix_opt(row.get::<_, Option<i64>>(6)?),
+                    is_official: row.get::<_, i32>(7)? != 0,
+                    data_type: DataSourceType::from_db_str(&row.get::<_, String>(8)?)
+                        .unwrap_or(DataSourceType::Combined),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(sources)
+    }
+
+    /// Updates the last_updated timestamp for a data source.
+    pub fn update_data_source_last_updated(&self, id: &str, timestamp: SystemTime) -> Result<()> {
+        let timestamp_secs = timestamp
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs() as i64;
+
+        self.conn.execute(
+            "UPDATE data_sources SET last_updated = ?1 WHERE id = ?2",
+            params![timestamp_secs, id],
+        )?;
+        Ok(())
+    }
+
+    /// Checks if a data source needs to be updated based on its frequency.
+    pub fn data_source_needs_update(&self, source: &DataSource) -> Result<bool> {
+        // If auto-update is disabled, never update
+        if !source.auto_update_enabled {
+            return Ok(false);
+        }
+
+        // If never update, return false
+        if let UpdateFrequency::Never = source.update_frequency {
+            return Ok(false);
+        }
+
+        // If never updated before, needs update
+        let last_updated = match source.last_updated {
+            Some(ts) => ts,
+            None => return Ok(true),
+        };
+
+        // Get the duration since last update
+        let duration_since_update = SystemTime::now()
+            .duration_since(last_updated)
+            .unwrap_or(Duration::ZERO);
+
+        // Get the update frequency duration
+        let update_duration = source
+            .update_frequency
+            .duration()
+            .ok_or_else(|| anyhow::anyhow!("Invalid update frequency"))?;
+
+        // Needs update if duration since last update >= update frequency
+        Ok(duration_since_update >= update_duration)
+    }
+
+    /// Upserts multiple bots from a source, updating the source's last_updated timestamp.
+    pub fn upsert_bots_from_source(
+        &mut self,
+        source_id: &str,
+        bots: Vec<Bot>,
+    ) -> Result<Vec<i64>> {
+        // First, ensure the data source exists
+        // If it doesn't exist, create a default one
+        let source_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM data_sources WHERE id = ?1",
+                [source_id],
+                |_| Ok(()),
+            )
+            .is_ok();
+
+        if !source_exists {
+            // Create a minimal data source entry
+            let default_source = DataSource {
+                id: source_id.to_string(),
+                name: source_id.to_string(),
+                description: format!("Auto-created source: {}", source_id),
+                url: None,
+                update_frequency: UpdateFrequency::Weekly,
+                auto_update_enabled: true,
+                last_updated: None,
+                is_official: false,
+                data_type: DataSourceType::Combined,
+            };
+            self.upsert_data_source(&default_source)?;
+        }
+
+        let mut bot_ids = Vec::new();
+
+        for mut bot in bots {
+            // Set the source_id for all bots
+            if bot.source_id.is_none() {
+                bot.source_id = Some(source_id.to_string());
+            }
+
+            // Upsert the bot and get its ID
+            let bot_id = self.upsert_bot(&bot)?;
+            bot_ids.push(bot_id);
+        }
+
+        // Update the source's last_updated timestamp
+        self.update_data_source_last_updated(source_id, SystemTime::now())?;
+
+        Ok(bot_ids)
+    }
+
+    /// Deletes all bots from a specific source.
+    pub fn delete_bots_from_source(&self, source_id: &str) -> Result<usize> {
+        let changes = self
+            .conn
+            .execute("DELETE FROM bots WHERE source_id = ?1", [source_id])?;
+        Ok(changes)
+    }
+
+    /// Refreshes bots from a specific source by deleting and re-inserting.
+    /// This is useful for full refreshes of a source's data.
+    pub fn refresh_bots_from_source(
+        &mut self,
+        source_id: &str,
+        bots: Vec<Bot>,
+    ) -> Result<Vec<i64>> {
+        // Delete existing bots from this source
+        self.delete_bots_from_source(source_id)?;
+
+        // Insert new bots (this will ensure the source exists and update last_updated)
+        self.upsert_bots_from_source(source_id, bots)
+    }
+
+    /// Fetches all bots from a specific source.
+    pub fn get_bots_by_source(&self, source_id: &str) -> Result<Vec<Bot>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM bots WHERE source_id = ?1")?;
+        let bot_ids: Vec<i64> = stmt
+            .query_map([source_id], |row| row.get(0))?
+            .collect::<Result<_, _>>()?;
+
+        let mut bots = Vec::new();
+        for id in bot_ids {
+            if let Some(bot) = self.get_bot(id)? {
+                bots.push(bot);
+            }
+        }
+        Ok(bots)
+    }
+
+    /// Fetches and stores bots from a specific source using the SourceFetcher.
+    pub async fn fetch_and_store_from_source(
+        &mut self,
+        source_id: &str,
+    ) -> Result<Vec<i64>> {
+        use crate::source_fetch::SourceFetcher;
+
+        let fetcher = SourceFetcher::new()?;
+        let bots = fetcher.fetch_from_source(source_id).await?;
+        self.upsert_bots_from_source(source_id, bots)
+    }
+
+    /// Fetches and stores bots from all official sources.
+    pub async fn fetch_and_store_official(&mut self) -> Result<Vec<i64>> {
+        use crate::source_fetch::SourceFetcher;
+
+        let fetcher = SourceFetcher::new()?;
+        let bots = fetcher.fetch_official().await?;
+
+        let mut all_ids = Vec::new();
+        
+        // Group bots by source_id
+        let mut bots_by_source: std::collections::HashMap<String, Vec<Bot>> = 
+            std::collections::HashMap::new();
+        
+        for bot in bots {
+            let source_id = bot.source_id.clone().unwrap_or_else(|| "unknown".to_string());
+            bots_by_source.entry(source_id).or_default().push(bot);
+        }
+
+        // Upsert bots for each source
+        for (source_id, source_bots) in bots_by_source {
+            let ids = self.upsert_bots_from_source(&source_id, source_bots)?;
+            all_ids.extend(ids);
+        }
+
+        Ok(all_ids)
+    }
+
     // Helper methods
 
     /// Converts a Unix timestamp to SystemTime.
@@ -1284,6 +1557,7 @@ mod tests {
             SignalType::Behavioral,
             SignalType::ManualReport,
             SignalType::OfficialSource,
+            SignalType::Crowdsourced,
         ];
 
         for signal in signals {
@@ -1425,5 +1699,366 @@ mod tests {
     fn test_bool_from_bot_status() {
         assert_eq!(bool::from(BotStatus::Allowed), true);
         assert_eq!(bool::from(BotStatus::Blocked), false);
+    }
+
+    #[test]
+    fn test_data_source_operations() {
+        use crate::source_fetch::KnownSources;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(temp_file.path()).unwrap();
+        db.initialize().unwrap();
+
+        // Initialize data sources
+        db.initialize_data_sources().unwrap();
+
+        // Get all data sources
+        let sources = db.get_all_data_sources().unwrap();
+        assert!(!sources.is_empty());
+
+        // Verify we have the expected number of sources
+        let known_sources = KnownSources::all();
+        assert_eq!(sources.len(), known_sources.len());
+
+        // Verify official sources are marked as official
+        let official_sources: Vec<_> = sources.iter().filter(|s| s.is_official).collect();
+        assert!(!official_sources.is_empty());
+
+        // Get a specific source
+        let googlebot = db.get_data_source("googlebot-official").unwrap();
+        assert!(googlebot.is_some());
+        assert!(googlebot.unwrap().is_official);
+
+        // Verify non-existent source returns None
+        let nonexistent = db.get_data_source("nonexistent").unwrap();
+        assert!(nonexistent.is_none());
+    }
+
+    #[test]
+    fn test_data_source_needs_update() {
+        use std::time::{Duration, SystemTime};
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(temp_file.path()).unwrap();
+        db.initialize().unwrap();
+
+        // Create a data source that was last updated 2 days ago with daily frequency
+        let mut source = DataSource {
+            id: "test-daily".to_string(),
+            name: "Test Daily".to_string(),
+            description: "Test source with daily updates".to_string(),
+            url: None,
+            update_frequency: UpdateFrequency::Daily,
+            auto_update_enabled: true,
+            last_updated: Some(SystemTime::now() - Duration::from_secs(86400 * 2)), // 2 days ago
+            is_official: true,
+            data_type: DataSourceType::Combined,
+        };
+
+        db.upsert_data_source(&source).unwrap();
+
+        // Should need update (2 days > 1 day)
+        assert!(db.data_source_needs_update(&source).unwrap());
+
+        // Update to now - should not need update
+        source.last_updated = Some(SystemTime::now());
+        db.upsert_data_source(&source).unwrap();
+        assert!(!db.data_source_needs_update(&source).unwrap());
+
+        // Test with auto-update disabled
+        source.auto_update_enabled = false;
+        db.upsert_data_source(&source).unwrap();
+        assert!(!db.data_source_needs_update(&source).unwrap());
+
+        // Test with Never frequency
+        source.auto_update_enabled = true;
+        source.update_frequency = UpdateFrequency::Never;
+        db.upsert_data_source(&source).unwrap();
+        assert!(!db.data_source_needs_update(&source).unwrap());
+    }
+
+    #[test]
+    fn test_upsert_bots_from_source() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(temp_file.path()).unwrap();
+        db.initialize().unwrap();
+        db.ensure_categories().unwrap();
+        db.ensure_signals().unwrap();
+        db.initialize_data_sources().unwrap();
+
+        // Create test bots from a source
+        let bots = vec![
+            Bot {
+                id: None,
+                name: "TestBot1".to_string(),
+                status: BotStatus::Blocked,
+                categories: vec![BotCategory::Scraper],
+                user_agent_patterns: vec![],
+                ip_ranges: vec![],
+                signals: vec![SignalType::UserAgent],
+                owner: None,
+                owner_id: None,
+                notes: Some("Test bot 1".to_string()),
+                is_ai_bot: false,
+                is_scanner: false,
+                source_id: None,
+                created_at: None,
+                updated_at: None,
+            },
+            Bot {
+                id: None,
+                name: "TestBot2".to_string(),
+                status: BotStatus::Allowed,
+                categories: vec![BotCategory::SearchEngine],
+                user_agent_patterns: vec![],
+                ip_ranges: vec![],
+                signals: vec![SignalType::OfficialSource],
+                owner: None,
+                owner_id: None,
+                notes: Some("Test bot 2".to_string()),
+                is_ai_bot: false,
+                is_scanner: false,
+                source_id: None,
+                created_at: None,
+                updated_at: None,
+            },
+        ];
+
+        // Upsert bots from source
+        let bot_ids = db
+            .upsert_bots_from_source("test-source", bots)
+            .unwrap();
+        assert_eq!(bot_ids.len(), 2);
+
+        // Verify bots were inserted
+        let all_bots = db.get_all_bots().unwrap();
+        assert_eq!(all_bots.len(), 2);
+
+        // Verify source_id was set
+        for bot in all_bots {
+            assert_eq!(bot.source_id, Some("test-source".to_string()));
+        }
+
+        // Verify last_updated was set on source
+        let source = db.get_data_source("test-source").unwrap();
+        assert!(source.is_some());
+        assert!(source.unwrap().last_updated.is_some());
+    }
+
+    #[test]
+    fn test_delete_bots_from_source() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(temp_file.path()).unwrap();
+        db.initialize().unwrap();
+        db.ensure_categories().unwrap();
+        db.ensure_signals().unwrap();
+        db.initialize_data_sources().unwrap();
+
+        // Create a bot with a source (use a known source or create it first)
+        let bot = Bot {
+            id: None,
+            name: "TestBot".to_string(),
+            status: BotStatus::Blocked,
+            categories: vec![BotCategory::Scraper],
+            user_agent_patterns: vec![],
+            ip_ranges: vec![],
+            signals: vec![],
+            owner: None,
+            owner_id: None,
+            notes: None,
+            is_ai_bot: false,
+            is_scanner: false,
+            source_id: Some("googlebot-official".to_string()), // Use a known source
+            created_at: None,
+            updated_at: None,
+        };
+
+        db.upsert_bot(&bot).unwrap();
+
+        // Verify bot exists
+        let all_bots = db.get_all_bots().unwrap();
+        assert_eq!(all_bots.len(), 1);
+
+        // Delete bots from source
+        let deleted = db.delete_bots_from_source("googlebot-official").unwrap();
+        assert_eq!(deleted, 1);
+
+        // Verify bot was deleted
+        let all_bots = db.get_all_bots().unwrap();
+        assert_eq!(all_bots.len(), 0);
+    }
+
+    #[test]
+    fn test_refresh_bots_from_source() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(temp_file.path()).unwrap();
+        db.initialize().unwrap();
+        db.ensure_categories().unwrap();
+        db.ensure_signals().unwrap();
+
+        // Insert initial bots
+        let initial_bots = vec![Bot {
+            id: None,
+            name: "OldBot".to_string(),
+            status: BotStatus::Blocked,
+            categories: vec![BotCategory::Scraper],
+            user_agent_patterns: vec![],
+            ip_ranges: vec![],
+            signals: vec![],
+            owner: None,
+            owner_id: None,
+            notes: Some("Old bot".to_string()),
+            is_ai_bot: false,
+            is_scanner: false,
+            source_id: Some("refresh-test".to_string()),
+            created_at: None,
+            updated_at: None,
+        }];
+
+        db.upsert_bots_from_source("refresh-test", initial_bots).unwrap();
+
+        // Verify old bot exists
+        let all_bots = db.get_all_bots().unwrap();
+        assert_eq!(all_bots.len(), 1);
+        assert_eq!(all_bots[0].name, "OldBot");
+
+        // Refresh with new bots
+        let new_bots = vec![Bot {
+            id: None,
+            name: "NewBot".to_string(),
+            status: BotStatus::Allowed,
+            categories: vec![BotCategory::SearchEngine],
+            user_agent_patterns: vec![],
+            ip_ranges: vec![],
+            signals: vec![],
+            owner: None,
+            owner_id: None,
+            notes: Some("New bot".to_string()),
+            is_ai_bot: false,
+            is_scanner: false,
+            source_id: None,
+            created_at: None,
+            updated_at: None,
+        }];
+
+        db.refresh_bots_from_source("refresh-test", new_bots).unwrap();
+
+        // Verify old bot was replaced
+        let all_bots = db.get_all_bots().unwrap();
+        assert_eq!(all_bots.len(), 1);
+        assert_eq!(all_bots[0].name, "NewBot");
+        assert_eq!(all_bots[0].status, BotStatus::Allowed);
+    }
+
+    #[test]
+    fn test_get_bots_by_source() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut db = Database::open(temp_file.path()).unwrap();
+        db.initialize().unwrap();
+        db.ensure_categories().unwrap();
+        db.ensure_signals().unwrap();
+        db.initialize_data_sources().unwrap();
+
+        // Create the test sources first
+        let source1 = DataSource {
+            id: "source-1".to_string(),
+            name: "Source 1".to_string(),
+            description: "Test source 1".to_string(),
+            url: None,
+            update_frequency: UpdateFrequency::Weekly,
+            auto_update_enabled: true,
+            last_updated: None,
+            is_official: false,
+            data_type: DataSourceType::Combined,
+        };
+
+        let source2 = DataSource {
+            id: "source-2".to_string(),
+            name: "Source 2".to_string(),
+            description: "Test source 2".to_string(),
+            url: None,
+            update_frequency: UpdateFrequency::Weekly,
+            auto_update_enabled: true,
+            last_updated: None,
+            is_official: false,
+            data_type: DataSourceType::Combined,
+        };
+
+        db.upsert_data_source(&source1).unwrap();
+        db.upsert_data_source(&source2).unwrap();
+
+        // Insert bots from different sources
+        let bot1 = Bot {
+            id: None,
+            name: "Source1Bot".to_string(),
+            status: BotStatus::Blocked,
+            categories: vec![BotCategory::Scraper],
+            user_agent_patterns: vec![],
+            ip_ranges: vec![],
+            signals: vec![],
+            owner: None,
+            owner_id: None,
+            notes: None,
+            is_ai_bot: false,
+            is_scanner: false,
+            source_id: Some("source-1".to_string()),
+            created_at: None,
+            updated_at: None,
+        };
+
+        let bot2 = Bot {
+            id: None,
+            name: "Source2Bot".to_string(),
+            status: BotStatus::Allowed,
+            categories: vec![BotCategory::SearchEngine],
+            user_agent_patterns: vec![],
+            ip_ranges: vec![],
+            signals: vec![],
+            owner: None,
+            owner_id: None,
+            notes: None,
+            is_ai_bot: false,
+            is_scanner: false,
+            source_id: Some("source-2".to_string()),
+            created_at: None,
+            updated_at: None,
+        };
+
+        let bot3 = Bot {
+            id: None,
+            name: "Source1Bot2".to_string(),
+            status: BotStatus::Blocked,
+            categories: vec![BotCategory::AiScraper],
+            user_agent_patterns: vec![],
+            ip_ranges: vec![],
+            signals: vec![],
+            owner: None,
+            owner_id: None,
+            notes: None,
+            is_ai_bot: false,
+            is_scanner: false,
+            source_id: Some("source-1".to_string()),
+            created_at: None,
+            updated_at: None,
+        };
+
+        db.upsert_bot(&bot1).unwrap();
+        db.upsert_bot(&bot2).unwrap();
+        db.upsert_bot(&bot3).unwrap();
+
+        // Get bots from source-1
+        let source1_bots = db.get_bots_by_source("source-1").unwrap();
+        assert_eq!(source1_bots.len(), 2);
+        assert!(source1_bots.iter().any(|b| b.name == "Source1Bot"));
+        assert!(source1_bots.iter().any(|b| b.name == "Source1Bot2"));
+
+        // Get bots from source-2
+        let source2_bots = db.get_bots_by_source("source-2").unwrap();
+        assert_eq!(source2_bots.len(), 1);
+        assert_eq!(source2_bots[0].name, "Source2Bot");
+
+        // Get bots from non-existent source
+        let nonexistent_bots = db.get_bots_by_source("nonexistent").unwrap();
+        assert_eq!(nonexistent_bots.len(), 0);
     }
 }
