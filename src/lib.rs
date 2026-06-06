@@ -4,4 +4,6 @@
 //! to stop bad bots while allowing good bots.
 
 pub mod bots;
+pub mod db;
 pub mod nginx;
+pub mod source_fetch;
