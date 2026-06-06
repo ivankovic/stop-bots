@@ -1,0 +1,29 @@
+[package]
+name = "stop-bots"
+version = "0.1.0"
+edition = "2021"
+authors = ["Marko Ivankovic <marko@ivankovic.me>"]
+license = "AGPL-3.0-only"
+description = "A TUI that helps you configure your server to stop bad bots and still allow good bots."
+
+[dependencies]
+# For TUI
+ratatui = "0.27"
+crossterm = "0.28"
+
+# For reading nginx config files
+walkdir = "2"
+
+# For error handling
+anyhow = "1"
+
+[dev-dependencies]
+# For testing
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
