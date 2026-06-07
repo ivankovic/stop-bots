@@ -890,7 +890,7 @@ impl HelpScreen {
                     Span::raw("Select item"),
                 ],
                 vec![
-                    Span::raw("  b            "),
+                    Span::raw("  Backspace    "),
                     Span::raw("Go back"),
                 ],
                 vec![
@@ -918,20 +918,20 @@ impl HelpScreen {
                     Span::raw("Views:"),
                 ],
                 vec![
-                    Span::raw("  1            "),
+                    Span::raw("  d            "),
                     Span::raw("Dashboard"),
                 ],
                 vec![
-                    Span::raw("  2            "),
+                    Span::raw("  b            "),
+                    Span::raw("Bot Settings"),
+                ],
+                vec![
+                    Span::raw("  l            "),
                     Span::raw("Bot List"),
                 ],
                 vec![
-                    Span::raw("  3            "),
-                    Span::raw("Data Sources"),
-                ],
-                vec![
-                    Span::raw("  4            "),
-                    Span::raw("Settings"),
+                    Span::raw("  f            "),
+                    Span::raw("Firewall"),
                 ],
                 vec![
                     Span::raw("  ?            "),
