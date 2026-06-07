@@ -5,6 +5,8 @@
 
 pub mod bots;
 pub mod db;
+pub mod iptables;
 pub mod nginx;
+pub mod nftables;
 pub mod source_fetch;
 pub mod tui;
