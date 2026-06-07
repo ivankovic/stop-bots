@@ -250,6 +250,8 @@ pub enum TuiEvent {
     OpenBotList,
     /// Open firewall screen.
     OpenFirewall,
+    /// Open help screen.
+    Help,
     /// Confirm action (Yes).
     Confirm,
     /// Cancel action (No).
@@ -296,6 +298,8 @@ pub fn key_event_to_tui_event(key_event: crossterm::event::KeyEvent) -> Option<T
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(TuiEvent::Confirm),
         // Cancel (No)
         KeyCode::Char('n') | KeyCode::Char('N') => Some(TuiEvent::Cancel),
+        // Help
+        KeyCode::Char('?') => Some(TuiEvent::Help),
         // Toggle category
         KeyCode::Char('s') | KeyCode::Char('S') => Some(TuiEvent::ToggleCategory),
         // Context menu

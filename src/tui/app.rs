@@ -196,6 +196,9 @@ impl App {
             TuiEvent::OpenFirewall => {
                 self.screen_state.navigate_to(Screen::Firewall);
             }
+            TuiEvent::Help => {
+                self.screen_state.navigate_to(Screen::Help);
+            }
             TuiEvent::Refresh => {
                 match self.screen_state.current_screen {
                     Screen::Firewall => {
