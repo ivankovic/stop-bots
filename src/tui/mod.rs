@@ -250,6 +250,8 @@ pub enum TuiEvent {
     OpenBotList,
     /// Open firewall screen.
     OpenFirewall,
+    /// Open dashboard screen.
+    OpenDashboard,
     /// Open help screen.
     Help,
     /// Confirm action (Yes).
@@ -294,6 +296,8 @@ pub fn key_event_to_tui_event(key_event: crossterm::event::KeyEvent) -> Option<T
         KeyCode::Char('l') | KeyCode::Char('L') => Some(TuiEvent::OpenBotList),
         // Open firewall screen
         KeyCode::Char('f') | KeyCode::Char('F') => Some(TuiEvent::OpenFirewall),
+        // Open dashboard
+        KeyCode::Char('d') | KeyCode::Char('D') => Some(TuiEvent::OpenDashboard),
         // Confirm (Yes)
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(TuiEvent::Confirm),
         // Cancel (No)

@@ -19,7 +19,11 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
 };
-use ratatui::{prelude::*, Terminal};
+use ratatui::{
+    prelude::*,
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
 
 // ============================================================================
 // Application State
@@ -198,6 +202,9 @@ impl App {
             }
             TuiEvent::Help => {
                 self.screen_state.navigate_to(Screen::Help);
+            }
+            TuiEvent::OpenDashboard => {
+                self.screen_state.navigate_to(Screen::Dashboard);
             }
             TuiEvent::Refresh => {
                 match self.screen_state.current_screen {
@@ -567,37 +574,86 @@ impl App {
     pub fn draw(&self, frame: &mut Frame) {
         let area = frame.size();
 
+        // Split area to leave room for status bar at the bottom
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(0)
+            .constraints([
+                Constraint::Min(0),     // Main content
+                Constraint::Length(1),  // Status bar
+            ])
+            .split(area);
+
+        // Render the current screen in the main area
         match self.screen_state.current_screen {
             Screen::Dashboard => {
-                self.dashboard.render(frame, &self.screen_state, area);
+                self.dashboard.render(frame, &self.screen_state, rows[0]);
             }
             Screen::BotList => {
-                self.bot_list.render(frame, &self.screen_state, area);
+                self.bot_list.render(frame, &self.screen_state, rows[0]);
             }
             Screen::BotDetail(_) => {
                 if let Some(ref bot_detail) = self.bot_detail {
-                    bot_detail.render(frame, &self.screen_state, area);
+                    bot_detail.render(frame, &self.screen_state, rows[0]);
                 }
             }
             Screen::SourceDetail(_) => {
                 // Source detail screen not yet implemented
             }
             Screen::Sources => {
-                self.sources.render(frame, &self.screen_state, area);
+                self.sources.render(frame, &self.screen_state, rows[0]);
             }
             Screen::Settings => {
-                self.settings.render(frame, &self.screen_state, area);
+                self.settings.render(frame, &self.screen_state, rows[0]);
             }
             Screen::Firewall => {
-                self.firewall.render(frame, &self.screen_state, area);
+                self.firewall.render(frame, &self.screen_state, rows[0]);
             }
             Screen::Help => {
-                self.help.render(frame, &self.screen_state, area);
+                self.help.render(frame, &self.screen_state, rows[0]);
             }
             Screen::QuitConfirm => {
-                self.quit_confirm.render(frame, &self.screen_state, area);
+                self.quit_confirm.render(frame, &self.screen_state, rows[0]);
             }
         }
+
+        // Render status bar at the bottom
+        self.render_status_bar(frame, &self.screen_state, rows[1]);
+    }
+
+    /// Renders the status bar at the bottom of the screen.
+    pub fn render_status_bar(&self, frame: &mut Frame, state: &ScreenState, area: Rect) {
+        let colors = &state.colors;
+        
+        // Create status bar
+        let status_text = match state.current_screen {
+            Screen::Dashboard => "Dashboard",
+            Screen::BotList => "Bot List",
+            Screen::BotDetail(_) => "Bot Details",
+            Screen::SourceDetail(_) => "Source Details",
+            Screen::Sources => "Data Sources",
+            Screen::Settings => "Bot Settings",
+            Screen::Firewall => "Firewall",
+            Screen::Help => "Help",
+            Screen::QuitConfirm => "Confirm Quit",
+        };
+
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(colors.border());
+
+        frame.render_widget(block, area);
+
+        let inner = area.inner(Margin::new(0, 1));
+        let status_line = Line::from(vec![
+            Span::styled("Current: ", colors.secondary()),
+            Span::styled(status_text, colors.primary().bold()),
+        ]);
+
+        let para = Paragraph::new(status_line)
+            .style(colors.text())
+            .alignment(Alignment::Left);
+        frame.render_widget(para, inner);
     }
 }
 
