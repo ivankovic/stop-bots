@@ -36,6 +36,8 @@ pub enum Screen {
     Help,
     /// Quit confirmation
     QuitConfirm,
+    /// Firewall management screen
+    Firewall,
 }
 
 // ============================================================================
@@ -1349,3 +1351,264 @@ impl SettingsScreen {
         }
     }
 }
+
+// ============================================================================
+// Firewall Screen
+// ============================================================================
+
+use crate::firewall::{BlockedIp, FirewallAddress, FirewallBackend, FirewallManager, FirewallStatus};
+
+/// Firewall management screen showing blocked IPs and firewall status.
+pub struct FirewallScreen {
+    /// Firewall manager
+    pub firewall: FirewallManager,
+    /// List of currently blocked IPs
+    pub blocked_ips: Vec<BlockedIp>,
+    /// Firewall status
+    pub status: Option<FirewallStatus>,
+    /// Selected IP index
+    pub selected_index: usize,
+    /// Scroll offset
+    pub scroll_offset: usize,
+    /// Error message (if any)
+    pub error: Option<String>,
+}
+
+impl FirewallScreen {
+    /// Creates a new firewall screen.
+    pub fn new() -> Self {
+        Self {
+            firewall: FirewallManager::new(),
+            blocked_ips: Vec::new(),
+            status: None,
+            selected_index: 0,
+            scroll_offset: 0,
+            error: None,
+        }
+    }
+
+    /// Refreshes the firewall status and blocked IPs list.
+    pub fn refresh(&mut self) {
+        self.error = None;
+        
+        match self.firewall.get_status() {
+            Ok(status) => {
+                self.status = Some(status.clone());
+                
+                // Get the list of rules
+                match self.firewall.list_rules() {
+                    Ok(rules) => {
+                        self.blocked_ips = rules
+                            .into_iter()
+                            .map(|r| BlockedIp::from(r))
+                            .collect();
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Failed to list rules: {}", e));
+                        self.blocked_ips = Vec::new();
+                    }
+                }
+            }
+            Err(e) => {
+                self.error = Some(format!("Failed to get status: {}", e));
+                self.status = None;
+                self.blocked_ips = Vec::new();
+            }
+        }
+    }
+
+    /// Adds a new IP address to block.
+    pub fn add_block_rule(&mut self, address: &str) -> Result<()> {
+        let addr = FirewallAddress::new(address);
+        if !addr.is_valid() {
+            anyhow::bail!("{} is not a valid IP address or CIDR range", address);
+        }
+        
+        self.firewall.add_block_rule(&addr)?;
+        self.refresh();
+        
+        Ok(())
+    }
+
+    /// Removes a block rule by index.
+    pub fn remove_block_rule(&mut self, index: usize) -> Result<()> {
+        if index >= self.blocked_ips.len() {
+            anyhow::bail!("Invalid IP index");
+        }
+        
+        let addr = FirewallAddress::new(self.blocked_ips[index].address.clone());
+        self.firewall.remove_block_rule(&addr)?;
+        
+        // If we removed the selected item, adjust the selection
+        if self.selected_index >= index && !self.blocked_ips.is_empty() {
+            self.selected_index = self.selected_index.saturating_sub(1);
+        }
+        
+        self.refresh();
+        
+        Ok(())
+    }
+
+    /// Toggles the firewall enabled state for a rule.
+    pub fn toggle_rule_action(&mut self, index: usize) -> Result<()> {
+        if index >= self.blocked_ips.len() {
+            anyhow::bail!("Invalid IP index");
+        }
+        
+        // For now, just remove and re-add with different action
+        // In a full implementation, we'd update the rule in place
+        self.firewall.remove_block_rule(&FirewallAddress::new(self.blocked_ips[index].address.clone()))?;
+        
+        // Determine new action
+        // Since we don't track action in BlockedIp, we'll just re-add as Drop
+        self.firewall.add_block_rule(&FirewallAddress::new(self.blocked_ips[index].address.clone()))?;
+        
+        self.refresh();
+        
+        Ok(())
+    }
+
+    /// Renders the firewall screen.
+    pub fn render(&self, frame: &mut Frame, state: &ScreenState, area: Rect) {
+        let colors = &state.colors;
+        let block = Block::default()
+            .title(Line::from(" Firewall Management ").style(colors.title()))
+            .borders(Borders::ALL)
+            .border_style(colors.border());
+
+        frame.render_widget(block, area);
+
+        let inner = area.inner(Margin::new(1, 1));
+
+        // Split into status, list, and help sections
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(0)
+            .constraints([
+                Constraint::Length(3),  // Status
+                Constraint::Min(5),    // IP list
+                Constraint::Length(3),  // Help
+            ])
+            .split(inner);
+
+        // Status section
+        self.render_status(frame, colors, rows[0]);
+
+        // IP list section
+        self.render_ip_list(frame, colors, rows[1], state);
+
+        // Help section
+        self.render_help(frame, colors, rows[2]);
+    }
+
+    fn render_status(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        let mut lines = Vec::new();
+
+        if let Some(ref status) = self.status {
+            lines.push(Line::from(vec![
+                Span::styled("Backend: ", Style::new().bold()),
+                Span::styled(
+                    match status.backend {
+                        FirewallBackend::Iptables => "iptables",
+                        FirewallBackend::Nftables => "nftables",
+                        FirewallBackend::Auto => "auto",
+                    },
+                    colors.primary(),
+                ),
+            ]));
+            
+            lines.push(Line::from(vec![
+                Span::styled("Status: ", Style::new().bold()),
+                Span::styled(
+                    if status.available { "Available" } else { "Not Available" },
+                    if status.available { colors.success() } else { colors.error() },
+                ),
+            ]));
+            
+            lines.push(Line::from(vec![
+                Span::styled("Rules: ", Style::new().bold()),
+                Span::styled(status.rule_count.to_string(), colors.text()),
+                Span::raw("   "),
+                Span::styled("Unique IPs: ", Style::new().bold()),
+                Span::styled(status.unique_ip_count.to_string(), colors.text()),
+            ]));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled("Status: ", Style::new().bold()),
+                Span::styled("Not Available", colors.error()),
+            ]));
+        }
+
+        // Show error if present
+        if let Some(ref error) = self.error {
+            lines.push(Line::from(vec![
+                Span::styled("Error: ", colors.error().bold()),
+                Span::styled(error, colors.error()),
+            ]));
+        }
+
+        let para = Paragraph::new(lines).style(colors.text());
+        frame.render_widget(para, area);
+    }
+
+    fn render_ip_list(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect, state: &ScreenState) {
+        if self.blocked_ips.is_empty() {
+            let para = Paragraph::new("No IPs blocked")
+                .style(colors.inactive())
+                .alignment(Alignment::Center);
+            frame.render_widget(para, area);
+            return;
+        }
+
+        // Calculate visible range
+        let items_per_page = area.height as usize;
+        let start_idx = state.scroll_offset.min(self.blocked_ips.len().saturating_sub(1));
+        let end_idx = (start_idx + items_per_page).min(self.blocked_ips.len());
+
+        // Create list items
+        let items: Vec<ListItem> = (start_idx..end_idx)
+            .map(|i| self.blocked_ips.get(i).unwrap())
+            .map(|ip| {
+                let line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(&ip.address, Style::new().bold()),
+                    if ip.is_cidr { 
+                        Span::styled(" (CIDR)", colors.secondary())
+                    } else {
+                        Span::raw("")
+                    },
+                ]);
+                ListItem::new(line).style(colors.text())
+            })
+            .collect();
+
+        let list = List::new(items)
+            .highlight_style(colors.selected())
+            .highlight_symbol("> ");
+
+        let list_area = area.inner(Margin::new(0, 0));
+        let selected = state.selected_index.saturating_sub(start_idx);
+        frame.render_stateful_widget(
+            list,
+            list_area,
+            &mut ListState::default().with_selected(Some(selected)),
+        );
+    }
+
+    fn render_help(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        let help_text = vec![
+            Line::from("↑↓/kj: Navigate"),
+            Line::from("a: Add IP to block"),
+            Line::from("d: Remove selected IP"),
+            Line::from("r: Refresh"),
+            Line::from("s: Sync with database"),
+            Line::from("b: Back"),
+        ];
+
+        let help_para = Paragraph::new(help_text)
+            .style(colors.inactive())
+            .alignment(Alignment::Center);
+        frame.render_widget(help_para, area);
+    }
+}
+

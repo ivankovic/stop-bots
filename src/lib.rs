@@ -5,6 +5,7 @@
 
 pub mod bots;
 pub mod db;
+pub mod firewall;
 pub mod iptables;
 pub mod nginx;
 pub mod nftables;

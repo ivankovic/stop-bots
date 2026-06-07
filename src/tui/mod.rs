@@ -248,12 +248,20 @@ pub enum TuiEvent {
     OpenSettings,
     /// Open bot list screen.
     OpenBotList,
+    /// Open firewall screen.
+    OpenFirewall,
     /// Confirm action (Yes).
     Confirm,
     /// Cancel action (No).
     Cancel,
     /// Toggle category status.
     ToggleCategory,
+    /// Add firewall rule.
+    AddFirewallRule,
+    /// Remove firewall rule.
+    RemoveFirewallRule,
+    /// Sync firewall with database.
+    SyncFirewall,
 }
 
 /// Converts a crossterm key event to a TuiEvent.
@@ -282,6 +290,8 @@ pub fn key_event_to_tui_event(key_event: crossterm::event::KeyEvent) -> Option<T
         KeyCode::Char('b') | KeyCode::Char('B') => Some(TuiEvent::OpenSettings),
         // Open bot list
         KeyCode::Char('l') | KeyCode::Char('L') => Some(TuiEvent::OpenBotList),
+        // Open firewall screen
+        KeyCode::Char('f') | KeyCode::Char('F') => Some(TuiEvent::OpenFirewall),
         // Confirm (Yes)
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(TuiEvent::Confirm),
         // Cancel (No)
@@ -290,6 +300,12 @@ pub fn key_event_to_tui_event(key_event: crossterm::event::KeyEvent) -> Option<T
         KeyCode::Char('s') | KeyCode::Char('S') => Some(TuiEvent::ToggleCategory),
         // Context menu
         KeyCode::Char('m') | KeyCode::Char('M') => Some(TuiEvent::ContextMenu),
+        // Firewall add rule
+        KeyCode::Char('+') => Some(TuiEvent::AddFirewallRule),
+        // Firewall remove rule
+        KeyCode::Char('-') => Some(TuiEvent::RemoveFirewallRule),
+        // Firewall sync
+        KeyCode::Char('*') => Some(TuiEvent::SyncFirewall),
         _ => None,
     }
 }

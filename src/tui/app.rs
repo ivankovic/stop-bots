@@ -4,9 +4,10 @@
 //! and handles user input and rendering.
 
 use crate::db::{BotStatus, Database};
+use crate::firewall::FirewallAddress;
 use crate::source_fetch::{KnownSources, SourceFetcher};
 use crate::tui::{
-    screens::{BotDetailScreen, BotListScreen, DashboardScreen, HelpScreen, QuitConfirmScreen, Screen, ScreenState, SettingsScreen, SourcesScreen},
+    screens::{BotDetailScreen, BotListScreen, DashboardScreen, FirewallScreen, HelpScreen, QuitConfirmScreen, Screen, ScreenState, SettingsScreen, SourcesScreen},
     key_event_to_tui_event, Theme, TuiEvent,
 };
 use anyhow::Result;
@@ -38,6 +39,8 @@ pub struct App {
     pub bot_list: BotListScreen,
     /// Sources screen
     pub sources: SourcesScreen,
+    /// Firewall screen
+    pub firewall: FirewallScreen,
     /// Bot detail screen
     pub bot_detail: Option<BotDetailScreen>,
     /// Help screen
@@ -99,6 +102,7 @@ impl App {
             },
             bot_list: BotListScreen::new(bots),
             sources: SourcesScreen::new(sources, needs_update),
+            firewall: FirewallScreen::new(),
             bot_detail: None,
             help: HelpScreen::new(),
             quit_confirm: QuitConfirmScreen::new(),
@@ -189,8 +193,18 @@ impl App {
             TuiEvent::OpenBotList => {
                 self.screen_state.navigate_to(Screen::BotList);
             }
+            TuiEvent::OpenFirewall => {
+                self.screen_state.navigate_to(Screen::Firewall);
+            }
             TuiEvent::Refresh => {
-                self.refresh_current_screen()?;
+                match self.screen_state.current_screen {
+                    Screen::Firewall => {
+                        self.firewall.refresh();
+                    }
+                    _ => {
+                        self.refresh_current_screen()?;
+                    }
+                }
             }
             TuiEvent::Back => {
                 // If category popup is open, close it
@@ -223,6 +237,53 @@ impl App {
                             .map(|s| s.status)
                             .unwrap_or(BotStatus::Blocked)
                     ));
+                }
+            }
+            TuiEvent::AddFirewallRule => {
+                // On firewall screen, add a rule (would need input handling)
+                if self.screen_state.current_screen == Screen::Firewall {
+                    // For now, just show a message
+                    self.add_message("Press 'a' to add a rule (input not yet implemented)".to_string());
+                }
+            }
+            TuiEvent::RemoveFirewallRule => {
+                // On firewall screen, remove the selected rule
+                if self.screen_state.current_screen == Screen::Firewall {
+                    if let Some(index) = self.screen_state.selected_index.checked_sub(1) {
+                        if index < self.firewall.blocked_ips.len() {
+                            if let Err(e) = self.firewall.remove_block_rule(index) {
+                                self.add_message(format!("Failed to remove rule: {}", e));
+                            } else {
+                                self.add_message("Rule removed".to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            TuiEvent::SyncFirewall => {
+                // On firewall screen, sync with database
+                if self.screen_state.current_screen == Screen::Firewall {
+                    // Get all blocked bots from database
+                    match self.db.get_all_bots() {
+                        Ok(bots) => {
+                            let addresses: Vec<_> = bots
+                                .into_iter()
+                                .filter(|b| b.status == BotStatus::Blocked)
+                                .flat_map(|b| b.ip_ranges.into_iter())
+                                .map(|r| FirewallAddress::new(r.address))
+                                .collect();
+                            
+                            if let Err(e) = self.firewall.firewall.sync_block_rules(&addresses) {
+                                self.add_message(format!("Failed to sync firewall: {}", e));
+                            } else {
+                                self.firewall.refresh();
+                                self.add_message(format!("Synced {} addresses to firewall", addresses.len()));
+                            }
+                        }
+                        Err(e) => {
+                            self.add_message(format!("Failed to get bots: {}", e));
+                        }
+                    }
                 }
             }
             TuiEvent::Select => {
@@ -325,6 +386,10 @@ impl App {
                     let bots = self.db.get_all_bots().ok().unwrap_or_default();
                     self.settings.open_category_config(bots);
                 }
+            }
+            Screen::Firewall => {
+                // On firewall screen, Enter/Space selects the current IP
+                // This would open a detail view or action menu in a full implementation
             }
             Screen::Help => {
                 self.screen_state.go_back();
@@ -519,6 +584,9 @@ impl App {
             }
             Screen::Settings => {
                 self.settings.render(frame, &self.screen_state, area);
+            }
+            Screen::Firewall => {
+                self.firewall.render(frame, &self.screen_state, area);
             }
             Screen::Help => {
                 self.help.render(frame, &self.screen_state, area);
