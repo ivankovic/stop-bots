@@ -3,7 +3,7 @@
 //! This module contains the main App struct that manages the application state
 //! and handles user input and rendering.
 
-use crate::db::{BotStatus, Database};
+use crate::db::{BotStatus, Database, DataSource};
 use crate::firewall::FirewallAddress;
 use crate::source_fetch::{KnownSources, SourceFetcher};
 use crate::tui::{
@@ -89,8 +89,12 @@ impl App {
             }
         }
 
-        // Count sources needing update
-        let sources_needing_update = needs_update.iter().filter(|&&n| n).count();
+        // Create sources with their update status for dashboard
+        let sources_with_status: Vec<(DataSource, bool)> = sources
+            .clone()
+            .into_iter()
+            .zip(needs_update.clone().into_iter())
+            .collect();
 
         Ok(Self {
             screen_state,
@@ -100,8 +104,7 @@ impl App {
                 total_bots: bots.len(),
                 bots_by_status,
                 bots_by_category,
-                source_count: sources.len(),
-                sources_needing_update,
+                sources: sources_with_status,
                 messages: Vec::new(),
             },
             bot_list: BotListScreen::new(bots),
@@ -462,14 +465,16 @@ impl App {
             .map(|s| self.db.data_source_needs_update(s).unwrap_or(false))
             .collect();
 
-        let sources_needing_update = needs_update.iter().filter(|&&n| n).count();
+        let sources_with_status: Vec<(DataSource, bool)> = sources
+            .into_iter()
+            .zip(needs_update.into_iter())
+            .collect();
 
         self.dashboard = DashboardScreen {
             total_bots: bots.len(),
             bots_by_status,
             bots_by_category,
-            source_count: sources.len(),
-            sources_needing_update,
+            sources: sources_with_status,
             messages: self.messages.clone(),
         };
 

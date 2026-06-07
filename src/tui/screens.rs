@@ -146,10 +146,8 @@ pub struct DashboardScreen {
     pub bots_by_status: std::collections::HashMap<BotStatus, usize>,
     /// Number of bots by category
     pub bots_by_category: std::collections::HashMap<BotCategory, usize>,
-    /// Number of configured data sources
-    pub source_count: usize,
-    /// Number of sources that need updating
-    pub sources_needing_update: usize,
+    /// List of data sources with their update status
+    pub sources: Vec<(DataSource, bool)>,
     /// Recent events or messages
     pub messages: Vec<String>,
 }
@@ -161,8 +159,7 @@ impl DashboardScreen {
             total_bots: 0,
             bots_by_status: std::collections::HashMap::new(),
             bots_by_category: std::collections::HashMap::new(),
-            source_count: 0,
-            sources_needing_update: 0,
+            sources: Vec::new(),
             messages: Vec::new(),
         }
     }
@@ -205,32 +202,61 @@ impl DashboardScreen {
     }
 
     fn render_stats(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
-        let stats = vec![
-            ("Total Bots", self.total_bots.to_string()),
-            ("Data Sources", self.source_count.to_string()),
-            ("Needs Update", self.sources_needing_update.to_string()),
-        ];
+        // Create a single column for the sources list
+        let list_area = area;
+        
+        let block = Block::default()
+            .title(Line::from(" Data Sources ").style(colors.secondary()))
+            .borders(Borders::NONE);
+        frame.render_widget(block, list_area);
 
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .margin(0)
-            .constraints([
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
-                Constraint::Ratio(1, 3),
-            ])
-            .split(area);
-
-        for (i, (label, value)) in stats.into_iter().enumerate() {
-            let stat_block = Block::default()
-                .title(Line::from(label).style(colors.secondary()))
-                .borders(Borders::NONE);
-            frame.render_widget(stat_block, columns[i]);
-
-            let value_para = Paragraph::new(Line::from(value).style(colors.title().bold()))
+        if self.sources.is_empty() {
+            let para = Paragraph::new("No data sources configured")
+                .style(colors.inactive())
                 .alignment(Alignment::Center);
-            frame.render_widget(value_para, columns[i].inner(Margin::new(0, 1)));
+            frame.render_widget(para, list_area.inner(Margin::new(0, 1)));
+            return;
         }
+
+        // Create list items for each source
+        let items: Vec<ListItem> = self
+            .sources
+            .iter()
+            .map(|(source, needs_update)| {
+                let status_style = if *needs_update {
+                    colors.warning()
+                } else {
+                    colors.success()
+                };
+                let official_marker = if source.is_official { "*" } else { "" };
+                let line = Line::from(vec![
+                    Span::styled(
+                        &source.name,
+                        Style::new().bold(),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        official_marker,
+                        colors.primary(),
+                    ),
+                    Span::raw(" - "),
+                    Span::styled(
+                        if *needs_update {
+                            "Needs update"
+                        } else {
+                            "Up to date"
+                        },
+                        status_style,
+                    ),
+                ]);
+                ListItem::new(line).style(colors.text())
+            })
+            .collect();
+
+        let list = List::new(items)
+            .highlight_style(colors.selected());
+        
+        frame.render_widget(list, list_area.inner(Margin::new(0, 1)));
     }
 
     fn render_status_breakdown(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
