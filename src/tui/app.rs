@@ -3,10 +3,10 @@
 //! This module contains the main App struct that manages the application state
 //! and handles user input and rendering.
 
-use crate::db::Database;
+use crate::db::{BotStatus, Database};
 use crate::source_fetch::{KnownSources, SourceFetcher};
 use crate::tui::{
-    screens::{BotDetailScreen, BotListScreen, DashboardScreen, HelpScreen, QuitConfirmScreen, Screen, ScreenState, SourcesScreen},
+    screens::{BotDetailScreen, BotListScreen, DashboardScreen, HelpScreen, QuitConfirmScreen, Screen, ScreenState, SettingsScreen, SourcesScreen},
     key_event_to_tui_event, Theme, TuiEvent,
 };
 use anyhow::Result;
@@ -30,6 +30,8 @@ pub struct App {
     pub screen_state: ScreenState,
     /// Database connection
     pub db: Database,
+    /// Settings screen (main screen)
+    pub settings: SettingsScreen,
     /// Dashboard screen
     pub dashboard: DashboardScreen,
     /// Bot list screen
@@ -86,6 +88,7 @@ impl App {
         Ok(Self {
             screen_state,
             db,
+            settings: SettingsScreen::new(),
             dashboard: DashboardScreen {
                 total_bots: bots.len(),
                 bots_by_status,
@@ -139,6 +142,21 @@ impl App {
 
     /// Handles a key event.
     pub fn on_key(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
+        // Handle y/n keys explicitly for QuitConfirm screen
+        if self.screen_state.current_screen == Screen::QuitConfirm {
+            match key.code {
+                crossterm::event::KeyCode::Char('y') | crossterm::event::KeyCode::Char('Y') => {
+                    self.running = false;
+                    return Ok(());
+                }
+                crossterm::event::KeyCode::Char('n') | crossterm::event::KeyCode::Char('N') => {
+                    self.screen_state.go_back();
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         let event = key_event_to_tui_event(key);
 
         if let Some(event) = event {
@@ -165,11 +183,22 @@ impl App {
                     }
                 ));
             }
+            TuiEvent::OpenSettings => {
+                self.screen_state.navigate_to(Screen::Settings);
+            }
+            TuiEvent::OpenBotList => {
+                self.screen_state.navigate_to(Screen::BotList);
+            }
             TuiEvent::Refresh => {
                 self.refresh_current_screen()?;
             }
             TuiEvent::Back => {
-                self.screen_state.go_back();
+                // If category popup is open, close it
+                if self.settings.category_popup.is_some() {
+                    self.settings.close_category_config();
+                } else {
+                    self.screen_state.go_back();
+                }
             }
             TuiEvent::Confirm => {
                 // On quit confirm screen, Y confirms quit
@@ -183,11 +212,46 @@ impl App {
                     self.screen_state.go_back();
                 }
             }
+            TuiEvent::ToggleCategory => {
+                // On settings screen, toggle the selected category status
+                if self.screen_state.current_screen == Screen::Settings {
+                    self.settings.toggle_selected_category();
+                    self.add_message(format!(
+                        "Toggled category to {}",
+                        self.settings.system_settings
+                            .get(self.settings.selected_category.unwrap_or(0))
+                            .map(|s| s.status)
+                            .unwrap_or(BotStatus::Blocked)
+                    ));
+                }
+            }
             TuiEvent::Select => {
                 self.on_select()?;
             }
             TuiEvent::Up | TuiEvent::Down | TuiEvent::Left | TuiEvent::Right => {
-                self.screen_state.handle_navigation(event)?;
+                // If category popup is open, navigate within it
+                if self.settings.category_popup.is_some() {
+                    match event {
+                        TuiEvent::Up => {
+                            if let Some(ref mut popup) = self.settings.category_popup {
+                                popup.navigate(-1);
+                            }
+                        }
+                        TuiEvent::Down => {
+                            if let Some(ref mut popup) = self.settings.category_popup {
+                                popup.navigate(1);
+                            }
+                        }
+                        _ => {
+                            self.screen_state.handle_navigation(event)?;
+                        }
+                    }
+                } else {
+                    // Navigate between categories
+                    self.screen_state.handle_navigation(event)?;
+                    // Sync selected_index with settings.selected_category
+                    self.settings.selected_category = Some(self.screen_state.selected_index);
+                }
             }
             _ => {}
         }
@@ -242,6 +306,26 @@ impl App {
                     ));
                 }
             }
+            Screen::Settings => {
+                // If category popup is open, toggle the selected bot
+                if let Some(ref mut popup) = self.settings.category_popup {
+                    if let Some(bot) = popup.selected_bot() {
+                        // Toggle the bot's status
+                        let new_status = bot.status.toggle();
+                        let mut updated_bot = bot.clone();
+                        updated_bot.status = new_status;
+                        self.db.upsert_bot(&updated_bot)?;
+                        self.add_message(format!(
+                            "Toggled {} to {}",
+                            updated_bot.name, new_status
+                        ));
+                    }
+                } else {
+                    // Open category config popup for selected category
+                    let bots = self.db.get_all_bots().ok().unwrap_or_default();
+                    self.settings.open_category_config(bots);
+                }
+            }
             Screen::Help => {
                 self.screen_state.go_back();
             }
@@ -260,6 +344,9 @@ impl App {
             Screen::Dashboard => {
                 self.refresh_dashboard()?;
             }
+            Screen::Settings => {
+                self.refresh_settings()?;
+            }
             Screen::BotList => {
                 self.refresh_bot_list()?;
             }
@@ -270,6 +357,13 @@ impl App {
         }
 
         self.add_message("Refreshed".to_string());
+        Ok(())
+    }
+
+    /// Refreshes the settings screen.
+    pub fn refresh_settings(&mut self) -> Result<()> {
+        // For now, just reload with fresh data
+        self.settings = SettingsScreen::new();
         Ok(())
     }
 
@@ -424,7 +518,7 @@ impl App {
                 self.sources.render(frame, &self.screen_state, area);
             }
             Screen::Settings => {
-                // Settings screen not yet implemented
+                self.settings.render(frame, &self.screen_state, area);
             }
             Screen::Help => {
                 self.help.render(frame, &self.screen_state, area);

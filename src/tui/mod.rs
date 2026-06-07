@@ -126,16 +126,16 @@ impl ColorScheme {
         Self {
             background: Color::Reset,  // Use terminal's default background (light)
             foreground: Color::Black,
-            primary: Color::Indexed(4),  // Blue (works on light bg)
-            secondary: Color::Indexed(8), // Dark gray
-            success: Color::Indexed(2),  // Green (works on light bg)
-            warning: Color::Indexed(11), // Bright yellow
-            error: Color::Indexed(1),   // Red (works on light bg)
-            border: Color::Indexed(8),  // Dark gray
-            title: Color::Indexed(6),   // Cyan/Dark cyan (works on light bg)
-            selected: Color::Indexed(15), // White
-            highlighted: Color::Indexed(11), // Bright yellow
-            inactive: Color::Indexed(8), // Dark gray
+            primary: Color::Rgb(0, 0, 255),  // Blue
+            secondary: Color::Rgb(128, 128, 128), // Dark gray
+            success: Color::Rgb(0, 128, 0),  // Dark green (readable on light bg)
+            warning: Color::Rgb(192, 192, 0), // Dark yellow
+            error: Color::Rgb(128, 0, 0),   // Dark red
+            border: Color::Rgb(64, 64, 64),  // Dark gray for borders
+            title: Color::Rgb(0, 128, 128),   // Dark cyan
+            selected: Color::Rgb(255, 255, 255), // White
+            highlighted: Color::Rgb(255, 255, 0), // Bright yellow
+            inactive: Color::Rgb(128, 128, 128), // Dark gray
         }
     }
 
@@ -145,16 +145,16 @@ impl ColorScheme {
         Self {
             background: Color::Reset,  // Use terminal's default background (dark)
             foreground: Color::White,
-            primary: Color::Indexed(6),  // Cyan (works on dark bg)
-            secondary: Color::Indexed(7), // Light gray
-            success: Color::Indexed(10), // Bright green
-            warning: Color::Indexed(11), // Bright yellow
-            error: Color::Indexed(9),   // Bright red
-            border: Color::Indexed(8),  // Dark gray
-            title: Color::Indexed(14),  // Light cyan
-            selected: Color::Indexed(12), // Light blue
-            highlighted: Color::Indexed(11), // Bright yellow
-            inactive: Color::Indexed(8), // Dark gray
+            primary: Color::Rgb(0, 255, 255),  // Cyan
+            secondary: Color::Rgb(192, 192, 192), // Light gray
+            success: Color::Rgb(0, 255, 0), // Bright green
+            warning: Color::Rgb(255, 255, 0), // Bright yellow
+            error: Color::Rgb(255, 0, 0),   // Bright red
+            border: Color::Rgb(128, 128, 128),  // Medium gray
+            title: Color::Rgb(128, 255, 255),  // Light cyan
+            selected: Color::Rgb(128, 128, 255), // Light blue
+            highlighted: Color::Rgb(255, 255, 0), // Bright yellow
+            inactive: Color::Rgb(64, 64, 64), // Dark gray
         }
     }
 
@@ -244,10 +244,16 @@ pub enum TuiEvent {
     Back,
     /// Open context menu.
     ContextMenu,
+    /// Open settings/bot config screen.
+    OpenSettings,
+    /// Open bot list screen.
+    OpenBotList,
     /// Confirm action (Yes).
     Confirm,
     /// Cancel action (No).
     Cancel,
+    /// Toggle category status.
+    ToggleCategory,
 }
 
 /// Converts a crossterm key event to a TuiEvent.
@@ -267,15 +273,21 @@ pub fn key_event_to_tui_event(key_event: crossterm::event::KeyEvent) -> Option<T
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => Some(TuiEvent::Up),
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => Some(TuiEvent::Down),
         KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => Some(TuiEvent::Left),
-        KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => Some(TuiEvent::Right),
+        KeyCode::Right => Some(TuiEvent::Right),
         // Select
         KeyCode::Enter | KeyCode::Char(' ') => Some(TuiEvent::Select),
-        // Back
-        KeyCode::Backspace | KeyCode::Char('b') | KeyCode::Char('B') => Some(TuiEvent::Back),
+        // Back (but 'b' alone should open bot list, not go back)
+        KeyCode::Backspace => Some(TuiEvent::Back),
+        // Open settings/bot config screen
+        KeyCode::Char('b') | KeyCode::Char('B') => Some(TuiEvent::OpenSettings),
+        // Open bot list
+        KeyCode::Char('l') | KeyCode::Char('L') => Some(TuiEvent::OpenBotList),
         // Confirm (Yes)
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(TuiEvent::Confirm),
         // Cancel (No)
         KeyCode::Char('n') | KeyCode::Char('N') => Some(TuiEvent::Cancel),
+        // Toggle category
+        KeyCode::Char('s') | KeyCode::Char('S') => Some(TuiEvent::ToggleCategory),
         // Context menu
         KeyCode::Char('m') | KeyCode::Char('M') => Some(TuiEvent::ContextMenu),
         _ => None,

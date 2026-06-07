@@ -526,7 +526,7 @@ impl<'a> Notification<'a> {
             NotificationType::Error => Color::Red,
         };
 
-        let fg_color = Color::Black; // Use black text on colored background
+        let fg_color = Color::White; // Use white text on colored background for better visibility
 
         let block = Block::default()
             .borders(Borders::NONE)
@@ -549,5 +549,192 @@ impl<'a> Notification<'a> {
         );
         let para = Paragraph::new(line).alignment(Alignment::Center);
         frame.render_widget(para, notification_area);
+    }
+}
+
+// ============================================================================
+// Category Configuration Popup
+// ============================================================================
+
+use crate::db::{Bot, BotCategory, BotStatus};
+
+/// A popup for configuring a bot category.
+/// Shows category status and allows toggling between ALLOWED and BLOCKED.
+/// Also shows individual bots in the category that can be overridden.
+#[derive(Debug, Clone)]
+pub struct CategoryConfigPopup {
+    /// The category being configured
+    pub category: BotCategory,
+    /// Current status of the category
+    pub status: BotStatus,
+    /// Bots in this category
+    pub bots: Vec<Bot>,
+    /// Currently selected index in bot list
+    pub selected_index: usize,
+    /// Whether the popup is active
+    pub active: bool,
+}
+
+impl CategoryConfigPopup {
+    /// Creates a new category configuration popup.
+    pub fn new(category: BotCategory, status: BotStatus, bots: Vec<Bot>) -> Self {
+        Self {
+            category,
+            status,
+            bots,
+            selected_index: 0,
+            active: true,
+        }
+    }
+
+    /// Toggles the category status.
+    pub fn toggle_status(&mut self) -> BotStatus {
+        self.status = self.status.toggle();
+        self.status
+    }
+
+    /// Handles navigation (up/down).
+    pub fn navigate(&mut self, direction: i32) {
+        if self.bots.is_empty() {
+            return;
+        }
+        
+        let len = self.bots.len();
+        if direction > 0 {
+            self.selected_index = (self.selected_index + 1) % len;
+        } else if direction < 0 {
+            self.selected_index = (self.selected_index + len - 1) % len;
+        }
+    }
+
+    /// Gets the currently selected bot.
+    pub fn selected_bot(&self) -> Option<&Bot> {
+        self.bots.get(self.selected_index)
+    }
+
+    /// Renders the category configuration popup.
+    pub fn render(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        // Calculate popup dimensions
+        let width = 80.min(area.width);
+        let height = 20.min(area.height);
+        
+        // Center the popup
+        let x = (area.width.saturating_sub(width)) / 2;
+        let y = (area.height.saturating_sub(height)) / 2;
+        let popup_area = Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+
+        // Draw the popup background
+        let block = Block::default()
+            .title(Line::from(format!(" {} ", self.category)).style(colors.title()))
+            .borders(Borders::ALL)
+            .border_style(colors.border());
+
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(block, popup_area);
+
+        let inner = popup_area.inner(Margin::new(1, 1));
+
+        // Split into header, bot list, and footer
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(0)
+            .constraints([
+                Constraint::Length(3),  // Header with status toggle
+                Constraint::Min(0),     // Bot list
+                Constraint::Length(1),  // Footer
+            ])
+            .split(inner);
+
+        // Header: Category status
+        self.render_header(frame, colors, rows[0]);
+
+        // Middle: Bot list
+        self.render_bot_list(frame, colors, rows[1]);
+
+        // Footer: Help
+        self.render_footer(frame, colors, rows[2]);
+    }
+
+    fn render_header(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        let status_style = match self.status {
+            BotStatus::Allowed => colors.success(),
+            BotStatus::Blocked => colors.error(),
+        };
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Status: ", Style::new().bold()),
+                Span::styled(format!("{}", self.status), status_style.bold()),
+            ]),
+            Line::from("(Press s to toggle, ↑↓ to select bot, Enter to override)"),
+        ];
+
+        let para = Paragraph::new(lines).style(colors.text());
+        frame.render_widget(para, area);
+    }
+
+    fn render_bot_list(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        if self.bots.is_empty() {
+            let para = Paragraph::new("No bots in this category")
+                .style(colors.inactive())
+                .alignment(Alignment::Center);
+            frame.render_widget(para, area);
+            return;
+        }
+
+        // Calculate visible range
+        let items_per_page = area.height as usize;
+        let start_idx = self.selected_index.min(self.bots.len().saturating_sub(items_per_page / 2));
+        let end_idx = (start_idx + items_per_page).min(self.bots.len());
+
+        // Create list items
+        let items: Vec<ListItem> = (start_idx..end_idx)
+            .map(|i| {
+                let bot = &self.bots[i];
+                let status_style = match bot.status {
+                    BotStatus::Allowed => colors.success(),
+                    BotStatus::Blocked => colors.error(),
+                };
+                
+                let name = bot.name.clone();
+                let line = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(name, Style::new().bold()),
+                    Span::raw(" - "),
+                    Span::styled(format!("{}", bot.status), status_style),
+                ]);
+                
+                ListItem::new(line)
+            })
+            .collect();
+
+        let list = List::new(items)
+            .highlight_style(colors.selected())
+            .highlight_symbol("> ");
+
+        frame.render_stateful_widget(
+            list,
+            area,
+            &mut ListState::default().with_selected(Some(self.selected_index - start_idx)),
+        );
+    }
+
+    fn render_footer(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        // Show help
+        let help = if let Some(bot) = self.selected_bot() {
+            format!("Selected: {} - Press Enter to override, s to toggle category", bot.name)
+        } else {
+            String::from("Press s to toggle category status")
+        };
+        
+        let para = Paragraph::new(help)
+            .style(colors.inactive())
+            .alignment(Alignment::Center);
+        frame.render_widget(para, area);
     }
 }

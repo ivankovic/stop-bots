@@ -4,6 +4,7 @@
 //! rendering logic.
 
 use crate::db::{Bot, BotCategory, BotStatus, DataSource};
+use crate::tui::components::CategoryConfigPopup;
 use crate::tui::{ColorScheme, Theme, TuiEvent};
 use anyhow::Result;
 use ratatui::{
@@ -18,9 +19,11 @@ use ratatui::{
 /// Different screens in the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
-    /// Main dashboard screen showing overview
+    /// Dashboard screen showing overview (main screen)
     #[default]
     Dashboard,
+    /// Main settings screen (from README spec) - accessible via 'b'
+    Settings,
     /// List of all bots
     BotList,
     /// Details of a specific bot
@@ -29,8 +32,6 @@ pub enum Screen {
     Sources,
     /// Details of a specific source
     SourceDetail(usize),
-    /// Settings screen
-    Settings,
     /// Help screen
     Help,
     /// Quit confirmation
@@ -1022,5 +1023,329 @@ impl QuitConfirmScreen {
 
         let para = Paragraph::new(lines).alignment(Alignment::Center);
         frame.render_widget(para, inner);
+    }
+}
+
+// ============================================================================
+// Settings Screen (Main screen per README)
+// ============================================================================
+
+/// Settings screen showing system-wide and per-site bot protection settings.
+/// This is the main screen as described in README.md.
+pub struct SettingsScreen {
+    /// System-wide settings for each category
+    pub system_settings: Vec<CategorySetting>,
+    /// Per-site settings
+    pub site_settings: Vec<SiteSetting>,
+    /// Time frame statistics
+    pub time_stats: Vec<TimeStats>,
+    /// Currently selected category index
+    pub selected_category: Option<usize>,
+    /// Currently open category config popup
+    pub category_popup: Option<CategoryConfigPopup>,
+}
+
+/// Represents a setting for a bot category.
+#[derive(Debug, Clone)]
+pub struct CategorySetting {
+    /// Name of the category
+    pub name: String,
+    /// Current status
+    pub status: BotStatus,
+    /// Details (e.g., for geo-block: list of countries)
+    pub details: String,
+    /// Whether this is a system-wide setting
+    pub is_system_wide: bool,
+}
+
+/// Represents bot protection settings for a specific site.
+#[derive(Debug, Clone)]
+pub struct SiteSetting {
+    /// Site name/identifier
+    pub name: String,
+    /// NGINX config path
+    pub nginx_path: Option<String>,
+    /// Category settings for this site
+    pub category_settings: Vec<CategorySetting>,
+}
+
+/// Time-based statistics for bot activity.
+#[derive(Debug, Clone)]
+pub struct TimeStats {
+    /// Time frame label
+    pub label: String,
+    /// Counts per category
+    pub counts: Vec<(String, usize)>,
+}
+
+impl SettingsScreen {
+    /// Creates a new settings screen with sample data.
+    pub fn new() -> Self {
+        // For now, create sample data
+        // In production, this would be loaded from the DB
+        let system_settings = vec![
+            CategorySetting {
+                name: "Geo-block".to_string(),
+                status: BotStatus::Allowed,
+                details: "CH, DE".to_string(),
+                is_system_wide: true,
+            },
+            CategorySetting {
+                name: "Scanners".to_string(),
+                status: BotStatus::Blocked,
+                details: "".to_string(),
+                is_system_wide: true,
+            },
+            CategorySetting {
+                name: "Search Bots".to_string(),
+                status: BotStatus::Allowed,
+                details: "".to_string(),
+                is_system_wide: true,
+            },
+            CategorySetting {
+                name: "AI Bots".to_string(),
+                status: BotStatus::Blocked,
+                details: "".to_string(),
+                is_system_wide: true,
+            },
+        ];
+
+        let site_settings = Vec::new();
+        let time_stats = vec![
+            TimeStats {
+                label: "Last 5 minutes".to_string(),
+                counts: vec![
+                    ("Scanners".to_string(), 120),
+                    ("Search".to_string(), 15),
+                    ("AI".to_string(), 2000),
+                ],
+            },
+            TimeStats {
+                label: "Last hour".to_string(),
+                counts: vec![
+                    ("Scanners".to_string(), 12312),
+                    ("Search".to_string(), 123),
+                    ("AI".to_string(), 41231),
+                ],
+            },
+        ];
+
+        Self {
+            system_settings,
+            site_settings,
+            time_stats,
+            selected_category: None,
+            category_popup: None,
+        }
+    }
+
+    /// Renders the settings screen.
+    pub fn render(&self, frame: &mut Frame, state: &ScreenState, area: Rect) {
+        let colors = &state.colors;
+        let block = Block::default()
+            .title(Line::from(" Stop Bots - Settings ").style(colors.title()))
+            .borders(Borders::ALL)
+            .border_style(colors.border());
+
+        frame.render_widget(block, area);
+
+        let inner = area.inner(Margin::new(1, 1));
+
+        // Split into system settings, sites, and time stats
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(0)
+            .constraints([
+                Constraint::Min(5),   // System settings
+                Constraint::Min(5),   // Sites
+                Constraint::Length(5), // Time stats
+            ])
+            .split(inner);
+
+        // System-wide settings
+        self.render_system_settings(frame, colors, rows[0]);
+
+        // Per-site settings
+        self.render_site_settings(frame, colors, rows[1]);
+
+        // Time frame statistics
+        self.render_time_stats(frame, colors, rows[2]);
+
+        // Render category popup if open
+        self.render_category_popup(frame, colors, area);
+    }
+
+    fn render_system_settings(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        let block = Block::default()
+            .title(Line::from(" System-wide Settings ").style(colors.title()))
+            .borders(Borders::NONE);
+        frame.render_widget(block, area);
+
+        let inner = area.inner(Margin::new(0, 0));
+
+        for (i, setting) in self.system_settings.iter().enumerate() {
+            let status_style = match setting.status {
+                BotStatus::Allowed => colors.success(),
+                BotStatus::Blocked => colors.error(),
+            };
+            
+            let details = if setting.details.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", setting.details)
+            };
+            
+            // Check if this category is selected
+            let is_selected = self.selected_category == Some(i);
+            let marker = if is_selected { "> " } else { "  " };
+            
+            let line = Line::from(vec![
+                Span::styled(marker, colors.primary()),
+                Span::styled("-", colors.text()),
+                Span::raw(" "),
+                Span::styled(&setting.name, Style::new().bold()),
+                Span::raw(" [ "),
+                Span::styled(format!("{}", setting.status), status_style.bold()),
+                Span::raw(format!("{} ]", details)),
+            ]);
+            
+            let y = inner.y + i as u16;
+            frame.render_widget(Paragraph::new(line), Rect {
+                x: inner.x,
+                y,
+                width: inner.width,
+                height: 1,
+            });
+        }
+    }
+
+    fn render_site_settings(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        if self.site_settings.is_empty() {
+            let block = Block::default()
+                .title(Line::from(" Per-Site Settings ").style(colors.title()))
+                .borders(Borders::NONE);
+            frame.render_widget(block, area);
+            
+            let para = Paragraph::new("No sites configured")
+                .style(colors.inactive())
+                .alignment(Alignment::Center);
+            frame.render_widget(para, area.inner(Margin::new(0, 0)));
+            return;
+        }
+
+        let block = Block::default()
+            .title(Line::from(" Per-Site Settings ").style(colors.title()))
+            .borders(Borders::NONE);
+        frame.render_widget(block, area);
+
+        // TODO: Implement per-site rendering
+    }
+
+    fn render_time_stats(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        let block = Block::default()
+            .title(Line::from(" Time Frame Statistics ").style(colors.title()))
+            .borders(Borders::TOP)
+            .border_style(colors.border());
+        frame.render_widget(block, area);
+
+        let inner = area.inner(Margin::new(0, 1));
+
+        // Create table header
+        let header_style = Style::new().bold();
+        let header = Row::new(vec![
+            Cell::from("Time frame").style(header_style),
+            Cell::from("Scanners").style(header_style),
+            Cell::from("Search").style(header_style),
+            Cell::from("AI").style(header_style),
+        ]);
+
+        let mut rows_data = Vec::new();
+        for stats in &self.time_stats {
+            let mut cells = vec![Cell::from(stats.label.as_str())];
+            for (_, count) in &stats.counts {
+                cells.push(Cell::from(count.to_string()));
+            }
+            rows_data.push(Row::new(cells));
+        }
+
+        let table = Table::new(rows_data, &[Constraint::Length(20), Constraint::Length(10), Constraint::Length(10), Constraint::Length(10)])
+            .header(header)
+            .block(Block::default());
+
+        frame.render_widget(table, inner);
+    }
+
+    /// Selects the next category.
+    pub fn select_next_category(&mut self) {
+        if self.system_settings.is_empty() {
+            return;
+        }
+        let next = match self.selected_category {
+            Some(i) => (i + 1) % self.system_settings.len(),
+            None => 0,
+        };
+        self.selected_category = Some(next);
+    }
+
+    /// Selects the previous category.
+    pub fn select_prev_category(&mut self) {
+        if self.system_settings.is_empty() {
+            return;
+        }
+        let prev = match self.selected_category {
+            Some(i) => (i + self.system_settings.len() - 1) % self.system_settings.len(),
+            None => self.system_settings.len() - 1,
+        };
+        self.selected_category = Some(prev);
+    }
+
+    /// Opens the configuration popup for the selected category.
+    pub fn open_category_config(&mut self, bots: Vec<Bot>) {
+        let index = self.selected_category.unwrap_or(0);
+        if index < self.system_settings.len() {
+            let setting = &self.system_settings[index];
+            
+            // Map category name to BotCategory
+            let category = match setting.name.as_str() {
+                "Geo-block" => BotCategory::SecurityScanner, // placeholder
+                "Scanners" => BotCategory::Scanner,
+                "Search Bots" => BotCategory::SearchEngine,
+                "AI Bots" => BotCategory::AiScraper,
+                _ => BotCategory::Unknown,
+            };
+            
+            // Filter bots by category
+            let category_bots: Vec<Bot> = bots
+                .into_iter()
+                .filter(|b| b.categories.contains(&category))
+                .collect();
+            
+            self.category_popup = Some(CategoryConfigPopup::new(
+                category,
+                setting.status,
+                category_bots,
+            ));
+        }
+    }
+
+    /// Closes the category configuration popup.
+    pub fn close_category_config(&mut self) {
+        self.category_popup = None;
+    }
+
+    /// Toggles the selected category status.
+    pub fn toggle_selected_category(&mut self) {
+        if let Some(index) = self.selected_category {
+            if index < self.system_settings.len() {
+                self.system_settings[index].status = self.system_settings[index].status.toggle();
+            }
+        }
+    }
+
+    /// Renders the category configuration popup if open.
+    pub fn render_category_popup(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
+        if let Some(ref popup) = self.category_popup {
+            popup.render(frame, colors, area);
+        }
     }
 }
