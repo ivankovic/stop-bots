@@ -3,10 +3,27 @@
 //! This is the main entry point for the application.
 
 use anyhow::{Context, Result};
-use stop_bots::nginx::{common_config_paths, discover_nginx_configs, is_nginx_installed};
-use std::io::{self, Write};
+use stop_bots::tui::app::run_tui;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Try to run the TUI
+    if let Err(e) = run_tui().await {
+        eprintln!("Error running TUI: {}", e);
+        eprintln!("\nFalling back to CLI mode...\n");
+        
+        // Fallback to CLI mode
+        cli_mode()?;
+    }
+
+    Ok(())
+}
+
+/// CLI fallback mode for when TUI is not available.
+fn cli_mode() -> Result<()> {
+    use stop_bots::nginx::{common_config_paths, discover_nginx_configs, is_nginx_installed};
+    use std::io::{self, Write};
+
     let stdout = io::stdout();
     let mut handle = stdout.lock();
 

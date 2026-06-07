@@ -7,3 +7,4 @@ pub mod bots;
 pub mod db;
 pub mod nginx;
 pub mod source_fetch;
+pub mod tui;

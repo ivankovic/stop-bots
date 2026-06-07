@@ -46,7 +46,7 @@ pub fn default_db_path() -> PathBuf {
 // ============================================================================
 
 /// Whether a bot is allowed or blocked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum BotStatus {
     /// Bot is allowed to access the site
     Allowed,
@@ -499,6 +499,7 @@ pub struct BotOwner {
 // ============================================================================
 
 /// Manages the SQLite database connection.
+#[derive(Debug)]
 pub struct Database {
     /// The SQLite connection
     conn: Connection,
