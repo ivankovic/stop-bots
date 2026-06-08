@@ -20,48 +20,37 @@ use std::time::{Duration, SystemTime};
 // ============================================================================
 
 /// Structure for Google's official bot IP ranges JSON.
-/// See: https://developers.google.com/static/search/apis/ipranges/googlebot.json
+/// See: https://developers.google.com/static/crawling/ipranges/common-crawlers.json
 #[derive(Debug, Clone, Deserialize)]
 struct GoogleBotJson {
-    #[serde(rename = "crawlers")]
-    crawlers: Vec<GoogleCrawler>,
+    #[serde(rename = "prefixes")]
+    prefixes: Vec<GooglePrefix>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct GoogleCrawler {
-    #[serde(rename = "ipv4_prefixes")]
-    ipv4_prefixes: Option<Vec<String>>,
-    #[serde(rename = "ipv6_prefixes")]
-    ipv6_prefixes: Option<Vec<String>>,
-    #[serde(rename = "user_agents")]
-    user_agents: Option<Vec<String>>,
-    #[serde(rename = "product_name")]
-    product_name: Option<String>,
-    #[serde(rename = "description")]
-    description: Option<String>,
-    #[serde(rename = "deprecated")]
-    deprecated: Option<bool>,
-    #[allow(dead_code)]
-    #[serde(rename = "product_url")]
-    product_url: Option<String>,
+struct GooglePrefix {
+    #[serde(rename = "ipv4Prefix")]
+    ipv4: Option<String>,
+    #[serde(rename = "ipv6Prefix")]
+    ipv6: Option<String>,
 }
 
 /// Structure for Bingbot's official JSON.
 /// See: https://www.bing.com/toolbox/bingbot.json
 #[derive(Debug, Clone, Deserialize)]
 struct BingBotJson {
-    #[serde(rename = "crawler")]
-    crawler: Vec<BingCrawler>,
+    #[serde(rename = "prefixes")]
+    prefixes: Vec<BingPrefix>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct BingCrawler {
-    #[serde(rename = "ipv4")]
-    ipv4: Vec<String>,
-    #[serde(rename = "ipv6")]
-    ipv6: Vec<String>,
+struct BingPrefix {
+    #[serde(rename = "ipv4Prefix")]
+    ipv4: Option<String>,
+    #[serde(rename = "ipv6Prefix")]
+    ipv6: Option<String>,
     #[serde(rename = "userAgent")]
-    user_agent: String,
+    user_agent: Option<String>,
 }
 
 /// Structure for OpenAI's official bot JSON.
@@ -69,8 +58,8 @@ struct BingCrawler {
 #[derive(Debug, Clone, Deserialize)]
 struct OpenAIBotJson {
     #[serde(rename = "prefixes")]
-    prefixes: Vec<String>,
-    #[serde(rename = "user_agent")]
+    prefixes: Vec<OpenAIPrefix>,
+    #[serde(rename = "userAgent")]
     user_agent: Option<String>,
     #[serde(rename = "description")]
     description: Option<String>,
@@ -80,6 +69,14 @@ struct OpenAIBotJson {
     #[allow(dead_code)]
     #[serde(rename = "product_url")]
     product_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OpenAIPrefix {
+    #[serde(rename = "ipv4Prefix")]
+    ipv4: Option<String>,
+    #[serde(rename = "ipv6Prefix")]
+    ipv6: Option<String>,
 }
 
 /// Structure for community well-known-bots JSON.
@@ -127,7 +124,7 @@ impl KnownSources {
                 id: "googlebot-official".to_string(),
                 name: "Googlebot Official".to_string(),
                 description: "Official Googlebot IP ranges and user agents".to_string(),
-                url: Some("https://developers.google.com/static/search/apis/ipranges/googlebot.json".to_string()),
+                url: Some("https://developers.google.com/static/crawling/ipranges/common-crawlers.json".to_string()),
                 update_frequency: UpdateFrequency::Daily,
                 auto_update_enabled: true,
                 last_updated: None,
@@ -183,7 +180,7 @@ impl KnownSources {
                 id: "arcjet-well-known-bots".to_string(),
                 name: "ArcJet Well-Known Bots".to_string(),
                 description: "Community-maintained list of well-known bots and user agents".to_string(),
-                url: Some("https://raw.githubusercontent.com/arcjet/well-known-bots/main/bots.json".to_string()),
+                url: Some("https://raw.githubusercontent.com/arcjet/well-known-bots/main/well-known-bots.json".to_string()),
                 update_frequency: UpdateFrequency::Weekly,
                 auto_update_enabled: true,
                 last_updated: None,
@@ -194,7 +191,7 @@ impl KnownSources {
                 id: "counter-robots".to_string(),
                 name: "COUNTER Robots".to_string(),
                 description: "Official COUNTER list of user agents regarded as robots".to_string(),
-                url: Some("https://raw.githubusercontent.com/atmire/COUNTER-Robots/master/robots.txt".to_string()),
+                url: Some("https://raw.githubusercontent.com/atmire/COUNTER-Robots/master/COUNTER_Robots_list.json".to_string()),
                 update_frequency: UpdateFrequency::Monthly,
                 auto_update_enabled: true,
                 last_updated: None,
@@ -205,7 +202,7 @@ impl KnownSources {
                 id: "monperrus-crawlers".to_string(),
                 name: "Monperrus Crawlers".to_string(),
                 description: "Community-maintained syntactic patterns of crawler user agents".to_string(),
-                url: Some("https://raw.githubusercontent.com/monperrus/crawler-user-agents/master/crawler-user-agents.txt".to_string()),
+                url: Some("https://raw.githubusercontent.com/monperrus/crawler-user-agents/master/crawler-user-agents.json".to_string()),
                 update_frequency: UpdateFrequency::Monthly,
                 auto_update_enabled: true,
                 last_updated: None,
@@ -376,7 +373,7 @@ pub struct GoogleBotFetcher;
 #[async_trait::async_trait]
 impl BotDataFetcher for GoogleBotFetcher {
     async fn fetch(&self, client: &HttpClient) -> Result<Vec<Bot>> {
-        let url = "https://developers.google.com/static/search/apis/ipranges/googlebot.json";
+        let url = "https://developers.google.com/static/crawling/ipranges/common-crawlers.json";
         let json: GoogleBotJson = client.fetch_json(url).await?;
 
         let mut bots = Vec::new();
@@ -387,103 +384,75 @@ impl BotDataFetcher for GoogleBotFetcher {
             contact: Some("googlebot@google.com".to_string()),
         };
 
-        for crawler in json.crawlers {
-            if crawler.deprecated.unwrap_or(false) {
-                continue;
+        // With the new format, we don't have crawler information anymore
+        // Create a single bot for all Google prefixes
+        // Note: This is a simplification due to Google's API change
+        let mut bot = Bot {
+            id: None,
+            name: "Googlebot Common".to_string(),
+            status: BotStatus::Allowed,
+            categories: vec![BotCategory::SearchEngine],
+            user_agent_patterns: vec![
+                BotUserAgentPattern {
+                    id: None,
+                    bot_id: None,
+                    pattern: "Googlebot".to_string(),
+                    is_regex: false,
+                    case_sensitive: false,
+                    is_primary: true,
+                },
+                BotUserAgentPattern {
+                    id: None,
+                    bot_id: None,
+                    pattern: "Googlebot-Image".to_string(),
+                    is_regex: false,
+                    case_sensitive: false,
+                    is_primary: false,
+                },
+            ],
+            ip_ranges: Vec::new(),
+            signals: vec![SignalType::IpAddress, SignalType::UserAgent, SignalType::OfficialSource],
+            owner: Some(owner.clone()),
+            owner_id: None,
+            notes: Some("Official Google crawler IP ranges".to_string()),
+            is_ai_bot: false,
+            is_scanner: false,
+            source_id: Some("googlebot-official".to_string()),
+            created_at: Some(SystemTime::now()),
+            updated_at: Some(SystemTime::now()),
+        };
+
+        // Add IP ranges
+        let verification = VerificationInfo {
+            status: VerificationStatus::Verified,
+            verified_at: Some(SystemTime::now()),
+            error: None,
+            source: VerificationSource::Official,
+        };
+
+        for prefix in json.prefixes {
+            if let Some(ip) = prefix.ipv4 {
+                bot.ip_ranges.push(BotIpRange {
+                    id: None,
+                    bot_id: None,
+                    address: ip,
+                    description: Some("Googlebot IPv4 range".to_string()),
+                    verification: verification.clone(),
+                });
             }
-
-            let (category, signals) = match crawler.product_name.as_deref() {
-                Some("Googlebot") | Some("Googlebot-Image") | Some("Googlebot-Video") => {
-                    (
-                        vec![BotCategory::SearchEngine],
-                        vec![SignalType::IpAddress, SignalType::UserAgent, SignalType::OfficialSource],
-                    )
-                }
-                Some("AdsBot Google") | Some("AdsBot Google-Mobile") => {
-                    (
-                        vec![BotCategory::AdBot],
-                        vec![SignalType::IpAddress, SignalType::UserAgent, SignalType::OfficialSource],
-                    )
-                }
-                Some("APIs-Google") => {
-                    (
-                        vec![BotCategory::Unknown],
-                        vec![SignalType::IpAddress, SignalType::OfficialSource],
-                    )
-                }
-                _ => (
-                    vec![BotCategory::Unknown],
-                    vec![SignalType::IpAddress, SignalType::OfficialSource],
-                ),
-            };
-
-            let mut bot = Bot {
-                id: None,
-                name: crawler.product_name.clone().unwrap_or_else(|| "Google Crawler".to_string()),
-                status: BotStatus::Allowed, // Googlebot is typically allowed
-                categories: category,
-                user_agent_patterns: Vec::new(),
-                ip_ranges: Vec::new(),
-                signals,
-                owner: Some(owner.clone()),
-                owner_id: None,
-                notes: crawler.description.clone(),
-                is_ai_bot: false,
-                is_scanner: false,
-                source_id: Some("googlebot-official".to_string()),
-                created_at: Some(SystemTime::now()),
-                updated_at: Some(SystemTime::now()),
-            };
-
-            // Add user agents
-            if let Some(uas) = crawler.user_agents {
-                for (idx, ua) in uas.into_iter().enumerate() {
-                    bot.user_agent_patterns.push(BotUserAgentPattern {
-                        id: None,
-                        bot_id: None,
-                        pattern: ua,
-                        is_regex: false,
-                        case_sensitive: false,
-                        is_primary: idx == 0,
-                    });
-                }
+            if let Some(ip) = prefix.ipv6 {
+                bot.ip_ranges.push(BotIpRange {
+                    id: None,
+                    bot_id: None,
+                    address: ip,
+                    description: Some("Googlebot IPv6 range".to_string()),
+                    verification: verification.clone(),
+                });
             }
+        }
 
-            // Add IP ranges
-            let verification = VerificationInfo {
-                status: VerificationStatus::Verified,
-                verified_at: Some(SystemTime::now()),
-                error: None,
-                source: VerificationSource::Official,
-            };
-
-            if let Some(ipv4_prefixes) = crawler.ipv4_prefixes {
-                for prefix in ipv4_prefixes {
-                    bot.ip_ranges.push(BotIpRange {
-                        id: None,
-                        bot_id: None,
-                        address: prefix,
-                        description: Some("Googlebot IPv4 range".to_string()),
-                        verification: verification.clone(),
-                    });
-                }
-            }
-
-            if let Some(ipv6_prefixes) = crawler.ipv6_prefixes {
-                for prefix in ipv6_prefixes {
-                    bot.ip_ranges.push(BotIpRange {
-                        id: None,
-                        bot_id: None,
-                        address: prefix,
-                        description: Some("Googlebot IPv6 range".to_string()),
-                        verification: verification.clone(),
-                    });
-                }
-            }
-
-            if !bot.ip_ranges.is_empty() || !bot.user_agent_patterns.is_empty() {
-                bots.push(bot);
-            }
+        if !bot.ip_ranges.is_empty() || !bot.user_agent_patterns.is_empty() {
+            bots.push(bot);
         }
 
         Ok(bots)
@@ -515,40 +484,64 @@ impl BotDataFetcher for BingBotFetcher {
             contact: None,
         };
 
-        for crawler in json.crawler {
-            let mut bot = Bot {
-                id: None,
-                name: "Bingbot".to_string(),
-                status: BotStatus::Allowed,
-                categories: vec![BotCategory::SearchEngine],
-                user_agent_patterns: vec![BotUserAgentPattern {
+        // Collect user agents from prefixes (they might not all be the same)
+        let user_agents: Vec<String> = json.prefixes
+            .iter()
+            .filter_map(|p| p.user_agent.as_ref().map(|ua| ua.clone()))
+            .collect();
+
+        let mut bot = Bot {
+            id: None,
+            name: "Bingbot".to_string(),
+            status: BotStatus::Allowed,
+            categories: vec![BotCategory::SearchEngine],
+            user_agent_patterns: Vec::new(),
+            ip_ranges: Vec::new(),
+            signals: vec![SignalType::IpAddress, SignalType::UserAgent, SignalType::OfficialSource],
+            owner: Some(owner.clone()),
+            owner_id: None,
+            notes: Some("Official Microsoft Bing crawler".to_string()),
+            is_ai_bot: false,
+            is_scanner: false,
+            source_id: Some("bingbot-official".to_string()),
+            created_at: Some(SystemTime::now()),
+            updated_at: Some(SystemTime::now()),
+        };
+
+        let verification = VerificationInfo {
+            status: VerificationStatus::Verified,
+            verified_at: Some(SystemTime::now()),
+            error: None,
+            source: VerificationSource::Official,
+        };
+
+        // Add user agents if any exist
+        if !user_agents.is_empty() {
+            for (idx, ua) in user_agents.into_iter().enumerate() {
+                bot.user_agent_patterns.push(BotUserAgentPattern {
                     id: None,
                     bot_id: None,
-                    pattern: crawler.user_agent.clone(),
+                    pattern: ua,
                     is_regex: false,
                     case_sensitive: false,
-                    is_primary: true,
-                }],
-                ip_ranges: Vec::new(),
-                signals: vec![SignalType::IpAddress, SignalType::UserAgent, SignalType::OfficialSource],
-                owner: Some(owner.clone()),
-                owner_id: None,
-                notes: Some("Official Microsoft Bing crawler".to_string()),
-                is_ai_bot: false,
-                is_scanner: false,
-                source_id: Some("bingbot-official".to_string()),
-                created_at: Some(SystemTime::now()),
-                updated_at: Some(SystemTime::now()),
-            };
+                    is_primary: idx == 0,
+                });
+            }
+        } else {
+            // Default user agent if none in prefixes
+            bot.user_agent_patterns.push(BotUserAgentPattern {
+                id: None,
+                bot_id: None,
+                pattern: "Bingbot".to_string(),
+                is_regex: false,
+                case_sensitive: false,
+                is_primary: true,
+            });
+        }
 
-            let verification = VerificationInfo {
-                status: VerificationStatus::Verified,
-                verified_at: Some(SystemTime::now()),
-                error: None,
-                source: VerificationSource::Official,
-            };
-
-            for ip in crawler.ipv4 {
+        // Add IP ranges
+        for prefix in json.prefixes {
+            if let Some(ip) = prefix.ipv4 {
                 bot.ip_ranges.push(BotIpRange {
                     id: None,
                     bot_id: None,
@@ -557,8 +550,7 @@ impl BotDataFetcher for BingBotFetcher {
                     verification: verification.clone(),
                 });
             }
-
-            for ip in crawler.ipv6 {
+            if let Some(ip) = prefix.ipv6 {
                 bot.ip_ranges.push(BotIpRange {
                     id: None,
                     bot_id: None,
@@ -567,7 +559,9 @@ impl BotDataFetcher for BingBotFetcher {
                     verification: verification.clone(),
                 });
             }
+        }
 
+        if !bot.ip_ranges.is_empty() || !bot.user_agent_patterns.is_empty() {
             bots.push(bot);
         }
 
@@ -678,15 +672,26 @@ impl BotDataFetcher for OpenAIBotFetcher {
             });
         }
 
-        // Add IP ranges
+        // Add IP ranges from prefixes
         for prefix in json.prefixes {
-            bot.ip_ranges.push(BotIpRange {
-                id: None,
-                bot_id: None,
-                address: prefix,
-                description: Some(format!("{} IP range", self.bot_type.bot_name())),
-                verification: verification.clone(),
-            });
+            if let Some(ip) = prefix.ipv4 {
+                bot.ip_ranges.push(BotIpRange {
+                    id: None,
+                    bot_id: None,
+                    address: ip,
+                    description: Some(format!("{} IP range", self.bot_type.bot_name())),
+                    verification: verification.clone(),
+                });
+            }
+            if let Some(ip) = prefix.ipv6 {
+                bot.ip_ranges.push(BotIpRange {
+                    id: None,
+                    bot_id: None,
+                    address: ip,
+                    description: Some(format!("{} IPv6 range", self.bot_type.bot_name())),
+                    verification: verification.clone(),
+                });
+            }
         }
 
         Ok(vec![bot])
@@ -715,7 +720,7 @@ pub struct WellKnownBotsFetcher;
 #[async_trait::async_trait]
 impl BotDataFetcher for WellKnownBotsFetcher {
     async fn fetch(&self, client: &HttpClient) -> Result<Vec<Bot>> {
-        let url = "https://raw.githubusercontent.com/arcjet/well-known-bots/main/bots.json";
+        let url = "https://raw.githubusercontent.com/arcjet/well-known-bots/main/well-known-bots.json";
         let json: WellKnownBotsJson = client.fetch_json(url).await?;
 
         let mut bots = Vec::new();
@@ -814,40 +819,42 @@ impl BotDataFetcher for WellKnownBotsFetcher {
     }
 }
 
+/// Structure for COUNTER Robots JSON.
+#[derive(Debug, Clone, Deserialize)]
+struct CounterRobotsJson {
+    #[serde(rename = "robots")]
+    robots: Vec<CounterRobot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CounterRobot {
+    #[serde(rename = "name")]
+    name: String,
+    #[serde(rename = "userAgent")]
+    user_agent: String,
+}
+
 /// Fetcher for COUNTER Robots list.
 pub struct CounterRobotsFetcher;
 
 #[async_trait::async_trait]
 impl BotDataFetcher for CounterRobotsFetcher {
     async fn fetch(&self, client: &HttpClient) -> Result<Vec<Bot>> {
-        let url = "https://raw.githubusercontent.com/atmire/COUNTER-Robots/master/robots.txt";
-        let text = client.fetch_text(url).await?;
+        let url = "https://raw.githubusercontent.com/atmire/COUNTER-Robots/master/COUNTER_Robots_list.json";
+        let json: CounterRobotsJson = client.fetch_json(url).await?;
 
         let mut bots = Vec::new();
 
-        // Parse robots.txt format (one user agent per line)
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-
-            // Extract bot name from user agent string
-            let name = if line.contains("/") {
-                line.split('/').next().unwrap_or(line).to_string()
-            } else {
-                line.to_string()
-            };
-
+        for robot in json.robots {
             let bot = Bot {
                 id: None,
-                name: name.clone(),
+                name: robot.name.clone(),
                 status: BotStatus::Allowed, // COUNTER robots are typically legitimate
                 categories: vec![BotCategory::Unknown],
                 user_agent_patterns: vec![BotUserAgentPattern {
                     id: None,
                     bot_id: None,
-                    pattern: line.to_string(),
+                    pattern: robot.user_agent,
                     is_regex: false,
                     case_sensitive: false,
                     is_primary: true,
@@ -879,33 +886,70 @@ impl BotDataFetcher for CounterRobotsFetcher {
     }
 }
 
+/// Structure for Monperrus crawler user agents JSON.
+#[derive(Debug, Clone, Deserialize)]
+struct MonperrusEntry {
+    #[serde(rename = "pattern")]
+    pattern: String,
+    #[allow(dead_code)]
+    #[serde(rename = "url")]
+    url: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "instances")]
+    instances: Option<Vec<String>>,
+    #[serde(rename = "description")]
+    description: Option<String>,
+    #[allow(dead_code)]
+    #[serde(rename = "tags")]
+    tags: Option<Vec<String>>,
+}
+
 /// Fetcher for Monperrus Crawler User Agents.
 pub struct MonperrusCrawlersFetcher;
 
 #[async_trait::async_trait]
 impl BotDataFetcher for MonperrusCrawlersFetcher {
     async fn fetch(&self, client: &HttpClient) -> Result<Vec<Bot>> {
-        let url = "https://raw.githubusercontent.com/monperrus/crawler-user-agents/master/crawler-user-agents.txt";
+        let url = "https://raw.githubusercontent.com/monperrus/crawler-user-agents/master/crawler-user-agents.json";
         let text = client.fetch_text(url).await?;
 
         let mut bots = Vec::new();
 
-        // Parse text file (one user agent per line)
-        // Format: user_agent_string -> bot_name
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
+        // Parse JSON file (array of user agents)
+        // Format is now JSON: [{"pattern": "...", "name": "..."}, ...]
+        // But if that fails, fall back to text format
+        let user_agents: Vec<MonperrusEntry> = match serde_json::from_str(&text) {
+            Ok(agents) => agents,
+            Err(_) => {
+                // Fall back to text format
+                let mut entries = Vec::new();
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    // Try to parse "pattern -> name" format
+                    let (pattern, _name) = if line.contains(" -> ") {
+                        let parts: Vec<&str> = line.splitn(2, " -> ").collect();
+                        (parts[0].to_string(), parts[1].to_string())
+                    } else {
+                        (line.to_string(), line.to_string())
+                    };
+                    entries.push(MonperrusEntry {
+                        pattern,
+                        url: None,
+                        instances: None,
+                        description: None,
+                        tags: None
+                    });
+                }
+                entries
             }
+        };
 
-            // Try to parse "pattern -> name" format
-            let (pattern, name) = if line.contains(" -> ") {
-                let parts: Vec<&str> = line.splitn(2, " -> ").collect();
-                (parts[0].to_string(), parts[1].to_string())
-            } else {
-                (line.to_string(), line.to_string())
-            };
-
+        for entry in user_agents {
+            // Use description as name if available, otherwise use pattern
+            let name = entry.description.clone().unwrap_or_else(|| entry.pattern.clone());
             let bot = Bot {
                 id: None,
                 name,
@@ -914,7 +958,7 @@ impl BotDataFetcher for MonperrusCrawlersFetcher {
                 user_agent_patterns: vec![BotUserAgentPattern {
                     id: None,
                     bot_id: None,
-                    pattern,
+                    pattern: entry.pattern,
                     is_regex: true,
                     case_sensitive: false,
                     is_primary: true,
