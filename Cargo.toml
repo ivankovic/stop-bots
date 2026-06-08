@@ -9,13 +9,14 @@ description = "A TUI that helps you configure your server to stop bad bots and s
 [dependencies]
 # For TUI
 ratatui = "0.27"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 
 # For reading nginx config files
 walkdir = "2"
 
 # For error handling
 anyhow = "1"
+color-eyre = "0.6"
 
 # For SQLite database
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -32,6 +33,9 @@ tokio = { version = "1.0", features = ["full"] }
 
 # For async trait
 async-trait = "0.1"
+
+# For futures utilities
+futures = "0.3"
 
 # For text width calculation
 unicode-width = "0.1"

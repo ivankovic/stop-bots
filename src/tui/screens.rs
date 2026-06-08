@@ -5,6 +5,7 @@
 
 use crate::db::{Bot, BotCategory, BotStatus, DataSource};
 use crate::tui::components::CategoryConfigPopup;
+use crate::tui::event::AppEvent;
 use crate::tui::{ColorScheme, Theme, TuiEvent};
 use anyhow::Result;
 use ratatui::{
@@ -127,6 +128,27 @@ impl ScreenState {
             }
             TuiEvent::Refresh => {}
             TuiEvent::ContextMenu => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Handles navigation from AppEvent (used in async event loop).
+    pub fn handle_navigation_from_app_event(&mut self, event: AppEvent) -> Result<()> {
+        match event {
+            AppEvent::Up => {
+                if self.selected_index > 0 {
+                    self.selected_index -= 1;
+                    if self.selected_index < self.scroll_offset {
+                        self.scroll_offset = self.selected_index;
+                    }
+                }
+            }
+            AppEvent::Down => {
+                self.selected_index += 1;
+            }
+            AppEvent::Left => {}
+            AppEvent::Right => {}
             _ => {}
         }
         Ok(())
