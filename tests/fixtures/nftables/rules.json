@@ -1,0 +1,44 @@
+[
+  {
+    "id": "nft-rule-1",
+    "address": "1.2.3.4",
+    "port": null,
+    "action": "drop",
+    "enabled": true
+  },
+  {
+    "id": "nft-rule-2",
+    "address": "5.6.7.0/24",
+    "port": null,
+    "action": "drop",
+    "enabled": true
+  },
+  {
+    "id": "nft-rule-3",
+    "address": "8.9.10.11",
+    "port": 80,
+    "action": "drop",
+    "enabled": true
+  },
+  {
+    "id": "nft-rule-4",
+    "address": "12.13.14.15",
+    "port": null,
+    "action": "reject",
+    "enabled": true
+  },
+  {
+    "id": "nft-rule-5",
+    "address": "66.249.64.0/19",
+    "port": null,
+    "action": "accept",
+    "enabled": true
+  },
+  {
+    "id": "nft-rule-6",
+    "address": "2001:db8::1",
+    "port": 443,
+    "action": "drop",
+    "enabled": true
+  }
+]

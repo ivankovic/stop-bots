@@ -1,0 +1,26 @@
+#!/usr/sbin/nft -f
+# Port-specific nftables rules for testing stop-bots
+
+flush ruleset
+
+table inet stop_bots {
+    chain bot_block {
+        type filter hook input priority -1; policy drop;
+        
+        # Allow established/related connections
+        ct state established,related accept
+        
+        # Allow loopback
+        iif lo accept
+        
+        # Block specific ports for bots
+        ip saddr 10.0.0.1 tcp dport 80 drop
+        ip saddr 10.0.0.1 tcp dport 443 drop
+        ip saddr 10.0.0.2 tcp dport 22 drop
+        ip saddr 10.0.0.3 tcp dport 8080 drop
+        ip saddr 10.0.0.4 udp dport 53 drop
+        
+        # Allow specific ports for good bots
+        ip saddr 66.249.64.0/19 tcp dport 443 accept
+    }
+}

@@ -1,0 +1,16 @@
+#!/usr/sbin/nft -f
+# Empty nftables rules with just the structure
+
+flush ruleset
+
+table inet stop_bots {
+    chain bot_block {
+        type filter hook input priority -1; policy drop;
+        
+        # Allow established/related connections
+        ct state established,related accept
+        
+        # Allow loopback
+        iif lo accept
+    }
+}

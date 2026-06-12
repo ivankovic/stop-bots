@@ -1,0 +1,22 @@
+# Port-specific iptables rules for testing
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:STOP-BOTS - [0:0]
+
+-I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-I INPUT -i lo -j ACCEPT
+-I INPUT -j STOP-BOTS
+
+# Block specific ports for bots
+-A STOP-BOTS -s 10.0.0.1 -p tcp --dport 80 -j DROP
+-A STOP-BOTS -s 10.0.0.1 -p tcp --dport 443 -j DROP
+-A STOP-BOTS -s 10.0.0.2 -p tcp --dport 22 -j DROP
+-A STOP-BOTS -s 10.0.0.3 -p tcp --dport 8080 -j DROP
+-A STOP-BOTS -s 10.0.0.4 -p udp --dport 53 -j DROP
+
+# Allow specific ports for good bots
+-A STOP-BOTS -s 66.249.64.0/19 -p tcp --dport 443 -j ACCEPT
+
+COMMIT

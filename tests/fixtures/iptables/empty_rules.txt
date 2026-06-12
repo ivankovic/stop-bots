@@ -1,0 +1,8 @@
+# Empty iptables rules with just the STOP-BOTS chain
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:STOP-BOTS - [0:0]
+-I INPUT -j STOP-BOTS
+COMMIT

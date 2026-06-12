@@ -1,0 +1,44 @@
+[
+  {
+    "id": "rule-1",
+    "address": "1.2.3.4",
+    "port": null,
+    "action": "DROP",
+    "enabled": true
+  },
+  {
+    "id": "rule-2",
+    "address": "5.6.7.0/24",
+    "port": null,
+    "action": "DROP",
+    "enabled": true
+  },
+  {
+    "id": "rule-3", 
+    "address": "8.9.10.11",
+    "port": 80,
+    "action": "DROP",
+    "enabled": true
+  },
+  {
+    "id": "rule-4",
+    "address": "12.13.14.15",
+    "port": null,
+    "action": "REJECT",
+    "enabled": true
+  },
+  {
+    "id": "rule-5",
+    "address": "66.249.64.0/19",
+    "port": null,
+    "action": "ACCEPT",
+    "enabled": true
+  },
+  {
+    "id": "rule-6",
+    "address": "192.168.1.100",
+    "port": 443,
+    "action": "DROP",
+    "enabled": false
+  }
+]

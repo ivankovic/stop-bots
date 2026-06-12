@@ -1,0 +1,27 @@
+# Basic iptables rules for testing stop-bots
+# This file contains sample iptables rules that might be generated or parsed
+
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:STOP-BOTS - [0:0]
+
+# Allow established connections
+-I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-I INPUT -i lo -j ACCEPT
+
+# Jump to STOP-BOTS chain
+-I INPUT -j STOP-BOTS
+
+# STOP-BOTS chain rules for blocking bots
+-A STOP-BOTS -s 1.2.3.4 -j DROP
+-A STOP-BOTS -s 5.6.7.0/24 -j DROP
+-A STOP-BOTS -s 8.9.10.11 -p tcp --dport 80 -j DROP
+-A STOP-BOTS -s 12.13.14.15 -j REJECT --reject-with icmp-host-prohibited
+
+# Allow good bots (crawlers)
+-A STOP-BOTS -s 66.249.64.0/19 -j ACCEPT  # Googlebot
+-A STOP-BOTS -s 157.240.0.0/16 -j ACCEPT   # Bingbot
+
+COMMIT

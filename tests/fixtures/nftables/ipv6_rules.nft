@@ -1,0 +1,24 @@
+#!/usr/sbin/nft -f
+# IPv6 nftables rules for testing stop-bots
+
+flush ruleset
+
+table inet stop_bots {
+    chain bot_block {
+        type filter hook input priority -1; policy drop;
+        
+        # Allow established/related connections
+        ct state established,related accept
+        
+        # Allow loopback
+        iif lo accept
+        
+        # Block IPv6 bots
+        ip6 saddr 2001:db8::1 drop
+        ip6 saddr 2001:db8:85a3::8a2e:370:7334/64 drop
+        ip6 saddr 2606:4700:4700::1111 drop
+        
+        # Allow good IPv6 bots
+        ip6 saddr 2607:f8b0:4000::/36 accept  # Googlebot IPv6
+    }
+}

@@ -1,0 +1,29 @@
+#!/usr/sbin/nft -f
+# Basic nftables rules for testing stop-bots
+
+# Flush existing rules
+flush ruleset
+
+# Create the stop_bots table
+table inet stop_bots {
+    # Create the bot_block chain
+    chain bot_block {
+        type filter hook input priority -1; policy drop;
+        
+        # Allow established/related connections
+        ct state established,related accept
+        
+        # Allow loopback
+        iif lo accept
+        
+        # Block bad bots
+        ip saddr 1.2.3.4 drop
+        ip saddr 5.6.7.0/24 drop
+        ip saddr 8.9.10.11 drop
+        ip saddr 12.13.14.15 reject
+        
+        # Allow good bots
+        ip saddr 66.249.64.0/19 accept  # Googlebot
+        ip saddr 157.240.0.0/16 accept   # Bingbot
+    }
+}

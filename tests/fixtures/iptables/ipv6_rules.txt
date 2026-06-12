@@ -1,0 +1,20 @@
+# IPv6 iptables rules for testing
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+:STOP-BOTS - [0:0]
+
+# Allow established connections
+-I INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+-I INPUT -i lo -j ACCEPT
+
+# Jump to STOP-BOTS chain
+-I INPUT -j STOP-BOTS
+
+# IPv6 bot blocking rules
+-A STOP-BOTS -s 2001:db8::1 -j DROP
+-A STOP-BOTS -s 2001:db8:85a3::8a2e:370:7334/64 -j DROP
+-A STOP-BOTS -s 2606:4700:4700::1111 -j DROP
+
+COMMIT
