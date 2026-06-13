@@ -37,6 +37,9 @@ async-trait = "0.1"
 # For futures utilities
 futures = "0.3"
 
+# For CLI argument parsing
+clap = { version = "4.4", features = ["derive"] }
+
 # For text width calculation
 unicode-width = "0.1"
 
@@ -45,6 +48,7 @@ unicode-width = "0.1"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 opt-level = 2

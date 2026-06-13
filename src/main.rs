@@ -3,83 +3,101 @@
 //! This is the main entry point for the application.
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use stop_bots::commands::{scan_sites, update_bot_lists};
+use stop_bots::db::Database;
 use stop_bots::tui::app::run_tui;
+
+/// Stop Bots - Configure your server to stop bad bots and allow good bots
+#[derive(Debug, Parser)]
+#[command(name = "stop-bots")]
+#[command(author = "Marko Ivankovic <marko@ivankovic.me>")]
+#[command(version = "0.1.0")]
+#[command(about = "A TUI that helps you configure your server to stop bad bots", long_about = None)]
+struct Cli {
+    /// Turn debugging information on
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+/// Available commands for stop-bots
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Start the TUI (default action if no command specified)
+    Tui,
+
+    /// Discover and store NGINX sites
+    #[command(alias = "scan")]
+    ScanSites,
+
+    /// Update bot lists from all data sources
+    #[command(alias = "update")]
+    UpdateBotLists,
+
+    /// Enable geoblock (stub - to be implemented)
+    EnableGeoblock {
+        /// Country code to enable geoblock for (optional, enables for all if not specified)
+        country_code: Option<String>,
+    },
+
+    /// Disable geoblock (stub - to be implemented)
+    DisableGeoblock {
+        /// Country code to disable geoblock for (optional, disables for all if not specified)
+        country_code: Option<String>,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Try to run the TUI
-    if let Err(e) = run_tui().await {
-        eprintln!("Error running TUI: {}", e);
-        eprintln!("\nFalling back to CLI mode...\n");
-        
-        // Fallback to CLI mode
-        cli_mode()?;
+    let cli = Cli::parse();
+
+    // Initialize logging based on verbosity
+    if cli.verbose > 0 {
+        std::env::set_var("RUST_LOG", "debug");
+        eprintln!("Debug mode enabled (level: {})", cli.verbose);
     }
 
-    Ok(())
-}
-
-/// CLI fallback mode for when TUI is not available.
-fn cli_mode() -> Result<()> {
-    use stop_bots::nginx::{common_config_paths, discover_nginx_configs, is_nginx_installed};
-    use std::io::{self, Write};
-
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-
-    // Check if nginx is installed
-    writeln!(handle, "Checking for NGINX installation...")?;
-    if !is_nginx_installed() {
-        writeln!(handle, "NGINX does not appear to be installed on this system.")?;
-        writeln!(handle)?;
-        writeln!(handle, "Common NGINX configuration paths:")?;
-        for path in common_config_paths() {
-            writeln!(handle, "  - {}", path)?;
+    match cli.command {
+        Commands::Tui => {
+            // Try to run the TUI
+            if let Err(e) = run_tui().await {
+                eprintln!("Error running TUI: {}", e);
+                std::process::exit(1);
+            }
         }
-        writeln!(handle)?;
-        writeln!(
-            handle,
-            "If NGINX is installed in a custom location, please ensure the config files exist."
-        )?;
-        return Ok(());
-    }
+        Commands::ScanSites => {
+            let mut db = Database::open_default()
+                .context("Failed to open database")?;
+            db.initialize()
+                .context("Failed to initialize database")?;
 
-    writeln!(handle, "NGINX is installed on this system.")?;
-    writeln!(handle)?;
-
-    // Discover nginx configuration files
-    writeln!(handle, "Discovering NGINX configuration files...")?;
-    let configs = discover_nginx_configs()
-        .context("Failed to discover NGINX configuration files")?;
-
-    // Print results
-    writeln!(handle)?;
-    writeln!(handle, "=== NGINX Configuration Discovery Results ===")?;
-    writeln!(handle)?;
-
-    if let Some(ref main_config) = configs.main_config {
-        writeln!(handle, "Main Configuration File:")?;
-        writeln!(handle, "  Path: {}", main_config.path.display())?;
-        writeln!(handle)?;
-    } else {
-        writeln!(handle, "No main configuration file found.")?;
-        writeln!(handle)?;
-    }
-
-    if !configs.additional_configs.is_empty() {
-        writeln!(handle, "Additional Configuration Files:")?;
-        for config in &configs.additional_configs {
-            writeln!(handle, "  - {}", config.path.display())?;
+            let count = scan_sites(&mut db)
+                .context("Failed to scan sites")?;
+            println!("Discovered and stored {} nginx sites", count);
         }
-        writeln!(handle)?;
-    } else {
-        writeln!(handle, "No additional configuration files found.")?;
-        writeln!(handle)?;
-    }
+        Commands::UpdateBotLists => {
+            let mut db = Database::open_default()
+                .context("Failed to open database")?;
+            db.initialize()
+                .context("Failed to initialize database")?;
 
-    // Summary
-    let total_files = configs.all_configs().len();
-    writeln!(handle, "Total configuration files found: {}", total_files)?;
+            let count = update_bot_lists(&mut db)
+                .await
+                .context("Failed to update bot lists")?;
+            println!("Updated {} bot entries", count);
+        }
+        Commands::EnableGeoblock { country_code } => {
+            println!("Enable geoblock command: country_code = {:?}", country_code);
+            println!("Note: Geoblock functionality is not yet fully implemented.");
+        }
+        Commands::DisableGeoblock { country_code } => {
+            println!("Disable geoblock command: country_code = {:?}", country_code);
+            println!("Note: Geoblock functionality is not yet fully implemented.");
+        }
+    }
 
     Ok(())
 }
