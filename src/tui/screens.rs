@@ -8,10 +8,7 @@ use crate::tui::components::CategoryConfigPopup;
 use crate::tui::event::AppEvent;
 use crate::tui::{ColorScheme, Theme, TuiEvent};
 use anyhow::Result;
-use ratatui::{
-    prelude::*,
-    widgets::*,
-};
+use ratatui::{prelude::*, widgets::*};
 
 // ============================================================================
 // Screen Types
@@ -203,10 +200,10 @@ impl DashboardScreen {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Length(3),  // Stats row
-                Constraint::Length(3),  // Status breakdown
-                Constraint::Length(3),  // Category breakdown
-                Constraint::Min(0),     // Messages
+                Constraint::Length(3), // Stats row
+                Constraint::Length(3), // Status breakdown
+                Constraint::Length(3), // Category breakdown
+                Constraint::Min(0),    // Messages
             ])
             .split(inner);
 
@@ -226,7 +223,7 @@ impl DashboardScreen {
     fn render_stats(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
         // Create a single column for the sources list
         let list_area = area;
-        
+
         let block = Block::default()
             .title(Line::from(" Data Sources ").style(colors.secondary()))
             .borders(Borders::NONE);
@@ -252,15 +249,9 @@ impl DashboardScreen {
                 };
                 let official_marker = if source.is_official { "*" } else { "" };
                 let line = Line::from(vec![
-                    Span::styled(
-                        &source.name,
-                        Style::new().bold(),
-                    ),
+                    Span::styled(&source.name, Style::new().bold()),
                     Span::raw(" "),
-                    Span::styled(
-                        official_marker,
-                        colors.primary(),
-                    ),
+                    Span::styled(official_marker, colors.primary()),
                     Span::raw(" - "),
                     Span::styled(
                         if *needs_update {
@@ -275,9 +266,8 @@ impl DashboardScreen {
             })
             .collect();
 
-        let list = List::new(items)
-            .highlight_style(colors.selected());
-        
+        let list = List::new(items).highlight_style(colors.selected());
+
         frame.render_widget(list, list_area.inner(Margin::new(0, 1)));
     }
 
@@ -470,8 +460,8 @@ impl BotListScreen {
 
         // Filter display
         if has_filter {
-            let filter_text = Paragraph::new(format!("Filter: {}", state.filter))
-                .style(colors.secondary());
+            let filter_text =
+                Paragraph::new(format!("Filter: {}", state.filter)).style(colors.secondary());
             frame.render_widget(filter_text, rows[0]);
         }
 
@@ -484,7 +474,13 @@ impl BotListScreen {
         self.render_help(frame, colors, help_area);
     }
 
-    fn render_bot_list(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect, state: &ScreenState) {
+    fn render_bot_list(
+        &self,
+        frame: &mut Frame,
+        colors: &ColorScheme,
+        area: Rect,
+        state: &ScreenState,
+    ) {
         if self.filtered_bots.is_empty() {
             let para = Paragraph::new("No bots found")
                 .style(colors.inactive())
@@ -495,27 +491,27 @@ impl BotListScreen {
 
         // Calculate visible range
         let items_per_page = area.height as usize;
-        let start_idx = state.scroll_offset.min(self.filtered_bots.len().saturating_sub(1));
+        let start_idx = state
+            .scroll_offset
+            .min(self.filtered_bots.len().saturating_sub(1));
         let end_idx = (start_idx + items_per_page).min(self.filtered_bots.len());
 
         // Create list items
         let items: Vec<ListItem> = (start_idx..end_idx)
-            .filter_map(|i| self.filtered_bots.get(i).and_then(|&bot_idx| self.bots.get(bot_idx)))
+            .filter_map(|i| {
+                self.filtered_bots
+                    .get(i)
+                    .and_then(|&bot_idx| self.bots.get(bot_idx))
+            })
             .map(|bot| {
                 let status_style = match bot.status {
                     BotStatus::Allowed => colors.success(),
                     BotStatus::Blocked => colors.error(),
                 };
                 let line = Line::from(vec![
-                    Span::styled(
-                        &bot.name,
-                        Style::new().bold(),
-                    ),
+                    Span::styled(&bot.name, Style::new().bold()),
                     Span::raw(" - "),
-                    Span::styled(
-                        format!("{}", bot.status),
-                        status_style,
-                    ),
+                    Span::styled(format!("{}", bot.status), status_style),
                     Span::raw(" - "),
                     Span::styled(
                         bot.categories
@@ -539,9 +535,8 @@ impl BotListScreen {
         frame.render_stateful_widget(
             list,
             list_area,
-            &mut ListState::default().with_selected(Some(
-                state.selected_index.saturating_sub(start_idx)
-            )),
+            &mut ListState::default()
+                .with_selected(Some(state.selected_index.saturating_sub(start_idx))),
         );
     }
 
@@ -604,11 +599,7 @@ impl SourcesScreen {
     pub fn get_selected_source(&self, index: usize) -> Option<(&DataSource, bool)> {
         self.filtered_sources
             .get(index)
-            .and_then(|&i| {
-                self.sources
-                    .get(i)
-                    .zip(self.needs_update.get(i).copied())
-            })
+            .and_then(|&i| self.sources.get(i).zip(self.needs_update.get(i).copied()))
     }
 
     /// Renders the sources screen.
@@ -639,8 +630,8 @@ impl SourcesScreen {
 
         // Filter display
         if has_filter {
-            let filter_text = Paragraph::new(format!("Filter: {}", state.filter))
-                .style(colors.secondary());
+            let filter_text =
+                Paragraph::new(format!("Filter: {}", state.filter)).style(colors.secondary());
             frame.render_widget(filter_text, rows[0]);
         }
 
@@ -653,7 +644,13 @@ impl SourcesScreen {
         self.render_help(frame, colors, help_area);
     }
 
-    fn render_sources_list(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect, state: &ScreenState) {
+    fn render_sources_list(
+        &self,
+        frame: &mut Frame,
+        colors: &ColorScheme,
+        area: Rect,
+        state: &ScreenState,
+    ) {
         if self.filtered_sources.is_empty() {
             let para = Paragraph::new("No sources found")
                 .style(colors.inactive())
@@ -664,14 +661,18 @@ impl SourcesScreen {
 
         // Calculate visible range
         let items_per_page = area.height as usize;
-        let start_idx = state.scroll_offset.min(self.filtered_sources.len().saturating_sub(1));
+        let start_idx = state
+            .scroll_offset
+            .min(self.filtered_sources.len().saturating_sub(1));
         let end_idx = (start_idx + items_per_page).min(self.filtered_sources.len());
 
         // Create list items
         let items: Vec<ListItem> = (start_idx..end_idx)
             .filter_map(|i| {
                 self.filtered_sources.get(i).and_then(|&src_idx| {
-                    self.sources.get(src_idx).zip(self.needs_update.get(src_idx).copied())
+                    self.sources
+                        .get(src_idx)
+                        .zip(self.needs_update.get(src_idx).copied())
                 })
             })
             .map(|(source, needs_update)| {
@@ -682,20 +683,11 @@ impl SourcesScreen {
                 };
                 let official_marker = if source.is_official { "*" } else { "" };
                 let line = Line::from(vec![
-                    Span::styled(
-                        &source.name,
-                        Style::new().bold(),
-                    ),
+                    Span::styled(&source.name, Style::new().bold()),
                     Span::raw(" "),
-                    Span::styled(
-                        official_marker,
-                        colors.primary(),
-                    ),
+                    Span::styled(official_marker, colors.primary()),
                     Span::raw(" - "),
-                    Span::styled(
-                        source.data_type.as_db_str(),
-                        colors.secondary(),
-                    ),
+                    Span::styled(source.data_type.as_db_str(), colors.secondary()),
                     Span::raw(" - "),
                     Span::styled(
                         if needs_update {
@@ -718,9 +710,8 @@ impl SourcesScreen {
         frame.render_stateful_widget(
             list,
             list_area,
-            &mut ListState::default().with_selected(Some(
-                state.selected_index.saturating_sub(start_idx)
-            )),
+            &mut ListState::default()
+                .with_selected(Some(state.selected_index.saturating_sub(start_idx))),
         );
     }
 
@@ -776,7 +767,7 @@ impl BotDetailScreen {
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                Constraint::Min(0), // Main info
+                Constraint::Min(0),    // Main info
                 Constraint::Length(3), // Actions
             ])
             .split(inner);
@@ -803,7 +794,12 @@ impl BotDetailScreen {
 
         // Categories
         if !self.bot.categories.is_empty() {
-            let categories: Vec<String> = self.bot.categories.iter().map(|c| format!("{}", c)).collect();
+            let categories: Vec<String> = self
+                .bot
+                .categories
+                .iter()
+                .map(|c| format!("{}", c))
+                .collect();
             lines.push(Line::from(vec![
                 Span::styled("Categories: ", Style::new().bold()),
                 Span::styled(categories.join(", "), colors.primary()),
@@ -827,9 +823,10 @@ impl BotDetailScreen {
 
         // IP Ranges
         if !self.bot.ip_ranges.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("IP Ranges: ", Style::new().bold()),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "IP Ranges: ",
+                Style::new().bold(),
+            )]));
             for range in &self.bot.ip_ranges {
                 lines.push(Line::from(vec![
                     Span::raw("  - "),
@@ -840,9 +837,10 @@ impl BotDetailScreen {
 
         // User Agent Patterns
         if !self.bot.user_agent_patterns.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled("User Agent Patterns: ", Style::new().bold()),
-            ]));
+            lines.push(Line::from(vec![Span::styled(
+                "User Agent Patterns: ",
+                Style::new().bold(),
+            )]));
             for pattern in &self.bot.user_agent_patterns {
                 lines.push(Line::from(vec![
                     Span::raw("  - "),
@@ -881,11 +879,7 @@ impl BotDetailScreen {
             ])
             .split(inner);
 
-        let actions = [
-            ("Toggle Status", "s"),
-            ("Edit", "e"),
-            ("Delete", "d"),
-        ];
+        let actions = [("Toggle Status", "s"), ("Edit", "e"), ("Delete", "d")];
 
         for (i, (action, key)) in actions.into_iter().enumerate() {
             let para = Paragraph::new(Line::from(vec![
@@ -914,41 +908,17 @@ impl HelpScreen {
     pub fn new() -> Self {
         Self {
             help_text: vec![
-                vec![
-                    Span::raw("Stop Bots - Keyboard Shortcuts"),
-                ],
+                vec![Span::raw("Stop Bots - Keyboard Shortcuts")],
                 vec![],
-                vec![
-                    Span::raw("Navigation:"),
-                ],
-                vec![
-                    Span::raw("  ↑/↓/k/j     "),
-                    Span::raw("Navigate up/down"),
-                ],
-                vec![
-                    Span::raw("  ←/h          "),
-                    Span::raw("Navigate left"),
-                ],
-                vec![
-                    Span::raw("  →/l          "),
-                    Span::raw("Navigate right"),
-                ],
-                vec![
-                    Span::raw("  Enter/Space  "),
-                    Span::raw("Select item"),
-                ],
-                vec![
-                    Span::raw("  Backspace    "),
-                    Span::raw("Go back"),
-                ],
-                vec![
-                    Span::raw("  Esc/q        "),
-                    Span::raw("Quit"),
-                ],
+                vec![Span::raw("Navigation:")],
+                vec![Span::raw("  ↑/↓/k/j     "), Span::raw("Navigate up/down")],
+                vec![Span::raw("  ←/h          "), Span::raw("Navigate left")],
+                vec![Span::raw("  →/l          "), Span::raw("Navigate right")],
+                vec![Span::raw("  Enter/Space  "), Span::raw("Select item")],
+                vec![Span::raw("  Backspace    "), Span::raw("Go back")],
+                vec![Span::raw("  Esc/q        "), Span::raw("Quit")],
                 vec![],
-                vec![
-                    Span::raw("Actions:"),
-                ],
+                vec![Span::raw("Actions:")],
                 vec![
                     Span::raw("  c            "),
                     Span::raw("Toggle theme (dark/light)"),
@@ -962,25 +932,11 @@ impl HelpScreen {
                     Span::raw("Refresh all sources"),
                 ],
                 vec![],
-                vec![
-                    Span::raw("Views:"),
-                ],
-                vec![
-                    Span::raw("  d            "),
-                    Span::raw("Dashboard"),
-                ],
-                vec![
-                    Span::raw("  b            "),
-                    Span::raw("Bot Settings"),
-                ],
-                vec![
-                    Span::raw("  l            "),
-                    Span::raw("Bot List"),
-                ],
-                vec![
-                    Span::raw("  f            "),
-                    Span::raw("Firewall"),
-                ],
+                vec![Span::raw("Views:")],
+                vec![Span::raw("  d            "), Span::raw("Dashboard")],
+                vec![Span::raw("  b            "), Span::raw("Bot Settings")],
+                vec![Span::raw("  l            "), Span::raw("Bot List")],
+                vec![Span::raw("  f            "), Span::raw("Firewall")],
                 vec![
                     Span::raw("  ?            "),
                     Span::raw("Help (this screen)"),
@@ -1131,6 +1087,11 @@ pub struct TimeStats {
 impl SettingsScreen {
     /// Creates a new settings screen with sample data.
     pub fn new() -> Self {
+        Self::with_sites(Vec::new())
+    }
+
+    /// Creates a new settings screen with the specified site settings.
+    pub fn with_sites(site_settings: Vec<SiteSetting>) -> Self {
         // For now, create sample data
         // In production, this would be loaded from the DB
         let system_settings = vec![
@@ -1160,7 +1121,6 @@ impl SettingsScreen {
             },
         ];
 
-        let site_settings = Vec::new();
         let time_stats = vec![
             TimeStats {
                 label: "Last 5 minutes".to_string(),
@@ -1206,8 +1166,8 @@ impl SettingsScreen {
             .direction(Direction::Vertical)
             .margin(0)
             .constraints([
-                Constraint::Min(5),   // System settings
-                Constraint::Min(5),   // Sites
+                Constraint::Min(5),    // System settings
+                Constraint::Min(5),    // Sites
                 Constraint::Length(5), // Time stats
             ])
             .split(inner);
@@ -1238,17 +1198,17 @@ impl SettingsScreen {
                 BotStatus::Allowed => colors.success(),
                 BotStatus::Blocked => colors.error(),
             };
-            
+
             let details = if setting.details.is_empty() {
                 String::new()
             } else {
                 format!(": {}", setting.details)
             };
-            
+
             // Check if this category is selected
             let is_selected = self.selected_category == Some(i);
             let marker = if is_selected { "> " } else { "  " };
-            
+
             let line = Line::from(vec![
                 Span::styled(marker, colors.primary()),
                 Span::styled("-", colors.text()),
@@ -1258,14 +1218,17 @@ impl SettingsScreen {
                 Span::styled(format!("{}", setting.status), status_style.bold()),
                 Span::raw(format!("{} ]", details)),
             ]);
-            
+
             let y = inner.y + i as u16;
-            frame.render_widget(Paragraph::new(line), Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            });
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect {
+                    x: inner.x,
+                    y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
         }
     }
 
@@ -1275,7 +1238,7 @@ impl SettingsScreen {
                 .title(Line::from(" Per-Site Settings ").style(colors.title()))
                 .borders(Borders::NONE);
             frame.render_widget(block, area);
-            
+
             let para = Paragraph::new("No sites configured")
                 .style(colors.inactive())
                 .alignment(Alignment::Center);
@@ -1318,9 +1281,17 @@ impl SettingsScreen {
             rows_data.push(Row::new(cells));
         }
 
-        let table = Table::new(rows_data, &[Constraint::Length(20), Constraint::Length(10), Constraint::Length(10), Constraint::Length(10)])
-            .header(header)
-            .block(Block::default());
+        let table = Table::new(
+            rows_data,
+            &[
+                Constraint::Length(20),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(10),
+            ],
+        )
+        .header(header)
+        .block(Block::default());
 
         frame.render_widget(table, inner);
     }
@@ -1354,7 +1325,7 @@ impl SettingsScreen {
         let index = self.selected_category.unwrap_or(0);
         if index < self.system_settings.len() {
             let setting = &self.system_settings[index];
-            
+
             // Map category name to BotCategory
             let category = match setting.name.as_str() {
                 "Geo-block" => BotCategory::SecurityScanner, // placeholder
@@ -1363,13 +1334,13 @@ impl SettingsScreen {
                 "AI Bots" => BotCategory::AiScraper,
                 _ => BotCategory::Unknown,
             };
-            
+
             // Filter bots by category
             let category_bots: Vec<Bot> = bots
                 .into_iter()
                 .filter(|b| b.categories.contains(&category))
                 .collect();
-            
+
             self.category_popup = Some(CategoryConfigPopup::new(
                 category,
                 setting.status,
@@ -1404,7 +1375,9 @@ impl SettingsScreen {
 // Firewall Screen
 // ============================================================================
 
-use crate::firewall::{BlockedIp, FirewallAddress, FirewallBackend, FirewallManager, FirewallStatus};
+use crate::firewall::{
+    BlockedIp, FirewallAddress, FirewallBackend, FirewallManager, FirewallStatus,
+};
 
 /// Firewall management screen showing blocked IPs and firewall status.
 pub struct FirewallScreen {
@@ -1438,18 +1411,15 @@ impl FirewallScreen {
     /// Refreshes the firewall status and blocked IPs list.
     pub fn refresh(&mut self) {
         self.error = None;
-        
+
         match self.firewall.get_status() {
             Ok(status) => {
                 self.status = Some(status.clone());
-                
+
                 // Get the list of rules
                 match self.firewall.list_rules() {
                     Ok(rules) => {
-                        self.blocked_ips = rules
-                            .into_iter()
-                            .map(|r| BlockedIp::from(r))
-                            .collect();
+                        self.blocked_ips = rules.into_iter().map(|r| BlockedIp::from(r)).collect();
                     }
                     Err(e) => {
                         self.error = Some(format!("Failed to list rules: {}", e));
@@ -1471,10 +1441,10 @@ impl FirewallScreen {
         if !addr.is_valid() {
             anyhow::bail!("{} is not a valid IP address or CIDR range", address);
         }
-        
+
         self.firewall.add_block_rule(&addr)?;
         self.refresh();
-        
+
         Ok(())
     }
 
@@ -1483,17 +1453,17 @@ impl FirewallScreen {
         if index >= self.blocked_ips.len() {
             anyhow::bail!("Invalid IP index");
         }
-        
+
         let addr = FirewallAddress::new(self.blocked_ips[index].address.clone());
         self.firewall.remove_block_rule(&addr)?;
-        
+
         // If we removed the selected item, adjust the selection
         if self.selected_index >= index && !self.blocked_ips.is_empty() {
             self.selected_index = self.selected_index.saturating_sub(1);
         }
-        
+
         self.refresh();
-        
+
         Ok(())
     }
 
@@ -1502,17 +1472,21 @@ impl FirewallScreen {
         if index >= self.blocked_ips.len() {
             anyhow::bail!("Invalid IP index");
         }
-        
+
         // For now, just remove and re-add with different action
         // In a full implementation, we'd update the rule in place
-        self.firewall.remove_block_rule(&FirewallAddress::new(self.blocked_ips[index].address.clone()))?;
-        
+        self.firewall.remove_block_rule(&FirewallAddress::new(
+            self.blocked_ips[index].address.clone(),
+        ))?;
+
         // Determine new action
         // Since we don't track action in BlockedIp, we'll just re-add as Drop
-        self.firewall.add_block_rule(&FirewallAddress::new(self.blocked_ips[index].address.clone()))?;
-        
+        self.firewall.add_block_rule(&FirewallAddress::new(
+            self.blocked_ips[index].address.clone(),
+        ))?;
+
         self.refresh();
-        
+
         Ok(())
     }
 
@@ -1533,9 +1507,9 @@ impl FirewallScreen {
             .direction(Direction::Vertical)
             .margin(0)
             .constraints([
-                Constraint::Length(3),  // Status
+                Constraint::Length(3), // Status
                 Constraint::Min(5),    // IP list
-                Constraint::Length(3),  // Help
+                Constraint::Length(3), // Help
             ])
             .split(inner);
 
@@ -1564,15 +1538,23 @@ impl FirewallScreen {
                     colors.primary(),
                 ),
             ]));
-            
+
             lines.push(Line::from(vec![
                 Span::styled("Status: ", Style::new().bold()),
                 Span::styled(
-                    if status.available { "Available" } else { "Not Available" },
-                    if status.available { colors.success() } else { colors.error() },
+                    if status.available {
+                        "Available"
+                    } else {
+                        "Not Available"
+                    },
+                    if status.available {
+                        colors.success()
+                    } else {
+                        colors.error()
+                    },
                 ),
             ]));
-            
+
             lines.push(Line::from(vec![
                 Span::styled("Rules: ", Style::new().bold()),
                 Span::styled(status.rule_count.to_string(), colors.text()),
@@ -1599,7 +1581,13 @@ impl FirewallScreen {
         frame.render_widget(para, area);
     }
 
-    fn render_ip_list(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect, state: &ScreenState) {
+    fn render_ip_list(
+        &self,
+        frame: &mut Frame,
+        colors: &ColorScheme,
+        area: Rect,
+        state: &ScreenState,
+    ) {
         if self.blocked_ips.is_empty() {
             let para = Paragraph::new("No IPs blocked")
                 .style(colors.inactive())
@@ -1610,7 +1598,9 @@ impl FirewallScreen {
 
         // Calculate visible range
         let items_per_page = area.height as usize;
-        let start_idx = state.scroll_offset.min(self.blocked_ips.len().saturating_sub(1));
+        let start_idx = state
+            .scroll_offset
+            .min(self.blocked_ips.len().saturating_sub(1));
         let end_idx = (start_idx + items_per_page).min(self.blocked_ips.len());
 
         // Create list items
@@ -1620,7 +1610,7 @@ impl FirewallScreen {
                 let line = Line::from(vec![
                     Span::raw("  "),
                     Span::styled(&ip.address, Style::new().bold()),
-                    if ip.is_cidr { 
+                    if ip.is_cidr {
                         Span::styled(" (CIDR)", colors.secondary())
                     } else {
                         Span::raw("")
@@ -1659,4 +1649,3 @@ impl FirewallScreen {
         frame.render_widget(help_para, area);
     }
 }
-

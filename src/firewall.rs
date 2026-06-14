@@ -19,16 +19,24 @@ pub struct FirewallAddress {
 
 impl FirewallAddress {
     pub fn new<A: Into<String>>(address: A) -> Self {
-        Self { address: address.into() }
+        Self {
+            address: address.into(),
+        }
     }
     pub fn is_valid(&self) -> bool {
         let addr = self.address.trim();
-        if addr.is_empty() { return false; }
-        if addr.parse::<std::net::IpAddr>().is_ok() { return true; }
+        if addr.is_empty() {
+            return false;
+        }
+        if addr.parse::<std::net::IpAddr>().is_ok() {
+            return true;
+        }
         if let Some(slash_pos) = addr.rfind('/') {
             let prefix = &addr[..slash_pos];
             let suffix = &addr[slash_pos + 1..];
-            if prefix.parse::<std::net::IpAddr>().is_ok() && suffix.chars().all(|c| c.is_ascii_digit()) {
+            if prefix.parse::<std::net::IpAddr>().is_ok()
+                && suffix.chars().all(|c| c.is_ascii_digit())
+            {
                 return true;
             }
         }
@@ -45,7 +53,9 @@ impl std::fmt::Display for FirewallAddress {
 /// Action to take when a packet matches a firewall rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirewallAction {
-    Drop, Reject, Accept,
+    Drop,
+    Reject,
+    Accept,
 }
 
 impl std::fmt::Display for FirewallAction {
@@ -70,16 +80,30 @@ pub struct FirewallRule {
 
 impl FirewallRule {
     pub fn new_block(address: FirewallAddress) -> Self {
-        Self { id: None, address, port: None, action: FirewallAction::Drop, enabled: true }
+        Self {
+            id: None,
+            address,
+            port: None,
+            action: FirewallAction::Drop,
+            enabled: true,
+        }
     }
-    pub fn with_port(mut self, port: u16) -> Self { self.port = Some(port); self }
-    pub fn with_action(mut self, action: FirewallAction) -> Self { self.action = action; self }
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = Some(port);
+        self
+    }
+    pub fn with_action(mut self, action: FirewallAction) -> Self {
+        self.action = action;
+        self
+    }
 }
 
 impl std::fmt::Display for FirewallRule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut s = format!("{} {}", self.action, self.address);
-        if let Some(port) = self.port { s.push_str(&format!(" port {}", port)); }
+        if let Some(port) = self.port {
+            s.push_str(&format!(" port {}", port));
+        }
         write!(f, "{}", s)
     }
 }
@@ -90,7 +114,10 @@ impl std::fmt::Display for FirewallRule {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FirewallBackend {
-    #[default] Iptables, Nftables, Auto,
+    #[default]
+    Iptables,
+    Nftables,
+    Auto,
 }
 
 // ============================================================================
@@ -117,10 +144,21 @@ impl Default for FirewallConfig {
 }
 
 impl FirewallConfig {
-    pub fn new() -> Self { Self::default() }
-    pub fn with_backend(mut self, backend: FirewallBackend) -> Self { self.backend = backend; self }
-    pub fn with_ipsets(mut self, enabled: bool) -> Self { self.use_ipsets = enabled; self }
-    pub fn with_ipset_name<N: Into<String>>(mut self, name: N) -> Self { self.ipset_name = name.into(); self }
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_backend(mut self, backend: FirewallBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+    pub fn with_ipsets(mut self, enabled: bool) -> Self {
+        self.use_ipsets = enabled;
+        self
+    }
+    pub fn with_ipset_name<N: Into<String>>(mut self, name: N) -> Self {
+        self.ipset_name = name.into();
+        self
+    }
 }
 
 // ============================================================================
@@ -147,20 +185,34 @@ impl FirewallManager {
     }
 
     pub fn with_config(config: FirewallConfig) -> Self {
-        Self { config, iptables: crate::iptables::Iptables::new(), nftables: crate::nftables::Nftables::new(), detected_backend: None }
+        Self {
+            config,
+            iptables: crate::iptables::Iptables::new(),
+            nftables: crate::nftables::Nftables::new(),
+            detected_backend: None,
+        }
     }
 
     pub fn detect_backend(&mut self) -> FirewallBackend {
-        if let Some(b) = self.detected_backend { return b; }
-        let b = if self.nftables.is_available() { FirewallBackend::Nftables }
-                else if self.iptables.is_available() { FirewallBackend::Iptables }
-                else { FirewallBackend::Iptables };
+        if let Some(b) = self.detected_backend {
+            return b;
+        }
+        let b = if self.nftables.is_available() {
+            FirewallBackend::Nftables
+        } else if self.iptables.is_available() {
+            FirewallBackend::Iptables
+        } else {
+            FirewallBackend::Iptables
+        };
         self.detected_backend = Some(b);
         b
     }
 
     pub fn active_backend(&mut self) -> FirewallBackend {
-        match self.config.backend { FirewallBackend::Auto => self.detect_backend(), other => other }
+        match self.config.backend {
+            FirewallBackend::Auto => self.detect_backend(),
+            other => other,
+        }
     }
 
     pub fn is_available(&mut self) -> bool {
@@ -179,75 +231,147 @@ impl FirewallManager {
     }
     fn from_iptables(&self, rule: crate::iptables::FirewallRule) -> FirewallRule {
         FirewallRule {
-            id: rule.id, address: FirewallAddress::new(rule.address.address),
+            id: rule.id,
+            address: FirewallAddress::new(rule.address.address),
             port: rule.port,
-            action: match rule.action { crate::iptables::FirewallAction::Drop => FirewallAction::Drop, crate::iptables::FirewallAction::Reject => FirewallAction::Reject, crate::iptables::FirewallAction::Accept => FirewallAction::Accept },
+            action: match rule.action {
+                crate::iptables::FirewallAction::Drop => FirewallAction::Drop,
+                crate::iptables::FirewallAction::Reject => FirewallAction::Reject,
+                crate::iptables::FirewallAction::Accept => FirewallAction::Accept,
+            },
             enabled: rule.enabled,
         }
     }
     fn from_nftables(&self, rule: crate::nftables::FirewallRule) -> FirewallRule {
         FirewallRule {
-            id: rule.id, address: FirewallAddress::new(rule.address.address),
+            id: rule.id,
+            address: FirewallAddress::new(rule.address.address),
             port: rule.port,
-            action: match rule.action { crate::nftables::FirewallAction::Drop => FirewallAction::Drop, crate::nftables::FirewallAction::Reject => FirewallAction::Reject, crate::nftables::FirewallAction::Accept => FirewallAction::Accept },
+            action: match rule.action {
+                crate::nftables::FirewallAction::Drop => FirewallAction::Drop,
+                crate::nftables::FirewallAction::Reject => FirewallAction::Reject,
+                crate::nftables::FirewallAction::Accept => FirewallAction::Accept,
+            },
             enabled: rule.enabled,
         }
     }
 
     pub fn initialize(&mut self) -> Result<()> {
         match self.active_backend() {
-            FirewallBackend::Nftables => { self.nftables.ensure_table_exists()?; }
-            _ => { self.iptables.ensure_chain_exists()?; if self.config.use_ipsets { self.create_ipset()?; self.setup_ipset_chain()?; } }
+            FirewallBackend::Nftables => {
+                self.nftables.ensure_table_exists()?;
+            }
+            _ => {
+                self.iptables.ensure_chain_exists()?;
+                if self.config.use_ipsets {
+                    self.create_ipset()?;
+                    self.setup_ipset_chain()?;
+                }
+            }
         }
         Ok(())
     }
 
     pub fn add_block_rule(&mut self, address: &FirewallAddress) -> Result<()> {
         match self.active_backend() {
-            FirewallBackend::Nftables => { let a = self.to_nftables(address); self.nftables.add_block_rule(&a) }
-            _ => { if self.config.use_ipsets && self.ipset_exists()? { self.add_to_ipset(address) } else { let a = self.to_iptables(address); self.iptables.add_block_rule(&a) } }
+            FirewallBackend::Nftables => {
+                let a = self.to_nftables(address);
+                self.nftables.add_block_rule(&a)
+            }
+            _ => {
+                if self.config.use_ipsets && self.ipset_exists()? {
+                    self.add_to_ipset(address)
+                } else {
+                    let a = self.to_iptables(address);
+                    self.iptables.add_block_rule(&a)
+                }
+            }
         }
     }
 
     pub fn remove_block_rule(&mut self, address: &FirewallAddress) -> Result<()> {
         match self.active_backend() {
-            FirewallBackend::Nftables => { let a = self.to_nftables(address); self.nftables.remove_rules_for_address(&a) }
-            _ => { if self.config.use_ipsets && self.ipset_exists()? { self.remove_from_ipset(address) } else { let a = self.to_iptables(address); self.iptables.remove_block_rule(&a) } }
+            FirewallBackend::Nftables => {
+                let a = self.to_nftables(address);
+                self.nftables.remove_rules_for_address(&a)
+            }
+            _ => {
+                if self.config.use_ipsets && self.ipset_exists()? {
+                    self.remove_from_ipset(address)
+                } else {
+                    let a = self.to_iptables(address);
+                    self.iptables.remove_block_rule(&a)
+                }
+            }
         }
     }
 
     pub fn list_rules(&mut self) -> Result<Vec<FirewallRule>> {
         match self.active_backend() {
-            FirewallBackend::Nftables => { let r = self.nftables.list_rules()?; Ok(r.into_iter().map(|r| self.from_nftables(r)).collect()) }
-            _ => { if self.config.use_ipsets && self.ipset_exists()? { self.list_ipset_entries() } else { let r = self.iptables.list_rules()?; Ok(r.into_iter().map(|r| self.from_iptables(r)).collect()) } }
+            FirewallBackend::Nftables => {
+                let r = self.nftables.list_rules()?;
+                Ok(r.into_iter().map(|r| self.from_nftables(r)).collect())
+            }
+            _ => {
+                if self.config.use_ipsets && self.ipset_exists()? {
+                    self.list_ipset_entries()
+                } else {
+                    let r = self.iptables.list_rules()?;
+                    Ok(r.into_iter().map(|r| self.from_iptables(r)).collect())
+                }
+            }
         }
     }
 
     pub fn clear_rules(&mut self) -> Result<()> {
         match self.active_backend() {
             FirewallBackend::Nftables => self.nftables.clear_rules(),
-            _ => { if self.config.use_ipsets && self.ipset_exists()? { self.clear_ipset() } else { self.iptables.clear_rules() } }
+            _ => {
+                if self.config.use_ipsets && self.ipset_exists()? {
+                    self.clear_ipset()
+                } else {
+                    self.iptables.clear_rules()
+                }
+            }
         }
     }
 
     pub fn sync_block_rules(&mut self, addresses: &[FirewallAddress]) -> Result<()> {
         match self.active_backend() {
-            FirewallBackend::Nftables => { let a: Vec<_> = addresses.iter().map(|a| self.to_nftables(a)).collect(); self.nftables.sync_block_rules(&a) }
-            _ => { if self.config.use_ipsets { self.sync_ipset(addresses) } else { let a: Vec<_> = addresses.iter().map(|a| self.to_iptables(a)).collect(); self.iptables.sync_block_rules(&a) } }
+            FirewallBackend::Nftables => {
+                let a: Vec<_> = addresses.iter().map(|a| self.to_nftables(a)).collect();
+                self.nftables.sync_block_rules(&a)
+            }
+            _ => {
+                if self.config.use_ipsets {
+                    self.sync_ipset(addresses)
+                } else {
+                    let a: Vec<_> = addresses.iter().map(|a| self.to_iptables(a)).collect();
+                    self.iptables.sync_block_rules(&a)
+                }
+            }
         }
     }
 
     pub fn cleanup(&mut self) -> Result<()> {
         match self.active_backend() {
             FirewallBackend::Nftables => self.nftables.cleanup(),
-            _ => { if self.config.use_ipsets && self.ipset_exists()? { let _ = self.destroy_ipset(); } self.iptables.cleanup() }
+            _ => {
+                if self.config.use_ipsets && self.ipset_exists()? {
+                    let _ = self.destroy_ipset();
+                }
+                self.iptables.cleanup()
+            }
         }
     }
 
     // IP Set Support
     fn run_ipset(&self, args: &[&str]) -> Result<()> {
         use std::process::Command;
-        let output = Command::new("sudo").arg("ipset").args(args).output()
+        let output = Command::new("sudo")
+            .arg("ipset")
+            .args(args)
+            .output()
             .with_context(|| format!("sudo ipset {}", args.join(" ")))?;
         if !output.status.success() {
             let s = String::from_utf8_lossy(&output.stderr);
@@ -259,19 +383,36 @@ impl FirewallManager {
     }
 
     fn create_ipset(&self) -> Result<()> {
-        let max = if self.config.ipset_max_entries > 0 { format!("maxelem {}", self.config.ipset_max_entries) } else { String::new() };
+        let max = if self.config.ipset_max_entries > 0 {
+            format!("maxelem {}", self.config.ipset_max_entries)
+        } else {
+            String::new()
+        };
         self.run_ipset(&["create", &self.config.ipset_name, "hash:ip", &max])
     }
     fn ipset_exists(&self) -> Result<bool> {
         use std::process::Command;
-        Ok(Command::new("sudo").arg("ipset").args(&["list", &self.config.ipset_name]).output().is_ok())
+        Ok(Command::new("sudo")
+            .arg("ipset")
+            .args(&["list", &self.config.ipset_name])
+            .output()
+            .is_ok())
     }
-    fn add_to_ipset(&self, addr: &FirewallAddress) -> Result<()> { self.run_ipset(&["add", &self.config.ipset_name, &addr.address]) }
-    fn remove_from_ipset(&self, addr: &FirewallAddress) -> Result<()> { self.run_ipset(&["del", &self.config.ipset_name, &addr.address]) }
+    fn add_to_ipset(&self, addr: &FirewallAddress) -> Result<()> {
+        self.run_ipset(&["add", &self.config.ipset_name, &addr.address])
+    }
+    fn remove_from_ipset(&self, addr: &FirewallAddress) -> Result<()> {
+        self.run_ipset(&["del", &self.config.ipset_name, &addr.address])
+    }
     fn list_ipset_entries(&self) -> Result<Vec<FirewallRule>> {
         use std::process::Command;
-        let out = Command::new("sudo").arg("ipset").args(&["list", &self.config.ipset_name]).output()?;
-        if !out.status.success() { anyhow::bail!("ipset list failed"); }
+        let out = Command::new("sudo")
+            .arg("ipset")
+            .args(&["list", &self.config.ipset_name])
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!("ipset list failed");
+        }
         let s = String::from_utf8_lossy(&out.stdout);
         let mut rules = Vec::new();
         for line in s.lines() {
@@ -282,16 +423,36 @@ impl FirewallManager {
         }
         Ok(rules)
     }
-    fn clear_ipset(&self) -> Result<()> { self.run_ipset(&["flush", &self.config.ipset_name]) }
-    fn destroy_ipset(&self) -> Result<()> { self.run_ipset(&["destroy", &self.config.ipset_name]) }
+    fn clear_ipset(&self) -> Result<()> {
+        self.run_ipset(&["flush", &self.config.ipset_name])
+    }
+    fn destroy_ipset(&self) -> Result<()> {
+        self.run_ipset(&["destroy", &self.config.ipset_name])
+    }
     fn sync_ipset(&self, addresses: &[FirewallAddress]) -> Result<()> {
-        self.create_ipset()?; self.clear_ipset()?;
-        for a in addresses { self.add_to_ipset(a)?; }
+        self.create_ipset()?;
+        self.clear_ipset()?;
+        for a in addresses {
+            self.add_to_ipset(a)?;
+        }
         Ok(())
     }
     fn setup_ipset_chain(&self) -> Result<()> {
         use std::process::Command;
-        Command::new("sudo").arg("iptables").args(&["-I", "STOP-BOTS", "-m", "set", "--match-set", &self.config.ipset_name, "src", "-j", "DROP"]).output()?;
+        Command::new("sudo")
+            .arg("iptables")
+            .args(&[
+                "-I",
+                "STOP-BOTS",
+                "-m",
+                "set",
+                "--match-set",
+                &self.config.ipset_name,
+                "src",
+                "-j",
+                "DROP",
+            ])
+            .output()?;
         Ok(())
     }
 
@@ -299,9 +460,17 @@ impl FirewallManager {
         let backend = self.active_backend();
         let available = self.is_available();
         let rules = self.list_rules()?;
-        let using_ipsets = self.config.use_ipsets && backend == FirewallBackend::Iptables && self.ipset_exists().unwrap_or(false);
+        let using_ipsets = self.config.use_ipsets
+            && backend == FirewallBackend::Iptables
+            && self.ipset_exists().unwrap_or(false);
         let unique_ips: HashSet<_> = rules.iter().map(|r| r.address.address.clone()).collect();
-        Ok(FirewallStatus { backend, available, using_ipsets, rule_count: rules.len(), unique_ip_count: unique_ips.len() })
+        Ok(FirewallStatus {
+            backend,
+            available,
+            using_ipsets,
+            rule_count: rules.len(),
+            unique_ip_count: unique_ips.len(),
+        })
     }
 }
 
@@ -320,9 +489,19 @@ pub struct FirewallStatus {
 
 impl std::fmt::Display for FirewallStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Backend: {}, Available: {}, Using IP Sets: {}, Rules: {}, Unique IPs: {}",
-            match self.backend { FirewallBackend::Iptables => "iptables", FirewallBackend::Nftables => "nftables", _ => "auto" },
-            self.available, self.using_ipsets, self.rule_count, self.unique_ip_count)
+        write!(
+            f,
+            "Backend: {}, Available: {}, Using IP Sets: {}, Rules: {}, Unique IPs: {}",
+            match self.backend {
+                FirewallBackend::Iptables => "iptables",
+                FirewallBackend::Nftables => "nftables",
+                _ => "auto",
+            },
+            self.available,
+            self.using_ipsets,
+            self.rule_count,
+            self.unique_ip_count
+        )
     }
 }
 
@@ -332,16 +511,37 @@ impl std::fmt::Display for FirewallStatus {
 
 #[derive(Debug, Clone)]
 pub struct BlockedIp {
-    pub address: String, pub is_cidr: bool, pub description: Option<String>,
+    pub address: String,
+    pub is_cidr: bool,
+    pub description: Option<String>,
 }
 
 impl BlockedIp {
-    pub fn new<A: Into<String>>(address: A) -> Self { let a = address.into(); let is_cidr = a.contains('/'); Self { address: a, is_cidr, description: None } }
-    pub fn with_description<D: Into<String>>(mut self, description: D) -> Self { self.description = Some(description.into()); self }
+    pub fn new<A: Into<String>>(address: A) -> Self {
+        let a = address.into();
+        let is_cidr = a.contains('/');
+        Self {
+            address: a,
+            is_cidr,
+            description: None,
+        }
+    }
+    pub fn with_description<D: Into<String>>(mut self, description: D) -> Self {
+        self.description = Some(description.into());
+        self
+    }
 }
 
-impl From<FirewallAddress> for BlockedIp { fn from(addr: FirewallAddress) -> Self { Self::new(addr.address) } }
-impl From<FirewallRule> for BlockedIp { fn from(rule: FirewallRule) -> Self { Self::new(rule.address.address) } }
+impl From<FirewallAddress> for BlockedIp {
+    fn from(addr: FirewallAddress) -> Self {
+        Self::new(addr.address)
+    }
+}
+impl From<FirewallRule> for BlockedIp {
+    fn from(rule: FirewallRule) -> Self {
+        Self::new(rule.address.address)
+    }
+}
 
 // ============================================================================
 // Tests
@@ -350,7 +550,19 @@ impl From<FirewallRule> for BlockedIp { fn from(rule: FirewallRule) -> Self { Se
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn test_config() { let c = FirewallConfig::new(); assert_eq!(c.backend, FirewallBackend::Auto); }
-    #[test] fn test_address() { assert!(FirewallAddress::new("1.2.3.4").is_valid()); assert!(FirewallAddress::new("1.2.3.0/24").is_valid()); }
-    #[test] fn test_blocked_ip() { assert!(!BlockedIp::new("1.2.3.4").is_cidr); assert!(BlockedIp::new("1.2.3.0/24").is_cidr); }
+    #[test]
+    fn test_config() {
+        let c = FirewallConfig::new();
+        assert_eq!(c.backend, FirewallBackend::Auto);
+    }
+    #[test]
+    fn test_address() {
+        assert!(FirewallAddress::new("1.2.3.4").is_valid());
+        assert!(FirewallAddress::new("1.2.3.0/24").is_valid());
+    }
+    #[test]
+    fn test_blocked_ip() {
+        assert!(!BlockedIp::new("1.2.3.4").is_cidr);
+        assert!(BlockedIp::new("1.2.3.0/24").is_cidr);
+    }
 }

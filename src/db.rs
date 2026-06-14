@@ -20,11 +20,19 @@ const DEFAULT_DB_NAME: &str = "stop-bots.db";
 ///
 /// On Unix-like systems: ~/.local/share/stop-bots/stop-bots.db
 /// On Windows: %APPDATA%\stop-bots\stop-bots.db
+/// Can be overridden with STOP_BOTS_DB_PATH environment variable (for testing)
 pub fn default_db_path() -> PathBuf {
+    // Check for environment variable override (for testing)
+    if let Ok(db_path) = std::env::var("STOP_BOTS_DB_PATH") {
+        return PathBuf::from(db_path);
+    }
+
     if cfg!(windows) {
         // Windows: %APPDATA%\stop-bots\stop-bots.db
         if let Ok(app_data) = std::env::var("APPDATA") {
-            return PathBuf::from(app_data).join("stop-bots").join(DEFAULT_DB_NAME);
+            return PathBuf::from(app_data)
+                .join("stop-bots")
+                .join(DEFAULT_DB_NAME);
         }
     }
 
@@ -495,6 +503,25 @@ pub struct BotOwner {
 }
 
 // ============================================================================
+// Site Definition
+// ============================================================================
+
+/// Represents a discovered NGINX site for database storage.
+#[derive(Debug, Clone)]
+pub struct Site {
+    /// Unique identifier
+    pub id: Option<i64>,
+    /// Site name (server_name from nginx config)
+    pub name: String,
+    /// Path to the nginx configuration file
+    pub config_path: String,
+    /// Line number where the server block starts
+    pub config_line: Option<i32>,
+    /// When the site was discovered
+    pub discovered_at: Option<SystemTime>,
+}
+
+// ============================================================================
 // Database Connection
 // ============================================================================
 
@@ -505,6 +532,26 @@ pub struct Database {
     conn: Connection,
     /// Path to the database file
     path: PathBuf,
+}
+
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        // Open a new connection to the same database file
+        // This allows sharing the database across threads via Arc<Mutex<Database>>
+        // or by cloning and using in spawn_blocking
+        let conn = Connection::open(&self.path).expect("Failed to clone database connection");
+
+        // Enable WAL mode and foreign keys on the cloned connection
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("Failed to enable WAL mode");
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("Failed to enable foreign keys");
+
+        Self {
+            conn,
+            path: self.path.clone(),
+        }
+    }
 }
 
 impl Database {
@@ -620,7 +667,9 @@ impl Database {
         // Bot categories (many-to-many)
         sql.push_str("CREATE TABLE IF NOT EXISTS bot_categories (");
         sql.push_str("    bot_id INTEGER NOT NULL REFERENCES bots(id) ON DELETE CASCADE,");
-        sql.push_str("    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,");
+        sql.push_str(
+            "    category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,",
+        );
         sql.push_str("    PRIMARY KEY (bot_id, category_id)");
         sql.push_str(");\n\n");
 
@@ -679,6 +728,16 @@ impl Database {
         sql.push_str("    value TEXT");
         sql.push_str(");\n\n");
 
+        // Sites table - for storing discovered NGINX sites
+        sql.push_str("CREATE TABLE IF NOT EXISTS sites (");
+        sql.push_str("    id INTEGER PRIMARY KEY,");
+        sql.push_str("    name TEXT NOT NULL,");
+        sql.push_str("    config_path TEXT NOT NULL,");
+        sql.push_str("    config_line INTEGER,");
+        sql.push_str("    discovered_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),");
+        sql.push_str("    UNIQUE(name, config_path)");
+        sql.push_str(");\n\n");
+
         sql
     }
 
@@ -695,10 +754,16 @@ impl Database {
         sql.push_str("CREATE INDEX IF NOT EXISTS idx_user_agent_patterns_bot_id ON user_agent_patterns(bot_id);\n");
         sql.push_str("CREATE INDEX IF NOT EXISTS idx_ip_ranges_address ON ip_ranges(address);\n");
         sql.push_str("CREATE INDEX IF NOT EXISTS idx_ip_ranges_bot_id ON ip_ranges(bot_id);\n");
-        sql.push_str("CREATE INDEX IF NOT EXISTS idx_bot_categories_bot_id ON bot_categories(bot_id);\n");
+        sql.push_str(
+            "CREATE INDEX IF NOT EXISTS idx_bot_categories_bot_id ON bot_categories(bot_id);\n",
+        );
         sql.push_str("CREATE INDEX IF NOT EXISTS idx_bot_categories_category_id ON bot_categories(category_id);\n");
-        sql.push_str("CREATE INDEX IF NOT EXISTS idx_geo_blocks_country_code ON geo_blocks(country_code);\n");
+        sql.push_str(
+            "CREATE INDEX IF NOT EXISTS idx_geo_blocks_country_code ON geo_blocks(country_code);\n",
+        );
         sql.push_str("CREATE INDEX IF NOT EXISTS idx_data_sources_id ON data_sources(id);\n");
+        sql.push_str("CREATE INDEX IF NOT EXISTS idx_sites_name ON sites(name);\n");
+        sql.push_str("CREATE INDEX IF NOT EXISTS idx_sites_config_path ON sites(config_path);\n");
 
         sql
     }
@@ -765,14 +830,23 @@ impl Database {
                 // Owner already has an ID, update it
                 tx.execute(
                     "UPDATE owners SET name = ?1, website = ?2, contact = ?3 WHERE id = ?4",
-                    params![&owner.name, owner.website.as_deref(), owner.contact.as_deref(), id],
+                    params![
+                        &owner.name,
+                        owner.website.as_deref(),
+                        owner.contact.as_deref(),
+                        id
+                    ],
                 )?;
                 Some(id)
             } else {
                 // Insert new owner
                 tx.execute(
                     "INSERT INTO owners (name, website, contact) VALUES (?1, ?2, ?3)",
-                    params![&owner.name, owner.website.as_deref(), owner.contact.as_deref()],
+                    params![
+                        &owner.name,
+                        owner.website.as_deref(),
+                        owner.contact.as_deref()
+                    ],
                 )?;
                 Some(tx.last_insert_rowid())
             }
@@ -782,7 +856,7 @@ impl Database {
 
         // Insert or update the bot
         let bot_id: i64;
-        
+
         if let Some(id) = bot.id {
             tx.execute(
                 "UPDATE bots SET name = ?1, status = ?2, is_ai_bot = ?3, is_scanner = ?4, 
@@ -821,12 +895,14 @@ impl Database {
         tx.execute("DELETE FROM bot_categories WHERE bot_id = ?1", [bot_id])?;
         for category in &bot.categories {
             // Try to get existing category ID first
-            let category_id: i64 = tx.query_row(
-                "SELECT id FROM categories WHERE name = ?1",
-                [category.as_db_str()],
-                |row| row.get(0),
-            ).unwrap_or(0);
-            
+            let category_id: i64 = tx
+                .query_row(
+                    "SELECT id FROM categories WHERE name = ?1",
+                    [category.as_db_str()],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
             let category_id = if category_id == 0 {
                 // Insert new category
                 tx.execute(
@@ -837,7 +913,7 @@ impl Database {
             } else {
                 category_id
             };
-            
+
             tx.execute(
                 "INSERT INTO bot_categories (bot_id, category_id) VALUES (?1, ?2)",
                 params![bot_id, category_id],
@@ -848,12 +924,14 @@ impl Database {
         tx.execute("DELETE FROM bot_signals WHERE bot_id = ?1", [bot_id])?;
         for signal in &bot.signals {
             // Try to get existing signal ID first
-            let signal_id: i64 = tx.query_row(
-                "SELECT id FROM signals WHERE name = ?1",
-                [signal.as_db_str()],
-                |row| row.get(0),
-            ).unwrap_or(0);
-            
+            let signal_id: i64 = tx
+                .query_row(
+                    "SELECT id FROM signals WHERE name = ?1",
+                    [signal.as_db_str()],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
             let signal_id = if signal_id == 0 {
                 // Insert new signal
                 tx.execute(
@@ -864,7 +942,7 @@ impl Database {
             } else {
                 signal_id
             };
-            
+
             tx.execute(
                 "INSERT INTO bot_signals (bot_id, signal_id) VALUES (?1, ?2)",
                 params![bot_id, signal_id],
@@ -914,7 +992,11 @@ impl Database {
                         &ip_range.address,
                         ip_range.description.as_deref(),
                         ip_range.verification.status.as_db_str(),
-                        ip_range.verification.verified_at.map(|t| t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or(Duration::ZERO).as_secs() as i64),
+                        ip_range.verification.verified_at.map(|t| t
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or(Duration::ZERO)
+                            .as_secs()
+                            as i64),
                         ip_range.verification.error.as_deref(),
                         ip_range.verification.source.as_db_str(),
                         bot_id,
@@ -953,7 +1035,8 @@ impl Database {
             Ok(Bot {
                 id: Some(row.get(0)?),
                 name: row.get(1)?,
-                status: BotStatus::from_db_str(&row.get::<_, String>(2)?).unwrap_or(BotStatus::Blocked),
+                status: BotStatus::from_db_str(&row.get::<_, String>(2)?)
+                    .unwrap_or(BotStatus::Blocked),
                 categories: Vec::new(),
                 user_agent_patterns: Vec::new(),
                 ip_ranges: Vec::new(),
@@ -1034,7 +1117,7 @@ impl Database {
                     source: VerificationSource::from_db_str(&row.get::<_, String>(6)?)
                         .unwrap_or(VerificationSource::Manual),
                 };
-                
+
                 Ok(BotIpRange {
                     id: row.get(0)?,
                     bot_id: Some(id),
@@ -1048,9 +1131,9 @@ impl Database {
         // Fetch owner if present
         let owner = if bot.owner_id.is_some() {
             let owner_id: i64 = bot.owner_id.unwrap();
-            let mut stmt = self.conn.prepare(
-                "SELECT id, name, website, contact FROM owners WHERE id = ?1",
-            )?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT id, name, website, contact FROM owners WHERE id = ?1")?;
             stmt.query_row([owner_id], |row| {
                 Ok(BotOwner {
                     id: row.get(0)?,
@@ -1058,7 +1141,8 @@ impl Database {
                     website: row.get(2)?,
                     contact: row.get(3)?,
                 })
-            }).ok()
+            })
+            .ok()
         } else {
             None
         };
@@ -1099,10 +1183,8 @@ impl Database {
 
     /// Initializes the data sources table with known sources.
     pub fn initialize_data_sources(&mut self) -> Result<()> {
-        // Clear existing data sources first
-        self.conn.execute("DELETE FROM data_sources", [])?;
-
-        // Insert all known sources
+        // Insert all known sources (use INSERT OR IGNORE to avoid conflicts)
+        // We don't delete existing sources to avoid breaking foreign key references from bots
         for source in crate::source_fetch::KnownSources::all() {
             self.upsert_data_source(&source)?;
         }
@@ -1237,11 +1319,7 @@ impl Database {
     }
 
     /// Upserts multiple bots from a source, updating the source's last_updated timestamp.
-    pub fn upsert_bots_from_source(
-        &mut self,
-        source_id: &str,
-        bots: Vec<Bot>,
-    ) -> Result<Vec<i64>> {
+    pub fn upsert_bots_from_source(&mut self, source_id: &str, bots: Vec<Bot>) -> Result<Vec<i64>> {
         // First, ensure the data source exists
         // If it doesn't exist, create a default one
         let source_exists: bool = self
@@ -1329,10 +1407,7 @@ impl Database {
     }
 
     /// Fetches and stores bots from a specific source using the SourceFetcher.
-    pub async fn fetch_and_store_from_source(
-        &mut self,
-        source_id: &str,
-    ) -> Result<Vec<i64>> {
+    pub async fn fetch_and_store_from_source(&mut self, source_id: &str) -> Result<Vec<i64>> {
         use crate::source_fetch::SourceFetcher;
 
         let fetcher = SourceFetcher::new()?;
@@ -1348,13 +1423,16 @@ impl Database {
         let bots = fetcher.fetch_official().await?;
 
         let mut all_ids = Vec::new();
-        
+
         // Group bots by source_id
-        let mut bots_by_source: std::collections::HashMap<String, Vec<Bot>> = 
+        let mut bots_by_source: std::collections::HashMap<String, Vec<Bot>> =
             std::collections::HashMap::new();
-        
+
         for bot in bots {
-            let source_id = bot.source_id.clone().unwrap_or_else(|| "unknown".to_string());
+            let source_id = bot
+                .source_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
             bots_by_source.entry(source_id).or_default().push(bot);
         }
 
@@ -1381,6 +1459,122 @@ impl Database {
     /// Converts an optional Unix timestamp to SystemTime.
     fn timestamp_from_unix_opt(timestamp: Option<i64>) -> Option<SystemTime> {
         timestamp.and_then(Self::timestamp_from_unix)
+    }
+
+    // Site operations
+
+    /// Inserts or updates a site.
+    pub fn upsert_site(
+        &mut self,
+        name: &str,
+        config_path: &str,
+        config_line: Option<usize>,
+    ) -> Result<i64> {
+        let line_num: Option<i32> = config_line.map(|l| l as i32);
+
+        let tx = self.conn.transaction()?;
+
+        // Try to update existing site
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM sites WHERE name = ?1 AND config_path = ?2",
+                params![name, config_path],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(id) = existing {
+            tx.execute(
+                "UPDATE sites SET config_line = ?1, discovered_at = strftime('%s', 'now') WHERE id = ?2",
+                params![line_num, id],
+            )?;
+            return Ok(id);
+        }
+
+        // Insert new site
+        tx.execute(
+            "INSERT INTO sites (name, config_path, config_line) VALUES (?1, ?2, ?3)",
+            params![name, config_path, line_num],
+        )?;
+
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Gets all sites from the database.
+    pub fn get_all_sites(&self) -> Result<Vec<Site>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, config_path, config_line, discovered_at FROM sites ORDER BY name",
+        )?;
+
+        let sites = stmt
+            .query_map([], |row| {
+                Ok(Site {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_path: row.get(2)?,
+                    config_line: row.get(3)?,
+                    discovered_at: Self::timestamp_from_unix_opt(row.get::<_, Option<i64>>(4)?),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(sites)
+    }
+
+    /// Gets a site by name.
+    pub fn get_site_by_name(&self, name: &str) -> Result<Option<Site>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, config_path, config_line, discovered_at FROM sites WHERE name = ?1",
+        )?;
+
+        let site = stmt
+            .query_row([name], |row| {
+                Ok(Site {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_path: row.get(2)?,
+                    config_line: row.get(3)?,
+                    discovered_at: Self::timestamp_from_unix_opt(row.get::<_, Option<i64>>(4)?),
+                })
+            })
+            .ok();
+
+        Ok(site)
+    }
+
+    /// Gets sites by config path.
+    pub fn get_sites_by_config_path(&self, config_path: &str) -> Result<Vec<Site>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, config_path, config_line, discovered_at FROM sites WHERE config_path = ?1 ORDER BY name",
+        )?;
+
+        let sites = stmt
+            .query_map([config_path], |row| {
+                Ok(Site {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    config_path: row.get(2)?,
+                    config_line: row.get(3)?,
+                    discovered_at: Self::timestamp_from_unix_opt(row.get::<_, Option<i64>>(4)?),
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+
+        Ok(sites)
+    }
+
+    /// Deletes a site by ID.
+    pub fn delete_site(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM sites WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Deletes all sites.
+    pub fn delete_all_sites(&self) -> Result<()> {
+        self.conn.execute("DELETE FROM sites", [])?;
+        Ok(())
     }
 }
 
@@ -1529,7 +1723,8 @@ mod tests {
 
         // Verify all categories were inserted
         for category in BotCategory::all() {
-            let count: i64 = db.conn()
+            let count: i64 = db
+                .conn()
                 .query_row(
                     "SELECT COUNT(*) FROM categories WHERE name = ?1",
                     [category.as_db_str()],
@@ -1562,7 +1757,8 @@ mod tests {
         ];
 
         for signal in signals {
-            let count: i64 = db.conn()
+            let count: i64 = db
+                .conn()
                 .query_row(
                     "SELECT COUNT(*) FROM signals WHERE name = ?1",
                     [signal.as_db_str()],
@@ -1649,8 +1845,14 @@ mod tests {
         assert_eq!(BotCategory::Scraper.as_db_str(), "scraper");
         assert_eq!(BotCategory::SearchEngine.as_db_str(), "search_engine");
 
-        assert_eq!(BotCategory::from_db_str("scraper"), Some(BotCategory::Scraper));
-        assert_eq!(BotCategory::from_db_str("search_engine"), Some(BotCategory::SearchEngine));
+        assert_eq!(
+            BotCategory::from_db_str("scraper"),
+            Some(BotCategory::Scraper)
+        );
+        assert_eq!(
+            BotCategory::from_db_str("search_engine"),
+            Some(BotCategory::SearchEngine)
+        );
     }
 
     #[test]
@@ -1659,9 +1861,18 @@ mod tests {
         assert_eq!(SignalType::IpAddress.as_db_str(), "ip_address");
         assert_eq!(SignalType::Crowdsourced.as_db_str(), "crowdsourced");
 
-        assert_eq!(SignalType::from_db_str("user_agent"), Some(SignalType::UserAgent));
-        assert_eq!(SignalType::from_db_str("ip_address"), Some(SignalType::IpAddress));
-        assert_eq!(SignalType::from_db_str("crowdsourced"), Some(SignalType::Crowdsourced));
+        assert_eq!(
+            SignalType::from_db_str("user_agent"),
+            Some(SignalType::UserAgent)
+        );
+        assert_eq!(
+            SignalType::from_db_str("ip_address"),
+            Some(SignalType::IpAddress)
+        );
+        assert_eq!(
+            SignalType::from_db_str("crowdsourced"),
+            Some(SignalType::Crowdsourced)
+        );
         assert_eq!(SignalType::from_db_str("invalid"), None);
     }
 
@@ -1671,9 +1882,18 @@ mod tests {
         assert_eq!(UpdateFrequency::Weekly.as_db_str(), "weekly");
         assert_eq!(UpdateFrequency::Never.as_db_str(), "never");
 
-        assert_eq!(UpdateFrequency::from_db_str("daily"), Some(UpdateFrequency::Daily));
-        assert_eq!(UpdateFrequency::from_db_str("weekly"), Some(UpdateFrequency::Weekly));
-        assert_eq!(UpdateFrequency::from_db_str("monthly"), Some(UpdateFrequency::Monthly));
+        assert_eq!(
+            UpdateFrequency::from_db_str("daily"),
+            Some(UpdateFrequency::Daily)
+        );
+        assert_eq!(
+            UpdateFrequency::from_db_str("weekly"),
+            Some(UpdateFrequency::Weekly)
+        );
+        assert_eq!(
+            UpdateFrequency::from_db_str("monthly"),
+            Some(UpdateFrequency::Monthly)
+        );
         assert_eq!(UpdateFrequency::from_db_str("invalid"), None);
     }
 
@@ -1826,9 +2046,7 @@ mod tests {
         ];
 
         // Upsert bots from source
-        let bot_ids = db
-            .upsert_bots_from_source("test-source", bots)
-            .unwrap();
+        let bot_ids = db.upsert_bots_from_source("test-source", bots).unwrap();
         assert_eq!(bot_ids.len(), 2);
 
         // Verify bots were inserted
@@ -1916,7 +2134,8 @@ mod tests {
             updated_at: None,
         }];
 
-        db.upsert_bots_from_source("refresh-test", initial_bots).unwrap();
+        db.upsert_bots_from_source("refresh-test", initial_bots)
+            .unwrap();
 
         // Verify old bot exists
         let all_bots = db.get_all_bots().unwrap();
@@ -1942,7 +2161,8 @@ mod tests {
             updated_at: None,
         }];
 
-        db.refresh_bots_from_source("refresh-test", new_bots).unwrap();
+        db.refresh_bots_from_source("refresh-test", new_bots)
+            .unwrap();
 
         // Verify old bot was replaced
         let all_bots = db.get_all_bots().unwrap();

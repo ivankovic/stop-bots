@@ -225,18 +225,12 @@ impl KnownSources {
 
     /// Returns only official company sources.
     pub fn official_only() -> Vec<DataSource> {
-        Self::all()
-            .into_iter()
-            .filter(|s| s.is_official)
-            .collect()
+        Self::all().into_iter().filter(|s| s.is_official).collect()
     }
 
     /// Returns only community/crowdsourced sources.
     pub fn community_only() -> Vec<DataSource> {
-        Self::all()
-            .into_iter()
-            .filter(|s| !s.is_official)
-            .collect()
+        Self::all().into_iter().filter(|s| !s.is_official).collect()
     }
 
     /// Returns sources by priority (official first, then community).
@@ -291,10 +285,7 @@ impl HttpClient {
     }
 
     /// Fetches JSON data from a URL.
-    pub async fn fetch_json<T: for<'de> serde::Deserialize<'de>>(
-        &self,
-        url: &str,
-    ) -> Result<T> {
+    pub async fn fetch_json<T: for<'de> serde::Deserialize<'de>>(&self, url: &str) -> Result<T> {
         let response = self
             .client
             .get(url)
@@ -303,11 +294,7 @@ impl HttpClient {
             .with_context(|| format!("Failed to fetch from: {}", url))?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "HTTP {}: {}",
-                response.status(),
-                url
-            ));
+            return Err(anyhow::anyhow!("HTTP {}: {}", response.status(), url));
         }
 
         response
@@ -326,11 +313,7 @@ impl HttpClient {
             .with_context(|| format!("Failed to fetch from: {}", url))?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "HTTP {}: {}",
-                response.status(),
-                url
-            ));
+            return Err(anyhow::anyhow!("HTTP {}: {}", response.status(), url));
         }
 
         response
@@ -411,7 +394,11 @@ impl BotDataFetcher for GoogleBotFetcher {
                 },
             ],
             ip_ranges: Vec::new(),
-            signals: vec![SignalType::IpAddress, SignalType::UserAgent, SignalType::OfficialSource],
+            signals: vec![
+                SignalType::IpAddress,
+                SignalType::UserAgent,
+                SignalType::OfficialSource,
+            ],
             owner: Some(owner.clone()),
             owner_id: None,
             notes: Some("Official Google crawler IP ranges".to_string()),
@@ -485,7 +472,8 @@ impl BotDataFetcher for BingBotFetcher {
         };
 
         // Collect user agents from prefixes (they might not all be the same)
-        let user_agents: Vec<String> = json.prefixes
+        let user_agents: Vec<String> = json
+            .prefixes
             .iter()
             .filter_map(|p| p.user_agent.as_ref().map(|ua| ua.clone()))
             .collect();
@@ -497,7 +485,11 @@ impl BotDataFetcher for BingBotFetcher {
             categories: vec![BotCategory::SearchEngine],
             user_agent_patterns: Vec::new(),
             ip_ranges: Vec::new(),
-            signals: vec![SignalType::IpAddress, SignalType::UserAgent, SignalType::OfficialSource],
+            signals: vec![
+                SignalType::IpAddress,
+                SignalType::UserAgent,
+                SignalType::OfficialSource,
+            ],
             owner: Some(owner.clone()),
             owner_id: None,
             notes: Some("Official Microsoft Bing crawler".to_string()),
@@ -720,7 +712,8 @@ pub struct WellKnownBotsFetcher;
 #[async_trait::async_trait]
 impl BotDataFetcher for WellKnownBotsFetcher {
     async fn fetch(&self, client: &HttpClient) -> Result<Vec<Bot>> {
-        let url = "https://raw.githubusercontent.com/arcjet/well-known-bots/main/well-known-bots.json";
+        let url =
+            "https://raw.githubusercontent.com/arcjet/well-known-bots/main/well-known-bots.json";
         let json: WellKnownBotsJson = client.fetch_json(url).await?;
 
         let mut bots = Vec::new();
@@ -729,7 +722,9 @@ impl BotDataFetcher for WellKnownBotsFetcher {
             let category = match well_known_bot.category.as_deref() {
                 Some("AI") | Some("ai") | Some("AI Bot") => vec![BotCategory::AiScraper],
                 Some("Search Engine") | Some("search engine") => vec![BotCategory::SearchEngine],
-                Some("Scanner") | Some("scanner") => vec![BotCategory::Scanner, BotCategory::SecurityScanner],
+                Some("Scanner") | Some("scanner") => {
+                    vec![BotCategory::Scanner, BotCategory::SecurityScanner]
+                }
                 Some("Scraper") | Some("scraper") => vec![BotCategory::Scraper],
                 Some("Ad") | Some("ad") => vec![BotCategory::AdBot],
                 Some("Social") | Some("social") => vec![BotCategory::SocialBot],
@@ -738,7 +733,9 @@ impl BotDataFetcher for WellKnownBotsFetcher {
             };
 
             let is_ai = well_known_bot.is_ai.unwrap_or(false);
-            let is_scanner = category.iter().any(|c| matches!(c, BotCategory::Scanner | BotCategory::SecurityScanner));
+            let is_scanner = category
+                .iter()
+                .any(|c| matches!(c, BotCategory::Scanner | BotCategory::SecurityScanner));
 
             let mut bot = Bot {
                 id: None,
@@ -940,7 +937,7 @@ impl BotDataFetcher for MonperrusCrawlersFetcher {
                         url: None,
                         instances: None,
                         description: None,
-                        tags: None
+                        tags: None,
                     });
                 }
                 entries
@@ -949,7 +946,10 @@ impl BotDataFetcher for MonperrusCrawlersFetcher {
 
         for entry in user_agents {
             // Use description as name if available, otherwise use pattern
-            let name = entry.description.clone().unwrap_or_else(|| entry.pattern.clone());
+            let name = entry
+                .description
+                .clone()
+                .unwrap_or_else(|| entry.pattern.clone());
             let bot = Bot {
                 id: None,
                 name,
@@ -1140,30 +1140,21 @@ impl SourceFetcher {
     /// Fetches bot data from all official sources.
     pub async fn fetch_official(&self) -> Result<Vec<Bot>> {
         let official_sources = KnownSources::official_only();
-        let source_ids: Vec<&str> = official_sources
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect();
+        let source_ids: Vec<&str> = official_sources.iter().map(|s| s.id.as_str()).collect();
         self.fetch_from_sources(&source_ids).await
     }
 
     /// Fetches bot data from all community sources.
     pub async fn fetch_community(&self) -> Result<Vec<Bot>> {
         let community_sources = KnownSources::community_only();
-        let source_ids: Vec<&str> = community_sources
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect();
+        let source_ids: Vec<&str> = community_sources.iter().map(|s| s.id.as_str()).collect();
         self.fetch_from_sources(&source_ids).await
     }
 
     /// Fetches bot data from all sources (official first, then community).
     pub async fn fetch_all(&self) -> Result<Vec<Bot>> {
         let all_sources = KnownSources::by_priority();
-        let source_ids: Vec<&str> = all_sources
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect();
+        let source_ids: Vec<&str> = all_sources.iter().map(|s| s.id.as_str()).collect();
         self.fetch_from_sources(&source_ids).await
     }
 
@@ -1175,6 +1166,11 @@ impl SourceFetcher {
     /// Gets the registry of fetchers.
     pub fn registry(&self) -> &FetcherRegistry {
         &self.registry
+    }
+
+    /// Checks if a fetcher exists for the given source ID.
+    pub fn has_fetcher(&self, source_id: &str) -> bool {
+        self.registry.get(source_id).is_some()
     }
 }
 
@@ -1297,7 +1293,10 @@ mod tests {
 
     #[test]
     fn test_openai_bot_type() {
-        assert_eq!(OpenAIBotType::GptBot.json_url(), "https://openai.com/gptbot.json");
+        assert_eq!(
+            OpenAIBotType::GptBot.json_url(),
+            "https://openai.com/gptbot.json"
+        );
         assert_eq!(OpenAIBotType::GptBot.bot_name(), "GPTBot");
         assert_eq!(OpenAIBotType::GptBot.source_id(), "openai-gptbot");
         assert_eq!(OpenAIBotType::GptBot.category(), BotCategory::AiScraper);

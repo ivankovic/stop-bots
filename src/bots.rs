@@ -249,11 +249,7 @@ impl GeoBlock {
 
     /// Validates that the country code is a valid 2-letter ISO code.
     pub fn is_valid(&self) -> bool {
-        self.country_code.len() == 2
-            && self
-                .country_code
-                .chars()
-                .all(|c| c.is_ascii_uppercase())
+        self.country_code.len() == 2 && self.country_code.chars().all(|c| c.is_ascii_uppercase())
     }
 }
 
@@ -680,8 +676,7 @@ mod tests {
 
     #[test]
     fn test_search_bot() {
-        let bot = SearchBot::new("Googlebot", "Googlebot")
-            .with_allowed(true);
+        let bot = SearchBot::new("Googlebot", "Googlebot").with_allowed(true);
 
         assert_eq!(bot.name, "Googlebot");
         assert!(bot.allowed);
@@ -689,8 +684,7 @@ mod tests {
 
     #[test]
     fn test_ai_bot() {
-        let bot = AiBot::new("GPTBot", "GPTBot")
-            .add_ip_range(IpBlock::new("1.2.3.0/24"));
+        let bot = AiBot::new("GPTBot", "GPTBot").add_ip_range(IpBlock::new("1.2.3.0/24"));
 
         assert_eq!(bot.name, "GPTBot");
         assert_eq!(bot.ip_ranges.len(), 1);
@@ -698,18 +692,9 @@ mod tests {
 
     #[test]
     fn test_block_response() {
-        assert_eq!(
-            BlockResponse::Return403.to_nginx_return(),
-            "return 403;"
-        );
-        assert_eq!(
-            BlockResponse::Return404.to_nginx_return(),
-            "return 404;"
-        );
-        assert_eq!(
-            BlockResponse::Return444.to_nginx_return(),
-            "return 444;"
-        );
+        assert_eq!(BlockResponse::Return403.to_nginx_return(), "return 403;");
+        assert_eq!(BlockResponse::Return404.to_nginx_return(), "return 404;");
+        assert_eq!(BlockResponse::Return444.to_nginx_return(), "return 444;");
     }
 
     #[test]

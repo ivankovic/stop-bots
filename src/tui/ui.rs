@@ -4,8 +4,8 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Gauge, List, ListItem, Paragraph, Row, Table};
-use unicode_width::UnicodeWidthChar;
 use std::time::Duration;
+use unicode_width::UnicodeWidthChar;
 
 /// Helper trait for creating styled spans.
 pub trait StyledSpan {
@@ -39,12 +39,7 @@ pub fn centered_paragraph<'a>(text: &'a str, style: Style) -> Paragraph<'a> {
 
 /// Creates a list of items.
 pub fn create_list<'a>(items: Vec<Line<'a>>, _selected: Option<usize>) -> List<'a> {
-    List::new(
-        items
-            .into_iter()
-            .map(ListItem::new)
-            .collect::<Vec<_>>(),
-    )
+    List::new(items.into_iter().map(ListItem::new).collect::<Vec<_>>())
 }
 
 /// Creates a gauge widget with the given ratio and style.
@@ -86,11 +81,7 @@ pub fn format_duration(duration: Duration) -> String {
     } else if total_secs < 3600 {
         format!("{}m {}s", total_secs / 60, total_secs % 60)
     } else if total_secs < 86400 {
-        format!(
-            "{}h {}m",
-            total_secs / 3600,
-            (total_secs % 3600) / 60
-        )
+        format!("{}h {}m", total_secs / 3600, (total_secs % 3600) / 60)
     } else {
         format!("{}d {}h", total_secs / 86400, (total_secs % 86400) / 3600)
     }
@@ -180,5 +171,3 @@ pub fn pad_text(text: &str, width: usize, alignment: Alignment) -> String {
         }
     }
 }
-
-

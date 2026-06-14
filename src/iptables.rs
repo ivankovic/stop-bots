@@ -204,9 +204,7 @@ impl Iptables {
                 .arg("--version")
                 .output()
         } else {
-            Command::new(&self.iptables_path)
-                .arg("--version")
-                .output()
+            Command::new(&self.iptables_path).arg("--version").output()
         };
 
         output.is_ok()
@@ -219,7 +217,7 @@ impl Iptables {
         if !chain_exists {
             // Create the chain
             self.create_chain(STOP_BOTS_CHAIN)?;
-            
+
             // Insert jump rule at the beginning of INPUT chain
             let rule = format!("-I INPUT -j {}", STOP_BOTS_CHAIN);
             self.run_iptables(rule.split_whitespace().collect::<Vec<_>>().as_slice())?;
@@ -240,21 +238,24 @@ impl Iptables {
     }
 
     /// Adds a rule to block an IP address or CIDR range.
-    /// 
+    ///
     /// This adds the rule to the STOP-BOTS chain.
     pub fn add_block_rule(&self, address: &FirewallAddress) -> Result<()> {
         self.ensure_chain_exists()?;
-        
-        let rule = format!("-A {} -p {} -s {} -j DROP", STOP_BOTS_CHAIN, PROTOCOL, address.address);
+
+        let rule = format!(
+            "-A {} -p {} -s {} -j DROP",
+            STOP_BOTS_CHAIN, PROTOCOL, address.address
+        );
         self.run_iptables(rule.split_whitespace().collect::<Vec<_>>().as_slice())?;
-        
+
         Ok(())
     }
 
     /// Adds a rule with a custom action.
     pub fn add_rule(&self, address: &FirewallAddress, action: FirewallAction) -> Result<()> {
         self.ensure_chain_exists()?;
-        
+
         let rule = format!(
             "-A {} -p {} -s {} -j {}",
             STOP_BOTS_CHAIN,
@@ -263,13 +264,16 @@ impl Iptables {
             action.to_iptables_action()
         );
         self.run_iptables(rule.split_whitespace().collect::<Vec<_>>().as_slice())?;
-        
+
         Ok(())
     }
 
     /// Removes a block rule for an IP address or CIDR range.
     pub fn remove_block_rule(&self, address: &FirewallAddress) -> Result<()> {
-        let rule = format!("-D {} -p {} -s {} -j DROP", STOP_BOTS_CHAIN, PROTOCOL, address.address);
+        let rule = format!(
+            "-D {} -p {} -s {} -j DROP",
+            STOP_BOTS_CHAIN, PROTOCOL, address.address
+        );
         // Try to delete the rule - it might not exist
         let _ = self.run_iptables(rule.split_whitespace().collect::<Vec<_>>().as_slice());
         Ok(())
@@ -291,10 +295,10 @@ impl Iptables {
     /// Lists all rules in the stop-bots chain.
     pub fn list_rules(&self) -> Result<Vec<FirewallRule>> {
         self.ensure_chain_exists()?;
-        
+
         let output = self.run_iptables(&["-L", STOP_BOTS_CHAIN, "--line-numbers"])?;
         let mut rules = Vec::new();
-        
+
         for line in output.lines() {
             // Parse line like: "num   target     prot opt source               destination"
             let parts: Vec<&str> = line.split_whitespace().collect();
@@ -305,7 +309,7 @@ impl Iptables {
                     "ACCEPT" => FirewallAction::Accept,
                     _ => continue,
                 };
-                
+
                 let address_str = parts[3]; // source column
                 rules.push(FirewallRule {
                     id: None,
@@ -316,7 +320,7 @@ impl Iptables {
                 });
             }
         }
-        
+
         Ok(rules)
     }
 
@@ -339,16 +343,16 @@ impl Iptables {
     }
 
     /// Syncs firewall rules with a list of addresses to block.
-    /// 
+    ///
     /// This clears existing rules and adds new ones for all addresses.
     pub fn sync_block_rules(&self, addresses: &[FirewallAddress]) -> Result<()> {
         self.ensure_chain_exists()?;
         self.clear_rules()?;
-        
+
         for address in addresses {
             self.add_block_rule(address)?;
         }
-        
+
         Ok(())
     }
 
@@ -370,11 +374,7 @@ impl Iptables {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stdout = String::from_utf8_lossy(&output.stdout);
-            bail!(
-                "iptables command failed: {}\\nstderr: {}",
-                stdout,
-                stderr
-            );
+            bail!("iptables command failed: {}\\nstderr: {}", stdout, stderr);
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -395,16 +395,16 @@ mod tests {
         assert!(FirewallAddress::new("192.168.1.1").is_valid());
         assert!(FirewallAddress::new("10.0.0.1").is_valid());
         assert!(FirewallAddress::new("8.8.8.8").is_valid());
-        
+
         // Valid IPv6
         assert!(FirewallAddress::new("::1").is_valid());
         assert!(FirewallAddress::new("2001:db8::1").is_valid());
-        
+
         // Valid CIDR
         assert!(FirewallAddress::new("192.168.1.0/24").is_valid());
         assert!(FirewallAddress::new("10.0.0.0/8").is_valid());
         assert!(FirewallAddress::new("8.8.8.0/24").is_valid());
-        
+
         // Invalid
         assert!(!FirewallAddress::new("").is_valid());
         assert!(!FirewallAddress::new("not-an-ip").is_valid());
@@ -422,9 +422,8 @@ mod tests {
     fn test_firewall_rule_display() {
         let rule = FirewallRule::new_block(FirewallAddress::new("1.2.3.4"));
         assert!(format!("{}", rule).contains("1.2.3.4"));
-        
-        let rule_with_port = FirewallRule::new_block(FirewallAddress::new("1.2.3.4"))
-            .with_port(80);
+
+        let rule_with_port = FirewallRule::new_block(FirewallAddress::new("1.2.3.4")).with_port(80);
         assert!(format!("{}", rule_with_port).contains("port 80"));
     }
 }

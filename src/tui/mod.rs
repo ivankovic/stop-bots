@@ -48,56 +48,56 @@ impl Default for Theme {
 /// Returns Theme::Light if a light theme is detected, otherwise Theme::Dark.
 fn detect_terminal_theme() -> Theme {
     // Check for common environment variables that indicate a light theme
-    
+
     // Try to detect from standard terminal color environment variables
     // Note: Detection is best-effort; users can always toggle with 'c' key
-    
+
     // Check if TERM_PROGRAM or similar indicates a light terminal
     if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
         if term_program.to_lowercase().contains("light") {
             return Theme::Light;
         }
     }
-    
+
     // Many terminal emulators and IDEs set this
     if let Ok(scheme) = std::env::var("COLOR_SCHEME") {
         if scheme.to_lowercase().contains("light") {
             return Theme::Light;
         }
     }
-    
+
     // VS Code and other editors use this
     if let Ok(theme) = std::env::var("VSCODE_DEFAULT_COLOR_THEME") {
         if theme.to_lowercase().contains("light") {
             return Theme::Light;
         }
     }
-    
+
     // Alacritty, WezTerm, etc. may have their own variables
     if let Ok(alacritty_colors) = std::env::var("ALACRITTY_COLORS") {
         if alacritty_colors.to_lowercase().contains("light") {
             return Theme::Light;
         }
     }
-    
+
     // Check TERM for light terminal variants
     if let Ok(term) = std::env::var("TERM") {
         let term_lower = term.to_lowercase();
-        if term_lower.contains("light") 
+        if term_lower.contains("light")
             || term_lower.contains("bright")
             || term_lower == "xterm-256color-light"
         {
             return Theme::Light;
         }
     }
-    
+
     // Check for Windows Terminal settings
     if let Ok(theme) = std::env::var("WT_PROFILE_ID") {
         if theme.to_lowercase().contains("light") {
             return Theme::Light;
         }
     }
-    
+
     // Default to light theme for better visibility
     // Users can always toggle with 'c' key
     Theme::Light
@@ -125,18 +125,18 @@ impl ColorScheme {
     /// Uses dark colors on light background for readability.
     pub fn light() -> Self {
         Self {
-            background: Color::Reset,  // Use terminal's default background (light)
+            background: Color::Reset, // Use terminal's default background (light)
             foreground: Color::Black,
-            primary: Color::Rgb(0, 0, 255),  // Blue
+            primary: Color::Rgb(0, 0, 255),       // Blue
             secondary: Color::Rgb(128, 128, 128), // Dark gray
-            success: Color::Rgb(0, 128, 0),  // Dark green (readable on light bg)
-            warning: Color::Rgb(192, 192, 0), // Dark yellow
-            error: Color::Rgb(128, 0, 0),   // Dark red
-            border: Color::Rgb(64, 64, 64),  // Dark gray for borders
-            title: Color::Rgb(0, 128, 128),   // Dark cyan
-            selected: Color::Rgb(255, 255, 255), // White
+            success: Color::Rgb(0, 128, 0),       // Dark green (readable on light bg)
+            warning: Color::Rgb(192, 192, 0),     // Dark yellow
+            error: Color::Rgb(128, 0, 0),         // Dark red
+            border: Color::Rgb(64, 64, 64),       // Dark gray for borders
+            title: Color::Rgb(0, 128, 128),       // Dark cyan
+            selected: Color::Rgb(255, 255, 255),  // White
             highlighted: Color::Rgb(255, 255, 0), // Bright yellow
-            inactive: Color::Rgb(128, 128, 128), // Dark gray
+            inactive: Color::Rgb(128, 128, 128),  // Dark gray
         }
     }
 
@@ -144,18 +144,18 @@ impl ColorScheme {
     /// Uses light/bright colors on dark background for readability.
     pub fn dark() -> Self {
         Self {
-            background: Color::Reset,  // Use terminal's default background (dark)
+            background: Color::Reset, // Use terminal's default background (dark)
             foreground: Color::White,
-            primary: Color::Rgb(0, 255, 255),  // Cyan
+            primary: Color::Rgb(0, 255, 255),     // Cyan
             secondary: Color::Rgb(192, 192, 192), // Light gray
-            success: Color::Rgb(0, 255, 0), // Bright green
-            warning: Color::Rgb(255, 255, 0), // Bright yellow
-            error: Color::Rgb(255, 0, 0),   // Bright red
-            border: Color::Rgb(128, 128, 128),  // Medium gray
-            title: Color::Rgb(128, 255, 255),  // Light cyan
-            selected: Color::Rgb(128, 128, 255), // Light blue
+            success: Color::Rgb(0, 255, 0),       // Bright green
+            warning: Color::Rgb(255, 255, 0),     // Bright yellow
+            error: Color::Rgb(255, 0, 0),         // Bright red
+            border: Color::Rgb(128, 128, 128),    // Medium gray
+            title: Color::Rgb(128, 255, 255),     // Light cyan
+            selected: Color::Rgb(128, 128, 255),  // Light blue
             highlighted: Color::Rgb(255, 255, 0), // Bright yellow
-            inactive: Color::Rgb(64, 64, 64), // Dark gray
+            inactive: Color::Rgb(64, 64, 64),     // Dark gray
         }
     }
 
@@ -166,18 +166,12 @@ impl ColorScheme {
 
     /// Returns a style for title text.
     pub fn title(&self) -> Style {
-        Style::new()
-            .fg(self.title)
-            .bg(self.background)
-            .bold()
+        Style::new().fg(self.title).bg(self.background).bold()
     }
 
     /// Returns a style for selected items.
     pub fn selected(&self) -> Style {
-        Style::new()
-            .fg(self.selected)
-            .bg(self.background)
-            .bold()
+        Style::new().fg(self.selected).bg(self.background).bold()
     }
 
     /// Returns a style for success messages.
@@ -275,7 +269,9 @@ pub fn key_event_to_tui_event(key_event: crossterm::event::KeyEvent) -> Option<T
 
     match key_event.code {
         // Quit
-        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc if key_event.modifiers.is_empty() => {
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
+            if key_event.modifiers.is_empty() =>
+        {
             Some(TuiEvent::Quit)
         }
         // Theme toggle

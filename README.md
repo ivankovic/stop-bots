@@ -90,7 +90,7 @@ The UI is a Terminal UI written using the excellent Ratatui and Crossterm librar
 
 ### UI design patterns
 
-The UI uses the [Component architecture](https://ratatui.rs/concepts/application-patterns/component-architecture/).
+The TUI must follow the [Ratatui event driven async template](https://github.com/ratatui/templates/tree/main/event-driven-async).
 
 Each component encapsulates its own state, event handlers, and rendering logic.
 

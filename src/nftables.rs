@@ -204,9 +204,7 @@ impl Nftables {
                 .arg("--version")
                 .output()
         } else {
-            Command::new(&self.nft_path)
-                .arg("--version")
-                .output()
+            Command::new(&self.nft_path).arg("--version").output()
         };
 
         output.is_ok() && output.as_ref().map_or(false, |o| o.status.success())
@@ -244,7 +242,10 @@ impl Nftables {
     pub fn add_block_rule(&self, address: &FirewallAddress) -> Result<()> {
         self.ensure_table_exists()?;
         let escaped_addr = address.escape_for_nftables();
-        let rule = format!("add rule {} {} ip saddr {} drop", STOP_BOTS_TABLE, BOT_BLOCK_CHAIN, escaped_addr);
+        let rule = format!(
+            "add rule {} {} ip saddr {} drop",
+            STOP_BOTS_TABLE, BOT_BLOCK_CHAIN, escaped_addr
+        );
         self.run_nft(rule.split_whitespace().collect::<Vec<_>>().as_slice())?;
         Ok(())
     }
@@ -254,18 +255,30 @@ impl Nftables {
         let escaped_addr = address.escape_for_nftables();
         let rule = format!(
             "add rule {} {} ip saddr {} {}",
-            STOP_BOTS_TABLE, BOT_BLOCK_CHAIN, escaped_addr, action.to_nftables_action()
+            STOP_BOTS_TABLE,
+            BOT_BLOCK_CHAIN,
+            escaped_addr,
+            action.to_nftables_action()
         );
         self.run_nft(rule.split_whitespace().collect::<Vec<_>>().as_slice())?;
         Ok(())
     }
 
-    pub fn add_rule_with_port(&self, address: &FirewallAddress, port: u16, action: FirewallAction) -> Result<()> {
+    pub fn add_rule_with_port(
+        &self,
+        address: &FirewallAddress,
+        port: u16,
+        action: FirewallAction,
+    ) -> Result<()> {
         self.ensure_table_exists()?;
         let escaped_addr = address.escape_for_nftables();
         let rule = format!(
             "add rule {} {} ip saddr {} tcp dport {} {}",
-            STOP_BOTS_TABLE, BOT_BLOCK_CHAIN, escaped_addr, port, action.to_nftables_action()
+            STOP_BOTS_TABLE,
+            BOT_BLOCK_CHAIN,
+            escaped_addr,
+            port,
+            action.to_nftables_action()
         );
         self.run_nft(rule.split_whitespace().collect::<Vec<_>>().as_slice())?;
         Ok(())
@@ -277,7 +290,14 @@ impl Nftables {
         for rule in rules {
             if rule.address.address == address.address {
                 if let Some(ref handle) = rule.id {
-                    let _ = self.run_nft(&["delete", "rule", STOP_BOTS_TABLE, BOT_BLOCK_CHAIN, "handle", handle]);
+                    let _ = self.run_nft(&[
+                        "delete",
+                        "rule",
+                        STOP_BOTS_TABLE,
+                        BOT_BLOCK_CHAIN,
+                        "handle",
+                        handle,
+                    ]);
                 }
             }
         }
@@ -292,7 +312,7 @@ impl Nftables {
         let mut in_chain = false;
         let mut current_handle: Option<String> = None;
         let mut current_address: Option<String> = None;
-        
+
         for line in output.lines() {
             let trimmed = line.trim();
             if trimmed.starts_with(&format!("table {} {{", STOP_BOTS_TABLE)) {
@@ -323,7 +343,9 @@ impl Nftables {
                         current_address = Some(parts[1].to_string());
                     }
                 } else if let Some(action) = self.parse_action(trimmed) {
-                    if let (Some(handle), Some(addr)) = (current_handle.clone(), current_address.clone()) {
+                    if let (Some(handle), Some(addr)) =
+                        (current_handle.clone(), current_address.clone())
+                    {
                         rules.push(FirewallRule {
                             id: Some(handle),
                             address: FirewallAddress::new(addr),

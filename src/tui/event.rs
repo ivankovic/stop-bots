@@ -82,18 +82,17 @@ pub enum AppEvent {
     OpenSources,
     /// Refresh all data sources from network.
     RefreshAllSources,
+    /// Discover NGINX sites.
+    DiscoverSites,
+    /// Sites discovery completed.
+    SitesDiscovered { count: usize },
     /// Sources refresh completed with results.
     SourcesRefreshed {
         sources: Vec<DataSource>,
         messages: Vec<String>,
     },
     /// Bot data fetched from a source.
-    BotDataFetched {
-        source_id: String,
-        bots: Vec<Bot>,
-    },
-    /// Error occurred during fetching.
-    FetchError(String),
+    BotDataFetched { source_id: String, bots: Vec<Bot> },
     /// Context menu.
     ContextMenu,
 }
@@ -102,7 +101,7 @@ pub enum AppEvent {
 #[derive(Debug)]
 pub struct EventHandler {
     /// Event sender channel.
-    sender: mpsc::UnboundedSender<Event>,
+    pub sender: mpsc::UnboundedSender<Event>,
     /// Event receiver channel.
     receiver: mpsc::UnboundedReceiver<Event>,
 }
@@ -199,13 +198,17 @@ pub fn key_event_to_app_event(key_event: crossterm::event::KeyEvent) -> Option<A
 
     match key_event.code {
         // Quit
-        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc if key_event.modifiers.is_empty() => {
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc
+            if key_event.modifiers.is_empty() =>
+        {
             Some(AppEvent::Quit)
         }
         // Theme toggle
         KeyCode::Char('c') | KeyCode::Char('C') => Some(AppEvent::ToggleTheme),
         // Refresh
         KeyCode::Char('r') | KeyCode::Char('R') => Some(AppEvent::RefreshAllSources),
+        // Scan for NGINX sites
+        KeyCode::Char('S') => Some(AppEvent::DiscoverSites),
         // Navigation
         KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => Some(AppEvent::Up),
         KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => Some(AppEvent::Down),
@@ -224,7 +227,7 @@ pub fn key_event_to_app_event(key_event: crossterm::event::KeyEvent) -> Option<A
         // Open dashboard
         KeyCode::Char('d') | KeyCode::Char('D') => Some(AppEvent::OpenDashboard),
         // Open sources screen
-        KeyCode::Char('s') | KeyCode::Char('S') => Some(AppEvent::OpenSources),
+        KeyCode::Char('s') => Some(AppEvent::OpenSources),
         // Confirm (Yes)
         KeyCode::Char('y') | KeyCode::Char('Y') => Some(AppEvent::Confirm),
         // Cancel (No)

@@ -6,13 +6,19 @@
 use anyhow::Result;
 use crossterm::event::{Event as CrosstermEvent, KeyEvent, KeyEventKind};
 use std::io;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
 
-use crate::db::{BotStatus, Database, DataSource};
+use crate::db::{BotStatus, DataSource, Database};
 use crate::firewall::FirewallAddress;
+use crate::nginx::discover_nginx_sites;
 use crate::source_fetch::SourceFetcher;
 use crate::tui::{
     event::{key_event_to_app_event, AppEvent, Event, EventHandler},
-    screens::{BotDetailScreen, BotListScreen, DashboardScreen, FirewallScreen, HelpScreen, QuitConfirmScreen, Screen, ScreenState, SettingsScreen, SourcesScreen},
+    screens::{
+        BotDetailScreen, BotListScreen, DashboardScreen, FirewallScreen, HelpScreen,
+        QuitConfirmScreen, Screen, ScreenState, SettingsScreen, SourcesScreen,
+    },
     Theme,
 };
 use ratatui::{
@@ -61,8 +67,6 @@ pub struct App {
 impl App {
     /// Creates a new application.
     pub fn new(db: Database) -> Result<Self> {
-        
-        
         let screen_state = ScreenState::new();
         let events = EventHandler::new();
         let source_fetcher = SourceFetcher::new()?;
@@ -120,13 +124,40 @@ impl App {
     }
 
     /// Run the application's main loop.
-    pub async fn run(mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> anyhow::Result<()> {
-        // Initial refresh from network
-        self.refresh_all_sources_from_network().await?;
+    pub async fn run(
+        mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> anyhow::Result<()> {
+        // Start initial refresh as a background task (non-blocking)
+        // This allows the TUI to render immediately while data loads in the background
+        let db_clone = self.db.clone();
+        let event_sender = self.events.sender.clone();
+
+        tokio::spawn(async move {
+            // First, discover and store nginx sites
+            let mut db_mut = db_clone;
+            let site_count = match Self::discover_and_store_nginx_sites_in_db(&mut db_mut) {
+                Ok(count) => count,
+                Err(e) => {
+                    eprintln!("Background nginx site discovery failed: {}", e);
+                    0
+                }
+            };
+
+            if site_count > 0 {
+                let _ =
+                    event_sender.send(Event::App(AppEvent::SitesDiscovered { count: site_count }));
+            }
+
+            // Then refresh sources
+            if let Err(e) = Self::refresh_all_sources_background(db_mut, event_sender).await {
+                eprintln!("Background refresh failed: {}", e);
+            }
+        });
 
         while self.running {
             terminal.draw(|frame| self.draw(frame))?;
-            
+
             match self.events.next().await? {
                 Event::Tick => self.tick(),
                 Event::Crossterm(event) => match event {
@@ -141,8 +172,107 @@ impl App {
                 Event::App(app_event) => self.handle_app_event(app_event).await?,
             }
         }
-        
+
         Ok(())
+    }
+
+    /// Background task to refresh all sources (runs in a spawned task).
+    async fn refresh_all_sources_background(
+        db: Database,
+        event_sender: mpsc::UnboundedSender<Event>,
+    ) -> Result<()> {
+        let all_sources = crate::source_fetch::KnownSources::all();
+        let mut messages = Vec::new();
+        let mut updated_sources = Vec::new();
+
+        // Use a semaphore to limit concurrent fetches
+        let semaphore = Arc::new(Semaphore::new(5)); // Max 5 concurrent fetches
+
+        let mut fetch_tasks = Vec::new();
+
+        for source in all_sources {
+            let permit = semaphore.clone().acquire_owned().await?;
+            let db_clone = db.clone();
+            let source_id = source.id.clone();
+            let source_name = source.name.clone();
+
+            let task = tokio::spawn(async move {
+                let result = Self::fetch_and_store_source(db_clone, source_id, source_name).await;
+                drop(permit); // Release the permit when done
+                result
+            });
+
+            fetch_tasks.push(task);
+        }
+
+        // Wait for all fetch tasks to complete
+        for task in fetch_tasks {
+            match task.await {
+                Ok(Ok((_bot_ids, updated_source, msg))) => {
+                    if let Some(src) = updated_source {
+                        updated_sources.push(src);
+                    }
+                    messages.push(msg);
+                }
+                Ok(Err(e)) => {
+                    messages.push(format!("Error: {}", e));
+                }
+                Err(e) => {
+                    messages.push(format!("Task failed: {}", e));
+                }
+            }
+        }
+
+        // Send the refresh complete event
+        let _ = event_sender.send(Event::App(AppEvent::SourcesRefreshed {
+            sources: updated_sources,
+            messages,
+        }));
+
+        Ok(())
+    }
+
+    /// Fetches from a single source and stores in database.
+    async fn fetch_and_store_source(
+        db: Database,
+        source_id: String,
+        source_name: String,
+    ) -> Result<(Vec<i64>, Option<DataSource>, String)> {
+        // Create a new SourceFetcher for this task
+        let source_fetcher = SourceFetcher::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create SourceFetcher: {}", e))?;
+
+        match source_fetcher.fetch_from_source(&source_id).await {
+            Ok(bots) => {
+                // Store bots in database using spawn_blocking
+                let mut db_for_store = db.clone();
+                let source_id_for_store = source_id.clone();
+                let bots_for_store = bots.clone();
+                let bot_ids = tokio::task::spawn_blocking(move || {
+                    db_for_store.upsert_bots_from_source(&source_id_for_store, bots_for_store)
+                })
+                .await??;
+
+                // Get the updated source from DB
+                let db_for_get = db.clone();
+                let source_id_for_get = source_id.clone();
+                let updated_source = tokio::task::spawn_blocking(move || {
+                    db_for_get.get_data_source(&source_id_for_get)
+                })
+                .await??;
+
+                Ok((
+                    bot_ids.clone(),
+                    updated_source,
+                    format!("Refreshed {}: {} bots", source_name, bot_ids.len()),
+                ))
+            }
+            Err(e) => Ok((
+                Vec::new(),
+                None,
+                format!("Error refreshing {}: {}", source_name, e),
+            )),
+        }
     }
 
     /// Draws the current screen.
@@ -154,8 +284,8 @@ impl App {
             .direction(Direction::Vertical)
             .margin(0)
             .constraints([
-                Constraint::Min(0),     // Main content
-                Constraint::Length(1),  // Status bar
+                Constraint::Min(0),    // Main content
+                Constraint::Length(1), // Status bar
             ])
             .split(area);
 
@@ -198,9 +328,8 @@ impl App {
 
     /// Renders the status bar at the bottom of the screen.
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-
         let colors = self.screen_state.colors;
-        
+
         // Get current screen name
         let screen_name = match self.screen_state.current_screen {
             Screen::Dashboard => "Dashboard",
@@ -216,11 +345,17 @@ impl App {
 
         // Build help text
         let help_text = match self.screen_state.current_screen {
-            Screen::Dashboard => "d: Dashboard | s: Settings | l: Bot List | f: Firewall | ?: Help | q: Quit",
+            Screen::Dashboard => {
+                "d: Dashboard | s: Settings | l: Bot List | f: Firewall | S: Scan NGINX | ?: Help | q: Quit"
+            }
             Screen::Settings => "↑/↓: Navigate | Enter/Space: Select | b: Back | ?: Help | q: Quit",
             Screen::BotList => "↑/↓: Navigate | Enter: Detail | b: Back | ?: Help | q: Quit",
-            Screen::Firewall => "↑/↓: Navigate | +: Add | -: Remove | *: Sync | b: Back | ?: Help | q: Quit",
-            Screen::Sources => "↑/↓: Navigate | Enter: Select | b: Back | r: Refresh | ?: Help | q: Quit",
+            Screen::Firewall => {
+                "↑/↓: Navigate | +: Add | -: Remove | *: Sync | b: Back | ?: Help | q: Quit"
+            }
+            Screen::Sources => {
+                "↑/↓: Navigate | Enter: Select | b: Back | r: Refresh | ?: Help | q: Quit"
+            }
             Screen::Help => "Any key: Back",
             Screen::QuitConfirm => "y: Yes | n: No",
             Screen::BotDetail(_) => "Enter: Toggle Status | b: Back | ?: Help | q: Quit",
@@ -228,24 +363,18 @@ impl App {
         };
 
         let status_line = Line::from(vec![
-            Span::styled(
-                format!(" {} ", screen_name),
-                colors.title().bold(),
-            ),
-            Span::styled(
-                format!(" | {} ", help_text),
-                colors.secondary(),
-            ),
+            Span::styled(format!(" {} ", screen_name), colors.title().bold()),
+            Span::styled(format!(" | {} ", help_text), colors.secondary()),
         ]);
 
         let block = Block::default()
             .borders(Borders::TOP)
             .border_style(colors.border());
-        
+
         let paragraph = Paragraph::new(status_line)
             .block(block)
             .alignment(Alignment::Left);
-        
+
         frame.render_widget(paragraph, area);
     }
 
@@ -273,11 +402,11 @@ impl App {
                     _ => {}
                 }
             }
-            
+
             // Send the app event to be processed
             self.events.send(app_event);
         }
-        
+
         Ok(())
     }
 
@@ -313,12 +442,46 @@ impl App {
             AppEvent::OpenSources => {
                 self.screen_state.navigate_to(Screen::Sources);
             }
+            AppEvent::DiscoverSites => {
+                // Discover nginx sites in background
+                let db_clone = self.db.clone();
+                let event_sender = self.events.sender.clone();
+
+                tokio::spawn(async move {
+                    let mut db_mut = db_clone;
+                    let site_count = match Self::discover_and_store_nginx_sites_in_db(&mut db_mut) {
+                        Ok(count) => count,
+                        Err(e) => {
+                            eprintln!("Site discovery failed: {}", e);
+                            0
+                        }
+                    };
+
+                    if site_count > 0 {
+                        let _ = event_sender
+                            .send(Event::App(AppEvent::SitesDiscovered { count: site_count }));
+                    }
+                });
+
+                self.add_message("Scanning for NGINX sites...".to_string());
+            }
             AppEvent::Help => {
                 self.screen_state.navigate_to(Screen::Help);
             }
             AppEvent::Refresh | AppEvent::RefreshAllSources => {
-                // Start async refresh
-                self.refresh_all_sources_from_network().await?;
+                // Start async refresh in background (non-blocking)
+                let db_clone = self.db.clone();
+                let event_sender = self.events.sender.clone();
+
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        Self::refresh_all_sources_background(db_clone, event_sender).await
+                    {
+                        eprintln!("Background refresh failed: {}", e);
+                    }
+                });
+
+                self.add_message("Starting refresh of all sources...".to_string());
             }
             AppEvent::Back => {
                 // If category popup is open, close it
@@ -346,7 +509,8 @@ impl App {
                     self.settings.toggle_selected_category();
                     self.add_message(format!(
                         "Toggled category to {}",
-                        self.settings.system_settings
+                        self.settings
+                            .system_settings
                             .get(self.settings.selected_category.unwrap_or(0))
                             .map(|s| s.status)
                             .unwrap_or(BotStatus::Blocked)
@@ -356,7 +520,9 @@ impl App {
             AppEvent::AddFirewallRule => {
                 // On firewall screen, add a rule
                 if self.screen_state.current_screen == Screen::Firewall {
-                    self.add_message("Press '+' to add a rule (input not yet implemented)".to_string());
+                    self.add_message(
+                        "Press '+' to add a rule (input not yet implemented)".to_string(),
+                    );
                 }
             }
             AppEvent::RemoveFirewallRule => {
@@ -386,19 +552,24 @@ impl App {
                 self.handle_navigation(event).await?;
             }
             AppEvent::ContextMenu => {}
+            AppEvent::SitesDiscovered { count } => {
+                self.add_message(format!("Discovered {} nginx sites", count));
+                // Refresh settings to show the new sites
+                self.refresh_settings()?;
+            }
             AppEvent::SourcesRefreshed { sources, messages } => {
                 // Update the sources list
                 let needs_update: Vec<bool> = sources
                     .iter()
                     .map(|s| self.db.data_source_needs_update(s).unwrap_or(false))
                     .collect();
-                
+
                 self.sources = SourcesScreen::new(sources, needs_update);
-                
+
                 for msg in messages {
                     self.add_message(msg);
                 }
-                
+
                 // Refresh dashboard to show updated source status
                 self.refresh_dashboard()?;
             }
@@ -406,22 +577,19 @@ impl App {
                 // Store bots in database
                 let bot_ids = self.db.upsert_bots_from_source(&source_id, bots)?;
                 self.add_message(format!("Stored {} bots from {}", bot_ids.len(), source_id));
-                
+
                 // Refresh bot list
                 self.refresh_bot_list()?;
             }
-            AppEvent::FetchError(error) => {
-                self.add_message(format!("Error: {}", error));
-            }
         }
-        
+
         Ok(())
     }
 
     /// Handles navigation events.
     pub async fn handle_navigation(&mut self, event: AppEvent) -> Result<()> {
         use AppEvent::*;
-        
+
         // If category popup is open, navigate within it
         if self.settings.category_popup.is_some() {
             match event {
@@ -445,7 +613,7 @@ impl App {
             // Sync selected_index with settings.selected_category
             self.settings.selected_category = Some(self.screen_state.selected_index);
         }
-        
+
         Ok(())
     }
 
@@ -482,10 +650,7 @@ impl App {
                     updated_bot.status = new_status;
                     self.db.upsert_bot(&updated_bot)?;
                     bot_detail.bot.status = new_status;
-                    self.add_message(format!(
-                        "Toggled {} to {}",
-                        updated_bot.name, new_status
-                    ));
+                    self.add_message(format!("Toggled {} to {}", updated_bot.name, new_status));
                 }
             }
             Screen::Settings => {
@@ -496,10 +661,7 @@ impl App {
                         let mut updated_bot = bot.clone();
                         updated_bot.status = new_status;
                         self.db.upsert_bot(&updated_bot)?;
-                        self.add_message(format!(
-                            "Toggled {} to {}",
-                            updated_bot.name, new_status
-                        ));
+                        self.add_message(format!("Toggled {} to {}", updated_bot.name, new_status));
                     }
                 } else {
                     // Open category config popup for selected category
@@ -516,47 +678,6 @@ impl App {
             }
             _ => {}
         }
-        
-        Ok(())
-    }
-
-    /// Refreshes all data sources from the network asynchronously.
-    pub async fn refresh_all_sources_from_network(&mut self) -> Result<()> {
-        let all_sources = crate::source_fetch::KnownSources::all();
-        let mut messages = Vec::new();
-        let mut updated_sources = Vec::new();
-
-        for source in all_sources {
-            match self.source_fetcher.fetch_from_source(&source.id).await {
-                Ok(bots) => {
-                    // Store bots in database
-                    let bot_ids = self.db.upsert_bots_from_source(&source.id, bots)?;
-                    
-                    // Get the updated source from DB
-                    if let Some(updated_source) = self.db.get_data_source(&source.id)? {
-                        updated_sources.push(updated_source);
-                    }
-                    
-                    messages.push(format!("Refreshed {}: {} bots", source.name, bot_ids.len()));
-                }
-                Err(e) => {
-                    messages.push(format!("Error refreshing {}: {}", source.name, e));
-                }
-            }
-        }
-
-        // Send the refresh complete event
-        self.events.send(AppEvent::SourcesRefreshed { 
-            sources: updated_sources,
-            messages 
-        });
-        
-        // Also refresh screens
-        self.refresh_dashboard()?;
-        self.refresh_bot_list()?;
-        self.refresh_sources()?;
-
-        self.add_message("All sources refreshed from network".to_string());
 
         Ok(())
     }
@@ -572,12 +693,15 @@ impl App {
                         .flat_map(|b| b.ip_ranges.into_iter())
                         .map(|r| FirewallAddress::new(r.address))
                         .collect();
-                    
+
                     if let Err(e) = self.firewall.firewall.sync_block_rules(&addresses) {
                         self.add_message(format!("Failed to sync firewall: {}", e));
                     } else {
                         self.firewall.refresh();
-                        self.add_message(format!("Synced {} addresses to firewall", addresses.len()));
+                        self.add_message(format!(
+                            "Synced {} addresses to firewall",
+                            addresses.len()
+                        ));
                     }
                 }
                 Err(e) => {
@@ -585,7 +709,7 @@ impl App {
                 }
             }
         }
-        
+
         Ok(())
     }
 
@@ -609,10 +733,8 @@ impl App {
             .map(|s| self.db.data_source_needs_update(s).unwrap_or(false))
             .collect();
 
-        let sources_with_status: Vec<(DataSource, bool)> = sources
-            .into_iter()
-            .zip(needs_update.into_iter())
-            .collect();
+        let sources_with_status: Vec<(DataSource, bool)> =
+            sources.into_iter().zip(needs_update.into_iter()).collect();
 
         self.dashboard = DashboardScreen {
             total_bots: bots.len(),
@@ -627,8 +749,50 @@ impl App {
 
     /// Refreshes the settings screen.
     pub fn refresh_settings(&mut self) -> Result<()> {
-        self.settings = SettingsScreen::new();
+        // Load sites from database
+        let sites = self.db.get_all_sites()?;
+
+        // Convert database sites to SiteSetting structs
+        let site_settings: Vec<crate::tui::screens::SiteSetting> = sites
+            .into_iter()
+            .map(|site| crate::tui::screens::SiteSetting {
+                name: site.name,
+                nginx_path: Some(site.config_path),
+                category_settings: Vec::new(), // TODO: Load category settings for this site
+            })
+            .collect();
+
+        self.settings = SettingsScreen::with_sites(site_settings);
         Ok(())
+    }
+
+    /// Discovers NGINX sites and stores them in the database.
+    pub fn discover_and_store_nginx_sites(&mut self) -> Result<usize> {
+        Self::discover_and_store_nginx_sites_in_db(&mut self.db)
+    }
+
+    /// Standalone function to discover and store nginx sites in a database.
+    fn discover_and_store_nginx_sites_in_db(db: &mut Database) -> Result<usize> {
+        // Discover nginx sites
+        let sites = match discover_nginx_sites() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error discovering nginx sites: {}", e);
+                return Ok(0);
+            }
+        };
+
+        let mut count = 0;
+        for site in &sites {
+            for server_name in &site.server_names {
+                let config_path = site.config_path.to_string_lossy().into_owned();
+                // Store each server name as a site
+                db.upsert_site(server_name, &config_path, Some(site.line_number))?;
+                count += 1;
+            }
+        }
+
+        Ok(count)
     }
 
     /// Refreshes the bot list screen.
@@ -666,7 +830,9 @@ impl App {
 
 /// Runs the TUI application.
 pub async fn run_tui() -> anyhow::Result<()> {
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
     use crossterm::ExecutableCommand;
     use std::io;
 
@@ -686,7 +852,13 @@ pub async fn run_tui() -> anyhow::Result<()> {
 
     // Create and run the application
     let app = App::new(db)?;
-    let result = app.run(&mut terminal).await;
+    let result = app.run(&mut terminal).await.map_err(|e| {
+        eprintln!("Error in app.run(): {}", e);
+        if let Some(source) = e.source() {
+            eprintln!("Caused by: {}", source);
+        }
+        e
+    });
 
     // Cleanup terminal
     disable_raw_mode()?;

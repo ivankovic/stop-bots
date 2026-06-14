@@ -4,10 +4,11 @@
 //! to stop bad bots while allowing good bots.
 
 pub mod bots;
+pub mod commands;
 pub mod db;
 pub mod firewall;
 pub mod iptables;
-pub mod nginx;
 pub mod nftables;
+pub mod nginx;
 pub mod source_fetch;
 pub mod tui;

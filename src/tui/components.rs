@@ -115,10 +115,7 @@ impl<'a> Popup<'a> {
             .split(area);
 
         for (i, (label, shortcut)) in self.buttons.iter().enumerate() {
-            let shortcut_span = Span::styled(
-                format!("[{}] ", shortcut),
-                colors.primary().bold(),
-            );
+            let shortcut_span = Span::styled(format!("[{}] ", shortcut), colors.primary().bold());
             let label_span = Span::styled(*label, colors.text());
             let line = Line::from(vec![shortcut_span, label_span]);
             let para = Paragraph::new(line).alignment(Alignment::Center);
@@ -170,8 +167,7 @@ impl<'a> ConfirmationDialog<'a> {
             ]),
         ];
 
-        let popup = Popup::new(self.action, content)
-            .with_style(self.style);
+        let popup = Popup::new(self.action, content).with_style(self.style);
         popup.render(frame, colors, area);
     }
 }
@@ -230,7 +226,9 @@ impl<'a> Input<'a> {
         if !self.active {
             return;
         }
-        let cursor_byte_pos = self.value.char_indices()
+        let cursor_byte_pos = self
+            .value
+            .char_indices()
             .nth(self.cursor_pos)
             .map(|(pos, _)| pos)
             .unwrap_or(self.value.len());
@@ -243,7 +241,9 @@ impl<'a> Input<'a> {
         if !self.active || self.value.is_empty() {
             return;
         }
-        let cursor_byte_pos = self.value.char_indices()
+        let cursor_byte_pos = self
+            .value
+            .char_indices()
             .nth(self.cursor_pos.saturating_sub(1))
             .map(|(pos, _)| pos)
             .unwrap_or(0);
@@ -258,7 +258,9 @@ impl<'a> Input<'a> {
         if !self.active || self.value.is_empty() {
             return;
         }
-        let cursor_byte_pos = self.value.char_indices()
+        let cursor_byte_pos = self
+            .value
+            .char_indices()
             .nth(self.cursor_pos)
             .map(|(pos, _)| pos)
             .unwrap_or(self.value.len());
@@ -310,7 +312,9 @@ impl<'a> Input<'a> {
 
         // Draw cursor if active
         if self.active {
-            let cursor_byte_pos = self.value.char_indices()
+            let cursor_byte_pos = self
+                .value
+                .char_indices()
                 .nth(self.cursor_pos)
                 .map(|(pos, _)| pos)
                 .unwrap_or(self.value.len());
@@ -541,12 +545,8 @@ impl<'a> Notification<'a> {
 
         frame.render_widget(block, notification_area);
 
-        let line = Line::from(self.message.clone()).style(
-            Style::new()
-                .fg(fg_color)
-                .bg(bg_color)
-                .bold(),
-        );
+        let line =
+            Line::from(self.message.clone()).style(Style::new().fg(fg_color).bg(bg_color).bold());
         let para = Paragraph::new(line).alignment(Alignment::Center);
         frame.render_widget(para, notification_area);
     }
@@ -598,7 +598,7 @@ impl CategoryConfigPopup {
         if self.bots.is_empty() {
             return;
         }
-        
+
         let len = self.bots.len();
         if direction > 0 {
             self.selected_index = (self.selected_index + 1) % len;
@@ -617,7 +617,7 @@ impl CategoryConfigPopup {
         // Calculate popup dimensions
         let width = 80.min(area.width);
         let height = 20.min(area.height);
-        
+
         // Center the popup
         let x = (area.width.saturating_sub(width)) / 2;
         let y = (area.height.saturating_sub(height)) / 2;
@@ -644,9 +644,9 @@ impl CategoryConfigPopup {
             .direction(Direction::Vertical)
             .margin(0)
             .constraints([
-                Constraint::Length(3),  // Header with status toggle
-                Constraint::Min(0),     // Bot list
-                Constraint::Length(1),  // Footer
+                Constraint::Length(3), // Header with status toggle
+                Constraint::Min(0),    // Bot list
+                Constraint::Length(1), // Footer
             ])
             .split(inner);
 
@@ -689,7 +689,9 @@ impl CategoryConfigPopup {
 
         // Calculate visible range
         let items_per_page = area.height as usize;
-        let start_idx = self.selected_index.min(self.bots.len().saturating_sub(items_per_page / 2));
+        let start_idx = self
+            .selected_index
+            .min(self.bots.len().saturating_sub(items_per_page / 2));
         let end_idx = (start_idx + items_per_page).min(self.bots.len());
 
         // Create list items
@@ -700,7 +702,7 @@ impl CategoryConfigPopup {
                     BotStatus::Allowed => colors.success(),
                     BotStatus::Blocked => colors.error(),
                 };
-                
+
                 let name = bot.name.clone();
                 let line = Line::from(vec![
                     Span::raw("  "),
@@ -708,7 +710,7 @@ impl CategoryConfigPopup {
                     Span::raw(" - "),
                     Span::styled(format!("{}", bot.status), status_style),
                 ]);
-                
+
                 ListItem::new(line)
             })
             .collect();
@@ -727,11 +729,14 @@ impl CategoryConfigPopup {
     fn render_footer(&self, frame: &mut Frame, colors: &ColorScheme, area: Rect) {
         // Show help
         let help = if let Some(bot) = self.selected_bot() {
-            format!("Selected: {} - Press Enter to override, s to toggle category", bot.name)
+            format!(
+                "Selected: {} - Press Enter to override, s to toggle category",
+                bot.name
+            )
         } else {
             String::from("Press s to toggle category status")
         };
-        
+
         let para = Paragraph::new(help)
             .style(colors.inactive())
             .alignment(Alignment::Center);

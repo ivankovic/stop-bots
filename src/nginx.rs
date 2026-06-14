@@ -6,7 +6,9 @@
 
 // Import bot types from the bots module
 // These are used for generating nginx configuration from bot protection config
-use crate::bots::{AiBot, BotProtectionConfig, GeoBlock, IpBlock, RateLimit, ScannerBlock, UserAgentBlock};
+use crate::bots::{
+    AiBot, BotProtectionConfig, GeoBlock, IpBlock, RateLimit, ScannerBlock, UserAgentBlock,
+};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,6 +34,48 @@ const NGINX_CONFIG_PATHS: &[&str] = &[
     "/opt/homebrew/etc/nginx/nginx.conf",
     "/opt/homebrew/etc/nginx/servers",
 ];
+
+// Thread-local storage for overriding NGINX config paths.
+// This allows tests to specify custom paths without modifying global constants.
+thread_local! {
+    static CUSTOM_CONFIG_PATHS: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Set custom NGINX config paths for testing purposes.
+/// This overrides the default paths only for the current thread.
+pub fn set_custom_config_paths(paths: Vec<&str>) {
+    CUSTOM_CONFIG_PATHS.with(|p| {
+        *p.borrow_mut() = Some(paths.iter().map(|s| s.to_string()).collect());
+    });
+}
+
+/// Clear custom NGINX config paths.
+pub fn clear_custom_config_paths() {
+    CUSTOM_CONFIG_PATHS.with(|p| {
+        *p.borrow_mut() = None;
+    });
+}
+
+/// Get the NGINX config paths to use, preferring custom paths if set.
+fn get_config_paths() -> Vec<String> {
+    // Check for environment variable to override config paths (for testing)
+    if let Ok(custom_paths) = std::env::var("STOP_BOTS_NGINX_CONFIG_PATHS") {
+        return custom_paths
+            .split(':')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+
+    // Check thread-local custom paths
+    CUSTOM_CONFIG_PATHS.with(|p| {
+        if let Some(ref custom) = *p.borrow() {
+            custom.clone()
+        } else {
+            NGINX_CONFIG_PATHS.iter().map(|s| s.to_string()).collect()
+        }
+    })
+}
 
 /// Represents an NGINX configuration file.
 #[derive(Debug, Clone)]
@@ -71,8 +115,9 @@ pub fn discover_nginx_configs() -> Result<NginxConfigSet> {
     let mut main_config: Option<NginxConfig> = None;
     let mut additional_configs: Vec<NginxConfig> = Vec::new();
 
-    for path_str in NGINX_CONFIG_PATHS {
-        let path = Path::new(path_str);
+    let config_paths = get_config_paths();
+    for path_str in config_paths {
+        let path = Path::new(&path_str);
 
         if path.exists() {
             if path.is_file() {
@@ -156,9 +201,8 @@ pub fn is_nginx_installed() -> bool {
     }
 
     // Check if any config paths exist
-    NGINX_CONFIG_PATHS
-        .iter()
-        .any(|path| Path::new(path).exists())
+    let config_paths = get_config_paths();
+    config_paths.iter().any(|path| Path::new(path).exists())
 }
 
 /// Returns the default NGINX configuration file path.
@@ -173,6 +217,96 @@ pub fn default_config_path() -> &'static str {
 /// Returns all common NGINX configuration paths.
 pub fn common_config_paths() -> &'static [&'static str] {
     NGINX_CONFIG_PATHS
+}
+
+// ============================================================================
+// NGINX Site Discovery
+// ============================================================================
+
+/// Represents a discovered NGINX site.
+#[derive(Debug, Clone)]
+pub struct NginxSite {
+    /// Server name(s) from the configuration
+    pub server_names: Vec<String>,
+    /// Path to the configuration file
+    pub config_path: PathBuf,
+    /// Line number where the server block starts
+    pub line_number: usize,
+}
+
+/// Discovers NGINX sites from configuration files.
+///
+/// This function parses NGINX configuration files to extract server blocks
+/// and their server_name directives.
+pub fn discover_nginx_sites() -> Result<Vec<NginxSite>> {
+    let configs = discover_nginx_configs()?;
+    let mut sites = Vec::new();
+
+    for config in configs.all_configs() {
+        let file_sites = parse_sites_from_config(config)?;
+        sites.extend(file_sites);
+    }
+
+    Ok(sites)
+}
+
+/// Parses a single NGINX configuration file to extract server blocks and their names.
+fn parse_sites_from_config(config: &NginxConfig) -> Result<Vec<NginxSite>> {
+    let mut sites = Vec::new();
+    let mut in_server_block = false;
+    let mut current_server_names = Vec::new();
+    let mut server_start_line = 0;
+
+    for (line_num, line) in config.content.lines().enumerate() {
+        let trimmed = line.trim();
+
+        // Check for server block start
+        if trimmed.starts_with("server {") || trimmed == "server" {
+            in_server_block = true;
+            current_server_names.clear();
+            server_start_line = line_num + 1; // 1-indexed
+            continue;
+        }
+
+        // Check for server block end
+        if in_server_block && trimmed == "}" {
+            // End of server block - save the site if we found server_names
+            if !current_server_names.is_empty() {
+                sites.push(NginxSite {
+                    server_names: current_server_names.clone(),
+                    config_path: config.path.clone(),
+                    line_number: server_start_line,
+                });
+            }
+            in_server_block = false;
+            current_server_names.clear();
+            continue;
+        }
+
+        // Look for server_name directive
+        if in_server_block && trimmed.starts_with("server_name") {
+            // Extract the server names from the directive
+            // server_name example.com www.example.com;
+            let directive = trimmed.split(';').next().unwrap_or(trimmed);
+            let names_part = directive
+                .split_once(char::is_whitespace)
+                .map(|(_, rest)| rest)
+                .unwrap_or("");
+
+            // Split by whitespace and filter out empty strings
+            current_server_names = names_part
+                .split_whitespace()
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    // Remove any trailing/leading quotes or semicolons
+                    s.trim_matches(|c| c == '"' || c == '\'' || c == ';')
+                        .to_string()
+                })
+                .collect();
+        }
+    }
+
+    Ok(sites)
 }
 
 // ============================================================================
@@ -288,18 +422,11 @@ fn generate_user_agent_blocks(user_agent_blocks: &[UserAgentBlock]) -> String {
     config.push_str("    default 0;\n");
 
     for ua_block in user_agent_blocks {
-        let operator = if ua_block.case_insensitive {
-            "~*"
-        } else {
-            "~"
-        };
+        let operator = if ua_block.case_insensitive { "~*" } else { "~" };
         if let Some(ref desc) = ua_block.description {
             config.push_str(&format!("    # {}\n", desc));
         }
-        config.push_str(&format!(
-            "    {} {} 1;\n",
-            operator, ua_block.pattern
-        ));
+        config.push_str(&format!("    {} {} 1;\n", operator, ua_block.pattern));
     }
 
     config.push_str("}\n");
@@ -327,36 +454,36 @@ fn generate_ai_bot_ua_blocks(ai_bots: &[AiBot]) -> String {
 fn generate_geo_blocks(geo_blocks: &[GeoBlock]) -> String {
     let mut config = String::from("# Geo Blocking\n");
 
-        // For geo blocking, we need to use the geo module
-        // First, we create a map based on the country codes
-        config.push_str("geo $blocked_geo {\n");
-        config.push_str("    default 0;\n");
+    // For geo blocking, we need to use the geo module
+    // First, we create a map based on the country codes
+    config.push_str("geo $blocked_geo {\n");
+    config.push_str("    default 0;\n");
 
-        for geo_block in geo_blocks {
-            if let Some(ref desc) = geo_block.description {
-                config.push_str(&format!("    # {}\n", desc));
-            }
-            // In real implementation, you'd map IP ranges to country codes
-            // For simplicity, we'll use a variable that would be set by geoip
-            config.push_str(&format!("    # {} blocked\n", geo_block.country_code));
+    for geo_block in geo_blocks {
+        if let Some(ref desc) = geo_block.description {
+            config.push_str(&format!("    # {}\n", desc));
         }
-
-        config.push_str("}\n");
-
-        // Add the blocking logic
-        config.push_str("map $geoip_country_code $is_blocked_country {\n");
-        config.push_str("    default 0;\n");
-
-        for geo_block in geo_blocks {
-            if let Some(ref desc) = geo_block.description {
-                config.push_str(&format!("    # {}\n", desc));
-            }
-            config.push_str(&format!("    {} 1;\n", geo_block.country_code));
-        }
-
-        config.push_str("}\n");
-        config
+        // In real implementation, you'd map IP ranges to country codes
+        // For simplicity, we'll use a variable that would be set by geoip
+        config.push_str(&format!("    # {} blocked\n", geo_block.country_code));
     }
+
+    config.push_str("}\n");
+
+    // Add the blocking logic
+    config.push_str("map $geoip_country_code $is_blocked_country {\n");
+    config.push_str("    default 0;\n");
+
+    for geo_block in geo_blocks {
+        if let Some(ref desc) = geo_block.description {
+            config.push_str(&format!("    # {}\n", desc));
+        }
+        config.push_str(&format!("    {} 1;\n", geo_block.country_code));
+    }
+
+    config.push_str("}\n");
+    config
+}
 
 /// Generates nginx config for rate limits.
 fn generate_rate_limits(rate_limits: &[RateLimit]) -> String {
@@ -442,8 +569,12 @@ pub fn write_bot_protection_config<P: AsRef<Path>>(
     let path = path.as_ref();
     let nginx_config = generate_bot_protection_config(config);
 
-    fs::write(path, nginx_config)
-        .with_context(|| format!("Failed to write bot protection config to: {}", path.display()))?;
+    fs::write(path, nginx_config).with_context(|| {
+        format!(
+            "Failed to write bot protection config to: {}",
+            path.display()
+        )
+    })?;
 
     Ok(path.to_path_buf())
 }
@@ -586,8 +717,8 @@ mod tests {
 
     #[test]
     fn test_generate_bot_protection_config_with_rate_limits() {
-        let config = BotProtectionConfig::new()
-            .add_rate_limit(RateLimit::new("scanner", "10m", "10r/s"));
+        let config =
+            BotProtectionConfig::new().add_rate_limit(RateLimit::new("scanner", "10m", "10r/s"));
 
         let generated = generate_bot_protection_config(&config);
 
@@ -597,11 +728,9 @@ mod tests {
 
     #[test]
     fn test_generate_bot_protection_config_with_scanner_blocks() {
-        let scanner = ScannerBlock::new("Test Scanner")
-            .add_ip(IpBlock::new("1.2.3.4"));
+        let scanner = ScannerBlock::new("Test Scanner").add_ip(IpBlock::new("1.2.3.4"));
 
-        let config = BotProtectionConfig::new()
-            .add_scanner_block(scanner);
+        let config = BotProtectionConfig::new().add_scanner_block(scanner);
 
         let generated = generate_bot_protection_config(&config);
 
@@ -612,11 +741,9 @@ mod tests {
 
     #[test]
     fn test_generate_bot_protection_config_with_ai_bots() {
-        let bot = AiBot::new("GPTBot", "GPTBot")
-            .add_ip_range(IpBlock::new("1.2.3.0/24"));
+        let bot = AiBot::new("GPTBot", "GPTBot").add_ip_range(IpBlock::new("1.2.3.0/24"));
 
-        let config = BotProtectionConfig::new()
-            .add_ai_bot(bot);
+        let config = BotProtectionConfig::new().add_ai_bot(bot);
 
         let generated = generate_bot_protection_config(&config);
 
@@ -647,7 +774,7 @@ mod tests {
 
     #[test]
     fn test_generate_bot_protection_config_full() {
-        use crate::bots::{SearchBot};
+        use crate::bots::SearchBot;
 
         let config = BotProtectionConfig::new()
             .add_ip_block(IpBlock::new("1.2.3.4"))
