@@ -8,14 +8,14 @@
   - `enable-geoblock` - Enable geoblock for specific country or all
   - `disable-geoblock` - Disable geoblock for specific country or all
 
-# Pending
+# Completed
 
-- TUI: "Bot settings" should be renamed to "Site settings"
-- TUI: "Dashboard" should be renamed to "Bot settings"
-- TUI: A new Dashboard should be created. It should be the default screen on app run. The new
+- ✅ TUI: "Bot settings" should be renamed to "Site settings"
+- ✅ TUI: "Dashboard" should be renamed to "Bot settings"
+- ✅ TUI: A new Dashboard should be created. It should be the default screen on app run. The new
   dashboard should contain: Overview of global settings, count of sites, count of bot lists that are
   up to date, count of bot lists that need updating, messages
-- TUI: The bottom of the screen has two borders. It should only be one.
+- ✅ TUI: The bottom of the screen has two borders. It should only be one.
 
 # Notes
 - Geoblock commands are stubs and need to be fully implemented in a future update
