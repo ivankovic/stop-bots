@@ -1,0 +1,52 @@
+[
+  {
+    "id": "ai-search-bot",
+    "categories": ["ai"],
+    "pattern": {
+      "accepted": ["AISearchBot"],
+      "forbidden": []
+    },
+    "url": "https://example.invalid/ai-search-bot"
+  },
+  {
+    "id": "google-crawler",
+    "categories": ["google", "search-engine"],
+    "pattern": {
+      "accepted": ["Googlebot\\/"],
+      "forbidden": []
+    },
+    "url": "http://www.google.com/bot.html"
+  },
+  {
+    "id": "jyxo-crawler",
+    "categories": ["unknown"],
+    "pattern": {
+      "accepted": ["jyxobot"],
+      "forbidden": []
+    }
+  },
+  {
+    "id": "no-pattern-bot",
+    "categories": ["ai"],
+    "pattern": {
+      "accepted": [],
+      "forbidden": []
+    }
+  },
+  {
+    "id": "quote-bot",
+    "categories": ["ai"],
+    "pattern": {
+      "accepted": ["Evil\"Bot"],
+      "forbidden": []
+    }
+  },
+  {
+    "id": "mixed-pattern-bot",
+    "categories": ["ai"],
+    "pattern": {
+      "accepted": ["GoodBot", "Evil\"Bot"],
+      "forbidden": []
+    }
+  }
+]
