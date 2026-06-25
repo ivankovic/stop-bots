@@ -242,6 +242,41 @@ rewrite:
 `apply-blocks` re-discovers sites from disk on every run rather than reading
 back `sites` from the db, so it can never act on a stale config path.
 
+**Default `--db` resolution falls back to a per-user path.** Every
+subcommand's `--db` is `Option<PathBuf>` (no `clap` `default_value`), not a
+plain `PathBuf` defaulting to `/var/lib/stop-bots/db.sqlite3` — a real
+default baked in at parse time would make it impossible to tell "user
+explicitly chose the system path" apart from "user didn't pass `--db` at
+all", which is exactly the distinction that matters here. `open_db` (in
+`main.rs`) keeps that distinction: an explicit `--db` is opened as-is, even
+if that fails — silently substituting a path the user asked for would be
+worse than erroring loudly. With no `--db`, `open_or_fallback` tries to
+create `/var/lib/stop-bots` and, only if creating *that directory*
+specifically fails, falls back to a per-user XDG location
+(`$XDG_DATA_HOME/stop-bots/db.sqlite3`, or `~/.local/share/stop-bots/db.sqlite3`),
+printing an explicit note about which path ended up being used. `/var/lib`
+needs root in practice, which applying nginx/firewall changes needs
+anyway — but just running `cargo run` or the TUI to look around shouldn't.
+
+The fallback trigger is deliberately narrow: only "can't create the
+directory", not "opening/reading the database failed" in general. If
+`/var/lib/stop-bots` already exists (e.g. a root-run systemd service
+created it) but isn't readable by the current user, that's a real
+permissions problem with *existing data* — falling back there would hand
+back a fresh, empty database that looks indistinguishable from "no data
+yet" instead of surfacing the actual problem. Only the specific case this
+exists for (the directory doesn't exist and can't be created) gets the
+silent fallback; everything else still fails loudly.
+
+`open_or_fallback`'s fallback parameter is a closure (`impl FnOnce() ->
+Result<PathBuf>`), not an already-resolved `PathBuf`: resolving it
+(`user_db_path`, which needs `XDG_DATA_HOME` or `HOME`) only happens inside
+the create-failed branch, never on the success path. Resolving it eagerly
+was tried first and is wrong — it would mean a root-run container with a
+minimal environment (`/var/lib` writable, no `HOME` set, a realistic way to
+run a server-side bot blocker) fails outright even though the primary path
+it actually needed never had a problem.
+
 ## End-to-end tests (`tests/cli.rs`, `tests/tui.rs`)
 
 `tests/cli.rs` covers the non-interactive subcommands via `assert_cmd`

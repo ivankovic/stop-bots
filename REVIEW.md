@@ -1,3 +1,14 @@
+# Pending
+
+- Exploratory testing found: The dashboard should allow the user to change the system-wide settings.
+  up/down arrow should cycle through system settings, the same it does currently on the bot settings
+  page.
+- Exploratory testing found: Bot settings page should not show system-wide bot blocking settings,
+  that should be on the dashboard.
+- Exploratory testing found: Bot settings page should be a list of all sources of bot lists, when
+  they were last updated, how many bot signals there are in the list and arrow keys should allow
+  the user to select a specific source and 'Enter' should pop-up a confirmation dialog for updating that list.
+
 # Completed
 
 - ✅ Implemented SQLite storage (`src/db.rs`): sources, bots, sites, and
@@ -26,20 +37,8 @@
   real compiled binary through a pty via `rexpect` (`assert_cmd` can't do
   this — no pty). Turns the manual tmux-verification session below into a
   repeatable regression test covering the same flow.
-
-# Notes
-- The previous TUI and geoblock integration were removed wholesale in an
-  earlier commit (`human: remove this shit`). Geoblock has not been rebuilt
-  (see TODO.md); the TUI has been, deliberately much smaller than the
-  ~4300-line original (no custom RGB theme palette, three screens instead of
-  several, no firewall/geoblock screens yet).
-- The iptables/nftables test fixtures (12 files) are now used by
-  `src/iptables.rs`/`src/nftables.rs` tests — the line syntax and JSON shape
-  drive the render tests, though the generated output deliberately deviates
-  from the fixtures' own envelope/safety choices (see SPECS.md).
-- `ratatui::init()` needs a real TTY, which the sandbox this was built in
-  doesn't have by default — but `tmux` was available, so the TUI was driven
-  and visually verified interactively through a real pty rather than only
-  unit-tested. That caught two bugs unit tests missed: a popup that rendered
-  off-screen (wrong centering math) and a Dashboard that didn't refresh
-  after a change made on another screen.
+- ✅ Fixed `cargo run`/`stop-bots` (no `--db`) failing with permission denied
+  trying to create `/var/lib/stop-bots` as a non-root user: `--db` is now
+  `Option<PathBuf>` everywhere, and `open_db` falls back to a per-user XDG
+  path when the system path isn't writable, printing which path it picked.
+  An explicit `--db` is still honored as-is and fails loudly if it's bad.

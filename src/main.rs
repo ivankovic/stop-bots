@@ -16,7 +16,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use stop_bots::db::{Db, FirewallAction, NewFirewallRule};
@@ -24,6 +24,9 @@ use stop_bots::{botlist, iptables, nftables, nginx};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
 const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
+
+/// Help text shared by every subcommand's `--db` flag.
+const DB_HELP: &str = "Database path (defaults to /var/lib/stop-bots/db.sqlite3, falling back to a per-user location if that's not writable)";
 
 #[derive(Parser)]
 #[command(name = "stop-bots", about = "Configure your server to stop bad bots")]
@@ -40,14 +43,14 @@ enum Command {
         /// Root directory to scan for NGINX config files
         #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
         root: PathBuf,
-        #[arg(long, default_value = DEFAULT_DB_PATH)]
-        db: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
     },
     /// Download and store the latest known-bot list
     #[command(alias = "update")]
     UpdateBotLists {
-        #[arg(long, default_value = DEFAULT_DB_PATH)]
-        db: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
         /// Read the bot list from a local file instead of downloading it
         #[arg(long)]
         source: Option<PathBuf>,
@@ -56,8 +59,8 @@ enum Command {
     ApplyBlocks {
         #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
         root: PathBuf,
-        #[arg(long, default_value = DEFAULT_DB_PATH)]
-        db: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
     },
     /// Add a firewall rule blocking (or allowing) an IP address or CIDR range
     AddFirewallRule {
@@ -69,20 +72,20 @@ enum Command {
         port: Option<u16>,
         #[arg(long, default_value = "block")]
         action: String,
-        #[arg(long, default_value = DEFAULT_DB_PATH)]
-        db: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
     },
     /// List all stored firewall rules
     ListFirewallRules {
-        #[arg(long, default_value = DEFAULT_DB_PATH)]
-        db: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
     },
     /// Remove a firewall rule by id
     RemoveFirewallRule {
         #[arg(long)]
         id: i64,
-        #[arg(long, default_value = DEFAULT_DB_PATH)]
-        db: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
     },
     /// Render the stored firewall rules into an iptables or nftables script.
     /// The script is written to disk only — it is never executed by this
@@ -93,13 +96,13 @@ enum Command {
         /// Path to write the generated script to
         #[arg(long)]
         out: PathBuf,
-        #[arg(long, default_value = DEFAULT_DB_PATH)]
-        db: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
     },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
-        #[arg(long, default_value = DEFAULT_DB_PATH)]
-        db: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
     },
 }
 
@@ -114,25 +117,104 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => run_tui(&PathBuf::from(DEFAULT_DB_PATH)).await,
-        Some(Command::Tui { db }) => run_tui(&db).await,
-        Some(Command::ScanSites { root, db }) => scan_sites(&root, &db),
-        Some(Command::UpdateBotLists { db, source }) => update_bot_lists(&db, source).await,
-        Some(Command::ApplyBlocks { root, db }) => apply_blocks(&root, &db),
+        None => run_tui(None).await,
+        Some(Command::Tui { db }) => run_tui(db).await,
+        Some(Command::ScanSites { root, db }) => scan_sites(&root, db),
+        Some(Command::UpdateBotLists { db, source }) => update_bot_lists(db, source).await,
+        Some(Command::ApplyBlocks { root, db }) => apply_blocks(&root, db),
         Some(Command::AddFirewallRule {
             address,
             port,
             action,
             db,
-        }) => add_firewall_rule(&db, address, port, &action),
-        Some(Command::ListFirewallRules { db }) => list_firewall_rules(&db),
-        Some(Command::RemoveFirewallRule { id, db }) => remove_firewall_rule(&db, id),
-        Some(Command::RenderFirewall { backend, out, db }) => render_firewall(&db, backend, &out),
+        }) => add_firewall_rule(db, address, port, &action),
+        Some(Command::ListFirewallRules { db }) => list_firewall_rules(db),
+        Some(Command::RemoveFirewallRule { id, db }) => remove_firewall_rule(db, id),
+        Some(Command::RenderFirewall { backend, out, db }) => render_firewall(db, backend, &out),
     }
 }
 
-async fn run_tui(db_path: &Path) -> Result<()> {
-    let db = Db::open(db_path)?;
+/// Resolves and opens the database. An explicit `--db` is always honored
+/// as-is, even if opening it fails — silently substituting a path the user
+/// asked for would be worse than just erroring. Without one, tries the
+/// system location first and falls back to a per-user location if that
+/// isn't writable: `/var/lib` typically needs root, which actually applying
+/// nginx/firewall changes needs anyway, but just exploring with `cargo run`
+/// or the TUI shouldn't require it.
+fn open_db(explicit: Option<PathBuf>) -> Result<Db> {
+    let Some(path) = explicit else {
+        return open_default_db();
+    };
+    Db::open(path)
+}
+
+fn open_default_db() -> Result<Db> {
+    open_or_fallback(Path::new(DEFAULT_DB_PATH), user_db_path)
+}
+
+/// Tries to create `primary`'s parent directory and open it as the
+/// database; only if that directory can't even be created does it fall
+/// back to whatever `fallback` resolves to (printing a note about which
+/// path was used). `fallback` is a closure, not an already-resolved path,
+/// so resolving it (which can itself fail, e.g. if neither `XDG_DATA_HOME`
+/// nor `HOME` is set) never gets in the way of the common case where
+/// `primary` just works — important for e.g. a root-run container with a
+/// minimal environment, where `/var/lib` is perfectly writable but `HOME`
+/// might not be set at all.
+///
+/// Deliberately narrow: this does *not* fall back on every kind of
+/// failure, e.g. the directory existing but its database file being
+/// corrupt, or owned by someone else and unreadable. Falling back in those
+/// cases would hand back a fresh, empty database that's easy to mistake for
+/// "no data yet" instead of surfacing the real problem — the dev-ergonomics
+/// win this exists for is specifically "the system directory doesn't exist
+/// and I can't create it", not "something is wrong with the system db".
+fn open_or_fallback(primary: &Path, fallback: impl FnOnce() -> Result<PathBuf>) -> Result<Db> {
+    let parent = primary
+        .parent()
+        .with_context(|| format!("{} has no parent directory", primary.display()))?;
+    if let Err(dir_err) = std::fs::create_dir_all(parent) {
+        let fallback = fallback()?;
+        eprintln!(
+            "Note: couldn't create {} ({dir_err}); using {} instead.",
+            parent.display(),
+            fallback.display()
+        );
+        return Db::open(&fallback).with_context(|| {
+            format!(
+                "failed to create {} ({dir_err}) and failed to open the fallback database at {}",
+                parent.display(),
+                fallback.display()
+            )
+        });
+    }
+    Db::open(primary)
+}
+
+/// The per-user fallback database location, following the XDG Base
+/// Directory spec (`$XDG_DATA_HOME`, or `~/.local/share` if that's unset).
+fn user_db_path() -> Result<PathBuf> {
+    resolve_user_db_path(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+/// Pure resolution logic for [`user_db_path`], taking the relevant env vars
+/// as parameters so it's testable without mutating real process env vars
+/// (which would race with other tests in this binary).
+fn resolve_user_db_path(
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let data_home = xdg_data_home
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".local/share")))
+        .context(
+            "could not determine a per-user data directory: neither XDG_DATA_HOME nor HOME is set",
+        )?;
+    Ok(data_home.join("stop-bots").join("db.sqlite3"))
+}
+
+async fn run_tui(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
     let app = stop_bots::app::App::new(db)?;
     let terminal = ratatui::init();
     let result = app.run(terminal).await;
@@ -140,8 +222,8 @@ async fn run_tui(db_path: &Path) -> Result<()> {
     result
 }
 
-fn scan_sites(root: &Path, db_path: &Path) -> Result<()> {
-    let db = Db::open(db_path)?;
+fn scan_sites(root: &Path, db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
     let sites = nginx::discover_sites(root)?;
     for site in &sites {
         db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
@@ -154,8 +236,8 @@ fn scan_sites(root: &Path, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn update_bot_lists(db_path: &Path, source: Option<PathBuf>) -> Result<()> {
-    let db = Db::open(db_path)?;
+async fn update_bot_lists(db_path: Option<PathBuf>, source: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
     let count = match source {
         Some(path) => {
             let json = std::fs::read_to_string(&path)?;
@@ -168,8 +250,8 @@ async fn update_bot_lists(db_path: &Path, source: Option<PathBuf>) -> Result<()>
     Ok(())
 }
 
-fn apply_blocks(root: &Path, db_path: &Path) -> Result<()> {
-    let db = Db::open(db_path)?;
+fn apply_blocks(root: &Path, db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
     let patterns = db.blocked_user_agent_patterns()?;
     let sites = nginx::discover_sites(root)?;
 
@@ -196,12 +278,12 @@ fn apply_blocks(root: &Path, db_path: &Path) -> Result<()> {
 }
 
 fn add_firewall_rule(
-    db_path: &Path,
+    db_path: Option<PathBuf>,
     address: String,
     port: Option<u16>,
     action: &str,
 ) -> Result<()> {
-    let db = Db::open(db_path)?;
+    let db = open_db(db_path)?;
     let id = db.add_firewall_rule(&NewFirewallRule {
         address,
         port,
@@ -211,8 +293,8 @@ fn add_firewall_rule(
     Ok(())
 }
 
-fn list_firewall_rules(db_path: &Path) -> Result<()> {
-    let db = Db::open(db_path)?;
+fn list_firewall_rules(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
     let rules = db.list_firewall_rules()?;
     if rules.is_empty() {
         println!("No firewall rules stored.");
@@ -229,15 +311,15 @@ fn list_firewall_rules(db_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_firewall_rule(db_path: &Path, id: i64) -> Result<()> {
-    let db = Db::open(db_path)?;
+fn remove_firewall_rule(db_path: Option<PathBuf>, id: i64) -> Result<()> {
+    let db = open_db(db_path)?;
     db.remove_firewall_rule(id)?;
     println!("Removed firewall rule #{id}");
     Ok(())
 }
 
-fn render_firewall(db_path: &Path, backend: FirewallBackend, out: &Path) -> Result<()> {
-    let db = Db::open(db_path)?;
+fn render_firewall(db_path: Option<PathBuf>, backend: FirewallBackend, out: &Path) -> Result<()> {
+    let db = open_db(db_path)?;
     let rules = db.list_firewall_rules()?;
     let enabled = rules.iter().filter(|r| r.enabled);
     let (script, run_hint, written) = match backend {
@@ -262,4 +344,85 @@ fn render_firewall(db_path: &Path, backend: FirewallBackend, out: &Path) -> Resu
         out.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_user_db_path_prefers_xdg_data_home() {
+        let path = resolve_user_db_path(Some("/custom/data".into()), Some("/home/someone".into()))
+            .unwrap();
+        assert_eq!(path, PathBuf::from("/custom/data/stop-bots/db.sqlite3"));
+    }
+
+    #[test]
+    fn resolve_user_db_path_falls_back_to_home_local_share() {
+        let path = resolve_user_db_path(None, Some("/home/someone".into())).unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("/home/someone/.local/share/stop-bots/db.sqlite3")
+        );
+    }
+
+    #[test]
+    fn resolve_user_db_path_errors_without_any_signal() {
+        assert!(resolve_user_db_path(None, None).is_err());
+    }
+
+    #[test]
+    fn open_db_with_an_explicit_path_opens_it_directly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("explicit.sqlite3");
+        assert!(open_db(Some(path.clone())).is_ok());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn open_or_fallback_uses_fallback_when_primary_directory_cannot_be_created() {
+        // A regular file masquerading as a directory component: `mkdir -p`
+        // through it must fail for any user, including root, so this is a
+        // root-safe way to force the "can't create the directory" path
+        // without needing real permission denial.
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let primary = blocker.join("db.sqlite3");
+
+        let fallback_dir = tempfile::tempdir().unwrap();
+        let fallback = fallback_dir.path().join("fallback.sqlite3");
+
+        assert!(open_or_fallback(&primary, || Ok(fallback.clone())).is_ok());
+        assert!(fallback.exists());
+        assert!(!primary.exists());
+    }
+
+    #[test]
+    fn open_or_fallback_uses_primary_when_it_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("nested").join("db.sqlite3");
+        let fallback = tmp.path().join("should-not-be-used.sqlite3");
+
+        assert!(open_or_fallback(&primary, || Ok(fallback.clone())).is_ok());
+        assert!(primary.exists());
+        assert!(!fallback.exists());
+    }
+
+    #[test]
+    fn open_or_fallback_never_resolves_fallback_when_primary_works() {
+        // Regression guard: resolving the fallback path can itself fail
+        // (e.g. neither XDG_DATA_HOME nor HOME is set, plausible in a
+        // minimal-env root container). That must never get in the way of
+        // the common case where the primary path just works.
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("nested").join("db.sqlite3");
+
+        let result = open_or_fallback(&primary, || {
+            anyhow::bail!("fallback should never be resolved here")
+        });
+
+        assert!(result.is_ok());
+        assert!(primary.exists());
+    }
 }
