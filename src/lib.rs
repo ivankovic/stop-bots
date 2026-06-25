@@ -16,6 +16,11 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+pub mod app;
 pub mod botlist;
 pub mod db;
+pub mod event;
+pub mod iptables;
+pub mod nftables;
 pub mod nginx;
+pub mod tui;

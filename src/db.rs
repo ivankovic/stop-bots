@@ -25,9 +25,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Whether a category or bot should be allowed through or blocked at the NGINX layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Policy {
     Allowed,
+    #[default]
     Blocked,
 }
 
@@ -141,6 +142,66 @@ pub struct Site {
     pub discovered_at: i64,
 }
 
+/// What a firewall rule should do with matching traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirewallAction {
+    Allow,
+    Block,
+    Reject,
+}
+
+impl FirewallAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            FirewallAction::Allow => "allow",
+            FirewallAction::Block => "block",
+            FirewallAction::Reject => "reject",
+        }
+    }
+
+    /// Parses an action, accepting both our canonical names and the
+    /// upstream iptables/nftables spellings (`ACCEPT`/`accept`, `DROP`/
+    /// `drop`, `REJECT`/`reject`), case-insensitively.
+    pub fn parse(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "allow" | "accept" => Ok(FirewallAction::Allow),
+            "block" | "drop" => Ok(FirewallAction::Block),
+            "reject" => Ok(FirewallAction::Reject),
+            other => anyhow::bail!("invalid firewall action: {other}"),
+        }
+    }
+}
+
+/// A firewall rule: allow, block or reject traffic from `address` (an IP
+/// address or CIDR range), optionally restricted to `port`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FirewallRule {
+    pub id: i64,
+    pub address: String,
+    pub port: Option<u16>,
+    pub action: FirewallAction,
+    pub enabled: bool,
+}
+
+/// Fields needed to add a new firewall rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewFirewallRule {
+    pub address: String,
+    pub port: Option<u16>,
+    pub action: FirewallAction,
+}
+
+/// Returns whether `address` is a plain IP address or CIDR range.
+fn is_valid_address(address: &str) -> bool {
+    let address = address.trim();
+    if let Some((prefix, suffix)) = address.split_once('/') {
+        return prefix.parse::<std::net::IpAddr>().is_ok()
+            && !suffix.is_empty()
+            && suffix.chars().all(|c| c.is_ascii_digit());
+    }
+    address.parse::<std::net::IpAddr>().is_ok()
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -214,6 +275,15 @@ impl Db {
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS firewall_rules (
+                id INTEGER PRIMARY KEY,
+                address TEXT NOT NULL,
+                port INTEGER,
+                action TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL
             );
             ",
         )?;
@@ -400,6 +470,66 @@ impl Db {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to list sites")
+    }
+
+    // ---- firewall rules ----
+
+    /// Adds a new firewall rule, enabled by default. Returns its id.
+    pub fn add_firewall_rule(&self, rule: &NewFirewallRule) -> Result<i64> {
+        if !is_valid_address(&rule.address) {
+            anyhow::bail!("invalid firewall rule address: {}", rule.address);
+        }
+        self.conn.execute(
+            "INSERT INTO firewall_rules (address, port, action, enabled, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![rule.address, rule.port, rule.action.as_str(), now()],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Deletes the firewall rule with the given id. Errors if no such rule exists.
+    pub fn remove_firewall_rule(&self, id: i64) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM firewall_rules WHERE id = ?1", params![id])?;
+        if changed == 0 {
+            anyhow::bail!("no firewall rule with id: {id}");
+        }
+        Ok(())
+    }
+
+    /// Enables or disables the firewall rule with the given id, without
+    /// deleting it. Errors if no such rule exists.
+    pub fn set_firewall_rule_enabled(&self, id: i64, enabled: bool) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE firewall_rules SET enabled = ?1 WHERE id = ?2",
+            params![enabled, id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("no firewall rule with id: {id}");
+        }
+        Ok(())
+    }
+
+    /// Lists every firewall rule, including disabled ones. Renderers
+    /// (`iptables::render`, `nftables::render`) skip disabled rules
+    /// themselves.
+    pub fn list_firewall_rules(&self) -> Result<Vec<FirewallRule>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, address, port, action, enabled FROM firewall_rules ORDER BY id")?;
+        let rows = stmt.query_map([], |row| {
+            let action: String = row.get(3)?;
+            Ok(FirewallRule {
+                id: row.get(0)?,
+                address: row.get(1)?,
+                port: row.get(2)?,
+                action: FirewallAction::parse(&action).unwrap_or(FirewallAction::Block),
+                enabled: row.get(4)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list firewall rules")
     }
 
     /// Computes the user-agent regex alternatives for every bot that should
@@ -597,5 +727,87 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].bot_count, 42);
         assert!(sources[0].last_fetched_at.is_some());
+    }
+
+    #[test]
+    fn firewall_action_parses_canonical_and_upstream_spellings() {
+        assert_eq!(
+            FirewallAction::parse("allow").unwrap(),
+            FirewallAction::Allow
+        );
+        assert_eq!(
+            FirewallAction::parse("ACCEPT").unwrap(),
+            FirewallAction::Allow
+        );
+        assert_eq!(
+            FirewallAction::parse("block").unwrap(),
+            FirewallAction::Block
+        );
+        assert_eq!(
+            FirewallAction::parse("DROP").unwrap(),
+            FirewallAction::Block
+        );
+        assert_eq!(
+            FirewallAction::parse("REJECT").unwrap(),
+            FirewallAction::Reject
+        );
+        assert!(FirewallAction::parse("nope").is_err());
+    }
+
+    #[test]
+    fn add_firewall_rule_rejects_invalid_addresses() {
+        let db = Db::open_in_memory().unwrap();
+        let result = db.add_firewall_rule(&NewFirewallRule {
+            address: "not-an-ip".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        });
+        assert!(result.is_err());
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn add_firewall_rule_accepts_plain_ips_and_cidr_ranges() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&NewFirewallRule {
+            address: "1.2.3.4".to_string(),
+            port: Some(80),
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+        db.add_firewall_rule(&NewFirewallRule {
+            address: "2001:db8::/32".to_string(),
+            port: None,
+            action: FirewallAction::Allow,
+        })
+        .unwrap();
+
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].address, "1.2.3.4");
+        assert_eq!(rules[0].port, Some(80));
+        assert!(rules[0].enabled);
+        assert_eq!(rules[1].action, FirewallAction::Allow);
+    }
+
+    #[test]
+    fn firewall_rule_enabled_toggle_and_removal() {
+        let db = Db::open_in_memory().unwrap();
+        let id = db
+            .add_firewall_rule(&NewFirewallRule {
+                address: "1.2.3.4".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            })
+            .unwrap();
+
+        db.set_firewall_rule_enabled(id, false).unwrap();
+        assert!(!db.list_firewall_rules().unwrap()[0].enabled);
+
+        db.remove_firewall_rule(id).unwrap();
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+
+        assert!(db.remove_firewall_rule(id).is_err());
+        assert!(db.set_firewall_rule_enabled(id, true).is_err());
     }
 }

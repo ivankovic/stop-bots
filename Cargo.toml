@@ -8,8 +8,8 @@ description = "A TUI that helps you configure your server to stop bad bots and s
 
 [dependencies]
 # For TUI
-ratatui = "0.27"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # For reading nginx config files
 walkdir = "2"
@@ -49,6 +49,10 @@ assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+
+# For driving the TUI through a real pty in e2e tests
+rexpect = "0.7"
+libc = "0.2"
 
 [profile.release]
 opt-level = 2

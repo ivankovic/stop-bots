@@ -88,3 +88,83 @@ fn update_scan_and_apply_blocks_happy_path() {
         .success()
         .stdout(predicate::str::contains("0 file(s) changed"));
 }
+
+#[test]
+fn firewall_add_list_render_remove_happy_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "add-firewall-rule",
+            "--db",
+            db_path,
+            "--address",
+            "1.2.3.4",
+            "--action",
+            "block",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "add-firewall-rule",
+            "--db",
+            db_path,
+            "--address",
+            "66.249.64.0/19",
+            "--action",
+            "allow",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1.2.3.4"))
+        .stdout(predicate::str::contains("66.249.64.0/19"));
+
+    let script_path = tmp.path().join("stop-bots.sh");
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "render-firewall",
+            "--db",
+            db_path,
+            "--backend",
+            "iptables",
+            "--out",
+            script_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Wrote 2 rule(s)"));
+
+    let script = fs::read_to_string(&script_path).unwrap();
+    assert!(script.contains("-A STOP-BOTS -s 1.2.3.4 -j DROP"));
+    assert!(script.contains("-A STOP-BOTS -s 66.249.64.0/19 -j ACCEPT"));
+    // This is the safety property that matters most: the script must never
+    // touch chains/policies outside our own dedicated STOP-BOTS chain.
+    assert!(!script.contains("*filter"));
+    assert!(!script.contains("COMMIT"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["remove-firewall-rule", "--db", db_path, "--id", "1"])
+        .assert()
+        .success();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1.2.3.4").not());
+}

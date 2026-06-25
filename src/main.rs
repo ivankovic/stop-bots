@@ -17,9 +17,10 @@
  */
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
-use stop_bots::{botlist, db::Db, nginx};
+use stop_bots::db::{Db, FirewallAction, NewFirewallRule};
+use stop_bots::{botlist, iptables, nftables, nginx};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
 const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
@@ -58,6 +59,54 @@ enum Command {
         #[arg(long, default_value = DEFAULT_DB_PATH)]
         db: PathBuf,
     },
+    /// Add a firewall rule blocking (or allowing) an IP address or CIDR range
+    AddFirewallRule {
+        /// IP address or CIDR range, e.g. 1.2.3.4 or 5.6.7.0/24
+        #[arg(long)]
+        address: String,
+        /// Restrict the rule to a single TCP port
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, default_value = "block")]
+        action: String,
+        #[arg(long, default_value = DEFAULT_DB_PATH)]
+        db: PathBuf,
+    },
+    /// List all stored firewall rules
+    ListFirewallRules {
+        #[arg(long, default_value = DEFAULT_DB_PATH)]
+        db: PathBuf,
+    },
+    /// Remove a firewall rule by id
+    RemoveFirewallRule {
+        #[arg(long)]
+        id: i64,
+        #[arg(long, default_value = DEFAULT_DB_PATH)]
+        db: PathBuf,
+    },
+    /// Render the stored firewall rules into an iptables or nftables script.
+    /// The script is written to disk only — it is never executed by this
+    /// tool. Review it, then apply it yourself.
+    RenderFirewall {
+        #[arg(long)]
+        backend: FirewallBackend,
+        /// Path to write the generated script to
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = DEFAULT_DB_PATH)]
+        db: PathBuf,
+    },
+    /// Start the TUI (also the default when run with no subcommand)
+    Tui {
+        #[arg(long, default_value = DEFAULT_DB_PATH)]
+        db: PathBuf,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum FirewallBackend {
+    Iptables,
+    Nftables,
 }
 
 #[tokio::main]
@@ -65,14 +114,30 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => {
-            println!("stop-bots: no command given, run with --help to see available commands");
-            Ok(())
-        }
+        None => run_tui(&PathBuf::from(DEFAULT_DB_PATH)).await,
+        Some(Command::Tui { db }) => run_tui(&db).await,
         Some(Command::ScanSites { root, db }) => scan_sites(&root, &db),
         Some(Command::UpdateBotLists { db, source }) => update_bot_lists(&db, source).await,
         Some(Command::ApplyBlocks { root, db }) => apply_blocks(&root, &db),
+        Some(Command::AddFirewallRule {
+            address,
+            port,
+            action,
+            db,
+        }) => add_firewall_rule(&db, address, port, &action),
+        Some(Command::ListFirewallRules { db }) => list_firewall_rules(&db),
+        Some(Command::RemoveFirewallRule { id, db }) => remove_firewall_rule(&db, id),
+        Some(Command::RenderFirewall { backend, out, db }) => render_firewall(&db, backend, &out),
     }
+}
+
+async fn run_tui(db_path: &Path) -> Result<()> {
+    let db = Db::open(db_path)?;
+    let app = stop_bots::app::App::new(db)?;
+    let terminal = ratatui::init();
+    let result = app.run(terminal).await;
+    ratatui::restore();
+    result
 }
 
 fn scan_sites(root: &Path, db_path: &Path) -> Result<()> {
@@ -126,6 +191,75 @@ fn apply_blocks(root: &Path, db_path: &Path) -> Result<()> {
         sites.len(),
         config_paths.len(),
         changed
+    );
+    Ok(())
+}
+
+fn add_firewall_rule(
+    db_path: &Path,
+    address: String,
+    port: Option<u16>,
+    action: &str,
+) -> Result<()> {
+    let db = Db::open(db_path)?;
+    let id = db.add_firewall_rule(&NewFirewallRule {
+        address,
+        port,
+        action: FirewallAction::parse(action)?,
+    })?;
+    println!("Added firewall rule #{id}");
+    Ok(())
+}
+
+fn list_firewall_rules(db_path: &Path) -> Result<()> {
+    let db = Db::open(db_path)?;
+    let rules = db.list_firewall_rules()?;
+    if rules.is_empty() {
+        println!("No firewall rules stored.");
+        return Ok(());
+    }
+    for rule in rules {
+        let port = rule.port.map(|p| format!(":{p}")).unwrap_or_default();
+        let status = if rule.enabled { "" } else { " (disabled)" };
+        println!(
+            "#{} {:?} {}{}{}",
+            rule.id, rule.action, rule.address, port, status
+        );
+    }
+    Ok(())
+}
+
+fn remove_firewall_rule(db_path: &Path, id: i64) -> Result<()> {
+    let db = Db::open(db_path)?;
+    db.remove_firewall_rule(id)?;
+    println!("Removed firewall rule #{id}");
+    Ok(())
+}
+
+fn render_firewall(db_path: &Path, backend: FirewallBackend, out: &Path) -> Result<()> {
+    let db = Db::open(db_path)?;
+    let rules = db.list_firewall_rules()?;
+    let enabled = rules.iter().filter(|r| r.enabled);
+    let (script, run_hint, written) = match backend {
+        FirewallBackend::Iptables => {
+            // iptables is IPv4-only; render() skips IPv6 rules (see SPECS.md).
+            let written = enabled.filter(|r| !r.address.contains(':')).count();
+            (
+                iptables::render(&rules),
+                format!("sh {}", out.display()),
+                written,
+            )
+        }
+        FirewallBackend::Nftables => (
+            nftables::render(&rules),
+            format!("nft -f {}", out.display()),
+            enabled.count(),
+        ),
+    };
+    std::fs::write(out, script)?;
+    println!(
+        "Wrote {written} rule(s) to {}. Not applied automatically — review it, then run: {run_hint}",
+        out.display()
     );
     Ok(())
 }
