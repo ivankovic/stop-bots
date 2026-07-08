@@ -19,6 +19,7 @@
 //! Terminal event plumbing, following the Ratatui event-driven-async
 //! template (<https://github.com/ratatui/templates/tree/main/event-driven-async>).
 
+use crate::db::NewBot;
 use anyhow::{Context, Result};
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
@@ -46,6 +47,14 @@ pub enum Event {
 pub enum AppEvent {
     /// Quit the application.
     Quit,
+    /// A background bot-list source fetch (started from the Bot settings
+    /// screen) has finished. Carries the source's display name (for the
+    /// status message) and either the parsed bots or a stringified error —
+    /// `anyhow::Error` isn't `Clone`, which `Event` needs to be.
+    SourceUpdateFinished {
+        name: String,
+        result: Result<Vec<NewBot>, String>,
+    },
 }
 
 /// Terminal event handler: spawns a background task that emits tick events
@@ -76,6 +85,12 @@ impl EventHandler {
     pub fn send(&self, app_event: AppEvent) {
         // Ignored: the receiver can't be dropped while this handle is alive.
         let _ = self.sender.send(Event::App(app_event));
+    }
+
+    /// Clones the sender half, for background tasks (e.g. a bot-list fetch)
+    /// that need to report a result back into the event loop.
+    pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
+        self.sender.clone()
     }
 }
 

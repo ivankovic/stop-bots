@@ -1,8 +1,10 @@
 //! End-to-end happy-path test for the TUI, driven through a real pty (via
 //! `rexpect`) since `ratatui::init()` requires one — `assert_cmd` alone
-//! can't exercise this, it has no pty. Covers: launch -> Bot settings ->
-//! open/confirm a category popup -> Dashboard reflects the change -> quit.
+//! can't exercise this, it has no pty. Covers: launch -> open/confirm a
+//! category popup right on the Dashboard -> Bot settings shows the seeded
+//! source and opens its update-confirmation popup -> quit.
 
+use assert_cmd::Command as AssertCommand;
 use rexpect::session::{spawn_command, PtySession};
 use rexpect::ReadUntil;
 use std::os::fd::AsRawFd;
@@ -49,6 +51,19 @@ fn send_key(session: &mut PtySession, keys: &str) {
     session.flush().unwrap();
 }
 
+/// Sends a bare Escape, separated from whatever comes next by a short
+/// pause. crossterm's raw-mode parser briefly buffers a lone ESC byte to
+/// see whether it's the start of an Alt-modified key (ESC immediately
+/// followed by a character) or a standalone Escape press; sending the next
+/// key right behind it risks exactly that misparse — e.g. Esc+`d` arriving
+/// as one `Alt+d` event, which a popup's key handler then silently
+/// swallows (any key other than the few it recognizes is just consumed),
+/// leaving the popup open and the rest of the test waiting forever.
+fn send_escape(session: &mut PtySession) {
+    send_key(session, "\x1b");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+}
+
 /// Waits for `anchor` (e.g. a row label like "Scanners") and then for the
 /// `[ ALLOWED ]`/`[ BLOCKED ]` tag that immediately follows it, returning
 /// which one matched.
@@ -81,45 +96,185 @@ fn expect_status_after(session: &mut PtySession, anchor: &str) -> &'static str {
 #[test]
 fn navigate_change_a_setting_and_quit() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+    let db_path = tmp.path().join("db.sqlite3");
 
-    // Dashboard is the default screen. Scanners starts out Blocked.
+    // Seed one bot-list source (no network access) so the Bot settings
+    // screen below has a source row to show.
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+
+    let mut session = spawn_tui(&db_path);
+
+    // Dashboard is the default screen. Scanners starts out Blocked, and is
+    // the first row, already selected.
     session.exp_string("Dashboard").unwrap();
     assert_eq!(expect_status_after(&mut session, "Scanners"), "BLOCKED");
 
-    // Switch to Bot settings.
-    send_key(&mut session, "b");
-    session.exp_string("Categories & bots").unwrap();
-
-    // Open the popup for the first row (Scanners, currently Blocked).
+    // Open the popup for the selected row (Scanners) right on the
+    // Dashboard — category defaults are edited here now, not on Bot
+    // settings. (Checked as two separate substrings, not the literal
+    // "Scanners default": the terminal output is diffed against the
+    // previous frame, and the space between the two words happens to land
+    // on a cell that was already blank, so the diff skips re-sending it —
+    // splitting the space out of the match avoids depending on that.)
     send_key(&mut session, "\r");
-    session.exp_string("Scanners default").unwrap();
+    session.exp_string("Scanners").unwrap();
+    session.exp_string("default").unwrap();
     session.exp_string("Allowed").unwrap();
     session.exp_string("Blocked").unwrap();
 
     // Move up to "Allowed" and confirm; the popup closes and the row
-    // updates immediately. (Plain `exp_string`, not anchored on "Scanners",
-    // is correct here: terminal output is diffed, so on this same,
-    // already-drawn screen only the cell that actually changed — this
-    // row's tag — gets retransmitted. Search Bots' tag was already
-    // consumed earlier and won't reappear since it didn't change.)
+    // updates immediately, on the same screen.
     send_key(&mut session, "\x1b[A");
     send_key(&mut session, "\r");
     session.exp_string("[ ALLOWED ]").unwrap();
+    session.exp_string("set").unwrap();
+    session.exp_string("to").unwrap();
+    session.exp_string("Allowed").unwrap();
 
-    // Back to the Dashboard: the change (and a status message about it)
-    // must be visible here too — this is exactly the cross-screen refresh
-    // that was broken until the `Mutated` outcome was introduced. (Without
-    // that fix this would still find "ALLOWED" on screen regardless, since
-    // Search Bots is allowed by default — anchoring to the "Scanners" label
-    // specifically is what makes this check meaningful.)
+    // Bot settings now shows bot-list sources (not categories): the seeded
+    // source, with its signal count, plus the known bots.
+    send_key(&mut session, "b");
+    session.exp_string("sources").unwrap();
+    session.exp_string("ArcJet").unwrap();
+    session.exp_string("bots").unwrap();
+    session.exp_string("4").unwrap();
+
+    // Enter on the source row opens an update-confirmation popup, not an
+    // immediate fetch.
+    send_key(&mut session, "\r");
+    session.exp_string("Update").unwrap();
+    session.exp_string("ArcJet").unwrap();
+    session.exp_string("Cancel").unwrap();
+    session.exp_string("Update").unwrap();
+    session.exp_string("now").unwrap();
+
+    // Cancel rather than confirm: this test must not touch the network.
+    send_escape(&mut session);
+
+    // Back to the Dashboard: the category change made earlier must still
+    // be visible here — this is exactly the cross-screen refresh that was
+    // broken until the `Mutated` outcome was introduced.
     send_key(&mut session, "d");
     assert_eq!(expect_status_after(&mut session, "Scanners"), "ALLOWED");
-    session
-        .exp_string("Scanners default set to Allowed")
-        .unwrap();
 
     // Quit from the Dashboard.
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
+#[test]
+fn bot_settings_shows_the_known_source_before_any_fetch_has_ever_run() {
+    // No `update-bot-lists` seeding step here, unlike the test above: a
+    // brand-new install's DB has no rows in `sources` at all. Without
+    // `App::new` registering the well-known-bots source on startup, the Bot
+    // settings screen would render an empty list with nothing to select and
+    // no way to trigger a first fetch from the TUI.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "b");
+    session.exp_string("sources").unwrap();
+    session.exp_string("ArcJet").unwrap();
+    session.exp_string("never updated").unwrap();
+
+    // The row is selectable and its "Update now" option still works, even
+    // though the source has never been fetched.
+    send_key(&mut session, "\r");
+    session.exp_string("Update").unwrap();
+    session.exp_string("ArcJet").unwrap();
+    session.exp_string("Cancel").unwrap();
+
+    send_escape(&mut session);
+
+    // `q` on Bot settings backs out to the Dashboard; a second `q`, now on
+    // the Dashboard, actually quits. Anchored on "wide" (System-wide
+    // settings), not "Dashboard": the tab label reads "Dashboard" already
+    // while on Bot settings (just unbolded), so the diffed terminal output
+    // never re-sends that exact text — "wide" only appears once we're
+    // actually back.
+    send_key(&mut session, "q");
+    session.exp_string("wide").unwrap();
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
+#[test]
+fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    // Seed four bots (no network access) so there's something to search.
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+
+    let mut session = spawn_tui(&db_path);
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "b");
+    session.exp_string("Bot details").unwrap();
+
+    // Before typing anything, the panel just hints at the search box rather
+    // than dumping every bot — that's the whole point of this screen.
+    session.exp_string("Press").unwrap();
+    session.exp_string("search").unwrap();
+
+    // "jyxo" uniquely matches "Jyxo Crawler" among the seeded bots, and
+    // isn't a substring of anything else already on screen (the source
+    // name, "Bot list sources", etc.) — picked so the diffed terminal
+    // output can't skip retransmitting it by coincidence (see SPECS.md's
+    // note on that gotcha in this test file).
+    send_key(&mut session, "/");
+    send_key(&mut session, "jyxo");
+    session.exp_string("Jyxo Crawler").unwrap();
+
+    // Enter on the (only) match opens its override popup.
+    send_key(&mut session, "\r");
+    session.exp_string("Override").unwrap();
+    session.exp_string("jyxo-crawler").unwrap();
+    session.exp_string("Use system settings").unwrap();
+    session.exp_string("Allowed").unwrap();
+    session.exp_string("Blocked").unwrap();
+
+    // Cancel via Escape rather than confirm: this test isn't about the
+    // override write path, which is already covered by unit tests.
+    send_escape(&mut session);
+
+    // Escape again leaves the search box (query preserved) without backing
+    // all the way out to the Dashboard. There's no new text to anchor on for
+    // that transition (only a border color changes) — proved indirectly
+    // instead: if focus hadn't actually returned to the sources panel, the
+    // `q` below would be swallowed as literal search-query text (Bot
+    // details treats every printable key as query text while focused)
+    // rather than backing out to the Dashboard, and the next `exp_string`
+    // would time out.
+    send_escape(&mut session);
+
+    send_key(&mut session, "q");
+    session.exp_string("wide").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -145,8 +300,12 @@ fn help_screen_opens_and_returns_to_the_previous_screen() {
 
     // `q` on a non-Dashboard screen backs out to the Dashboard rather than
     // quitting; only a second `q`, now on the Dashboard, actually quits.
+    // (Anchored on "wide", not "System-wide": the leading "S" lands on the
+    // same cell the previous screen's "Sites" title left a coincidentally
+    // identical "S", so the diffed terminal output never re-sends it.)
     send_key(&mut session, "q");
-    session.exp_string("Overview").unwrap();
+    session.exp_string("wide").unwrap();
+    session.exp_string("settings").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()

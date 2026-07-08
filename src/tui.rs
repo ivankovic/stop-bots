@@ -132,7 +132,7 @@ impl Screen {
 /// What a screen's key handler did with a key press, so [`App`] knows
 /// whether to fall back to global key handling (quit, theme toggle, screen
 /// switching, ...).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyOutcome {
     /// The key was handled (e.g. list navigation) with no change other
     /// screens need to know about.
@@ -146,6 +146,9 @@ pub enum KeyOutcome {
     Back,
     /// Not relevant to this screen; let the caller handle it.
     Ignored,
+    /// The Bot settings screen confirmed updating the named bot-list source.
+    /// `App` owns the event loop, so it's the one that spawns the fetch.
+    UpdateSource(String),
 }
 
 /// Returns a `Rect` of exactly `width` x `height` cells, centered within

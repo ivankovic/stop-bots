@@ -19,6 +19,7 @@
 //! The app controller: owns all TUI state, runs the event loop, and routes
 //! key presses to the active screen (falling back to global key handling).
 
+use crate::botlist;
 use crate::db::Db;
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::tui::{self, KeyOutcome, Screen, Theme};
@@ -55,6 +56,7 @@ impl App {
             bot_settings: tui::bot_settings::BotSettings::default(),
             site_settings: tui::site_settings::SiteSettings::default(),
         };
+        botlist::register_source(&app.db)?;
         app.refresh()?;
         Ok(app)
     }
@@ -80,6 +82,49 @@ impl App {
                 }
                 Event::Crossterm(_) => {}
                 Event::App(AppEvent::Quit) => self.running = false,
+                Event::App(AppEvent::SourceUpdateFinished { name, result }) => {
+                    self.finish_source_update(name, result)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Starts a background fetch+parse of the named bot-list source (there's
+    /// only one today, `botlist::SOURCE_ID`, so it's the only fetcher this
+    /// reaches for). Runs off the main thread because `Db`'s connection isn't
+    /// `Sync` — the spawned task only fetches and parses; storing the result
+    /// happens back on the main thread in `finish_source_update`.
+    fn start_source_update(&mut self, name: String) {
+        self.message = Some(format!("Updating {name}…"));
+        let sender = self.events.sender();
+        tokio::spawn(async move {
+            let result = async {
+                let json = botlist::fetch().await?;
+                botlist::parse(&json)
+            }
+            .await
+            .map_err(|err| err.to_string());
+            let _ = sender.send(Event::App(AppEvent::SourceUpdateFinished { name, result }));
+        });
+    }
+
+    /// Stores the fetched bots (on success) and reports the outcome, run
+    /// back on the main thread once the background fetch in
+    /// `start_source_update` completes.
+    fn finish_source_update(
+        &mut self,
+        name: String,
+        result: Result<Vec<crate::db::NewBot>, String>,
+    ) -> Result<()> {
+        match result {
+            Ok(bots) => {
+                let count = botlist::store(&self.db, &bots)?;
+                self.message = Some(format!("Stored {count} bot(s) from {name}"));
+                self.refresh()?;
+            }
+            Err(err) => {
+                self.message = Some(format!("Failed to update {name}: {err}"));
             }
         }
         Ok(())
@@ -99,7 +144,9 @@ impl App {
         }
 
         let outcome = match self.screen {
-            Screen::Dashboard => KeyOutcome::Ignored,
+            Screen::Dashboard => self
+                .dashboard
+                .handle_key(key, &self.db, &mut self.message)?,
             Screen::BotSettings => {
                 self.bot_settings
                     .handle_key(key, &self.db, &mut self.message)?
@@ -120,6 +167,10 @@ impl App {
             }
             KeyOutcome::Back => {
                 self.screen = Screen::Dashboard;
+                return Ok(());
+            }
+            KeyOutcome::UpdateSource(name) => {
+                self.start_source_update(name);
                 return Ok(());
             }
             KeyOutcome::Ignored => {}

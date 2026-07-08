@@ -327,6 +327,26 @@ impl Db {
         Ok(())
     }
 
+    /// Registers `source` if no source with that `id` exists yet; a no-op
+    /// otherwise. Unlike [`Self::upsert_source`], this never overwrites an
+    /// already-fetched source's `last_fetched_at`/`bot_count` — it's meant to
+    /// make a known source selectable (and thus fetchable) in the TUI before
+    /// it has ever been fetched, not to refresh one that has.
+    pub fn register_source(&self, source: &Source) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sources (id, name, url, last_fetched_at, bot_count)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                source.id,
+                source.name,
+                source.url,
+                source.last_fetched_at,
+                source.bot_count
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Records that `id` was just fetched, with `bot_count` bots found.
     pub fn touch_source(&self, id: &str, bot_count: i64) -> Result<()> {
         self.conn.execute(
@@ -727,6 +747,50 @@ mod tests {
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].bot_count, 42);
         assert!(sources[0].last_fetched_at.is_some());
+    }
+
+    #[test]
+    fn register_source_does_not_clobber_an_already_fetched_source() {
+        let db = Db::open_in_memory().unwrap();
+        let source = Source {
+            id: "well-known-bots".to_string(),
+            name: "ArcJet Well-Known Bots".to_string(),
+            url: "https://example.invalid/bots.json".to_string(),
+            last_fetched_at: None,
+            bot_count: 0,
+        };
+        db.upsert_source(&source).unwrap();
+        db.touch_source("well-known-bots", 42).unwrap();
+
+        // Re-registering the same id (e.g. on every TUI startup) must not
+        // reset a source that's already been fetched back to "never
+        // updated / 0 bots".
+        db.register_source(&source).unwrap();
+
+        let sources = db.list_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].bot_count, 42);
+        assert!(sources[0].last_fetched_at.is_some());
+    }
+
+    #[test]
+    fn register_source_makes_an_unfetched_source_appear() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.list_sources().unwrap().is_empty());
+
+        db.register_source(&Source {
+            id: "well-known-bots".to_string(),
+            name: "ArcJet Well-Known Bots".to_string(),
+            url: "https://example.invalid/bots.json".to_string(),
+            last_fetched_at: None,
+            bot_count: 0,
+        })
+        .unwrap();
+
+        let sources = db.list_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].last_fetched_at.is_none());
+        assert_eq!(sources[0].bot_count, 0);
     }
 
     #[test]

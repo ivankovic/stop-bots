@@ -112,6 +112,20 @@ pub async fn fetch() -> Result<String> {
     Ok(body)
 }
 
+/// Registers the well-known-bots source in `db` if it isn't there yet,
+/// without touching an already-fetched source's state. Called on TUI
+/// startup so the source shows up (as "never updated") and can be selected
+/// to trigger a first fetch, even before anything has ever been downloaded.
+pub fn register_source(db: &Db) -> Result<()> {
+    db.register_source(&Source {
+        id: SOURCE_ID.to_string(),
+        name: SOURCE_NAME.to_string(),
+        url: SOURCE_URL.to_string(),
+        last_fetched_at: None,
+        bot_count: 0,
+    })
+}
+
 /// Stores `bots` in `db`, registering/refreshing the source entry. Returns
 /// the number of bots stored.
 pub fn store(db: &Db, bots: &[NewBot]) -> Result<usize> {
@@ -185,6 +199,33 @@ mod tests {
     fn humanize_titlecases_each_word() {
         assert_eq!(humanize("google-crawler"), "Google Crawler");
         assert_eq!(humanize("gptbot"), "Gptbot");
+    }
+
+    #[test]
+    fn register_source_makes_it_visible_before_any_fetch() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.list_sources().unwrap().is_empty());
+
+        register_source(&db).unwrap();
+
+        let sources = db.list_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, SOURCE_ID);
+        assert!(sources[0].last_fetched_at.is_none());
+    }
+
+    #[test]
+    fn register_source_does_not_clobber_a_real_fetch() {
+        let db = Db::open_in_memory().unwrap();
+        let bots = parse(SAMPLE).unwrap();
+        store(&db, &bots).unwrap();
+
+        register_source(&db).unwrap();
+
+        let sources = db.list_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].bot_count, 4);
+        assert!(sources[0].last_fetched_at.is_some());
     }
 
     #[test]

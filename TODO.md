@@ -10,9 +10,15 @@
 - `update-bot-lists` only knows about one source (well-known-bots). Add more
   sources (e.g. official per-vendor IP-range feeds) once the single-source
   pipeline has proven out.
-- No CLI verb to change category defaults or per-bot status (the TUI's Bot
-  settings screen covers this now; `Db::set_category_default` /
-  `Db::set_bot_status` just aren't wired up as `stop-bots` subcommands too).
+- No CLI verb to change category defaults or per-bot status (the TUI covers
+  this now — category defaults on the Dashboard, per-bot overrides on Bot
+  settings; `Db::set_category_default` / `Db::set_bot_status` just aren't
+  wired up as `stop-bots` subcommands too).
+- `update-bot-lists`/Bot settings' "Update now" popup both still only know
+  about the one `well-known-bots` source (see the item above about adding
+  more sources) — the TUI's per-source update is wired generically (any row
+  in the sources list can trigger it), but the actual fetch always reaches
+  for `botlist::fetch`, so a second source wouldn't update for real yet.
 - Geo-blocking is out of scope for this pass.
 - The TUI has no screen for firewall rules (`add-firewall-rule` etc. are
   CLI-only) or for adjusting NGINX/firewall settings per site (Site settings

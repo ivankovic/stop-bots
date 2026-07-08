@@ -1,15 +1,22 @@
 # Pending
 
-- Exploratory testing found: The dashboard should allow the user to change the system-wide settings.
-  up/down arrow should cycle through system settings, the same it does currently on the bot settings
-  page.
-- Exploratory testing found: Bot settings page should not show system-wide bot blocking settings,
-  that should be on the dashboard.
-- Exploratory testing found: Bot settings page should be a list of all sources of bot lists, when
-  they were last updated, how many bot signals there are in the list and arrow keys should allow
-  the user to select a specific source and 'Enter' should pop-up a confirmation dialog for updating that list.
-
 # Completed
+
+- ✅ Exploratory testing found: the Dashboard should allow changing the
+  system-wide settings, with up/down cycling through them the same way Bot
+  settings already did. The Dashboard's "Overview" panel (`src/tui/dashboard.rs`)
+  is now a navigable list of the three category defaults; Enter opens the
+  same Allowed/Blocked popup Bot settings used to own for them.
+- ✅ Exploratory testing found: Bot settings shouldn't show the system-wide
+  bot-blocking settings — moved to the Dashboard (see above); Bot settings
+  no longer has category rows.
+- ✅ Exploratory testing found: Bot settings should list all bot-list
+  sources (last updated, signal count), with arrow keys to select one and
+  Enter popping a confirmation dialog before updating it. Added to
+  `src/tui/bot_settings.rs`, alongside (not replacing) the existing per-bot
+  override list. Confirming "Update now" fetches and stores the source's
+  bots without blocking the UI thread — see the `KeyOutcome::UpdateSource`
+  / `AppEvent::SourceUpdateFinished` plumbing in SPECS.md.
 
 - ✅ Implemented SQLite storage (`src/db.rs`): sources, bots, sites, and
   global per-category default settings, with manual bot overrides surviving
@@ -29,10 +36,11 @@
   `iptables`/`nft` itself (a deliberate choice; see SPECS.md and TODO.md).
 - ✅ Implemented the TUI (`src/app.rs`, `src/event.rs`, `src/tui.rs`,
   `src/tui/`), following the Ratatui event-driven-async template: Dashboard
-  (default, read-only overview), Bot settings (category defaults + per-bot
-  overrides via a popup), Site settings (read-only site list), Help —
-  matching the screen names/roles already decided in the entries below.
-  Running the binary with no subcommand now launches it, per README.
+  (default overview, with editable category defaults — see below), Bot
+  settings (bot-list sources + per-bot overrides, each via a popup), Site
+  settings (read-only site list), Help — matching the screen names/roles
+  already decided in the entries below. Running the binary with no
+  subcommand now launches it, per README.
 - ✅ Added an automated e2e test for the TUI (`tests/tui.rs`), driving the
   real compiled binary through a pty via `rexpect` (`assert_cmd` can't do
   this — no pty). Turns the manual tmux-verification session below into a

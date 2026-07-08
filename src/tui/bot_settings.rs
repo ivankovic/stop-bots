@@ -16,34 +16,53 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! The Bot settings screen: the three global category defaults (Scanners,
-//! Search Bots, AI Bots) plus every known bot and its effective status.
-//! Enter/Space opens a popup to change the selected row; Escape closes the
-//! popup without saving.
+//! The Bot settings screen: two panels, since the combined source+bot list
+//! got too long to scan once a source actually had hundreds of bots in it.
+//! "Bot list sources" (top) lists every bot-list source — name, last
+//! fetched, signal/bot count — with Enter opening a Cancel/Update-now
+//! confirmation popup. "Bot details" (bottom) holds a search box: press `/`
+//! to focus it, type (part of) a bot's name, and Enter on a match opens a
+//! popup to set that bot's status: "Use system settings" (the default —
+//! follows whichever category default applies, see the Dashboard), or an
+//! explicit "Allowed"/"Blocked" override. Every matched bot's row always
+//! shows a `(system)` or `(override)` tag alongside its effective
+//! `[ ALLOWED ]`/`[ BLOCKED ]` state, so it's never ambiguous which one is
+//! actually driving that state. The three global category defaults used to
+//! live here too; they've moved to the Dashboard.
+//!
+//! Only one of the two panels has keyboard focus at a time ([`Focus`]).
+//! While the search box is focused, every printable key is query text (bot
+//! names can contain spaces, digits, anything) rather than a shortcut —
+//! Escape is what returns focus to the sources panel. Escape with no popup
+//! and no search focus backs out to the Dashboard, matching every other
+//! screen.
 
-use crate::db::{Bot, BotStatus, Category, Db, Policy};
+use crate::db::{Bot, BotStatus, Category, Db, Policy, Source};
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A row in the combined category + bot list.
-#[derive(Debug, Clone, Copy)]
-enum Row {
-    Category(Category),
-    Bot(usize),
+/// Which panel keyboard input currently goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Focus {
+    #[default]
+    Sources,
+    Search,
 }
 
 /// What's being changed in the open popup, and the options to cycle through.
 #[derive(Debug, Clone)]
 enum PopupTarget {
-    Category(Category),
+    /// Confirming a refresh of the named source.
+    Source(String),
     Bot(String),
 }
 
@@ -56,103 +75,143 @@ struct Popup {
 
 #[derive(Debug, Default)]
 pub struct BotSettings {
+    sources: Vec<Source>,
     bots: Vec<Bot>,
     scanner_default: Policy,
     search_default: Policy,
     ai_default: Policy,
-    list_state: ListState,
+    sources_state: ListState,
+    query: String,
+    results_state: ListState,
+    focus: Focus,
     popup: Option<Popup>,
 }
 
 impl BotSettings {
     pub fn refresh(&mut self, db: &Db) -> Result<()> {
+        self.sources = db.list_sources()?;
         self.bots = db.list_bots()?;
+        // Not shown here anymore (see the Dashboard), but still needed to
+        // compute each bot's effective policy below.
         self.scanner_default = db.get_category_default(Category::Scanner)?;
         self.search_default = db.get_category_default(Category::Search)?;
         self.ai_default = db.get_category_default(Category::Ai)?;
-        if self.list_state.selected().is_none() {
-            self.list_state.select(Some(0));
+        if self.sources_state.selected().is_none() {
+            self.sources_state.select(Some(0));
         }
         Ok(())
     }
 
-    fn rows(&self) -> Vec<Row> {
-        let mut rows = vec![
-            Row::Category(Category::Scanner),
-            Row::Category(Category::Search),
-            Row::Category(Category::Ai),
-        ];
-        rows.extend((0..self.bots.len()).map(Row::Bot));
-        rows
+    /// Bots whose name or slug contains the current search query
+    /// (case-insensitive). Empty until something is typed — the whole point
+    /// of the search box is to avoid ever dumping the full bot list on
+    /// screen at once.
+    fn filtered_bots(&self) -> Vec<&Bot> {
+        if self.query.is_empty() {
+            return Vec::new();
+        }
+        let query = self.query.to_lowercase();
+        self.bots
+            .iter()
+            .filter(|bot| {
+                bot.name.to_lowercase().contains(&query) || bot.slug.to_lowercase().contains(&query)
+            })
+            .collect()
     }
 
-    fn category_default(&self, category: Category) -> Policy {
-        match category {
-            Category::Scanner => self.scanner_default,
-            Category::Search => self.search_default,
-            Category::Ai => self.ai_default,
+    /// Snaps the results selection back to the top match, or clears it if
+    /// the query no longer has any. Called whenever the query text changes.
+    fn reset_results_selection(&mut self) {
+        if self.filtered_bots().is_empty() {
+            self.results_state.select(None);
+        } else {
+            self.results_state.select(Some(0));
         }
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let rows = self.rows();
-        let items: Vec<ListItem> = rows
-            .iter()
-            .map(|row| ListItem::new(self.row_line(*row)))
-            .collect();
+        let sources_height = (self.sources.len() as u16 + 2).clamp(3, 8);
+        let [sources_area, details_area] =
+            Layout::vertical([Constraint::Length(sources_height), Constraint::Min(3)]).areas(area);
 
-        let list = List::new(items)
-            .block(
-                Block::bordered()
-                    .title("Categories & bots")
-                    .fg(theme.accent()),
-            )
-            .highlight_style(ratatui::style::Style::new().reversed());
-        frame.render_stateful_widget(list, area, &mut self.list_state);
+        self.render_sources(frame, sources_area, theme);
+        self.render_details(frame, details_area, theme);
 
         if let Some(popup) = &self.popup {
             self.render_popup(frame, area, popup);
         }
     }
 
-    fn row_line(&self, row: Row) -> Line<'static> {
-        match row {
-            Row::Category(category) => {
-                let label = match category {
-                    Category::Scanner => "Scanners",
-                    Category::Search => "Search Bots",
-                    Category::Ai => "AI Bots",
-                };
-                let mut line = vec![Span::from(format!("{label:<24}")).bold()];
-                line.push(policy_tag(self.category_default(category)));
-                Line::from(line)
-            }
-            Row::Bot(index) => {
-                let bot = &self.bots[index];
-                let effective = effective_policy(
+    fn render_sources(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let items: Vec<ListItem> = self
+            .sources
+            .iter()
+            .map(|source| ListItem::new(source_line(source)))
+            .collect();
+
+        let mut block = Block::bordered().title("Bot list sources");
+        if self.focus == Focus::Sources {
+            block = block.fg(theme.accent());
+        }
+        let list = List::new(items)
+            .block(block)
+            .highlight_style(ratatui::style::Style::new().reversed());
+        frame.render_stateful_widget(list, area, &mut self.sources_state);
+    }
+
+    fn render_details(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let mut block = Block::bordered().title("Bot details");
+        if self.focus == Focus::Search {
+            block = block.fg(theme.accent());
+        }
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let [search_area, results_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+        frame.render_widget(Paragraph::new(self.search_line()), search_area);
+
+        let matches = self.filtered_bots();
+        if matches.is_empty() {
+            let hint = if !self.query.is_empty() {
+                format!("No bots match \"{}\".", self.query)
+            } else if self.bots.is_empty() {
+                "No bots yet — pick a source above and \"Update now\" to download some.".to_string()
+            } else {
+                "Press / then type a bot name to search.".to_string()
+            };
+            frame.render_widget(Paragraph::new(hint).dim(), results_area);
+            return;
+        }
+
+        let items: Vec<ListItem> = matches
+            .iter()
+            .map(|bot| {
+                ListItem::new(bot_line(
                     bot,
                     self.ai_default,
                     self.search_default,
                     self.scanner_default,
-                );
-                let mut line = vec![Span::from(format!("  {:<22}", bot.name))];
-                line.push(policy_tag(effective));
-                if bot.status != BotStatus::Default {
-                    line.push(Span::from(" (override)").dim());
-                }
-                Line::from(line)
+                ))
+            })
+            .collect();
+        let list = List::new(items).highlight_style(ratatui::style::Style::new().reversed());
+        frame.render_stateful_widget(list, results_area, &mut self.results_state);
+    }
+
+    fn search_line(&self) -> Line<'static> {
+        match self.focus {
+            Focus::Search => format!("/{}\u{2588}", self.query).into(),
+            Focus::Sources if self.query.is_empty() => {
+                Line::from(Span::from("Press / to search bots by name").dim())
             }
+            Focus::Sources => Line::from(Span::from(format!("/{}", self.query)).dim()),
         }
     }
 
     fn render_popup(&self, frame: &mut Frame, area: Rect, popup: &Popup) {
         let title = match &popup.target {
-            PopupTarget::Category(category) => match category {
-                Category::Scanner => "Scanners default",
-                Category::Search => "Search Bots default",
-                Category::Ai => "AI Bots default",
-            }
-            .to_string(),
+            PopupTarget::Source(name) => format!("Update {name}?"),
             PopupTarget::Bot(slug) => format!("Override: {slug}"),
         };
 
@@ -208,6 +267,17 @@ impl BotSettings {
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     let popup = self.popup.take().expect("checked above");
+                    if matches!(popup.target, PopupTarget::Source(_)) {
+                        let confirmed = popup.selected == 1;
+                        let PopupTarget::Source(name) = popup.target else {
+                            unreachable!("checked above")
+                        };
+                        return Ok(if confirmed {
+                            KeyOutcome::UpdateSource(name)
+                        } else {
+                            KeyOutcome::Consumed
+                        });
+                    }
                     *message = Some(self.apply_popup(db, popup)?);
                     // The caller (`App`) reloads every screen on `Mutated`,
                     // so no need to refresh `self` here too.
@@ -217,80 +287,128 @@ impl BotSettings {
             }
         }
 
-        match key.code {
-            KeyCode::Esc => return Ok(KeyOutcome::Back),
-            KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
-            KeyCode::Down | KeyCode::Char('j') => self.list_state.select_next(),
-            KeyCode::Enter | KeyCode::Char(' ') => self.open_popup(),
-            _ => return Ok(KeyOutcome::Ignored),
+        match self.focus {
+            Focus::Sources => match key.code {
+                KeyCode::Esc => return Ok(KeyOutcome::Back),
+                KeyCode::Up | KeyCode::Char('k') => self.sources_state.select_previous(),
+                KeyCode::Down | KeyCode::Char('j') => self.sources_state.select_next(),
+                KeyCode::Enter | KeyCode::Char(' ') => self.open_source_popup(),
+                KeyCode::Char('/') => self.focus = Focus::Search,
+                _ => return Ok(KeyOutcome::Ignored),
+            },
+            Focus::Search => match key.code {
+                // Esc leaves the search box rather than backing out to the
+                // Dashboard — a second Esc (now with Sources focused and no
+                // popup open) does that instead, same nested-back-out
+                // pattern popups already use.
+                KeyCode::Esc => self.focus = Focus::Sources,
+                KeyCode::Up => self.results_state.select_previous(),
+                KeyCode::Down => self.results_state.select_next(),
+                KeyCode::Enter => self.open_bot_popup(),
+                KeyCode::Backspace => {
+                    self.query.pop();
+                    self.reset_results_selection();
+                }
+                // Includes Space: bot names can contain one, so it's query
+                // text here rather than the "confirm" shortcut Space is
+                // everywhere else in this app.
+                KeyCode::Char(c) => {
+                    self.query.push(c);
+                    self.reset_results_selection();
+                }
+                _ => return Ok(KeyOutcome::Ignored),
+            },
         }
         Ok(KeyOutcome::Consumed)
     }
 
-    fn open_popup(&mut self) {
-        let rows = self.rows();
-        let Some(selected) = self.list_state.selected() else {
+    fn open_source_popup(&mut self) {
+        let Some(selected) = self.sources_state.selected() else {
             return;
         };
-        let Some(row) = rows.get(selected) else {
+        let Some(source) = self.sources.get(selected) else {
             return;
         };
-        self.popup = Some(match *row {
-            Row::Category(category) => Popup {
-                target: PopupTarget::Category(category),
-                options: vec!["Allowed", "Blocked"],
-                selected: match self.category_default(category) {
-                    Policy::Allowed => 0,
-                    Policy::Blocked => 1,
-                },
-            },
-            Row::Bot(index) => {
-                let bot = &self.bots[index];
-                Popup {
-                    target: PopupTarget::Bot(bot.slug.clone()),
-                    options: vec!["Default", "Allowed", "Blocked"],
-                    selected: match bot.status {
-                        BotStatus::Default => 0,
-                        BotStatus::Allowed => 1,
-                        BotStatus::Blocked => 2,
-                    },
-                }
-            }
+        self.popup = Some(Popup {
+            target: PopupTarget::Source(source.name.clone()),
+            options: vec!["Cancel", "Update now"],
+            selected: 0,
         });
     }
 
-    /// Writes the popup's selected option to `db` and returns a status message.
+    fn open_bot_popup(&mut self) {
+        let Some(selected) = self.results_state.selected() else {
+            return;
+        };
+        let matches = self.filtered_bots();
+        let Some(bot) = matches.get(selected) else {
+            return;
+        };
+        self.popup = Some(Popup {
+            target: PopupTarget::Bot(bot.slug.clone()),
+            options: vec!["Use system settings", "Allowed", "Blocked"],
+            selected: match bot.status {
+                BotStatus::Default => 0,
+                BotStatus::Allowed => 1,
+                BotStatus::Blocked => 2,
+            },
+        });
+    }
+
+    /// Writes the popup's selected option to `db` and returns a status
+    /// message. Only ever called for a [`PopupTarget::Bot`] popup — a
+    /// [`PopupTarget::Source`] confirmation is handled in `handle_key`
+    /// before reaching here, since it triggers an async fetch rather than a
+    /// direct write.
     fn apply_popup(&self, db: &Db, popup: Popup) -> Result<String> {
-        match popup.target {
-            PopupTarget::Category(category) => {
-                let policy = match popup.selected {
-                    0 => Policy::Allowed,
-                    _ => Policy::Blocked,
-                };
-                db.set_category_default(category, policy)?;
-                Ok(format!(
-                    "{} default set to {policy:?}",
-                    category_label(category)
-                ))
-            }
-            PopupTarget::Bot(slug) => {
-                let status = match popup.selected {
-                    0 => BotStatus::Default,
-                    1 => BotStatus::Allowed,
-                    _ => BotStatus::Blocked,
-                };
-                db.set_bot_status(&slug, status)?;
-                Ok(format!("{slug} set to {status:?}"))
-            }
-        }
+        let PopupTarget::Bot(slug) = popup.target else {
+            unreachable!("Source popups are handled before reaching apply_popup")
+        };
+        let status = match popup.selected {
+            0 => BotStatus::Default,
+            1 => BotStatus::Allowed,
+            _ => BotStatus::Blocked,
+        };
+        db.set_bot_status(&slug, status)?;
+        Ok(format!("{slug} set to {}", status_label(status)))
     }
 }
 
-fn category_label(category: Category) -> &'static str {
-    match category {
-        Category::Scanner => "Scanners",
-        Category::Search => "Search Bots",
-        Category::Ai => "AI Bots",
+fn source_line(source: &Source) -> Line<'static> {
+    Line::from(vec![
+        Span::from(format!("{:<28}", source.name)).bold(),
+        Span::from(format!("{:>5} bots  ", source.bot_count)).dim(),
+        Span::from(humanize_age(source.last_fetched_at)).dim(),
+    ])
+}
+
+fn bot_line(
+    bot: &Bot,
+    ai_default: Policy,
+    search_default: Policy,
+    scanner_default: Policy,
+) -> Line<'static> {
+    let effective = effective_policy(bot, ai_default, search_default, scanner_default);
+    let mut line = vec![Span::from(format!("  {:<22}", bot.name))];
+    line.push(policy_tag(effective));
+    // Always shown, not just on override: the point is to make it
+    // unambiguous whether this bot is following the system default or has
+    // its own explicit setting, not just to flag the exceptional case.
+    let annotation = match bot.status {
+        BotStatus::Default => " (system)",
+        BotStatus::Allowed | BotStatus::Blocked => " (override)",
+    };
+    line.push(Span::from(annotation).dim());
+    Line::from(line)
+}
+
+/// The label shown for each `BotStatus` in the override popup and in the
+/// confirmation message after picking one.
+fn status_label(status: BotStatus) -> &'static str {
+    match status {
+        BotStatus::Default => "use system settings",
+        BotStatus::Allowed => "Allowed",
+        BotStatus::Blocked => "Blocked",
     }
 }
 
@@ -326,6 +444,27 @@ fn effective_policy(
     }
 }
 
+/// A short "updated Xs/Xm/Xh/Xd ago" (or "never updated") label.
+fn humanize_age(last_fetched_at: Option<i64>) -> String {
+    let Some(last_fetched_at) = last_fetched_at else {
+        return "never updated".to_string();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let age = (now - last_fetched_at).max(0);
+    if age < 60 {
+        format!("updated {age}s ago")
+    } else if age < 3600 {
+        format!("updated {}m ago", age / 60)
+    } else if age < 86400 {
+        format!("updated {}h ago", age / 3600)
+    } else {
+        format!("updated {}d ago", age / 86400)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,27 +493,99 @@ mod tests {
         db
     }
 
-    #[test]
-    fn refresh_loads_bots_and_category_defaults() {
-        let db = test_db_with_bot("gptbot", true);
-        let mut screen = BotSettings::default();
-        screen.refresh(&db).unwrap();
-
-        assert_eq!(screen.bots.len(), 1);
-        assert_eq!(screen.ai_default, Policy::Blocked);
-        assert_eq!(screen.list_state.selected(), Some(0));
+    fn search_for(screen: &mut BotSettings, db: &Db, query: &str) {
+        let mut message = None;
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('/')), db, &mut message)
+            .unwrap();
+        for c in query.chars() {
+            screen
+                .handle_key(KeyEvent::from(KeyCode::Char(c)), db, &mut message)
+                .unwrap();
+        }
     }
 
     #[test]
-    fn rows_lists_categories_before_bots() {
+    fn refresh_loads_sources_bots_and_category_defaults() {
         let db = test_db_with_bot("gptbot", true);
         let mut screen = BotSettings::default();
         screen.refresh(&db).unwrap();
 
-        let rows = screen.rows();
-        assert_eq!(rows.len(), 4);
-        assert!(matches!(rows[0], Row::Category(Category::Scanner)));
-        assert!(matches!(rows[3], Row::Bot(0)));
+        assert_eq!(screen.sources.len(), 1);
+        assert_eq!(screen.bots.len(), 1);
+        assert_eq!(screen.ai_default, Policy::Blocked);
+        assert_eq!(screen.sources_state.selected(), Some(0));
+        assert_eq!(screen.focus, Focus::Sources);
+    }
+
+    #[test]
+    fn filtered_bots_is_empty_until_something_is_typed() {
+        let db = test_db_with_bot("gptbot", true);
+        let mut screen = BotSettings::default();
+        screen.refresh(&db).unwrap();
+
+        assert!(screen.filtered_bots().is_empty());
+    }
+
+    #[test]
+    fn slash_focuses_search_and_typing_filters_by_name_case_insensitively() {
+        let db = test_db_with_bot("gptbot", true);
+        let mut screen = BotSettings::default();
+        screen.refresh(&db).unwrap();
+
+        search_for(&mut screen, &db, "GPT");
+
+        assert_eq!(screen.focus, Focus::Search);
+        let matches = screen.filtered_bots();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].slug, "gptbot");
+        assert_eq!(screen.results_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn search_with_no_matches_clears_the_results_selection() {
+        let db = test_db_with_bot("gptbot", true);
+        let mut screen = BotSettings::default();
+        screen.refresh(&db).unwrap();
+
+        search_for(&mut screen, &db, "nonexistent-bot");
+
+        assert!(screen.filtered_bots().is_empty());
+        assert_eq!(screen.results_state.selected(), None);
+    }
+
+    #[test]
+    fn backspace_shrinks_the_query_and_refilters() {
+        let db = test_db_with_bot("gptbot", true);
+        let mut screen = BotSettings::default();
+        screen.refresh(&db).unwrap();
+
+        search_for(&mut screen, &db, "gptbotx"); // no match
+        assert!(screen.filtered_bots().is_empty());
+
+        let mut message = None;
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Backspace), &db, &mut message)
+            .unwrap();
+        assert_eq!(screen.filtered_bots().len(), 1); // "gptbot" matches again
+    }
+
+    #[test]
+    fn escape_in_search_returns_focus_to_sources_without_backing_out() {
+        let db = test_db_with_bot("gptbot", true);
+        let mut screen = BotSettings::default();
+        screen.refresh(&db).unwrap();
+        search_for(&mut screen, &db, "gpt");
+
+        let mut message = None;
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Esc), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert_eq!(screen.focus, Focus::Sources);
+        // The query itself is untouched, so re-focusing resumes the search.
+        assert_eq!(screen.query, "gpt");
     }
 
     #[test]
@@ -410,11 +621,21 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_category_row_opens_popup_at_current_value() {
+    fn humanize_age_handles_never_and_recent() {
+        assert_eq!(humanize_age(None), "never updated");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert_eq!(humanize_age(Some(now)), "updated 0s ago");
+    }
+
+    #[test]
+    fn enter_on_source_row_opens_confirmation_popup_defaulting_to_cancel() {
         let db = test_db_with_bot("gptbot", true);
         let mut screen = BotSettings::default();
         screen.refresh(&db).unwrap();
-        screen.list_state.select(Some(0)); // Scanner row, default Blocked
+        screen.sources_state.select(Some(0));
 
         let mut message = None;
         screen
@@ -422,38 +643,49 @@ mod tests {
             .unwrap();
 
         let popup = screen.popup.as_ref().unwrap();
-        assert!(matches!(
-            popup.target,
-            PopupTarget::Category(Category::Scanner)
-        ));
-        assert_eq!(popup.selected, 1); // Blocked
+        assert!(matches!(popup.target, PopupTarget::Source(_)));
+        assert_eq!(popup.selected, 0); // Cancel
     }
 
     #[test]
-    fn confirming_category_popup_writes_through_and_closes() {
+    fn confirming_cancel_on_source_popup_does_not_trigger_an_update() {
         let db = test_db_with_bot("gptbot", true);
         let mut screen = BotSettings::default();
         screen.refresh(&db).unwrap();
-        screen.list_state.select(Some(0)); // Scanner row
+        screen.sources_state.select(Some(0));
 
         let mut message = None;
         screen
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
-        // Move selection to "Allowed" and confirm.
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Up), &db, &mut message)
-            .unwrap();
-        screen
+        let outcome = screen
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
 
+        assert_eq!(outcome, KeyOutcome::Consumed);
         assert!(screen.popup.is_none());
-        assert_eq!(
-            db.get_category_default(Category::Scanner).unwrap(),
-            Policy::Allowed
-        );
-        assert!(message.unwrap().contains("Scanners"));
+    }
+
+    #[test]
+    fn confirming_update_now_on_source_popup_returns_update_source() {
+        let db = test_db_with_bot("gptbot", true);
+        let mut screen = BotSettings::default();
+        screen.refresh(&db).unwrap();
+        screen.sources_state.select(Some(0));
+
+        let mut message = None;
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap(); // Cancel -> Update now
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::UpdateSource("Test".to_string()));
+        assert!(screen.popup.is_none());
     }
 
     #[test]
@@ -461,14 +693,14 @@ mod tests {
         let db = test_db_with_bot("gptbot", true);
         let mut screen = BotSettings::default();
         screen.refresh(&db).unwrap();
-        screen.list_state.select(Some(0));
+        search_for(&mut screen, &db, "gptbot");
 
         let mut message = None;
         screen
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
         screen
-            .handle_key(KeyEvent::from(KeyCode::Up), &db, &mut message)
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
         let outcome = screen
             .handle_key(KeyEvent::from(KeyCode::Esc), &db, &mut message)
@@ -477,14 +709,12 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::Consumed);
         assert!(screen.popup.is_none());
         // Unchanged: escape must not have written the in-progress selection.
-        assert_eq!(
-            db.get_category_default(Category::Scanner).unwrap(),
-            Policy::Blocked
-        );
+        let bots = db.list_bots().unwrap();
+        assert_eq!(bots[0].status, BotStatus::Default);
     }
 
     #[test]
-    fn escape_with_no_popup_backs_out_to_dashboard() {
+    fn escape_with_no_popup_and_sources_focused_backs_out_to_dashboard() {
         let db = test_db_with_bot("gptbot", true);
         let mut screen = BotSettings::default();
         screen.refresh(&db).unwrap();
@@ -501,7 +731,7 @@ mod tests {
         let db = test_db_with_bot("gptbot", true);
         let mut screen = BotSettings::default();
         screen.refresh(&db).unwrap();
-        screen.list_state.select(Some(3)); // the gptbot row
+        search_for(&mut screen, &db, "gptbot");
 
         let mut message = None;
         screen
@@ -520,5 +750,70 @@ mod tests {
         let bots = db.list_bots().unwrap();
         assert_eq!(bots[0].status, BotStatus::Allowed);
         assert!(message.unwrap().contains("gptbot"));
+    }
+
+    #[test]
+    fn confirming_bot_popup_back_to_default_reports_use_system_settings() {
+        let db = test_db_with_bot("gptbot", true);
+        db.set_bot_status("gptbot", BotStatus::Allowed).unwrap();
+        let mut screen = BotSettings::default();
+        screen.refresh(&db).unwrap();
+        search_for(&mut screen, &db, "gptbot");
+
+        let mut message = None;
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        // The popup opens on the bot's current status (Allowed); Up moves
+        // back to "Use system settings".
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Up), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        let bots = db.list_bots().unwrap();
+        assert_eq!(bots[0].status, BotStatus::Default);
+        assert_eq!(message.unwrap(), "gptbot set to use system settings");
+    }
+
+    #[test]
+    fn bot_row_is_tagged_system_or_override_depending_on_its_status() {
+        let default_bot = Bot {
+            id: 1,
+            slug: "gptbot".to_string(),
+            name: "gptbot".to_string(),
+            is_ai: true,
+            is_search_engine: false,
+            is_scanner: false,
+            user_agent_pattern: "gptbot-ua".to_string(),
+            status: BotStatus::Default,
+            source_id: "test".to_string(),
+            updated_at: 0,
+        };
+        let system_line = bot_line(
+            &default_bot,
+            Policy::Blocked,
+            Policy::Allowed,
+            Policy::Blocked,
+        );
+        assert!(system_line
+            .spans
+            .iter()
+            .any(|s| s.content.contains("(system)")));
+
+        let mut overridden_bot = default_bot.clone();
+        overridden_bot.status = BotStatus::Allowed;
+        let override_line = bot_line(
+            &overridden_bot,
+            Policy::Blocked,
+            Policy::Allowed,
+            Policy::Blocked,
+        );
+        assert!(override_line
+            .spans
+            .iter()
+            .any(|s| s.content.contains("(override)")));
     }
 }

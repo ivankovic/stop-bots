@@ -178,14 +178,50 @@ the template's Cargo.toml resolved two different crossterm versions in the
 tree, which risks `KeyEvent` type-mismatch errors between crates).
 
 **Screens**, per the renames already decided in REVIEW.md before the
-previous implementation was deleted: **Dashboard** (new, default screen —
-read-only overview: category defaults, site count, bot-source
-up-to-date/stale counts, last action message), **Bot settings** (the three
-category defaults plus every known bot and its effective status, each
-changeable via a popup), **Site settings** (read-only list of discovered
-sites — no per-site override storage exists yet, see TODO.md). A **Help**
-screen (`?`) is reachable from any of the three and returns to whichever one
-was active.
+previous implementation was deleted: **Dashboard** (default screen — site
+count, bot-source up-to-date/stale counts, last action message, *and* the
+three category defaults, navigable and editable via a popup — see the
+redesign note below), **Bot settings** (every bot-list source — name, last
+fetched, signal/bot count — with Enter opening a Cancel/Update-now
+confirmation popup, followed by every known bot and its effective status,
+changeable via its own popup), **Site settings** (read-only list of
+discovered sites — no per-site override storage exists yet, see TODO.md). A
+**Help** screen (`?`) is reachable from any of the three and returns to
+whichever one was active.
+
+**Redesign (per REVIEW.md, after the initial cut above shipped):** the three
+category defaults moved from Bot settings to the Dashboard — the Dashboard's
+"Overview" panel is now a navigable `List` (up/down selects a category,
+Enter opens the same Allowed/Blocked popup Bot settings used to own) instead
+of a read-only `Paragraph`. Bot settings, in turn, gained the bot-list
+source list (sources first, bots after, in one combined row list — mirrors
+how it used to combine categories and bots) and lost the category rows.
+Confirming a source's "Update now" popup doesn't write to the database
+directly the way every other popup in this app does: `Db`'s connection isn't
+`Sync`, so the fetch (network IO) has to happen off the screen's
+synchronous `handle_key`. The screen returns a new `KeyOutcome::UpdateSource(name)`
+instead; `App` (which owns the `EventHandler`) spawns a `tokio` task that
+does *only* `botlist::fetch` + `botlist::parse` and reports the result back
+as a new `AppEvent::SourceUpdateFinished`, and `App` does the actual
+`botlist::store` on the main thread once that event arrives. `Event`/
+`AppEvent` need to stay `Clone` for this (the channel is `Clone`-bounded),
+so the fetch error is stringified at the task boundary rather than kept as
+an `anyhow::Error` (not `Clone`).
+
+`tests/tui.rs`'s pty-driven assertions turned up a real rexpect/crossterm
+gotcha worth recording: sending a bare Escape immediately followed by
+another key (no intervening `exp_string` wait) risks crossterm's raw-mode
+parser coalescing them into a single `Alt+<key>` event — which a screen's
+popup branch then silently swallows (anything it doesn't recognize is just
+`Consumed`), leaving the popup open and the rest of the test hanging. Every
+Esc that isn't immediately followed by a synchronizing wait now goes through
+a small `send_escape` helper that sleeps briefly first. The terminal output
+being diffed against the previous frame caused a second, unrelated kind of
+test flakiness: a character that happens to coincide with whatever was at
+that exact cell in the previous frame never gets retransmitted, so a popup
+title like "Scanners default" can arrive over the wire as "canners" +
+(cursor jump) + "default" — tests anchor on substrings that avoid straddling
+or starting on such a coincidence rather than the literal label text.
 
 Each screen is a self-contained component (state + `render` + `handle_key`),
 per AGENTS.md. The key-handling contract is a `KeyOutcome`: `Consumed` (state
@@ -344,3 +380,89 @@ This was checked, not just reasoned through: temporarily reverting the
 even reaching the Dashboard one — confirming the fix is also load-bearing
 for `BotSettings`'s own row, not just the Dashboard), then restoring the fix
 made it pass again. Byte-identical to the pre-revert version afterward.
+
+## Bootstrapping a bot-list source before it's ever been fetched
+
+`sources` only ever gained a row inside `botlist::store`, which only runs
+after a *successful* fetch. That's fine for the CLI (`update-bot-lists` can
+always reach for the network or `--source <file>` regardless of what's in
+the db yet), but it left the TUI with no way to trigger a first fetch at
+all: Bot settings' "Update now" popup only opens for a row already in
+`self.sources`, and on a brand-new install `sources` is empty — an
+unpopulated database renders an empty screen with nothing to select.
+
+Fixed with `Db::register_source` (`INSERT OR IGNORE`, unlike
+`upsert_source`'s `ON CONFLICT DO UPDATE`) and `botlist::register_source`,
+called once from `App::new` on every TUI startup. It's a deliberate no-op
+once a source has actually been fetched — using `upsert_source` here
+instead would reset `last_fetched_at`/`bot_count` back to "never
+updated"/`0` on every launch, silently discarding real fetch state. A fresh
+database now shows the well-known-bots source as "never updated" and
+selectable, same as any other source, rather than nothing at all.
+
+## Bot settings redesign: sources + a searchable "Bot details" panel
+
+The original combined source-then-bots single list (see the redesign note
+above) stopped scaling once a source's bot count grew past a handful — the
+whole point of a bot list is to carry hundreds of entries, and rendering
+all of them into one scrollable list buries the sources at the top and
+makes finding one specific bot a matter of scrolling, not searching.
+
+Split into two independent panels, each with its own `ListState`:
+**Bot list sources** (top, unchanged behavior — Enter opens the
+Cancel/Update-now popup) and **Bot details** (bottom — a one-line search
+box plus whatever currently matches it). The bot list itself is never
+rendered in full: `BotSettings::filtered_bots` returns nothing until the
+query is non-empty, on the theory that a search box that also doubles as a
+"browse everything" list defeats its own purpose.
+
+A `Focus` enum (`Sources` / `Search`) tracks which panel owns keyboard
+input, since this is the first screen in the app with more than one
+interactive region. `/` moves focus into the search box from anywhere in
+Sources; from there, every printable key (including Space — bot names can
+contain one, e.g. "Google Crawler") is query text rather than a shortcut,
+Backspace edits it, Up/Down (not `j`/`k` — those need to be typable) move
+the match selection, and Enter opens the selected match's override popup.
+Escape is overloaded the same nested way popups already use it: first
+press returns focus to Sources without touching the query (so re-pressing
+`/` resumes the same search); a second Escape, now with Sources focused and
+no popup open, backs out to the Dashboard as usual.
+
+The empty-results hint in Bot details distinguishes two states that look
+identical if conflated: "haven't typed a query yet" vs. "typed one that
+matched nothing" vs. "there are no bots in the database at all yet" (the
+last one pointing back at the sources panel above rather than implying the
+search itself is broken).
+
+Focus is indicated the same minimal way selection already is elsewhere in
+this app: the focused panel's border is `theme.accent()`; the other one is
+left at the terminal's default foreground, per AGENTS.md's TUI color
+guidance rather than a second bespoke "dim but not too dim" color.
+
+Covered by a new pty test (`tests/tui.rs::bot_details_search_filters_by_name_and_opens_a_bot_popup`)
+that types into the live search box and confirms a match's popup opens —
+worth noting for future tests that touch this box: the search term needs to
+be a substring that isn't already on screen anywhere else in Bot settings,
+since the terminal-output-diffing gotcha documented above applies just as
+much to freshly-typed text as to state transitions.
+
+## Naming `BotStatus::Default` "Use system settings" in the UI
+
+`BotStatus::Default` (the Rust/db name, unchanged — it's still the string
+`"default"` on disk, and `Db::set_bot_status`/`effective_policy` don't care
+what it's called) was surfaced to the user only as the word "Default" in
+the override popup, and not surfaced at all on the bot row itself — a row
+only got a `(override)` tag once you picked something else, so "no tag"
+was silently doing double duty for "this bot follows the system default"
+with no visual cue that a system-wide policy was even in play.
+
+Two changes, both purely presentational — no data model or `BotStatus`
+variant change: the popup option reads "Use system settings" instead of
+"Default" (`status_label`, also used for the post-confirm message, so
+"gptbot set to use system settings" reads the same way rather than falling
+back to `{status:?}`'s "Default"), and every bot row now always carries an
+explicit `(system)` or `(override)` tag — never blank — next to its
+effective `[ ALLOWED ]`/`[ BLOCKED ]` state. The goal was specifically
+"make it clear when the bot-specific setting overrides the system setting
+and when not", which an absence-of-a-tag can't do as legibly as two
+always-present, differently-worded ones.
