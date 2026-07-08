@@ -251,6 +251,12 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
     send_key(&mut session, "jyxo");
     session.exp_string("Jyxo Crawler").unwrap();
 
+    // The row itself always carries a "(system)" or "(override)" tag, not
+    // just the popup — jyxo-crawler has no category (its source fixture
+    // tags it "unknown"), so it's untouched, still following the system
+    // default.
+    session.exp_string("(system)").unwrap();
+
     // Enter on the (only) match opens its override popup.
     send_key(&mut session, "\r");
     session.exp_string("Override").unwrap();
