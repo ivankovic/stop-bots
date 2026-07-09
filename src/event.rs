@@ -58,12 +58,12 @@ pub enum AppEvent {
         result: Result<Vec<NewBot>, String>,
     },
     /// A background fetch of one country's IP ranges (started from the
-    /// Dashboard's "add a country to block" popup, for a country not
-    /// already fetched) has finished. Carries the parsed CIDR list — not
-    /// stored yet, since `Db` isn't `Sync`: storing, and blocking the
-    /// country, happens back on the main thread in
-    /// `App::finish_country_block`.
-    CountryBlockFinished {
+    /// Dashboard's "add a country" popup, for a country not already
+    /// fetched) has finished. Carries the parsed CIDR list — not stored
+    /// yet, since `Db` isn't `Sync`: storing, and adding the country to the
+    /// geo selection, happens back on the main thread in
+    /// `App::finish_country_select`.
+    CountrySelectFinished {
         country_code: String,
         result: Result<Vec<String>, String>,
     },

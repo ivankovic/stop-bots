@@ -82,18 +82,51 @@
   needed, the write-up on why it's harder than per-site UA/bot overrides
   (shared include files, `site_apply_status` no longer being a simple
   in-block text diff) is in SPECS.md — worth reading before attempting it.
+- Added: geo-blocking now has two modes (`Db::GeoMode`, `settings` key
+  `geo_mode`, defaults to Blocklist): **Blocklist** (selected countries are
+  blocked, everything else allowed — the original design) and
+  **Allowlist** (selected countries are the *only* ones allowed, every
+  other CIDR blocked via a trailing `0.0.0.0/0`/`::/0` catch-all —
+  `Db::geo_firewall_rules`). The table backing the selection was renamed
+  `blocked_countries` → `selected_countries` (and its CLI verbs
+  `block-country`/`unblock-country`/`list-blocked-countries` →
+  `add-country`/`remove-country`/`list-selected-countries`,
+  `set-geo-mode` added) since "blocked" stopped being universally true
+  once Allowlist existed. See SPECS.md's "Geo-blocking: Blocklist and
+  Allowlist modes" section for the full design, including two real bugs
+  this surfaced and fixed along the way:
+  1. **`render-firewall` now refuses Allowlist mode on `--backend
+     iptables`.** The trailing catch-all is only safe on nftables: this
+     project's `iptables::render` has no loopback/established-connection
+     allowance in its chain (so `0.0.0.0/0` would drop local traffic too)
+     and silently skips IPv6 rules entirely (so an IPv6 catch-all never
+     renders, quietly permitting *all* IPv6 while IPv4 is locked down).
+  2. **The SSH lockout check (`main.rs::lockout_risks`) was rewritten to
+     simulate first-match-wins evaluation**, not "does any Block rule's
+     CIDR contain this IP". The old heuristic would have misfired
+     constantly under Allowlist: an admin correctly covered by an earlier
+     Allow rule (their own `firewall_rules` entry, or an allowed country)
+     would still get flagged just because the trailing catch-all's CIDR
+     also technically contains their IP. It now walks the exact rendered
+     rule order and stops at the first match, same as the real firewall.
+     A side effect worth knowing: this uncovered that `ipranges::cidr_contains`
+     didn't handle a bare IP address with no `/len` at all (e.g. an
+     admin's plain `add-firewall-rule --address 1.2.3.4`) — it now treats
+     that as an exact-match `/32`/`/128` rather than "never matches".
 - Added: the Dashboard now has a "Geo-blocking (host-wide)" panel below
   "System-wide settings" — a second, independently-focused list (`Down`
   past the last category row flows focus into it, `Up` above its first row
-  flows back, no dedicated focus key) showing every host-wide blocked
-  country plus a fixed "+ Add a country to block" row. Confirming a
-  2-letter code whose ranges are already fetched blocks it immediately; a
-  not-yet-fetched code spawns a background fetch first
-  (`App::start_country_block`/`AppEvent::CountryBlockFinished`, same
-  fetch-off-the-main-thread-then-store-on-it shape as bot-list source
-  updates) and blocks it once that finishes. Enter on an existing blocked
-  country unblocks it directly, no confirmation popup — unlike a category
-  default (which is genuinely "choose one of two options"), unblocking a
+  flows back, no dedicated focus key) showing the mode in its title plus
+  every selected country and a fixed "+ Add a country" row. `m` opens a
+  popup to switch Blocklist/Allowlist (a popup, not a direct toggle like
+  removing a country, since flipping to Allowlist is materially
+  higher-stakes). Confirming a 2-letter code whose ranges are already
+  fetched adds it immediately; a not-yet-fetched code spawns a background
+  fetch first (`App::start_country_select`/`AppEvent::CountrySelectFinished`,
+  same fetch-off-the-main-thread-then-store-on-it shape as bot-list source
+  updates) and adds it once that finishes. Enter on an existing selected
+  country removes it directly, no confirmation popup — unlike a category
+  default (which is genuinely "choose one of two options"), removing a
   country is a single reversible action, same reasoning Site settings'
   apply/apply-all actions already use. See SPECS.md's "Dashboard
   geo-blocking panel" section.
@@ -101,10 +134,9 @@
   (Googlebot/Bingbot/GPTBot) from the TUI, still CLI-only (see the firewall
   bullet above); no way to refresh an already-fetched country's ranges from
   the TUI — re-adding a code that's already fetched just reuses the cached
-  ranges and blocks immediately (see the AddCountry confirm handler), it
-  never re-fetches. A genuine "refresh this country" action is a separate,
-  not yet built, feature (the CLI's `update-country-ranges` does force a
-  re-fetch, for now).
+  ranges and adds it immediately, it never re-fetches. A genuine "refresh
+  this country" action is a separate, not yet built, feature (the CLI's
+  `update-country-ranges` does force a re-fetch, for now).
 - The TUI has no screen for firewall rules (`add-firewall-rule` etc. are
   CLI-only).
 - No quit confirmation in the TUI: `q`/Esc on the Dashboard exits

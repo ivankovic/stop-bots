@@ -94,17 +94,23 @@ enum Command {
     },
     /// Render the stored firewall rules into an iptables or nftables script.
     /// The script is written to disk only — it is never executed by this
-    /// tool. Review it, then apply it yourself. Also includes derived Block
-    /// rules from any blocked-by-default crawler IP-range source and any
-    /// host-wide blocked country (see UpdateIpRanges/BlockCountry) —
-    /// these are computed fresh each render, never stored as their own
-    /// firewall_rules rows.
+    /// tool. Review it, then apply it yourself. Also includes derived rules
+    /// from any blocked-by-default crawler IP-range source and the current
+    /// geo mode's selected countries (see UpdateIpRanges/AddCountry/
+    /// SetGeoMode) — these are computed fresh each render, never stored as
+    /// their own firewall_rules rows.
     ///
     /// Before writing anything, checks recent successful SSH logins (from
     /// /var/log/auth.log, /var/log/secure or journalctl) against every
-    /// address about to be blocked. If any currently-connected client would
-    /// be cut off, it refuses to write the script (pass --force to
-    /// override).
+    /// address about to be blocked, simulating the same first-match-wins
+    /// order the script itself will evaluate. If any currently-connected
+    /// client would be cut off, it refuses to write the script (pass
+    /// --force to override).
+    ///
+    /// Allowlist geo mode (see SetGeoMode) requires --backend nftables:
+    /// iptables has no loopback/established-connection allowance and
+    /// silently permits all IPv6 (it skips IPv6 rules entirely), both fatal
+    /// once a trailing "block everything else" rule is in play.
     RenderFirewall {
         #[arg(long)]
         backend: FirewallBackend,
@@ -133,7 +139,7 @@ enum Command {
         source_id: String,
     },
     /// Download and store IPdeny's current aggregated CIDR list for one
-    /// country (does not block it — see BlockCountry)
+    /// country (does not select it — see AddCountry)
     UpdateCountryRanges {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
@@ -141,23 +147,35 @@ enum Command {
         #[arg(long)]
         country: String,
     },
-    /// Host-wide block every CIDR currently stored for a country (fetch its
-    /// ranges first with UpdateCountryRanges)
-    BlockCountry {
+    /// Sets the host-wide geo mode: "blocklist" (selected countries are
+    /// blocked, everything else allowed — the default) or "allowlist"
+    /// (selected countries are the only ones allowed, everything else
+    /// blocked). Switching modes doesn't touch the selected-country list
+    /// itself, only how render-firewall interprets it.
+    SetGeoMode {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        mode: GeoModeArg,
+    },
+    /// Add a country to the host-wide geo selection (fetch its ranges first
+    /// with UpdateCountryRanges). What this means depends on the current
+    /// geo mode — see SetGeoMode.
+    AddCountry {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
         #[arg(long)]
         country: String,
     },
-    /// Undo a previous BlockCountry
-    UnblockCountry {
+    /// Remove a country from the host-wide geo selection
+    RemoveCountry {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
         #[arg(long)]
         country: String,
     },
-    /// List every host-wide blocked country
-    ListBlockedCountries {
+    /// List the current geo mode and every selected country
+    ListSelectedCountries {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
@@ -176,6 +194,21 @@ enum Command {
 enum FirewallBackend {
     Iptables,
     Nftables,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GeoModeArg {
+    Blocklist,
+    Allowlist,
+}
+
+impl From<GeoModeArg> for stop_bots::db::GeoMode {
+    fn from(arg: GeoModeArg) -> Self {
+        match arg {
+            GeoModeArg::Blocklist => stop_bots::db::GeoMode::Blocklist,
+            GeoModeArg::Allowlist => stop_bots::db::GeoMode::Allowlist,
+        }
+    }
 }
 
 #[tokio::main]
@@ -211,9 +244,10 @@ async fn main() -> Result<()> {
         Some(Command::UpdateCountryRanges { db, country }) => {
             update_country_ranges(db, country).await
         }
-        Some(Command::BlockCountry { db, country }) => set_country_blocked(db, country, true),
-        Some(Command::UnblockCountry { db, country }) => set_country_blocked(db, country, false),
-        Some(Command::ListBlockedCountries { db }) => list_blocked_countries(db),
+        Some(Command::SetGeoMode { db, mode }) => set_geo_mode(db, mode),
+        Some(Command::AddCountry { db, country }) => set_country_selected(db, country, true),
+        Some(Command::RemoveCountry { db, country }) => set_country_selected(db, country, false),
+        Some(Command::ListSelectedCountries { db }) => list_selected_countries(db),
     }
 }
 
@@ -445,21 +479,31 @@ async fn update_country_ranges(db_path: Option<PathBuf>, country: String) -> Res
     Ok(())
 }
 
-fn set_country_blocked(db_path: Option<PathBuf>, country: String, blocked: bool) -> Result<()> {
+fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
     let db = open_db(db_path)?;
-    db.set_country_blocked(&country, blocked)?;
+    let mode: stop_bots::db::GeoMode = mode.into();
+    db.set_geo_mode(mode)?;
+    println!("Geo mode set to {mode:?}");
+    Ok(())
+}
+
+fn set_country_selected(db_path: Option<PathBuf>, country: String, selected: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_country_selected(&country, selected)?;
     println!(
         "{} country {country}",
-        if blocked { "Blocked" } else { "Unblocked" }
+        if selected { "Added" } else { "Removed" }
     );
     Ok(())
 }
 
-fn list_blocked_countries(db_path: Option<PathBuf>) -> Result<()> {
+fn list_selected_countries(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
-    let countries = db.list_blocked_countries()?;
+    let mode = db.get_geo_mode()?;
+    let countries = db.list_selected_countries()?;
+    println!("Geo mode: {mode:?}");
     if countries.is_empty() {
-        println!("No countries blocked.");
+        println!("No countries selected.");
         return Ok(());
     }
     for country in countries {
@@ -468,41 +512,57 @@ fn list_blocked_countries(db_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Every synthetic (never persisted) Block `FirewallRule` derived from
-/// currently-blocked-by-default crawler IP-range sources and host-wide
-/// blocked countries — see `Db::derived_block_addresses`. Uses `id: 0`
-/// since these don't correspond to a real `firewall_rules` row; they're
-/// never looked up or removed by id, only rendered.
+/// Every synthetic (never persisted) `FirewallRule` derived from
+/// currently-blocked-by-default crawler IP-range sources and the current
+/// geo mode's selected countries — see `Db::derived_firewall_entries`.
+/// Uses `id: 0` since these don't correspond to a real `firewall_rules`
+/// row; they're never looked up or removed by id, only rendered. Order is
+/// preserved from `derived_firewall_entries` (crawler ranges, then geo
+/// rules with any Allowlist catch-all strictly last) — callers must append
+/// this after admin rules, never reorder it.
 fn derived_firewall_rules(db: &Db) -> Result<Vec<FirewallRule>> {
     Ok(db
-        .derived_block_addresses()?
+        .derived_firewall_entries()?
         .into_iter()
-        .map(|address| FirewallRule {
+        .map(|(address, action)| FirewallRule {
             id: 0,
             address,
             port: None,
-            action: FirewallAction::Block,
+            action,
             enabled: true,
         })
         .collect())
 }
 
-/// Every `(connected_ip, matching_cidr)` pair where a client with a recent
-/// successful SSH login (from `connected_ips`) would be cut off by one of
-/// `addresses` — the safety check `render_firewall` runs before writing
-/// anything, unless `--force` is passed. An unparseable `connected_ips`
+/// Every `(connected_ip, matching_rule_address)` pair where a client with a
+/// recent successful SSH login (from `connected_ips`) would actually end up
+/// blocked by `rules` — simulating the same first-match-wins evaluation the
+/// rendered script itself performs, walking `rules` in the exact order
+/// they'll be written. This is deliberately *not* "does any Block rule's
+/// CIDR contain this IP": once Allowlist geo mode can put an Allow rule
+/// ahead of a catch-all Block, that cruder check would misfire on an IP an
+/// earlier Allow rule already protects. Existing (established/related)
+/// connections aren't modeled — this answers "can this client *reconnect*
+/// after applying this", which is the stricter and more useful question:
+/// an admin who disconnects after a bad allowlist can't rely on an
+/// already-open session to get back in. An unparseable `connected_ips`
 /// entry is simply skipped rather than erroring: this check exists to *add*
 /// a warning on top of firewall rendering, never to block it over
 /// something unrelated to that rendering.
-fn lockout_risks(addresses: &[String], connected_ips: &[String]) -> Vec<(String, String)> {
+fn lockout_risks(rules: &[FirewallRule], connected_ips: &[String]) -> Vec<(String, String)> {
     let mut risks = Vec::new();
     for ip_str in connected_ips {
         let Ok(ip) = ip_str.parse::<std::net::IpAddr>() else {
             continue;
         };
-        for cidr in addresses {
-            if ipranges::cidr_contains(cidr, ip) {
-                risks.push((ip_str.clone(), cidr.clone()));
+        for rule in rules.iter().filter(|r| r.enabled) {
+            if ipranges::cidr_contains(&rule.address, ip) {
+                if rule.action != FirewallAction::Allow {
+                    risks.push((ip_str.clone(), rule.address.clone()));
+                }
+                // First match wins, same as the real firewall: stop
+                // checking further rules for this IP either way.
+                break;
             }
         }
     }
@@ -522,12 +582,13 @@ fn print_lockout_warning(risks: &[(String, String)]) {
 
 /// The lockout safety check `render_firewall` runs before writing anything:
 /// finds recent successful SSH logins (via `--ssh-log`, or auto-detected)
-/// and warns if any of them would be blocked by `addresses`. Returns
-/// whether it's safe to proceed — `false` means the caller should refuse to
-/// write the script unless `--force` was passed. A log source that
-/// couldn't be found or read at all is not a risk in itself (nothing to
-/// check against), just a note that the check didn't run.
-fn check_lockout_risk(addresses: &[String], ssh_log: Option<&Path>, force: bool) -> Result<bool> {
+/// and warns if any of them would actually end up blocked by `rules` (see
+/// `lockout_risks` for what "actually end up" means). Returns whether it's
+/// safe to proceed — `false` means the caller should refuse to write the
+/// script unless `--force` was passed. A log source that couldn't be found
+/// or read at all is not a risk in itself (nothing to check against), just
+/// a note that the check didn't run.
+fn check_lockout_risk(rules: &[FirewallRule], ssh_log: Option<&Path>, force: bool) -> Result<bool> {
     let source = match ssh_log {
         Some(path) => sshlog::read_log_file(path),
         None => sshlog::find_default_source(),
@@ -542,7 +603,7 @@ fn check_lockout_risk(addresses: &[String], ssh_log: Option<&Path>, force: bool)
         }
     };
     let connected_ips = sshlog::parse_accepted_ips(&log_text);
-    let risks = lockout_risks(addresses, &connected_ips);
+    let risks = lockout_risks(rules, &connected_ips);
     if risks.is_empty() {
         return Ok(true);
     }
@@ -562,15 +623,25 @@ fn render_firewall(
     ssh_log: Option<PathBuf>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+
+    // Allowlist mode's trailing "block everything else" catch-all is only
+    // safe on nftables: iptables has no loopback/established-connection
+    // allowance in this chain (so 0.0.0.0/0 would drop even local traffic)
+    // and silently skips IPv6 rules entirely (so an IPv6 catch-all never
+    // renders, quietly permitting all IPv6 while IPv4 is locked down). See
+    // SPECS.md.
+    if db.get_geo_mode()? == stop_bots::db::GeoMode::Allowlist
+        && matches!(backend, FirewallBackend::Iptables)
+    {
+        anyhow::bail!(
+            "Allowlist geo mode requires --backend nftables (iptables can't safely enforce a default-deny catch-all — see SPECS.md)"
+        );
+    }
+
     let mut rules = db.list_firewall_rules()?;
     rules.extend(derived_firewall_rules(&db)?);
 
-    let addresses: Vec<String> = rules
-        .iter()
-        .filter(|r| r.enabled)
-        .map(|r| r.address.clone())
-        .collect();
-    if !check_lockout_risk(&addresses, ssh_log.as_deref(), force)? {
+    if !check_lockout_risk(&rules, ssh_log.as_deref(), force)? {
         anyhow::bail!(
             "Refusing to write firewall rules: would block a currently-connected SSH client. Re-run with --force if you're sure."
         );
@@ -681,8 +752,18 @@ mod tests {
         assert!(primary.exists());
     }
 
+    fn rule(address: &str, action: FirewallAction) -> FirewallRule {
+        FirewallRule {
+            id: 0,
+            address: address.to_string(),
+            port: None,
+            action,
+            enabled: true,
+        }
+    }
+
     #[test]
-    fn derived_firewall_rules_combines_blocked_ip_ranges_and_countries() {
+    fn derived_firewall_rules_combines_blocked_ip_ranges_and_geo_rules() {
         let db = Db::open_in_memory().unwrap();
         db.register_ip_range_source(&stop_bots::db::IpRangeSource {
             id: "gptbot".to_string(),
@@ -697,7 +778,7 @@ mod tests {
             .unwrap();
         db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
             .unwrap();
-        db.set_country_blocked("us", true).unwrap();
+        db.set_country_selected("us", true).unwrap();
 
         let mut rules = derived_firewall_rules(&db).unwrap();
         rules.sort_by(|a, b| a.address.cmp(&b.address));
@@ -710,33 +791,79 @@ mod tests {
     }
 
     #[test]
-    fn derived_firewall_rules_is_empty_with_no_ip_ranges_or_blocked_countries() {
+    fn derived_firewall_rules_is_empty_with_no_ip_ranges_or_selected_countries() {
         let db = Db::open_in_memory().unwrap();
         assert!(derived_firewall_rules(&db).unwrap().is_empty());
     }
 
     #[test]
-    fn lockout_risks_finds_a_connected_ip_inside_a_blocked_cidr() {
-        let addresses = vec!["4.5.6.0/24".to_string()];
+    fn derived_firewall_rules_in_allowlist_mode_ends_with_the_catchall() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(stop_bots::db::GeoMode::Allowlist).unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("nl", true).unwrap();
+
+        let rules = derived_firewall_rules(&db).unwrap();
+        assert_eq!(rules[0].address, "1.2.3.0/24");
+        assert_eq!(rules[0].action, FirewallAction::Allow);
+        assert_eq!(rules[1].address, "0.0.0.0/0");
+        assert_eq!(rules[1].action, FirewallAction::Block);
+        assert_eq!(rules[2].address, "::/0");
+        assert_eq!(rules[2].action, FirewallAction::Block);
+    }
+
+    #[test]
+    fn lockout_risks_finds_a_connected_ip_inside_a_block_rule() {
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
         let connected = vec!["4.5.6.7".to_string()];
         assert_eq!(
-            lockout_risks(&addresses, &connected),
+            lockout_risks(&rules, &connected),
             vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())]
         );
     }
 
     #[test]
     fn lockout_risks_is_empty_when_no_connected_ip_matches() {
-        let addresses = vec!["4.5.6.0/24".to_string()];
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
         let connected = vec!["9.9.9.9".to_string()];
-        assert!(lockout_risks(&addresses, &connected).is_empty());
+        assert!(lockout_risks(&rules, &connected).is_empty());
     }
 
     #[test]
     fn lockout_risks_skips_unparseable_connected_ip_entries() {
-        let addresses = vec!["0.0.0.0/0".to_string()];
+        let rules = vec![rule("0.0.0.0/0", FirewallAction::Block)];
         let connected = vec!["not-an-ip".to_string()];
-        assert!(lockout_risks(&addresses, &connected).is_empty());
+        assert!(lockout_risks(&rules, &connected).is_empty());
+    }
+
+    /// The critical correctness property for Allowlist geo mode: an IP
+    /// covered by an earlier Allow rule must never be flagged, even though
+    /// a later catch-all Block rule's CIDR also technically contains it —
+    /// first match wins, exactly like the real firewall evaluates it.
+    #[test]
+    fn lockout_risks_is_safe_when_an_earlier_allow_rule_covers_the_catchall() {
+        let rules = vec![
+            rule("4.5.6.0/24", FirewallAction::Allow),
+            rule("0.0.0.0/0", FirewallAction::Block),
+        ];
+        let connected = vec!["4.5.6.7".to_string()];
+        assert!(lockout_risks(&rules, &connected).is_empty());
+    }
+
+    /// The flip side: an IP *not* covered by any earlier Allow rule must
+    /// still be caught by the trailing catch-all.
+    #[test]
+    fn lockout_risks_catches_an_ip_only_covered_by_the_catchall() {
+        let rules = vec![
+            rule("4.5.6.0/24", FirewallAction::Allow),
+            rule("0.0.0.0/0", FirewallAction::Block),
+        ];
+        let connected = vec!["9.9.9.9".to_string()];
+        assert_eq!(
+            lockout_risks(&rules, &connected),
+            vec![("9.9.9.9".to_string(), "0.0.0.0/0".to_string())]
+        );
     }
 
     #[test]
@@ -749,9 +876,9 @@ mod tests {
         )
         .unwrap();
 
-        let addresses = vec!["4.5.6.0/24".to_string()];
-        assert!(!check_lockout_risk(&addresses, Some(&log_path), false).unwrap());
-        assert!(check_lockout_risk(&addresses, Some(&log_path), true).unwrap());
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+        assert!(!check_lockout_risk(&rules, Some(&log_path), false).unwrap());
+        assert!(check_lockout_risk(&rules, Some(&log_path), true).unwrap());
     }
 
     #[test]
@@ -764,15 +891,29 @@ mod tests {
         )
         .unwrap();
 
-        let addresses = vec!["4.5.6.0/24".to_string()];
-        assert!(check_lockout_risk(&addresses, Some(&log_path), false).unwrap());
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+        assert!(check_lockout_risk(&rules, Some(&log_path), false).unwrap());
     }
 
     #[test]
     fn check_lockout_risk_passes_when_the_log_source_is_unavailable() {
-        let addresses = vec!["4.5.6.0/24".to_string()];
-        assert!(
-            check_lockout_risk(&addresses, Some(Path::new("/nonexistent/x.log")), false).unwrap()
-        );
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+        assert!(check_lockout_risk(&rules, Some(Path::new("/nonexistent/x.log")), false).unwrap());
+    }
+
+    #[test]
+    fn render_firewall_rejects_allowlist_mode_on_iptables() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite3");
+        {
+            let db = Db::open(&db_path).unwrap();
+            db.set_geo_mode(stop_bots::db::GeoMode::Allowlist).unwrap();
+        }
+        let out = tmp.path().join("fw.sh");
+
+        let result = render_firewall(Some(db_path), FirewallBackend::Iptables, &out, false, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nftables"));
+        assert!(!out.exists());
     }
 }

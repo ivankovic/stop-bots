@@ -30,19 +30,31 @@
 //! `Down` past the last category row or `Up` above the first country
 //! row — no dedicated focus key, since these are just two vertically
 //! stacked lists, not a list-plus-search-box pair like Bot settings'
-//! `Focus`) shows every host-wide blocked country (`Db::list_blocked_countries`)
-//! plus a fixed "+ Add a country to block" action row at the top. Enter on
-//! that row opens a text-input popup for a two-letter code; Enter on an
-//! existing country row unblocks it directly (no confirmation popup — unlike
-//! a category default, unblocking a country isn't "choose one of several
-//! options", it's a single reversible action, the same reasoning Site
-//! settings' apply/apply-all actions already use). Confirming the input
-//! popup with a code whose ranges are already fetched blocks it immediately
-//! (`Mutated`); a not-yet-fetched code returns `KeyOutcome::BlockCountry` so
-//! `App` can fetch it first (`App::start_country_block`) — see that
-//! function's doc comment for why fetching can't happen here directly.
+//! `Focus`) shows every host-wide selected country (`Db::list_selected_countries`)
+//! plus a fixed "+ Add a country" action row at the top. What being
+//! "selected" *means* depends on the geo mode, shown in the panel's title
+//! and toggled with `m` (a popup, unlike the direct actions below, since
+//! switching to Allowlist is meaningfully higher-stakes — see
+//! [`Popup::GeoMode`]):
+//!
+//! - **Blocklist** (the default): selected countries are blocked,
+//!   everything else is allowed.
+//! - **Allowlist**: selected countries are the *only* ones allowed,
+//!   everything else is blocked host-wide once `render-firewall` runs (see
+//!   `Db::geo_firewall_rules` and its nftables-only guard in `main.rs`).
+//!
+//! Enter on the "Add" row opens a text-input popup for a two-letter code;
+//! Enter on an existing country row removes it directly (no confirmation
+//! popup — unlike a category default, removing a country isn't "choose one
+//! of several options", it's a single reversible action, the same
+//! reasoning Site settings' apply/apply-all actions already use).
+//! Confirming the input popup with a code whose ranges are already fetched
+//! adds it immediately (`Mutated`); a not-yet-fetched code returns
+//! `KeyOutcome::SelectCountry` so `App` can fetch it first
+//! (`App::start_country_select`) — see that function's doc comment for why
+//! fetching can't happen here directly.
 
-use crate::db::{Category, Db, Policy, Source};
+use crate::db::{Category, Db, GeoMode, Policy, Source};
 use crate::ipranges;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
@@ -71,9 +83,10 @@ enum Focus {
     Countries,
 }
 
-/// The popup opened by the Dashboard: either editing a category default
-/// (cycles between Allowed (0) and Blocked (1), mirroring Bot settings'
-/// category popup before it moved here) or entering a country code to block.
+/// The popup opened by the Dashboard: editing a category default (cycles
+/// between Allowed (0) and Blocked (1), mirroring Bot settings' category
+/// popup before it moved here), entering a country code to add to the geo
+/// selection, or switching the geo mode itself.
 #[derive(Debug, Clone)]
 enum Popup {
     Category {
@@ -83,6 +96,14 @@ enum Popup {
     AddCountry {
         input: String,
         error: Option<String>,
+    },
+    /// Cycles between Blocklist (0) and Allowlist (1) — a popup, not a
+    /// direct toggle like removing a country, because flipping to
+    /// Allowlist is a materially bigger decision: it turns host-wide geo
+    /// enforcement into a default-deny gate for the whole box once
+    /// `render-firewall` runs, not just "one more blocked country".
+    GeoMode {
+        selected: usize,
     },
 }
 
@@ -95,7 +116,8 @@ pub struct Dashboard {
     ai_default: Policy,
     list_state: ListState,
     popup: Option<Popup>,
-    blocked_countries: Vec<String>,
+    geo_mode: GeoMode,
+    selected_countries: Vec<String>,
     fetched_countries: Vec<(String, i64, i64)>,
     countries_state: ListState,
     focus: Focus,
@@ -109,7 +131,8 @@ impl Dashboard {
         self.scanner_default = db.get_category_default(Category::Scanner)?;
         self.search_default = db.get_category_default(Category::Search)?;
         self.ai_default = db.get_category_default(Category::Ai)?;
-        self.blocked_countries = db.list_blocked_countries()?;
+        self.geo_mode = db.get_geo_mode()?;
+        self.selected_countries = db.list_selected_countries()?;
         self.fetched_countries = db.list_fetched_countries()?;
         if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
@@ -117,12 +140,12 @@ impl Dashboard {
         if self.countries_state.selected().is_none() {
             self.countries_state.select(Some(0));
         }
-        // Unblocking shrinks `blocked_countries`; without this the
+        // Removing a country shrinks `selected_countries`; without this the
         // selection could be left pointing past the new last row (stale
         // until the next arrow press re-clamps it via `select_previous`/
         // `select_next`) if the row that was just removed wasn't the last
         // one selected.
-        let max_row = self.blocked_countries.len(); // +1 (the "Add" row) - 1 (0-indexed)
+        let max_row = self.selected_countries.len(); // +1 (the "Add" row) - 1 (0-indexed)
         if self.countries_state.selected().is_some_and(|s| s > max_row) {
             self.countries_state.select(Some(max_row));
         }
@@ -130,8 +153,8 @@ impl Dashboard {
     }
 
     /// How many CIDRs are currently known for `country_code`, if it's ever
-    /// been fetched — `None` for a country that was blocked (e.g. via the
-    /// CLI's `block-country`) before its ranges were ever fetched.
+    /// been fetched — `None` for a country that was selected (e.g. via the
+    /// CLI's `add-country`) before its ranges were ever fetched.
     fn range_count(&self, country_code: &str) -> Option<i64> {
         self.fetched_countries
             .iter()
@@ -192,19 +215,24 @@ impl Dashboard {
             });
         frame.render_stateful_widget(list, settings_area, &mut self.list_state);
 
-        let country_items: Vec<ListItem> = std::iter::once(ListItem::new(
-            Line::from("+ Add a country to block").italic(),
-        ))
-        .chain(
-            self.blocked_countries
-                .iter()
-                .map(|cc| ListItem::new(self.country_row_line(cc))),
-        )
-        .collect();
+        let country_items: Vec<ListItem> =
+            std::iter::once(ListItem::new(Line::from("+ Add a country").italic()))
+                .chain(
+                    self.selected_countries
+                        .iter()
+                        .map(|cc| ListItem::new(self.country_row_line(cc))),
+                )
+                .collect();
+        let mode_label = match self.geo_mode {
+            GeoMode::Blocklist => "Blocklist",
+            GeoMode::Allowlist => "Allowlist",
+        };
         let country_list = List::new(country_items)
             .block(
                 Block::bordered()
-                    .title("Geo-blocking (host-wide) — Enter to add/remove")
+                    .title(format!(
+                        "Geo-blocking (host-wide) — {mode_label} — Enter to add/remove, m for mode"
+                    ))
                     .fg(theme.accent()),
             )
             .highlight_style(if self.focus == Focus::Countries {
@@ -245,7 +273,18 @@ impl Dashboard {
             Some(count) => format!("{count} range(s)"),
             None => "not yet fetched".to_string(),
         };
-        Line::from(format!("{:<8}{}", country_code.to_uppercase(), ranges))
+        // Every row currently in the list is enforced the same way — the
+        // mode governs all of them at once — so the tag is a direct
+        // reflection of `geo_mode`, not a per-row setting.
+        let policy = match self.geo_mode {
+            GeoMode::Blocklist => Policy::Blocked,
+            GeoMode::Allowlist => Policy::Allowed,
+        };
+        Line::from(vec![
+            Span::from(format!("{:<8}", country_code.to_uppercase())),
+            policy_tag(policy),
+            Span::from(format!(" {ranges}")),
+        ])
     }
 
     fn render_popup(&self, frame: &mut Frame, area: Rect, popup: Popup) {
@@ -278,7 +317,7 @@ impl Dashboard {
                 frame.render_widget(list, popup_area);
             }
             Popup::AddCountry { input, error } => {
-                let title = "Block a country (2-letter code)";
+                let title = "Add a country (2-letter code)";
                 let width = 40u16;
                 let height = if error.is_some() { 5 } else { 4 };
                 let popup_area = centered_rect(width, height, area);
@@ -290,6 +329,31 @@ impl Dashboard {
                 let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(paragraph, popup_area);
+            }
+            Popup::GeoMode { selected } => {
+                let title = "Geo mode";
+                let options = [
+                    "Blocklist (block selected countries)",
+                    "Allowlist (block everything except selected)",
+                ];
+                let content_width = options.iter().map(|o| o.len()).max().unwrap_or(0);
+                let popup_area =
+                    centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
+                let items: Vec<ListItem> = options
+                    .iter()
+                    .enumerate()
+                    .map(|(i, label)| {
+                        let line = if i == selected {
+                            Line::from(*label).reversed()
+                        } else {
+                            Line::from(*label)
+                        };
+                        ListItem::new(line)
+                    })
+                    .collect();
+                let list = List::new(items).block(Block::bordered().title(title));
+                frame.render_widget(Clear, popup_area);
+                frame.render_widget(list, popup_area);
             }
         }
     }
@@ -356,23 +420,71 @@ impl Dashboard {
                             }
                             Ok(cc) => {
                                 self.popup = None;
-                                if self.blocked_countries.iter().any(|b| b == &cc) {
+                                if self.selected_countries.iter().any(|b| b == &cc) {
                                     *message =
-                                        Some(format!("{} is already blocked", cc.to_uppercase()));
+                                        Some(format!("{} is already selected", cc.to_uppercase()));
                                     return Ok(KeyOutcome::Consumed);
                                 }
                                 if self.fetched_countries.iter().any(|(c, _, _)| c == &cc) {
-                                    db.set_country_blocked(&cc, true)?;
-                                    *message = Some(format!("Blocked {}", cc.to_uppercase()));
+                                    db.set_country_selected(&cc, true)?;
+                                    let verb = match self.geo_mode {
+                                        GeoMode::Blocklist => "Blocked",
+                                        GeoMode::Allowlist => "Allowed",
+                                    };
+                                    *message = Some(format!("{verb} {}", cc.to_uppercase()));
                                     return Ok(KeyOutcome::Mutated);
                                 }
-                                return Ok(KeyOutcome::BlockCountry(cc));
+                                return Ok(KeyOutcome::SelectCountry(cc));
                             }
                         }
                     }
                     _ => return Ok(KeyOutcome::Consumed),
                 },
+                Popup::GeoMode { selected } => match key.code {
+                    KeyCode::Esc => {
+                        self.popup = None;
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selected = (*selected + 1).min(1);
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        let Some(Popup::GeoMode { selected }) = self.popup.take() else {
+                            unreachable!("checked above")
+                        };
+                        let mode = match selected {
+                            0 => GeoMode::Blocklist,
+                            _ => GeoMode::Allowlist,
+                        };
+                        db.set_geo_mode(mode)?;
+                        *message = Some(match mode {
+                            GeoMode::Blocklist => {
+                                "Geo mode set to Blocklist: selected countries are blocked, everything else is allowed".to_string()
+                            }
+                            GeoMode::Allowlist => {
+                                "Geo mode set to Allowlist: selected countries are the ONLY ones allowed, everything else will be blocked host-wide once render-firewall runs".to_string()
+                            }
+                        });
+                        return Ok(KeyOutcome::Mutated);
+                    }
+                    _ => return Ok(KeyOutcome::Consumed),
+                },
             }
+        }
+
+        if key.code == KeyCode::Char('m') {
+            self.popup = Some(Popup::GeoMode {
+                selected: match self.geo_mode {
+                    GeoMode::Blocklist => 0,
+                    GeoMode::Allowlist => 1,
+                },
+            });
+            return Ok(KeyOutcome::Consumed);
         }
 
         match self.focus {
@@ -448,11 +560,11 @@ impl Dashboard {
             });
             return Ok(KeyOutcome::Consumed);
         }
-        let Some(country_code) = self.blocked_countries.get(selected - 1) else {
+        let Some(country_code) = self.selected_countries.get(selected - 1) else {
             return Ok(KeyOutcome::Consumed);
         };
-        db.set_country_blocked(country_code, false)?;
-        *message = Some(format!("Unblocked {}", country_code.to_uppercase()));
+        db.set_country_selected(country_code, false)?;
+        *message = Some(format!("Removed {}", country_code.to_uppercase()));
         Ok(KeyOutcome::Mutated)
     }
 }
@@ -641,7 +753,7 @@ mod tests {
                 assert_eq!(category, Category::Scanner);
                 assert_eq!(selected, 1); // Blocked
             }
-            Popup::AddCountry { .. } => panic!("expected a Category popup"),
+            other => panic!("expected a Category popup, got {other:?}"),
         }
     }
 
@@ -766,7 +878,7 @@ mod tests {
                 assert!(input.is_empty());
                 assert!(error.is_none());
             }
-            Popup::Category { .. } => panic!("expected an AddCountry popup"),
+            other => panic!("expected an AddCountry popup, got {other:?}"),
         }
     }
 
@@ -789,12 +901,12 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::Consumed);
         match dashboard.popup.unwrap() {
             Popup::AddCountry { error, .. } => assert!(error.is_some()),
-            Popup::Category { .. } => panic!("expected an AddCountry popup"),
+            other => panic!("expected an AddCountry popup, got {other:?}"),
         }
     }
 
     #[test]
-    fn add_country_popup_confirming_an_unfetched_code_returns_block_country() {
+    fn add_country_popup_confirming_an_unfetched_code_returns_select_country() {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
@@ -808,12 +920,12 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
 
-        assert_eq!(outcome, KeyOutcome::BlockCountry("nl".to_string()));
+        assert_eq!(outcome, KeyOutcome::SelectCountry("nl".to_string()));
         assert!(dashboard.popup.is_none());
     }
 
     #[test]
-    fn add_country_popup_confirming_an_already_fetched_code_blocks_it_directly() {
+    fn add_country_popup_confirming_an_already_fetched_code_selects_it_directly() {
         let db = Db::open_in_memory().unwrap();
         db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
             .unwrap();
@@ -831,16 +943,20 @@ mod tests {
 
         assert_eq!(outcome, KeyOutcome::Mutated);
         assert!(dashboard.popup.is_none());
-        assert_eq!(db.list_blocked_countries().unwrap(), vec!["nl".to_string()]);
-        assert!(message.unwrap().contains("NL"));
+        assert_eq!(
+            db.list_selected_countries().unwrap(),
+            vec!["nl".to_string()]
+        );
+        // Default geo mode is Blocklist, so selecting a country blocks it.
+        assert!(message.unwrap().contains("Blocked NL"));
     }
 
     #[test]
-    fn add_country_popup_confirming_an_already_blocked_code_is_a_noop_with_a_message() {
+    fn add_country_popup_confirming_an_already_selected_code_is_a_noop_with_a_message() {
         let db = Db::open_in_memory().unwrap();
         db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
             .unwrap();
-        db.set_country_blocked("nl", true).unwrap();
+        db.set_country_selected("nl", true).unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         dashboard.popup = Some(Popup::AddCountry {
@@ -854,7 +970,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome, KeyOutcome::Consumed);
-        assert!(message.unwrap().contains("already blocked"));
+        assert!(message.unwrap().contains("already selected"));
     }
 
     #[test]
@@ -889,11 +1005,11 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_blocked_country_row_unblocks_it_directly() {
+    fn enter_on_a_selected_country_row_removes_it_directly() {
         let db = Db::open_in_memory().unwrap();
         db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
             .unwrap();
-        db.set_country_blocked("nl", true).unwrap();
+        db.set_country_selected("nl", true).unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         dashboard.focus = Focus::Countries;
@@ -905,8 +1021,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome, KeyOutcome::Mutated);
-        assert!(db.list_blocked_countries().unwrap().is_empty());
-        assert!(message.unwrap().contains("Unblocked NL"));
+        assert!(db.list_selected_countries().unwrap().is_empty());
+        assert!(message.unwrap().contains("Removed NL"));
     }
 
     /// Regression test: unblocking the *last* selected row must not leave
@@ -915,19 +1031,19 @@ mod tests {
     /// leaves a stale out-of-range index after the list shrinks out from
     /// under it.
     #[test]
-    fn unblocking_the_last_selected_country_clamps_the_selection() {
+    fn removing_the_last_selected_country_clamps_the_selection() {
         let db = Db::open_in_memory().unwrap();
         db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
             .unwrap();
-        db.set_country_blocked("nl", true).unwrap();
+        db.set_country_selected("nl", true).unwrap();
         db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
             .unwrap();
-        db.set_country_blocked("us", true).unwrap();
+        db.set_country_selected("us", true).unwrap();
 
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         dashboard.focus = Focus::Countries;
-        // Rows: 0 = Add, 1 = nl, 2 = us. Select the last one and unblock it.
+        // Rows: 0 = Add, 1 = nl, 2 = us. Select the last one and remove it.
         dashboard.countries_state.select(Some(2));
 
         let mut message = None;
@@ -943,11 +1059,11 @@ mod tests {
     }
 
     #[test]
-    fn render_shows_the_geo_blocking_panel_and_blocked_countries() {
+    fn render_shows_the_geo_blocking_panel_and_selected_countries() {
         let db = Db::open_in_memory().unwrap();
         db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
             .unwrap();
-        db.set_country_blocked("nl", true).unwrap();
+        db.set_country_selected("nl", true).unwrap();
 
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
@@ -966,8 +1082,79 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(content.contains("Geo-blocking"));
-        assert!(content.contains("Add a country to block"));
+        assert!(content.contains("Blocklist"));
+        assert!(content.contains("Add a country"));
         assert!(content.contains("NL"));
         assert!(content.contains("1 range(s)"));
+    }
+
+    #[test]
+    fn m_key_opens_the_geo_mode_popup_at_the_current_mode() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('m')), &db, &mut message)
+            .unwrap();
+
+        match dashboard.popup.unwrap() {
+            Popup::GeoMode { selected } => assert_eq!(selected, 0), // Blocklist
+            other => panic!("expected a GeoMode popup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirming_the_geo_mode_popup_switches_mode_and_reflects_in_new_messages() {
+        let db = Db::open_in_memory().unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::GeoMode { selected: 0 });
+
+        let mut message = None;
+        // Move to "Allowlist" and confirm.
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(dashboard.popup.is_none());
+        assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Allowlist);
+        assert!(message.unwrap().contains("Allowlist"));
+
+        // Selecting a country now reads "Allowed", not "Blocked".
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::AddCountry {
+            input: "nl".to_string(),
+            error: None,
+        });
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert!(message.unwrap().contains("Allowed NL"));
+    }
+
+    #[test]
+    fn escape_closes_the_geo_mode_popup_without_changing_it() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::GeoMode { selected: 1 });
+
+        let mut message = None;
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Esc), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(dashboard.popup.is_none());
+        assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Blocklist);
     }
 }

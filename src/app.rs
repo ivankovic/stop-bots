@@ -88,11 +88,11 @@ impl App {
                 Event::App(AppEvent::SourceUpdateFinished { source_id, result }) => {
                     self.finish_source_update(source_id, result)?;
                 }
-                Event::App(AppEvent::CountryBlockFinished {
+                Event::App(AppEvent::CountrySelectFinished {
                     country_code,
                     result,
                 }) => {
-                    self.finish_country_block(country_code, result)?;
+                    self.finish_country_select(country_code, result)?;
                 }
             }
         }
@@ -149,11 +149,12 @@ impl App {
     }
 
     /// Starts a background fetch of `country_code`'s IP ranges, spawned from
-    /// the Dashboard's "add a country to block" popup for a country that
-    /// isn't fetched yet. Only fetches and parses on the spawned task, same
-    /// reason as `start_source_update`: storing (and blocking the country)
-    /// happens back on the main thread in `finish_country_block`.
-    fn start_country_block(&mut self, country_code: String) {
+    /// the Dashboard's "add a country" popup for a country that isn't
+    /// fetched yet. Only fetches and parses on the spawned task, same
+    /// reason as `start_source_update`: storing (and adding the country to
+    /// the geo selection) happens back on the main thread in
+    /// `finish_country_select`.
+    fn start_country_select(&mut self, country_code: String) {
         self.message = Some(format!(
             "Fetching IP ranges for {}…",
             country_code.to_uppercase()
@@ -166,19 +167,22 @@ impl App {
             }
             .await
             .map_err(|err: anyhow::Error| err.to_string());
-            let _ = sender.send(Event::App(AppEvent::CountryBlockFinished {
+            let _ = sender.send(Event::App(AppEvent::CountrySelectFinished {
                 country_code,
                 result,
             }));
         });
     }
 
-    /// Stores the fetched CIDRs (on success) and blocks the country — this
-    /// completes the intent behind the Dashboard action that started this
-    /// fetch, which was always "block this country", not just "fetch its
-    /// ranges". Run back on the main thread once `start_country_block`'s
-    /// background fetch completes.
-    fn finish_country_block(
+    /// Stores the fetched CIDRs (on success) and adds the country to the
+    /// geo selection — this completes the intent behind the Dashboard
+    /// action that started this fetch, which was always "add this
+    /// country", not just "fetch its ranges". Run back on the main thread
+    /// once `start_country_select`'s background fetch completes. The
+    /// message says "Blocked"/"Allowed" depending on the *current* geo
+    /// mode, same mode-relative wording `Dashboard` already uses for the
+    /// synchronous (already-fetched) path.
+    fn finish_country_select(
         &mut self,
         country_code: String,
         result: Result<Vec<String>, String>,
@@ -187,8 +191,12 @@ impl App {
         match result {
             Ok(cidrs) => {
                 let count = self.db.replace_country_ranges(&country_code, &cidrs)?;
-                self.db.set_country_blocked(&country_code, true)?;
-                self.message = Some(format!("Blocked {label} ({count} range(s))"));
+                self.db.set_country_selected(&country_code, true)?;
+                let verb = match self.db.get_geo_mode()? {
+                    crate::db::GeoMode::Blocklist => "Blocked",
+                    crate::db::GeoMode::Allowlist => "Allowed",
+                };
+                self.message = Some(format!("{verb} {label} ({count} range(s))"));
                 self.refresh()?;
             }
             Err(err) => {
@@ -241,8 +249,8 @@ impl App {
                 self.start_source_update(name);
                 return Ok(());
             }
-            KeyOutcome::BlockCountry(country_code) => {
-                self.start_country_block(country_code);
+            KeyOutcome::SelectCountry(country_code) => {
+                self.start_country_select(country_code);
                 return Ok(());
             }
             KeyOutcome::Ignored => {}

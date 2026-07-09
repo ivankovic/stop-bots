@@ -890,7 +890,7 @@ the stable **id** (`"well-known-bots"`) instead, resolved via
 `PopupTarget::Source` changed the same way, looking the display name back
 up from `self.sources` only when rendering the popup's title.
 
-## Crawler and country IP ranges (`src/ipranges.rs`, `Db::derived_block_addresses`)
+## Crawler and country IP ranges (`src/ipranges.rs`, `Db::derived_firewall_entries`)
 
 Extends the firewall layer (see "Firewall integration" above, which
 predates this and describes it as plain admin-managed with "no bot-list
@@ -1108,18 +1108,121 @@ back on the main thread in `App::finish_country_block`, once
 `AppEvent::CountryBlockFinished` arrives. Exactly the
 fetch-off-thread/store-on-thread split `start_source_update`/
 `finish_source_update` already established for bot-list source updates;
-`KeyOutcome::BlockCountry`/`AppEvent::CountryBlockFinished` are the
-country-blocking analogues of `KeyOutcome::UpdateSource`/
-`AppEvent::SourceUpdateFinished`.
+`KeyOutcome::SelectCountry`/`AppEvent::CountrySelectFinished` are the
+country-selection analogues of `KeyOutcome::UpdateSource`/
+`AppEvent::SourceUpdateFinished`. (Originally named `BlockCountry`/
+`CountryBlockFinished` — renamed along with everything else described in
+"Geo-blocking: Blocklist and Allowlist modes" below, once "block" stopped
+being universally true.)
 
 **Testing the fetch-needed path without hitting the network.** Every pty
 test in this codebase that involves a real fetch cancels rather than
 confirms (see "End-to-end tests" above) — this one is no different in
 spirit, just cheaper to arrange: the unit test
-(`add_country_popup_confirming_an_unfetched_code_returns_block_country`)
+(`add_country_popup_confirming_an_unfetched_code_returns_select_country`)
 asserts the `KeyOutcome` directly without ever spawning anything, and the
 one pty test (`dashboard_geo_blocking_add_and_remove_a_country`) seeds an
 *already-fetched* country directly via `Db::replace_country_ranges` before
 launching the TUI, so the add-country flow it exercises takes the
 synchronous "already fetched" branch — no network access, same as every
 other pty test in this suite.
+
+## Geo-blocking: Blocklist and Allowlist modes (`Db::GeoMode`, `Db::geo_firewall_rules`)
+
+The original geo design (previous two sections) only ever blocked selected
+countries, everything else allowed. Extended to a second mode: **Allowlist**
+— selected countries are the *only* ones allowed, everything else blocked
+host-wide. `Db::GeoMode` (`Blocklist` | `Allowlist`, stored in `settings`
+under `geo_mode`, defaulting to `Blocklist`) governs how
+`Db::geo_firewall_rules` interprets `selected_countries` (renamed from
+`blocked_countries` — see below):
+
+- **Blocklist**: every selected country's CIDRs, as Block.
+- **Allowlist**: every selected country's CIDRs, as Allow, **followed by**
+  a trailing `0.0.0.0/0`/`::/0` Block — the "everything else" catch-all.
+  Order is load-bearing: the catch-all must render last so it never shadows
+  an allowed country's rule, or an admin's own `firewall_rules` Allow
+  entry, that came before it in the combined rule list `main.rs::render_firewall`
+  builds (admin rules, then crawler IP-range Blocks, then geo rules).
+
+**Renamed, not just extended — "blocked" stopped being universally true.**
+`blocked_countries` → `selected_countries`; `Db::set_country_blocked`/
+`list_blocked_countries` → `set_country_selected`/`list_selected_countries`;
+CLI `block-country`/`unblock-country`/`list-blocked-countries` →
+`add-country`/`remove-country`/`list-selected-countries`, plus a new
+`set-geo-mode --mode blocklist|allowlist`. `Db::blocked_country_ranges`
+(a join across all blocked countries) was replaced by a plain per-country
+`Db::country_ranges` lookup, since `geo_firewall_rules` needed to iterate
+selected countries and look up each one's CIDRs regardless of what action
+they'd get. The Dashboard's messages ("Blocked NL" vs "Allowed NL",
+"Removed NL" regardless of mode) and the geo panel's title
+(`Geo-blocking (host-wide) — Blocklist — ...` / `— Allowlist — ...`) read
+`geo_mode` directly rather than hardcoding "block" language — see
+"Dashboard geo-blocking panel" above for the panel itself, extended here
+with `Popup::GeoMode { selected }` (`m` key, from anywhere on the
+Dashboard) and its own confirmation message spelling out exactly what
+Allowlist means, since it's the one action on this screen that isn't
+easily reversible in spirit (Blocklist→Allowlist doesn't destroy data, but
+the *next* `render-firewall` run behaves completely differently).
+
+This mode split surfaced two real bugs, both fixed as part of landing it
+rather than filed for later — Allowlist's trailing catch-all is exactly
+the kind of change that turns a latent gap into an active one:
+
+**1. `render-firewall` now refuses Allowlist mode on `--backend iptables`.**
+A trailing `0.0.0.0/0`/`::/0` Block only makes the resulting chain a safe
+default-deny gate if two things are also true: loopback and
+established/related connections are allowed ahead of it, and IPv6 is
+actually enforced. `nftables::render` already emits both (`iif lo accept`,
+`ct state established,related accept`, and real `ip6 saddr` rules) — see
+"Firewall integration" above. `iptables::render` has neither: its
+`STOP-BOTS` chain has no loopback/established carve-out at all (fine
+today, since it only ever holds specific DROPs that fall through to
+INPUT's own ACCEPT policy when nothing matches — but a `0.0.0.0/0` DROP as
+the last rule means *nothing* ever falls through again, dropping
+`127.0.0.1` along with everything else), and it skips IPv6 rules entirely
+by design (see its module doc comment) — meaning an Allowlist catch-all's
+`::/0` entry never renders at all, silently permitting *all* IPv6 traffic
+while IPv4 is locked down to just the allowed countries. `render_firewall`
+now checks `db.get_geo_mode()` before doing anything else and bails with a
+clear message if the backend is iptables — a one-line guard that avoids
+either failure mode entirely, rather than trying to patch iptables into
+supporting a use case its module doc comment already explains it wasn't
+designed for.
+
+**2. The SSH lockout check was rewritten to simulate first-match-wins
+evaluation, not "does any Block rule's CIDR contain this IP".** The
+pre-Allowlist version (`lockout_risks(addresses: &[String], ...)`, see
+"SSH lockout safety net" above) only ever had Block-rule addresses to
+check against, so "any Block CIDR contains this IP" and "the first
+matching rule is a Block" were the same question. Allowlist breaks that
+equivalence on purpose: an admin's connected IP might be *covered by an
+earlier Allow rule* (their own `firewall_rules` entry, or an allowed
+country) before the catch-all is ever reached — real firewalls stop at
+the first match, so that admin is safe, but the old heuristic would still
+flag them, because the catch-all's `0.0.0.0/0` CIDR *does* technically
+contain their IP too. Rewritten to `lockout_risks(rules: &[FirewallRule],
+...)`: for each connected IP, walk `rules` in the exact order they'll be
+rendered and stop at the first CIDR match; only a Block/Reject first-match
+counts as a risk. Deliberately doesn't model established/related
+connections — the question this answers is "can this client *reconnect*
+after applying this", which is the stricter and more useful one (an admin
+who disconnects can't rely on an already-open session to get back in).
+Verified end to end in `tests/cli.rs`
+(`render_firewall_allowlist_mode_does_not_warn_when_an_earlier_allow_rule_covers_the_admin`):
+an admin-added Allow rule for the connected IP renders successfully with
+no warning, while the same IP with no such rule (`render_firewall_rejects_allowlist_mode_on_iptables_cli`'s
+sibling scenarios) still gets caught by the catch-all.
+
+**A side effect of fixing #2, not something Allowlist mode itself needed:**
+tracing through real rule lists surfaced that `ipranges::cidr_contains`
+never matched a bare IP address with no `/len` at all — exactly the shape
+of `firewall_rules.address` for a plain `add-firewall-rule --address
+1.2.3.4` (no CIDR suffix). Its `split_once('/')` returning `None` fell
+through to "no match", silently treating every plain-IP admin rule as
+invisible to the lockout check. Fixed by treating a bare address as an
+exact-match `/32`/`/128` rather than "not a CIDR, so never matches" — this
+was already wrong before Allowlist existed (a plain-IP Block rule's
+address was never checked against connected IPs either), just never
+exercised by a test until this rewrite needed real rule lists containing
+plain IPs to verify the first-match-wins logic against.

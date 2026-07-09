@@ -119,6 +119,43 @@ impl Category {
     }
 }
 
+/// How the countries in `selected_countries` should be enforced host-wide.
+/// See [`Db::geo_firewall_rules`] for exactly what each mode produces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GeoMode {
+    /// Selected countries are blocked; everything else is allowed (the
+    /// default — matches the original, simpler design before allowlisting
+    /// existed, and is the only mode safe to render on either firewall
+    /// backend).
+    #[default]
+    Blocklist,
+    /// Selected countries are the *only* ones allowed; everything else is
+    /// blocked host-wide via a trailing catch-all. Meaningfully more
+    /// dangerous than Blocklist — see `main.rs::render_firewall`'s
+    /// nftables-only guard and SPECS.md.
+    Allowlist,
+}
+
+impl GeoMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            GeoMode::Blocklist => "blocklist",
+            GeoMode::Allowlist => "allowlist",
+        }
+    }
+
+    /// Falls back to `Blocklist` for any unrecognized value, same
+    /// never-fail-a-read-over-a-stored-enum convention as
+    /// [`Category::from_str`] — the column is only ever written by
+    /// [`Self::as_str`].
+    fn from_str(s: &str) -> Self {
+        match s {
+            "allowlist" => GeoMode::Allowlist,
+            _ => GeoMode::Blocklist,
+        }
+    }
+}
+
 /// A bot-list data source that bots can be fetched from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -419,12 +456,17 @@ impl Db {
                 PRIMARY KEY (country_code, cidr)
             );
 
-            -- Row presence means \"block this country\", host-wide (not
-            -- per-site — see SPECS.md for why per-site geo was dropped once
-            -- real CIDR data, not just country codes, was in scope: some
-            -- countries carry tens of thousands of CIDR blocks, which is
-            -- impractical to enforce per NGINX vhost).
-            CREATE TABLE IF NOT EXISTS blocked_countries (
+            -- Row presence means \"this country is in the active geo
+            -- list\", host-wide (not per-site — see SPECS.md for why
+            -- per-site geo was dropped once real CIDR data, not just
+            -- country codes, was in scope: some countries carry tens of
+            -- thousands of CIDR blocks, which is impractical to enforce per
+            -- NGINX vhost). What being \"in the list\" actually *means* —
+            -- blocked, or the only ones allowed — depends on the
+            -- `geo_mode` setting (see GeoMode), which is why this table is
+            -- named for what it stores (a selection) rather than for one
+            -- mode's interpretation of it.
+            CREATE TABLE IF NOT EXISTS selected_countries (
                 country_code TEXT PRIMARY KEY,
                 added_at INTEGER NOT NULL
             );
@@ -443,6 +485,14 @@ impl Db {
                 params![key, default.as_str()],
             )?;
         }
+
+        // Seed the default geo mode: Blocklist (block specific countries,
+        // allow everything else) — the least surprising default, and the
+        // only one that's safe to render on either firewall backend.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('geo_mode', ?1)",
+            params![GeoMode::Blocklist.as_str()],
+        )?;
 
         Ok(())
     }
@@ -727,6 +777,24 @@ impl Db {
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![category.settings_key(), policy.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_geo_mode(&self) -> Result<GeoMode> {
+        let value: String = self.conn.query_row(
+            "SELECT value FROM settings WHERE key = 'geo_mode'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(GeoMode::from_str(&value))
+    }
+
+    pub fn set_geo_mode(&self, mode: GeoMode) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('geo_mode', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![mode.as_str()],
         )?;
         Ok(())
     }
@@ -1072,61 +1140,103 @@ impl Db {
             .context("failed to list fetched countries")
     }
 
-    /// Sets, or clears, whether `country_code` is host-wide blocked. Row
-    /// presence in `blocked_countries` encodes the block, same convention as
-    /// the site override tables.
-    pub fn set_country_blocked(&self, country_code: &str, blocked: bool) -> Result<()> {
-        if blocked {
+    /// Adds or removes `country_code` from the active geo selection. Row
+    /// presence in `selected_countries` encodes membership, same convention
+    /// as the site override tables — what membership actually *means*
+    /// (blocked, or the only one allowed) depends on [`Self::get_geo_mode`].
+    pub fn set_country_selected(&self, country_code: &str, selected: bool) -> Result<()> {
+        if selected {
             self.conn.execute(
-                "INSERT OR IGNORE INTO blocked_countries (country_code, added_at) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO selected_countries (country_code, added_at) VALUES (?1, ?2)",
                 params![country_code, now()],
             )?;
         } else {
             self.conn.execute(
-                "DELETE FROM blocked_countries WHERE country_code = ?1",
+                "DELETE FROM selected_countries WHERE country_code = ?1",
                 params![country_code],
             )?;
         }
         Ok(())
     }
 
-    pub fn list_blocked_countries(&self) -> Result<Vec<String>> {
+    pub fn list_selected_countries(&self) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT country_code FROM blocked_countries ORDER BY country_code")?;
+            .prepare("SELECT country_code FROM selected_countries ORDER BY country_code")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to list blocked countries")
+            .context("failed to list selected countries")
     }
 
-    /// Every CIDR belonging to a currently host-wide-blocked country. A
-    /// country marked blocked before its ranges were ever fetched (or after
-    /// its only fetch was somehow cleared) simply contributes nothing yet —
-    /// blocking it is a no-op until `replace_country_ranges` has run for it
-    /// at least once, not an error.
-    pub fn blocked_country_ranges(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT cidr FROM country_ip_ranges WHERE country_code IN (
-                SELECT country_code FROM blocked_countries
-             ) ORDER BY cidr",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    /// Every CIDR currently known for `country_code` — a plain lookup, not
+    /// filtered by selection state, unlike the old (removed)
+    /// `blocked_country_ranges`'s all-blocked-countries join. A country
+    /// with no fetched ranges yet simply returns empty, not an error.
+    fn country_ranges(&self, country_code: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT cidr FROM country_ip_ranges WHERE country_code = ?1 ORDER BY cidr")?;
+        let rows = stmt.query_map(params![country_code], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
-            .context("failed to list blocked country ranges")
+            .context("failed to list a country's ip ranges")
     }
 
-    /// Every address [`Self::blocked_ip_ranges`] and
-    /// [`Self::blocked_country_ranges`] currently contribute, combined —
-    /// what `render-firewall` layers on top of the admin-managed
-    /// `firewall_rules` table as synthetic, always-Block, non-persisted
-    /// rules (see `main.rs::render_firewall`). Not persisted into
-    /// `firewall_rules` itself: recomputing this fresh on every render means
-    /// there is never a stale derived row to reconcile, and an admin's own
-    /// rules are never at risk of being deleted by a refresh.
-    pub fn derived_block_addresses(&self) -> Result<Vec<String>> {
-        let mut addrs = self.blocked_ip_ranges()?;
-        addrs.extend(self.blocked_country_ranges()?);
-        Ok(addrs)
+    /// The host-wide geo portion of the firewall, as `(address, action)`
+    /// pairs in the exact order they must be rendered — see
+    /// [`Self::derived_firewall_entries`] and `main.rs::render_firewall`,
+    /// which appends this after admin rules and crawler IP ranges, never
+    /// reorders it, and feeds the same ordered list to both the rendered
+    /// script and the pre-render lockout safety check.
+    ///
+    /// - [`GeoMode::Blocklist`]: every selected country's CIDRs, as Block.
+    ///   A country selected before its ranges were ever fetched (or after
+    ///   its only fetch was cleared) simply contributes nothing yet, not an
+    ///   error — same "fetching and selecting are independent steps"
+    ///   reasoning `ipranges`'s doc comments already describe.
+    /// - [`GeoMode::Allowlist`]: every selected country's CIDRs, as Allow,
+    ///   **followed by** a trailing `0.0.0.0/0`/`::/0` Block — the
+    ///   "everything else" catch-all. Order is load-bearing here: the
+    ///   catch-all must be last so it never shadows an allowed country's
+    ///   rule (or, upstream of this function, an admin's own explicit
+    ///   Allow rule) that came before it. This mode is meaningfully more
+    ///   dangerous than Blocklist — see `main.rs::render_firewall`'s
+    ///   nftables-only guard.
+    pub fn geo_firewall_rules(&self) -> Result<Vec<(String, FirewallAction)>> {
+        let mode = self.get_geo_mode()?;
+        let selected = self.list_selected_countries()?;
+        let mut rules = Vec::new();
+        let action = match mode {
+            GeoMode::Blocklist => FirewallAction::Block,
+            GeoMode::Allowlist => FirewallAction::Allow,
+        };
+        for country_code in &selected {
+            for cidr in self.country_ranges(country_code)? {
+                rules.push((cidr, action));
+            }
+        }
+        if mode == GeoMode::Allowlist {
+            rules.push(("0.0.0.0/0".to_string(), FirewallAction::Block));
+            rules.push(("::/0".to_string(), FirewallAction::Block));
+        }
+        Ok(rules)
+    }
+
+    /// Every `(address, action)` pair [`Self::blocked_ip_ranges`] (always
+    /// Block) and [`Self::geo_firewall_rules`] (Block or Allow, depending on
+    /// mode) currently contribute, combined — what `render-firewall` layers
+    /// on top of the admin-managed `firewall_rules` table as synthetic,
+    /// non-persisted rules (see `main.rs::render_firewall`). Not persisted
+    /// into `firewall_rules` itself: recomputing this fresh on every render
+    /// means there is never a stale derived row to reconcile, and an
+    /// admin's own rules are never at risk of being deleted by a refresh.
+    pub fn derived_firewall_entries(&self) -> Result<Vec<(String, FirewallAction)>> {
+        let mut entries: Vec<(String, FirewallAction)> = self
+            .blocked_ip_ranges()?
+            .into_iter()
+            .map(|address| (address, FirewallAction::Block))
+            .collect();
+        entries.extend(self.geo_firewall_rules()?);
+        Ok(entries)
     }
 
     /// Computes the user-agent regex alternatives for every bot that should
@@ -1919,43 +2029,92 @@ mod tests {
     }
 
     #[test]
-    fn blocked_country_ranges_only_includes_explicitly_blocked_countries() {
+    fn geo_mode_defaults_to_blocklist_and_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Blocklist);
+
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Allowlist);
+
+        db.set_geo_mode(GeoMode::Blocklist).unwrap();
+        assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Blocklist);
+    }
+
+    #[test]
+    fn blocklist_mode_only_blocks_explicitly_selected_countries() {
         let db = Db::open_in_memory().unwrap();
         db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
             .unwrap();
         db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
             .unwrap();
 
-        assert!(db.blocked_country_ranges().unwrap().is_empty());
+        assert!(db.geo_firewall_rules().unwrap().is_empty());
 
-        db.set_country_blocked("us", true).unwrap();
+        db.set_country_selected("us", true).unwrap();
         assert_eq!(
-            db.blocked_country_ranges().unwrap(),
-            vec!["4.5.6.0/24".to_string()]
+            db.geo_firewall_rules().unwrap(),
+            vec![("4.5.6.0/24".to_string(), FirewallAction::Block)]
         );
-        assert_eq!(db.list_blocked_countries().unwrap(), vec!["us".to_string()]);
+        assert_eq!(
+            db.list_selected_countries().unwrap(),
+            vec!["us".to_string()]
+        );
 
-        db.set_country_blocked("us", false).unwrap();
-        assert!(db.blocked_country_ranges().unwrap().is_empty());
+        db.set_country_selected("us", false).unwrap();
+        assert!(db.geo_firewall_rules().unwrap().is_empty());
     }
 
     #[test]
-    fn blocking_a_country_before_its_ranges_are_fetched_is_a_harmless_noop() {
+    fn allowlist_mode_allows_selected_countries_then_blocks_everything_else() {
         let db = Db::open_in_memory().unwrap();
-        db.set_country_blocked("us", true).unwrap();
-        assert!(db.blocked_country_ranges().unwrap().is_empty());
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("nl", true).unwrap();
+
+        // Order matters: the allowed country's rule must come before the
+        // trailing catch-all, never after.
+        assert_eq!(
+            db.geo_firewall_rules().unwrap(),
+            vec![
+                ("1.2.3.0/24".to_string(), FirewallAction::Allow),
+                ("0.0.0.0/0".to_string(), FirewallAction::Block),
+                ("::/0".to_string(), FirewallAction::Block),
+            ]
+        );
+    }
+
+    #[test]
+    fn allowlist_mode_with_no_selected_countries_still_blocks_everything() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+
+        assert_eq!(
+            db.geo_firewall_rules().unwrap(),
+            vec![
+                ("0.0.0.0/0".to_string(), FirewallAction::Block),
+                ("::/0".to_string(), FirewallAction::Block),
+            ]
+        );
+    }
+
+    #[test]
+    fn selecting_a_country_before_its_ranges_are_fetched_is_a_harmless_noop() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_country_selected("us", true).unwrap();
+        assert!(db.geo_firewall_rules().unwrap().is_empty());
 
         // Fetching afterwards makes the block take effect retroactively.
         db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
             .unwrap();
         assert_eq!(
-            db.blocked_country_ranges().unwrap(),
-            vec!["4.5.6.0/24".to_string()]
+            db.geo_firewall_rules().unwrap(),
+            vec![("4.5.6.0/24".to_string(), FirewallAction::Block)]
         );
     }
 
     #[test]
-    fn derived_block_addresses_combines_ip_ranges_and_country_ranges() {
+    fn derived_firewall_entries_combines_ip_ranges_and_geo_rules() {
         let db = Db::open_in_memory().unwrap();
         db.register_ip_range_source(&sample_ip_range_source("gptbot", Category::Ai))
             .unwrap();
@@ -1963,13 +2122,16 @@ mod tests {
             .unwrap();
         db.replace_country_ranges("us", &["7.8.9.0/24".to_string()])
             .unwrap();
-        db.set_country_blocked("us", true).unwrap();
+        db.set_country_selected("us", true).unwrap();
 
-        let mut derived = db.derived_block_addresses().unwrap();
-        derived.sort();
+        let mut derived = db.derived_firewall_entries().unwrap();
+        derived.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             derived,
-            vec!["4.5.6.0/24".to_string(), "7.8.9.0/24".to_string()]
+            vec![
+                ("4.5.6.0/24".to_string(), FirewallAction::Block),
+                ("7.8.9.0/24".to_string(), FirewallAction::Block),
+            ]
         );
     }
 }

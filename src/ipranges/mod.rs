@@ -229,8 +229,14 @@ pub fn parse_zone_file(raw: &str) -> Vec<String> {
 pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
 
+    // `firewall_rules.address` (unlike a fetched IP-range CIDR) is
+    // routinely a bare IP with no "/len" at all — e.g. an admin's own
+    // `add-firewall-rule --address 4.5.6.7`. Treat that as an exact match
+    // rather than "no CIDR here, so never matches": a bare address is
+    // functionally a /32 (or /128), and the lockout check must recognize
+    // it as covering the corresponding connected IP.
     let Some((base, prefix_len)) = cidr.split_once('/') else {
-        return false;
+        return cidr.parse::<IpAddr>().is_ok_and(|base| base == ip);
     };
     let Ok(prefix_len) = prefix_len.parse::<u32>() else {
         return false;
@@ -417,6 +423,21 @@ mod tests {
         assert!(!cidr_contains("not-a-cidr", ip));
         assert!(!cidr_contains("1.2.3.4/not-a-number", ip));
         assert!(!cidr_contains("1.2.3.4/99", ip));
-        assert!(!cidr_contains("1.2.3.4", ip)); // missing "/len" entirely
+    }
+
+    /// `firewall_rules.address` is routinely a bare IP with no "/len" at
+    /// all (e.g. `add-firewall-rule --address 4.5.6.7`) — must be treated
+    /// as an exact match, not "no CIDR here, so never matches", or the
+    /// lockout check in `main.rs` would never recognize an admin's own
+    /// plain-IP Allow rule as covering their connected IP.
+    #[test]
+    fn cidr_contains_treats_a_bare_address_as_an_exact_match() {
+        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(cidr_contains("1.2.3.4", ip));
+        assert!(!cidr_contains("1.2.3.5", ip));
+
+        let ip6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(cidr_contains("2001:db8::1", ip6));
+        assert!(!cidr_contains("2001:db8::2", ip6));
     }
 }

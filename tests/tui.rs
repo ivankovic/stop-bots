@@ -769,35 +769,79 @@ fn dashboard_geo_blocking_add_and_remove_a_country() {
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
     session.exp_string("Geo-blocking").unwrap();
-    session.exp_string("Add a country to block").unwrap();
+    session.exp_string("Add a country").unwrap();
 
     // Down past the last category row (Scanners/Search Bots/AI Bots) flows
     // focus over into the Countries list, landing on its first row — the
-    // fixed "Add a country to block" action.
+    // fixed "Add a country" action.
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\r");
-    session.exp_string("Block a country").unwrap();
+    session.exp_string("Add a country").unwrap();
 
     send_key(&mut session, "nl");
     send_key(&mut session, "\r");
 
-    // Already fetched: blocks immediately, no "Fetching…" network step.
-    // Checked in actual top-to-bottom render order (the geo box's row is
-    // above the message box, so its text hits the wire first) — checking
-    // "Blocked NL" before "range(s)" would consume past the row's text
-    // while scanning for the message, then hang waiting for "range(s)" to
-    // retransmit, which a diffed terminal never does once it's already on
-    // screen.
+    // Already fetched: adds it immediately, no "Fetching…" network step.
+    // Default geo mode is Blocklist, so this blocks NL. Checked in actual
+    // top-to-bottom render order (the geo box's row is above the message
+    // box, so its text hits the wire first) — checking "Blocked NL" before
+    // "range(s)" would consume past the row's text while scanning for the
+    // message, then hang waiting for "range(s)" to retransmit, which a
+    // diffed terminal never does once it's already on screen.
     session.exp_string("range(s)").unwrap();
     session.exp_string("Blocked NL").unwrap();
 
-    // One more Down selects the new "nl" row; Enter unblocks it directly
-    // (no confirmation popup, unlike a category default).
+    // One more Down selects the new "nl" row; Enter removes it directly
+    // (no confirmation popup, unlike a category default). Checked as
+    // "Remov", not the full "Removed NL": "Blocked NL" (the previous
+    // message) and "Removed NL" coincidentally share identical trailing
+    // characters ("ed NL") at the same screen position, so the diffed
+    // terminal only retransmits the part that actually changed.
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\r");
-    session.exp_string("Unblocked NL").unwrap();
+    session.exp_string("Remov").unwrap();
+
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
+/// `m` opens the geo mode popup from anywhere on the Dashboard (not just
+/// while the Countries list has focus); confirming it switches the panel's
+/// title and every subsequent "add a country" message from
+/// Blocked/Blocklist wording to Allowed/Allowlist wording.
+#[test]
+fn dashboard_geo_mode_toggle_switches_to_allowlist() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+    session.exp_string("Dashboard").unwrap();
+    session.exp_string("Blocklist").unwrap();
+
+    send_key(&mut session, "m");
+    session.exp_string("Geo mode").unwrap();
+    session
+        .exp_string("Blocklist (block selected countries)")
+        .unwrap();
+    session
+        .exp_string("Allowlist (block everything except selected)")
+        .unwrap();
+
+    // Move to "Allowlist" and confirm. The panel title (above the message
+    // box in render order) updates in the same frame, so it's checked
+    // first — "Allowlist" here is the title's occurrence, not the
+    // message's. The rest of the confirmation sentence is checked as two
+    // split substrings, not verbatim: a couple of characters in the
+    // middle ("o " between "set t" and "Allowlist") coincidentally match
+    // whatever was already on screen at that exact position, so the
+    // diffed terminal never retransmits them.
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\r");
+    session.exp_string("Allowlist").unwrap();
+    session.exp_string("Geo mode set t").unwrap();
+    session.exp_string("Allowlist:").unwrap();
 
     send_key(&mut session, "q");
     session

@@ -411,7 +411,7 @@ fn render_firewall_lockout_check_covers_derived_country_ranges_too() {
         let db = stop_bots::db::Db::open(&db_path).unwrap();
         db.replace_country_ranges("xx", &["4.5.6.0/24".to_string()])
             .unwrap();
-        db.set_country_blocked("xx", true).unwrap();
+        db.set_country_selected("xx", true).unwrap();
     }
 
     let log_path = tmp.path().join("auth.log");
@@ -439,4 +439,159 @@ fn render_firewall_lockout_check_covers_derived_country_ranges_too() {
         .failure()
         .stderr(predicate::str::contains("4.5.6.7"));
     assert!(!script_path.exists());
+}
+
+#[test]
+fn geo_mode_and_country_selection_cli_happy_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    // Defaults to Blocklist with nothing selected.
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-selected-countries", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Blocklist"))
+        .stdout(predicate::str::contains("No countries selected"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["add-country", "--db", db_path, "--country", "nl"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Added country nl"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-selected-countries", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nl"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["set-geo-mode", "--db", db_path, "--mode", "allowlist"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Allowlist"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-selected-countries", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Allowlist"))
+        .stdout(predicate::str::contains("nl"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["remove-country", "--db", db_path, "--country", "nl"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed country nl"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-selected-countries", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No countries selected"));
+}
+
+/// The nftables-only guard, end to end through the real CLI: Allowlist
+/// mode's trailing default-deny catch-all is unsafe on iptables (no
+/// loopback/established allowance, silently permits all IPv6), so
+/// render-firewall must refuse before ever writing a script.
+#[test]
+fn render_firewall_rejects_allowlist_mode_on_iptables_cli() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["set-geo-mode", "--db", db_path, "--mode", "allowlist"])
+        .assert()
+        .success();
+
+    let script_path = tmp.path().join("stop-bots.sh");
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "render-firewall",
+            "--db",
+            db_path,
+            "--backend",
+            "iptables",
+            "--out",
+            script_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nftables"));
+    assert!(!script_path.exists());
+}
+
+/// The scenario the whole first-match-wins lockout fix exists for: in
+/// Allowlist mode, an admin whose connected IP is covered by an *earlier*
+/// Allow rule (here, their own admin-added `firewall_rules` entry) must not
+/// be flagged as at-risk just because the trailing catch-all's CIDR also
+/// technically contains their IP — the catch-all never actually applies to
+/// them, since the Allow rule matches first.
+#[test]
+fn render_firewall_allowlist_mode_does_not_warn_when_an_earlier_allow_rule_covers_the_admin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["set-geo-mode", "--db", db_path, "--mode", "allowlist"])
+        .assert()
+        .success();
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "add-firewall-rule",
+            "--db",
+            db_path,
+            "--address",
+            "4.5.6.7",
+            "--action",
+            "allow",
+        ])
+        .assert()
+        .success();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(
+        &log_path,
+        "Accepted publickey for admin from 4.5.6.7 port 54321 ssh2\n",
+    )
+    .unwrap();
+
+    let script_path = tmp.path().join("stop-bots.sh");
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "render-firewall",
+            "--db",
+            db_path,
+            "--backend",
+            "nftables",
+            "--out",
+            script_path.to_str().unwrap(),
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("WARNING").not());
+
+    let script = fs::read_to_string(&script_path).unwrap();
+    assert!(script.contains("ip saddr 4.5.6.7 accept"));
+    assert!(script.contains("ip saddr 0.0.0.0/0 drop"));
+    assert!(script.contains("ip6 saddr ::/0 drop"));
 }
