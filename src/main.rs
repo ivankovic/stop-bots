@@ -611,7 +611,6 @@ fn check_lockout_risk(rules: &[FirewallRule], ssh_log: Option<&Path>, force: boo
     if force {
         return Ok(true);
     }
-    print_lockout_warning(&risks);
     Ok(false)
 }
 

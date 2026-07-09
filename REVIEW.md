@@ -1,5 +1,9 @@
 # Pending
 
+- In /home/m/src/stop-bots/src/main.rs on line 628: Why are we using 0.0.0.0/0 in a iptables rule instead of setting the default chain policy to DROP/ACCEPT?
+- How are iptables rules applied from the TUI? Is there missing functionality? Can we add a way to
+  apply it from the TUI?
+
 # Completed
 
 - ✅ Exploratory testing found: the Dashboard should allow changing the
@@ -50,3 +54,4 @@
   `Option<PathBuf>` everywhere, and `open_db` falls back to a per-user XDG
   path when the system path isn't writable, printing which path it picked.
   An explicit `--db` is still honored as-is and fails loudly if it's bad.
+
