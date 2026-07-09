@@ -218,6 +218,52 @@ pub fn parse_zone_file(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `ip` falls inside `cidr`. Used only for the lockout safety check
+/// in `main.rs::render_firewall` (cross-referencing recently-connected SSH
+/// client IPs against everything about to be blocked) — not on any path
+/// that decides what to block, so it deliberately treats a malformed CIDR
+/// or a family mismatch (an IPv4 `ip` against an IPv6 `cidr`, or vice versa)
+/// as simply "no match" rather than an error worth propagating.
+pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+
+    let Some((base, prefix_len)) = cidr.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix_len) = prefix_len.parse::<u32>() else {
+        return false;
+    };
+    let Ok(base) = base.parse::<IpAddr>() else {
+        return false;
+    };
+
+    match (base, ip) {
+        (IpAddr::V4(base), IpAddr::V4(ip)) => {
+            if prefix_len > 32 {
+                return false;
+            }
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix_len)
+            };
+            (u32::from(base) & mask) == (u32::from(ip) & mask)
+        }
+        (IpAddr::V6(base), IpAddr::V6(ip)) => {
+            if prefix_len > 128 {
+                return false;
+            }
+            let mask = if prefix_len == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix_len)
+            };
+            (u128::from(base) & mask) == (u128::from(ip) & mask)
+        }
+        _ => false,
+    }
+}
+
 /// Fetches, parses and stores `country_code`'s current CIDR list. Returns
 /// the count now stored.
 pub async fn update_country(db: &Db, country_code: &str) -> Result<usize> {
@@ -328,5 +374,47 @@ mod tests {
                 "103.71.56.0/24".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn cidr_contains_matches_ipv4_within_range_and_rejects_outside_it() {
+        let ip: std::net::IpAddr = "192.168.1.42".parse().unwrap();
+        assert!(cidr_contains("192.168.1.0/24", ip));
+        assert!(!cidr_contains("192.168.2.0/24", ip));
+    }
+
+    #[test]
+    fn cidr_contains_handles_the_full_prefix_length_range() {
+        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        // /32 only matches the exact address.
+        assert!(cidr_contains("10.0.0.1/32", ip));
+        assert!(!cidr_contains("10.0.0.2/32", ip));
+        // /0 matches everything.
+        assert!(cidr_contains("0.0.0.0/0", ip));
+    }
+
+    #[test]
+    fn cidr_contains_matches_ipv6() {
+        let ip: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(cidr_contains("2001:db8::/32", ip));
+        assert!(!cidr_contains("2001:db9::/32", ip));
+        assert!(cidr_contains("::/0", ip));
+    }
+
+    #[test]
+    fn cidr_contains_never_matches_across_address_families() {
+        let v4: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        let v6: std::net::IpAddr = "::1".parse().unwrap();
+        assert!(!cidr_contains("::/0", v4));
+        assert!(!cidr_contains("0.0.0.0/0", v6));
+    }
+
+    #[test]
+    fn cidr_contains_is_false_not_an_error_for_malformed_input() {
+        let ip: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(!cidr_contains("not-a-cidr", ip));
+        assert!(!cidr_contains("1.2.3.4/not-a-number", ip));
+        assert!(!cidr_contains("1.2.3.4/99", ip));
+        assert!(!cidr_contains("1.2.3.4", ip)); // missing "/len" entirely
     }
 }

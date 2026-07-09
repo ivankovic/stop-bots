@@ -24,4 +24,5 @@ pub mod ipranges;
 pub mod iptables;
 pub mod nftables;
 pub mod nginx;
+pub mod sshlog;
 pub mod tui;

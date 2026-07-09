@@ -265,3 +265,178 @@ fn firewall_add_list_render_remove_happy_path() {
         .success()
         .stdout(predicate::str::contains("1.2.3.4").not());
 }
+
+/// The lockout safety net: `render-firewall` must refuse to write a script
+/// that would block an IP address with a recent successful SSH login,
+/// unless `--force` is passed. Uses `--ssh-log` to point at a fixture
+/// instead of the real system logs, so this is deterministic regardless of
+/// what's actually in `/var/log/auth.log` on whatever machine runs the test.
+#[test]
+fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "add-firewall-rule",
+            "--db",
+            db_path,
+            "--address",
+            "4.5.6.0/24",
+            "--action",
+            "block",
+        ])
+        .assert()
+        .success();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(
+        &log_path,
+        "Jun 12 01:02:03 host sshd[111]: Accepted publickey for admin from 4.5.6.7 port 54321 ssh2: ED25519 SHA256:abc\n",
+    )
+    .unwrap();
+
+    let script_path = tmp.path().join("stop-bots.sh");
+
+    // Without --force: refuses, warns twice, writes nothing.
+    let output = Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "render-firewall",
+            "--db",
+            db_path,
+            "--backend",
+            "nftables",
+            "--out",
+            script_path.to_str().unwrap(),
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("WARNING").count(), 2);
+    assert!(stderr.contains("4.5.6.7"));
+    assert!(stderr.contains("Refusing to write"));
+    assert!(!script_path.exists());
+
+    // With --force: still warns (once), but writes the script.
+    let output = Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "render-firewall",
+            "--db",
+            db_path,
+            "--backend",
+            "nftables",
+            "--out",
+            script_path.to_str().unwrap(),
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--force",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(stderr.matches("WARNING").count(), 1);
+    assert!(stderr.contains("4.5.6.7"));
+    assert!(fs::read_to_string(&script_path)
+        .unwrap()
+        .contains("4.5.6.0/24"));
+}
+
+/// The flip side: a log with logins from unrelated IPs must not trip the
+/// safety net at all — `render-firewall` should behave exactly as if
+/// `--ssh-log` were never passed.
+#[test]
+fn render_firewall_proceeds_normally_when_no_connected_ip_is_at_risk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "add-firewall-rule",
+            "--db",
+            db_path,
+            "--address",
+            "4.5.6.0/24",
+            "--action",
+            "block",
+        ])
+        .assert()
+        .success();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(
+        &log_path,
+        "Accepted publickey for admin from 9.9.9.9 port 54321 ssh2\n",
+    )
+    .unwrap();
+
+    let script_path = tmp.path().join("stop-bots.sh");
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "render-firewall",
+            "--db",
+            db_path,
+            "--backend",
+            "nftables",
+            "--out",
+            script_path.to_str().unwrap(),
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("WARNING").not());
+    assert!(script_path.exists());
+}
+
+/// A crawler IP-range / country-block feeding into the *same* rendered
+/// output must trip the same safety net as an admin-added rule — the check
+/// runs against everything about to be written, not just `firewall_rules`.
+#[test]
+fn render_firewall_lockout_check_covers_derived_country_ranges_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    {
+        let db = stop_bots::db::Db::open(&db_path).unwrap();
+        db.replace_country_ranges("xx", &["4.5.6.0/24".to_string()])
+            .unwrap();
+        db.set_country_blocked("xx", true).unwrap();
+    }
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(
+        &log_path,
+        "Accepted publickey for admin from 4.5.6.7 port 54321 ssh2\n",
+    )
+    .unwrap();
+
+    let script_path = tmp.path().join("stop-bots.sh");
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "render-firewall",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--backend",
+            "nftables",
+            "--out",
+            script_path.to_str().unwrap(),
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("4.5.6.7"));
+    assert!(!script_path.exists());
+}

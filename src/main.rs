@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule};
-use stop_bots::{botlist, ipranges, iptables, nftables, nginx};
+use stop_bots::{botlist, ipranges, iptables, nftables, nginx, sshlog};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
 const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
@@ -99,12 +99,27 @@ enum Command {
     /// host-wide blocked country (see UpdateIpRanges/BlockCountry) —
     /// these are computed fresh each render, never stored as their own
     /// firewall_rules rows.
+    ///
+    /// Before writing anything, checks recent successful SSH logins (from
+    /// /var/log/auth.log, /var/log/secure or journalctl) against every
+    /// address about to be blocked. If any currently-connected client would
+    /// be cut off, it refuses to write the script (pass --force to
+    /// override).
     RenderFirewall {
         #[arg(long)]
         backend: FirewallBackend,
         /// Path to write the generated script to
         #[arg(long)]
         out: PathBuf,
+        /// Write the script even if it would block an IP with a recent
+        /// successful SSH login
+        #[arg(long)]
+        force: bool,
+        /// Check this SSH log file instead of auto-detecting one — for a
+        /// non-standard log location, or a container where the real logs
+        /// aren't at their usual path
+        #[arg(long)]
+        ssh_log: Option<PathBuf>,
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
@@ -185,7 +200,13 @@ async fn main() -> Result<()> {
         }) => add_firewall_rule(db, address, port, &action),
         Some(Command::ListFirewallRules { db }) => list_firewall_rules(db),
         Some(Command::RemoveFirewallRule { id, db }) => remove_firewall_rule(db, id),
-        Some(Command::RenderFirewall { backend, out, db }) => render_firewall(db, backend, &out),
+        Some(Command::RenderFirewall {
+            backend,
+            out,
+            force,
+            ssh_log,
+            db,
+        }) => render_firewall(db, backend, &out, force, ssh_log),
         Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
         Some(Command::UpdateCountryRanges { db, country }) => {
             update_country_ranges(db, country).await
@@ -466,10 +487,95 @@ fn derived_firewall_rules(db: &Db) -> Result<Vec<FirewallRule>> {
         .collect())
 }
 
-fn render_firewall(db_path: Option<PathBuf>, backend: FirewallBackend, out: &Path) -> Result<()> {
+/// Every `(connected_ip, matching_cidr)` pair where a client with a recent
+/// successful SSH login (from `connected_ips`) would be cut off by one of
+/// `addresses` — the safety check `render_firewall` runs before writing
+/// anything, unless `--force` is passed. An unparseable `connected_ips`
+/// entry is simply skipped rather than erroring: this check exists to *add*
+/// a warning on top of firewall rendering, never to block it over
+/// something unrelated to that rendering.
+fn lockout_risks(addresses: &[String], connected_ips: &[String]) -> Vec<(String, String)> {
+    let mut risks = Vec::new();
+    for ip_str in connected_ips {
+        let Ok(ip) = ip_str.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        for cidr in addresses {
+            if ipranges::cidr_contains(cidr, ip) {
+                risks.push((ip_str.clone(), cidr.clone()));
+            }
+        }
+    }
+    risks
+}
+
+fn print_lockout_warning(risks: &[(String, String)]) {
+    eprintln!(
+        "WARNING: these firewall rules would block {} currently-connected SSH client IP address(es):",
+        risks.len()
+    );
+    for (ip, cidr) in risks {
+        eprintln!("  {ip} (blocked by {cidr})");
+    }
+    eprintln!("Applying them could lock you out of remote access to this machine.");
+}
+
+/// The lockout safety check `render_firewall` runs before writing anything:
+/// finds recent successful SSH logins (via `--ssh-log`, or auto-detected)
+/// and warns if any of them would be blocked by `addresses`. Returns
+/// whether it's safe to proceed — `false` means the caller should refuse to
+/// write the script unless `--force` was passed. A log source that
+/// couldn't be found or read at all is not a risk in itself (nothing to
+/// check against), just a note that the check didn't run.
+fn check_lockout_risk(addresses: &[String], ssh_log: Option<&Path>, force: bool) -> Result<bool> {
+    let source = match ssh_log {
+        Some(path) => sshlog::read_log_file(path),
+        None => sshlog::find_default_source(),
+    };
+    let log_text = match source {
+        sshlog::LogSource::Found(text) => text,
+        sshlog::LogSource::Unavailable => {
+            eprintln!(
+                "Note: couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — skipping the lockout safety check. Run as root, or pass --ssh-log, for this check to work."
+            );
+            return Ok(true);
+        }
+    };
+    let connected_ips = sshlog::parse_accepted_ips(&log_text);
+    let risks = lockout_risks(addresses, &connected_ips);
+    if risks.is_empty() {
+        return Ok(true);
+    }
+    print_lockout_warning(&risks);
+    if force {
+        return Ok(true);
+    }
+    print_lockout_warning(&risks);
+    Ok(false)
+}
+
+fn render_firewall(
+    db_path: Option<PathBuf>,
+    backend: FirewallBackend,
+    out: &Path,
+    force: bool,
+    ssh_log: Option<PathBuf>,
+) -> Result<()> {
     let db = open_db(db_path)?;
     let mut rules = db.list_firewall_rules()?;
     rules.extend(derived_firewall_rules(&db)?);
+
+    let addresses: Vec<String> = rules
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.address.clone())
+        .collect();
+    if !check_lockout_risk(&addresses, ssh_log.as_deref(), force)? {
+        anyhow::bail!(
+            "Refusing to write firewall rules: would block a currently-connected SSH client. Re-run with --force if you're sure."
+        );
+    }
+
     let enabled = rules.iter().filter(|r| r.enabled);
     let (script, run_hint, written) = match backend {
         FirewallBackend::Iptables => {
@@ -607,5 +713,66 @@ mod tests {
     fn derived_firewall_rules_is_empty_with_no_ip_ranges_or_blocked_countries() {
         let db = Db::open_in_memory().unwrap();
         assert!(derived_firewall_rules(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn lockout_risks_finds_a_connected_ip_inside_a_blocked_cidr() {
+        let addresses = vec!["4.5.6.0/24".to_string()];
+        let connected = vec!["4.5.6.7".to_string()];
+        assert_eq!(
+            lockout_risks(&addresses, &connected),
+            vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())]
+        );
+    }
+
+    #[test]
+    fn lockout_risks_is_empty_when_no_connected_ip_matches() {
+        let addresses = vec!["4.5.6.0/24".to_string()];
+        let connected = vec!["9.9.9.9".to_string()];
+        assert!(lockout_risks(&addresses, &connected).is_empty());
+    }
+
+    #[test]
+    fn lockout_risks_skips_unparseable_connected_ip_entries() {
+        let addresses = vec!["0.0.0.0/0".to_string()];
+        let connected = vec!["not-an-ip".to_string()];
+        assert!(lockout_risks(&addresses, &connected).is_empty());
+    }
+
+    #[test]
+    fn check_lockout_risk_blocks_without_force_and_passes_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("auth.log");
+        std::fs::write(
+            &log_path,
+            "Accepted publickey for admin from 4.5.6.7 port 12345 ssh2\n",
+        )
+        .unwrap();
+
+        let addresses = vec!["4.5.6.0/24".to_string()];
+        assert!(!check_lockout_risk(&addresses, Some(&log_path), false).unwrap());
+        assert!(check_lockout_risk(&addresses, Some(&log_path), true).unwrap());
+    }
+
+    #[test]
+    fn check_lockout_risk_passes_when_the_log_has_no_matching_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("auth.log");
+        std::fs::write(
+            &log_path,
+            "Accepted publickey for admin from 9.9.9.9 port 12345 ssh2\n",
+        )
+        .unwrap();
+
+        let addresses = vec!["4.5.6.0/24".to_string()];
+        assert!(check_lockout_risk(&addresses, Some(&log_path), false).unwrap());
+    }
+
+    #[test]
+    fn check_lockout_risk_passes_when_the_log_source_is_unavailable() {
+        let addresses = vec!["4.5.6.0/24".to_string()];
+        assert!(
+            check_lockout_risk(&addresses, Some(Path::new("/nonexistent/x.log")), false).unwrap()
+        );
     }
 }
