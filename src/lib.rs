@@ -20,6 +20,7 @@ pub mod app;
 pub mod botlist;
 pub mod db;
 pub mod event;
+pub mod ipranges;
 pub mod iptables;
 pub mod nftables;
 pub mod nginx;

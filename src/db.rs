@@ -103,6 +103,20 @@ impl Category {
             Category::Ai => "ai",
         }
     }
+
+    /// Falls back to `Ai` for any unrecognized value, same
+    /// never-fail-a-read-over-a-stored-enum convention as
+    /// [`BotStatus::from_str`] and how `list_firewall_rules` reads back
+    /// [`FirewallAction`] — the column is only ever written by
+    /// [`Self::as_str`], so a mismatch here would mean a bug elsewhere, not
+    /// bad user input to reject.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "scanner" => Category::Scanner,
+            "search" => Category::Search,
+            _ => Category::Ai,
+        }
+    }
 }
 
 /// A bot-list data source that bots can be fetched from.
@@ -115,7 +129,15 @@ pub struct Source {
     pub bot_count: i64,
 }
 
-/// A single known bot, normalized from one of the bot-list sources.
+/// A single known bot, *merged* from every source that currently reports
+/// it (see `bot_source_entries` and [`Db::upsert_bot`]): `is_ai`/
+/// `is_search_engine`/`is_scanner` are true if *any* contributing source
+/// says so, and `user_agent_pattern` is every distinct contributed pattern
+/// joined with `|`. `source_id` is now purely informational — one of the
+/// contributing sources, deterministically but arbitrarily chosen —
+/// nothing in this codebase's blocking logic reads it; it stays on this
+/// struct/table only because dropping it would need a schema migration
+/// this project has never needed before, not because it means anything.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bot {
     pub id: i64,
@@ -130,9 +152,12 @@ pub struct Bot {
     pub updated_at: i64,
 }
 
-/// Fields needed to insert or refresh a bot from a source. The user's manual
-/// `status` override is intentionally not part of this struct so that
-/// refreshing a bot list never clobbers it; see [`Db::upsert_bot`].
+/// One source's raw contribution for a bot — what a bot-list parser
+/// produces. The user's manual `status` override is intentionally not
+/// part of this struct so that refreshing a bot list never clobbers it;
+/// see [`Db::upsert_bot`]. Multiple `NewBot`s with the same `slug` but
+/// different `source_id`s are expected and merged, not treated as
+/// conflicting versions of one record — see `bot_source_entries`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewBot {
     pub slug: String,
@@ -209,6 +234,23 @@ pub struct NewFirewallRule {
     pub action: FirewallAction,
 }
 
+/// A published IP-range source for a known crawler (Google, Bing, OpenAI's
+/// GPTBot, ...), distinct from the UA-pattern `bots`/`sources` tables: these
+/// publishers ship one CIDR list covering *all* of their crawling activity,
+/// which doesn't line up with this app's much more granular per-variant bot
+/// slugs (Google alone splits into a dozen `google-crawler-*` well-known-bots
+/// entries). Blocking decisions for a source are made at the coarser
+/// `category` level instead — see [`Db::blocked_ip_ranges`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct IpRangeSource {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub category: Category,
+    pub last_fetched_at: Option<i64>,
+    pub range_count: i64,
+}
+
 /// Returns whether `address` is a plain IP address or CIDR range.
 fn is_valid_address(address: &str) -> bool {
     let address = address.trim();
@@ -282,6 +324,28 @@ impl Db {
                 updated_at INTEGER NOT NULL
             );
 
+            -- One source's raw contribution for a bot, keyed by (slug,
+            -- source_id) rather than bots.id: the first time a source
+            -- contributes a slug, there may be no `bots` row for it yet.
+            -- A `bots` row's own is_ai/is_search_engine/is_scanner/
+            -- user_agent_pattern/name is the *merged* view recomputed from
+            -- every row here for that slug (see Db::recompute_merged_bot)
+            -- whenever any of them changes — this is what lets two
+            -- different sources both describing the same bot (e.g. one
+            -- tagging it is_ai, another tagging the same name is_scanner)
+            -- combine instead of whichever fetched last silently
+            -- overwriting the other's categorization.
+            CREATE TABLE IF NOT EXISTS bot_source_entries (
+                slug TEXT NOT NULL,
+                source_id TEXT NOT NULL REFERENCES sources(id),
+                name TEXT NOT NULL,
+                is_ai INTEGER NOT NULL DEFAULT 0,
+                is_search_engine INTEGER NOT NULL DEFAULT 0,
+                is_scanner INTEGER NOT NULL DEFAULT 0,
+                user_agent_pattern TEXT NOT NULL,
+                PRIMARY KEY (slug, source_id)
+            );
+
             CREATE TABLE IF NOT EXISTS sites (
                 id INTEGER PRIMARY KEY,
                 server_name TEXT NOT NULL,
@@ -320,6 +384,49 @@ impl Db {
                 bot_id INTEGER NOT NULL REFERENCES bots(id),
                 policy TEXT NOT NULL,
                 PRIMARY KEY (site_id, bot_id)
+            );
+
+            -- Published crawler IP-range sources (Google, Bing, GPTBot, ...)
+            -- and their current CIDRs. Kept separate from `sources`/`bots`:
+            -- these publish one list per *publisher*, not per UA-slug, so
+            -- there is no bot row to merge into (see `IpRangeSource`'s doc
+            -- comment). `ip_ranges` is a plain child table, not a
+            -- source-entries/merge setup like `bot_source_entries` — two
+            -- sources publishing the exact same CIDR is not a real scenario
+            -- worth designing for.
+            CREATE TABLE IF NOT EXISTS ip_range_sources (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                category TEXT NOT NULL,
+                last_fetched_at INTEGER,
+                range_count INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS ip_ranges (
+                source_id TEXT NOT NULL REFERENCES ip_range_sources(id),
+                cidr TEXT NOT NULL,
+                PRIMARY KEY (source_id, cidr)
+            );
+
+            -- One country's currently-known CIDR blocks (from IPdeny),
+            -- fetched on demand per country rather than all ~250 at once —
+            -- see `Db::replace_country_ranges`.
+            CREATE TABLE IF NOT EXISTS country_ip_ranges (
+                country_code TEXT NOT NULL,
+                cidr TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL,
+                PRIMARY KEY (country_code, cidr)
+            );
+
+            -- Row presence means \"block this country\", host-wide (not
+            -- per-site — see SPECS.md for why per-site geo was dropped once
+            -- real CIDR data, not just country codes, was in scope: some
+            -- countries carry tens of thousands of CIDR blocks, which is
+            -- impractical to enforce per NGINX vhost).
+            CREATE TABLE IF NOT EXISTS blocked_countries (
+                country_code TEXT PRIMARY KEY,
+                added_at INTEGER NOT NULL
             );
             ",
         )?;
@@ -411,10 +518,136 @@ impl Db {
 
     // ---- bots ----
 
-    /// Inserts a bot, or refreshes its metadata if a bot with the same `slug`
-    /// already exists. The `status` column is left untouched on update so a
-    /// bot-list refresh never clobbers a manual override.
+    /// Records one source's contribution for a bot (`bot.slug`,
+    /// `bot.source_id`), then recomputes that slug's merged row in `bots`
+    /// from every source's current contribution to it — see
+    /// [`Self::recompute_merged_bot`]. The user's manual `status` override
+    /// is untouched either way, same guarantee this always had.
     pub fn upsert_bot(&self, bot: &NewBot) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO bot_source_entries (slug, source_id, name, is_ai, is_search_engine, is_scanner, user_agent_pattern)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(slug, source_id) DO UPDATE SET
+                name = excluded.name,
+                is_ai = excluded.is_ai,
+                is_search_engine = excluded.is_search_engine,
+                is_scanner = excluded.is_scanner,
+                user_agent_pattern = excluded.user_agent_pattern",
+            params![
+                bot.slug,
+                bot.source_id,
+                bot.name,
+                bot.is_ai,
+                bot.is_search_engine,
+                bot.is_scanner,
+                bot.user_agent_pattern,
+            ],
+        )?;
+        self.recompute_merged_bot(&bot.slug)
+    }
+
+    /// Deletes every `bot_source_entries` row for `source_id` (called
+    /// before a re-fetch re-inserts its current list, so a bot this fetch
+    /// no longer includes stops being attributed to it too, rather than
+    /// accumulating stale contributions forever), returning the distinct
+    /// slugs that were affected. The caller is responsible for calling
+    /// [`Self::recompute_merged_bot`] on any of these not present in the
+    /// new batch — a slug this source just dropped might still have other
+    /// sources' entries to fall back to.
+    pub fn clear_source_bot_entries(&self, source_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT slug FROM bot_source_entries WHERE source_id = ?1")?;
+        let slugs = stmt
+            .query_map(params![source_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list a source's contributed slugs")?;
+        self.conn.execute(
+            "DELETE FROM bot_source_entries WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        Ok(slugs)
+    }
+
+    /// How many distinct bots `source_id` currently contributes to the
+    /// merged list — the accurate, post-collapse count, unlike a source's
+    /// own raw pre-dedup parsed length (which is what `sources.bot_count`
+    /// used to be set from, and could overstate reality once a source had
+    /// internal duplicates or another source reclaimed an overlapping
+    /// slug).
+    pub fn count_bot_source_entries(&self, source_id: &str) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM bot_source_entries WHERE source_id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .context("failed to count a source's contributed bots")
+    }
+
+    /// Recomputes `slug`'s merged row in `bots` from every remaining
+    /// `bot_source_entries` row for it: `is_ai`/`is_search_engine`/
+    /// `is_scanner` are true if *any* contributing source says so;
+    /// `user_agent_pattern` is every distinct contributed pattern joined
+    /// with `|` (the same "multiple accepted patterns" shape a single
+    /// source's own list can already produce); `name` is the longest
+    /// contributed name (ties broken by whichever sorts later
+    /// alphabetically) — usually the most descriptive/properly-cased
+    /// variant, and deterministic regardless of fetch order. A no-op if
+    /// `slug` has zero entries: if it never had any, there's nothing to
+    /// create; if it just dropped to zero (its last contributing source
+    /// stopped reporting it), the existing `bots` row — and any manual
+    /// `status` override or site override pointing at its id — is
+    /// deliberately left exactly as it was rather than zeroed out or
+    /// deleted, the same "never silently destroy state" bias the rest of
+    /// this schema already follows.
+    pub fn recompute_merged_bot(&self, slug: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_id, name, is_ai, is_search_engine, is_scanner, user_agent_pattern
+             FROM bot_source_entries WHERE slug = ?1 ORDER BY source_id",
+        )?;
+        let entries: Vec<(String, String, bool, bool, bool, String)> = stmt
+            .query_map(params![slug], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to load a bot's source entries")?;
+
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+
+        let is_ai = entries.iter().any(|e| e.2);
+        let is_search_engine = entries.iter().any(|e| e.3);
+        let is_scanner = entries.iter().any(|e| e.4);
+
+        let mut patterns: Vec<&str> = Vec::new();
+        for entry in &entries {
+            if !patterns.contains(&entry.5.as_str()) {
+                patterns.push(&entry.5);
+            }
+        }
+        let user_agent_pattern = patterns.join("|");
+
+        let mut name = first.1.clone();
+        for entry in &entries[1..] {
+            if entry.1.len() > name.len() || (entry.1.len() == name.len() && entry.1 > name) {
+                name = entry.1.clone();
+            }
+        }
+
+        // Purely informational (see `Bot`'s doc comment) — the
+        // alphabetically last contributing source id, an arbitrary but
+        // deterministic pick.
+        let source_id = &entries.last().expect("checked non-empty above").0;
+
         self.conn.execute(
             "INSERT INTO bots (slug, name, is_ai, is_search_engine, is_scanner, user_agent_pattern, status, source_id, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'default', ?7, ?8)
@@ -427,13 +660,13 @@ impl Db {
                 source_id = excluded.source_id,
                 updated_at = excluded.updated_at",
             params![
-                bot.slug,
-                bot.name,
-                bot.is_ai,
-                bot.is_search_engine,
-                bot.is_scanner,
-                bot.user_agent_pattern,
-                bot.source_id,
+                slug,
+                name,
+                is_ai,
+                is_search_engine,
+                is_scanner,
+                user_agent_pattern,
+                source_id,
                 now()
             ],
         )?;
@@ -701,6 +934,201 @@ impl Db {
             .context("failed to list firewall rules")
     }
 
+    // ---- crawler IP-range sources ----
+
+    /// Registers `source` if no source with that `id` exists yet, same
+    /// never-clobber-an-already-fetched-source convention as
+    /// [`Self::register_source`].
+    pub fn register_ip_range_source(&self, source: &IpRangeSource) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO ip_range_sources (id, name, url, category, last_fetched_at, range_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                source.id,
+                source.name,
+                source.url,
+                source.category.as_str(),
+                source.last_fetched_at,
+                source.range_count
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_ip_range_sources(&self) -> Result<Vec<IpRangeSource>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, url, category, last_fetched_at, range_count
+             FROM ip_range_sources ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let category: String = row.get(3)?;
+            Ok(IpRangeSource {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                url: row.get(2)?,
+                category: Category::from_str(&category),
+                last_fetched_at: row.get(4)?,
+                range_count: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list ip range sources")
+    }
+
+    /// Replaces every CIDR `source_id` currently contributes with `cidrs`,
+    /// updates its `last_fetched_at`/`range_count`, and returns the new
+    /// count — same clear-then-reinsert idiom as
+    /// [`Self::clear_source_bot_entries`], so a CIDR dropped from the
+    /// upstream list on a later fetch doesn't linger here forever.
+    pub fn replace_ip_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
+        self.conn.execute(
+            "DELETE FROM ip_ranges WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        for cidr in cidrs {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO ip_ranges (source_id, cidr) VALUES (?1, ?2)",
+                params![source_id, cidr],
+            )?;
+        }
+        // The real distinct count, not `cidrs.len()`: `INSERT OR IGNORE`
+        // above means a source whose fetched list has internal duplicate
+        // CIDRs would otherwise overstate its own count here — the same
+        // drift `count_bot_source_entries` exists to avoid for bot-list
+        // sources.
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM ip_ranges WHERE source_id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "UPDATE ip_range_sources SET last_fetched_at = ?1, range_count = ?2 WHERE id = ?3",
+            params![now(), count, source_id],
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn ip_ranges_for_source(&self, source_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT cidr FROM ip_ranges WHERE source_id = ?1 ORDER BY cidr")?;
+        let rows = stmt.query_map(params![source_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list a source's ip ranges")
+    }
+
+    /// Every CIDR from every registered IP-range source whose `category`
+    /// currently defaults to Blocked. Coarser than
+    /// [`Self::blocked_user_agent_patterns`]: it only ever consults the
+    /// *global category default*, not per-bot overrides or site overrides —
+    /// there is no single bot row a multi-variant publisher like Google maps
+    /// onto (see `IpRangeSource`'s doc comment), so there is nothing finer
+    /// to check. A source whose category defaults to Allowed (e.g. Google
+    /// and Bing, since Search is Allowed by default) contributes nothing —
+    /// not a bug, just this mechanism's natural, documented inertness until
+    /// that category is actually blocked.
+    pub fn blocked_ip_ranges(&self) -> Result<Vec<String>> {
+        let mut addrs = Vec::new();
+        for source in self.list_ip_range_sources()? {
+            if self.get_category_default(source.category)? == Policy::Blocked {
+                addrs.extend(self.ip_ranges_for_source(&source.id)?);
+            }
+        }
+        Ok(addrs)
+    }
+
+    // ---- country IP ranges and host-wide geo blocking ----
+
+    /// Replaces every CIDR known for `country_code` with `cidrs`, stamping
+    /// them with the current time. Same clear-then-reinsert idiom as
+    /// [`Self::replace_ip_ranges`] — a CIDR IPdeny drops from a country's
+    /// zone file on a later fetch stops being attributed to it.
+    pub fn replace_country_ranges(&self, country_code: &str, cidrs: &[String]) -> Result<usize> {
+        self.conn.execute(
+            "DELETE FROM country_ip_ranges WHERE country_code = ?1",
+            params![country_code],
+        )?;
+        let fetched_at = now();
+        for cidr in cidrs {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO country_ip_ranges (country_code, cidr, fetched_at)
+                 VALUES (?1, ?2, ?3)",
+                params![country_code, cidr, fetched_at],
+            )?;
+        }
+        Ok(cidrs.len())
+    }
+
+    /// Every country code with at least one fetched CIDR, alongside how many
+    /// and when they were last fetched — backs a CLI listing of "which
+    /// countries have data available to block".
+    pub fn list_fetched_countries(&self) -> Result<Vec<(String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT country_code, COUNT(*), MAX(fetched_at) FROM country_ip_ranges
+             GROUP BY country_code ORDER BY country_code",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list fetched countries")
+    }
+
+    /// Sets, or clears, whether `country_code` is host-wide blocked. Row
+    /// presence in `blocked_countries` encodes the block, same convention as
+    /// the site override tables.
+    pub fn set_country_blocked(&self, country_code: &str, blocked: bool) -> Result<()> {
+        if blocked {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO blocked_countries (country_code, added_at) VALUES (?1, ?2)",
+                params![country_code, now()],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM blocked_countries WHERE country_code = ?1",
+                params![country_code],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn list_blocked_countries(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT country_code FROM blocked_countries ORDER BY country_code")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list blocked countries")
+    }
+
+    /// Every CIDR belonging to a currently host-wide-blocked country. A
+    /// country marked blocked before its ranges were ever fetched (or after
+    /// its only fetch was somehow cleared) simply contributes nothing yet —
+    /// blocking it is a no-op until `replace_country_ranges` has run for it
+    /// at least once, not an error.
+    pub fn blocked_country_ranges(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT cidr FROM country_ip_ranges WHERE country_code IN (
+                SELECT country_code FROM blocked_countries
+             ) ORDER BY cidr",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list blocked country ranges")
+    }
+
+    /// Every address [`Self::blocked_ip_ranges`] and
+    /// [`Self::blocked_country_ranges`] currently contribute, combined —
+    /// what `render-firewall` layers on top of the admin-managed
+    /// `firewall_rules` table as synthetic, always-Block, non-persisted
+    /// rules (see `main.rs::render_firewall`). Not persisted into
+    /// `firewall_rules` itself: recomputing this fresh on every render means
+    /// there is never a stale derived row to reconcile, and an admin's own
+    /// rules are never at risk of being deleted by a refresh.
+    pub fn derived_block_addresses(&self) -> Result<Vec<String>> {
+        let mut addrs = self.blocked_ip_ranges()?;
+        addrs.extend(self.blocked_country_ranges()?);
+        Ok(addrs)
+    }
+
     /// Computes the user-agent regex alternatives for every bot that should
     /// currently be blocked, taking category defaults and per-bot overrides
     /// into account. Returns an empty vec if nothing should be blocked.
@@ -840,6 +1268,149 @@ mod tests {
 
         let bots = db.list_bots().unwrap();
         assert_eq!(bots[0].status, BotStatus::Allowed);
+    }
+
+    /// Registers a second source ("test-source-2") in `db`, for tests that
+    /// exercise merging contributions from more than one source.
+    fn add_second_source(db: &Db) {
+        db.upsert_source(&Source {
+            id: "test-source-2".to_string(),
+            name: "Test Source 2".to_string(),
+            url: "https://example.invalid/2".to_string(),
+            last_fetched_at: None,
+            bot_count: 0,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn two_sources_contributing_the_same_slug_merge_their_category_flags() {
+        let db = test_db();
+        add_second_source(&db);
+
+        let mut ai_entry = sample_bot("gptbot");
+        ai_entry.is_ai = true;
+        db.upsert_bot(&ai_entry).unwrap();
+
+        let mut scanner_entry = sample_bot("gptbot");
+        scanner_entry.is_scanner = true;
+        scanner_entry.source_id = "test-source-2".to_string();
+        db.upsert_bot(&scanner_entry).unwrap();
+
+        let bots = db.list_bots().unwrap();
+        assert_eq!(bots.len(), 1);
+        assert!(bots[0].is_ai);
+        assert!(bots[0].is_scanner);
+        assert!(!bots[0].is_search_engine);
+    }
+
+    #[test]
+    fn merging_two_sources_is_order_independent() {
+        // Same two contributions as above, but upserted in the opposite
+        // order — the whole point of merging instead of last-write-wins
+        // is that fetch order must not change the final result.
+        let db = test_db();
+        add_second_source(&db);
+
+        let mut scanner_entry = sample_bot("gptbot");
+        scanner_entry.is_scanner = true;
+        scanner_entry.source_id = "test-source-2".to_string();
+        db.upsert_bot(&scanner_entry).unwrap();
+
+        let mut ai_entry = sample_bot("gptbot");
+        ai_entry.is_ai = true;
+        db.upsert_bot(&ai_entry).unwrap();
+
+        let bots = db.list_bots().unwrap();
+        assert_eq!(bots.len(), 1);
+        assert!(bots[0].is_ai);
+        assert!(bots[0].is_scanner);
+    }
+
+    #[test]
+    fn merge_joins_distinct_patterns_but_dedupes_identical_ones() {
+        let db = test_db();
+        add_second_source(&db);
+
+        let mut a = sample_bot("gptbot");
+        a.user_agent_pattern = "GPTBot".to_string();
+        db.upsert_bot(&a).unwrap();
+
+        let mut b = sample_bot("gptbot");
+        b.user_agent_pattern = "GPTBot-2".to_string();
+        b.source_id = "test-source-2".to_string();
+        db.upsert_bot(&b).unwrap();
+
+        assert_eq!(
+            db.list_bots().unwrap()[0].user_agent_pattern,
+            "GPTBot|GPTBot-2"
+        );
+
+        // Re-upserting source 2 with the exact same pattern must not
+        // duplicate it in the merged string.
+        db.upsert_bot(&b).unwrap();
+        assert_eq!(
+            db.list_bots().unwrap()[0].user_agent_pattern,
+            "GPTBot|GPTBot-2"
+        );
+    }
+
+    #[test]
+    fn dropping_a_bot_from_one_source_falls_back_to_the_others_contribution() {
+        let db = test_db();
+        add_second_source(&db);
+
+        let mut ai_entry = sample_bot("gptbot");
+        ai_entry.is_ai = true;
+        db.upsert_bot(&ai_entry).unwrap();
+
+        let mut scanner_entry = sample_bot("gptbot");
+        scanner_entry.is_scanner = true;
+        scanner_entry.source_id = "test-source-2".to_string();
+        db.upsert_bot(&scanner_entry).unwrap();
+
+        // test-source no longer reports this bot at all — simulates its
+        // next fetch just not including it anymore.
+        let dropped = db.clear_source_bot_entries("test-source").unwrap();
+        assert_eq!(dropped, vec!["gptbot".to_string()]);
+        db.recompute_merged_bot("gptbot").unwrap();
+
+        let bots = db.list_bots().unwrap();
+        assert_eq!(bots.len(), 1);
+        assert!(!bots[0].is_ai);
+        assert!(bots[0].is_scanner);
+    }
+
+    #[test]
+    fn a_bot_with_no_remaining_contributions_is_left_as_is_not_deleted() {
+        let db = test_db();
+        let mut ai_entry = sample_bot("gptbot");
+        ai_entry.is_ai = true;
+        db.upsert_bot(&ai_entry).unwrap();
+        db.set_bot_status("gptbot", BotStatus::Allowed).unwrap();
+
+        db.clear_source_bot_entries("test-source").unwrap();
+        db.recompute_merged_bot("gptbot").unwrap();
+
+        // The row, its flags and its manual override all survive even
+        // though no source contributes it anymore — see
+        // recompute_merged_bot's doc comment for why that's deliberate.
+        let bots = db.list_bots().unwrap();
+        assert_eq!(bots.len(), 1);
+        assert!(bots[0].is_ai);
+        assert_eq!(bots[0].status, BotStatus::Allowed);
+    }
+
+    #[test]
+    fn count_bot_source_entries_reflects_distinct_contributed_slugs() {
+        let db = test_db();
+        db.upsert_bot(&sample_bot("gptbot")).unwrap();
+        db.upsert_bot(&sample_bot("claudebot")).unwrap();
+        // Re-upserting the same slug from the same source must not
+        // double-count.
+        db.upsert_bot(&sample_bot("gptbot")).unwrap();
+
+        assert_eq!(db.count_bot_source_entries("test-source").unwrap(), 2);
     }
 
     #[test]
@@ -1221,5 +1792,184 @@ mod tests {
 
         assert!(db.remove_firewall_rule(id).is_err());
         assert!(db.set_firewall_rule_enabled(id, true).is_err());
+    }
+
+    fn sample_ip_range_source(id: &str, category: Category) -> IpRangeSource {
+        IpRangeSource {
+            id: id.to_string(),
+            name: id.to_string(),
+            url: format!("https://example.invalid/{id}.json"),
+            category,
+            last_fetched_at: None,
+            range_count: 0,
+        }
+    }
+
+    #[test]
+    fn register_ip_range_source_is_idempotent_and_preserves_a_later_fetch() {
+        let db = Db::open_in_memory().unwrap();
+        let source = sample_ip_range_source("googlebot", Category::Search);
+        db.register_ip_range_source(&source).unwrap();
+        db.replace_ip_ranges("googlebot", &["1.2.3.0/24".to_string()])
+            .unwrap();
+
+        // Re-registering (e.g. on every TUI/CLI startup) must not reset a
+        // source that's already been fetched.
+        db.register_ip_range_source(&source).unwrap();
+
+        let sources = db.list_ip_range_sources().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].range_count, 1);
+        assert!(sources[0].last_fetched_at.is_some());
+        assert_eq!(sources[0].category, Category::Search);
+    }
+
+    #[test]
+    fn replace_ip_ranges_drops_cidrs_no_longer_present() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_ip_range_source(&sample_ip_range_source("gptbot", Category::Ai))
+            .unwrap();
+
+        db.replace_ip_ranges(
+            "gptbot",
+            &["1.2.3.0/24".to_string(), "4.5.6.0/24".to_string()],
+        )
+        .unwrap();
+        assert_eq!(db.ip_ranges_for_source("gptbot").unwrap().len(), 2);
+
+        db.replace_ip_ranges("gptbot", &["4.5.6.0/24".to_string()])
+            .unwrap();
+        assert_eq!(
+            db.ip_ranges_for_source("gptbot").unwrap(),
+            vec!["4.5.6.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn replace_ip_ranges_reports_the_distinct_count_not_the_raw_input_length() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_ip_range_source(&sample_ip_range_source("gptbot", Category::Ai))
+            .unwrap();
+
+        // A source's fetched list has an internal duplicate — the reported
+        // and stored count must reflect the distinct CIDR, not the raw
+        // input length (same drift bug already fixed for bot_count).
+        let count = db
+            .replace_ip_ranges(
+                "gptbot",
+                &[
+                    "1.2.3.0/24".to_string(),
+                    "1.2.3.0/24".to_string(),
+                    "4.5.6.0/24".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(db.list_ip_range_sources().unwrap()[0].range_count, 2);
+    }
+
+    #[test]
+    fn blocked_ip_ranges_only_includes_sources_whose_category_defaults_to_blocked() {
+        let db = Db::open_in_memory().unwrap();
+        // Search defaults to Allowed, AI defaults to Blocked (see
+        // open_in_memory_creates_schema_with_defaults).
+        db.register_ip_range_source(&sample_ip_range_source("googlebot", Category::Search))
+            .unwrap();
+        db.replace_ip_ranges("googlebot", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.register_ip_range_source(&sample_ip_range_source("gptbot", Category::Ai))
+            .unwrap();
+        db.replace_ip_ranges("gptbot", &["4.5.6.0/24".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            db.blocked_ip_ranges().unwrap(),
+            vec!["4.5.6.0/24".to_string()]
+        );
+
+        // Flipping Search to Blocked makes googlebot's ranges contribute too.
+        db.set_category_default(Category::Search, Policy::Blocked)
+            .unwrap();
+        let mut blocked = db.blocked_ip_ranges().unwrap();
+        blocked.sort();
+        assert_eq!(
+            blocked,
+            vec!["1.2.3.0/24".to_string(), "4.5.6.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn replace_country_ranges_is_idempotent_and_reports_status() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.list_fetched_countries().unwrap().is_empty());
+
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string(), "5.6.7.0/24".to_string()])
+            .unwrap();
+        let fetched = db.list_fetched_countries().unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].0, "nl");
+        assert_eq!(fetched[0].1, 2);
+
+        // A later fetch with fewer CIDRs must drop the stale one, not just
+        // add to it.
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        let fetched = db.list_fetched_countries().unwrap();
+        assert_eq!(fetched[0].1, 1);
+    }
+
+    #[test]
+    fn blocked_country_ranges_only_includes_explicitly_blocked_countries() {
+        let db = Db::open_in_memory().unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
+            .unwrap();
+
+        assert!(db.blocked_country_ranges().unwrap().is_empty());
+
+        db.set_country_blocked("us", true).unwrap();
+        assert_eq!(
+            db.blocked_country_ranges().unwrap(),
+            vec!["4.5.6.0/24".to_string()]
+        );
+        assert_eq!(db.list_blocked_countries().unwrap(), vec!["us".to_string()]);
+
+        db.set_country_blocked("us", false).unwrap();
+        assert!(db.blocked_country_ranges().unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocking_a_country_before_its_ranges_are_fetched_is_a_harmless_noop() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_country_blocked("us", true).unwrap();
+        assert!(db.blocked_country_ranges().unwrap().is_empty());
+
+        // Fetching afterwards makes the block take effect retroactively.
+        db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
+            .unwrap();
+        assert_eq!(
+            db.blocked_country_ranges().unwrap(),
+            vec!["4.5.6.0/24".to_string()]
+        );
+    }
+
+    #[test]
+    fn derived_block_addresses_combines_ip_ranges_and_country_ranges() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_ip_range_source(&sample_ip_range_source("gptbot", Category::Ai))
+            .unwrap();
+        db.replace_ip_ranges("gptbot", &["4.5.6.0/24".to_string()])
+            .unwrap();
+        db.replace_country_ranges("us", &["7.8.9.0/24".to_string()])
+            .unwrap();
+        db.set_country_blocked("us", true).unwrap();
+
+        let mut derived = db.derived_block_addresses().unwrap();
+        derived.sort();
+        assert_eq!(
+            derived,
+            vec!["4.5.6.0/24".to_string(), "7.8.9.0/24".to_string()]
+        );
     }
 }

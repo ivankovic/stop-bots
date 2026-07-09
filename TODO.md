@@ -38,20 +38,26 @@
   differences between all three and how `botlist::SourceKind` dispatches
   to each. `is_search_engine` still only comes from well-known-bots — none
   of the three sources here are search-engine-specific.
-- Real overlap exists between the three sources' bot names (measured, see
-  SPECS.md: ~34 names shared across pairs, e.g. `GPTBot`/`anthropic-ai`/
-  `CCBot` appear in both ai-robots-txt as `is_ai` and nginx-bad-bots as
-  `is_scanner`). Since `bots.slug` is the only identity and `upsert_bot`
-  is last-write-wins, updating one of an overlapping pair after the other
-  silently discards the first source's categorization rather than merging
-  them. No fix planned — it's the existing single-source-of-truth-per-slug
-  design, just newly observable with more than one real source.
-- Each source's `sources.bot_count` is the pre-dedup parsed count
-  (`bots.len()` at fetch time), not the number of rows actually still
-  attributed to that `source_id` after any cross-source slug reclaiming
-  above — so per-source counts shown in Bot settings can overstate
-  reality once sources overlap. Pre-existing counting behavior, just more
-  visible now.
+- Fixed: bots contributed by more than one source now merge instead of
+  last-write-wins. `bot_source_entries` records each source's own raw
+  contribution per slug; a `bots` row's `is_ai`/`is_search_engine`/
+  `is_scanner`/`user_agent_pattern` are recomputed from *all* of a slug's
+  current entries (OR the flags, join distinct patterns with `|`)
+  whenever any of them changes. Verified against live data in both fetch
+  orders: `GPTBot`/`anthropic-ai`/`CCBot`/`ChatGPT-User` now correctly
+  carry both `is_ai` (from ai-robots-txt) and `is_scanner` (from
+  nginx-bad-bots) at once, regardless of which source was fetched last.
+  See SPECS.md's "Bot-list sources: merging overlapping bots" section.
+  `sources.bot_count` is also now the accurate post-merge count
+  (`Db::count_bot_source_entries`), fixing the drift noted previously.
+  Deliberately not handled: a bot whose *only* contributing source drops
+  it keeps its last-known merged state rather than being zeroed out or
+  deleted — same "never silently destroy state" bias the rest of this
+  schema follows (see `Db::recompute_merged_bot`'s doc comment). No CLI/
+  TUI surface yet for *seeing* which sources contribute to a given bot
+  (e.g. "is_ai because ai-robots-txt, is_scanner because nginx-bad-bots")
+  — `bot_source_entries` has the data, nothing displays it. Worth adding
+  if per-bot provenance ever matters enough to look at.
 - Applying now bakes every bot from every fetched source into one `~*`
   alternation per site (potentially ~1400+ patterns with all three
   sources populated, up from ~635). NGINX handles this fine, but it's a
@@ -62,12 +68,20 @@
   this now — category defaults on the Dashboard, per-bot overrides on Bot
   settings; `Db::set_category_default` / `Db::set_bot_status` just aren't
   wired up as `stop-bots` subcommands too).
-- Geo-blocking is out of scope for this pass — deferred pending a decision
-  on an IP-to-country data source (this codebase has no GeoIP/MaxMind
-  infrastructure at all today). If/when it lands, the user's stated
-  preference is a static per-site country allow/block list stored in the
-  db first, without real IP lookup — i.e. get the data model and UI in
-  place before wiring up actual enforcement.
+- Fixed (with a scope change from the original plan): geo-blocking now uses
+  real IPdeny CIDR data, not just stored country codes — but it's host-wide
+  via `firewall_rules`/iptables/nftables, not per-site as originally
+  planned. That plan predated knowing the actual data scale: a country's
+  *aggregated* CIDR list alone can run into the tens of thousands of
+  entries (`us-aggregated.zone` is ~29,000 lines) — duplicating that into
+  every site's NGINX config, or building shared-include-file plumbing just
+  for NGINX, was judged not worth it for a per-site distinction real
+  deployments are unlikely to need. Host-wide reuses the exact same
+  render-time-derivation path as crawler IP ranges (see the firewall bullet
+  above) with no NGINX changes at all. If per-site geo is ever actually
+  needed, the write-up on why it's harder than per-site UA/bot overrides
+  (shared include files, `site_apply_status` no longer being a simple
+  in-block text diff) is in SPECS.md — worth reading before attempting it.
 - The TUI has no screen for firewall rules (`add-firewall-rule` etc. are
   CLI-only).
 - No quit confirmation in the TUI: `q`/Esc on the Dashboard exits
@@ -84,9 +98,27 @@
 - `FirewallRule` has no protocol field; ports always render as TCP in both
   `iptables::render` and `nftables::render`, even though real bot/scanner
   traffic can be UDP. Add a protocol field once a real use case needs it.
-- Firewall rules are entirely admin-managed (no bot-list source provides IP
-  ranges yet). Once one does, decide how it feeds `firewall_rules` —
-  probably mirrors how `bots`/`blocked_user_agent_patterns` works today.
+- Fixed: firewall rules are no longer *only* admin-managed. `ipranges::` adds
+  two independent sources of IP data: published crawler CIDR lists
+  (Googlebot, Bingbot, GPTBot — `IpRangeSourceKind`, `stop-bots
+  update-ip-ranges --source-id <id>`) and IPdeny's per-country aggregated
+  CIDR lists (`stop-bots update-country-ranges --country <cc>`, fetched on
+  demand, not all ~250 up front). `Db::derived_block_addresses` combines
+  whichever crawler sources currently resolve to Blocked (via their
+  `category`'s global default — Google/Bing are Search, so inert by default;
+  GPTBot is AI, blocked by default) with every CIDR from a host-wide
+  `stop-bots block-country --country <cc>` country, and `render-firewall`
+  layers this on top of `firewall_rules` as synthetic, non-persisted Block
+  rules — never written to the table, so there's no derived-vs-admin
+  bookkeeping and no risk of a refresh deleting an admin's own rule. See
+  SPECS.md's "Crawler and country IP ranges" section.
+  Deliberately not done: no per-bot cascade for crawler IP ranges (Google
+  alone splits into a dozen well-known-bots UA slugs with no single bot row
+  an IP-range publisher maps onto — see `IpRangeSource`'s doc comment, and
+  the category-only design is coarser than the UA path on purpose); no TUI
+  for any of this yet (CLI-only, same gap as firewall rules generally, just
+  below); country blocking is host-wide, not per-site — see the geo bullet
+  below for why that changed from the original plan.
 - `render-firewall` only ever writes a file; nothing in this codebase shells
   out to `iptables`/`nft`, by deliberate choice (see SPECS.md). Revisit only
   if explicitly asked for — the blast radius of getting that wrong (locking

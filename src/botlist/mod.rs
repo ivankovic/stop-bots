@@ -141,14 +141,37 @@ pub fn register_all_sources(db: &Db) -> Result<()> {
 }
 
 /// Stores `bots` in `db` under `kind`'s source row, registering/refreshing
-/// it. Returns the number of bots stored.
+/// it, and *replaces* rather than layers onto whatever this source
+/// contributed last time (see `Db::clear_source_bot_entries`) — a bot this
+/// fetch no longer includes must stop being attributed to `kind`, not
+/// linger forever just because a previous fetch once reported it. Returns
+/// the accurate, post-merge count of bots this source currently
+/// contributes (from `Db::count_bot_source_entries`), not `bots.len()`,
+/// since a source can have internal duplicates that collapse to fewer
+/// distinct slugs than it parsed.
 pub fn store(db: &Db, kind: SourceKind, bots: &[NewBot]) -> Result<usize> {
     db.upsert_source(&kind.as_source())?;
+
+    let previously_contributed = db.clear_source_bot_entries(kind.id())?;
     for bot in bots {
         db.upsert_bot(bot)?;
     }
-    db.touch_source(kind.id(), bots.len() as i64)?;
-    Ok(bots.len())
+
+    // A slug this source no longer contributes still needs its merged row
+    // recomputed — it might fall back to another source's contribution,
+    // or (if this was its only one) be deliberately left as-is; either
+    // way `upsert_bot` above never touched it, since it's not in `bots`.
+    let still_contributed: std::collections::HashSet<&str> =
+        bots.iter().map(|b| b.slug.as_str()).collect();
+    for slug in &previously_contributed {
+        if !still_contributed.contains(slug.as_str()) {
+            db.recompute_merged_bot(slug)?;
+        }
+    }
+
+    let count = db.count_bot_source_entries(kind.id())?;
+    db.touch_source(kind.id(), count)?;
+    Ok(count as usize)
 }
 
 /// Fetches `kind`'s list over the network, parses it and stores it in
@@ -268,5 +291,58 @@ mod tests {
             .find(|b| b.slug == "ai-search-bot")
             .unwrap();
         assert_eq!(refreshed.status, BotStatus::Allowed);
+    }
+
+    /// End-to-end regression test for the actual bug this module's merge
+    /// design fixes: the fixture lists for `ai_robots_txt` and
+    /// `nginx_bad_bots` both include "GPTBot" (real overlap this project
+    /// hit fetching the live sources — see SPECS.md). Storing both real
+    /// `SourceKind`s' parsed output, in either order, must land on one
+    /// merged bot carrying *both* sources' flags — not whichever store()
+    /// call happened to run last.
+    #[test]
+    fn storing_two_overlapping_sources_merges_rather_than_clobbers() {
+        let ai_bots = ai_robots_txt::parse(include_str!(
+            "../../tests/fixtures/botlists/ai-robots-txt-sample.json"
+        ))
+        .unwrap();
+        let scanner_bots = nginx_bad_bots::parse(include_str!(
+            "../../tests/fixtures/botlists/nginx-bad-bots-sample.list"
+        ))
+        .unwrap();
+        assert!(
+            ai_bots.iter().any(|b| b.name == "GPTBot"),
+            "fixture must contain the overlapping name for this test to mean anything"
+        );
+        assert!(scanner_bots.iter().any(|b| b.name == "GPTBot"));
+
+        for (first, second) in [
+            (SourceKind::AiRobotsTxt, SourceKind::NginxBadBots),
+            (SourceKind::NginxBadBots, SourceKind::AiRobotsTxt),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            let (first_bots, second_bots) = if first == SourceKind::AiRobotsTxt {
+                (&ai_bots, &scanner_bots)
+            } else {
+                (&scanner_bots, &ai_bots)
+            };
+            store(&db, first, first_bots).unwrap();
+            store(&db, second, second_bots).unwrap();
+
+            let gptbot = db
+                .list_bots()
+                .unwrap()
+                .into_iter()
+                .find(|b| b.name == "GPTBot")
+                .unwrap();
+            assert!(
+                gptbot.is_ai,
+                "lost is_ai when {first:?} was stored before {second:?}"
+            );
+            assert!(
+                gptbot.is_scanner,
+                "lost is_scanner when {first:?} was stored before {second:?}"
+            );
+        }
     }
 }

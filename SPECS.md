@@ -782,35 +782,90 @@ escaped — it's fed straight into NGINX's own regex, same shape
 while `name`/`slug` run through a small `unescape` helper first, so the
 Bot settings search box shows `"1h4x.com"`, not `"1h4x\.com"`.
 
-**Note on cross-source slug collisions — measured, not just theoretical**:
-`bots.slug` is globally `UNIQUE`, and `upsert_bot` keys only on it — if two
-sources (or two entries within one source) slugify to the same string, the
-later upsert silently overwrites the earlier one's categorization,
-`source_id`, and `user_agent_pattern` (though never its `status` — see
-`upsert_bot`'s own `ON CONFLICT` clause). This isn't new behavior
-introduced by adding more sources; it's the existing "slug is identity,
-last write wins" design `store`'s own doc comment already relies on to
-preserve a user's override across a source's own re-fetch. What's new is
-that it now actually happens in practice: fetching all three real, live
-sources and comparing slug sets directly (not just observing the db after
-the fact, which can't distinguish "no collision" from "collided and
-already resolved") finds genuine overlap — well-known-bots vs
-ai-robots-txt: 3 (e.g. `Perplexity-User`/`perplexity-user`); well-known-bots
-vs nginx-bad-bots: 10 (e.g. `HTTrack`/`httrack`, `Nmap`/`nmap`);
-ai-robots-txt vs nginx-bad-bots: 21, including well-known names like
-`GPTBot`, `anthropic-ai`, `CCBot`, `ChatGPT-User`, `cohere-ai` — bots
-ai.robots.txt tags `is_ai` and nginx-bad-bots simultaneously tags
-`is_scanner`. For any of these ~34 bots, whichever of the two sources is
-fetched *last* wins outright — the other source's categorization is fully
-discarded, not merged. There's also small **internal** collision within a
-single source's own list (well-known-bots: 0; ai-robots-txt: 159 keys ->
-156 unique slugs, all genuine upstream near-duplicates like
-`Meta-ExternalAgent`/`meta-externalagent`; nginx-bad-bots: 696 lines -> 689
-unique). None of this is a bug to fix here — it's a direct, foreseeable
-consequence of the existing single-column-slug identity design, just not
-exercised until there was more than one real source — but it means
-`is_ai`/`is_scanner` for an overlapping bot name reflects whichever source
-you updated most recently, not the union of both.
+**Cross-source overlap is real, measured against live data**: fetching all
+three real sources and comparing slug sets directly (not just observing
+the db after the fact, which can't distinguish "no collision" from
+"collided and already resolved") found genuine overlap — well-known-bots
+vs ai-robots-txt: 3 names (e.g. `Perplexity-User`/`perplexity-user`);
+well-known-bots vs nginx-bad-bots: 10 (e.g. `HTTrack`/`httrack`); ai-robots-txt
+vs nginx-bad-bots: 21, including well-known names like `GPTBot`,
+`anthropic-ai`, `CCBot`, `ChatGPT-User` — names ai.robots.txt tags `is_ai`
+and nginx-bad-bots simultaneously tags `is_scanner`. There's also small
+**internal** collision within a single source's own list (well-known-bots:
+0; ai-robots-txt: ~159 keys -> ~156 unique slugs, genuine upstream
+near-duplicates like `Meta-ExternalAgent`/`meta-externalagent`;
+nginx-bad-bots: ~696 lines -> ~689 unique).
+
+## Bot-list sources: merging overlapping bots
+
+Originally, `bots.slug` was globally `UNIQUE` and `upsert_bot` keyed only
+on it — a straight `ON CONFLICT(slug) DO UPDATE` that overwrote
+`is_ai`/`is_search_engine`/`is_scanner`/`user_agent_pattern`/`source_id`
+wholesale on every upsert (never `status`, so a manual override always
+survived). That's fine with one source, but with the ~34 real overlapping
+names above, it meant whichever source was fetched *last* won outright —
+e.g. fetching ai-robots-txt then nginx-bad-bots left `GPTBot` tagged
+`is_scanner` only, having silently lost `is_ai`; fetching in the other
+order lost `is_scanner` instead. Both are wrong: the point of having
+multiple sources is that a bot flagged by two of them should end up
+carrying *both* flags.
+
+**Fix**: a new table, `bot_source_entries`, keyed by `(slug, source_id)`
+rather than `bots.id` (a slug's `bots` row may not exist yet the first
+time a source contributes it) records each source's own raw, un-merged
+contribution — its own `name`/`is_ai`/`is_search_engine`/`is_scanner`/
+`user_agent_pattern` for that slug. A `bots` row is now a *derived* view:
+`Db::recompute_merged_bot(slug)` reads every `bot_source_entries` row for
+that slug and computes `is_ai`/`is_search_engine`/`is_scanner` as the
+logical OR across all of them, `user_agent_pattern` as every *distinct*
+contributed pattern joined with `|` (the same "multiple accepted
+patterns" shape a single source's own list can already produce, e.g.
+well-known-bots' `pattern.accepted`), and `name` as the longest
+contributed name (ties broken by whichever sorts later alphabetically) —
+picked for usually being the most descriptive/properly-cased variant, and
+deterministic regardless of fetch order. `source_id` on the merged row is
+now purely informational (see `Bot`'s own doc comment) — nothing reads it
+for logic anymore, it's kept only because dropping the column would need
+a schema migration this project has never had before.
+
+`Db::upsert_bot` now writes to `bot_source_entries` first (`ON
+CONFLICT(slug, source_id) DO UPDATE`, so a source re-contributing the same
+bot just refreshes its own entry) and then calls
+`recompute_merged_bot(&bot.slug)`. `botlist::store` calls a new
+`Db::clear_source_bot_entries(source_id)` *before* re-upserting a source's
+current list — deleting all of that source's previous entries and
+returning which slugs they were — so a bot the source no longer reports
+stops being attributed to it, rather than its old contribution lingering
+forever. Any of those previously-contributed slugs *not* present in the
+new batch (i.e. `upsert_bot` won't touch them this round) get an explicit
+`recompute_merged_bot` call too, so they either fall back correctly to
+another source's still-current contribution, or (documented, deliberate
+simplification) are left exactly as they last were if this was their only
+contributing source — `recompute_merged_bot` is a no-op when a slug has
+zero remaining entries, rather than zeroing out or deleting the `bots`
+row, so a manual `status` override or a site override pointing at that
+bot's id doesn't silently go stale. `store` also now sets
+`sources.bot_count` from `Db::count_bot_source_entries(source_id)` (the
+accurate, post-merge count) instead of the raw pre-dedup `bots.len()`,
+fixing the count-drift this same overlap caused.
+
+**Verified against live data, both fetch orders**: storing ai-robots-txt
+then nginx-bad-bots, and the reverse, on a fresh db each time — `GPTBot`,
+`anthropic-ai`, `CCBot`, `ChatGPT-User` end up with **both** `is_ai=1` and
+`is_scanner=1` regardless of which order they were fetched in. Also
+checked: re-fetching a source a second time doesn't double-count or
+duplicate anything (`bot_source_entries`' composite primary key makes
+that an update, not an insert). Covered by a new regression test in
+`botlist/mod.rs`, `storing_two_overlapping_sources_merges_rather_than_clobbers`,
+using real fixture data with a deliberately shared name (`GPTBot`, added
+to the `nginx-bad-bots` sample fixture specifically to exercise this),
+plus a set of lower-level `db.rs` tests exercising the merge/fallback/
+no-op-on-zero-entries cases directly against `bot_source_entries`.
+
+**Not done**: no CLI/TUI surface for seeing *which* sources contribute to
+a given bot's merged flags (e.g. "is_ai because ai-robots-txt, is_scanner
+because nginx-bad-bots") — `bot_source_entries` has that data, nothing
+displays it yet.
 
 **CLI**: `update-bot-lists` gained a `--source-id` flag (`well-known-bots`,
 `ai-robots-txt`, or `nginx-bad-bots`; defaults to `well-known-bots` for
@@ -834,3 +889,101 @@ the stable **id** (`"well-known-bots"`) instead, resolved via
 `SourceKind::from_id` on the receiving end; `bot_settings.rs`'s
 `PopupTarget::Source` changed the same way, looking the display name back
 up from `self.sources` only when rendering the popup's title.
+
+## Crawler and country IP ranges (`src/ipranges.rs`, `Db::derived_block_addresses`)
+
+Extends the firewall layer (see "Firewall integration" above, which
+predates this and describes it as plain admin-managed with "no bot-list
+source provides IP ranges yet") with two real IP-data sources, both feeding
+`firewall_rules`/iptables/nftables rather than NGINX:
+
+**Published crawler CIDR lists.** Google, Bing and OpenAI (GPTBot) each
+publish a stable JSON URL with the *identical* shape —
+`{"creationTime": ..., "prefixes": [{"ipv4Prefix": "x.x.x.x/y"} |
+{"ipv6Prefix": "..."}]}` — verified live against all three
+(`developers.google.com/search/apis/ipranges/googlebot.json`,
+`bing.com/toolbox/bingbot.json`, `openai.com/gptbot.json`). Because the
+shape is identical, `IpRangeSourceKind` (in `src/ipranges.rs`) shares one
+parser across all three, unlike `botlist::SourceKind`'s three different
+per-source modules. Anthropic doesn't publish a range file (recommends
+reverse-DNS instead), so there's no fourth source here.
+
+**Why these don't map onto `bots`/`bot_source_entries` at all.** A
+publisher's IP list covers *all* of its crawling activity, not one UA
+variant — Google alone splits into a dozen distinct well-known-bots slugs
+(`google-crawler`, `google-crawler-mobile`, `google-adsbot`, ...) with no
+single row an IP list could attach to. Rather than inventing a fake
+mapping, `IpRangeSource` (a new, separate `ip_range_sources`/`ip_ranges`
+table pair in `db.rs`) is keyed to a `Category` instead:
+`Db::blocked_ip_ranges` includes a source's CIDRs only if that category's
+*global* default currently resolves to Blocked. Google and Bing are tagged
+`Category::Search` (Allowed by default — these two sources are genuinely
+inert until Search is blocked, which is correct, not a bug: their real
+value would be *allow-listing* real crawler IPs while blocking spoofed
+UAs, a feature this pass doesn't build). GPTBot is tagged `Category::Ai`
+(Blocked by default), so it's live immediately. This is deliberately
+coarser than `blocked_user_agent_patterns`'s cascade — no per-bot or
+per-site override layer — because there's no per-bot row to layer one on
+top of for a multi-slug publisher, and adding one just for GPTBot (the one
+source that *does* have a matching bot row) would be an asymmetric special
+case for a single source, not a real generalization.
+
+**IPdeny country CIDRs, fetched on demand.** `ipranges::fetch_country`
+pulls the *aggregated* variant of IPdeny's per-country zone file
+(`ipdeny.com/ipblocks/data/aggregated/<cc>-aggregated.zone`) — plain
+CIDR-per-line, no header, no API key. One country at a time, never all
+~250 at once: verified live that even the aggregated form is large
+(`nl-aggregated.zone` ≈ 5,700 lines, `us-aggregated.zone` ≈ 29,000 —
+several times more in the unaggregated form, which is why aggregated is
+used unconditionally). Fetched ranges land in `country_ip_ranges`; a
+separate `blocked_countries` table (row presence = blocked, same
+convention as `site_category_overrides`) marks which fetched countries are
+actually enforced. Blocking a country before ever fetching its ranges is a
+deliberate, harmless no-op (see `Db::blocked_country_ranges`'s doc
+comment) rather than an error — the two steps are independent by design
+(`update-country-ranges` vs. `block-country`), same "fetching updates data,
+a separate step decides what's enforced" split `botlist`/`apply-blocks`
+already has for UA patterns.
+
+**Host-wide, not per-site — a scope change from the original plan.**
+TODO.md previously said geo-blocking's deferred design would be a per-site
+country allow/block list once a data source was chosen. That plan assumed
+storing just country *codes*, cheap enough to duplicate per site. Once real
+CIDR data was in scope, the per-country scale above (tens of thousands of
+entries for large countries) made per-site enforcement impractical: NGINX
+has no problem with a large `deny` list per se, but duplicating one across
+every site's config, or building a shared-include-file mechanism just to
+avoid that duplication, is real added complexity for a distinction (does
+this specific site need a different blocked-country set than every other
+site on the box) that's a much rarer real-world need than per-site
+bot/category overrides already are. Host-wide reuses the exact same
+firewall pipeline crawler IP ranges use, with zero NGINX changes:
+`Db::derived_block_addresses` unions `blocked_ip_ranges()` and
+`blocked_country_ranges()`, and `main.rs::render_firewall` builds synthetic
+`FirewallRule { id: 0, action: Block, enabled: true, .. }` values from it,
+appended to (never persisted alongside) `db.list_firewall_rules()` before
+handing everything to `iptables::render`/`nftables::render`.
+
+*If per-site geo is revisited later*, two sharp edges this design sidesteps
+are worth knowing about going in: (1) NGINX's `allow`/`deny` directives
+accept CIDRs directly with no GeoIP module needed, so the mechanism itself
+is cheap — the expensive part is exactly the duplication/include-file
+problem above; and (2) a per-site status tag analogous to
+`SiteApplyStatus` would need real thought once large shared CIDR lists are
+involved — re-fetching a country would rewrite a shared include file's
+contents without touching any site's own config text, so a naive
+in-block-text diff (which is exactly how `site_apply_status` works for UA
+patterns today) would report "up to date" while the enforced ranges
+silently changed underneath it.
+
+**Not done, deliberately, for this pass:** no TUI surface at all (CLI-only:
+`update-ip-ranges --source-id <id>`, `update-country-ranges --country
+<cc>`, `block-country`/`unblock-country --country <cc>`,
+`list-blocked-countries`) — matches the pre-existing gap that firewall
+rules in general have no TUI screen yet. No per-bot or per-site cascade for
+crawler IP ranges (see above). No allow-listing use of the verified
+crawler IPs (only ever used to add Block rules when a category is
+blocked). No validation of country codes beyond a 2-letter-alpha shape
+check — an unknown code just 404s at fetch time with IPdeny's own error
+surfaced via `.error_for_status()`, there's no embedded list of valid ISO
+codes to validate against up front.

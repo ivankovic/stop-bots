@@ -19,8 +19,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
-use stop_bots::db::{Db, FirewallAction, NewFirewallRule};
-use stop_bots::{botlist, iptables, nftables, nginx};
+use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule};
+use stop_bots::{botlist, ipranges, iptables, nftables, nginx};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
 const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
@@ -94,13 +94,55 @@ enum Command {
     },
     /// Render the stored firewall rules into an iptables or nftables script.
     /// The script is written to disk only — it is never executed by this
-    /// tool. Review it, then apply it yourself.
+    /// tool. Review it, then apply it yourself. Also includes derived Block
+    /// rules from any blocked-by-default crawler IP-range source and any
+    /// host-wide blocked country (see UpdateIpRanges/BlockCountry) —
+    /// these are computed fresh each render, never stored as their own
+    /// firewall_rules rows.
     RenderFirewall {
         #[arg(long)]
         backend: FirewallBackend,
         /// Path to write the generated script to
         #[arg(long)]
         out: PathBuf,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+    },
+    /// Download and store the current CIDR list for one published crawler
+    /// IP-range source (Googlebot, Bingbot or GPTBot)
+    UpdateIpRanges {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Which source to update: googlebot, bingbot or gptbot
+        #[arg(long)]
+        source_id: String,
+    },
+    /// Download and store IPdeny's current aggregated CIDR list for one
+    /// country (does not block it — see BlockCountry)
+    UpdateCountryRanges {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Two-letter country code, e.g. "us" or "nl"
+        #[arg(long)]
+        country: String,
+    },
+    /// Host-wide block every CIDR currently stored for a country (fetch its
+    /// ranges first with UpdateCountryRanges)
+    BlockCountry {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        country: String,
+    },
+    /// Undo a previous BlockCountry
+    UnblockCountry {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        country: String,
+    },
+    /// List every host-wide blocked country
+    ListBlockedCountries {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
@@ -144,6 +186,13 @@ async fn main() -> Result<()> {
         Some(Command::ListFirewallRules { db }) => list_firewall_rules(db),
         Some(Command::RemoveFirewallRule { id, db }) => remove_firewall_rule(db, id),
         Some(Command::RenderFirewall { backend, out, db }) => render_firewall(db, backend, &out),
+        Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
+        Some(Command::UpdateCountryRanges { db, country }) => {
+            update_country_ranges(db, country).await
+        }
+        Some(Command::BlockCountry { db, country }) => set_country_blocked(db, country, true),
+        Some(Command::UnblockCountry { db, country }) => set_country_blocked(db, country, false),
+        Some(Command::ListBlockedCountries { db }) => list_blocked_countries(db),
     }
 }
 
@@ -359,9 +408,68 @@ fn remove_firewall_rule(db_path: Option<PathBuf>, id: i64) -> Result<()> {
     Ok(())
 }
 
+async fn update_ip_ranges(db_path: Option<PathBuf>, source_id: String) -> Result<()> {
+    let db = open_db(db_path)?;
+    let kind = ipranges::IpRangeSourceKind::from_id(&source_id)
+        .with_context(|| format!("unknown ip-range source id: {source_id}"))?;
+    let count = ipranges::update(&db, kind).await?;
+    println!("Stored {count} CIDR range(s) from {}", kind.name());
+    Ok(())
+}
+
+async fn update_country_ranges(db_path: Option<PathBuf>, country: String) -> Result<()> {
+    let db = open_db(db_path)?;
+    let count = ipranges::update_country(&db, &country).await?;
+    println!("Stored {count} CIDR range(s) for country {country}");
+    Ok(())
+}
+
+fn set_country_blocked(db_path: Option<PathBuf>, country: String, blocked: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_country_blocked(&country, blocked)?;
+    println!(
+        "{} country {country}",
+        if blocked { "Blocked" } else { "Unblocked" }
+    );
+    Ok(())
+}
+
+fn list_blocked_countries(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+    let countries = db.list_blocked_countries()?;
+    if countries.is_empty() {
+        println!("No countries blocked.");
+        return Ok(());
+    }
+    for country in countries {
+        println!("{country}");
+    }
+    Ok(())
+}
+
+/// Every synthetic (never persisted) Block `FirewallRule` derived from
+/// currently-blocked-by-default crawler IP-range sources and host-wide
+/// blocked countries — see `Db::derived_block_addresses`. Uses `id: 0`
+/// since these don't correspond to a real `firewall_rules` row; they're
+/// never looked up or removed by id, only rendered.
+fn derived_firewall_rules(db: &Db) -> Result<Vec<FirewallRule>> {
+    Ok(db
+        .derived_block_addresses()?
+        .into_iter()
+        .map(|address| FirewallRule {
+            id: 0,
+            address,
+            port: None,
+            action: FirewallAction::Block,
+            enabled: true,
+        })
+        .collect())
+}
+
 fn render_firewall(db_path: Option<PathBuf>, backend: FirewallBackend, out: &Path) -> Result<()> {
     let db = open_db(db_path)?;
-    let rules = db.list_firewall_rules()?;
+    let mut rules = db.list_firewall_rules()?;
+    rules.extend(derived_firewall_rules(&db)?);
     let enabled = rules.iter().filter(|r| r.enabled);
     let (script, run_hint, written) = match backend {
         FirewallBackend::Iptables => {
@@ -465,5 +573,39 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(primary.exists());
+    }
+
+    #[test]
+    fn derived_firewall_rules_combines_blocked_ip_ranges_and_countries() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_ip_range_source(&stop_bots::db::IpRangeSource {
+            id: "gptbot".to_string(),
+            name: "GPTBot IP ranges".to_string(),
+            url: "https://example.invalid/gptbot.json".to_string(),
+            category: stop_bots::db::Category::Ai,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        db.replace_ip_ranges("gptbot", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
+            .unwrap();
+        db.set_country_blocked("us", true).unwrap();
+
+        let mut rules = derived_firewall_rules(&db).unwrap();
+        rules.sort_by(|a, b| a.address.cmp(&b.address));
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].address, "1.2.3.0/24");
+        assert_eq!(rules[1].address, "4.5.6.0/24");
+        assert!(rules.iter().all(|r| r.action == FirewallAction::Block));
+        assert!(rules.iter().all(|r| r.enabled));
+    }
+
+    #[test]
+    fn derived_firewall_rules_is_empty_with_no_ip_ranges_or_blocked_countries() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(derived_firewall_rules(&db).unwrap().is_empty());
     }
 }
