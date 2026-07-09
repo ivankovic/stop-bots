@@ -82,6 +82,29 @@
   needed, the write-up on why it's harder than per-site UA/bot overrides
   (shared include files, `site_apply_status` no longer being a simple
   in-block text diff) is in SPECS.md — worth reading before attempting it.
+- Added: the Dashboard now has a "Geo-blocking (host-wide)" panel below
+  "System-wide settings" — a second, independently-focused list (`Down`
+  past the last category row flows focus into it, `Up` above its first row
+  flows back, no dedicated focus key) showing every host-wide blocked
+  country plus a fixed "+ Add a country to block" row. Confirming a
+  2-letter code whose ranges are already fetched blocks it immediately; a
+  not-yet-fetched code spawns a background fetch first
+  (`App::start_country_block`/`AppEvent::CountryBlockFinished`, same
+  fetch-off-the-main-thread-then-store-on-it shape as bot-list source
+  updates) and blocks it once that finishes. Enter on an existing blocked
+  country unblocks it directly, no confirmation popup — unlike a category
+  default (which is genuinely "choose one of two options"), unblocking a
+  country is a single reversible action, same reasoning Site settings'
+  apply/apply-all actions already use. See SPECS.md's "Dashboard
+  geo-blocking panel" section.
+  Deliberately not done: no way to see/manage crawler IP-range sources
+  (Googlebot/Bingbot/GPTBot) from the TUI, still CLI-only (see the firewall
+  bullet above); no way to refresh an already-fetched country's ranges from
+  the TUI — re-adding a code that's already fetched just reuses the cached
+  ranges and blocks immediately (see the AddCountry confirm handler), it
+  never re-fetches. A genuine "refresh this country" action is a separate,
+  not yet built, feature (the CLI's `update-country-ranges` does force a
+  re-fetch, for now).
 - The TUI has no screen for firewall rules (`add-firewall-rule` etc. are
   CLI-only).
 - No quit confirmation in the TUI: `q`/Esc on the Dashboard exits
@@ -115,10 +138,34 @@
   Deliberately not done: no per-bot cascade for crawler IP ranges (Google
   alone splits into a dozen well-known-bots UA slugs with no single bot row
   an IP-range publisher maps onto — see `IpRangeSource`'s doc comment, and
-  the category-only design is coarser than the UA path on purpose); no TUI
-  for any of this yet (CLI-only, same gap as firewall rules generally, just
-  below); country blocking is host-wide, not per-site — see the geo bullet
-  below for why that changed from the original plan.
+  the category-only design is coarser than the UA path on purpose); country
+  blocking is host-wide, not per-site — see the geo bullet below for why
+  that changed from the original plan. Crawler IP-range sources
+  (Googlebot/Bingbot/GPTBot) still have no TUI (CLI-only, same gap as
+  firewall rules generally, just below) — but country blocking itself now
+  does, see the Dashboard bullet further down.
+- Added: a lockout safety net on `render-firewall`. Before writing anything,
+  it cross-references recent successful SSH logins (`src/sshlog.rs`: reads
+  `/var/log/auth.log`, falls back to `/var/log/secure`, then `journalctl -u
+  sshd`/`-u ssh` for systemd-only hosts with no log file at all) against
+  every address about to be blocked — admin `firewall_rules` *and* the
+  derived crawler/country ranges above. If any currently-connected client
+  would be cut off, it prints the warning twice and refuses to write the
+  script; `--force` overrides (still warns once, so the risk is never
+  silently swallowed). `--ssh-log <path>` points at a specific log file
+  instead of auto-detecting one, for non-standard locations/containers —
+  and is what makes this deterministically testable
+  (`tests/cli.rs`) without depending on whatever's actually in the real
+  system logs on whatever machine runs the tests. Read-only throughout:
+  never writes to, rotates or truncates any log.
+  Deliberately not done: this only ever warns/refuses at
+  `render-firewall` time, the one point this codebase already controls
+  before a script reaches disk — it has no way to warn again at the actual
+  `sh`/`nft -f` apply step, since this tool deliberately never runs those
+  itself (see "Firewall integration" in SPECS.md). No IPv4/IPv6 log-rotation
+  handling (`auth.log.1`, `.gz`, etc.) — only the live/current log/journal
+  is checked, on the theory that a session active in the last rotation
+  window is the one that matters for "would this lock me out right now".
 - `render-firewall` only ever writes a file; nothing in this codebase shells
   out to `iptables`/`nft`, by deliberate choice (see SPECS.md). Revisit only
   if explicitly asked for — the blast radius of getting that wrong (locking

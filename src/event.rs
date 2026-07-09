@@ -57,6 +57,16 @@ pub enum AppEvent {
         source_id: String,
         result: Result<Vec<NewBot>, String>,
     },
+    /// A background fetch of one country's IP ranges (started from the
+    /// Dashboard's "add a country to block" popup, for a country not
+    /// already fetched) has finished. Carries the parsed CIDR list — not
+    /// stored yet, since `Db` isn't `Sync`: storing, and blocking the
+    /// country, happens back on the main thread in
+    /// `App::finish_country_block`.
+    CountryBlockFinished {
+        country_code: String,
+        result: Result<Vec<String>, String>,
+    },
 }
 
 /// Terminal event handler: spawns a background task that emits tick events

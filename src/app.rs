@@ -22,6 +22,7 @@
 use crate::botlist;
 use crate::db::Db;
 use crate::event::{AppEvent, Event, EventHandler};
+use crate::ipranges;
 use crate::tui::{self, KeyOutcome, Screen, Theme};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -87,6 +88,12 @@ impl App {
                 Event::App(AppEvent::SourceUpdateFinished { source_id, result }) => {
                     self.finish_source_update(source_id, result)?;
                 }
+                Event::App(AppEvent::CountryBlockFinished {
+                    country_code,
+                    result,
+                }) => {
+                    self.finish_country_block(country_code, result)?;
+                }
             }
         }
         Ok(())
@@ -141,6 +148,56 @@ impl App {
         Ok(())
     }
 
+    /// Starts a background fetch of `country_code`'s IP ranges, spawned from
+    /// the Dashboard's "add a country to block" popup for a country that
+    /// isn't fetched yet. Only fetches and parses on the spawned task, same
+    /// reason as `start_source_update`: storing (and blocking the country)
+    /// happens back on the main thread in `finish_country_block`.
+    fn start_country_block(&mut self, country_code: String) {
+        self.message = Some(format!(
+            "Fetching IP ranges for {}…",
+            country_code.to_uppercase()
+        ));
+        let sender = self.events.sender();
+        tokio::spawn(async move {
+            let result = async {
+                let raw = ipranges::fetch_country(&country_code).await?;
+                Ok(ipranges::parse_zone_file(&raw))
+            }
+            .await
+            .map_err(|err: anyhow::Error| err.to_string());
+            let _ = sender.send(Event::App(AppEvent::CountryBlockFinished {
+                country_code,
+                result,
+            }));
+        });
+    }
+
+    /// Stores the fetched CIDRs (on success) and blocks the country — this
+    /// completes the intent behind the Dashboard action that started this
+    /// fetch, which was always "block this country", not just "fetch its
+    /// ranges". Run back on the main thread once `start_country_block`'s
+    /// background fetch completes.
+    fn finish_country_block(
+        &mut self,
+        country_code: String,
+        result: Result<Vec<String>, String>,
+    ) -> Result<()> {
+        let label = country_code.to_uppercase();
+        match result {
+            Ok(cidrs) => {
+                let count = self.db.replace_country_ranges(&country_code, &cidrs)?;
+                self.db.set_country_blocked(&country_code, true)?;
+                self.message = Some(format!("Blocked {label} ({count} range(s))"));
+                self.refresh()?;
+            }
+            Err(err) => {
+                self.message = Some(format!("Failed to fetch IP ranges for {label}: {err}"));
+            }
+        }
+        Ok(())
+    }
+
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             self.events.send(AppEvent::Quit);
@@ -182,6 +239,10 @@ impl App {
             }
             KeyOutcome::UpdateSource(name) => {
                 self.start_source_update(name);
+                return Ok(());
+            }
+            KeyOutcome::BlockCountry(country_code) => {
+                self.start_country_block(country_code);
                 return Ok(());
             }
             KeyOutcome::Ignored => {}

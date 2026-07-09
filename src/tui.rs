@@ -153,6 +153,14 @@ pub enum KeyOutcome {
     /// fetch and parse with. `App` owns the event loop, so it's the one
     /// that spawns the fetch.
     UpdateSource(String),
+    /// The Dashboard's "add a country to block" popup confirmed a
+    /// validated, not-yet-fetched two-letter country code. `App` spawns a
+    /// background fetch of that country's IP ranges and, once it succeeds,
+    /// blocks it — see `App::start_country_block`. A country whose ranges
+    /// are already fetched never produces this: the Dashboard blocks it
+    /// directly and returns `Mutated` instead, since no network round-trip
+    /// is needed.
+    BlockCountry(String),
 }
 
 /// Returns a `Rect` of exactly `width` x `height` cells, centered within

@@ -182,7 +182,9 @@ fn country_zone_url(country_code: &str) -> String {
 
 /// Normalizes and validates a country code into IPdeny's expected lowercase
 /// two-letter form, rejecting anything else before it's used to build a URL.
-fn validate_country_code(country_code: &str) -> Result<String> {
+/// `pub` so the Dashboard's "add a country to block" popup can validate
+/// what's typed before ever dispatching a fetch.
+pub fn validate_country_code(country_code: &str) -> Result<String> {
     let cc = country_code.trim().to_ascii_lowercase();
     if cc.len() == 2 && cc.chars().all(|c| c.is_ascii_lowercase()) {
         Ok(cc)

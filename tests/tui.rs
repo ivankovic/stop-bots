@@ -749,3 +749,58 @@ fn help_screen_opens_and_returns_to_the_previous_screen() {
         .exp_eof()
         .expect("process should exit after q on the Dashboard");
 }
+
+/// The Dashboard's geo-blocking panel, added below "System-wide settings".
+/// Seeds an already-fetched-but-unblocked country directly (no network
+/// access): the TUI only hits the network for a country that hasn't been
+/// fetched yet (`App::start_country_block`), so blocking one that's already
+/// fetched is the synchronous path this test can exercise without touching
+/// the network.
+#[test]
+fn dashboard_geo_blocking_add_and_remove_a_country() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    {
+        let db = stop_bots::db::Db::open(&db_path).unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+    }
+
+    let mut session = spawn_tui(&db_path);
+    session.exp_string("Dashboard").unwrap();
+    session.exp_string("Geo-blocking").unwrap();
+    session.exp_string("Add a country to block").unwrap();
+
+    // Down past the last category row (Scanners/Search Bots/AI Bots) flows
+    // focus over into the Countries list, landing on its first row — the
+    // fixed "Add a country to block" action.
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\r");
+    session.exp_string("Block a country").unwrap();
+
+    send_key(&mut session, "nl");
+    send_key(&mut session, "\r");
+
+    // Already fetched: blocks immediately, no "Fetching…" network step.
+    // Checked in actual top-to-bottom render order (the geo box's row is
+    // above the message box, so its text hits the wire first) — checking
+    // "Blocked NL" before "range(s)" would consume past the row's text
+    // while scanning for the message, then hang waiting for "range(s)" to
+    // retransmit, which a diffed terminal never does once it's already on
+    // screen.
+    session.exp_string("range(s)").unwrap();
+    session.exp_string("Blocked NL").unwrap();
+
+    // One more Down selects the new "nl" row; Enter unblocks it directly
+    // (no confirmation popup, unlike a category default).
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\r");
+    session.exp_string("Unblocked NL").unwrap();
+
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}

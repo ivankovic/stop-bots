@@ -987,3 +987,139 @@ blocked). No validation of country codes beyond a 2-letter-alpha shape
 check — an unknown code just 404s at fetch time with IPdeny's own error
 surfaced via `.error_for_status()`, there's no embedded list of valid ISO
 codes to validate against up front.
+
+## SSH lockout safety net (`src/sshlog.rs`, `main.rs::render_firewall`)
+
+Host-wide country blocking (see above) raised an obvious risk the crawler
+IP-range work didn't: a country block emits an unconditional DROP for every
+inbound packet from that country's ranges, including SSH — block the
+country you (or the box's only remote admin) actually connect through, and
+`render-firewall`'s generated script locks you out the moment it's applied.
+The generate-only design (nothing here ever shells out to `iptables`/`nft`
+itself) is the existing safety margin, but it only helps if the admin
+actually re-reads the script before running it — which a decent-sized
+country's CIDR list makes easy to skim past.
+
+**The check.** Before writing anything, `render_firewall` reads whichever
+common Linux SSH log source is actually available —
+`sshlog::find_default_source` tries `/var/log/auth.log`, then
+`/var/log/secure`, then falls back to `journalctl -u sshd`/`-u ssh` (RHEL
+vs. Debian systemd unit naming) for a systemd-only host with no log file
+at all — and extracts every IP with a recent *successful* login
+(`sshlog::parse_accepted_ips`, matching sshd's own `Accepted <method> for
+<user> from <ip> port <port>` message, identical whether it arrives via
+classic syslog or `journalctl -o cat`). Each of those IPs is checked
+against every address about to be blocked — admin `firewall_rules` *and*
+the derived crawler/country ranges, via a small dependency-free
+`ipranges::cidr_contains` (handles IPv4 and IPv6, treats a malformed CIDR
+or a family mismatch as simply "no match", since this check only ever adds
+a warning, never a hard failure over unrelated data). Read-only throughout:
+this module never writes to, rotates, or truncates any log.
+
+**Why parsing is keyed on the literal `"Accepted "` prefix, not just
+`" from "`.** sshd logs failed attempts and disconnects with their own
+`from <ip>` text too (`Failed password for ... from ...`, `Received
+disconnect from ...`) — those must never count as a currently-reachable
+session. Requiring `"Accepted "` to appear first excludes both.
+
+**Warn twice, refuse; `--force` warns once, proceeds.** If any connected
+IP would be blocked, the warning (which IP, which CIDR) prints twice and
+`render_firewall` returns an error without writing the script — a
+literal reading of the ask ("warn the user 2 times before applying"), and
+a deliberately loud one given the stakes. `--force` still prints the
+warning once (so the risk is never *silently* bypassed) but proceeds.  A
+log source that couldn't be found or read at all (missing file,
+permission denied — these logs are typically root/`adm`-group-only, or no
+`journalctl` binary) is not treated as a risk in itself; it just means the
+check didn't run, noted on stderr, and rendering proceeds normally — a
+missing safety net isn't a reason to block firewall generation the user
+explicitly asked for.
+
+**`--ssh-log <path>`** bypasses auto-detection entirely, reading that file
+instead. Built for two real needs at once: non-standard log locations
+(containers, unusual distros) and deterministic testing —
+`tests/cli.rs`'s lockout tests write a fixture log and point `--ssh-log` at
+it, rather than depending on whatever happens to be in the real system
+logs on whichever machine runs the suite (which, during development,
+turned out to have real, readable `Accepted` entries — harmless here since
+none of those IPs happen to fall inside the fixture-only test data, but a
+reminder that this check is live against real data by default, not just a
+test fixture concept).
+
+**Not done, deliberately:** no check at the actual apply step — this tool
+never runs `sh`/`nft -f` itself (see "Firewall integration" above), so
+there's no second checkpoint to warn at even if one were wanted; the
+`render-firewall` check is the one point this codebase actually controls
+before a script reaches disk. No log-rotation handling (`auth.log.1`,
+`.gz`, ...) — only the live log/journal is read, on the theory that a
+session active within the current rotation window is what "would this
+lock me out right now" actually needs.
+
+## Dashboard geo-blocking panel (`src/tui/dashboard.rs`)
+
+Adds a TUI surface for the host-wide country blocking described above —
+previously CLI-only (`update-country-ranges`/`block-country`/
+`unblock-country`). Lives on the Dashboard, not a new screen: a second
+list, "Geo-blocking (host-wide)", rendered below the existing "System-wide
+settings" category list.
+
+**Two lists, one arrow-key flow, no dedicated focus key.** Bot settings'
+`Focus` enum switches panels via `/` because it's pairing a list with a
+search box — genuinely different input modes. Here both panels are plain
+lists, so `Focus::Categories`/`Focus::Countries` switches simply by
+flowing `Down` past the last category row into the countries list (landing
+on row 0), and `Up` above the countries list's row 0 back into the last
+category row. Feels like scrolling one continuous list without the
+bookkeeping of actually unifying two differently-shaped data sources
+(fixed 3 categories vs. a dynamic "+ Add a country" action row plus N
+blocked countries) into one.
+
+**The countries list's row 0 is always the fixed "+ Add a country to
+block" action**, never a real country — `Db::list_blocked_countries()`'s
+results start at row 1. Enter on row 0 opens a small text-input popup
+(`Popup::AddCountry { input, error }`); Enter on any other row unblocks
+that country directly, no confirmation popup. This asymmetry is
+deliberate: a category default is genuinely "choose one of two options"
+(warrants a popup with both shown), but unblocking a country has exactly
+one meaningful action — direct execution matches how Site settings'
+apply/apply-all already work (immediate, reversible, no "are you sure").
+
+**The add-country popup validates before ever dispatching anything.**
+`ipranges::validate_country_code` (made `pub` for this) rejects anything
+that isn't 2 alphabetic characters inline, in the popup itself (`error:
+Option<String>` shown under the input), before any database write or
+network call. Confirming a *valid* code then branches on whether it's
+already known:
+- Already blocked → no-op, just a "already blocked" message.
+- Already fetched (has rows in `country_ip_ranges`, e.g. blocked before via
+  the CLI, or blocked-then-unblocked previously in this same session) →
+  `Db::set_country_blocked` directly, `KeyOutcome::Mutated`. No network
+  round-trip needed — reuses whatever was cached.
+- Never fetched → `KeyOutcome::BlockCountry(code)`, handled by `App`.
+
+**Why fetching can't happen inside `Dashboard::handle_key` itself.** Same
+constraint `start_source_update` already works around: `Db`'s connection
+isn't `Sync`, so a `tokio::spawn`ed background task can't hold a reference
+to it. `App::start_country_block` spawns a task that only fetches and
+parses (`ipranges::fetch_country` + `parse_zone_file`); the actual
+`Db::replace_country_ranges` + `Db::set_country_blocked` — completing the
+original "block this country" intent, not just "fetch its data" — happens
+back on the main thread in `App::finish_country_block`, once
+`AppEvent::CountryBlockFinished` arrives. Exactly the
+fetch-off-thread/store-on-thread split `start_source_update`/
+`finish_source_update` already established for bot-list source updates;
+`KeyOutcome::BlockCountry`/`AppEvent::CountryBlockFinished` are the
+country-blocking analogues of `KeyOutcome::UpdateSource`/
+`AppEvent::SourceUpdateFinished`.
+
+**Testing the fetch-needed path without hitting the network.** Every pty
+test in this codebase that involves a real fetch cancels rather than
+confirms (see "End-to-end tests" above) — this one is no different in
+spirit, just cheaper to arrange: the unit test
+(`add_country_popup_confirming_an_unfetched_code_returns_block_country`)
+asserts the `KeyOutcome` directly without ever spawning anything, and the
+one pty test (`dashboard_geo_blocking_add_and_remove_a_country`) seeds an
+*already-fetched* country directly via `Db::replace_country_ranges` before
+launching the TUI, so the add-country flow it exercises takes the
+synchronous "already fetched" branch — no network access, same as every
+other pty test in this suite.
