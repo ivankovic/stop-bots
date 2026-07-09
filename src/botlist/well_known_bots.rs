@@ -16,9 +16,10 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! Downloads and normalizes the [ArcJet Well-Known Bots] list, the bot-list
-//! source used to populate the database with known scanners, search engines
-//! and AI crawlers.
+//! Downloads and normalizes the [ArcJet Well-Known Bots] list, the original
+//! bot-list source used to populate the database with known scanners,
+//! search engines and AI crawlers. See sibling modules (`ai_robots_txt`,
+//! `nginx_bad_bots`) for the other sources `SourceKind` dispatches to.
 //!
 //! Fetching (network IO) and parsing (pure) are kept separate so that parsing
 //! can be exercised in tests with a local fixture file, without ever hitting
@@ -26,7 +27,7 @@
 //!
 //! [ArcJet Well-Known Bots]: https://github.com/arcjet/well-known-bots
 
-use crate::db::{Db, NewBot, Source};
+use crate::db::NewBot;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -112,51 +113,11 @@ pub async fn fetch() -> Result<String> {
     Ok(body)
 }
 
-/// Registers the well-known-bots source in `db` if it isn't there yet,
-/// without touching an already-fetched source's state. Called on TUI
-/// startup so the source shows up (as "never updated") and can be selected
-/// to trigger a first fetch, even before anything has ever been downloaded.
-pub fn register_source(db: &Db) -> Result<()> {
-    db.register_source(&Source {
-        id: SOURCE_ID.to_string(),
-        name: SOURCE_NAME.to_string(),
-        url: SOURCE_URL.to_string(),
-        last_fetched_at: None,
-        bot_count: 0,
-    })
-}
-
-/// Stores `bots` in `db`, registering/refreshing the source entry. Returns
-/// the number of bots stored.
-pub fn store(db: &Db, bots: &[NewBot]) -> Result<usize> {
-    db.upsert_source(&Source {
-        id: SOURCE_ID.to_string(),
-        name: SOURCE_NAME.to_string(),
-        url: SOURCE_URL.to_string(),
-        last_fetched_at: None,
-        bot_count: 0,
-    })?;
-    for bot in bots {
-        db.upsert_bot(bot)?;
-    }
-    db.touch_source(SOURCE_ID, bots.len() as i64)?;
-    Ok(bots.len())
-}
-
-/// Fetches the well-known-bots list over the network, parses it and stores
-/// it in `db`. Returns the number of bots stored.
-pub async fn update(db: &Db) -> Result<usize> {
-    let json = fetch().await?;
-    let bots = parse(&json)?;
-    store(db, &bots)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::BotStatus;
 
-    const SAMPLE: &str = include_str!("../tests/fixtures/botlists/well-known-bots-sample.json");
+    const SAMPLE: &str = include_str!("../../tests/fixtures/botlists/well-known-bots-sample.json");
 
     #[test]
     fn parse_skips_bots_without_a_pattern() {
@@ -199,60 +160,5 @@ mod tests {
     fn humanize_titlecases_each_word() {
         assert_eq!(humanize("google-crawler"), "Google Crawler");
         assert_eq!(humanize("gptbot"), "Gptbot");
-    }
-
-    #[test]
-    fn register_source_makes_it_visible_before_any_fetch() {
-        let db = Db::open_in_memory().unwrap();
-        assert!(db.list_sources().unwrap().is_empty());
-
-        register_source(&db).unwrap();
-
-        let sources = db.list_sources().unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].id, SOURCE_ID);
-        assert!(sources[0].last_fetched_at.is_none());
-    }
-
-    #[test]
-    fn register_source_does_not_clobber_a_real_fetch() {
-        let db = Db::open_in_memory().unwrap();
-        let bots = parse(SAMPLE).unwrap();
-        store(&db, &bots).unwrap();
-
-        register_source(&db).unwrap();
-
-        let sources = db.list_sources().unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].bot_count, 4);
-        assert!(sources[0].last_fetched_at.is_some());
-    }
-
-    #[test]
-    fn store_registers_source_and_bots_and_preserves_overrides_on_refresh() {
-        let db = Db::open_in_memory().unwrap();
-        let bots = parse(SAMPLE).unwrap();
-
-        let stored = store(&db, &bots).unwrap();
-        assert_eq!(stored, 4);
-        assert_eq!(db.list_bots().unwrap().len(), 4);
-
-        let sources = db.list_sources().unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].id, SOURCE_ID);
-        assert_eq!(sources[0].bot_count, 4);
-        assert!(sources[0].last_fetched_at.is_some());
-
-        db.set_bot_status("ai-search-bot", BotStatus::Allowed)
-            .unwrap();
-        store(&db, &bots).unwrap();
-
-        let refreshed = db
-            .list_bots()
-            .unwrap()
-            .into_iter()
-            .find(|b| b.slug == "ai-search-bot")
-            .unwrap();
-        assert_eq!(refreshed.status, BotStatus::Allowed);
     }
 }

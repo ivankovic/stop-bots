@@ -61,7 +61,10 @@ enum Focus {
 /// What's being changed in the open popup, and the options to cycle through.
 #[derive(Debug, Clone)]
 enum PopupTarget {
-    /// Confirming a refresh of the named source.
+    /// Confirming a refresh of the source with this id (`Source.id`, e.g.
+    /// `"well-known-bots"` — not its display name, since this is what
+    /// `KeyOutcome::UpdateSource` carries on to `App`, which needs the
+    /// stable id to resolve a `botlist::SourceKind`).
     Source(String),
     Bot(String),
 }
@@ -149,7 +152,7 @@ impl BotSettings {
             .map(|source| ListItem::new(source_line(source)))
             .collect();
 
-        let mut block = Block::bordered().title("Bot list sources");
+        let mut block = Block::bordered().title("Bot list sources — Enter to update");
         if self.focus == Focus::Sources {
             block = block.fg(theme.accent());
         }
@@ -211,7 +214,14 @@ impl BotSettings {
 
     fn render_popup(&self, frame: &mut Frame, area: Rect, popup: &Popup) {
         let title = match &popup.target {
-            PopupTarget::Source(name) => format!("Update {name}?"),
+            PopupTarget::Source(id) => {
+                let name = self
+                    .sources
+                    .iter()
+                    .find(|s| &s.id == id)
+                    .map_or(id.as_str(), |s| s.name.as_str());
+                format!("Update {name}?")
+            }
             PopupTarget::Bot(slug) => format!("Override: {slug}"),
         };
 
@@ -330,7 +340,7 @@ impl BotSettings {
             return;
         };
         self.popup = Some(Popup {
-            target: PopupTarget::Source(source.name.clone()),
+            target: PopupTarget::Source(source.id.clone()),
             options: vec!["Cancel", "Update now"],
             selected: 0,
         });
@@ -684,7 +694,9 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
 
-        assert_eq!(outcome, KeyOutcome::UpdateSource("Test".to_string()));
+        // The source's id ("test"), not its display name ("Test") — see
+        // `PopupTarget::Source`'s doc comment for why.
+        assert_eq!(outcome, KeyOutcome::UpdateSource("test".to_string()));
         assert!(screen.popup.is_none());
     }
 

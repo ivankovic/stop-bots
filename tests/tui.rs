@@ -20,8 +20,20 @@ const TIMEOUT_MS: u64 = 5_000;
 /// explicitly via `TIOCSWINSZ` right after spawning, before the child's
 /// first draw.
 fn spawn_tui(db_path: &Path) -> PtySession {
+    spawn_tui_with_args(db_path, &[])
+}
+
+/// Like [`spawn_tui`], but also passes `--root <root>` — needed for tests
+/// that trigger a site scan from Site settings against a controlled fixture
+/// directory rather than the real `/etc/nginx`.
+fn spawn_tui_with_root(db_path: &Path, root: &Path) -> PtySession {
+    spawn_tui_with_args(db_path, &["--root", root.to_str().unwrap()])
+}
+
+fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
     cmd.args(["tui", "--db", db_path.to_str().unwrap()]);
+    cmd.args(extra_args);
     cmd.env("TERM", "xterm-256color");
 
     let session = spawn_command(cmd, Some(TIMEOUT_MS)).expect("failed to spawn stop-bots tui");
@@ -141,19 +153,22 @@ fn navigate_change_a_setting_and_quit() {
     session.exp_string("to").unwrap();
     session.exp_string("Allowed").unwrap();
 
-    // Bot settings now shows bot-list sources (not categories): the seeded
-    // source, with its signal count, plus the known bots.
+    // Bot settings now shows bot-list sources (not categories): all three
+    // known sources (App::new registers them all on startup, regardless of
+    // which one was actually fetched), plus the known bots.
     send_key(&mut session, "b");
     session.exp_string("sources").unwrap();
     session.exp_string("ArcJet").unwrap();
     session.exp_string("bots").unwrap();
     session.exp_string("4").unwrap();
 
-    // Enter on the source row opens an update-confirmation popup, not an
-    // immediate fetch.
+    // Enter on the selected source row opens an update-confirmation popup,
+    // not an immediate fetch. "ai-robots-txt" sorts first alphabetically
+    // among the three known source ids, so it's the one selected by
+    // default here, not the seeded ArcJet one.
     send_key(&mut session, "\r");
     session.exp_string("Update").unwrap();
-    session.exp_string("ArcJet").unwrap();
+    session.exp_string("ai.robots.txt").unwrap();
     session.exp_string("Cancel").unwrap();
     session.exp_string("Update").unwrap();
     session.exp_string("now").unwrap();
@@ -175,10 +190,10 @@ fn navigate_change_a_setting_and_quit() {
 }
 
 #[test]
-fn bot_settings_shows_the_known_source_before_any_fetch_has_ever_run() {
+fn bot_settings_shows_the_known_sources_before_any_fetch_has_ever_run() {
     // No `update-bot-lists` seeding step here, unlike the test above: a
     // brand-new install's DB has no rows in `sources` at all. Without
-    // `App::new` registering the well-known-bots source on startup, the Bot
+    // `App::new` registering every known source on startup, the Bot
     // settings screen would render an empty list with nothing to select and
     // no way to trigger a first fetch from the TUI.
     let tmp = tempfile::tempdir().unwrap();
@@ -187,14 +202,23 @@ fn bot_settings_shows_the_known_source_before_any_fetch_has_ever_run() {
 
     send_key(&mut session, "b");
     session.exp_string("sources").unwrap();
+    // All three known sources show up, not just whichever was last used —
+    // checked in the order they actually render (sorted by id:
+    // "ai-robots-txt" < "nginx-bad-bots" < "well-known-bots"), since
+    // `exp_string` only ever scans forward through the stream.
+    session.exp_string("ai.robots.txt").unwrap();
+    session
+        .exp_string("Nginx Ultimate Bad Bot Blocker")
+        .unwrap();
     session.exp_string("ArcJet").unwrap();
     session.exp_string("never updated").unwrap();
 
-    // The row is selectable and its "Update now" option still works, even
-    // though the source has never been fetched.
+    // The selected row (ai.robots.txt, sorted first by id) is selectable
+    // and its "Update now" option still works, even though the source has
+    // never been fetched.
     send_key(&mut session, "\r");
     session.exp_string("Update").unwrap();
-    session.exp_string("ArcJet").unwrap();
+    session.exp_string("ai.robots.txt").unwrap();
     session.exp_string("Cancel").unwrap();
 
     send_escape(&mut session);
@@ -285,6 +309,414 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
     session
         .exp_eof()
         .expect("process should exit after q on the Dashboard");
+}
+
+#[test]
+fn site_settings_scan_now_discovers_sites_from_the_tui() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    // No `scan-sites` seeding step: the db starts with zero sites, and the
+    // scan is triggered entirely from the TUI below. `--root` points at the
+    // static fixture directory `tests/cli.rs` also uses (2 discoverable
+    // sites: "localhost" and "example.com") — read-only, so pointing
+    // straight at it rather than copying is fine.
+    let root = Path::new("tests/fixtures/nginx");
+    let mut session = spawn_tui_with_root(&db_path, root);
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+    session.exp_string("Press").unwrap();
+    session.exp_string("scan").unwrap();
+
+    // `r` opens a Cancel/Scan-now confirmation popup, same as Bot
+    // settings' source-update popup — even though there's nothing in the
+    // sites list yet, this is exactly the bootstrap case it exists for.
+    // (Not Enter: that now opens a site's detail view instead, once one
+    // exists — see site_detail_search_and_override_a_site_from_the_tui.)
+    send_key(&mut session, "r");
+    session.exp_string("Scan").unwrap();
+    session.exp_string("Cancel").unwrap();
+    // Checked as "now" alone, not the literal "Scan now": the popup title
+    // ("Scan <root>?") already sent "Scan" moments earlier, so re-anchoring
+    // on that exact word risks the terminal-output-diffing coincidence
+    // documented in SPECS.md/this file's other tests.
+    session.exp_string("now").unwrap();
+
+    send_key(&mut session, "\x1b[B"); // Cancel -> Scan now
+    send_key(&mut session, "\r");
+
+    // The scan ran synchronously (no async fetch involved, unlike bot-list
+    // sources): the discovered site appears immediately.
+    session.exp_string("example.com").unwrap();
+
+    send_key(&mut session, "q");
+    session.exp_string("wide").unwrap();
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
+/// Recursively copies `src` into `dst`, creating `dst` and any
+/// intermediate directories as needed. Used to get a writable copy of the
+/// (checked-in, read-only) NGINX fixtures for tests that actually write to
+/// disk — mirrors `tests/cli.rs`'s own `copy_dir_all`, not shared with it
+/// since these are two separate test binaries.
+fn copy_dir_all(src: &Path, dst: &Path) {
+    for entry in walkdir::WalkDir::new(src)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let rel = entry.path().strip_prefix(src).unwrap();
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+        } else {
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn site_settings_apply_writes_the_selected_sites_rule_to_its_own_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
+
+    // Seed bots (AISearchBot is AI, blocked by the global default with no
+    // overrides at all) and scan the writable fixture copy, entirely via
+    // the CLI — the apply itself is what this test drives through the TUI.
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut session = spawn_tui(&db_path);
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+    // Nothing's been applied to disk yet, but a rule is expected (the
+    // global AI default blocks AISearchBot with no overrides needed).
+    session.exp_string("STALE").unwrap();
+
+    // "example.com" sorts first and is selected by default. `a` opens a
+    // Cancel/Apply-now popup, same shape as `r`'s scan popup.
+    send_key(&mut session, "a");
+    session
+        .exp_string("Apply blocking rules to example.com")
+        .unwrap();
+    session.exp_string("Cancel").unwrap();
+    session.exp_string("now").unwrap();
+
+    send_key(&mut session, "\x1b[B"); // Cancel -> Apply now
+    send_key(&mut session, "\r");
+    session.exp_string("UP TO DATE").unwrap();
+
+    send_key(&mut session, "q");
+    session.exp_string("wide").unwrap();
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+
+    // Belt-and-suspenders: the file itself carries the rule, and only
+    // example.com's block — localhost's file must be untouched since it
+    // was never applied.
+    let example_com_conf =
+        std::fs::read_to_string(nginx_root.join("sites-enabled/example.com")).unwrap();
+    assert!(example_com_conf.contains("AISearchBot"));
+
+    let localhost_conf = std::fs::read_to_string(nginx_root.join("conf.d/server.conf")).unwrap();
+    assert!(!localhost_conf.contains("AISearchBot"));
+}
+
+#[test]
+fn site_settings_apply_all_writes_the_rule_to_every_sites_own_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
+
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut session = spawn_tui(&db_path);
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+    session.exp_string("STALE").unwrap();
+
+    // Shift+A opens a Cancel/Apply-now popup covering both discovered
+    // sites at once, distinct from `a`'s single-site popup.
+    send_key(&mut session, "A");
+    session
+        .exp_string("Apply blocking rules to all 2 site(s)")
+        .unwrap();
+
+    send_key(&mut session, "\x1b[B"); // Cancel -> Apply now
+    send_key(&mut session, "\r");
+    session.exp_string("UP TO DATE").unwrap();
+
+    send_key(&mut session, "q");
+    session.exp_string("wide").unwrap();
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+
+    // Both files, not just one, got the rule this time.
+    let example_com_conf =
+        std::fs::read_to_string(nginx_root.join("sites-enabled/example.com")).unwrap();
+    assert!(example_com_conf.contains("AISearchBot"));
+    let localhost_conf = std::fs::read_to_string(nginx_root.join("conf.d/server.conf")).unwrap();
+    assert!(localhost_conf.contains("AISearchBot"));
+}
+
+#[test]
+fn site_settings_apply_failure_shows_a_dismissible_alert_with_a_root_suggestion() {
+    // Root bypasses file permission bits, so chmod-ing the file read-only
+    // below wouldn't actually make the write fail there.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root, permission bits are unenforced");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
+
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Make example.com's config file read-only, simulating running the
+    // TUI without the privileges nginx's own config directory normally
+    // requires.
+    let example_com_path = nginx_root.join("sites-enabled/example.com");
+    let mut perms = std::fs::metadata(&example_com_path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
+    std::fs::set_permissions(&example_com_path, perms).unwrap();
+
+    let mut session = spawn_tui(&db_path);
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+    session.exp_string("STALE").unwrap();
+
+    send_key(&mut session, "a");
+    session
+        .exp_string("Apply blocking rules to example.com")
+        .unwrap();
+    send_key(&mut session, "\x1b[B"); // Cancel -> Apply now
+    send_key(&mut session, "\r");
+
+    session.exp_string("Apply failed").unwrap();
+    session.exp_string("Try running as root").unwrap();
+
+    // Dismiss the alert and quit. Not re-asserting "STALE" reappears here:
+    // the alert's own text and the row's tag can share individual
+    // characters at the same screen positions, which risks the same
+    // terminal-output-diffing coincidence documented elsewhere in this
+    // file (only a differing tail retransmits) — the file-content check
+    // below is a more reliable way to confirm the write really didn't
+    // happen.
+    send_key(&mut session, "\r");
+
+    send_key(&mut session, "q");
+    session.exp_string("wide").unwrap();
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+
+    // Belt-and-suspenders: the file must be completely untouched by the
+    // failed write attempt, not partially modified.
+    let example_com_conf = std::fs::read_to_string(&example_com_path).unwrap();
+    assert!(!example_com_conf.contains("AISearchBot"));
+}
+
+#[test]
+fn site_detail_search_and_override_a_site_from_the_tui() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    // Seed 4 bots (jyxo-crawler among them, tagged "unknown" — no category
+    // flags at all) and both fixture sites via the CLI; the detail view
+    // itself is driven entirely through the TUI below.
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            "tests/fixtures/nginx",
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let mut session = spawn_tui(&db_path);
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+    // "example.com" sorts before "localhost" and is selected by default.
+    session.exp_string("example.com").unwrap();
+
+    // Enter drills into the selected site's detail view rather than
+    // opening the rescan popup (that's `r` now — see the test above).
+    send_key(&mut session, "\r");
+    session.exp_string("categories").unwrap();
+
+    // Move to the Search Bots row (index 1) and override it to Blocked —
+    // Search defaults to Allowed globally, so this is a visible flip, and
+    // unrelated to the bot override exercised below.
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\r");
+    session.exp_string("Use system default").unwrap();
+    session.exp_string("Allowed").unwrap();
+    session.exp_string("Blocked").unwrap();
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\x1b[B"); // Use system default -> Allowed -> Blocked
+    send_key(&mut session, "\r");
+    // Checked as "override)" alone, not the literal "(site override)": the
+    // row previously read "(system)", which shares its leading "(s" with
+    // "(site override)" — the terminal-output-diffing gotcha documented
+    // above means only the differing tail actually retransmits.
+    session.exp_string("override)").unwrap();
+
+    // Search for a bot with no category flags at all: overriding it
+    // specifically (independent of the category override above) proves
+    // the per-bot path works on its own.
+    send_key(&mut session, "/");
+    send_key(&mut session, "jyxo");
+    session.exp_string("Jyxo Crawler").unwrap();
+
+    send_key(&mut session, "\r");
+    session.exp_string("Use site & system default").unwrap();
+    send_key(&mut session, "\x1b[B");
+    send_key(&mut session, "\x1b[B"); // -> Blocked
+    send_key(&mut session, "\r");
+    // Checked as "override)" alone, not the literal "(site override)": the
+    // row previously read "(system)", which shares its leading "(s" with
+    // "(site override)" — the terminal-output-diffing gotcha documented
+    // above means only the differing tail actually retransmits.
+    session.exp_string("override)").unwrap();
+
+    // Leave the search box, then back all the way out of the detail view.
+    send_escape(&mut session);
+    send_escape(&mut session);
+
+    send_key(&mut session, "q");
+    session.exp_string("wide").unwrap();
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+
+    // Belt-and-suspenders: confirm both writes actually landed in the db,
+    // not just that the right text was rendered.
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    let example_com = db
+        .list_sites()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.server_name == "example.com")
+        .unwrap();
+    assert_eq!(
+        db.get_site_category_override(example_com.id, stop_bots::db::Category::Search)
+            .unwrap(),
+        Some(stop_bots::db::Policy::Blocked)
+    );
+    let jyxo_bot = db
+        .list_bots()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.slug == "jyxo-crawler")
+        .unwrap();
+    let jyxo_override = db
+        .site_bot_overrides(example_com.id)
+        .unwrap()
+        .into_iter()
+        .find(|o| o.bot_id == jyxo_bot.id)
+        .map(|o| o.policy);
+    assert_eq!(jyxo_override, Some(stop_bots::db::Policy::Blocked));
 }
 
 #[test]

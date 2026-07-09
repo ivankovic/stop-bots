@@ -48,11 +48,13 @@ pub enum AppEvent {
     /// Quit the application.
     Quit,
     /// A background bot-list source fetch (started from the Bot settings
-    /// screen) has finished. Carries the source's display name (for the
-    /// status message) and either the parsed bots or a stringified error —
-    /// `anyhow::Error` isn't `Clone`, which `Event` needs to be.
+    /// screen) has finished. Carries the source's stable id (so `App` can
+    /// look up which `botlist::SourceKind` to store the result under, and
+    /// derive its display name for the status message) and either the
+    /// parsed bots or a stringified error — `anyhow::Error` isn't `Clone`,
+    /// which `Event` needs to be.
     SourceUpdateFinished {
-        name: String,
+        source_id: String,
         result: Result<Vec<NewBot>, String>,
     },
 }

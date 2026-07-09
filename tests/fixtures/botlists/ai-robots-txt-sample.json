@@ -1,0 +1,23 @@
+{
+  "GPTBot": {
+    "operator": "OpenAI",
+    "respect": "Yes",
+    "function": "AI Data Scraper",
+    "frequency": "No information.",
+    "description": "Test fixture entry."
+  },
+  "ChatGPT Agent": {
+    "operator": "OpenAI",
+    "respect": "Yes",
+    "function": "AI Agent",
+    "frequency": "No information.",
+    "description": "Test fixture entry."
+  },
+  "Quote\"Bot": {
+    "operator": "Test",
+    "respect": "Unclear",
+    "function": "Test",
+    "frequency": "Unclear",
+    "description": "Should be dropped: the name itself contains a quote."
+  }
+}

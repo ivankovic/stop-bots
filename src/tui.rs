@@ -24,6 +24,7 @@
 pub mod bot_settings;
 pub mod dashboard;
 pub mod help;
+pub mod site_detail;
 pub mod site_settings;
 
 use crate::app::App;
@@ -146,8 +147,11 @@ pub enum KeyOutcome {
     Back,
     /// Not relevant to this screen; let the caller handle it.
     Ignored,
-    /// The Bot settings screen confirmed updating the named bot-list source.
-    /// `App` owns the event loop, so it's the one that spawns the fetch.
+    /// The Bot settings screen confirmed updating a bot-list source,
+    /// identified by its stable id (e.g. `"well-known-bots"`, not its
+    /// display name) so `App` can resolve which `botlist::SourceKind` to
+    /// fetch and parse with. `App` owns the event loop, so it's the one
+    /// that spawns the fetch.
     UpdateSource(String),
 }
 

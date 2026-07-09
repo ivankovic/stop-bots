@@ -466,3 +466,371 @@ effective `[ ALLOWED ]`/`[ BLOCKED ]` state. The goal was specifically
 "make it clear when the bot-specific setting overrides the system setting
 and when not", which an absence-of-a-tag can't do as legibly as two
 always-present, differently-worded ones.
+
+## Triggering a site scan from Site settings
+
+Site settings was read-only: `scan-sites` was CLI-only, with no TUI path to
+populate `sites` at all short of shelling out separately. Added an Enter
+opens a Cancel/Scan-now confirmation popup, same shape as Bot settings'
+source-update popup — but **synchronous**, not spawned: the async path in
+`app.rs` exists specifically because bot-list fetching is network IO and
+`Db` isn't `Sync`, neither of which applies to `nginx::discover_sites` (a
+local filesystem walk). Doing it inline inside `handle_key` and returning
+`KeyOutcome::Mutated` is simpler and correct here — no `AppEvent` variant,
+no background task.
+
+The confirmation popup renders even when `sites` is empty — that's the
+actual bootstrap case it exists for (a fresh install has zero sites and no
+other way to get the first one short of the CLI), so `render` no longer
+early-returns before the popup check the way it used to before this popup
+existed. Missed on the first pass, caught by a stronger reviewer before
+implementing: an early `return` after the empty-state placeholder would
+have made the popup silently never draw on exactly the state it's meant to
+fix.
+
+`nginx::discover_sites` takes a `root: &Path`, which the TUI didn't
+previously have any notion of — `App::new` gained a `root: PathBuf`
+parameter (passed down to `SiteSettings::new`), and `stop-bots tui` gained
+a `--root` flag (`default_value = DEFAULT_NGINX_ROOT`, matching
+`scan-sites`/`apply-blocks`). The no-subcommand default path (`None =>
+run_tui(...)`) bypasses clap's own `default_value` resolution, so it has to
+pass `PathBuf::from(DEFAULT_NGINX_ROOT)` explicitly rather than relying on
+some parsed default trickling through — an easy thing to silently get wrong
+since it'd still compile fine while behaving differently from `stop-bots
+tui` with no flags.
+
+A scan failure (Errors are theoretically possible since `discover_sites`
+returns a `Result`) is caught inside `SiteSettings::scan` and turned into a
+status message rather than propagated: `handle_key`'s `Result` bubbles all
+the way up through `App::run`, so letting an `Err` through would tear down
+the whole TUI over what should be a recoverable, reportable failure — same
+philosophy as the async bot-source-update error handling, just synchronous
+here instead of arriving via an `AppEvent`. In practice `discover_sites`
+today never actually returns `Err` for a bad root (it silently skips
+`WalkDir` errors, per its own doc comment) — the catch-and-report path is
+there for `Db::upsert_site` failures and to not depend on that
+implementation detail holding forever.
+
+Covered by a new pty test
+(`tests/tui.rs::site_settings_scan_now_discovers_sites_from_the_tui`) that
+points `--root` at the same static `tests/fixtures/nginx` fixture
+`tests/cli.rs` uses, drives the whole popup from an empty sites list, and
+confirms a discovered site's name appears — exercising the exact bootstrap
+path the empty-state fix above was for.
+
+## Per-site category and bot overrides
+
+Every site used to follow the exact same global blocking policy —
+`apply-blocks` computed one pattern list and wrote it into every `server{}`
+block on disk (TODO.md: "Per-site bot overrides ... needs a
+`site_bot_overrides` table plus CLI/TUI support"). Added per-site category
+overrides (Scanners/Search/AI) and per-site individual-bot overrides, TUI
+only — no new CLI verbs, matching the existing gap for global
+category/bot-status changes. Geo-blocking (also shown in the README's
+per-site mock) stays explicitly deferred: this codebase has zero
+IP-to-country infrastructure, and building that is a separate decision.
+
+**Precedence cascade**, most to least specific:
+
+1. A site's own per-bot override, if set — decisive.
+2. A *global* per-bot override (`bot.status` Allowed/Blocked) — decisive,
+   bypasses category logic entirely.
+3. Otherwise, per category the bot belongs to: the site's category
+   override if it has one, else the global category default. Blocked if
+   *any* matching category resolves to Blocked.
+
+This is a direct generalization of the cascade `bot_settings.rs` already
+shipped (an explicit per-bot pin bypasses category checks, globally); it's
+now applied at both the site and global level rather than inventing a
+second rule for the site layer. The one asymmetry worth remembering: **a
+site's category override can never reach through a *global* per-bot pin**
+— only that site's own per-bot override (tier 1) can override a globally
+pinned bot. Zero overrides anywhere is byte-identical to the pre-existing
+global-only behavior (checked with an equivalence test). A design-review
+pass also flagged the multi-category case (a bot with both `is_ai` and
+`is_search_engine` set) as untested territory before this change — now
+covered explicitly.
+
+**Schema** (`site_category_overrides`, `site_bot_overrides`): both use
+row-presence to encode "overridden" — no stored "inherit" value, the same
+reason `NewBot` deliberately excludes `status`. `Db::compute_blocked_patterns`
+is a new private helper extracted from the pre-existing
+`blocked_user_agent_patterns`, so the global and per-site public functions
+(`blocked_user_agent_patterns` / `blocked_user_agent_patterns_for_site`)
+share one cascade body rather than two copies. Per-bot overrides are a
+`Vec<SiteBotOverride>` searched linearly, not a `HashMap` — this codebase
+uses `Vec<T>` from `list_*` everywhere and bot/site counts are in the
+hundreds, so introducing a new collection type here wasn't worth it.
+
+**The `apply_blocks` per-file scoping fix** (caught in design review, not
+obvious at first): `sites` has `UNIQUE(server_name, config_path)` — the
+*same* `server_name` can legitimately appear in two different files (a
+stale config left behind after a rename; nothing prunes this table). A
+naive implementation would build one flat name→patterns map for the whole
+`apply-blocks` run and reuse it across every file, letting one site's
+override leak onto another same-named site's block in a different file.
+Fixed by building `site_patterns` freshly *inside* the per-file loop,
+filtered to `db.list_sites()` rows whose `config_path` matches that
+specific file. Regression-tested in `tests/cli.rs` with two files sharing
+one `server_name`, one overridden — the other must be untouched.
+`nginx::apply_blocks_to_file` itself gained a `site_patterns: &[(String,
+Vec<String>)]` parameter (linear-scanned by `block.names.first()`) plus a
+`default_patterns` fallback for a block whose name isn't a known site yet;
+two blocks sharing one `server_name` (the pre-existing redirect+HTTPS
+regression test) still resolve to the same entry, so that invariant holds.
+Note the disk↔db join is a textual `config_path` match, only valid when
+`apply-blocks` runs with the same `--root` used at scan time — a mismatch
+degrades safely to `default_patterns`, not an error.
+
+**TUI**: a new `src/tui/site_detail.rs` (`SiteDetail`), opened from Site
+settings via `Enter` on a site row. Deliberately mirrors `bot_settings.rs`'s
+shape closely — a `Focus` enum, a search box that shows nothing until
+something is typed, a 3-way popup — rather than sharing code with it: this
+codebase already tolerates this level of duplication across screens (e.g.
+`render_popup` is independently reimplemented near-identically in
+`dashboard.rs`, `bot_settings.rs`, and `site_settings.rs`), and a shared
+search/popup abstraction would be the kind of premature genericization
+AGENTS.md/CLAUDE.md warn against. Two differences from Bot settings'
+version: the popups are 3-way, not 2-way ("Use system default"/"Allowed"/
+"Blocked" for categories, "Use site & system default"/.../... for bots),
+since "no override" is a real third state here; and bot rows carry a
+3-state tag (`(site override)` / `(global override)` / `(default)`)
+instead of Bot settings' 2-state one, reflecting which cascade tier is
+actually driving that bot's effective policy on this site.
+
+`SiteSettings` owns `detail: Option<SiteDetail>` and delegates to it first
+in both `render` and `handle_key`; a `Back` from the detail view is
+intercepted and turned into `self.detail = None` + `Consumed` rather than
+propagated (which would exit all the way to the Dashboard) — the same
+nested-back-out shape `bot_settings.rs`'s own `Focus::Search` already uses
+for its Escape handling, one level deeper here. `SiteSettings::refresh`
+also refreshes an open `detail`, so a write inside it doesn't leave a stale
+tag on screen until you back out and back in.
+
+**An intentional key rebind**: Site settings used to trigger its scan
+popup with Enter (previous session). Since Enter now needs a per-row
+meaning (open that site's detail), the scan trigger moved to a dedicated
+`r`, avoiding one key meaning two different things depending on whether the
+list happened to be empty. The empty-state placeholder text changed
+accordingly ("Press r to scan..." instead of "Press Enter to scan...").
+
+Covered by a new pty test
+(`tests/tui.rs::site_detail_search_and_override_a_site_from_the_tui`) that
+overrides a category, searches for and overrides an individual bot, backs
+all the way out, quits, then reopens the resulting db file directly
+(`stop_bots::db::Db::open`) to confirm both writes actually landed — not
+just that the right text was rendered. Hit the same terminal-output-diffing
+gotcha documented above while writing it: a tag reading `(site override)`
+right after previously reading `(system)` only retransmitted its differing
+tail (`ite override)`), since both strings share a `(s` prefix at the same
+screen position — anchored on `override)` instead to sidestep it.
+
+## Per-site apply status and a per-site "Apply now" action
+
+Previously the only way to get any computed rule (global or per-site) onto
+disk was `stop-bots apply-blocks`, run out-of-band from the TUI, with no
+feedback in Site settings about whether a given site's file was actually
+up to date. Two additions close that gap, both in `src/nginx.rs`:
+
+- `site_apply_status(config_path, server_name, patterns) -> SiteApplyStatus`
+  (`UpToDate` / `Stale` / `NotFound`) — a read-only check, re-reads the file
+  and compares what's actually written in the matching block(s)' sentinel
+  rule against `patterns` (the currently-computed rule), rather than
+  caching a flag anywhere. `NotFound` covers both an unreadable file and a
+  file that no longer has a `server_name` matching what was recorded at
+  scan time (renamed/removed on disk since). A bot list update, a category
+  default change, or hand-editing the file are therefore all reflected
+  immediately on the next `refresh`, with no separate invalidation to keep
+  in sync. The readback (`current_block_pattern`) is anchored to the
+  sentinel's own line range via the existing `locate_existing_block`, not
+  just the first `~* "..."` found anywhere in the block — an admin's own
+  hand-written `if ($http_user_agent ~* "...")` condition elsewhere in the
+  same `server { ... }`, ahead of the sentinel, would otherwise be
+  misread as our applied pattern and make an already-correct site read
+  permanently `Stale`. Regression-tested with exactly that fixture shape.
+- `apply_block_for_site(config_path, server_name, patterns) -> Result<bool>`
+  — deliberately *not* built on top of `apply_blocks_to_file`. That
+  function resets every block it has no explicit `site_patterns` entry for
+  back to `default_patterns`, which is correct for a whole-tree
+  `apply-blocks` run but wrong for "apply just this one site": two sites
+  can share a config file, and touching the file must not silently rewrite
+  the other site's block. `apply_block_for_site` walks every block in the
+  file (same re-parse-before-each-edit approach as `apply_blocks_to_file`,
+  for the same reason — edits shift byte offsets of blocks after them) but
+  only edits ones whose `server_name` matches; every other block is left
+  byte-for-byte untouched.
+
+**TUI**: `SiteSettings` gained a `statuses: Vec<SiteApplyStatus>` parallel
+to `sites`, recomputed in full on every `refresh` (one `site_apply_status`
+call per site — a local file re-read, not network IO, so no need to keep
+it off the main thread, same reasoning as the site scan itself). Each row
+renders its tag via a `status_tag` helper mirroring `site_detail.rs`'s
+`policy_tag`. A new `a` key opens a Cancel/Apply-now popup (same shape as
+`r`'s scan popup) that calls `apply_block_for_site` for just the selected
+site, using that site's own `db`-recorded `config_path` and
+`blocked_user_agent_patterns_for_site` — notably, this path never depends
+on `--root` at all, so it isn't subject to the `apply-blocks`
+CLI's textual `config_path`-vs-`--root` mismatch caveat noted above.
+`Popup` gained an `action: PopupAction` field (`Scan` or `Apply(usize)`,
+the site's index) so the two confirmation flows can share one popup type
+and `render_popup` picks the right title from it. Confirming either action
+returns `KeyOutcome::Mutated` — technically a stretch of its doc comment
+("a screen wrote to the database"), since applying only touches the nginx
+file, but it's the existing, simplest way to get `App::refresh` to re-run
+`SiteSettings::refresh` and pick up the file's new on-disk state in the
+status tag.
+
+**A failed apply needs its own popup, not `App`'s shared `message`**: a
+real-world test of this (applying against `/etc/nginx` without root)
+surfaced a pre-existing gap — `tui.rs`'s render dispatch only ever passes
+`app.message` into `Dashboard::render`; `BotSettings`/`SiteSettings` never
+render it at all. A failure reported through `*message` from Site settings
+was therefore completely invisible unless the user happened to switch to
+the Dashboard tab, which looked indistinguishable from "nothing happened,
+still STALE". `SiteSettings` now has its own `alert: Option<String>`,
+rendered as a dismissible bordered popup (Enter/Esc/Space to close, and
+while it's open it swallows every other key — same "block input until
+dismissed" shape as the existing confirm popups, just with no options to
+select) set directly by `apply_site` on failure, independent of
+`*message`. It also special-cases a permission-denied write — by far the
+most likely real cause, since `/etc/nginx` is normally root-owned — with
+an extra "Try running as root" line, detected via `err.chain().any(...)`
+downcasting each cause to `std::io::Error` and checking
+`ErrorKind::PermissionDenied` (`anyhow`'s `.with_context()` wraps the
+original `io::Error` as the new error's `source()`, reachable through
+`.chain()`, not just the outer message). Covered by both a unit test that
+chmods a file read-only (skipped under `geteuid() == 0`, since root
+ignores permission bits) and a pty test doing the same against a real
+`stop-bots tui` process. This is scoped to the apply flow only — the
+identical invisibility gap in `scan`'s own error path, and in
+`BotSettings`'/`Dashboard`'s messages generally when not on the Dashboard
+tab, is a wider pre-existing issue this pass doesn't attempt to fix.
+
+**`A` applies every known site in one go**: `apply_all` just loops
+`run_apply_site` over every index in `self.sites` — the same per-site
+`nginx::apply_block_for_site` call `a` already used, not a new bulk-write
+code path. A site's failure doesn't stop the rest from being tried; all
+failures collected during the loop are joined into one alert afterwards
+(one line per failed site), with the same "Try running as root" suggestion
+if *any* failure in the batch was permission-denied — reasonable since a
+single process either has root or doesn't, so one such failure usually
+means the rest will fail the same way. The success message reports
+counts (`"Applied blocking rules to N site(s), M already up to date, K
+failed"`) rather than one message per site, since a batch could cover many
+sites at once. `PopupAction` gained a third variant, `ApplyAll` (no
+site index — it always covers every currently-known site), sharing the
+existing `Popup`/`render_popup` machinery.
+
+**Bot settings' sources list spells out its own key binding**: the panel
+title changed from "Bot list sources" to "Bot list sources — Enter to
+update", mirroring the hint style Site settings' own title already uses
+("Sites — Enter for overrides, r to rescan, a to apply, A for all").
+Previously this relied entirely on the generic "Enter, Space open a
+setting" line in the Help screen, which doesn't make it obvious from the
+sources list itself that Enter is the way to trigger an update.
+
+**Known limitations, not addressed by this pass**: `SiteDetail` (the
+per-site override editor) has no apply/status of its own — after editing
+a site's overrides there, back out to the list (`Esc`) and press `a` there
+to apply. And `block_text`'s pattern interpolation was already unescaped
+before this change (a literal `"` inside a bot's user-agent pattern, e.g.
+the `Evil"Bot` fixture, breaks the written nginx string) — a pre-existing
+issue, not something this feature's status check can paper over, since a
+malformed on-disk rule can't be read back as "matching" anything sensible.
+
+## Bot-list sources: `SourceKind` and three sources
+
+`src/botlist.rs` was a single flat file hardcoded to one source
+(well-known-bots): its own `SOURCE_ID`/`SOURCE_NAME`/`SOURCE_URL`
+constants, and `fetch`/`parse`/`store`/`update`/`register_source`
+functions that only ever knew how to talk to that one JSON schema. Adding
+two more real-world sources — [ai.robots.txt] and
+[nginx-ultimate-bad-bot-blocker] — meant genericizing the whole pipeline,
+since their upstream formats are both completely different from
+well-known-bots' and from each other:
+
+| Source | Format | Pattern comes from | Categories set |
+|---|---|---|---|
+| `well_known_bots` | JSON array, each entry has `pattern.accepted: [String]` | An explicit field, possibly multiple patterns joined with `\|` | `is_ai`/`is_search_engine` from `categories` |
+| `ai_robots_txt` | JSON object keyed by bot name, e.g. `{"GPTBot": {...}}` | The object *key itself* — there's no separate pattern field at all; upstream's own generated `nginx-block-ai-bots.conf` matches bot names directly | Always `is_ai` — that's this source's entire scope |
+| `nginx_bad_bots` | Plain text, one already-regex-escaped token per line (e.g. `1h4x\.com`, `ALittle\ Client`) | The line itself, verbatim | Always `is_scanner` — the first source that actually populates it (see TODO.md) |
+
+[ai.robots.txt]: https://github.com/ai-robots-txt/ai.robots.txt
+[nginx-ultimate-bad-bot-blocker]: https://github.com/mitchellkrogza/nginx-ultimate-bad-bot-blocker
+
+**Module layout**: `src/botlist.rs` became `src/botlist/mod.rs` plus three
+sibling modules (`well_known_bots.rs`, `ai_robots_txt.rs`,
+`nginx_bad_bots.rs`), each owning its own `SOURCE_ID`/`SOURCE_NAME`/
+`SOURCE_URL`/`parse`/`fetch` — `well_known_bots.rs` is the original file's
+content moved as-is. `botlist::SourceKind` (`WellKnownBots`/`AiRobotsTxt`/
+`NginxBadBots`) is the single place that knows all three exist, dispatching
+`id()`/`name()`/`url()`/`parse()`/`fetch()` to the right module; adding a
+fourth source means adding one variant here plus one new sibling module,
+nothing else. `register_all_sources`/`store`/`update` are now generic over
+`SourceKind`, replacing the old hardcoded versions of the same names.
+
+**Two normalization problems specific to the new sources**, both solved by
+a shared `botlist::slugify(name: &str) -> String` (lowercases, collapses
+runs of non-alphanumeric characters to one hyphen): well-known-bots has a
+ready-made kebab-case `id` field to use as `slug` directly, but neither new
+source does — ai.robots.txt's keys are things like `"ChatGPT Agent"` and
+`"Claude-Code"`, and nginx_bad_bots' lines are backslash-escaped for regex
+use (`"1h4x\.com"`). `nginx_bad_bots::parse` therefore keeps two different
+strings per entry: `user_agent_pattern` stays exactly as-written (still
+escaped — it's fed straight into NGINX's own regex, same shape
+`Db::blocked_user_agent_patterns` already produces by joining with `\|`),
+while `name`/`slug` run through a small `unescape` helper first, so the
+Bot settings search box shows `"1h4x.com"`, not `"1h4x\.com"`.
+
+**Note on cross-source slug collisions — measured, not just theoretical**:
+`bots.slug` is globally `UNIQUE`, and `upsert_bot` keys only on it — if two
+sources (or two entries within one source) slugify to the same string, the
+later upsert silently overwrites the earlier one's categorization,
+`source_id`, and `user_agent_pattern` (though never its `status` — see
+`upsert_bot`'s own `ON CONFLICT` clause). This isn't new behavior
+introduced by adding more sources; it's the existing "slug is identity,
+last write wins" design `store`'s own doc comment already relies on to
+preserve a user's override across a source's own re-fetch. What's new is
+that it now actually happens in practice: fetching all three real, live
+sources and comparing slug sets directly (not just observing the db after
+the fact, which can't distinguish "no collision" from "collided and
+already resolved") finds genuine overlap — well-known-bots vs
+ai-robots-txt: 3 (e.g. `Perplexity-User`/`perplexity-user`); well-known-bots
+vs nginx-bad-bots: 10 (e.g. `HTTrack`/`httrack`, `Nmap`/`nmap`);
+ai-robots-txt vs nginx-bad-bots: 21, including well-known names like
+`GPTBot`, `anthropic-ai`, `CCBot`, `ChatGPT-User`, `cohere-ai` — bots
+ai.robots.txt tags `is_ai` and nginx-bad-bots simultaneously tags
+`is_scanner`. For any of these ~34 bots, whichever of the two sources is
+fetched *last* wins outright — the other source's categorization is fully
+discarded, not merged. There's also small **internal** collision within a
+single source's own list (well-known-bots: 0; ai-robots-txt: 159 keys ->
+156 unique slugs, all genuine upstream near-duplicates like
+`Meta-ExternalAgent`/`meta-externalagent`; nginx-bad-bots: 696 lines -> 689
+unique). None of this is a bug to fix here — it's a direct, foreseeable
+consequence of the existing single-column-slug identity design, just not
+exercised until there was more than one real source — but it means
+`is_ai`/`is_scanner` for an overlapping bot name reflects whichever source
+you updated most recently, not the union of both.
+
+**CLI**: `update-bot-lists` gained a `--source-id` flag (`well-known-bots`,
+`ai-robots-txt`, or `nginx-bad-bots`; defaults to `well-known-bots` for
+backward compatibility), resolved via `SourceKind::from_id`. `--source
+<path>` (read a local file instead of downloading) is now parsed using
+whichever format `--source-id` selects, rather than always assuming
+well-known-bots' JSON shape.
+
+**TUI**: `App::new` now calls `botlist::register_all_sources`, so Bot
+settings shows all three rows (sorted by id — `"ai-robots-txt"` sorts
+first, alphabetically ahead of the seeded well-known-bots row, which
+matters for pty tests asserting on default row selection) even before any
+of them has ever been fetched. The bigger change is what
+`KeyOutcome::UpdateSource` and `AppEvent::SourceUpdateFinished` carry: both
+used to carry the source's *display name* (`"ArcJet Well-Known Bots"`),
+which was fine when there was only one possible fetcher to call regardless
+of which row was confirmed. With three different fetch/parse
+implementations to choose between, `App::start_source_update` needs to
+resolve a `SourceKind` from whatever gets confirmed — so both now carry
+the stable **id** (`"well-known-bots"`) instead, resolved via
+`SourceKind::from_id` on the receiving end; `bot_settings.rs`'s
+`PopupTarget::Source` changed the same way, looking the display name back
+up from `self.sources` only when rendering the popup's title.

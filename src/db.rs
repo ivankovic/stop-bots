@@ -20,7 +20,7 @@
 //! sites and global per-category blocking defaults.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -92,6 +92,17 @@ impl Category {
             Category::Ai => "default_status_ai",
         }
     }
+
+    /// A plain identifier for this category, used as the `category` column
+    /// value in `site_category_overrides` — distinct from [`Self::settings_key`],
+    /// which is a compound key specific to the flat `settings` table.
+    fn as_str(self) -> &'static str {
+        match self {
+            Category::Scanner => "scanner",
+            Category::Search => "search",
+            Category::Ai => "ai",
+        }
+    }
 }
 
 /// A bot-list data source that bots can be fetched from.
@@ -140,6 +151,13 @@ pub struct Site {
     pub server_name: String,
     pub config_path: String,
     pub discovered_at: i64,
+}
+
+/// A single bot's blocking override for one site, from `site_bot_overrides`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SiteBotOverride {
+    pub bot_id: i64,
+    pub policy: Policy,
 }
 
 /// What a firewall rule should do with matching traffic.
@@ -284,6 +302,24 @@ impl Db {
                 action TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL
+            );
+
+            -- Row presence encodes an override; absence means \"inherit the
+            -- global category default\" (see get_site_category_override).
+            CREATE TABLE IF NOT EXISTS site_category_overrides (
+                site_id INTEGER NOT NULL REFERENCES sites(id),
+                category TEXT NOT NULL,
+                policy TEXT NOT NULL,
+                PRIMARY KEY (site_id, category)
+            );
+
+            -- Same presence-encodes-override convention as above, but for a
+            -- single bot on a single site (see get_site_bot_override).
+            CREATE TABLE IF NOT EXISTS site_bot_overrides (
+                site_id INTEGER NOT NULL REFERENCES sites(id),
+                bot_id INTEGER NOT NULL REFERENCES bots(id),
+                policy TEXT NOT NULL,
+                PRIMARY KEY (site_id, bot_id)
             );
             ",
         )?;
@@ -492,6 +528,119 @@ impl Db {
             .context("failed to list sites")
     }
 
+    // ---- per-site overrides ----
+
+    /// The site's override for `category`, if one has been set. `None`
+    /// means "inherit the global category default" — no row is stored for
+    /// that case, so absence is exactly how "not overridden" is represented.
+    pub fn get_site_category_override(
+        &self,
+        site_id: i64,
+        category: Category,
+    ) -> Result<Option<Policy>> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT policy FROM site_category_overrides WHERE site_id = ?1 AND category = ?2",
+                params![site_id, category.as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value.map(|v| Policy::from_str(&v)).transpose()
+    }
+
+    /// Sets, or clears (`policy = None`), `site_id`'s override for `category`.
+    pub fn set_site_category_override(
+        &self,
+        site_id: i64,
+        category: Category,
+        policy: Option<Policy>,
+    ) -> Result<()> {
+        match policy {
+            Some(policy) => {
+                self.conn.execute(
+                    "INSERT INTO site_category_overrides (site_id, category, policy)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(site_id, category) DO UPDATE SET policy = excluded.policy",
+                    params![site_id, category.as_str(), policy.as_str()],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM site_category_overrides WHERE site_id = ?1 AND category = ?2",
+                    params![site_id, category.as_str()],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every per-bot override set for `site_id`. Sparse by design — most
+    /// sites override nothing, so this is typically empty rather than
+    /// listing every known bot with a "no override" placeholder.
+    pub fn site_bot_overrides(&self, site_id: i64) -> Result<Vec<SiteBotOverride>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT bot_id, policy FROM site_bot_overrides WHERE site_id = ?1")?;
+        let rows = stmt.query_map(params![site_id], |row| {
+            let policy: String = row.get(1)?;
+            Ok((row.get::<_, i64>(0)?, policy))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list site bot overrides")?
+            .into_iter()
+            .map(|(bot_id, policy)| {
+                Ok(SiteBotOverride {
+                    bot_id,
+                    policy: Policy::from_str(&policy)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Sets, or clears (`policy = None`), `site_id`'s override for `bot_id`.
+    pub fn set_site_bot_override(
+        &self,
+        site_id: i64,
+        bot_id: i64,
+        policy: Option<Policy>,
+    ) -> Result<()> {
+        match policy {
+            Some(policy) => {
+                self.conn.execute(
+                    "INSERT INTO site_bot_overrides (site_id, bot_id, policy)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(site_id, bot_id) DO UPDATE SET policy = excluded.policy",
+                    params![site_id, bot_id, policy.as_str()],
+                )?;
+            }
+            None => {
+                self.conn.execute(
+                    "DELETE FROM site_bot_overrides WHERE site_id = ?1 AND bot_id = ?2",
+                    params![site_id, bot_id],
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::blocked_user_agent_patterns`], but layering `site_id`'s
+    /// category and per-bot overrides on top of the global cascade. See the
+    /// precedence order documented on [`Self::compute_blocked_patterns`].
+    pub fn blocked_user_agent_patterns_for_site(&self, site_id: i64) -> Result<Vec<String>> {
+        let ai = self
+            .get_site_category_override(site_id, Category::Ai)?
+            .unwrap_or(self.get_category_default(Category::Ai)?);
+        let search = self
+            .get_site_category_override(site_id, Category::Search)?
+            .unwrap_or(self.get_category_default(Category::Search)?);
+        let scanner = self
+            .get_site_category_override(site_id, Category::Scanner)?
+            .unwrap_or(self.get_category_default(Category::Scanner)?);
+        let overrides = self.site_bot_overrides(site_id)?;
+        self.compute_blocked_patterns(ai, search, scanner, &overrides)
+    }
+
     // ---- firewall rules ----
 
     /// Adds a new firewall rule, enabled by default. Returns its id.
@@ -559,16 +708,51 @@ impl Db {
         let ai_default = self.get_category_default(Category::Ai)?;
         let search_default = self.get_category_default(Category::Search)?;
         let scanner_default = self.get_category_default(Category::Scanner)?;
+        self.compute_blocked_patterns(ai_default, search_default, scanner_default, &[])
+    }
 
+    /// Shared cascade behind [`Self::blocked_user_agent_patterns`] and
+    /// [`Self::blocked_user_agent_patterns_for_site`]. Precedence, most to
+    /// least specific:
+    ///
+    /// 1. `bot_overrides` (a site's per-bot override, when called for a
+    ///    site — empty for the global case) — decisive.
+    /// 2. `bot.status` (a *global* per-bot override) — decisive, bypasses
+    ///    category checks entirely.
+    /// 3. Otherwise, per category the bot belongs to: `ai`/`search`/
+    ///    `scanner` here are already the *effective* values for the call
+    ///    site (a site's category override if it has one, else the global
+    ///    default) — blocked if any matching category is `Blocked`.
+    ///
+    /// Note the asymmetry: a site's category override can never override a
+    /// *global* per-bot pin — only a site's own per-bot override can. That
+    /// bypass-categories-entirely behavior for an explicit bot pin already
+    /// existed before per-site overrides did; this just applies it at both
+    /// levels rather than inventing a second rule for the site layer.
+    fn compute_blocked_patterns(
+        &self,
+        ai: Policy,
+        search: Policy,
+        scanner: Policy,
+        bot_overrides: &[SiteBotOverride],
+    ) -> Result<Vec<String>> {
         let mut patterns = Vec::new();
         for bot in self.list_bots()? {
-            let blocked = match bot.status {
-                BotStatus::Blocked => true,
-                BotStatus::Allowed => false,
-                BotStatus::Default => {
-                    (bot.is_ai && ai_default == Policy::Blocked)
-                        || (bot.is_search_engine && search_default == Policy::Blocked)
-                        || (bot.is_scanner && scanner_default == Policy::Blocked)
+            let overridden = bot_overrides
+                .iter()
+                .find(|o| o.bot_id == bot.id)
+                .map(|o| o.policy);
+            let blocked = if let Some(policy) = overridden {
+                policy == Policy::Blocked
+            } else {
+                match bot.status {
+                    BotStatus::Blocked => true,
+                    BotStatus::Allowed => false,
+                    BotStatus::Default => {
+                        (bot.is_ai && ai == Policy::Blocked)
+                            || (bot.is_search_engine && search == Policy::Blocked)
+                            || (bot.is_scanner && scanner == Policy::Blocked)
+                    }
                 }
             };
             if blocked {
@@ -728,6 +912,170 @@ mod tests {
         let sites = db.list_sites().unwrap();
         assert_eq!(sites.len(), 1);
         assert_eq!(sites[0].server_name, "example.com");
+    }
+
+    fn site_id(db: &Db, server_name: &str) -> i64 {
+        db.upsert_site(server_name, "/etc/nginx/sites-enabled/x")
+            .unwrap();
+        db.list_sites()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.server_name == server_name)
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn site_category_override_defaults_to_none_and_round_trips() {
+        let db = Db::open_in_memory().unwrap();
+        let site = site_id(&db, "example.com");
+
+        assert_eq!(
+            db.get_site_category_override(site, Category::Ai).unwrap(),
+            None
+        );
+
+        db.set_site_category_override(site, Category::Ai, Some(Policy::Allowed))
+            .unwrap();
+        assert_eq!(
+            db.get_site_category_override(site, Category::Ai).unwrap(),
+            Some(Policy::Allowed)
+        );
+
+        db.set_site_category_override(site, Category::Ai, None)
+            .unwrap();
+        assert_eq!(
+            db.get_site_category_override(site, Category::Ai).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn site_bot_override_defaults_to_empty_and_round_trips() {
+        let db = test_db();
+        let site = site_id(&db, "example.com");
+        db.upsert_bot(&sample_bot("gptbot")).unwrap();
+        let bot_id = db.list_bots().unwrap()[0].id;
+
+        assert!(db.site_bot_overrides(site).unwrap().is_empty());
+
+        db.set_site_bot_override(site, bot_id, Some(Policy::Blocked))
+            .unwrap();
+        let overrides = db.site_bot_overrides(site).unwrap();
+        assert_eq!(
+            overrides,
+            vec![SiteBotOverride {
+                bot_id,
+                policy: Policy::Blocked
+            }]
+        );
+
+        db.set_site_bot_override(site, bot_id, None).unwrap();
+        assert!(db.site_bot_overrides(site).unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocked_patterns_for_site_matches_global_when_no_overrides_are_set() {
+        let db = test_db();
+        let site = site_id(&db, "example.com");
+        let mut ai_bot = sample_bot("ai-bot");
+        ai_bot.is_ai = true;
+        db.upsert_bot(&ai_bot).unwrap();
+
+        assert_eq!(
+            db.blocked_user_agent_patterns_for_site(site).unwrap(),
+            db.blocked_user_agent_patterns().unwrap()
+        );
+    }
+
+    #[test]
+    fn site_bot_override_wins_over_everything_else() {
+        let db = test_db();
+        let site = site_id(&db, "example.com");
+        let mut ai_bot = sample_bot("ai-bot");
+        ai_bot.is_ai = true;
+        db.upsert_bot(&ai_bot).unwrap();
+        let bot_id = db.list_bots().unwrap()[0].id;
+
+        // Global default blocks AI bots; a global per-bot override allows
+        // it; the site override should still win over both.
+        db.set_bot_status("ai-bot", BotStatus::Allowed).unwrap();
+        db.set_site_bot_override(site, bot_id, Some(Policy::Blocked))
+            .unwrap();
+
+        assert_eq!(
+            db.blocked_user_agent_patterns_for_site(site).unwrap(),
+            vec!["ai-bot-ua".to_string()]
+        );
+    }
+
+    #[test]
+    fn global_bot_override_wins_over_a_site_category_override() {
+        let db = test_db();
+        let site = site_id(&db, "example.com");
+        let mut ai_bot = sample_bot("ai-bot");
+        ai_bot.is_ai = true;
+        db.upsert_bot(&ai_bot).unwrap();
+
+        // The bot is globally pinned Allowed; the site blocks the whole AI
+        // category but sets no override for this specific bot. The global
+        // pin should still win: a site category override can't reach
+        // through an explicit global per-bot pin (see
+        // Db::compute_blocked_patterns's doc comment).
+        db.set_bot_status("ai-bot", BotStatus::Allowed).unwrap();
+        db.set_site_category_override(site, Category::Ai, Some(Policy::Blocked))
+            .unwrap();
+
+        assert!(db
+            .blocked_user_agent_patterns_for_site(site)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn site_category_override_wins_over_global_default_when_bot_has_no_pin() {
+        let db = test_db();
+        let site = site_id(&db, "example.com");
+        let mut search_bot = sample_bot("search-bot");
+        search_bot.is_search_engine = true;
+        db.upsert_bot(&search_bot).unwrap();
+
+        // Global default allows search engines; site overrides to Blocked.
+        db.set_site_category_override(site, Category::Search, Some(Policy::Blocked))
+            .unwrap();
+
+        assert_eq!(
+            db.blocked_user_agent_patterns_for_site(site).unwrap(),
+            vec!["search-bot-ua".to_string()]
+        );
+    }
+
+    #[test]
+    fn multi_category_bot_is_blocked_if_any_matching_category_is_blocked() {
+        let db = test_db();
+        let site = site_id(&db, "example.com");
+        let mut bot = sample_bot("both-bot");
+        bot.is_ai = true;
+        bot.is_search_engine = true;
+        db.upsert_bot(&bot).unwrap();
+
+        // Search is allowed globally, AI is blocked globally: the bot
+        // matches both, so it should be blocked.
+        assert_eq!(
+            db.blocked_user_agent_patterns_for_site(site).unwrap(),
+            vec!["both-bot-ua".to_string()]
+        );
+
+        // Allowing AI at the site level isn't enough on its own: the bot is
+        // also a search engine, and search defaults to Allowed globally
+        // anyway, so it should now be fully unblocked (confirms the
+        // multi-category check is an OR, not just "any override clears it").
+        db.set_site_category_override(site, Category::Ai, Some(Policy::Allowed))
+            .unwrap();
+        assert!(db
+            .blocked_user_agent_patterns_for_site(site)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -263,16 +263,22 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
 }
 
 /// Applies the bot-blocking rule to every `server { ... }` block found in
-/// `config_path`, blocking the given combined `patterns` (regex
-/// alternatives). An empty `patterns` list removes any existing block.
-/// Returns whether the file was actually changed on disk.
+/// `config_path`. Each block gets the pattern list from `site_patterns`
+/// belonging to its own `server_name` (its `names.first()`), or
+/// `default_patterns` if that name isn't in `site_patterns` at all (e.g. a
+/// block discovered on disk that was never scanned into the db yet). An
+/// empty pattern list for a block removes any existing block there. Returns
+/// whether the file was actually changed on disk.
 ///
-/// Operates on *all* server blocks in the file rather than looking one up by
-/// `server_name`: a single file commonly has multiple blocks sharing the same
-/// `server_name` (e.g. a port-80-redirect block plus the real port-443
-/// block), and blocking decisions aren't per-site yet anyway (see TODO.md),
-/// so every block in a discovered config file should get the same rule.
-pub fn apply_blocks_to_file(config_path: &Path, patterns: &[String]) -> Result<bool> {
+/// Two blocks sharing the same `server_name` (e.g. a port-80-redirect block
+/// plus the real port-443 block for the same site) resolve to the same
+/// `site_patterns` entry and so still get the same rule; two blocks with
+/// *different* names in the same file now correctly get independent rules.
+pub fn apply_blocks_to_file(
+    config_path: &Path,
+    site_patterns: &[(String, Vec<String>)],
+    default_patterns: &[String],
+) -> Result<bool> {
     let mut content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
 
@@ -280,7 +286,6 @@ pub fn apply_blocks_to_file(config_path: &Path, patterns: &[String]) -> Result<b
     if block_count == 0 {
         return Ok(false);
     }
-    let pattern = (!patterns.is_empty()).then(|| patterns.join("|"));
 
     // Editing a block shifts the byte offsets of every block after it, so
     // re-parse before each edit rather than reusing stale spans. Block order
@@ -289,7 +294,121 @@ pub fn apply_blocks_to_file(config_path: &Path, patterns: &[String]) -> Result<b
     let mut changed = false;
     for i in 0..block_count {
         let blocks = parse_server_blocks(&content);
-        let updated = apply_block(&content, &blocks[i], pattern.as_deref());
+        let block = &blocks[i];
+        let patterns = block
+            .names
+            .first()
+            .and_then(|name| site_patterns.iter().find(|(n, _)| n == name))
+            .map(|(_, patterns)| patterns.as_slice())
+            .unwrap_or(default_patterns);
+        let pattern = (!patterns.is_empty()).then(|| patterns.join("|"));
+        let updated = apply_block(&content, block, pattern.as_deref());
+        if updated != content {
+            changed = true;
+            content = updated;
+        }
+    }
+
+    if !changed {
+        return Ok(false);
+    }
+    fs::write(config_path, &content)
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(true)
+}
+
+/// Whether a site's on-disk config currently matches the blocking rule
+/// that would be computed for it right now — backs the TUI's per-site
+/// status tag in Site settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteApplyStatus {
+    /// Every `server` block for this name already carries the expected
+    /// rule (or none is expected and none is present).
+    UpToDate,
+    /// At least one block for this name is missing the expected rule, or
+    /// carries a different one.
+    Stale,
+    /// The config file couldn't be read, or no `server` block in it
+    /// declares this `server_name` anymore (e.g. renamed or removed on
+    /// disk since the last scan).
+    NotFound,
+}
+
+/// Extracts the user-agent pattern currently applied inside `block`'s
+/// sentinel rule, if any. Anchored to the sentinel's own line range (via
+/// `locate_existing_block`), not just searched for anywhere in the whole
+/// block — a hand-written `if ($http_user_agent ~* "...")` or similar
+/// regex condition elsewhere in the same `server { ... }` would otherwise
+/// be picked up as "the" applied pattern and make an up-to-date site
+/// permanently read as stale.
+fn current_block_pattern(content: &str, block: &ServerBlock) -> Option<String> {
+    let (start, end) = locate_existing_block(content, block)?;
+    let region = &content[start..end];
+    let pattern_start = region.find("~* \"")? + 4;
+    let rest = &region[pattern_start..];
+    let pattern_end = rest.find('"')?;
+    Some(rest[..pattern_end].to_string())
+}
+
+/// Compares what's actually written in `config_path` for `server_name`
+/// against `patterns` (the currently computed blocking rule for that
+/// site) without changing anything on disk.
+pub fn site_apply_status(
+    config_path: &Path,
+    server_name: &str,
+    patterns: &[String],
+) -> SiteApplyStatus {
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return SiteApplyStatus::NotFound;
+    };
+    let blocks = parse_server_blocks(&content);
+    let matching: Vec<&ServerBlock> = blocks
+        .iter()
+        .filter(|b| b.names.first().map(String::as_str) == Some(server_name))
+        .collect();
+    if matching.is_empty() {
+        return SiteApplyStatus::NotFound;
+    }
+    let expected = (!patterns.is_empty()).then(|| patterns.join("|"));
+    if matching
+        .iter()
+        .all(|block| current_block_pattern(&content, block) == expected)
+    {
+        SiteApplyStatus::UpToDate
+    } else {
+        SiteApplyStatus::Stale
+    }
+}
+
+/// Applies `patterns` only to the `server { ... }` block(s) in
+/// `config_path` whose first `server_name` is `server_name`, leaving
+/// every other block in the file completely untouched — unlike
+/// [`apply_blocks_to_file`], which resets every block it has no explicit
+/// entry for back to `default_patterns`. This backs the TUI's per-site
+/// "Apply now" action: applying one site's overrides must never silently
+/// rewrite an unrelated site sharing the same file. Returns whether the
+/// file was actually changed on disk.
+pub fn apply_block_for_site(
+    config_path: &Path,
+    server_name: &str,
+    patterns: &[String],
+) -> Result<bool> {
+    let mut content = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+
+    let block_count = parse_server_blocks(&content).len();
+    let pattern = (!patterns.is_empty()).then(|| patterns.join("|"));
+
+    // Same re-parse-before-each-edit approach as apply_blocks_to_file:
+    // editing a block shifts the byte offsets of every block after it.
+    let mut changed = false;
+    for i in 0..block_count {
+        let blocks = parse_server_blocks(&content);
+        let block = &blocks[i];
+        if block.names.first().map(String::as_str) != Some(server_name) {
+            continue;
+        }
+        let updated = apply_block(&content, block, pattern.as_deref());
         if updated != content {
             changed = true;
             content = updated;
@@ -410,14 +529,14 @@ mod tests {
         .unwrap();
 
         let patterns = vec!["BadBot".to_string(), "EvilCrawler".to_string()];
-        let changed = apply_blocks_to_file(&path, &patterns).unwrap();
+        let changed = apply_blocks_to_file(&path, &[], &patterns).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains(BLOCK_BEGIN));
         assert!(written.contains("BadBot|EvilCrawler"));
 
-        let changed_again = apply_blocks_to_file(&path, &patterns).unwrap();
+        let changed_again = apply_blocks_to_file(&path, &[], &patterns).unwrap();
         assert!(!changed_again);
     }
 
@@ -427,7 +546,7 @@ mod tests {
         let path = dir.path().join("nginx.conf");
         fs::write(&path, "events {}\nhttp {\n    include conf.d/*.conf;\n}\n").unwrap();
 
-        let changed = apply_blocks_to_file(&path, &["BadBot".to_string()]).unwrap();
+        let changed = apply_blocks_to_file(&path, &[], &["BadBot".to_string()]).unwrap();
         assert!(!changed);
         assert!(!fs::read_to_string(&path).unwrap().contains(BLOCK_BEGIN));
     }
@@ -446,7 +565,7 @@ mod tests {
         )
         .unwrap();
 
-        let changed = apply_blocks_to_file(&path, &["BadBot".to_string()]).unwrap();
+        let changed = apply_blocks_to_file(&path, &[], &["BadBot".to_string()]).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -458,5 +577,190 @@ mod tests {
             let region = &written[block.open..block.close];
             assert!(region.contains(BLOCK_BEGIN));
         }
+    }
+
+    #[test]
+    fn apply_blocks_to_file_applies_different_patterns_per_server_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi-site.conf");
+        fs::write(
+            &path,
+            "server {\n    listen 80;\n    server_name a.example;\n}\n\
+             server {\n    listen 80;\n    server_name b.example;\n}\n",
+        )
+        .unwrap();
+
+        let site_patterns = vec![
+            ("a.example".to_string(), vec!["OnlyOnA".to_string()]),
+            ("b.example".to_string(), vec!["OnlyOnB".to_string()]),
+        ];
+        let changed = apply_blocks_to_file(&path, &site_patterns, &[]).unwrap();
+        assert!(changed);
+
+        let written = fs::read_to_string(&path).unwrap();
+        let blocks = parse_server_blocks(&written);
+        let a_region = &written[blocks[0].open..blocks[0].close];
+        let b_region = &written[blocks[1].open..blocks[1].close];
+        assert!(a_region.contains("OnlyOnA"));
+        assert!(!a_region.contains("OnlyOnB"));
+        assert!(b_region.contains("OnlyOnB"));
+        assert!(!b_region.contains("OnlyOnA"));
+    }
+
+    #[test]
+    fn apply_blocks_to_file_falls_back_to_default_patterns_for_an_unknown_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unscanned.conf");
+        fs::write(
+            &path,
+            "server {\n    listen 80;\n    server_name unscanned.example;\n}\n",
+        )
+        .unwrap();
+
+        // No entry for "unscanned.example" in site_patterns at all (as if
+        // it was just discovered on disk but never scanned into the db).
+        let changed = apply_blocks_to_file(&path, &[], &["GlobalDefaultBot".to_string()]).unwrap();
+        assert!(changed);
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("GlobalDefaultBot"));
+    }
+
+    #[test]
+    fn site_apply_status_reports_not_found_for_a_missing_file() {
+        let status = site_apply_status(
+            Path::new("/nonexistent/does-not-exist.conf"),
+            "example.com",
+            &["BadBot".to_string()],
+        );
+        assert_eq!(status, SiteApplyStatus::NotFound);
+    }
+
+    #[test]
+    fn site_apply_status_reports_not_found_when_the_server_name_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+
+        let status = site_apply_status(&path, "b.example", &["BadBot".to_string()]);
+        assert_eq!(status, SiteApplyStatus::NotFound);
+    }
+
+    #[test]
+    fn site_apply_status_is_up_to_date_when_nothing_is_expected_and_nothing_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+
+        let status = site_apply_status(&path, "a.example", &[]);
+        assert_eq!(status, SiteApplyStatus::UpToDate);
+    }
+
+    #[test]
+    fn site_apply_status_is_stale_when_a_rule_is_expected_but_not_yet_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+
+        let status = site_apply_status(&path, "a.example", &["BadBot".to_string()]);
+        assert_eq!(status, SiteApplyStatus::Stale);
+    }
+
+    #[test]
+    fn site_apply_status_is_up_to_date_once_the_matching_rule_is_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+        apply_block_for_site(
+            &path,
+            "a.example",
+            &["BadBot".to_string(), "EvilBot".to_string()],
+        )
+        .unwrap();
+
+        let status = site_apply_status(
+            &path,
+            "a.example",
+            &["BadBot".to_string(), "EvilBot".to_string()],
+        );
+        assert_eq!(status, SiteApplyStatus::UpToDate);
+    }
+
+    /// Regression test: a hand-written user-agent regex condition elsewhere
+    /// in the same server block, ahead of our sentinel, must not be
+    /// mistaken for our own applied pattern.
+    #[test]
+    fn site_apply_status_ignores_a_hand_written_user_agent_check_ahead_of_the_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(
+            &path,
+            "server {\n    server_name a.example;\n    if ($http_user_agent ~* \"AdminBot\") { return 403; }\n}\n",
+        )
+        .unwrap();
+        apply_block_for_site(&path, "a.example", &["BadBot".to_string()]).unwrap();
+
+        let status = site_apply_status(&path, "a.example", &["BadBot".to_string()]);
+        assert_eq!(status, SiteApplyStatus::UpToDate);
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("AdminBot"));
+        assert!(written.contains("BadBot"));
+    }
+
+    #[test]
+    fn site_apply_status_is_stale_when_the_applied_pattern_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+        apply_block_for_site(&path, "a.example", &["OldBot".to_string()]).unwrap();
+
+        let status = site_apply_status(&path, "a.example", &["NewBot".to_string()]);
+        assert_eq!(status, SiteApplyStatus::Stale);
+    }
+
+    #[test]
+    fn apply_block_for_site_only_touches_the_named_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi-site.conf");
+        fs::write(
+            &path,
+            "server {\n    listen 80;\n    server_name a.example;\n}\n\
+             server {\n    listen 80;\n    server_name b.example;\n}\n",
+        )
+        .unwrap();
+
+        let changed = apply_block_for_site(&path, "a.example", &["OnlyOnA".to_string()]).unwrap();
+        assert!(changed);
+
+        let written = fs::read_to_string(&path).unwrap();
+        let blocks = parse_server_blocks(&written);
+        let a_region = &written[blocks[0].open..blocks[0].close];
+        let b_region = &written[blocks[1].open..blocks[1].close];
+        assert!(a_region.contains("OnlyOnA"));
+        assert!(!b_region.contains(BLOCK_BEGIN));
+    }
+
+    #[test]
+    fn apply_block_for_site_is_a_noop_once_already_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+
+        assert!(apply_block_for_site(&path, "a.example", &["BadBot".to_string()]).unwrap());
+        assert!(!apply_block_for_site(&path, "a.example", &["BadBot".to_string()]).unwrap());
+    }
+
+    #[test]
+    fn apply_block_for_site_is_a_noop_for_an_unknown_server_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        let original = "server {\n    server_name a.example;\n}\n";
+        fs::write(&path, original).unwrap();
+
+        let changed =
+            apply_block_for_site(&path, "unknown.example", &["BadBot".to_string()]).unwrap();
+        assert!(!changed);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 }

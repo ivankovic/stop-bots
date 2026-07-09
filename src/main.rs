@@ -46,12 +46,17 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
-    /// Download and store the latest known-bot list
+    /// Download and store the latest known-bot list from one source
     #[command(alias = "update")]
     UpdateBotLists {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
+        /// Which bot-list source to update: well-known-bots, ai-robots-txt
+        /// or nginx-bad-bots
+        #[arg(long, default_value = "well-known-bots")]
+        source_id: String,
         /// Read the bot list from a local file instead of downloading it
+        /// (parsed as --source-id's format)
         #[arg(long)]
         source: Option<PathBuf>,
     },
@@ -103,6 +108,10 @@ enum Command {
     Tui {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
+        /// Root directory to scan for NGINX config files, when triggering a
+        /// site scan from Site settings
+        #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
+        root: PathBuf,
     },
 }
 
@@ -117,10 +126,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => run_tui(None).await,
-        Some(Command::Tui { db }) => run_tui(db).await,
+        None => run_tui(None, PathBuf::from(DEFAULT_NGINX_ROOT)).await,
+        Some(Command::Tui { db, root }) => run_tui(db, root).await,
         Some(Command::ScanSites { root, db }) => scan_sites(&root, db),
-        Some(Command::UpdateBotLists { db, source }) => update_bot_lists(db, source).await,
+        Some(Command::UpdateBotLists {
+            db,
+            source_id,
+            source,
+        }) => update_bot_lists(db, source_id, source).await,
         Some(Command::ApplyBlocks { root, db }) => apply_blocks(&root, db),
         Some(Command::AddFirewallRule {
             address,
@@ -213,9 +226,9 @@ fn resolve_user_db_path(
     Ok(data_home.join("stop-bots").join("db.sqlite3"))
 }
 
-async fn run_tui(db_path: Option<PathBuf>) -> Result<()> {
+async fn run_tui(db_path: Option<PathBuf>, root: PathBuf) -> Result<()> {
     let db = open_db(db_path)?;
-    let app = stop_bots::app::App::new(db)?;
+    let app = stop_bots::app::App::new(db, root)?;
     let terminal = ratatui::init();
     let result = app.run(terminal).await;
     ratatui::restore();
@@ -236,23 +249,32 @@ fn scan_sites(root: &Path, db_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-async fn update_bot_lists(db_path: Option<PathBuf>, source: Option<PathBuf>) -> Result<()> {
+async fn update_bot_lists(
+    db_path: Option<PathBuf>,
+    source_id: String,
+    source: Option<PathBuf>,
+) -> Result<()> {
     let db = open_db(db_path)?;
+    let kind = botlist::SourceKind::from_id(&source_id)
+        .with_context(|| format!("unknown bot-list source id: {source_id}"))?;
     let count = match source {
         Some(path) => {
-            let json = std::fs::read_to_string(&path)?;
-            let bots = botlist::parse(&json)?;
-            botlist::store(&db, &bots)?
+            let raw = std::fs::read_to_string(&path)?;
+            let bots = kind.parse(&raw)?;
+            botlist::store(&db, kind, &bots)?
         }
-        None => botlist::update(&db).await?,
+        None => botlist::update(&db, kind).await?,
     };
-    println!("Stored {count} bot(s) from {}", botlist::SOURCE_NAME);
+    println!("Stored {count} bot(s) from {}", kind.name());
     Ok(())
 }
 
 fn apply_blocks(root: &Path, db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
-    let patterns = db.blocked_user_agent_patterns()?;
+    let default_patterns = db.blocked_user_agent_patterns()?;
+    // Sites already known to the db (i.e. previously scanned) — the only
+    // ones that can carry a per-site override at all.
+    let known_sites = db.list_sites()?;
     let sites = nginx::discover_sites(root)?;
 
     // A single config file commonly holds multiple `server` blocks for the
@@ -264,7 +286,26 @@ fn apply_blocks(root: &Path, db_path: Option<PathBuf>) -> Result<()> {
 
     let mut changed = 0;
     for path in &config_paths {
-        if nginx::apply_blocks_to_file(path, &patterns)? {
+        // Built fresh per file, filtered to sites that actually live in
+        // *this* file: `server_name` alone isn't unique across the whole
+        // `sites` table (two different files can share one, e.g. a stale
+        // config left behind after a rename), so a single map built once
+        // for the whole run could leak one site's override onto another's
+        // same-named block in a different file. Note this join is a
+        // textual `config_path` match, only valid when `--root` here
+        // matches whatever `--root` was used at scan time — a mismatch
+        // just falls through to `default_patterns` below, not an error.
+        let site_patterns: Vec<(String, Vec<String>)> = known_sites
+            .iter()
+            .filter(|s| Path::new(&s.config_path) == path.as_path())
+            .map(|s| {
+                Ok((
+                    s.server_name.clone(),
+                    db.blocked_user_agent_patterns_for_site(s.id)?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+        if nginx::apply_blocks_to_file(path, &site_patterns, &default_patterns)? {
             changed += 1;
         }
     }
