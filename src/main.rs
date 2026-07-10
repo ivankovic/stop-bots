@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule};
-use stop_bots::{botlist, ipranges, iptables, nftables, nginx, sshlog};
+use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
 const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
@@ -128,6 +128,77 @@ enum Command {
         ssh_log: Option<PathBuf>,
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
+    },
+    /// Scans the SSH log for IP addresses with a pile of failed
+    /// authentication attempts — the signature of an automated
+    /// scanner/brute-force bot, not a human — and adds a temporary Block
+    /// rule (expiring after --ttl-days) for each to the firewall_rules
+    /// table. Never blocks an IP that also has a successful login anywhere
+    /// in the same log, or a loopback/private address (see
+    /// stop_bots::sshlog::scanning_ips). Adding a rule here only stores it:
+    /// as with every other firewall_rules row, it has no effect until
+    /// RenderFirewall renders it into a script and you apply that script
+    /// yourself — so this is safe to run unattended (e.g. from cron)
+    /// without risking an immediate, unreviewed lockout. The expiry is
+    /// enforced by RenderFirewall/ListFirewallRules pruning lapsed rows
+    /// on read, not by anything running on a timer — so a block only
+    /// actually lifts on the host the next time you render and re-apply
+    /// after it expires.
+    BlockScanners {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Minimum number of failed-authentication log lines (not a rate —
+        /// this module doesn't parse timestamps) before an IP is
+        /// considered a scanner rather than someone who mistyped a
+        /// password a couple of times
+        #[arg(long, default_value_t = 20)]
+        threshold: usize,
+        /// How many days an added block rule lasts before it's
+        /// automatically dropped (re-added on a later run if the IP is
+        /// still scanning by then)
+        #[arg(long, default_value_t = 5)]
+        ttl_days: i64,
+        /// Check this SSH log file instead of auto-detecting one
+        #[arg(long)]
+        ssh_log: Option<PathBuf>,
+        /// Show what would be added without writing to the database
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Scans the NGINX access log for IP addresses that requested a pile of
+    /// distinct nonexistent URLs (404s) — the signature of an automated
+    /// vulnerability/URL scanner, not a human clicking a dead link — and
+    /// adds a temporary Block rule (expiring after --ttl-days) for each to
+    /// the firewall_rules table. Unlike BlockScanners, an IP is not
+    /// exempted just because it also got a successful (200) response
+    /// somewhere in the log: a scanner's own recon traffic almost always
+    /// includes one (see stop_bots::accesslog::scanning_ips for the full
+    /// reasoning). Also excludes IPs inside known crawler ranges (Googlebot/
+    /// Bingbot/GPTBot). Adding a rule here only stores it: same as every
+    /// other firewall_rules row, it has no effect until RenderFirewall
+    /// renders it into a script and you apply that script yourself — same
+    /// expiry-is-enforced-on-read caveat as BlockScanners.
+    BlockWebScanners {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Minimum number of *distinct* 404-returning paths (not total
+        /// hits, and not a rate — this module doesn't parse timestamps)
+        /// before an IP is considered a scanner rather than a client that
+        /// hit one dead link
+        #[arg(long, default_value_t = 15)]
+        threshold: usize,
+        /// How many days an added block rule lasts before it's
+        /// automatically dropped (re-added on a later run if the IP is
+        /// still scanning by then)
+        #[arg(long, default_value_t = 1)]
+        ttl_days: i64,
+        /// Check this NGINX access log file instead of the default
+        /// /var/log/nginx/access.log
+        #[arg(long)]
+        access_log: Option<PathBuf>,
+        /// Show what would be added without writing to the database
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Download and store the current CIDR list for one published crawler
     /// IP-range source (Googlebot, Bingbot or GPTBot)
@@ -240,6 +311,20 @@ async fn main() -> Result<()> {
             ssh_log,
             db,
         }) => render_firewall(db, backend, &out, force, ssh_log),
+        Some(Command::BlockScanners {
+            db,
+            threshold,
+            ttl_days,
+            ssh_log,
+            dry_run,
+        }) => block_scanners(db, threshold, ttl_days, ssh_log, dry_run),
+        Some(Command::BlockWebScanners {
+            db,
+            threshold,
+            ttl_days,
+            access_log,
+            dry_run,
+        }) => block_web_scanners(db, threshold, ttl_days, access_log, dry_run),
         Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
         Some(Command::UpdateCountryRanges { db, country }) => {
             update_country_ranges(db, country).await
@@ -448,12 +533,40 @@ fn list_firewall_rules(db_path: Option<PathBuf>) -> Result<()> {
     for rule in rules {
         let port = rule.port.map(|p| format!(":{p}")).unwrap_or_default();
         let status = if rule.enabled { "" } else { " (disabled)" };
+        let expiry = rule
+            .expires_at
+            .map(|t| format!(" ({})", format_expiry(t)))
+            .unwrap_or_default();
         println!(
-            "#{} {:?} {}{}{}",
-            rule.id, rule.action, rule.address, port, status
+            "#{} {:?} {}{}{}{}",
+            rule.id, rule.action, rule.address, port, status, expiry
         );
     }
     Ok(())
+}
+
+/// Renders a firewall rule's `expires_at` (Unix seconds, already known to
+/// be in the future — anything at or past `now` would have been pruned
+/// before `list_firewall_rules` returned it) as a short "expires in ..."
+/// string for `list-firewall-rules`. Rounds down to whole days once at
+/// least one has passed, otherwise whole hours — precision the admin
+/// scanning a rule list actually needs, not a countdown clock.
+fn format_expiry(expires_at: i64) -> String {
+    let seconds_left = (expires_at - now_secs()).max(0);
+    let days = seconds_left / 86_400;
+    if days > 0 {
+        format!("expires in {days}d")
+    } else {
+        let hours = (seconds_left / 3_600).max(1);
+        format!("expires in {hours}h")
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 fn remove_firewall_rule(db_path: Option<PathBuf>, id: i64) -> Result<()> {
@@ -512,61 +625,30 @@ fn list_selected_countries(db_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Every synthetic (never persisted) `FirewallRule` derived from
-/// currently-blocked-by-default crawler IP-range sources and the current
-/// geo mode's selected countries — see `Db::derived_firewall_entries`.
-/// Uses `id: 0` since these don't correspond to a real `firewall_rules`
-/// row; they're never looked up or removed by id, only rendered. Order is
-/// preserved from `derived_firewall_entries` (crawler ranges, then geo
-/// rules with any Allowlist catch-all strictly last) — callers must append
-/// this after admin rules, never reorder it.
-fn derived_firewall_rules(db: &Db) -> Result<Vec<FirewallRule>> {
-    Ok(db
-        .derived_firewall_entries()?
-        .into_iter()
-        .map(|(address, action)| FirewallRule {
-            id: 0,
-            address,
-            port: None,
-            action,
-            enabled: true,
-        })
-        .collect())
-}
-
-/// Every `(connected_ip, matching_rule_address)` pair where a client with a
-/// recent successful SSH login (from `connected_ips`) would actually end up
-/// blocked by `rules` — simulating the same first-match-wins evaluation the
-/// rendered script itself performs, walking `rules` in the exact order
-/// they'll be written. This is deliberately *not* "does any Block rule's
-/// CIDR contain this IP": once Allowlist geo mode can put an Allow rule
-/// ahead of a catch-all Block, that cruder check would misfire on an IP an
-/// earlier Allow rule already protects. Existing (established/related)
-/// connections aren't modeled — this answers "can this client *reconnect*
-/// after applying this", which is the stricter and more useful question:
-/// an admin who disconnects after a bad allowlist can't rely on an
-/// already-open session to get back in. An unparseable `connected_ips`
-/// entry is simply skipped rather than erroring: this check exists to *add*
-/// a warning on top of firewall rendering, never to block it over
-/// something unrelated to that rendering.
-fn lockout_risks(rules: &[FirewallRule], connected_ips: &[String]) -> Vec<(String, String)> {
-    let mut risks = Vec::new();
-    for ip_str in connected_ips {
-        let Ok(ip) = ip_str.parse::<std::net::IpAddr>() else {
-            continue;
-        };
-        for rule in rules.iter().filter(|r| r.enabled) {
-            if ipranges::cidr_contains(&rule.address, ip) {
-                if rule.action != FirewallAction::Allow {
-                    risks.push((ip_str.clone(), rule.address.clone()));
-                }
-                // First match wins, same as the real firewall: stop
-                // checking further rules for this IP either way.
-                break;
+/// The lockout safety check `render_firewall` runs before writing anything:
+/// finds recent successful SSH logins (via `--ssh-log`, or auto-detected)
+/// and warns if any of them would actually end up blocked by `rules` (see
+/// [`stop_bots::firewall::lockout_risks`] for what "actually end up" means).
+/// Returns whether it's safe to proceed — `false` means the caller should
+/// refuse to write the script unless `--force` was passed. A log source
+/// that couldn't be found or read at all is not a risk in itself (nothing
+/// to check against), just a note that the check didn't run.
+fn check_lockout_risk(rules: &[FirewallRule], ssh_log: Option<&Path>, force: bool) -> Result<bool> {
+    match stop_bots::firewall::assess_lockout_risk(rules, ssh_log) {
+        stop_bots::firewall::LockoutStatus::LogUnavailable => {
+            eprintln!(
+                "Note: couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — skipping the lockout safety check. Run as root, or pass --ssh-log, for this check to work."
+            );
+            Ok(true)
+        }
+        stop_bots::firewall::LockoutStatus::Risks(risks) => {
+            if risks.is_empty() {
+                return Ok(true);
             }
+            print_lockout_warning(&risks);
+            Ok(force)
         }
     }
-    risks
 }
 
 fn print_lockout_warning(risks: &[(String, String)]) {
@@ -580,38 +662,13 @@ fn print_lockout_warning(risks: &[(String, String)]) {
     eprintln!("Applying them could lock you out of remote access to this machine.");
 }
 
-/// The lockout safety check `render_firewall` runs before writing anything:
-/// finds recent successful SSH logins (via `--ssh-log`, or auto-detected)
-/// and warns if any of them would actually end up blocked by `rules` (see
-/// `lockout_risks` for what "actually end up" means). Returns whether it's
-/// safe to proceed — `false` means the caller should refuse to write the
-/// script unless `--force` was passed. A log source that couldn't be found
-/// or read at all is not a risk in itself (nothing to check against), just
-/// a note that the check didn't run.
-fn check_lockout_risk(rules: &[FirewallRule], ssh_log: Option<&Path>, force: bool) -> Result<bool> {
-    let source = match ssh_log {
-        Some(path) => sshlog::read_log_file(path),
-        None => sshlog::find_default_source(),
-    };
-    let log_text = match source {
-        sshlog::LogSource::Found(text) => text,
-        sshlog::LogSource::Unavailable => {
-            eprintln!(
-                "Note: couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — skipping the lockout safety check. Run as root, or pass --ssh-log, for this check to work."
-            );
-            return Ok(true);
+impl From<FirewallBackend> for stop_bots::firewall::FirewallBackend {
+    fn from(backend: FirewallBackend) -> Self {
+        match backend {
+            FirewallBackend::Iptables => stop_bots::firewall::FirewallBackend::Iptables,
+            FirewallBackend::Nftables => stop_bots::firewall::FirewallBackend::Nftables,
         }
-    };
-    let connected_ips = sshlog::parse_accepted_ips(&log_text);
-    let risks = lockout_risks(rules, &connected_ips);
-    if risks.is_empty() {
-        return Ok(true);
     }
-    print_lockout_warning(&risks);
-    if force {
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 fn render_firewall(
@@ -622,53 +679,152 @@ fn render_firewall(
     ssh_log: Option<PathBuf>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let backend: stop_bots::firewall::FirewallBackend = backend.into();
+    let built = stop_bots::firewall::build_script(&db, backend)?;
 
-    // Allowlist mode's trailing "block everything else" catch-all is only
-    // safe on nftables: iptables has no loopback/established-connection
-    // allowance in this chain (so 0.0.0.0/0 would drop even local traffic)
-    // and silently skips IPv6 rules entirely (so an IPv6 catch-all never
-    // renders, quietly permitting all IPv6 while IPv4 is locked down). See
-    // SPECS.md.
-    if db.get_geo_mode()? == stop_bots::db::GeoMode::Allowlist
-        && matches!(backend, FirewallBackend::Iptables)
-    {
-        anyhow::bail!(
-            "Allowlist geo mode requires --backend nftables (iptables can't safely enforce a default-deny catch-all — see SPECS.md)"
-        );
-    }
-
-    let mut rules = db.list_firewall_rules()?;
-    rules.extend(derived_firewall_rules(&db)?);
-
-    if !check_lockout_risk(&rules, ssh_log.as_deref(), force)? {
+    if !check_lockout_risk(&built.rules, ssh_log.as_deref(), force)? {
         anyhow::bail!(
             "Refusing to write firewall rules: would block a currently-connected SSH client. Re-run with --force if you're sure."
         );
     }
 
-    let enabled = rules.iter().filter(|r| r.enabled);
-    let (script, run_hint, written) = match backend {
-        FirewallBackend::Iptables => {
-            // iptables is IPv4-only; render() skips IPv6 rules (see SPECS.md).
-            let written = enabled.filter(|r| !r.address.contains(':')).count();
-            (
-                iptables::render(&rules),
-                format!("sh {}", out.display()),
-                written,
-            )
-        }
-        FirewallBackend::Nftables => (
-            nftables::render(&rules),
-            format!("nft -f {}", out.display()),
-            enabled.count(),
-        ),
-    };
-    std::fs::write(out, script)?;
+    stop_bots::firewall::write_script(out, &built.script)?;
     println!(
-        "Wrote {written} rule(s) to {}. Not applied automatically — review it, then run: {run_hint}",
+        "Wrote {} rule(s) to {}. Not applied automatically — review it, then run: {} {}",
+        built.written,
+        out.display(),
+        backend.apply_command(),
         out.display()
     );
     Ok(())
+}
+
+/// Finds scanning IPs in the SSH log and adds a temporary Block rule for
+/// each — see [`stop_bots::scanblock::block_ssh_scanners`] for the shared
+/// detection/insertion logic (also used by the internal cron's
+/// `BlockScanners` job). This CLI wrapper only resolves the log source and
+/// reconstructs the on-screen messages from the returned outcome.
+fn block_scanners(
+    db_path: Option<PathBuf>,
+    threshold: usize,
+    ttl_days: i64,
+    ssh_log: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+
+    let source = match ssh_log.as_deref() {
+        Some(path) => sshlog::read_log_file(path),
+        None => sshlog::find_default_source(),
+    };
+    let log_text = match source {
+        sshlog::LogSource::Found(text) => text,
+        sshlog::LogSource::Unavailable => {
+            anyhow::bail!(
+                "couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — \
+                 pass --ssh-log, or run as root, for this to work"
+            );
+        }
+    };
+
+    let outcome = stop_bots::scanblock::block_ssh_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
+    if outcome.candidates == 0 {
+        println!("No scanning IPs found (threshold: {threshold} failed attempt(s)).");
+        return Ok(());
+    }
+    print_scan_block_outcome(&outcome);
+    Ok(())
+}
+
+/// Finds IPs whose NGINX access-log traffic looks like an automated URL
+/// scanner and adds a temporary Block rule for each — see
+/// [`stop_bots::scanblock::block_web_scanners`] for the shared
+/// detection/exclusion/insertion logic (also used by the internal cron's
+/// `BlockWebScanners` job). This CLI wrapper only resolves the log source
+/// and reconstructs the on-screen messages from the returned outcome.
+fn block_web_scanners(
+    db_path: Option<PathBuf>,
+    threshold: usize,
+    ttl_days: i64,
+    access_log: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+
+    let source = match access_log.as_deref() {
+        Some(path) => accesslog::read_log_file(path),
+        None => accesslog::find_default_source(),
+    };
+    let log_text = match source {
+        accesslog::LogSource::Found(text) => text,
+        accesslog::LogSource::Unavailable => {
+            anyhow::bail!(
+                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
+                 --access-log, or run as root, for this to work"
+            );
+        }
+    };
+
+    let outcome = stop_bots::scanblock::block_web_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
+    if outcome.candidates == 0 {
+        println!("No scanning IPs found (threshold: {threshold} distinct 404'd path(s)).");
+        return Ok(());
+    }
+    if !outcome.crawler_exclusion_active {
+        println!(
+            "Warning: no crawler IP ranges fetched yet (run update-ip-ranges --source-id \
+             googlebot/bingbot/gptbot first) — known-crawler exclusion is inactive, so a \
+             legitimate search crawler chasing stale links could be flagged below."
+        );
+    }
+    if outcome.skipped_known_crawlers > 0 {
+        println!(
+            "Skipped {} IP(s) matching known crawler ranges (Googlebot/Bingbot/GPTBot) — never \
+             auto-blocked here, even when their 404 behavior looks scan-like.",
+            outcome.skipped_known_crawlers
+        );
+    }
+    if outcome.newly_blocked.is_empty() && outcome.already_covered == 0 {
+        println!("No scanning IPs left to block after excluding known crawlers.");
+        return Ok(());
+    }
+    print_scan_block_outcome(&outcome);
+    Ok(())
+}
+
+/// Prints the per-IP and summary lines shared by [`block_scanners`] and
+/// [`block_web_scanners`], reconstructing the wording each used to print
+/// directly (back when the detection/insertion logic itself lived here)
+/// from the [`stop_bots::scanblock::ScanBlockOutcome`] it now gets handed.
+fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
+    for ip in &outcome.newly_blocked {
+        if outcome.dry_run {
+            println!("Would block {ip} for {} day(s) (dry run)", outcome.ttl_days);
+        } else {
+            println!("Added block rule for {ip}, expiring in {} day(s)", outcome.ttl_days);
+        }
+    }
+    if outcome.newly_blocked.is_empty() {
+        println!(
+            "Found {} scanning IP(s), all already covered by an existing firewall rule.",
+            outcome.already_covered
+        );
+    } else if outcome.dry_run {
+        println!(
+            "Would add {} new block rule(s), each expiring after {} day(s). Re-run without \
+             --dry-run to apply.",
+            outcome.newly_blocked.len(),
+            outcome.ttl_days
+        );
+    } else {
+        println!(
+            "Added {} new block rule(s), each expiring after {} day(s). Not applied \
+             automatically — run render-firewall, then apply the generated script, to actually \
+             enforce them (and again after they expire, to actually lift the block).",
+            outcome.newly_blocked.len(),
+            outcome.ttl_days
+        );
+    }
 }
 
 #[cfg(test)]
@@ -751,6 +907,24 @@ mod tests {
         assert!(primary.exists());
     }
 
+    #[test]
+    fn format_expiry_rounds_to_whole_days_once_at_least_one_has_passed() {
+        let expires_at = now_secs() + 3 * 86_400 + 100;
+        assert_eq!(format_expiry(expires_at), "expires in 3d");
+    }
+
+    #[test]
+    fn format_expiry_rounds_to_whole_hours_under_a_day() {
+        let expires_at = now_secs() + 5 * 3_600;
+        assert_eq!(format_expiry(expires_at), "expires in 5h");
+    }
+
+    #[test]
+    fn format_expiry_floors_at_one_hour_for_an_imminent_expiry() {
+        let expires_at = now_secs() + 30;
+        assert_eq!(format_expiry(expires_at), "expires in 1h");
+    }
+
     fn rule(address: &str, action: FirewallAction) -> FirewallRule {
         FirewallRule {
             id: 0,
@@ -758,111 +932,8 @@ mod tests {
             port: None,
             action,
             enabled: true,
+            expires_at: None,
         }
-    }
-
-    #[test]
-    fn derived_firewall_rules_combines_blocked_ip_ranges_and_geo_rules() {
-        let db = Db::open_in_memory().unwrap();
-        db.register_ip_range_source(&stop_bots::db::IpRangeSource {
-            id: "gptbot".to_string(),
-            name: "GPTBot IP ranges".to_string(),
-            url: "https://example.invalid/gptbot.json".to_string(),
-            category: stop_bots::db::Category::Ai,
-            last_fetched_at: None,
-            range_count: 0,
-        })
-        .unwrap();
-        db.replace_ip_ranges("gptbot", &["1.2.3.0/24".to_string()])
-            .unwrap();
-        db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
-            .unwrap();
-        db.set_country_selected("us", true).unwrap();
-
-        let mut rules = derived_firewall_rules(&db).unwrap();
-        rules.sort_by(|a, b| a.address.cmp(&b.address));
-
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].address, "1.2.3.0/24");
-        assert_eq!(rules[1].address, "4.5.6.0/24");
-        assert!(rules.iter().all(|r| r.action == FirewallAction::Block));
-        assert!(rules.iter().all(|r| r.enabled));
-    }
-
-    #[test]
-    fn derived_firewall_rules_is_empty_with_no_ip_ranges_or_selected_countries() {
-        let db = Db::open_in_memory().unwrap();
-        assert!(derived_firewall_rules(&db).unwrap().is_empty());
-    }
-
-    #[test]
-    fn derived_firewall_rules_in_allowlist_mode_ends_with_the_catchall() {
-        let db = Db::open_in_memory().unwrap();
-        db.set_geo_mode(stop_bots::db::GeoMode::Allowlist).unwrap();
-        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
-            .unwrap();
-        db.set_country_selected("nl", true).unwrap();
-
-        let rules = derived_firewall_rules(&db).unwrap();
-        assert_eq!(rules[0].address, "1.2.3.0/24");
-        assert_eq!(rules[0].action, FirewallAction::Allow);
-        assert_eq!(rules[1].address, "0.0.0.0/0");
-        assert_eq!(rules[1].action, FirewallAction::Block);
-        assert_eq!(rules[2].address, "::/0");
-        assert_eq!(rules[2].action, FirewallAction::Block);
-    }
-
-    #[test]
-    fn lockout_risks_finds_a_connected_ip_inside_a_block_rule() {
-        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        let connected = vec!["4.5.6.7".to_string()];
-        assert_eq!(
-            lockout_risks(&rules, &connected),
-            vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())]
-        );
-    }
-
-    #[test]
-    fn lockout_risks_is_empty_when_no_connected_ip_matches() {
-        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        let connected = vec!["9.9.9.9".to_string()];
-        assert!(lockout_risks(&rules, &connected).is_empty());
-    }
-
-    #[test]
-    fn lockout_risks_skips_unparseable_connected_ip_entries() {
-        let rules = vec![rule("0.0.0.0/0", FirewallAction::Block)];
-        let connected = vec!["not-an-ip".to_string()];
-        assert!(lockout_risks(&rules, &connected).is_empty());
-    }
-
-    /// The critical correctness property for Allowlist geo mode: an IP
-    /// covered by an earlier Allow rule must never be flagged, even though
-    /// a later catch-all Block rule's CIDR also technically contains it —
-    /// first match wins, exactly like the real firewall evaluates it.
-    #[test]
-    fn lockout_risks_is_safe_when_an_earlier_allow_rule_covers_the_catchall() {
-        let rules = vec![
-            rule("4.5.6.0/24", FirewallAction::Allow),
-            rule("0.0.0.0/0", FirewallAction::Block),
-        ];
-        let connected = vec!["4.5.6.7".to_string()];
-        assert!(lockout_risks(&rules, &connected).is_empty());
-    }
-
-    /// The flip side: an IP *not* covered by any earlier Allow rule must
-    /// still be caught by the trailing catch-all.
-    #[test]
-    fn lockout_risks_catches_an_ip_only_covered_by_the_catchall() {
-        let rules = vec![
-            rule("4.5.6.0/24", FirewallAction::Allow),
-            rule("0.0.0.0/0", FirewallAction::Block),
-        ];
-        let connected = vec!["9.9.9.9".to_string()];
-        assert_eq!(
-            lockout_risks(&rules, &connected),
-            vec![("9.9.9.9".to_string(), "0.0.0.0/0".to_string())]
-        );
     }
 
     #[test]
@@ -914,5 +985,124 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nftables"));
         assert!(!out.exists());
+    }
+
+    fn not_found_line(ip: &str, path: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 404 1 \"-\" \"Googlebot\"\n"
+        )
+    }
+
+    /// The property the crawler exclusion exists for: an IP inside a known
+    /// crawler's published ranges must never be auto-blocked by
+    /// `block_web_scanners`, even when its 404 behavior clears the
+    /// scanning threshold — a real Googlebot routinely chases enough stale
+    /// links to do exactly that.
+    #[test]
+    fn block_web_scanners_never_blocks_an_ip_inside_a_known_crawler_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite3");
+        {
+            let db = Db::open(&db_path).unwrap();
+            ipranges::store(
+                &db,
+                ipranges::IpRangeSourceKind::GoogleBot,
+                &["198.51.100.0/24".to_string()],
+            )
+            .unwrap();
+        }
+
+        let log_path = tmp.path().join("access.log");
+        let log: String = (0..20)
+            .map(|i| not_found_line("198.51.100.9", &format!("/missing-{i}")))
+            .collect();
+        std::fs::write(&log_path, log).unwrap();
+
+        block_web_scanners(Some(db_path.clone()), 15, 1, Some(log_path), false).unwrap();
+
+        let db = Db::open(&db_path).unwrap();
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// The flip side: an IP that scans just as aggressively but *isn't*
+    /// inside any known crawler range must still get blocked.
+    #[test]
+    fn block_web_scanners_still_blocks_a_scanner_outside_known_crawler_ranges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite3");
+        {
+            let db = Db::open(&db_path).unwrap();
+            ipranges::store(
+                &db,
+                ipranges::IpRangeSourceKind::GoogleBot,
+                &["198.51.100.0/24".to_string()],
+            )
+            .unwrap();
+        }
+
+        let log_path = tmp.path().join("access.log");
+        let log: String = (0..20)
+            .map(|i| not_found_line("203.0.113.9", &format!("/missing-{i}")))
+            .collect();
+        std::fs::write(&log_path, log).unwrap();
+
+        block_web_scanners(Some(db_path.clone()), 15, 1, Some(log_path), false).unwrap();
+
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(
+            db.list_firewall_rules().unwrap()[0].address,
+            "203.0.113.9".to_string()
+        );
+    }
+
+    /// The dup-row hazard a naive "list then filter expired" design would
+    /// hit: re-running `block_scanners` against an IP whose earlier block
+    /// already expired must produce exactly one row for that address, not
+    /// two (one stale-but-undeleted, one freshly inserted). Proven here by
+    /// calling `block_scanners` twice against the same still-scanning IP —
+    /// first with a negative TTL (an instantly-expired "earlier" block),
+    /// then with a normal positive one.
+    #[test]
+    fn block_scanners_re_blocks_cleanly_after_a_rule_expires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite3");
+
+        let log_path = tmp.path().join("auth.log");
+        let log: String =
+            "Failed password for root from 198.51.100.9 port 4444 ssh2\n".repeat(25);
+        std::fs::write(&log_path, &log).unwrap();
+
+        block_scanners(Some(db_path.clone()), 20, -1, Some(log_path.clone()), false).unwrap();
+        {
+            // The rule from the first (instantly-expired) call must
+            // already be gone before the second call ever runs, exactly
+            // as `list_firewall_rules`'s pruning intends.
+            let db = Db::open(&db_path).unwrap();
+            assert!(db.list_firewall_rules().unwrap().is_empty());
+        }
+
+        block_scanners(Some(db_path.clone()), 20, 5, Some(log_path), false).unwrap();
+
+        let db = Db::open(&db_path).unwrap();
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].address, "198.51.100.9");
+        assert!(rules[0].expires_at.is_some());
+
+        // Guards against a regression to "filter expired rows on read"
+        // instead of actually deleting them: under a filter-only
+        // implementation every assertion above would still pass (the
+        // dead first-call row would just be hidden, not gone), but the
+        // raw table would hold two physical rows for this address instead
+        // of one.
+        let raw = rusqlite::Connection::open(&db_path).unwrap();
+        let raw_count: i64 = raw
+            .query_row(
+                "SELECT COUNT(*) FROM firewall_rules WHERE address = '198.51.100.9'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_count, 1);
     }
 }

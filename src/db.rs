@@ -253,7 +253,12 @@ impl FirewallAction {
 }
 
 /// A firewall rule: allow, block or reject traffic from `address` (an IP
-/// address or CIDR range), optionally restricted to `port`.
+/// address or CIDR range), optionally restricted to `port`. `expires_at`
+/// (Unix seconds) is `None` for a permanent, hand-added rule (via
+/// [`Db::add_firewall_rule`]); `Some` for a temporary one (via
+/// [`Db::add_firewall_rule_with_ttl`], e.g. `block-scanners`/
+/// `block-web-scanners`'s auto-detected rows) — see
+/// [`Db::list_firewall_rules`] for how expiry is actually enforced.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FirewallRule {
     pub id: i64,
@@ -261,6 +266,7 @@ pub struct FirewallRule {
     pub port: Option<u16>,
     pub action: FirewallAction,
     pub enabled: bool,
+    pub expires_at: Option<i64>,
 }
 
 /// Fields needed to add a new firewall rule.
@@ -288,15 +294,34 @@ pub struct IpRangeSource {
     pub range_count: i64,
 }
 
-/// Returns whether `address` is a plain IP address or CIDR range.
+/// Returns whether `address` is a plain IP address or CIDR range. A CIDR's
+/// prefix length must be within the address family's actual bit width (0-32
+/// for IPv4, 0-128 for IPv6) — otherwise it's a mask no renderer can turn
+/// into a real `iptables`/`nft` rule, e.g. `1.2.3.4/40` or `1.2.3.4/999`
+/// would slip past this check and fail at *apply* time instead, and on
+/// iptables (whose generated script runs under `set -e`) that means the
+/// script aborts partway through, having applied only some of its rules.
 fn is_valid_address(address: &str) -> bool {
+    use std::net::IpAddr;
+
     let address = address.trim();
-    if let Some((prefix, suffix)) = address.split_once('/') {
-        return prefix.parse::<std::net::IpAddr>().is_ok()
-            && !suffix.is_empty()
-            && suffix.chars().all(|c| c.is_ascii_digit());
+    let Some((prefix, suffix)) = address.split_once('/') else {
+        return address.parse::<IpAddr>().is_ok();
+    };
+    // `"+5".parse::<u32>()` succeeds, so the digit check must stay even
+    // though we now also parse the value — otherwise a mask like `/+5`
+    // would slip back through as "valid".
+    if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
     }
-    address.parse::<std::net::IpAddr>().is_ok()
+    let Ok(prefix_len) = suffix.parse::<u32>() else {
+        return false;
+    };
+    match prefix.parse::<IpAddr>() {
+        Ok(IpAddr::V4(_)) => prefix_len <= 32,
+        Ok(IpAddr::V6(_)) => prefix_len <= 128,
+        Err(_) => false,
+    }
 }
 
 fn now() -> i64 {
@@ -402,7 +427,8 @@ impl Db {
                 port INTEGER,
                 action TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER
             );
 
             -- Row presence encodes an override; absence means \"inherit the
@@ -472,6 +498,26 @@ impl Db {
             );
             ",
         )?;
+
+        // `firewall_rules.expires_at` is on the `CREATE TABLE` above, which
+        // only takes effect for a database created fresh by this version —
+        // an existing database from before this column existed needs it
+        // added explicitly. This project has never needed a schema
+        // migration before now (see the doc comment on `Bot::source_id`),
+        // so there's no migration runner to hook into; this one column is
+        // simple enough to guard by hand instead: `ALTER TABLE ADD COLUMN`
+        // errors ("duplicate column name") if the column is already there
+        // (which it always is on a fresh database, since `CREATE TABLE`
+        // just added it above), so check via `PRAGMA table_info` first and
+        // only run the `ALTER` on a database that actually predates it.
+        let has_expires_at = self
+            .conn
+            .prepare("SELECT 1 FROM pragma_table_info('firewall_rules') WHERE name = 'expires_at'")?
+            .exists([])?;
+        if !has_expires_at {
+            self.conn
+                .execute("ALTER TABLE firewall_rules ADD COLUMN expires_at INTEGER", [])?;
+        }
 
         // Seed default category policies, matching the product defaults shown
         // in the README: scanners and AI bots blocked by default, search engines allowed.
@@ -799,6 +845,67 @@ impl Db {
         Ok(())
     }
 
+    // ---- internal cron (`crate::cron`) ----
+    //
+    // Reuses the existing `settings` key/value table rather than a new one:
+    // this project's first (and, so far, only) schema migration was adding
+    // `firewall_rules.expires_at` for scanner-detection TTLs — a second
+    // migration isn't worth it just to persist "when did each background
+    // job last run". Two keys per job, `cron_last_run:{id}` (a Unix
+    // timestamp, as text) and `cron_last_summary:{id}` (a short
+    // human-readable outcome), so both the Dashboard's "Scheduled tasks"
+    // panel and `crate::cron::due_jobs` can read a job's state without
+    // needing its own row shape.
+
+    /// When `job_id` last ran, or `None` if it never has (on a fresh
+    /// database, or a database from before this feature existed) — treated
+    /// by [`crate::cron::due_jobs`] as "due immediately", the same
+    /// never-fetched-yet-so-do-it-now convention `ipranges` sources already
+    /// use for staleness.
+    pub fn get_cron_last_run(&self, job_id: &str) -> Result<Option<i64>> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![format!("cron_last_run:{job_id}")],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|v| v.parse::<i64>().context("corrupt cron_last_run value"))
+            .transpose()
+    }
+
+    /// Records that `job_id` just ran at `ran_at` (Unix seconds) with a
+    /// short `summary` of what happened — both are always set together so
+    /// a caller reading the Dashboard's job list never sees a fresh
+    /// timestamp next to a stale summary from a previous run, or vice versa.
+    pub fn set_cron_last_run(&self, job_id: &str, ran_at: i64, summary: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![format!("cron_last_run:{job_id}"), ran_at.to_string()],
+        )?;
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![format!("cron_last_summary:{job_id}"), summary],
+        )?;
+        Ok(())
+    }
+
+    /// `job_id`'s last recorded outcome, or `None` if it's never run.
+    pub fn get_cron_last_summary(&self, job_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![format!("cron_last_summary:{job_id}")],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     // ---- sites ----
 
     /// Records that a site with the given `server_name` was discovered in
@@ -944,17 +1051,57 @@ impl Db {
 
     // ---- firewall rules ----
 
-    /// Adds a new firewall rule, enabled by default. Returns its id.
+    /// Adds a new firewall rule, enabled by default, that never expires.
+    /// Returns its id. Every hand-added rule (`add-firewall-rule`) goes
+    /// through here — permanent unless an admin removes it themselves.
     pub fn add_firewall_rule(&self, rule: &NewFirewallRule) -> Result<i64> {
+        self.insert_firewall_rule(rule, None)
+    }
+
+    /// Adds a new firewall rule, enabled by default, that expires
+    /// `ttl_seconds` from now — [`Self::list_firewall_rules`] (and so every
+    /// renderer/lister that reads through it) stops returning the row once
+    /// its `expires_at` has passed, and actually deletes it at that point
+    /// rather than just hiding it. Used for auto-detected scanner rules
+    /// (`block-scanners`/`block-web-scanners`), where a temporary block is
+    /// the point — a bot that stops scanning shouldn't stay blocked
+    /// forever, and one that doesn't will simply get re-flagged and
+    /// re-added on the next detection run after this one lapses.
+    /// `ttl_seconds` isn't validated as positive: a zero or negative value
+    /// legitimately produces an already-expired row (used by tests to
+    /// exercise pruning deterministically without waiting or mocking time).
+    pub fn add_firewall_rule_with_ttl(&self, rule: &NewFirewallRule, ttl_seconds: i64) -> Result<i64> {
+        self.insert_firewall_rule(rule, Some(now() + ttl_seconds))
+    }
+
+    fn insert_firewall_rule(&self, rule: &NewFirewallRule, expires_at: Option<i64>) -> Result<i64> {
         if !is_valid_address(&rule.address) {
             anyhow::bail!("invalid firewall rule address: {}", rule.address);
         }
         self.conn.execute(
-            "INSERT INTO firewall_rules (address, port, action, enabled, created_at)
-             VALUES (?1, ?2, ?3, 1, ?4)",
-            params![rule.address, rule.port, rule.action.as_str(), now()],
+            "INSERT INTO firewall_rules (address, port, action, enabled, created_at, expires_at)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5)",
+            params![rule.address, rule.port, rule.action.as_str(), now(), expires_at],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Deletes every firewall rule whose `expires_at` has passed. Returns
+    /// how many were removed. Called at the top of
+    /// [`Self::list_firewall_rules`] so every consumer (rendering, the CLI
+    /// listing, the scanner commands' own dedup check) sees a
+    /// already-pruned table without needing to remember to call this
+    /// separately — critical for the scanner commands specifically: their
+    /// "is this address already covered by an existing rule" dedup check
+    /// reads through `list_firewall_rules`, so an expired-but-not-yet-
+    /// deleted row would otherwise make a still-scanning IP whose block
+    /// just lapsed look "already covered" forever instead of getting
+    /// re-flagged.
+    pub fn prune_expired_firewall_rules(&self) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM firewall_rules WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now()],
+        )?)
     }
 
     /// Deletes the firewall rule with the given id. Errors if no such rule exists.
@@ -983,11 +1130,15 @@ impl Db {
 
     /// Lists every firewall rule, including disabled ones. Renderers
     /// (`iptables::render`, `nftables::render`) skip disabled rules
-    /// themselves.
+    /// themselves. Prunes expired rules first (see
+    /// [`Self::prune_expired_firewall_rules`]) so every caller — rendering,
+    /// the CLI listing, the scanner commands' dedup check — automatically
+    /// sees a table with no stale, already-lapsed rows in it.
     pub fn list_firewall_rules(&self) -> Result<Vec<FirewallRule>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, address, port, action, enabled FROM firewall_rules ORDER BY id")?;
+        self.prune_expired_firewall_rules()?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, address, port, action, enabled, expires_at FROM firewall_rules ORDER BY id",
+        )?;
         let rows = stmt.query_map([], |row| {
             let action: String = row.get(3)?;
             Ok(FirewallRule {
@@ -996,6 +1147,7 @@ impl Db {
                 port: row.get(2)?,
                 action: FirewallAction::parse(&action).unwrap_or(FirewallAction::Block),
                 enabled: row.get(4)?,
+                expires_at: row.get(5)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -1859,6 +2011,24 @@ mod tests {
         assert!(db.list_firewall_rules().unwrap().is_empty());
     }
 
+    /// A prefix length past the address family's actual bit width (32 for
+    /// IPv4, 128 for IPv6) must be rejected here rather than slipping
+    /// through to render an `iptables`/`nft` rule that fails at apply time —
+    /// see `is_valid_address`'s doc comment.
+    #[test]
+    fn add_firewall_rule_rejects_out_of_range_cidr_prefixes() {
+        let db = Db::open_in_memory().unwrap();
+        for address in ["1.2.3.4/40", "1.2.3.4/999", "2001:db8::/129", "1.2.3.4/+5"] {
+            let result = db.add_firewall_rule(&NewFirewallRule {
+                address: address.to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            });
+            assert!(result.is_err(), "{address} should have been rejected");
+        }
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
     #[test]
     fn add_firewall_rule_accepts_plain_ips_and_cidr_ranges() {
         let db = Db::open_in_memory().unwrap();
@@ -1881,6 +2051,115 @@ mod tests {
         assert_eq!(rules[0].port, Some(80));
         assert!(rules[0].enabled);
         assert_eq!(rules[1].action, FirewallAction::Allow);
+    }
+
+    #[test]
+    fn add_firewall_rule_never_expires() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&NewFirewallRule {
+            address: "1.2.3.4".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+        assert_eq!(db.list_firewall_rules().unwrap()[0].expires_at, None);
+    }
+
+    #[test]
+    fn add_firewall_rule_with_ttl_sets_a_future_expiry() {
+        let db = Db::open_in_memory().unwrap();
+        let before = now();
+        db.add_firewall_rule_with_ttl(
+            &NewFirewallRule {
+                address: "1.2.3.4".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            },
+            60,
+        )
+        .unwrap();
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        let expires_at = rules[0].expires_at.expect("should have an expiry");
+        assert!(expires_at >= before + 60);
+    }
+
+    /// The core property this feature exists for: a rule added with a
+    /// negative (or otherwise already-past) TTL is functionally identical
+    /// to a rule that expired naturally — real time doesn't need to pass,
+    /// and no time-mocking is needed, to exercise pruning deterministically.
+    #[test]
+    fn list_firewall_rules_prunes_an_already_expired_rule() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule_with_ttl(
+            &NewFirewallRule {
+                address: "1.2.3.4".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            },
+            -1,
+        )
+        .unwrap();
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_firewall_rules_keeps_a_rule_that_has_not_expired_yet() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule_with_ttl(
+            &NewFirewallRule {
+                address: "1.2.3.4".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            },
+            60,
+        )
+        .unwrap();
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn prune_expired_firewall_rules_deletes_only_lapsed_rows_and_reports_the_count() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&NewFirewallRule {
+            address: "1.2.3.4".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+        db.add_firewall_rule_with_ttl(
+            &NewFirewallRule {
+                address: "5.6.7.8".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            },
+            -1,
+        )
+        .unwrap();
+        db.add_firewall_rule_with_ttl(
+            &NewFirewallRule {
+                address: "9.10.11.12".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            },
+            60,
+        )
+        .unwrap();
+
+        let pruned = db.prune_expired_firewall_rules().unwrap();
+        assert_eq!(pruned, 1);
+
+        let mut remaining: Vec<String> = db
+            .list_firewall_rules()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.address)
+            .collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["1.2.3.4".to_string(), "9.10.11.12".to_string()]
+        );
     }
 
     #[test]
@@ -2038,6 +2317,60 @@ mod tests {
 
         db.set_geo_mode(GeoMode::Blocklist).unwrap();
         assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Blocklist);
+    }
+
+    #[test]
+    fn cron_last_run_is_none_for_a_job_that_has_never_run() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.get_cron_last_run("block_scanners").unwrap(), None);
+        assert_eq!(db.get_cron_last_summary("block_scanners").unwrap(), None);
+    }
+
+    #[test]
+    fn set_cron_last_run_round_trips_timestamp_and_summary() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_cron_last_run("block_scanners", 1_700_000_000, "blocked 2 IP(s)")
+            .unwrap();
+
+        assert_eq!(
+            db.get_cron_last_run("block_scanners").unwrap(),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            db.get_cron_last_summary("block_scanners").unwrap(),
+            Some("blocked 2 IP(s)".to_string())
+        );
+    }
+
+    #[test]
+    fn cron_last_run_updating_overwrites_rather_than_duplicates() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_cron_last_run("block_scanners", 1_700_000_000, "first run")
+            .unwrap();
+        db.set_cron_last_run("block_scanners", 1_800_000_000, "second run")
+            .unwrap();
+
+        assert_eq!(
+            db.get_cron_last_run("block_scanners").unwrap(),
+            Some(1_800_000_000)
+        );
+        assert_eq!(
+            db.get_cron_last_summary("block_scanners").unwrap(),
+            Some("second run".to_string())
+        );
+    }
+
+    #[test]
+    fn cron_last_run_is_tracked_independently_per_job() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_cron_last_run("block_scanners", 1_700_000_000, "ssh")
+            .unwrap();
+
+        assert_eq!(
+            db.get_cron_last_run("block_scanners").unwrap(),
+            Some(1_700_000_000)
+        );
+        assert_eq!(db.get_cron_last_run("block_web_scanners").unwrap(), None);
     }
 
     #[test]

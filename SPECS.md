@@ -157,6 +157,20 @@ on a real box.
 UDP examples too; a real protocol field is deferred until something needs it
 (see TODO.md).
 
+**`firewall_rules.expires_at` — this project's first schema migration.**
+Added for the scanner-detection commands' temporary blocks (see "SSH scan
+detection"/"Web scan detection" below): `NULL` for a permanent, hand-added
+rule, a Unix timestamp for a temporary auto-added one. Every table so far
+had been `CREATE TABLE IF NOT EXISTS` from day one — the `Bot::source_id`
+doc comment even notes this project had never needed a real migration
+before. A brand-new column needs one: `CREATE TABLE IF NOT EXISTS` only
+adds it for a database created fresh by this version, so `init_schema`
+also checks `pragma_table_info('firewall_rules')` for the column and runs
+a guarded `ALTER TABLE ... ADD COLUMN` if an existing (pre-this-version)
+database is missing it — guarded because an unconditional `ALTER` would
+itself error ("duplicate column name") on a freshly created database that
+already has the column via `CREATE TABLE`.
+
 ## TUI (`src/app.rs`, `src/event.rs`, `src/tui.rs`, `src/tui/`)
 
 Follows the Ratatui event-driven-async template
@@ -274,6 +288,20 @@ rewrite:
   manage the `firewall_rules` table.
 - `render-firewall --backend <iptables|nftables> --out <path>` — write the
   generated script to `<path>`. Never executes it.
+- `block-scanners --threshold <n> [--ttl-days <n>] [--ssh-log <path>] [--dry-run]`
+  — find IPs with `>= n` failed-authentication log lines
+  (`stop_bots::sshlog::scanning_ips`; default threshold 20) and add each as
+  a temporary `firewall_rules` Block row, expiring after `--ttl-days`
+  (default 5). See "SSH scan detection" below.
+- `block-web-scanners --threshold <n> [--ttl-days <n>] [--access-log <path>] [--dry-run]`
+  — find IPs with `>= n` distinct 404-returning paths in the NGINX access
+  log (`stop_bots::accesslog::scanning_ips`; default threshold 15) and add
+  each as a temporary `firewall_rules` Block row, expiring after
+  `--ttl-days` (default 1). See "Web scan detection" below. Deliberately
+  named separately from `block-scanners` (not
+  `block-ssh-scanners`/`block-web-scanners` symmetry) since renaming the
+  just-shipped `block-scanners` would break anyone who already wired it
+  into cron.
 
 `apply-blocks` re-discovers sites from disk on every run rather than reading
 back `sites` from the db, so it can never act on a stale config path.
@@ -1054,6 +1082,275 @@ before a script reaches disk. No log-rotation handling (`auth.log.1`,
 `.gz`, ...) — only the live log/journal is read, on the theory that a
 session active within the current rotation window is what "would this
 lock me out right now" actually needs.
+
+## SSH scan detection (`src/sshlog.rs::scanning_ips`, `main.rs::block_scanners`)
+
+`block-scanners` is the offensive counterpart to the lockout safety net
+above: instead of protecting a currently-connected admin from a bad
+firewall render, it turns the same SSH log into new Block rules for IPs
+that look like automated scanners/brute-force bots.
+
+**Detection is a threshold over log *lines*, not a rate over time.**
+`sshlog::scanning_ips(log_text, threshold)` counts every failed-auth line
+per IP (`parse_failed_attempt_ips`: sshd's `Failed
+password/publickey/keyboard-interactive/none for [invalid user] <user> from
+<ip> port <port>` and the standalone `Invalid user <user> from <ip> port
+<port>` logged before any auth method is tried) and flags any IP at or
+above `threshold`. There is deliberately no timestamp parsing — log formats
+vary too much across syslog/journalctl to parse reliably — so the count is
+over however much of the log the caller happened to read (a day, a month,
+a whole boot's worth of `journalctl`), not a real rate. The default
+threshold (20) is set high specifically because of this: a real scanner
+produces dozens to thousands of failed attempts, while a human who
+mistyped a password a couple of times should never come close.
+
+**Two hard exclusions, independent of the threshold.** An IP with a
+successful login anywhere in the same log (`parse_accepted_ips`) is never
+flagged, no matter how many failures preceded it — this is the same
+"proven itself a legitimate, currently-reachable client" reasoning the
+lockout check uses, and both sides of the comparison go through
+`IpAddr::to_string()` so an IPv6 formatting mismatch can't quietly defeat
+it. Loopback and private addresses (RFC1918, IPv6 `fc00::/7`, `is_loopback`
+on both families) are excluded outright — a monitoring box or jump host on
+the same LAN hammering SSH is not an internet scanner.
+
+**Only ever inserts into `firewall_rules`; never renders or applies
+anything.** `block_scanners` calls `Db::add_firewall_rule` for each newly
+found IP (`FirewallAction::Block`, no port), skipping any address that
+already has a rule (exact-address match only — not CIDR-aware, so a
+scanner already covered by a broader admin-added range still gets its own
+row; harmless, just redundant). Like every other `firewall_rules` row, an
+added rule has no effect on the actual host until `render-firewall` renders
+it and the admin applies the script themselves — this is what makes it
+reasonable to suggest running `block-scanners` unattended (e.g. from cron)
+without the immediate-lockout risk a live `iptables`/`nft` write would
+carry. `--dry-run` prints what would be added without touching the
+database, for a preview before wiring up automation.
+
+**Expiry (`--ttl-days`, default 5).** Auto-added rules aren't permanent:
+`Db::add_firewall_rule_with_ttl` stamps `firewall_rules.expires_at` (Unix
+seconds) instead of leaving it `NULL` the way a hand-added
+`add-firewall-rule` row does, and `Db::list_firewall_rules` — read by
+*every* consumer (rendering, `list-firewall-rules`, the scanner commands'
+own dedup check) — deletes any row whose `expires_at` has passed before
+returning anything. This is what makes an auto-block temporary rather than
+a growing, never-reviewed pile: a scanner that's moved on stops being
+blocked after `--ttl-days`, and one that's still scanning simply gets
+re-flagged and re-added on the next run. Pruning-on-list, not a separate
+sweep job, is also what keeps re-blocking clean: without it, an
+already-expired-but-undeleted row would make the dedup check think a
+still-scanning IP was "already covered" forever (never re-added) instead
+of correctly treating a lapsed block as gone. **The expiry only takes
+effect in the database** — same as everything else in this table, the
+actual host-level block only lifts once `render-firewall` runs again
+(picking up the now-shorter rule list) and the admin applies the new
+script; if you automate `block-scanners`, automate `render-firewall`
+alongside it, or blocks will outlive their TTL in practice even though
+they've already expired in the data. `list-firewall-rules` shows
+`(expires in Nd)`/`(expires in Nh)` next to a temporary rule so it reads
+differently from a permanent one at a glance. The TTL of an existing,
+not-yet-expired block is never extended by a later detection run that
+still finds the IP scanning — it just expires on its original schedule and
+gets a fresh one if it's re-flagged after that.
+
+**Known limitations, left deliberately unaddressed:** no CIDR-range
+grouping (each scanning IP gets its own `/32` rule, even if several came
+from the same subnet). Some older sshd log shapes (`Connection closed by
+invalid user ... [preauth]`, disconnect notices without a `port` token)
+aren't counted — undercounts rather than overcounts, and the companion
+`Failed password`/`Invalid user` line for the same connection attempt is
+normally already counted, so this rarely loses an IP entirely. No
+interactive TUI affordance (no popup to run this on demand or tweak its
+threshold/TTL from the Dashboard) — but it does now run automatically on a
+timer while the TUI is open, and its state is shown there; see "Internal
+cron" below.
+
+## Web scan detection (`src/accesslog.rs::scanning_ips`, `main.rs::block_web_scanners`)
+
+The HTTP-layer counterpart to SSH scan detection above: `block-web-scanners`
+reads the NGINX access log and adds Block rules for IPs that look like
+automated URL/vulnerability scanners — clients probing for paths like
+`/wp-login.php`, `/.env`, `/phpmyadmin` that don't exist on this site.
+Structurally it's the same shape as `block-scanners` (find scanning IPs,
+add Block rules, skip addresses already covered, storage-only), but two
+of its detection decisions deliberately diverge from the SSH version, and
+both are load-bearing enough to call out explicitly.
+
+**Counts *distinct* 404 paths per IP, not raw hit count.** A real client
+that keeps retrying the same dead link (a stale bookmark, a broken image
+reference elsewhere on the site) must never look like a scanner no matter
+how many times it retries — so `accesslog::scanning_ips` puts each IP's
+404'd request paths into a `HashSet` and thresholds on its size, not on
+the number of 404 lines. A scanner probing dozens of different
+well-known vulnerable paths is the actual signature being caught, and
+that's inherently about path *diversity*, unlike SSH's brute-force case
+where every failed attempt (even against the same username) is itself
+already suspicious. The query string is stripped before counting
+(`/foo?a=1` and `/foo?a=2` collapse to `/foo`) — otherwise a single
+real 404 endpoint hit with varying parameters would inflate into "many
+distinct invalid URLs" and false-positive a legitimate client.
+
+**No "had a success" exclusion, unlike `sshlog::scanning_ips`.** The SSH
+version never flags an IP that has a successful login anywhere in the
+log — a strong signal of a legitimate, credentialed client. There's no
+HTTP equivalent: a scanner's own recon traffic almost always includes at
+least one 200 (`/`, `/robots.txt`, a common file it happens to guess
+right), so requiring "never got a 200" would exclude nearly every real
+scanner rather than protecting legitimate ones. What *is* still shared
+with the SSH version: loopback/private source IPs
+(`ipranges::is_local_or_private`, moved there from `sshlog` specifically
+so both modules could use it) are excluded outright, since an internal
+monitoring probe hammering a stale endpoint isn't an internet scanner
+either.
+
+**Known-crawler exclusion (`main.rs::known_crawler_ranges`/
+`known_crawler_match`) — the one exclusion that actually matters here.**
+Dropping the "had a success" filter (above) means a *real* Googlebot,
+Bingbot or GPTBot crawling a site with a stale sitemap or a run of removed
+pages will routinely clear the distinct-404 threshold purely by doing its
+job — chasing old links is normal crawler behavior, not scanning. Since
+this app's entire premise is "stop bad bots, still allow good bots"
+(README/Cargo.toml), shipping this feature without an exclusion for the
+three *verified* crawler sources it already tracks would auto-blocklist
+exactly the bots the rest of the codebase goes out of its way to protect.
+Before adding any Block rules, `block_web_scanners` fetches every CIDR
+already stored for `ipranges::IpRangeSourceKind::ALL` (Googlebot, Bingbot,
+GPTBot — the same three `update-ip-ranges` populates) via
+`Db::ip_ranges_for_source`, and drops any candidate IP that
+`ipranges::cidr_contains` places inside one of them, regardless of the
+site's current category-blocking defaults — this is about never
+misidentifying a *verified* crawler via a behavioral heuristic, a
+different concern from whether the admin has separately chosen to block
+that crawler's category through the normal, range-complete derived-
+firewall-rule path (which still works independently of this exclusion).
+If none of the three sources has ever been fetched (`update-ip-ranges`
+never run), the exclusion list is simply empty and a warning is printed —
+silently providing no protection would be worse than saying so. That
+warning only covers *never fetched*, though — it's silent about *fetched
+long ago*: Google/Bing periodically rotate their published ranges, so an
+admin who fetches once at setup and only automates `block-web-scanners`
+(not `update-ip-ranges`) will find the exclusion quietly going stale over
+time. If you're automating this, automate both together.
+
+**Threshold is a count, not a rate — same caveat as `block-scanners`.**
+No timestamp parsing, so `--threshold` (default 15) counts over however
+much of the log got read, not attempts-per-minute. Lower than SSH's
+default-20 specifically because it's counting *distinct paths*, already a
+much stronger signal than raw line count — a benign visitor essentially
+never racks up 15 different dead links, while scanner tooling (nikto,
+dirb-style path enumeration, ...) routinely tries far more than that in
+one pass.
+
+**Log source:** unlike `sshlog::find_default_source`, there's no second
+default path to try and no `journalctl` fallback — NGINX writes to a
+configured file path regardless of init system, and the vast majority of
+installs use the stock `/var/log/nginx/access.log`. `--access-log <path>`
+overrides it, same rationale as `--ssh-log` (custom install layouts,
+deterministic tests).
+
+**Expiry (`--ttl-days`, default 1) — same mechanism as `block-scanners`,
+shorter default.** A day, not five: an HTTP scan is typically a single
+short automated pass (crawling every path on a list in minutes), not an
+ongoing brute-force campaign, so there's less value in holding the block
+open for days and more value in re-evaluating sooner whether the IP is
+still worth blocking. Otherwise identical semantics — pruned on read via
+`Db::list_firewall_rules`, expiry only takes effect once `render-firewall`
+re-renders and is re-applied, no TTL refresh on re-detection, shown in
+`list-firewall-rules` as `(expires in Nd)`/`(expires in Nh)` — see the SSH
+section above for the full reasoning, which isn't repeated per-flag here.
+
+**Known limitations, left deliberately unaddressed, same spirit as
+`block-scanners`'s:** no CIDR-range grouping; only the stock "combined" log format is parsed (a
+custom `log_format` directive that reorders or omits fields won't parse,
+and is silently skipped line-by-line rather than erroring); only ever
+reads whichever single file `--access-log`/the default path names — a
+multi-vhost setup logging each site to its own file needs one run per
+log file, there's no vhost-discovery integration with `discover_sites`
+yet; no interactive TUI affordance, same caveat as `block-scanners` above
+— it does run on a timer via "Internal cron" below, just without a popup
+to trigger or configure it on demand. Behind a reverse proxy/CDN,
+`$remote_addr` is the proxy's own IP, not the real client's (that's
+`X-Forwarded-For`, not parsed here) — on a proxied site this would
+blocklist the proxy, i.e. every visitor. No `X-Forwarded-For` handling is
+built, deliberately: trusting a client-controlled header without also
+knowing which upstream proxies are legitimate is its own can of worms, and
+better solved (if ever) as its own deliberate feature rather than bolted
+onto this one.
+
+## Internal cron (`src/cron.rs`, `App`'s tick handler in `src/app.rs`, the Dashboard's "Scheduled tasks" panel)
+
+Replaces relying on an external `cron`/systemd-timer entry to keep the
+scanner-detection and crawler-range commands running unattended, by having
+the TUI itself periodically check which of four background jobs are due
+and run them: `UpdateIpRanges`, `BlockScanners`, `BlockWebScanners`,
+`RenderFirewall` (see `CronJob` for exactly what each does — it's the same
+logic each equivalent CLI subcommand runs, via `scanblock`/`ipranges`/
+`firewall`, not a reimplementation). The Dashboard grew a fifth panel,
+"Scheduled tasks", listing all four with when they last ran and their last
+outcome.
+
+**Only automates while the TUI is open — this is the one limitation to
+know before treating it as a full cron replacement.** Closing the TUI
+pauses every job; there is no separate headless daemon mode. A job overdue
+when the TUI (re)starts just runs the next time it's checked (the same
+never-fetched-yet convention `ipranges` staleness already used), not a
+"catch up on however many intervals were missed" scheme.
+
+**State is persisted in the existing `settings` table, not kept
+in-memory.** Two keys per job (`cron_last_run:{id}`, `cron_last_summary:{id}`,
+new `Db` methods) rather than a second schema migration (see "Firewall
+integration" above for the first one, `firewall_rules.expires_at`) — this
+buys two things: "last ran 3h ago" survives restarts instead of resetting
+(and, worse, making everything look overdue and firing a thundering herd
+of work every time the TUI opens), and a future headless daemon could read
+and write the exact same state the TUI does, making it a thin follow-on
+rather than a different architecture chosen now.
+
+**Per-job interval, not one blanket tick rate** (see `CronJob::interval`'s
+doc comment for the full reasoning): `UpdateIpRanges` daily, `BlockScanners`
+every 4 hours, `BlockWebScanners` hourly (its Block rules already expire
+in a day, and a URL-enumeration scan is typically one short automated
+pass, so catching it sooner matters more than for SSH brute-forcing's
+longer campaigns), `RenderFirewall` daily. `App::check_cron` itself is
+throttled to checking once a minute against `Event::Tick`'s 30fps rate —
+cheap either way (a handful of `settings` reads), but there's no reason to
+ask 30 times a second what only changes on the order of hours.
+
+**Three of the four jobs run inline; only `UpdateIpRanges` spawns a
+background task.** `BlockScanners`/`BlockWebScanners`/`RenderFirewall` are
+pure local log-parsing/`Db`/file-writing work — the same class of
+synchronous call the Dashboard already makes directly elsewhere — so they
+run straight from `App::check_cron` without going through
+`EventHandler`/`AppEvent`. `UpdateIpRanges` is the one job doing network
+I/O (three fetches, one per crawler source), so it follows the existing
+`start_source_update`/`start_country_select` shape: spawn a task that only
+fetches and parses (`Db` isn't `Sync`, so it never touches `self.db`),
+report back via a new `AppEvent::CronIpRangesFetched`, and store the
+result back on the main thread in `finish_cron_update_ip_ranges`. A
+`cron_update_ip_ranges_in_flight` guard stops a slow round-trip from
+starting a second, overlapping fetch if `check_cron` finds the job still
+"due" on a later tick — its `last_run` doesn't update until the fetch
+actually completes, so without the guard every check while one was still
+in flight would start another.
+
+**`RenderFirewall` never applies anything — same generate-only design as
+everywhere else `firewall_rules` is touched.** It writes to
+`firewall::DEFAULT_OUTPUT_PATH` (`/etc/stop-bots/firewall.nft`, the same
+path the Dashboard's `f`-key popup defaults to) using the nftables backend
+(handles allowlist geo mode, unlike iptables), and skips the write
+entirely — recording why as the job's summary, not an error — if the
+lockout check finds it would risk cutting off a currently-connected SSH
+client. Actually applying the script (`nft -f ...`) remains a manual step
+for the admin; an internal cron that silently executed firewall changes
+would be a categorically different, much riskier feature than this one.
+
+**The three-things-must-be-automated-together caveat from the scan
+detection sections above is exactly what this feature closes** — `update-ip-ranges`,
+`block-scanners`/`block-web-scanners`, and `render-firewall` no longer
+need separate cron entries kept in sync by hand, since all three now run
+on their own schedules from the same process. What it *doesn't* close:
+applying the rendered script is still manual (see above), and none of it
+runs when the TUI isn't open.
 
 ## Dashboard geo-blocking panel (`src/tui/dashboard.rs`)
 

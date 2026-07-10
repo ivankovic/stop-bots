@@ -105,6 +105,13 @@ enum Popup {
     GeoMode {
         selected: usize,
     },
+    /// Firewall rendering: select backend (0 = iptables, 1 = nftables) and
+    /// enter the output path.
+    RenderFirewall {
+        backend_selected: usize,
+        out_path: String,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -121,6 +128,10 @@ pub struct Dashboard {
     fetched_countries: Vec<(String, i64, i64)>,
     countries_state: ListState,
     focus: Focus,
+    /// The internal cron's per-job state (see `crate::cron`), read-only
+    /// here — this panel only displays it, `App` is what actually runs due
+    /// jobs.
+    cron_status: Vec<crate::cron::JobStatus>,
 }
 
 impl Dashboard {
@@ -134,6 +145,7 @@ impl Dashboard {
         self.geo_mode = db.get_geo_mode()?;
         self.selected_countries = db.list_selected_countries()?;
         self.fetched_countries = db.list_fetched_countries()?;
+        self.cron_status = crate::cron::status(db)?;
         if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
@@ -188,10 +200,11 @@ impl Dashboard {
         theme: Theme,
         message: &Option<String>,
     ) {
-        let [settings_area, geo_area, stats_area, message_area] = Layout::vertical([
+        let [settings_area, geo_area, stats_area, cron_area, message_area] = Layout::vertical([
             Constraint::Length(5),
             Constraint::Length(8),
             Constraint::Length(4),
+            Constraint::Length(6),
             Constraint::Min(1),
         ])
         .areas(area);
@@ -252,6 +265,13 @@ impl Dashboard {
         ])
         .block(Block::bordered().title("Stats"));
         frame.render_widget(stats, stats_area);
+
+        let cron_lines: Vec<Line> = self.cron_status.iter().map(cron_status_line).collect();
+        let cron_panel = Paragraph::new(cron_lines).block(
+            Block::bordered()
+                .title("Scheduled tasks (internal cron — runs only while this TUI is open)"),
+        );
+        frame.render_widget(cron_panel, cron_area);
 
         let message_text = message.as_deref().unwrap_or("No recent actions.");
         let messages = Paragraph::new(message_text).block(Block::bordered().title("Messages"));
@@ -354,6 +374,41 @@ impl Dashboard {
                 let list = List::new(items).block(Block::bordered().title(title));
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(list, popup_area);
+            }
+            Popup::RenderFirewall {
+                backend_selected,
+                out_path,
+                error,
+            } => {
+                let title = "Render firewall rules";
+                let width = 50u16;
+                let height = 6u16;
+                let popup_area = centered_rect(width, height, area);
+
+                let mut lines = vec![
+                    Line::from("Backend:").bold(),
+                    Line::from(vec![
+                        Span::from("  [ "),
+                        Span::from(match backend_selected {
+                            0 => "nftables (recommended)",
+                            1 => "iptables (IPv4 only)",
+                            _ => "unknown",
+                        })
+                        .reversed(),
+                        Span::from(" ]"),
+                    ]),
+                    Line::from(""),
+                    Line::from(format!("Output: {}_", out_path)),
+                ];
+                if let Some(err) = &error {
+                    lines.push(Line::from(err.as_str()).red());
+                }
+                lines.push(Line::from("").dim());
+                lines.push(Line::from("↑/↓ change backend  Enter confirm  Esc cancel").dim());
+
+                let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
+                frame.render_widget(Clear, popup_area);
+                frame.render_widget(paragraph, popup_area);
             }
         }
     }
@@ -474,6 +529,63 @@ impl Dashboard {
                     }
                     _ => return Ok(KeyOutcome::Consumed),
                 },
+                Popup::RenderFirewall {
+                    backend_selected,
+                    out_path,
+                    error,
+                } => match key.code {
+                    KeyCode::Esc => {
+                        self.popup = None;
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *backend_selected = backend_selected.saturating_sub(1);
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *backend_selected = (*backend_selected + 1).min(1);
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Char(c) if c.is_ascii_punctuation() || c.is_ascii_alphanumeric() => {
+                        out_path.push(c);
+                        *error = None;
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Backspace => {
+                        out_path.pop();
+                        *error = None;
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Enter => {
+                        let Some(Popup::RenderFirewall {
+                            backend_selected,
+                            out_path,
+                            ..
+                        }) = self.popup.take()
+                        else {
+                            unreachable!("checked above")
+                        };
+                        let backend = match backend_selected {
+                            0 => crate::firewall::FirewallBackend::Nftables,
+                            _ => crate::firewall::FirewallBackend::Iptables,
+                        };
+                        // Validate the path is not empty
+                        if out_path.is_empty() {
+                            self.popup = Some(Popup::RenderFirewall {
+                                backend_selected,
+                                out_path,
+                                error: Some("Enter an output path".to_string()),
+                            });
+                            return Ok(KeyOutcome::Consumed);
+                        }
+                        return Ok(KeyOutcome::RenderFirewall {
+                            backend,
+                            out_path,
+                            force: false,
+                        });
+                    }
+                    _ => return Ok(KeyOutcome::Consumed),
+                },
             }
         }
 
@@ -483,6 +595,16 @@ impl Dashboard {
                     GeoMode::Blocklist => 0,
                     GeoMode::Allowlist => 1,
                 },
+            });
+            return Ok(KeyOutcome::Consumed);
+        }
+
+        // 'f' key opens the firewall render popup
+        if key.code == KeyCode::Char('f') {
+            self.popup = Some(Popup::RenderFirewall {
+                backend_selected: 0, // default to nftables (recommended)
+                out_path: crate::firewall::DEFAULT_OUTPUT_PATH.to_string(),
+                error: None,
             });
             return Ok(KeyOutcome::Consumed);
         }
@@ -584,6 +706,54 @@ fn policy_tag(policy: Policy) -> Span<'static> {
     }
 }
 
+/// Renders one line of the "Scheduled tasks" panel: the job's label, when
+/// it last ran (or "never"), and its last outcome — or, if it's currently
+/// due, that instead (the outcome shown would otherwise be stale the
+/// moment a job becomes due again, misleadingly implying nothing's changed
+/// since).
+fn cron_status_line(status: &crate::cron::JobStatus) -> Line<'static> {
+    let last_run = match status.last_run {
+        Some(t) => format_relative_time(t),
+        None => "never".to_string(),
+    };
+    let outcome = if status.due {
+        "due now".to_string()
+    } else {
+        status
+            .last_summary
+            .clone()
+            .unwrap_or_else(|| "-".to_string())
+    };
+    // Deliberately compact (no fixed-width padding): the panel is a fixed
+    // 4-line block with no wrapping, so a long label/summary combination
+    // must fit the terminal's width rather than get silently clipped.
+    Line::from(format!(
+        "{}: last ran {last_run}, {outcome}",
+        status.job.label()
+    ))
+}
+
+/// Formats a Unix timestamp `t` (assumed to be in the past) as a short
+/// "Nd"/"Nh"/"Nm"/"just now" relative-time string for the "Scheduled
+/// tasks" panel — coarser precision the further back `t` is, matching how
+/// `main.rs::format_expiry` rounds an upcoming expiry the same way.
+fn format_relative_time(t: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let elapsed = (now - t).max(0);
+    if elapsed < 60 {
+        "just now".to_string()
+    } else if elapsed < 3_600 {
+        format!("{}m ago", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h ago", elapsed / 3_600)
+    } else {
+        format!("{}d ago", elapsed / 86_400)
+    }
+}
+
 fn is_stale(last_fetched_at: Option<i64>) -> bool {
     let Some(last_fetched_at) = last_fetched_at else {
         return true;
@@ -623,6 +793,81 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         assert!(is_stale(Some(now - STALE_AFTER_SECS - 1)));
+    }
+
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    #[test]
+    fn format_relative_time_rounds_to_the_coarsest_useful_unit() {
+        assert_eq!(format_relative_time(now_secs() - 30), "just now");
+        assert_eq!(format_relative_time(now_secs() - 5 * 60), "5m ago");
+        assert_eq!(format_relative_time(now_secs() - 3 * 3_600), "3h ago");
+        assert_eq!(format_relative_time(now_secs() - 2 * 86_400), "2d ago");
+    }
+
+    #[test]
+    fn cron_status_line_shows_never_and_due_now_for_an_unrun_job() {
+        let status = crate::cron::JobStatus {
+            job: crate::cron::CronJob::BlockScanners,
+            last_run: None,
+            last_summary: None,
+            due: true,
+        };
+        let rendered = cron_status_line(&status).to_string();
+        assert!(rendered.contains("never"));
+        assert!(rendered.contains("due now"));
+    }
+
+    #[test]
+    fn cron_status_line_shows_last_run_and_summary_for_a_completed_job() {
+        let status = crate::cron::JobStatus {
+            job: crate::cron::CronJob::BlockWebScanners,
+            last_run: Some(now_secs() - 3_600),
+            last_summary: Some("blocked 2 IP(s)".to_string()),
+            due: false,
+        };
+        let rendered = cron_status_line(&status).to_string();
+        assert!(rendered.contains("1h ago"));
+        assert!(rendered.contains("blocked 2 IP(s)"));
+        assert!(!rendered.contains("due now"));
+    }
+
+    #[test]
+    fn render_shows_the_scheduled_tasks_panel() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_cron_last_run(
+            crate::cron::CronJob::BlockScanners.id(),
+            now_secs(),
+            "blocked 3 IP(s)",
+        )
+        .unwrap();
+
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(60, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| dashboard.render(frame, frame.area(), Theme::Dark, &None))
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("Scheduled tasks"));
+        assert!(content.contains("Block SSH scanners"));
+        assert!(content.contains("blocked 3 IP(s)"));
+        assert!(content.contains("Update crawler IP ranges"));
+        assert!(content.contains("due now"));
     }
 
     #[test]
@@ -692,7 +937,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 22);
+        let backend = TestBackend::new(60, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -1068,7 +1313,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 22);
+        let backend = TestBackend::new(60, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| dashboard.render(frame, frame.area(), Theme::Dark, &None))

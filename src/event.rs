@@ -67,6 +67,18 @@ pub enum AppEvent {
         country_code: String,
         result: Result<Vec<String>, String>,
     },
+    /// The internal cron's background fetch for the `UpdateIpRanges` job
+    /// (see `crate::cron`) has finished — the only cron job that needs a
+    /// background task, since it's the only one doing network I/O; the
+    /// other three (`BlockScanners`, `BlockWebScanners`, `RenderFirewall`)
+    /// are pure local log-parsing/file-writing and run inline when due.
+    /// Carries each of the three crawler sources' fetch outcome (parsed
+    /// CIDRs, or a stringified error) so `App` can store whatever succeeded
+    /// and summarize the rest — one source failing (e.g. a transient
+    /// network error) shouldn't discard what the other two got.
+    CronIpRangesFetched {
+        results: Vec<(crate::ipranges::IpRangeSourceKind, Result<Vec<String>, String>)>,
+    },
 }
 
 /// Terminal event handler: spawns a background task that emits tick events

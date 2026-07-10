@@ -1,0 +1,405 @@
+/*  This file is part of the stop-bots project.
+ *
+ *  Copyright (C) 2026 Marko Ivankovic
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU Affero General Public License as published
+ *  by the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU Affero General Public License for more details.
+ *
+ *  You should have received a copy of the GNU Affero General License
+ *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+//! Shared firewall-rendering logic used by both the CLI's `render-firewall`
+//! subcommand and the TUI's Dashboard "render firewall" popup (`f` key) —
+//! gathering rules, the allowlist/iptables guard, script rendering and the
+//! lockout safety check all live here so the two callers can never drift
+//! out of sync with each other. Presentation (what gets printed to stderr
+//! for the CLI vs. what gets put in the TUI's status message) stays with
+//! each caller.
+
+use crate::db::{Db, FirewallAction, FirewallRule, GeoMode};
+use crate::{iptables, ipranges, nftables, sshlog};
+use anyhow::Result;
+use std::path::Path;
+
+/// The default output path for a rendered firewall script — shared by the
+/// Dashboard's `f`-key render popup and the internal cron's
+/// `RenderFirewall` job (see `crate::cron`), so a script one renders is
+/// where the other expects to find it.
+pub const DEFAULT_OUTPUT_PATH: &str = "/etc/stop-bots/firewall.nft";
+
+/// Which backend to render a script for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirewallBackend {
+    Iptables,
+    Nftables,
+}
+
+impl FirewallBackend {
+    /// The command an admin should run to apply the generated script.
+    pub fn apply_command(self) -> &'static str {
+        match self {
+            FirewallBackend::Iptables => "sh",
+            FirewallBackend::Nftables => "nft -f",
+        }
+    }
+}
+
+/// Every synthetic (never persisted) `FirewallRule` derived from
+/// currently-blocked-by-default crawler IP-range sources and the current
+/// geo mode's selected countries — see [`Db::derived_firewall_entries`].
+/// Uses `id: 0` since these don't correspond to a real `firewall_rules` row;
+/// they're never looked up or removed by id, only rendered. Order is
+/// preserved from `derived_firewall_entries` (crawler ranges, then geo rules
+/// with any Allowlist catch-all strictly last) — callers must append this
+/// after admin rules, never reorder it.
+pub fn derived_firewall_rules(db: &Db) -> Result<Vec<FirewallRule>> {
+    Ok(db
+        .derived_firewall_entries()?
+        .into_iter()
+        .map(|(address, action)| FirewallRule {
+            id: 0,
+            address,
+            port: None,
+            action,
+            enabled: true,
+            expires_at: None,
+        })
+        .collect())
+}
+
+/// Every `(connected_ip, matching_rule_address)` pair where a client with a
+/// recent successful SSH login (from `connected_ips`) would actually end up
+/// blocked by `rules` — simulating the same first-match-wins evaluation the
+/// rendered script itself performs, walking `rules` in the exact order
+/// they'll be written. This is deliberately *not* "does any Block rule's
+/// CIDR contain this IP": once Allowlist geo mode can put an Allow rule
+/// ahead of a catch-all Block, that cruder check would misfire on an IP an
+/// earlier Allow rule already protects. Existing (established/related)
+/// connections aren't modeled — this answers "can this client *reconnect*
+/// after applying this", which is the stricter and more useful question:
+/// an admin who disconnects after a bad allowlist can't rely on an
+/// already-open session to get back in. An unparseable `connected_ips`
+/// entry is simply skipped rather than erroring: this check exists to *add*
+/// a warning on top of firewall rendering, never to block it over
+/// something unrelated to that rendering.
+pub fn lockout_risks(rules: &[FirewallRule], connected_ips: &[String]) -> Vec<(String, String)> {
+    let mut risks = Vec::new();
+    for ip_str in connected_ips {
+        let Ok(ip) = ip_str.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        for rule in rules.iter().filter(|r| r.enabled) {
+            if ipranges::cidr_contains(&rule.address, ip) {
+                if rule.action != FirewallAction::Allow {
+                    risks.push((ip_str.clone(), rule.address.clone()));
+                }
+                // First match wins, same as the real firewall: stop
+                // checking further rules for this IP either way.
+                break;
+            }
+        }
+    }
+    risks
+}
+
+/// What checking `rules` against currently-connected SSH clients found.
+pub enum LockoutStatus {
+    /// No SSH log could be found or read at all — nothing to check
+    /// against, not itself a risk.
+    LogUnavailable,
+    /// Checked; these currently-connected `(ip, matching_rule_address)`
+    /// pairs would actually end up blocked (empty if none would).
+    Risks(Vec<(String, String)>),
+}
+
+/// Finds recent successful SSH logins (via `ssh_log`, or auto-detected) and
+/// checks whether any of them would actually end up blocked by `rules` (see
+/// [`lockout_risks`] for what "actually end up" means). Pure with respect to
+/// presentation: callers decide how to report [`LockoutStatus::Risks`] and
+/// whether to proceed anyway.
+pub fn assess_lockout_risk(rules: &[FirewallRule], ssh_log: Option<&Path>) -> LockoutStatus {
+    let source = match ssh_log {
+        Some(path) => sshlog::read_log_file(path),
+        None => sshlog::find_default_source(),
+    };
+    match source {
+        sshlog::LogSource::Found(text) => {
+            let connected_ips = sshlog::parse_accepted_ips(&text);
+            LockoutStatus::Risks(lockout_risks(rules, &connected_ips))
+        }
+        sshlog::LogSource::Unavailable => LockoutStatus::LogUnavailable,
+    }
+}
+
+/// A firewall script rendered for one backend, ready to write to disk.
+#[derive(Debug)]
+pub struct BuiltFirewall {
+    /// Every rule that went into `script`: admin-managed rules followed by
+    /// derived crawler/geo rules, in the exact order they were rendered —
+    /// feed this to [`assess_lockout_risk`] so the safety check evaluates
+    /// the same order the script itself will.
+    pub rules: Vec<FirewallRule>,
+    pub script: String,
+    /// How many rules actually made it into `script`: excludes disabled
+    /// rules, and on iptables, IPv6 rules that backend can't represent
+    /// (see `iptables`'s module docs).
+    pub written: usize,
+}
+
+/// Gathers every firewall rule (admin-managed, from [`Db::list_firewall_rules`],
+/// plus derived crawler/geo rules from [`derived_firewall_rules`]) and
+/// renders them for `backend`. Fails immediately, before gathering or
+/// rendering anything, if `backend` is iptables and geo mode is Allowlist —
+/// see `iptables`'s module docs for why that combination can't be safely
+/// enforced.
+pub fn build_script(db: &Db, backend: FirewallBackend) -> Result<BuiltFirewall> {
+    if db.get_geo_mode()? == GeoMode::Allowlist && matches!(backend, FirewallBackend::Iptables) {
+        anyhow::bail!(
+            "Allowlist geo mode requires --backend nftables. iptables cannot safely enforce a \
+             default-deny (catch-all) policy because: (1) it is IPv4-only, so the ::/0 \
+             IPv6 catch-all would be silently skipped, leaving IPv6 traffic unblocked; \
+             and (2) it would block established connections and loopback without \
+             explicit allow rules. Use nftables which handles both address families."
+        );
+    }
+
+    let mut rules = db.list_firewall_rules()?;
+    rules.extend(derived_firewall_rules(db)?);
+
+    let (script, written) = match backend {
+        FirewallBackend::Iptables => {
+            // iptables is IPv4-only; render() skips IPv6 rules (see SPECS.md).
+            let written = rules
+                .iter()
+                .filter(|r| r.enabled && !r.address.contains(':'))
+                .count();
+            (iptables::render(&rules), written)
+        }
+        FirewallBackend::Nftables => {
+            let written = rules.iter().filter(|r| r.enabled).count();
+            (nftables::render(&rules), written)
+        }
+    };
+
+    Ok(BuiltFirewall {
+        rules,
+        script,
+        written,
+    })
+}
+
+/// Writes a rendered script to `out`, creating any missing parent
+/// directories first. Plain `std::fs::write` doesn't create parents, and
+/// `DEFAULT_OUTPUT_PATH` (`/etc/stop-bots/`) has no other code path that
+/// creates it — unlike the database's `/var/lib/stop-bots`, which
+/// `open_or_fallback` creates — so without this, writing to the default
+/// path fails with "No such file or directory" on any host where an admin
+/// hasn't already `mkdir`ed it, including the internal cron's unattended
+/// `RenderFirewall` job, which has no human present to react to the error.
+pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(out, script)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(address: &str, action: FirewallAction) -> FirewallRule {
+        FirewallRule {
+            id: 0,
+            address: address.to_string(),
+            port: None,
+            action,
+            enabled: true,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn derived_firewall_rules_combines_blocked_ip_ranges_and_geo_rules() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_ip_range_source(&crate::db::IpRangeSource {
+            id: "gptbot".to_string(),
+            name: "GPTBot IP ranges".to_string(),
+            url: "https://example.invalid/gptbot.json".to_string(),
+            category: crate::db::Category::Ai,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        db.replace_ip_ranges("gptbot", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("us", true).unwrap();
+
+        let mut rules = derived_firewall_rules(&db).unwrap();
+        rules.sort_by(|a, b| a.address.cmp(&b.address));
+
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].address, "1.2.3.0/24");
+        assert_eq!(rules[1].address, "4.5.6.0/24");
+        assert!(rules.iter().all(|r| r.action == FirewallAction::Block));
+        assert!(rules.iter().all(|r| r.enabled));
+    }
+
+    #[test]
+    fn derived_firewall_rules_is_empty_with_no_ip_ranges_or_selected_countries() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(derived_firewall_rules(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn derived_firewall_rules_in_allowlist_mode_ends_with_the_catchall() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("nl", true).unwrap();
+
+        let rules = derived_firewall_rules(&db).unwrap();
+        assert_eq!(rules[0].address, "1.2.3.0/24");
+        assert_eq!(rules[0].action, FirewallAction::Allow);
+        assert_eq!(rules[1].address, "0.0.0.0/0");
+        assert_eq!(rules[1].action, FirewallAction::Block);
+        assert_eq!(rules[2].address, "::/0");
+        assert_eq!(rules[2].action, FirewallAction::Block);
+    }
+
+    #[test]
+    fn lockout_risks_finds_a_connected_ip_inside_a_block_rule() {
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+        let connected = vec!["4.5.6.7".to_string()];
+        assert_eq!(
+            lockout_risks(&rules, &connected),
+            vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())]
+        );
+    }
+
+    #[test]
+    fn lockout_risks_is_empty_when_no_connected_ip_matches() {
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+        let connected = vec!["9.9.9.9".to_string()];
+        assert!(lockout_risks(&rules, &connected).is_empty());
+    }
+
+    #[test]
+    fn lockout_risks_skips_unparseable_connected_ip_entries() {
+        let rules = vec![rule("0.0.0.0/0", FirewallAction::Block)];
+        let connected = vec!["not-an-ip".to_string()];
+        assert!(lockout_risks(&rules, &connected).is_empty());
+    }
+
+    /// The critical correctness property for Allowlist geo mode: an IP
+    /// covered by an earlier Allow rule must never be flagged, even though
+    /// a later catch-all Block rule's CIDR also technically contains it —
+    /// first match wins, exactly like the real firewall evaluates it.
+    #[test]
+    fn lockout_risks_is_safe_when_an_earlier_allow_rule_covers_the_catchall() {
+        let rules = vec![
+            rule("4.5.6.0/24", FirewallAction::Allow),
+            rule("0.0.0.0/0", FirewallAction::Block),
+        ];
+        let connected = vec!["4.5.6.7".to_string()];
+        assert!(lockout_risks(&rules, &connected).is_empty());
+    }
+
+    /// The flip side: an IP *not* covered by any earlier Allow rule must
+    /// still be caught by the trailing catch-all.
+    #[test]
+    fn lockout_risks_catches_an_ip_only_covered_by_the_catchall() {
+        let rules = vec![
+            rule("4.5.6.0/24", FirewallAction::Allow),
+            rule("0.0.0.0/0", FirewallAction::Block),
+        ];
+        let connected = vec!["9.9.9.9".to_string()];
+        assert_eq!(
+            lockout_risks(&rules, &connected),
+            vec![("9.9.9.9".to_string(), "0.0.0.0/0".to_string())]
+        );
+    }
+
+    #[test]
+    fn assess_lockout_risk_reports_risks_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("auth.log");
+        std::fs::write(
+            &log_path,
+            "Accepted publickey for admin from 4.5.6.7 port 12345 ssh2\n",
+        )
+        .unwrap();
+
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+        match assess_lockout_risk(&rules, Some(&log_path)) {
+            LockoutStatus::Risks(risks) => {
+                assert_eq!(risks, vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())]);
+            }
+            LockoutStatus::LogUnavailable => panic!("expected the log to be found"),
+        }
+    }
+
+    #[test]
+    fn assess_lockout_risk_is_unavailable_for_a_nonexistent_log() {
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+        assert!(matches!(
+            assess_lockout_risk(&rules, Some(Path::new("/nonexistent/x.log"))),
+            LockoutStatus::LogUnavailable
+        ));
+    }
+
+    #[test]
+    fn write_script_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("nested/deeper/firewall.nft");
+
+        write_script(&out, "table inet stop_bots {}\n").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "table inet stop_bots {}\n"
+        );
+    }
+
+    #[test]
+    fn write_script_overwrites_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("firewall.nft");
+        std::fs::write(&out, "old content").unwrap();
+
+        write_script(&out, "new content").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "new content");
+    }
+
+    #[test]
+    fn build_script_rejects_allowlist_mode_on_iptables() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+
+        let result = build_script(&db, FirewallBackend::Iptables);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nftables"));
+    }
+
+    #[test]
+    fn build_script_allows_allowlist_mode_on_nftables() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+
+        let built = build_script(&db, FirewallBackend::Nftables).unwrap();
+        assert!(built.script.contains("policy accept"));
+    }
+}

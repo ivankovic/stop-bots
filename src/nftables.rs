@@ -133,6 +133,7 @@ mod tests {
                 port: r.port,
                 action: FirewallAction::parse(&r.action).unwrap(),
                 enabled: r.enabled,
+                expires_at: None,
             })
             .collect()
     }
@@ -215,6 +216,7 @@ mod tests {
                 port: None,
                 action: FirewallAction::Block,
                 enabled: true,
+                expires_at: None,
             },
             FirewallRule {
                 id: 2,
@@ -222,6 +224,7 @@ mod tests {
                 port: None,
                 action: FirewallAction::Block,
                 enabled: true,
+                expires_at: None,
             },
         ];
         let rendered = render(&rules);

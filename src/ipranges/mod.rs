@@ -272,6 +272,22 @@ pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Whether `ip` is loopback, RFC1918 (IPv4 private) or IPv6 unique-local
+/// (`fc00::/7`) — never worth suggesting as a firewall block, since it's
+/// necessarily either this host talking to itself or a client on the same
+/// private network (a monitoring box, a jump host, ...), not an internet
+/// scanner/bot. Shared by `sshlog::scanning_ips` and
+/// `accesslog::scanning_ips`. Best-effort: doesn't attempt every
+/// documented/reserved range, just the ones a scanner could never
+/// plausibly connect from.
+pub fn is_local_or_private(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
 /// Fetches, parses and stores `country_code`'s current CIDR list. Returns
 /// the count now stored.
 pub async fn update_country(db: &Db, country_code: &str) -> Result<usize> {
@@ -439,5 +455,29 @@ mod tests {
         let ip6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
         assert!(cidr_contains("2001:db8::1", ip6));
         assert!(!cidr_contains("2001:db8::2", ip6));
+    }
+
+    #[test]
+    fn is_local_or_private_flags_loopback_and_rfc1918_ipv4() {
+        for addr in ["127.0.0.1", "10.0.0.5", "172.16.0.1", "192.168.1.5"] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(is_local_or_private(&ip), "{addr} should be local/private");
+        }
+    }
+
+    #[test]
+    fn is_local_or_private_flags_loopback_and_unique_local_ipv6() {
+        for addr in ["::1", "fc00::1", "fd12:3456::1"] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(is_local_or_private(&ip), "{addr} should be local/private");
+        }
+    }
+
+    #[test]
+    fn is_local_or_private_does_not_flag_public_addresses() {
+        for addr in ["198.51.100.9", "2001:db8::1"] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(!is_local_or_private(&ip), "{addr} should be public");
+        }
     }
 }

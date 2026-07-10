@@ -16,13 +16,17 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+pub mod accesslog;
 pub mod app;
 pub mod botlist;
+pub mod cron;
 pub mod db;
 pub mod event;
+pub mod firewall;
 pub mod ipranges;
 pub mod iptables;
 pub mod nftables;
 pub mod nginx;
+pub mod scanblock;
 pub mod sshlog;
 pub mod tui;

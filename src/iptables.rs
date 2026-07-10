@@ -35,6 +35,19 @@
 //! rules are skipped here (left as a comment) rather than emitted broken;
 //! use [`crate::nftables`] for IPv6, which handles both families in one
 //! table.
+//!
+//! ## Default-deny (allowlist) mode
+//!
+//! For allowlist geo-blocking (block everything except selected countries),
+//! [`crate::db::geo_firewall_rules`] generates a trailing `0.0.0.0/0` Block
+//! rule. Unlike `nftables`, iptables cannot safely enforce this because:
+//! 1. iptables is IPv4-only — the corresponding `::/0` IPv6 catch-all would
+//!    be silently skipped, leaving IPv6 traffic completely unblocked.
+//! 2. Without explicit allow rules for established connections and loopback
+//!    (which this module now adds), a `0.0.0.0/0` rule would block all existing
+//!    connections and local traffic. We now add those safety rules (see
+//!    [`render`]), but the IPv6 limitation remains — hence allowlist mode
+//!    requires the nftables backend (enforced in `main.rs`).
 
 use crate::db::{FirewallAction, FirewallRule};
 
@@ -59,6 +72,11 @@ fn is_ipv6(address: &str) -> bool {
 /// IPv6 rules are skipped (see module docs); ports are rendered as
 /// `-p tcp --dport <port>` — there's no protocol field on [`FirewallRule`]
 /// yet, so UDP-specific rules aren't representable either (see TODO.md).
+///
+/// The generated chain always includes explicit ACCEPT rules for established/
+/// related connections and loopback traffic before any user rules, ensuring
+/// that a trailing catch-all block rule (used in allowlist geo mode) won't
+/// lock out existing connections or local traffic.
 pub fn render(rules: &[FirewallRule]) -> String {
     let mut out = String::new();
     out.push_str("#!/bin/sh\n");
@@ -82,6 +100,16 @@ pub fn render(rules: &[FirewallRule]) -> String {
     ));
     out.push_str(&format!("    iptables -I INPUT -j {CHAIN}\n"));
     out.push_str("fi\n");
+
+    // Safety first: always accept established/related connections and loopback.
+    // This is critical for allowlist mode where a trailing 0.0.0.0/0 block rule
+    // would otherwise lock out all existing connections and local traffic.
+    // Note: iptables is IPv4-only, so we can't match IPv6 addresses or set an
+    // IPv6 default policy — both reasons allowlist mode requires nftables.
+    out.push_str(&format!(
+        "iptables -A {CHAIN} -m state --state ESTABLISHED,RELATED -j ACCEPT\n"
+    ));
+    out.push_str(&format!("iptables -A {CHAIN} -i lo -j ACCEPT\n"));
 
     let enabled: Vec<&FirewallRule> = rules.iter().filter(|r| r.enabled).collect();
     if !enabled.is_empty() {
@@ -134,6 +162,7 @@ mod tests {
                 port: r.port,
                 action: FirewallAction::parse(&r.action).unwrap(),
                 enabled: r.enabled,
+                expires_at: None,
             })
             .collect()
     }
@@ -159,6 +188,9 @@ mod tests {
         assert!(rendered.contains(&format!("iptables -F {CHAIN}")));
         assert!(rendered.contains(&format!("iptables -I INPUT -j {CHAIN}")));
         assert!(!rendered.contains("-A STOP-BOTS -s"));
+        // Even with no user rules, we still have safety rules for established/related and loopback
+        assert!(rendered.contains("state --state ESTABLISHED,RELATED"));
+        assert!(rendered.contains("-i lo -j ACCEPT"));
     }
 
     #[test]
@@ -212,6 +244,7 @@ mod tests {
             port: None,
             action: FirewallAction::Block,
             enabled: true,
+            expires_at: None,
         }];
         let rendered = render(&rules);
         assert!(!rendered.contains("iptables -A STOP-BOTS -s 2001:db8::1"));

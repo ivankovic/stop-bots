@@ -300,7 +300,7 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
 
     let script_path = tmp.path().join("stop-bots.sh");
 
-    // Without --force: refuses, warns twice, writes nothing.
+    // Without --force: refuses, warns once, writes nothing.
     let output = Command::cargo_bin("stop-bots")
         .unwrap()
         .args([
@@ -318,7 +318,7 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(stderr.matches("WARNING").count(), 2);
+    assert_eq!(stderr.matches("WARNING").count(), 1);
     assert!(stderr.contains("4.5.6.7"));
     assert!(stderr.contains("Refusing to write"));
     assert!(!script_path.exists());
@@ -594,4 +594,420 @@ fn render_firewall_allowlist_mode_does_not_warn_when_an_earlier_allow_rule_cover
     assert!(script.contains("ip saddr 4.5.6.7 accept"));
     assert!(script.contains("ip saddr 0.0.0.0/0 drop"));
     assert!(script.contains("ip6 saddr ::/0 drop"));
+}
+
+fn repeat_failed_attempt(ip: &str, times: usize) -> String {
+    format!("Failed password for root from {ip} port 4444 ssh2\n").repeat(times)
+}
+
+#[test]
+fn block_scanners_adds_a_rule_for_an_ip_over_the_threshold_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-scanners",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "20",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Added 1 new block rule"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9"));
+
+    // Re-running against the same log must not add a duplicate rule.
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-scanners",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "20",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "all already covered by an existing firewall rule",
+        ));
+}
+
+#[test]
+fn block_scanners_ignores_an_ip_below_the_threshold() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 5)).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-scanners",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "20",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No scanning IPs found"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9").not());
+}
+
+/// The safety property that matters most: an IP that eventually logs in
+/// successfully must never be auto-blocked, even with a mountain of failed
+/// attempts before it.
+#[test]
+fn block_scanners_never_blocks_an_ip_that_eventually_logged_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("auth.log");
+    let mut log = repeat_failed_attempt("198.51.100.9", 25);
+    log.push_str("Accepted publickey for admin from 198.51.100.9 port 5555 ssh2\n");
+    fs::write(&log_path, log).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-scanners",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "20",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No scanning IPs found"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9").not());
+}
+
+#[test]
+fn block_scanners_dry_run_reports_without_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-scanners",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "20",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would add 1 new block rule"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9").not());
+}
+
+fn not_found_line(ip: &str, path: &str) -> String {
+    format!(
+        "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0\"\n"
+    )
+}
+
+#[test]
+fn block_web_scanners_adds_a_rule_for_distinct_not_found_paths_and_is_idempotent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("access.log");
+    let log: String = (0..20)
+        .map(|i| not_found_line("198.51.100.9", &format!("/missing-{i}")))
+        .collect();
+    fs::write(&log_path, log).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-web-scanners",
+            "--db",
+            db_path,
+            "--access-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "15",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Added 1 new block rule"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9"));
+
+    // Re-running against the same log must not add a duplicate rule.
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-web-scanners",
+            "--db",
+            db_path,
+            "--access-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "15",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "all already covered by an existing firewall rule",
+        ));
+}
+
+/// The core discriminator this feature exists to get right, verified again
+/// at the CLI/DB-state level (already unit-tested in `accesslog.rs`):
+/// hitting the *same* dead path repeatedly must never look like scanning.
+#[test]
+fn block_web_scanners_ignores_repeated_hits_on_a_single_dead_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("access.log");
+    let log: String = (0..50).map(|_| not_found_line("198.51.100.9", "/missing")).collect();
+    fs::write(&log_path, log).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-web-scanners",
+            "--db",
+            db_path,
+            "--access-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "15",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No scanning IPs found"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9").not());
+}
+
+#[test]
+fn block_web_scanners_dry_run_reports_without_writing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("access.log");
+    let log: String = (0..20)
+        .map(|i| not_found_line("198.51.100.9", &format!("/missing-{i}")))
+        .collect();
+    fs::write(&log_path, log).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-web-scanners",
+            "--db",
+            db_path,
+            "--access-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "15",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Would add 1 new block rule"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9").not());
+}
+
+/// End-to-end through the real binary: a rule added with an already-past
+/// TTL (`--ttl-days=-1`, using `=` so clap doesn't mistake the negative
+/// number for a flag) must be gone by the very next `list-firewall-rules`
+/// call — proving the CLI wiring actually reaches `Db::list_firewall_rules`'s
+/// pruning, not just the unit-tested `Db` layer in isolation.
+#[test]
+fn block_scanners_ttl_days_expires_the_rule_by_the_next_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-scanners",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "20",
+            "--ttl-days=-1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("expiring in -1 day"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9").not());
+}
+
+/// The default (positive) TTL path — a freshly added rule must still show
+/// up normally, with its expiry reflected in the confirmation message.
+#[test]
+fn block_web_scanners_ttl_days_defaults_to_one_day() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("access.log");
+    let log: String = (0..20)
+        .map(|i| not_found_line("198.51.100.9", &format!("/missing-{i}")))
+        .collect();
+    fs::write(&log_path, log).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-web-scanners",
+            "--db",
+            db_path,
+            "--access-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "15",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("expiring after 1 day"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("198.51.100.9"));
+}
+
+/// `list-firewall-rules` must show a temporary rule's expiry (so an admin
+/// scanning the list can tell an auto-added block from a permanent
+/// hand-added one), but never show one for a permanent rule.
+#[test]
+fn list_firewall_rules_shows_expiry_only_for_temporary_rules() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "add-firewall-rule",
+            "--db",
+            db_path,
+            "--address",
+            "9.9.9.9",
+            "--action",
+            "block",
+        ])
+        .assert()
+        .success();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-scanners",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "20",
+        ])
+        .assert()
+        .success();
+
+    let output = Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-firewall-rules", "--db", db_path])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let permanent_line = stdout.lines().find(|l| l.contains("9.9.9.9")).unwrap();
+    let temporary_line = stdout
+        .lines()
+        .find(|l| l.contains("198.51.100.9"))
+        .unwrap();
+    assert!(!permanent_line.contains("expires"));
+    assert!(temporary_line.contains("expires in"));
 }

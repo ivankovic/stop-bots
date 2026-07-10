@@ -161,6 +161,14 @@ pub enum KeyOutcome {
     /// it directly and returns `Mutated` instead, since no network
     /// round-trip is needed.
     SelectCountry(String),
+    /// The Dashboard's firewall render action was triggered. Carries the
+    /// selected backend and output path for `App` to call the render
+    /// function (see `App::render_firewall`).
+    RenderFirewall {
+        backend: crate::firewall::FirewallBackend,
+        out_path: String,
+        force: bool,
+    },
 }
 
 /// Returns a `Rect` of exactly `width` x `height` cells, centered within
