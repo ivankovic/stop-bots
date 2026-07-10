@@ -19,5 +19,12 @@
     "function": "Test",
     "frequency": "Unclear",
     "description": "Should be dropped: the name itself contains a quote."
+  },
+  "Trailing\\": {
+    "operator": "Test",
+    "respect": "Unclear",
+    "function": "Test",
+    "frequency": "Unclear",
+    "description": "Should be dropped: the name ends in a backslash."
   }
 }

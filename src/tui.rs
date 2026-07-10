@@ -169,6 +169,14 @@ pub enum KeyOutcome {
         out_path: String,
         force: bool,
     },
+    /// Site settings wrote at least one changed NGINX config file on disk
+    /// (`apply now` / `apply all`). Reloading is a real side effect (shells
+    /// out to `nginx -t` and `systemctl reload nginx`), so — same reasoning
+    /// as `RenderFirewall`/`UpdateSource` — it stays with `App` rather than
+    /// running inline in the screen's own `handle_key`, keeping that code
+    /// free of real process execution so its tests stay fast and
+    /// deterministic (see `crate::nginx::reload`).
+    ReloadNginx,
 }
 
 /// Returns a `Rect` of exactly `width` x `height` cells, centered within

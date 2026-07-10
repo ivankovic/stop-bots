@@ -32,7 +32,12 @@ fn spawn_tui_with_root(db_path: &Path, root: &Path) -> PtySession {
 
 fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
-    cmd.args(["tui", "--db", db_path.to_str().unwrap()]);
+    // `--no-reload`: some of these tests drive a real Site settings apply
+    // through this real spawned process, and without this it would shell
+    // out to the real `nginx -t`/`systemctl reload nginx` on whatever
+    // machine runs the test suite (see `main.rs`'s `apply-blocks
+    // --no-reload`, the same escape hatch for the CLI's own apply path).
+    cmd.args(["tui", "--db", db_path.to_str().unwrap(), "--no-reload"]);
     cmd.args(extra_args);
     cmd.env("TERM", "xterm-256color");
 

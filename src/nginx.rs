@@ -180,12 +180,99 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
     blocks
 }
 
+/// Whether `pattern` can be embedded verbatim inside the double-quoted
+/// NGINX string [`block_text`] builds, without corrupting the surrounding
+/// config. Two conditions:
+///
+/// - No literal `"` — would end the string early (each botlist parser
+///   already filters this at the source, but this is the last line of
+///   defense for any pattern that reaches here some other way, including a
+///   row already stored in the db from before a parser had this filter).
+/// - Doesn't end in a backslash — NGINX's config parser treats `\"`
+///   immediately before what would be our closing quote as an *escaped*
+///   quote, not a terminator, so a trailing backslash on the last pattern
+///   joined into the string leaves the quoted state open. NGINX then keeps
+///   scanning for a real closing quote through the rest of the file and
+///   reports `too long parameter, probably missing terminating """
+///   character` once it hits EOF still "inside" the string — confirmed
+///   against a real `nginx -t`. (A trailing backslash *pair* avoids that
+///   specific failure by collapsing to one backslash before the closing
+///   quote, but that one leftover backslash then fails regex compilation
+///   instead — `pcre2_compile() failed: \ at end of pattern` — so any
+///   trailing backslash at all is treated as unsafe, not just an odd run.)
+fn is_embeddable(pattern: &str) -> bool {
+    !pattern.contains('"') && !pattern.ends_with('\\')
+}
+
+/// Joins the patterns in `patterns` that are safe to embed (see
+/// [`is_embeddable`]) into a single `|`-separated NGINX regex, or `None` if
+/// none remain — the same "nothing to block" case as an empty pattern list,
+/// which removes any existing sentinel block instead of writing an empty
+/// one.
+fn join_patterns(patterns: &[String]) -> Option<String> {
+    let safe: Vec<&str> = patterns
+        .iter()
+        .map(String::as_str)
+        .filter(|p| is_embeddable(p))
+        .collect();
+    (!safe.is_empty()).then(|| safe.join("|"))
+}
+
+/// Maximum byte length of a single chunk [`chunk_pattern`] produces.
+///
+/// NGINX's config-file parser has a hard ceiling on the length of a single
+/// quoted parameter — confirmed empirically against a real `nginx -t`:
+/// even a *properly terminated* quoted string fails with `too long
+/// parameter, probably missing terminating """ character` once it crosses
+/// roughly 4100 bytes (matching `NGX_CONF_BUFFER`), regardless of what
+/// precedes it in the file. This is unrelated to the quote-escaping issue
+/// [`is_embeddable`] guards against — even a config free of embedding bugs
+/// can still hit this purely from having enough blocked bots: the
+/// `nginx-bad-bots` source alone is ~700 entries, easily exceeding 4096
+/// bytes once joined with `|`. Set well below the observed failure point to
+/// stay safe regardless of how much unrelated content precedes the
+/// sentinel block in a real config file (confirmed empirically too: a
+/// 2000-byte quoted parameter still parses fine even after ~10KB of
+/// preceding file content).
+const MAX_PATTERN_CHUNK_LEN: usize = 2000;
+
+/// Splits `full` (a `|`-joined NGINX regex, as produced by [`join_patterns`])
+/// into pieces of at most `max_len` bytes each, splitting only on `|`
+/// boundaries so no individual alternative is ever cut in half. A single
+/// alternative longer than `max_len` on its own still becomes its own
+/// (oversized) chunk rather than being dropped or truncated — better to
+/// risk that rare case than silently stop blocking a legitimate pattern.
+fn chunk_pattern(full: &str, max_len: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    for part in full.split('|') {
+        match chunks.last_mut() {
+            Some(last) if last.len() + 1 + part.len() <= max_len => {
+                last.push('|');
+                last.push_str(part);
+            }
+            _ => chunks.push(part.to_string()),
+        }
+    }
+    chunks
+}
+
 /// Renders the sentinel block content (without surrounding blank lines) for
-/// the given combined user-agent regex `pattern`.
+/// the given combined user-agent regex `pattern`, split (via
+/// [`chunk_pattern`]) into one `if` statement per chunk if it's long enough
+/// to need it. Multiple sequential `if ($http_user_agent ~* "...") { return
+/// 403; }` statements are equivalent to one big alternation — whichever
+/// fires first returns 403 — so splitting changes nothing about what gets
+/// blocked, only how it's written, and a pattern short enough for one chunk
+/// renders exactly as before (a single `if`).
 fn block_text(pattern: &str) -> String {
-    format!(
-        "    {BLOCK_BEGIN}\n    if ($http_user_agent ~* \"{pattern}\") {{\n        return 403;\n    }}\n    {BLOCK_END}\n"
-    )
+    let mut out = format!("    {BLOCK_BEGIN}\n");
+    for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
+        out.push_str(&format!(
+            "    if ($http_user_agent ~* \"{chunk}\") {{\n        return 403;\n    }}\n"
+        ));
+    }
+    out.push_str(&format!("    {BLOCK_END}\n"));
+    out
 }
 
 /// Finds the byte range of an existing sentinel block's lines within
@@ -301,7 +388,7 @@ pub fn apply_blocks_to_file(
             .and_then(|name| site_patterns.iter().find(|(n, _)| n == name))
             .map(|(_, patterns)| patterns.as_slice())
             .unwrap_or(default_patterns);
-        let pattern = (!patterns.is_empty()).then(|| patterns.join("|"));
+        let pattern = join_patterns(patterns);
         let updated = apply_block(&content, block, pattern.as_deref());
         if updated != content {
             changed = true;
@@ -344,10 +431,24 @@ pub enum SiteApplyStatus {
 fn current_block_pattern(content: &str, block: &ServerBlock) -> Option<String> {
     let (start, end) = locate_existing_block(content, block)?;
     let region = &content[start..end];
-    let pattern_start = region.find("~* \"")? + 4;
-    let rest = &region[pattern_start..];
-    let pattern_end = rest.find('"')?;
-    Some(rest[..pattern_end].to_string())
+
+    // A pattern long enough to need [`chunk_pattern`]'s splitting renders as
+    // more than one `if` statement (see `block_text`), so every occurrence
+    // has to be collected and rejoined with `|` to reconstruct the full
+    // pattern — not just the first one. Safe to search for a bare `"` as
+    // each chunk's end even though patterns can contain arbitrary text: no
+    // pattern ever contains a literal `"` itself (`is_embeddable` rejects
+    // those before they're ever written), so the first `"` after each
+    // `~* "` marker is always that chunk's real closing quote.
+    let mut patterns = Vec::new();
+    let mut rest = region;
+    while let Some(marker) = rest.find("~* \"") {
+        let after = &rest[marker + 4..];
+        let Some(end) = after.find('"') else { break };
+        patterns.push(&after[..end]);
+        rest = &after[end + 1..];
+    }
+    (!patterns.is_empty()).then(|| patterns.join("|"))
 }
 
 /// Compares what's actually written in `config_path` for `server_name`
@@ -369,7 +470,7 @@ pub fn site_apply_status(
     if matching.is_empty() {
         return SiteApplyStatus::NotFound;
     }
-    let expected = (!patterns.is_empty()).then(|| patterns.join("|"));
+    let expected = join_patterns(patterns);
     if matching
         .iter()
         .all(|block| current_block_pattern(&content, block) == expected)
@@ -397,7 +498,7 @@ pub fn apply_block_for_site(
         .with_context(|| format!("failed to read {}", config_path.display()))?;
 
     let block_count = parse_server_blocks(&content).len();
-    let pattern = (!patterns.is_empty()).then(|| patterns.join("|"));
+    let pattern = join_patterns(patterns);
 
     // Same re-parse-before-each-edit approach as apply_blocks_to_file:
     // editing a block shifts the byte offsets of every block after it.
@@ -421,6 +522,43 @@ pub fn apply_block_for_site(
     fs::write(config_path, &content)
         .with_context(|| format!("failed to write {}", config_path.display()))?;
     Ok(true)
+}
+
+/// Validates the currently-installed NGINX config with `nginx -t`. Run
+/// before every [`reload`] so a malformed config — ours or an unrelated
+/// hand edit elsewhere in the same install — is reported as a clear error
+/// here rather than left for the admin to dig out of `systemctl status`.
+fn test_config() -> Result<()> {
+    let output = std::process::Command::new("nginx")
+        .arg("-t")
+        .output()
+        .context("failed to run `nginx -t`")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "nginx -t failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
+/// Reloads NGINX via `systemctl reload nginx` so a just-written blocking
+/// rule (from [`apply_blocks_to_file`] or [`apply_block_for_site`]) actually
+/// takes effect — writing the sentinel block to a site's config file alone
+/// does nothing until NGINX re-reads it. Always preceded by [`test_config`]:
+/// `systemctl reload` refuses a config that fails validation on its own too,
+/// but checking explicitly here gets a message callers can show directly
+/// rather than send the admin to `systemctl status`/`journalctl`.
+pub fn reload() -> Result<()> {
+    test_config()?;
+    let status = std::process::Command::new("systemctl")
+        .args(["reload", "nginx"])
+        .status()
+        .context("failed to run `systemctl reload nginx`")?;
+    if !status.success() {
+        anyhow::bail!("systemctl reload nginx exited with {status}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -762,5 +900,152 @@ mod tests {
             apply_block_for_site(&path, "unknown.example", &["BadBot".to_string()]).unwrap();
         assert!(!changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn is_embeddable_rejects_a_literal_quote() {
+        assert!(!is_embeddable("Evil\"Bot"));
+    }
+
+    #[test]
+    fn is_embeddable_rejects_any_trailing_backslash_run() {
+        assert!(!is_embeddable("EvilBot\\"));
+        assert!(!is_embeddable("EvilBot\\\\"));
+        assert!(!is_embeddable("EvilBot\\\\\\"));
+    }
+
+    #[test]
+    fn is_embeddable_accepts_an_interior_backslash() {
+        assert!(is_embeddable("1h4x\\.com"));
+    }
+
+    #[test]
+    fn join_patterns_drops_only_the_unsafe_entries() {
+        let patterns = vec![
+            "GoodBot".to_string(),
+            "Trailing\\".to_string(),
+            "1h4x\\.com".to_string(),
+        ];
+        assert_eq!(
+            join_patterns(&patterns).as_deref(),
+            Some("GoodBot|1h4x\\.com")
+        );
+    }
+
+    #[test]
+    fn join_patterns_is_none_when_every_pattern_is_unsafe() {
+        let patterns = vec!["Trailing\\".to_string(), "Quoted\"Bot".to_string()];
+        assert_eq!(join_patterns(&patterns), None);
+    }
+
+    /// Regression test for a real bug: a bot pattern ending in a backslash,
+    /// if it happened to land last in the joined `|`-separated regex, wrote
+    /// an NGINX config that failed `nginx -t` with "too long parameter,
+    /// probably missing terminating \" character" — confirmed against a
+    /// real `nginx -t` binary. `apply_blocks_to_file` must silently drop
+    /// such a pattern rather than write it.
+    #[test]
+    fn apply_blocks_to_file_drops_a_pattern_with_a_trailing_backslash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.com");
+        fs::write(
+            &path,
+            fs::read_to_string(format!("{FIXTURES_ROOT}/sites-enabled/example.com")).unwrap(),
+        )
+        .unwrap();
+
+        let patterns = vec!["GoodBot".to_string(), "TrailingBackslash\\".to_string()];
+        apply_blocks_to_file(&path, &[], &patterns).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("GoodBot"));
+        assert!(!written.contains("TrailingBackslash"));
+        // The sentinel's own closing quote must be the last character
+        // before the closing paren, i.e. immediately followed by `) {` —
+        // not swallowed into an unterminated string.
+        assert!(written.contains("~* \"GoodBot\") {"));
+    }
+
+    #[test]
+    fn chunk_pattern_keeps_everything_in_one_chunk_when_it_fits() {
+        let chunks = chunk_pattern("A|B|C", 2000);
+        assert_eq!(chunks, vec!["A|B|C".to_string()]);
+    }
+
+    #[test]
+    fn chunk_pattern_splits_only_on_pipe_boundaries_once_the_limit_is_hit() {
+        // Each part is 5 bytes ("AAAAA" etc, 4 chars + digit); a limit of 11
+        // fits exactly two parts plus their separator (5 + 1 + 5 = 11) but
+        // not three.
+        let full = "AAAA0|AAAA1|AAAA2|AAAA3";
+        let chunks = chunk_pattern(full, 11);
+        assert_eq!(
+            chunks,
+            vec!["AAAA0|AAAA1".to_string(), "AAAA2|AAAA3".to_string()]
+        );
+        // Rejoining every chunk with `|` must reconstruct the original,
+        // order preserved — this is the property `current_block_pattern`
+        // relies on to read a chunked block back correctly.
+        assert_eq!(chunks.join("|"), full);
+    }
+
+    #[test]
+    fn chunk_pattern_gives_an_oversized_single_part_its_own_chunk_rather_than_dropping_it() {
+        let huge = "x".repeat(50);
+        let chunks = chunk_pattern(&huge, 10);
+        assert_eq!(chunks, vec![huge]);
+    }
+
+    /// Regression test for the real bug: NGINX's config parser rejects any
+    /// single quoted parameter beyond roughly 4100 bytes with `too long
+    /// parameter, probably missing terminating """ character` — confirmed
+    /// against a real `nginx -t`, and easily reached by a realistic
+    /// default bot list (`nginx-bad-bots` alone is ~700 entries). A single
+    /// giant `if` block must not be written; `block_text` should split into
+    /// several instead, each safely under the limit.
+    #[test]
+    fn apply_blocks_to_file_splits_a_long_pattern_list_into_multiple_if_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.com");
+        fs::write(
+            &path,
+            fs::read_to_string(format!("{FIXTURES_ROOT}/sites-enabled/example.com")).unwrap(),
+        )
+        .unwrap();
+
+        // Comfortably more than MAX_PATTERN_CHUNK_LEN once joined with `|`.
+        let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
+        apply_blocks_to_file(&path, &[], &patterns).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        let if_count = written.matches("if ($http_user_agent").count();
+        assert!(if_count > 1, "expected multiple if blocks, got {if_count}");
+        for line in written.lines() {
+            assert!(
+                line.len() < MAX_PATTERN_CHUNK_LEN + 100,
+                "line exceeds the safe chunk length: {} bytes",
+                line.len()
+            );
+        }
+        assert!(written.contains("BadBot0Agent"));
+        assert!(written.contains("BadBot499Agent"));
+    }
+
+    /// A chunked block (multiple `if` statements) must still be read back
+    /// correctly by `site_apply_status` — otherwise every site with a long
+    /// enough pattern list would permanently read `Stale` even right after
+    /// applying, since `current_block_pattern` would only ever see the
+    /// first chunk.
+    #[test]
+    fn site_apply_status_is_up_to_date_after_applying_a_chunked_pattern_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+
+        let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
+        apply_block_for_site(&path, "a.example", &patterns).unwrap();
+
+        let status = site_apply_status(&path, "a.example", &patterns);
+        assert_eq!(status, SiteApplyStatus::UpToDate);
     }
 }

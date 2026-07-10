@@ -41,18 +41,19 @@ pub const SOURCE_URL: &str =
 /// Parses the raw ai.robots.txt JSON document — a flat object keyed by bot
 /// name, e.g. `{"GPTBot": {...}, "ClaudeBot": {...}}` — into [`NewBot`]
 /// records. The per-bot metadata (operator, respect, function, ...) isn't
-/// modeled here; only the key is needed. A name containing a `"` is
-/// dropped, same reasoning as `well_known_bots::parse`: it would end up
-/// embedded in a double-quoted NGINX string (see
+/// modeled here; only the key is needed. A name containing a `"`, or ending
+/// in a backslash, is dropped, same reasoning as `well_known_bots::parse`:
+/// it would end up embedded in a double-quoted NGINX string (see
 /// `nginx::apply_blocks_to_file`), so an untrusted one with a quote in it
-/// could break out and inject directives into a config loaded as root.
+/// could break out and inject directives into a config loaded as root, and
+/// one ending in a backslash can escape NGINX's own closing quote instead.
 pub fn parse(json: &str) -> Result<Vec<NewBot>> {
     let raw: BTreeMap<String, serde::de::IgnoredAny> =
         serde_json::from_str(json).context("failed to parse ai.robots.txt JSON")?;
 
     let bots = raw
         .into_keys()
-        .filter(|name| !name.contains('"'))
+        .filter(|name| !name.contains('"') && !name.ends_with('\\'))
         .map(|name| NewBot {
             slug: slugify(&name),
             user_agent_pattern: name.clone(),
@@ -108,5 +109,11 @@ mod tests {
     fn parse_drops_a_name_with_a_quote_in_it() {
         let bots = parse(SAMPLE).unwrap();
         assert!(!bots.iter().any(|b| b.name.contains('"')));
+    }
+
+    #[test]
+    fn parse_drops_a_name_ending_in_a_backslash() {
+        let bots = parse(SAMPLE).unwrap();
+        assert!(!bots.iter().any(|b| b.name.ends_with('\\')));
     }
 }

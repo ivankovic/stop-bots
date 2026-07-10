@@ -24,6 +24,7 @@ use crate::cron::CronJob;
 use crate::db::Db;
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::ipranges;
+use crate::nginx;
 use crate::tui::{self, KeyOutcome, Screen, Theme};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -60,13 +61,22 @@ pub struct App {
     /// `due_jobs` alone can't prevent since `last_run` only updates once
     /// the job actually completes.
     cron_update_ip_ranges_in_flight: bool,
+    /// Whether `KeyOutcome::ReloadNginx` actually calls `nginx::reload()`.
+    /// Always `true` for real usage; `false` only for the end-to-end TUI
+    /// tests in `tests/tui.rs`, which drive a real Site settings "apply"
+    /// through a real spawned binary — without this, that would shell out
+    /// to the real `nginx -t`/`systemctl reload nginx` on whatever machine
+    /// runs the test suite (see `main.rs`'s `tui --no-reload` flag, the
+    /// same escape hatch `apply-blocks --no-reload` uses).
+    reload_nginx: bool,
 }
 
 impl App {
     /// Constructs a new [`App`], loading initial state from `db`. `root` is
     /// the NGINX config root Site settings scans when the user triggers a
-    /// rescan from the TUI.
-    pub fn new(db: Db, root: std::path::PathBuf) -> Result<Self> {
+    /// rescan from the TUI. `reload_nginx` gates whether a successful Site
+    /// settings apply actually reloads NGINX (see the field doc comment).
+    pub fn new(db: Db, root: std::path::PathBuf, reload_nginx: bool) -> Result<Self> {
         let mut app = Self {
             running: true,
             events: EventHandler::new(),
@@ -80,6 +90,7 @@ impl App {
             site_settings: tui::site_settings::SiteSettings::new(root),
             last_cron_check: std::time::Instant::now(),
             cron_update_ip_ranges_in_flight: false,
+            reload_nginx,
         };
         botlist::register_all_sources(&app.db)?;
         app.refresh()?;
@@ -524,6 +535,16 @@ impl App {
                 self.render_firewall(backend, out_path, force);
                 return Ok(());
             }
+            KeyOutcome::ReloadNginx => {
+                self.refresh()?;
+                if self.reload_nginx {
+                    if let Err(err) = nginx::reload() {
+                        let applied = self.message.take().unwrap_or_default();
+                        self.message = Some(format!("{applied} — failed to reload NGINX: {err}"));
+                    }
+                }
+                return Ok(());
+            }
             KeyOutcome::Ignored => {}
         }
 
@@ -570,7 +591,15 @@ mod tests {
     use crate::firewall::FirewallBackend;
 
     fn test_app() -> App {
-        App::new(Db::open_in_memory().unwrap(), std::path::PathBuf::from("/etc/nginx")).unwrap()
+        // `reload_nginx: false` — no test here drives a Site settings apply
+        // through `handle_key_event`, but this keeps it that way even if
+        // one is added later, rather than relying on that staying true.
+        App::new(
+            Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/etc/nginx"),
+            false,
+        )
+        .unwrap()
     }
 
     /// The direct `stop_bots::firewall` call this method now makes (instead

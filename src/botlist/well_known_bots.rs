@@ -67,9 +67,12 @@ fn humanize(slug: &str) -> String {
 
 /// Parses the raw well-known-bots JSON document into [`NewBot`] records.
 /// Bots with no usable user-agent pattern are skipped. Patterns containing a
-/// `"` are dropped too: they end up embedded in a double-quoted NGINX string
-/// (see `nginx::apply_blocks_to_file`), so an untrusted pattern with a quote
-/// in it could break out and inject directives into a config loaded as root.
+/// `"`, or ending in a backslash, are dropped too: they end up embedded in a
+/// double-quoted NGINX string (see `nginx::apply_blocks_to_file`), so an
+/// untrusted pattern with a quote in it could break out and inject
+/// directives into a config loaded as root, and one ending in a backslash
+/// can escape NGINX's own closing quote instead (see `nginx::is_embeddable`
+/// for the mechanics — confirmed against a real `nginx -t`).
 pub fn parse(json: &str) -> Result<Vec<NewBot>> {
     let raw: Vec<RawBot> = serde_json::from_str(json).context("failed to parse bot list JSON")?;
 
@@ -80,7 +83,7 @@ pub fn parse(json: &str) -> Result<Vec<NewBot>> {
                 .pattern
                 .accepted
                 .into_iter()
-                .filter(|p| !p.contains('"'))
+                .filter(|p| !p.contains('"') && !p.ends_with('\\'))
                 .collect();
             if patterns.is_empty() {
                 return None;
@@ -154,6 +157,12 @@ mod tests {
         // remaining, safe pattern.
         let mixed = bots.iter().find(|b| b.slug == "mixed-pattern-bot").unwrap();
         assert_eq!(mixed.user_agent_pattern, "GoodBot");
+    }
+
+    #[test]
+    fn parse_drops_a_pattern_ending_in_a_backslash() {
+        let bots = parse(SAMPLE).unwrap();
+        assert!(!bots.iter().any(|b| b.slug == "trailing-backslash-bot"));
     }
 
     #[test]

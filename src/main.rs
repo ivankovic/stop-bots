@@ -66,6 +66,12 @@ enum Command {
         root: PathBuf,
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
+        /// Skip reloading NGINX after writing config changes (e.g. for
+        /// tests, or to review the written config before it goes live).
+        /// Applying is a no-op without a reload, so real usage wants this
+        /// left on.
+        #[arg(long)]
+        no_reload: bool,
     },
     /// Add a firewall rule blocking (or allowing) an IP address or CIDR range
     AddFirewallRule {
@@ -258,6 +264,11 @@ enum Command {
         /// site scan from Site settings
         #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
         root: PathBuf,
+        /// Skip reloading NGINX after Site settings applies blocking rules
+        /// (e.g. for tests driving the TUI end to end against a throwaway
+        /// fixture root, where there's no real NGINX install to reload)
+        #[arg(long)]
+        no_reload: bool,
     },
 }
 
@@ -287,15 +298,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => run_tui(None, PathBuf::from(DEFAULT_NGINX_ROOT)).await,
-        Some(Command::Tui { db, root }) => run_tui(db, root).await,
+        None => run_tui(None, PathBuf::from(DEFAULT_NGINX_ROOT), false).await,
+        Some(Command::Tui {
+            db,
+            root,
+            no_reload,
+        }) => run_tui(db, root, no_reload).await,
         Some(Command::ScanSites { root, db }) => scan_sites(&root, db),
         Some(Command::UpdateBotLists {
             db,
             source_id,
             source,
         }) => update_bot_lists(db, source_id, source).await,
-        Some(Command::ApplyBlocks { root, db }) => apply_blocks(&root, db),
+        Some(Command::ApplyBlocks {
+            root,
+            db,
+            no_reload,
+        }) => apply_blocks(&root, db, no_reload),
         Some(Command::AddFirewallRule {
             address,
             port,
@@ -415,9 +434,9 @@ fn resolve_user_db_path(
     Ok(data_home.join("stop-bots").join("db.sqlite3"))
 }
 
-async fn run_tui(db_path: Option<PathBuf>, root: PathBuf) -> Result<()> {
+async fn run_tui(db_path: Option<PathBuf>, root: PathBuf, no_reload: bool) -> Result<()> {
     let db = open_db(db_path)?;
-    let app = stop_bots::app::App::new(db, root)?;
+    let app = stop_bots::app::App::new(db, root, !no_reload)?;
     let terminal = ratatui::init();
     let result = app.run(terminal).await;
     ratatui::restore();
@@ -458,7 +477,7 @@ async fn update_bot_lists(
     Ok(())
 }
 
-fn apply_blocks(root: &Path, db_path: Option<PathBuf>) -> Result<()> {
+fn apply_blocks(root: &Path, db_path: Option<PathBuf>, no_reload: bool) -> Result<()> {
     let db = open_db(db_path)?;
     let default_patterns = db.blocked_user_agent_patterns()?;
     // Sites already known to the db (i.e. previously scanned) — the only
@@ -504,6 +523,13 @@ fn apply_blocks(root: &Path, db_path: Option<PathBuf>) -> Result<()> {
         config_paths.len(),
         changed
     );
+
+    // Writing the sentinel block does nothing until NGINX re-reads it — no
+    // point reloading when nothing actually changed on disk.
+    if changed > 0 && !no_reload {
+        nginx::reload().context("nginx config was applied, but reload failed")?;
+        println!("Reloaded NGINX");
+    }
     Ok(())
 }
 

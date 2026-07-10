@@ -74,8 +74,9 @@ not just one looked up by name: the common redirect-plus-main-site layout
 only ever touch the first one found.
 
 NGINX itself was not available in this environment to validate the generated
-config with `nginx -t`; the generator was only checked against the existing
-fixtures and hand-built multi-block cases, not a real NGINX parse.
+config with `nginx -t` at the time this was written; it has since become
+available and was used to find and fix a real quoting bug — see "NGINX
+reload, a real quoting bug, and a duplicate search hint" below.
 
 Parsing avoids both a regex crate and a full NGINX grammar: a single
 comment-aware tokenizer (`#` strips to end of line) feeds a brace-depth stack
@@ -1523,3 +1524,140 @@ was already wrong before Allowlist existed (a plain-IP Block rule's
 address was never checked against connected IPs either), just never
 exercised by a test until this rewrite needed real rule lists containing
 plain IPs to verify the first-match-wins logic against.
+
+## NGINX reload, a real quoting bug, and a duplicate search hint
+
+Three issues found by exploratory testing on a real machine (NGINX now
+available in this environment, unlike when "NGINX integration" above was
+written).
+
+**1. A bot pattern ending in a backslash corrupted the generated config.**
+Reproduced against a real `nginx -t`: NGINX's config parser treats a `\"`
+immediately before what would be a string's closing quote as an *escaped*
+quote, not a terminator, so a trailing backslash on whichever pattern
+happened to land last in the `|`-joined regex left the quoted state open.
+NGINX then scans for a real closing quote through the rest of the file and
+fails at EOF with `too long parameter, probably missing terminating """
+character` — exactly the error seen in the field. (A trailing backslash
+*pair* avoids that specific failure by collapsing to one backslash before
+the closing quote, but that leftover backslash then fails regex compilation
+instead: `pcre2_compile() failed: \ at end of pattern`. So any trailing
+backslash at all is unsafe, not just an odd run — confirmed with both cases
+against the real binary.) Each botlist parser already filtered patterns
+containing a literal `"` (they'd break out of the string the same way), but
+none filtered a trailing backslash, and `nginx-bad-bots` in particular is a
+~700-entry scraped list where a malformed trailing-backslash entry is
+entirely plausible upstream.
+
+Fixed at the point patterns get joined into NGINX syntax (`nginx::
+is_embeddable`/`join_patterns` in `src/nginx.rs`), not only at the botlist
+parsers: this is the single place all three current sources' output (and
+any row already sitting in the db from before this fix) funnels through, so
+it's the actual last line of defense regardless of where a bad pattern came
+from. The three parsers also got the same filter extended (`!p.contains('"')
+&& !p.ends_with('\\')`) for defense in depth and to keep obviously-unusable
+patterns out of the db entirely, matching their existing quote-filtering.
+Regression test in `nginx.rs` writes the exact scenario and asserts the
+sentinel's closing quote lands where expected; verified end to end against
+a real `nginx -t` during development (not committed as an automated test,
+since it needs the `nginx` binary).
+
+**1b. This was not the actual production failure.** After landing the fix
+above, the same `too long parameter, probably missing terminating """
+character` error recurred on the real machine. Re-tested against a real
+`nginx -t` with a properly *terminated* quoted string of increasing length
+and found a second, unrelated cause: NGINX's config parser has a hard
+ceiling on a single quoted parameter's length, somewhere around 4100 bytes
+(matching `NGX_CONF_BUFFER`) — confirmed by binary search (4090 bytes: ok;
+4095: fails) and confirmed the boundary isn't about file position either (a
+2000-byte parameter still parses fine after ~10KB of unrelated preceding
+content). A single `if ($http_user_agent ~* "pattern1|pattern2|...")`
+holding every blocked bot's pattern joined with `|` trivially exceeds that
+once there are enough bots — `nginx-bad-bots` alone is ~700 entries, and a
+synthetic 700-entry list reproduced the exact production error end to end
+(`nginx -t` on the generated config: fails before the fix, "syntax is ok"
+after).
+
+Fixed by splitting: `chunk_pattern` (in `src/nginx.rs`) breaks the `|`-joined
+pattern back into pieces of at most `MAX_PATTERN_CHUNK_LEN` (2000, well
+under the observed ~4100-byte failure point) bytes each, splitting only on
+`|` boundaries so no individual bot pattern is ever cut in half.
+`block_text` renders one `if ($http_user_agent ~* "chunk") { return 403; }`
+per chunk instead of a single one — sequential `if` statements are
+equivalent to one big alternation (whichever fires first returns 403), so
+this changes nothing about *what* gets blocked, only how it's written. A
+pattern short enough for one chunk (every existing test fixture) still
+renders as exactly one `if`, so this was a no-op for all prior test
+coverage. The one place that had to change to match: `current_block_pattern`
+(backing `site_apply_status`) previously read only the *first* `~* "..."`
+occurrence in a sentinel block; a chunked block now has several, so it
+collects every occurrence and rejoins them with `|` to reconstruct the full
+pattern — otherwise any site with a long enough pattern list would read
+permanently `Stale` immediately after a successful apply, since the
+comparison would only ever see the first chunk. Verified end to end with a
+synthetic 700-entry list, both via a unit test (asserts every generated
+line stays under the safe chunk length and `site_apply_status` reads
+`UpToDate` right after applying) and against a real `nginx -t`.
+
+**2. Applying blocking rules never reloaded NGINX**, so a freshly-applied
+rule had no effect until an admin manually reloaded — the actual bug the
+first exploratory-testing note flagged. Added `nginx::reload()` (`nginx -t`
+then `systemctl reload nginx`; the explicit `-t` first gets a caller-facing
+error message instead of digging through `systemctl status`). Wiring it in
+had a test-suite hazard: both `tests/cli.rs`'s `apply-blocks` invocations
+and `site_settings.rs`'s apply tests exercise the real success path
+(`Ok(true)`, a file actually changed) as part of normal test coverage, and
+naively calling `nginx::reload()` inline there would mean `cargo test`
+shells out to the *real* `systemctl reload nginx` against whatever NGINX
+happens to be installed on the machine running the tests — nondeterministic
+in CI, and actually reloads a real service as a side effect of running the
+test suite.
+
+Two different fixes for the two callers:
+- **CLI** (`apply-blocks`): new `--no-reload` flag (tests pass it; real
+  usage leaves it off, since applying is a no-op without a reload).
+- **TUI** (`site_settings.rs`'s "Apply now"/"Apply all"): reload is a real
+  side effect the same way `RenderFirewall`/`UpdateSource` already are, so
+  it doesn't run inline inside the screen's own (unit-tested, no real
+  process execution) `handle_key`. `apply_site`/`apply_all` now return
+  `(String, bool)` — status message plus whether a file actually changed —
+  and `handle_key` turns that into a new `KeyOutcome::ReloadNginx` instead
+  of `Mutated` when something did. `App` (`src/app.rs`) is the only place
+  that actually calls `nginx::reload()`, exactly mirroring how it already
+  owns `render_firewall`. A reload failure appends to the already-set
+  status message rather than replacing it, so a successful apply doesn't
+  get reported as a total failure just because the reload step afterward
+  didn't work.
+
+  This still wasn't the whole story: `site_settings.rs`'s own unit tests
+  only reach `handle_key`, which *returns* `KeyOutcome::ReloadNginx` but
+  never executes it, so they were always safe. `tests/tui.rs`, though,
+  drives a real spawned `stop-bots tui` process through a pty and *does*
+  reach `App::handle_key_event` for real in its Site settings apply tests
+  — missed on the first pass and only caught by asking for a second look
+  before calling this done. Fixed the same way as the CLI: `App::new`
+  gained a `reload_nginx: bool` (stored, checked in the `ReloadNginx` arm
+  before calling `nginx::reload()`), threaded from a new `tui --no-reload`
+  CLI flag, which `tests/tui.rs`'s single `spawn_tui_with_args` choke point
+  now always passes — every pty-driven test is covered, not just the ones
+  that currently apply, so a future test reaching the same path stays safe
+  by default. `App`'s own unit tests (`test_app()`) also pass
+  `reload_nginx: false`, on the same "don't rely on today's coverage
+  staying true" reasoning.
+
+**3. The Bot settings and Site detail search boxes showed two "press /"
+hints at once.** `filtered_bots()` returns nothing until the query is
+non-empty (deliberate — searching starts empty, not "show everything").
+With an empty query and at least one bot loaded, that meant *both* the
+header's `search_line()` ("Press / to search bots by name") *and* the
+results area's empty-state hint ("Press / then type a bot name to search.")
+rendered simultaneously — not two different screens each saying it once,
+but the same screen saying it twice. Fixed by dropping the results-area
+hint for that specific case (empty query, non-empty `bots`) in both
+`bot_settings.rs` and `site_detail.rs`, since the header's hint already
+covers it; the "no bots yet" and "no bots match "query"" hints are
+unaffected. Verified with a `TestBackend` render test in each file
+asserting `"Press /"` appears exactly once, not just by reading the code —
+this was originally a report from looking at the rendered screen, so the
+regression test renders the screen too rather than only exercising
+`filtered_bots()`/`search_line()` in isolation.

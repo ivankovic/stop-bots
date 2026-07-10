@@ -60,14 +60,17 @@ fn unescape(line: &str) -> String {
 /// verbatim (still escaped) since that's what actually gets joined into
 /// the regex, while `name`/`slug` use the unescaped, human-readable form.
 /// Blank lines are skipped defensively (none are expected upstream, but
-/// nothing guarantees that stays true); a line containing a `"` is
-/// dropped, same reasoning as `well_known_bots::parse` — it would break
-/// out of the double-quoted NGINX string it ends up embedded in.
+/// nothing guarantees that stays true); a line containing a `"`, or ending
+/// in a backslash, is dropped, same reasoning as `well_known_bots::parse` —
+/// it would break out of (or leave open) the double-quoted NGINX string it
+/// ends up embedded in. A trailing backslash here means a raw, unpaired one
+/// at the end of the line itself — routine mid-pattern escapes like
+/// `1h4x\.com` are untouched, since the backslash there isn't at the end.
 pub fn parse(text: &str) -> Result<Vec<NewBot>> {
     let bots = text
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.contains('"'))
+        .filter(|line| !line.is_empty() && !line.contains('"') && !line.ends_with('\\'))
         .map(|line| {
             let name = unescape(line);
             NewBot {
@@ -143,5 +146,19 @@ mod tests {
     fn parse_drops_a_line_with_a_quote_in_it() {
         let bots = parse(SAMPLE).unwrap();
         assert!(!bots.iter().any(|b| b.name.contains('"')));
+    }
+
+    #[test]
+    fn parse_drops_a_line_ending_in_a_backslash() {
+        let bots = parse(SAMPLE).unwrap();
+        assert!(!bots
+            .iter()
+            .any(|b| b.user_agent_pattern == "TrailingBackslash\\"));
+    }
+
+    #[test]
+    fn parse_keeps_a_mid_pattern_escape_that_does_not_end_in_a_backslash() {
+        let bots = parse(SAMPLE).unwrap();
+        assert!(bots.iter().any(|b| b.user_agent_pattern == "1h4x\\.com"));
     }
 }

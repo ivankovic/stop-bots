@@ -176,14 +176,23 @@ impl BotSettings {
 
         let matches = self.filtered_bots();
         if matches.is_empty() {
+            // No third "type something to search" hint here when the query
+            // is empty and there are bots to search: `search_line()` above
+            // already renders "Press / to search bots by name" in that
+            // case, so a second hint would just repeat it.
             let hint = if !self.query.is_empty() {
-                format!("No bots match \"{}\".", self.query)
+                Some(format!("No bots match \"{}\".", self.query))
             } else if self.bots.is_empty() {
-                "No bots yet — pick a source above and \"Update now\" to download some.".to_string()
+                Some(
+                    "No bots yet — pick a source above and \"Update now\" to download some."
+                        .to_string(),
+                )
             } else {
-                "Press / then type a bot name to search.".to_string()
+                None
             };
-            frame.render_widget(Paragraph::new(hint).dim(), results_area);
+            if let Some(hint) = hint {
+                frame.render_widget(Paragraph::new(hint).dim(), results_area);
+            }
             return;
         }
 
@@ -827,5 +836,35 @@ mod tests {
             .spans
             .iter()
             .any(|s| s.content.contains("(override)")));
+    }
+
+    /// Regression test for a real bug: with an empty query and at least one
+    /// bot loaded, the header search line and the (then-empty) results area
+    /// both rendered a "press /" hint at once — the header's own "Press /
+    /// to search bots by name" made the results area's "Press / then type a
+    /// bot name to search." entirely redundant.
+    #[test]
+    fn press_slash_hint_renders_only_once_with_an_empty_query() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let db = test_db_with_bot("gptbot", true);
+        let mut screen = BotSettings::default();
+        screen.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert_eq!(content.matches("Press /").count(), 1);
     }
 }

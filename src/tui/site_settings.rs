@@ -286,16 +286,25 @@ impl SiteSettings {
                     if popup.selected != 1 {
                         return Ok(KeyOutcome::Consumed);
                     }
-                    *message = Some(match popup.action {
-                        PopupAction::Scan => self.scan(db),
+                    let (result_message, wrote_nginx_config) = match popup.action {
+                        PopupAction::Scan => (self.scan(db), false),
                         PopupAction::Apply(index) => self.apply_site(db, index),
                         PopupAction::ApplyAll => self.apply_all(db),
+                    };
+                    *message = Some(result_message);
+                    // Neither of these necessarily writes to the db
+                    // (applying only touches nginx files), but `Mutated` is
+                    // also how every screen's state gets refreshed —
+                    // needed here so the status tags reflect the files we
+                    // just wrote. An apply that actually changed a file
+                    // asks `App` to reload NGINX on top of that (see
+                    // `KeyOutcome::ReloadNginx`'s doc comment for why that
+                    // happens there and not inline here).
+                    return Ok(if wrote_nginx_config {
+                        KeyOutcome::ReloadNginx
+                    } else {
+                        KeyOutcome::Mutated
                     });
-                    // None of these necessarily write to the db (applying
-                    // only touches nginx files), but `Mutated` is also how
-                    // every screen's state gets refreshed — needed here so
-                    // the status tags reflect the files we just wrote.
-                    return Ok(KeyOutcome::Mutated);
                 }
                 _ => return Ok(KeyOutcome::Consumed),
             }
@@ -388,21 +397,23 @@ impl SiteSettings {
     /// Applies just `self.sites[index]`'s currently computed rule to its
     /// own config file, returning a status message either way (consumed by
     /// the caller for `App`'s shared `message` field — see the module doc
-    /// comment for why that's not enough on its own). On failure, also
-    /// sets `self.alert` so the error is actually visible on this screen;
-    /// a permission-denied write gets an extra, actionable suggestion.
-    fn apply_site(&mut self, db: &Db, index: usize) -> String {
+    /// comment for why that's not enough on its own) alongside whether the
+    /// file actually changed, so the caller knows whether to ask `App` to
+    /// reload NGINX. On failure, also sets `self.alert` so the error is
+    /// actually visible on this screen; a permission-denied write gets an
+    /// extra, actionable suggestion.
+    fn apply_site(&mut self, db: &Db, index: usize) -> (String, bool) {
         let server_name = self.sites[index].server_name.clone();
         match self.run_apply_site(db, index) {
-            Ok(true) => format!("Applied blocking rules to {server_name}"),
-            Ok(false) => format!("{server_name} was already up to date"),
+            Ok(true) => (format!("Applied blocking rules to {server_name}"), true),
+            Ok(false) => (format!("{server_name} was already up to date"), false),
             Err(err) => {
                 let mut alert = format!("Failed to apply rules to {server_name}:\n{err}");
                 if is_permission_denied(&err) {
                     alert.push_str("\n\nTry running as root.");
                 }
                 self.alert = Some(alert);
-                format!("Apply failed for {server_name}")
+                (format!("Apply failed for {server_name}"), false)
             }
         }
     }
@@ -420,8 +431,10 @@ impl SiteSettings {
     /// any failures are collected into one alert afterwards (with the same
     /// "Try running as root" suggestion if any of them was a permission
     /// error — the common case, since a single process either has root or
-    /// doesn't, so one failure usually means they all will).
-    fn apply_all(&mut self, db: &Db) -> String {
+    /// doesn't, so one failure usually means they all will). The returned
+    /// bool is whether *any* site's file actually changed, same meaning as
+    /// `apply_site`'s.
+    fn apply_all(&mut self, db: &Db) -> (String, bool) {
         let total = self.sites.len();
         let mut applied = 0;
         let mut unchanged = 0;
@@ -451,9 +464,12 @@ impl SiteSettings {
             self.alert = Some(alert);
         }
 
-        format!(
-            "Applied blocking rules to {applied} site(s), {unchanged} already up to date, {} failed",
-            failures.len()
+        (
+            format!(
+                "Applied blocking rules to {applied} site(s), {unchanged} already up to date, {} failed",
+                failures.len()
+            ),
+            applied > 0,
         )
     }
 }
@@ -786,7 +802,7 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
 
-        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(outcome, KeyOutcome::ReloadNginx);
         assert!(message.unwrap().contains("Applied"));
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("BadBot-UA"));
@@ -1029,7 +1045,7 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
 
-        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(outcome, KeyOutcome::ReloadNginx);
         assert!(message.unwrap().contains("Applied blocking rules to 2"));
         assert!(fs::read_to_string(&path_a).unwrap().contains("BadBot-UA"));
         assert!(fs::read_to_string(&path_b).unwrap().contains("BadBot-UA"));

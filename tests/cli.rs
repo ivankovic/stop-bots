@@ -54,6 +54,11 @@ fn update_scan_and_apply_blocks_happy_path() {
         .success()
         .stdout(predicate::str::contains("Discovered 2 site(s)"));
 
+    // `--no-reload`: this test's "nginx root" is a throwaway temp dir, not
+    // the real system config, so there's nothing for a real `nginx -t` /
+    // `systemctl reload nginx` to validate — and the CLI would otherwise
+    // reload the machine's actual NGINX (if any) as a side effect of
+    // running this test suite.
     Command::cargo_bin("stop-bots")
         .unwrap()
         .args([
@@ -62,6 +67,7 @@ fn update_scan_and_apply_blocks_happy_path() {
             nginx_root.to_str().unwrap(),
             "--db",
             db_path.to_str().unwrap(),
+            "--no-reload",
         ])
         .assert()
         .success()
@@ -83,6 +89,7 @@ fn update_scan_and_apply_blocks_happy_path() {
             nginx_root.to_str().unwrap(),
             "--db",
             db_path.to_str().unwrap(),
+            "--no-reload",
         ])
         .assert()
         .success()
@@ -169,6 +176,7 @@ fn apply_blocks_scopes_a_site_override_to_its_own_file_even_with_a_shared_server
             nginx_root.to_str().unwrap(),
             "--db",
             db_path.to_str().unwrap(),
+            "--no-reload",
         ])
         .assert()
         .success();

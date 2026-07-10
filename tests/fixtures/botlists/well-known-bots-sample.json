@@ -48,5 +48,13 @@
       "accepted": ["GoodBot", "Evil\"Bot"],
       "forbidden": []
     }
+  },
+  {
+    "id": "trailing-backslash-bot",
+    "categories": ["ai"],
+    "pattern": {
+      "accepted": ["Trailing\\\\"],
+      "forbidden": []
+    }
   }
 ]
