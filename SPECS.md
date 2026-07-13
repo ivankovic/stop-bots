@@ -1798,7 +1798,7 @@ already used elsewhere, not a new kind of fragility.
 A new fifth tab, `d`/`b`/`s`/`p` jump keys (was `d`/`b`/`s`), inserted
 between Site settings and Help in the tab cycle. Two panels — "Top IPs
 attempting SSH connection" and "Top User Agents" — each a ranked,
-navigable list tagged `PENDING` or `BLOCKED` (`BLOCKED until <Nd/Nh>` for
+navigable list tagged `NOT BLOCKED` or `BLOCKED` (`BLOCKED until <Nd/Nh>` for
 a temporary `firewall_rules` row, bare `BLOCKED` for a permanent one).
 `Tab`/`Shift+Tab` switch which panel `Up`/`Down`/`j`/`k` apply to; `Enter`
 permanently blocks the selected row. This superseded the Dashboard's
@@ -1987,7 +1987,7 @@ right next to a selector).
 Three additions to the existing SSH/User Agent panels: `BLOCKED` rows
 render in red (`style_by_status`, mirroring `dashboard.rs::policy_tag`'s
 fixed, theme-independent red/green — not varied per light/dark theme); a
-shared `f`-cycled `Filter` (`All` -> `PendingOnly` -> `BlockedOnly` ->
+shared `f`-cycled `Filter` (`All` -> `NotBlockedOnly` -> `BlockedOnly` ->
 `All`) applied to both panels at once; and `Enter` now unblocks an
 already-`Blocked` row instead of only ever (re-)blocking.
 

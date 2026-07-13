@@ -53,9 +53,9 @@ Tab / Shift+Tab (or Left/Right, or their vim `h`/`l` aliases) cycle through the 
   site lets you override its category/bot policy individually.
 - **Dynamic Protection**: a live, actionable view of what's currently hitting the server — "Top
   IPs attempting SSH connection" and "Top User Agents", each ranked by count and tagged
-  `PENDING`/`BLOCKED` (shown in red). `Tab`/`Shift+Tab` switch which of the two panels
-  `Up`/`Down` apply to; `f` cycles a shared filter (all / pending only / blocked only);
-  `Enter` blocks the selected `PENDING` row, or unblocks it if it's already `BLOCKED`.
+  `NOT BLOCKED`/`BLOCKED` (shown in red). `Tab`/`Shift+Tab` switch which of the two panels
+  `Up`/`Down` apply to; `f` cycles a shared filter (all / not blocked only / blocked only);
+  `Enter` blocks the selected `NOT BLOCKED` row, or unblocks it if it's already `BLOCKED`.
 - **Help**: the full key-binding reference.
 
 ## What it actually protects against

@@ -19,11 +19,11 @@
 //! The Dynamic Protection screen: a live, actionable view of what's
 //! currently hitting the server, split into two panels — "Top IPs
 //! attempting SSH connection" and "Top User Agents" — each ranked by count
-//! and tagged `PENDING` or `BLOCKED` (rendered in red). `Tab`/`Shift+Tab`
+//! and tagged `NOT BLOCKED` or `BLOCKED` (rendered in red). `Tab`/`Shift+Tab`
 //! switch which panel `Up`/`Down` (or `j`/`k`) move through; `f` cycles a
-//! shared display filter (All / Pending only / Blocked only) applied to
+//! shared display filter (All / Not blocked only / Blocked only) applied to
 //! both panels; `Enter` toggles the selected row's block state — blocks a
-//! `Pending` row, unblocks a `Blocked` one. All of this is storage-only,
+//! `NOT BLOCKED` row, unblocks a `BLOCKED` one. All of this is storage-only,
 //! same as everywhere else in this codebase: (un)blocking an IP only adds
 //! or removes a `firewall_rules` row (`render-firewall`, then applying the
 //! script, is what actually enforces it — and its lockout-safety check
@@ -46,12 +46,12 @@
 //! tally) won't show up here; this panel is about traffic that's *getting
 //! through*, not a complete traffic log.
 //!
-//! Both panels use the same `RowStatus`: `Pending` (no block on file yet)
-//! or `Blocked` (`until: Some(t)` for a temporary `firewall_rules` block —
-//! e.g. one `block-scanners` already added — `None` for permanent). Only
-//! the SSH panel can show a temporary `Blocked`; a manually-blocked user
-//! agent is always permanent, since [`crate::db::Db::block_user_agent`]
-//! has no TTL concept.
+//! Both panels use the same `RowStatus`: `Pending` (no block on file yet,
+//! rendered as "NOT BLOCKED") or `Blocked` (`until: Some(t)` for a temporary
+//! `firewall_rules` block — e.g. one `block-scanners` already added — `None`
+//! for permanent). Only the SSH panel can show a temporary `Blocked`; a
+//! manually-blocked user agent is always permanent, since
+//! [`crate::db::Db::block_user_agent`] has no TTL concept.
 //!
 //! `refresh` itself (which resolves the live SSH log via
 //! `sshlog::find_default_source`, the same fixed-paths-or-journalctl
@@ -98,7 +98,7 @@ enum RowStatus {
 impl RowStatus {
     fn label(self) -> String {
         match self {
-            RowStatus::Pending => "PENDING".to_string(),
+            RowStatus::Pending => "NOT BLOCKED".to_string(),
             RowStatus::Blocked { until: None } => "BLOCKED".to_string(),
             RowStatus::Blocked {
                 until: Some(expires_at),
@@ -112,7 +112,7 @@ impl RowStatus {
 }
 
 /// A shared display filter applied to both panels — cycled with `f`
-/// (`All` -> `PendingOnly` -> `BlockedOnly` -> `All`). One filter for both
+/// (`All` -> `NotBlockedOnly` -> `BlockedOnly` -> `All`). One filter for both
 /// panels rather than a separate one each: this screen only ever shows one
 /// filter's worth of state at a time in its titles, and both panels share
 /// the same "what am I looking for right now" question (either "what's
@@ -145,7 +145,7 @@ impl Filter {
     fn label(self) -> &'static str {
         match self {
             Filter::All => "all",
-            Filter::PendingOnly => "pending only",
+            Filter::PendingOnly => "not blocked only",
             Filter::BlockedOnly => "blocked only",
         }
     }
@@ -274,7 +274,7 @@ impl DynamicProtection {
     /// (resolved against that panel's *filtered* rows — see
     /// [`Self::visible_ssh_rows`]/[`Self::visible_ua_rows`], since the
     /// selection index refers to a position on screen, not in the full
-    /// underlying `ssh_rows`/`ua_rows`): a `Pending` row gets permanently
+    /// underlying `ssh_rows`/`ua_rows`): a `NOT BLOCKED` row gets permanently
     /// blocked, a `Blocked` one gets unblocked. A no-op (still `Consumed`,
     /// not `Mutated`) if the panel is empty (or fully filtered out) —
     /// there's nothing to select.
@@ -389,7 +389,7 @@ impl DynamicProtection {
 /// into ranked, status-tagged rows: an address present (with a Block
 /// action) in `firewall_blocks` is `Blocked` (its `Option<i64>` is the
 /// rule's `expires_at`, `None` meaning permanent); everything else is
-/// `Pending`. Sorted by count descending, address ascending as a
+/// `NOT BLOCKED`. Sorted by count descending, address ascending as a
 /// deterministic tiebreaker.
 fn build_ssh_rows(
     counts: HashMap<String, u64>,
@@ -419,7 +419,7 @@ fn build_ssh_rows(
 
 /// Turns `stats` (already sorted by `Db::list_user_agent_stats`) into
 /// status-tagged rows: a user agent present in `blocked` is permanently
-/// `Blocked` (manual blocks have no TTL); everything else is `Pending`.
+/// `Blocked` (manual blocks have no TTL); everything else is `NOT BLOCKED`.
 fn build_ua_rows(stats: Vec<UserAgentStat>, blocked: &HashSet<String>) -> Vec<UaRow> {
     stats
         .into_iter()
@@ -928,7 +928,7 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Top IPs attempting SSH connection"));
         assert!(content.contains("198.51.100.9"));
-        assert!(content.contains("PENDING"));
+        assert!(content.contains("NOT BLOCKED"));
         assert!(content.contains("Top User Agents"));
         assert!(content.contains("curl/8.0"));
     }
