@@ -53,11 +53,20 @@ pub enum CronJob {
     /// "automate both together" caveat before this feature existed).
     UpdateIpRanges,
     /// Runs `scanblock::block_ssh_scanners` against the auto-detected SSH
-    /// log.
+    /// log — on [`CronJob::interval`]'s tightest cadence, so an ongoing
+    /// brute-force attempt gets blocked while it's still running rather
+    /// than hours later.
     BlockScanners,
     /// Runs `scanblock::block_web_scanners` against the auto-detected
-    /// NGINX access log.
+    /// NGINX access log — same tightest cadence as `BlockScanners`, for the
+    /// same reason: catch a URL-enumeration scan while it's still in
+    /// progress.
     BlockWebScanners,
+    /// Runs `accessstats::record_access_stats` against the auto-detected
+    /// NGINX access log — tallies successful-request user agents into
+    /// `user_agent_stats`, independent of (and against the same log as)
+    /// `BlockWebScanners`'s bad-traffic detection.
+    RecordAccessStats,
     /// Renders the current firewall rules to the same default path the
     /// Dashboard's `f`-key popup defaults to, using the nftables backend
     /// (handles allowlist geo mode; iptables doesn't — see
@@ -66,10 +75,11 @@ pub enum CronJob {
 }
 
 impl CronJob {
-    pub const ALL: [CronJob; 4] = [
+    pub const ALL: [CronJob; 5] = [
         CronJob::UpdateIpRanges,
         CronJob::BlockScanners,
         CronJob::BlockWebScanners,
+        CronJob::RecordAccessStats,
         CronJob::RenderFirewall,
     ];
 
@@ -81,6 +91,7 @@ impl CronJob {
             CronJob::UpdateIpRanges => "update_ip_ranges",
             CronJob::BlockScanners => "block_scanners",
             CronJob::BlockWebScanners => "block_web_scanners",
+            CronJob::RecordAccessStats => "record_access_stats",
             CronJob::RenderFirewall => "render_firewall",
         }
     }
@@ -91,6 +102,7 @@ impl CronJob {
             CronJob::UpdateIpRanges => "Update crawler IP ranges",
             CronJob::BlockScanners => "Block SSH scanners",
             CronJob::BlockWebScanners => "Block web scanners",
+            CronJob::RecordAccessStats => "Record access-log stats",
             CronJob::RenderFirewall => "Render firewall script",
         }
     }
@@ -99,20 +111,27 @@ impl CronJob {
     /// blanket interval:
     /// - `UpdateIpRanges`: daily — crawler ranges change slowly; this only
     ///   needs to stay roughly current.
-    /// - `BlockScanners`: every 4 hours — SSH brute-forcing tends to be an
-    ///   ongoing campaign, not a single burst, so there's less urgency
-    ///   than the web case.
-    /// - `BlockWebScanners`: hourly — a URL-enumeration scan is typically
-    ///   a single short automated pass (minutes), so catching it sooner
-    ///   matters more, and its Block rules already expire in a day anyway.
+    /// - `BlockScanners`/`BlockWebScanners`: every minute — both are
+    ///   detection, and the whole point of detection is catching an attack
+    ///   while it's still happening rather than finding out about it after
+    ///   the fact. A minute is also the practical floor: `App::check_cron`
+    ///   only re-checks which jobs are due once a minute
+    ///   (`CRON_CHECK_INTERVAL` in `crate::app`), so anything shorter
+    ///   wouldn't actually run any sooner, just get asked for more often.
+    /// - `RecordAccessStats`: every minute, same as `BlockWebScanners` — it
+    ///   reads the same log, so there's no reason to check it on a
+    ///   different cadence; unlike detection there's no urgency here
+    ///   either way, but matching the cadence keeps both jobs seeing
+    ///   comparable log windows.
     /// - `RenderFirewall`: daily — just needs to stay reasonably in sync
     ///   with whatever's accumulated in `firewall_rules` since the last
     ///   render; nothing about it is time-sensitive the way detection is.
     pub fn interval(self) -> Duration {
         match self {
             CronJob::UpdateIpRanges => Duration::from_secs(24 * 60 * 60),
-            CronJob::BlockScanners => Duration::from_secs(4 * 60 * 60),
-            CronJob::BlockWebScanners => Duration::from_secs(60 * 60),
+            CronJob::BlockScanners => Duration::from_secs(60),
+            CronJob::BlockWebScanners => Duration::from_secs(60),
+            CronJob::RecordAccessStats => Duration::from_secs(60),
             CronJob::RenderFirewall => Duration::from_secs(24 * 60 * 60),
         }
     }
@@ -197,12 +216,8 @@ mod tests {
     fn a_job_run_past_its_interval_is_due_again() {
         let db = Db::open_in_memory().unwrap();
         let interval = CronJob::BlockWebScanners.interval().as_secs() as i64;
-        db.set_cron_last_run(
-            CronJob::BlockWebScanners.id(),
-            now() - interval - 60,
-            "ran",
-        )
-        .unwrap();
+        db.set_cron_last_run(CronJob::BlockWebScanners.id(), now() - interval - 60, "ran")
+            .unwrap();
         assert!(is_due(&db, CronJob::BlockWebScanners).unwrap());
     }
 
@@ -210,12 +225,8 @@ mod tests {
     fn a_job_run_within_its_interval_is_not_due() {
         let db = Db::open_in_memory().unwrap();
         let interval = CronJob::BlockWebScanners.interval().as_secs() as i64;
-        db.set_cron_last_run(
-            CronJob::BlockWebScanners.id(),
-            now() - interval + 60,
-            "ran",
-        )
-        .unwrap();
+        db.set_cron_last_run(CronJob::BlockWebScanners.id(), now() - interval + 60, "ran")
+            .unwrap();
         assert!(!is_due(&db, CronJob::BlockWebScanners).unwrap());
     }
 

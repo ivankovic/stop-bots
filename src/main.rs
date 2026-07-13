@@ -191,7 +191,7 @@ enum Command {
         /// hits, and not a rate — this module doesn't parse timestamps)
         /// before an IP is considered a scanner rather than a client that
         /// hit one dead link
-        #[arg(long, default_value_t = 15)]
+        #[arg(long, default_value_t = 7)]
         threshold: usize,
         /// How many days an added block rule lasts before it's
         /// automatically dropped (re-added on a later run if the IP is
@@ -205,6 +205,27 @@ enum Command {
         /// Show what would be added without writing to the database
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Reads the NGINX access log and tallies which user agents made a
+    /// successful (non-4xx/5xx) request, adding the counts onto the
+    /// `user_agent_stats` table (see stop_bots::accessstats::
+    /// record_access_stats) — a read of who's actually visiting
+    /// successfully, complementing BlockWebScanners' bad-traffic detection
+    /// rather than replacing it. Additive across runs: re-running over an
+    /// overlapping or rotated log window accumulates onto each user
+    /// agent's existing count instead of resetting it.
+    RecordAccessStats {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Check this NGINX access log file instead of the default
+        /// /var/log/nginx/access.log
+        #[arg(long)]
+        access_log: Option<PathBuf>,
+    },
+    /// Lists recorded user-agent hit counts, most-seen first
+    ListAccessStats {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
     },
     /// Download and store the current CIDR list for one published crawler
     /// IP-range source (Googlebot, Bingbot or GPTBot)
@@ -344,6 +365,8 @@ async fn main() -> Result<()> {
             access_log,
             dry_run,
         }) => block_web_scanners(db, threshold, ttl_days, access_log, dry_run),
+        Some(Command::RecordAccessStats { db, access_log }) => record_access_stats(db, access_log),
+        Some(Command::ListAccessStats { db }) => list_access_stats(db),
         Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
         Some(Command::UpdateCountryRanges { db, country }) => {
             update_country_ranges(db, country).await
@@ -753,7 +776,8 @@ fn block_scanners(
         }
     };
 
-    let outcome = stop_bots::scanblock::block_ssh_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
+    let outcome =
+        stop_bots::scanblock::block_ssh_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
         println!("No scanning IPs found (threshold: {threshold} failed attempt(s)).");
         return Ok(());
@@ -791,7 +815,8 @@ fn block_web_scanners(
         }
     };
 
-    let outcome = stop_bots::scanblock::block_web_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
+    let outcome =
+        stop_bots::scanblock::block_web_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
         println!("No scanning IPs found (threshold: {threshold} distinct 404'd path(s)).");
         return Ok(());
@@ -827,7 +852,10 @@ fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
         if outcome.dry_run {
             println!("Would block {ip} for {} day(s) (dry run)", outcome.ttl_days);
         } else {
-            println!("Added block rule for {ip}, expiring in {} day(s)", outcome.ttl_days);
+            println!(
+                "Added block rule for {ip}, expiring in {} day(s)",
+                outcome.ttl_days
+            );
         }
     }
     if outcome.newly_blocked.is_empty() {
@@ -851,6 +879,52 @@ fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
             outcome.ttl_days
         );
     }
+}
+
+/// Reads the NGINX access log and records successful-request user-agent
+/// counts — see [`stop_bots::accessstats::record_access_stats`] for the
+/// shared detection/persistence logic (also used by the internal cron's
+/// `RecordAccessStats` job). This CLI wrapper only resolves the log source
+/// and prints the returned outcome's summary.
+fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+
+    let log_path = access_log
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(accesslog::DEFAULT_LOG_PATH));
+    let source = match access_log.as_deref() {
+        Some(path) => accesslog::read_log_file(path),
+        None => accesslog::find_default_source(),
+    };
+    let log_text = match source {
+        accesslog::LogSource::Found(text) => text,
+        accesslog::LogSource::Unavailable => {
+            anyhow::bail!(
+                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
+                 --access-log, or run as root, for this to work"
+            );
+        }
+    };
+
+    let outcome =
+        stop_bots::accessstats::record_access_stats(&db, &log_path.to_string_lossy(), &log_text)?;
+    println!("{}", outcome.summary());
+    Ok(())
+}
+
+/// Lists every recorded user agent's accumulated hit count, most-seen
+/// first (see [`stop_bots::db::Db::list_user_agent_stats`]).
+fn list_access_stats(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+    let stats = db.list_user_agent_stats()?;
+    if stats.is_empty() {
+        println!("No user-agent stats recorded yet — run record-access-stats first.");
+        return Ok(());
+    }
+    for stat in stats {
+        println!("{:>8}  {}", stat.hit_count, stat.user_agent);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1094,8 +1168,7 @@ mod tests {
         let db_path = tmp.path().join("db.sqlite3");
 
         let log_path = tmp.path().join("auth.log");
-        let log: String =
-            "Failed password for root from 198.51.100.9 port 4444 ssh2\n".repeat(25);
+        let log: String = "Failed password for root from 198.51.100.9 port 4444 ssh2\n".repeat(25);
         std::fs::write(&log_path, &log).unwrap();
 
         block_scanners(Some(db_path.clone()), 20, -1, Some(log_path.clone()), false).unwrap();
@@ -1130,5 +1203,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(raw_count, 1);
+    }
+
+    fn ok_line(ip: &str, user_agent: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 512 \"-\" \"{user_agent}\"\n"
+        )
+    }
+
+    #[test]
+    fn record_access_stats_persists_counts_from_the_default_log_path_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite3");
+        let log_path = tmp.path().join("access.log");
+        let mut log = String::new();
+        log.push_str(&ok_line("203.0.113.5", "Mozilla/5.0"));
+        log.push_str(&ok_line("203.0.113.6", "Mozilla/5.0"));
+        std::fs::write(&log_path, log).unwrap();
+
+        record_access_stats(Some(db_path.clone()), Some(log_path)).unwrap();
+
+        let db = Db::open(&db_path).unwrap();
+        let stats = db.list_user_agent_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].user_agent, "Mozilla/5.0");
+        assert_eq!(stats[0].hit_count, 2);
+    }
+
+    #[test]
+    fn list_access_stats_succeeds_on_an_empty_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("db.sqlite3");
+        Db::open(&db_path).unwrap();
+
+        list_access_stats(Some(db_path)).unwrap();
     }
 }

@@ -20,9 +20,12 @@
 //! settings (Scanners/Search Bots/AI Bots defaults, navigable and editable
 //! via a popup, mirroring how Bot settings edits a single bot's override),
 //! how many sites are known, whether bot-list sources are up to date, and
-//! host-wide geo-blocking (see "Geo-blocking" below). No per-request traffic
-//! metrics yet (see TODO.md) — there is no log analysis backend to source
-//! them from.
+//! host-wide geo-blocking (see "Geo-blocking" below). The "Summary" panel is
+//! deliberately just a glance — it used to also fold in top user agents
+//! seen in successful traffic, but that's moved to its own dedicated
+//! "Dynamic Protection" screen (`crate::tui::dynamic_protection`), which
+//! also lets an admin act on it (permanently block one), not just look at
+//! it.
 //!
 //! ## Geo-blocking
 //!
@@ -105,11 +108,15 @@ enum Popup {
     GeoMode {
         selected: usize,
     },
-    /// Firewall rendering: select backend (0 = iptables, 1 = nftables) and
-    /// enter the output path.
+    /// Firewall rendering: select backend (0 = iptables, 1 = nftables),
+    /// enter the output path, and optionally toggle `apply_after_write`
+    /// (Space) so confirming with Enter also actually enforces the script
+    /// (`firewall::apply_script`, gated by `App::apply_firewall`) instead of
+    /// only writing it for the admin to apply by hand.
     RenderFirewall {
         backend_selected: usize,
         out_path: String,
+        apply_after_write: bool,
         error: Option<String>,
     },
 }
@@ -132,6 +139,14 @@ pub struct Dashboard {
     /// here — this panel only displays it, `App` is what actually runs due
     /// jobs.
     cron_status: Vec<crate::cron::JobStatus>,
+    /// Whether the current rule set (`firewall::all_rules`) differs from
+    /// what was in effect the last time the firewall was actually rendered
+    /// (`firewall::rules_signature`, compared via
+    /// `Db::get_firewall_rendered_signature`) — shown as a Summary panel
+    /// row so an admin can tell, without opening the render popup, whether
+    /// e.g. a scanner blocked since the last daily `RenderFirewall` cron
+    /// tick is actually reflected in the on-disk script yet.
+    firewall_needs_update: bool,
 }
 
 impl Dashboard {
@@ -146,6 +161,7 @@ impl Dashboard {
         self.selected_countries = db.list_selected_countries()?;
         self.fetched_countries = db.list_fetched_countries()?;
         self.cron_status = crate::cron::status(db)?;
+        self.firewall_needs_update = firewall_needs_update(db)?;
         if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
@@ -189,6 +205,17 @@ impl Dashboard {
             .count()
     }
 
+    /// Whether the Summary panel's firewall row currently reads "needs
+    /// updating" — `pub(crate)` and test-only, purely so `App`'s own tests
+    /// (a different module) can assert that a render triggered through the
+    /// key/outcome flow actually refreshes this cached value, not just the
+    /// underlying `Db` signature (see `App::handle_key_event`'s
+    /// `RenderFirewall` arm).
+    #[cfg(test)]
+    pub(crate) fn firewall_needs_update(&self) -> bool {
+        self.firewall_needs_update
+    }
+
     fn needs_update_count(&self) -> usize {
         self.sources.len() - self.up_to_date_count()
     }
@@ -199,12 +226,25 @@ impl Dashboard {
         area: Rect,
         theme: Theme,
         message: &Option<String>,
+        running_jobs: &std::collections::HashSet<crate::cron::CronJob>,
     ) {
+        // Geo-blocking gives up 1 row (8 -> 7) to Summary (4 -> 5, for the
+        // new firewall-status line below) so the total stays exactly what
+        // it was — this project's documented 30-row minimum terminal size
+        // leaves the Messages panel (`Constraint::Min(1)`) no slack to
+        // absorb a net increase (see SPECS.md's "Successful-access
+        // user-agent tracking" entry, which hit the same ceiling and
+        // rebalanced the same way). Geo-blocking is the one to shrink, not
+        // Messages or Bot list sources: it's a scrollable `List`, which
+        // degrades gracefully by scrolling to the selected row when its
+        // viewport shrinks, unlike `Paragraph`'s fixed lines, which would
+        // just silently lose whichever line no longer fits.
         let [settings_area, geo_area, stats_area, cron_area, message_area] = Layout::vertical([
             Constraint::Length(5),
-            Constraint::Length(8),
-            Constraint::Length(4),
-            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(5),
+            // 2 border lines + one line per known job.
+            Constraint::Length(2 + crate::cron::CronJob::ALL.len() as u16),
             Constraint::Min(1),
         ])
         .areas(area);
@@ -255,18 +295,27 @@ impl Dashboard {
             });
         frame.render_stateful_widget(country_list, geo_area, &mut self.countries_state);
 
-        let stats = Paragraph::new(vec![
+        let summary = Paragraph::new(vec![
             Line::from(format!("Sites discovered: {}", self.site_count)),
             Line::from(format!(
                 "Bot list sources: {} up to date, {} need updating",
                 self.up_to_date_count(),
                 self.needs_update_count()
             )),
+            Line::from(if self.firewall_needs_update {
+                "Firewall rules: needs updating (press f to update)".to_string()
+            } else {
+                "Firewall rules: up to date".to_string()
+            }),
         ])
-        .block(Block::bordered().title("Stats"));
-        frame.render_widget(stats, stats_area);
+        .block(Block::bordered().title("Summary"));
+        frame.render_widget(summary, stats_area);
 
-        let cron_lines: Vec<Line> = self.cron_status.iter().map(cron_status_line).collect();
+        let cron_lines: Vec<Line> = self
+            .cron_status
+            .iter()
+            .map(|status| cron_status_line(status, running_jobs.contains(&status.job)))
+            .collect();
         let cron_panel = Paragraph::new(cron_lines).block(
             Block::bordered()
                 .title("Scheduled tasks (internal cron — runs only while this TUI is open)"),
@@ -378,11 +427,12 @@ impl Dashboard {
             Popup::RenderFirewall {
                 backend_selected,
                 out_path,
+                apply_after_write,
                 error,
             } => {
                 let title = "Render firewall rules";
-                let width = 50u16;
-                let height = 6u16;
+                let width = 56u16;
+                let height = if error.is_some() { 10 } else { 9 };
                 let popup_area = centered_rect(width, height, area);
 
                 let mut lines = vec![
@@ -399,12 +449,18 @@ impl Dashboard {
                     ]),
                     Line::from(""),
                     Line::from(format!("Output: {}_", out_path)),
+                    Line::from(vec![
+                        Span::from("Apply after writing: "),
+                        Span::from(if apply_after_write { "[x]" } else { "[ ]" }),
+                    ]),
                 ];
                 if let Some(err) = &error {
                     lines.push(Line::from(err.as_str()).red());
                 }
                 lines.push(Line::from("").dim());
-                lines.push(Line::from("↑/↓ change backend  Enter confirm  Esc cancel").dim());
+                lines.push(
+                    Line::from("↑/↓ backend  Space apply toggle  Enter confirm  Esc cancel").dim(),
+                );
 
                 let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
                 frame.render_widget(Clear, popup_area);
@@ -532,18 +588,32 @@ impl Dashboard {
                 Popup::RenderFirewall {
                     backend_selected,
                     out_path,
+                    apply_after_write,
                     error,
                 } => match key.code {
                     KeyCode::Esc => {
                         self.popup = None;
                         return Ok(KeyOutcome::Consumed);
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    // Arrow keys only here, deliberately no `j`/`k` vim
+                    // aliases (unlike every other popup/list in this app):
+                    // this popup has a free-text output-path field, and
+                    // `j`/`k` are common path characters — aliasing them to
+                    // navigation would silently eat any literal 'j'/'k' the
+                    // admin tries to type instead of appending it (caught by
+                    // `pressing_f_then_enter_refreshes_the_dashboards_stale_indicator`
+                    // flaking whenever a temp-dir path happened to contain
+                    // one).
+                    KeyCode::Up => {
                         *backend_selected = backend_selected.saturating_sub(1);
                         return Ok(KeyOutcome::Consumed);
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down => {
                         *backend_selected = (*backend_selected + 1).min(1);
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Char(' ') => {
+                        *apply_after_write = !*apply_after_write;
                         return Ok(KeyOutcome::Consumed);
                     }
                     KeyCode::Char(c) if c.is_ascii_punctuation() || c.is_ascii_alphanumeric() => {
@@ -560,6 +630,7 @@ impl Dashboard {
                         let Some(Popup::RenderFirewall {
                             backend_selected,
                             out_path,
+                            apply_after_write,
                             ..
                         }) = self.popup.take()
                         else {
@@ -574,6 +645,7 @@ impl Dashboard {
                             self.popup = Some(Popup::RenderFirewall {
                                 backend_selected,
                                 out_path,
+                                apply_after_write,
                                 error: Some("Enter an output path".to_string()),
                             });
                             return Ok(KeyOutcome::Consumed);
@@ -582,6 +654,7 @@ impl Dashboard {
                             backend,
                             out_path,
                             force: false,
+                            apply: apply_after_write,
                         });
                     }
                     _ => return Ok(KeyOutcome::Consumed),
@@ -604,6 +677,7 @@ impl Dashboard {
             self.popup = Some(Popup::RenderFirewall {
                 backend_selected: 0, // default to nftables (recommended)
                 out_path: crate::firewall::DEFAULT_OUTPUT_PATH.to_string(),
+                apply_after_write: false,
                 error: None,
             });
             return Ok(KeyOutcome::Consumed);
@@ -706,17 +780,35 @@ fn policy_tag(policy: Policy) -> Span<'static> {
     }
 }
 
+/// Braille "dots" spinner frames for the "Running now" indicator.
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Picks the current spinner frame from wall-clock time rather than a
+/// counter `Dashboard` would need to own and advance itself — since
+/// `render` is called on every redraw of the TUI's draw loop, this alone
+/// is enough to animate smoothly.
+fn spinner_frame() -> char {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame = (millis / 80) % SPINNER_FRAMES.len() as u128;
+    SPINNER_FRAMES[frame as usize]
+}
+
 /// Renders one line of the "Scheduled tasks" panel: the job's label, when
 /// it last ran (or "never"), and its last outcome — or, if it's currently
-/// due, that instead (the outcome shown would otherwise be stale the
-/// moment a job becomes due again, misleadingly implying nothing's changed
-/// since).
-fn cron_status_line(status: &crate::cron::JobStatus) -> Line<'static> {
+/// running in the background (`running`) or due but not yet started, that
+/// instead (the outcome shown would otherwise be stale the moment a job
+/// becomes due again, misleadingly implying nothing's changed since).
+fn cron_status_line(status: &crate::cron::JobStatus, running: bool) -> Line<'static> {
     let last_run = match status.last_run {
         Some(t) => format_relative_time(t),
         None => "never".to_string(),
     };
-    let outcome = if status.due {
+    let outcome = if running {
+        format!("{} Running now", spinner_frame())
+    } else if status.due {
         "due now".to_string()
     } else {
         status
@@ -752,6 +844,20 @@ fn format_relative_time(t: i64) -> String {
     } else {
         format!("{}d ago", elapsed / 86_400)
     }
+}
+
+/// Whether the firewall's current rule set differs from what was in effect
+/// at the last successful render — see the `Dashboard::firewall_needs_update`
+/// field doc for what this drives. Never reads the on-disk script itself:
+/// comparing a signature the app itself persisted on the last successful
+/// write (`Db::get_firewall_rendered_signature`) keeps this hermetic (no
+/// dependency on a real system path existing) and correctly reflects "did
+/// the desired rules change since our own last render", not "does some
+/// file's bytes happen to match", which is also unaffected by which
+/// backend/output path that last render used (see `rules_signature`'s doc).
+fn firewall_needs_update(db: &Db) -> Result<bool> {
+    let current = crate::firewall::rules_signature(&crate::firewall::all_rules(db)?);
+    Ok(db.get_firewall_rendered_signature()?.as_deref() != Some(current.as_str()))
 }
 
 fn is_stale(last_fetched_at: Option<i64>) -> bool {
@@ -818,7 +924,7 @@ mod tests {
             last_summary: None,
             due: true,
         };
-        let rendered = cron_status_line(&status).to_string();
+        let rendered = cron_status_line(&status, false).to_string();
         assert!(rendered.contains("never"));
         assert!(rendered.contains("due now"));
     }
@@ -831,10 +937,31 @@ mod tests {
             last_summary: Some("blocked 2 IP(s)".to_string()),
             due: false,
         };
-        let rendered = cron_status_line(&status).to_string();
+        let rendered = cron_status_line(&status, false).to_string();
         assert!(rendered.contains("1h ago"));
         assert!(rendered.contains("blocked 2 IP(s)"));
         assert!(!rendered.contains("due now"));
+    }
+
+    /// `running` must override both "due now" and any stale summary with a
+    /// "Running now" indicator — the frame character itself is
+    /// time-derived, so only the fixed label is asserted here, not a
+    /// specific spinner glyph.
+    #[test]
+    fn cron_status_line_shows_running_now_when_a_job_is_in_flight() {
+        let status = crate::cron::JobStatus {
+            job: crate::cron::CronJob::RenderFirewall,
+            last_run: Some(now_secs() - 3_600),
+            last_summary: Some("wrote 3 rule(s) to /etc/stop-bots/firewall.nft".to_string()),
+            due: true,
+        };
+        let rendered = cron_status_line(&status, true).to_string();
+        assert!(rendered.contains("Running now"), "rendered was: {rendered}");
+        assert!(!rendered.contains("due now"), "rendered was: {rendered}");
+        assert!(
+            !rendered.contains("wrote 3 rule(s)"),
+            "rendered was: {rendered}"
+        );
     }
 
     #[test]
@@ -853,7 +980,15 @@ mod tests {
         let backend = TestBackend::new(60, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| dashboard.render(frame, frame.area(), Theme::Dark, &None))
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
             .unwrap();
 
         let content = terminal
@@ -868,6 +1003,74 @@ mod tests {
         assert!(content.contains("blocked 3 IP(s)"));
         assert!(content.contains("Update crawler IP ranges"));
         assert!(content.contains("due now"));
+    }
+
+    #[test]
+    fn render_shows_running_now_for_a_job_in_the_running_set() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_cron_last_run(
+            crate::cron::CronJob::BlockScanners.id(),
+            now_secs(),
+            "blocked 3 IP(s)",
+        )
+        .unwrap();
+
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let running_jobs = std::collections::HashSet::from([crate::cron::CronJob::BlockScanners]);
+        let backend = TestBackend::new(60, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| dashboard.render(frame, frame.area(), Theme::Dark, &None, &running_jobs))
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("Running now"), "content was: {content}");
+        assert!(
+            !content.contains("blocked 3 IP(s)"),
+            "content was: {content}"
+        );
+    }
+
+    #[test]
+    fn render_shows_the_summary_panel() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_site("example.com", "/etc/nginx/sites-enabled/example.com")
+            .unwrap();
+
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(60, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("Summary"));
+        assert!(content.contains("Sites discovered: 1"));
     }
 
     #[test]
@@ -946,6 +1149,7 @@ mod tests {
                     frame.area(),
                     Theme::Dark,
                     &Some("Stored 4 bot(s)".to_string()),
+                    &std::collections::HashSet::new(),
                 )
             })
             .unwrap();
@@ -1316,7 +1520,15 @@ mod tests {
         let backend = TestBackend::new(60, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| dashboard.render(frame, frame.area(), Theme::Dark, &None))
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
             .unwrap();
 
         let content = terminal
@@ -1401,5 +1613,252 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::Consumed);
         assert!(dashboard.popup.is_none());
         assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Blocklist);
+    }
+
+    #[test]
+    fn f_key_opens_the_render_firewall_popup_with_defaults() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('f')), &db, &mut message)
+            .unwrap();
+
+        match dashboard.popup.unwrap() {
+            Popup::RenderFirewall {
+                backend_selected,
+                out_path,
+                apply_after_write,
+                error,
+            } => {
+                assert_eq!(backend_selected, 0);
+                assert_eq!(out_path, crate::firewall::DEFAULT_OUTPUT_PATH);
+                assert!(!apply_after_write);
+                assert!(error.is_none());
+            }
+            other => panic!("expected a RenderFirewall popup, got {other:?}"),
+        }
+    }
+
+    /// Regression test: `j`/`k` are common path characters, but every other
+    /// popup/list in this app treats them as vim-style Down/Up aliases.
+    /// This popup has a free-text output-path field, so those aliases must
+    /// NOT apply here — otherwise typing a path containing 'j' or 'k'
+    /// silently drops that character instead of appending it (found via
+    /// `App`'s `pressing_f_then_enter_refreshes_the_dashboards_stale_indicator`
+    /// flaking whenever a temp-dir path happened to contain one).
+    #[test]
+    fn render_firewall_popup_accepts_literal_j_and_k_in_the_output_path() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::RenderFirewall {
+            backend_selected: 0,
+            out_path: String::new(),
+            apply_after_write: false,
+            error: None,
+        });
+
+        let mut message = None;
+        for c in "/tmp/jk-test.nft".chars() {
+            dashboard
+                .handle_key(KeyEvent::from(KeyCode::Char(c)), &db, &mut message)
+                .unwrap();
+        }
+
+        match &dashboard.popup {
+            Some(Popup::RenderFirewall { out_path, .. }) => {
+                assert_eq!(out_path, "/tmp/jk-test.nft")
+            }
+            other => panic!("expected a RenderFirewall popup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn space_toggles_apply_after_write_in_the_render_firewall_popup() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::RenderFirewall {
+            backend_selected: 0,
+            out_path: "/tmp/fw.nft".to_string(),
+            apply_after_write: false,
+            error: None,
+        });
+
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char(' ')), &db, &mut message)
+            .unwrap();
+        match &dashboard.popup {
+            Some(Popup::RenderFirewall {
+                apply_after_write, ..
+            }) => assert!(apply_after_write),
+            other => panic!("expected a RenderFirewall popup, got {other:?}"),
+        }
+
+        // Toggling again flips it back off.
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char(' ')), &db, &mut message)
+            .unwrap();
+        match &dashboard.popup {
+            Some(Popup::RenderFirewall {
+                apply_after_write, ..
+            }) => assert!(!apply_after_write),
+            other => panic!("expected a RenderFirewall popup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_in_render_firewall_popup_carries_the_apply_toggle_through() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::RenderFirewall {
+            backend_selected: 0,
+            out_path: "/tmp/fw.nft".to_string(),
+            apply_after_write: true,
+            error: None,
+        });
+
+        let mut message = None;
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        match outcome {
+            KeyOutcome::RenderFirewall {
+                out_path, apply, ..
+            } => {
+                assert_eq!(out_path, "/tmp/fw.nft");
+                assert!(apply);
+            }
+            other => panic!("expected a RenderFirewall outcome, got {other:?}"),
+        }
+        assert!(dashboard.popup.is_none());
+    }
+
+    #[test]
+    fn render_firewall_popup_rejects_an_empty_output_path_and_stays_open() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::RenderFirewall {
+            backend_selected: 0,
+            out_path: String::new(),
+            apply_after_write: false,
+            error: None,
+        });
+
+        let mut message = None;
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        match dashboard.popup.unwrap() {
+            Popup::RenderFirewall { error, .. } => assert!(error.is_some()),
+            other => panic!("expected a RenderFirewall popup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn firewall_needs_update_is_true_before_any_render() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(firewall_needs_update(&db).unwrap());
+    }
+
+    #[test]
+    fn firewall_needs_update_is_false_right_after_a_matching_render() {
+        let db = Db::open_in_memory().unwrap();
+        let rules = crate::firewall::all_rules(&db).unwrap();
+        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&rules))
+            .unwrap();
+        assert!(!firewall_needs_update(&db).unwrap());
+    }
+
+    #[test]
+    fn firewall_needs_update_is_true_again_after_the_rule_set_changes() {
+        let db = Db::open_in_memory().unwrap();
+        let rules = crate::firewall::all_rules(&db).unwrap();
+        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&rules))
+            .unwrap();
+
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "9.9.9.9".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+
+        assert!(firewall_needs_update(&db).unwrap());
+    }
+
+    #[test]
+    fn render_shows_the_firewall_summary_row() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(60, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("Firewall rules: needs updating"));
+        assert!(content.contains("press f to update"));
+    }
+
+    #[test]
+    fn render_shows_the_firewall_summary_row_as_up_to_date_after_a_render() {
+        let db = Db::open_in_memory().unwrap();
+        let rules = crate::firewall::all_rules(&db).unwrap();
+        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&rules))
+            .unwrap();
+
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(60, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("Firewall rules: up to date"));
+        assert!(!content.contains("needs updating"));
     }
 }

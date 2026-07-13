@@ -21,6 +21,7 @@
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -277,6 +278,17 @@ pub struct NewFirewallRule {
     pub action: FirewallAction,
 }
 
+/// One distinct user agent's accumulated hit count from successful
+/// (non-4xx/5xx) NGINX access-log traffic — see
+/// [`Db::record_user_agent_hits`]/[`Db::list_user_agent_stats`] and
+/// `accesslog::successful_user_agent_counts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserAgentStat {
+    pub user_agent: String,
+    pub hit_count: i64,
+    pub last_seen_at: i64,
+}
+
 /// A published IP-range source for a known crawler (Google, Bing, OpenAI's
 /// GPTBot, ...), distinct from the UA-pattern `bots`/`sources` tables: these
 /// publishers ship one CIDR list covering *all* of their crawling activity,
@@ -496,6 +508,37 @@ impl Db {
                 country_code TEXT PRIMARY KEY,
                 added_at INTEGER NOT NULL
             );
+
+            -- Successful-access user-agent frequency — the complement to
+            -- `firewall_rules`' bad-traffic focus: `accesslog::
+            -- successful_user_agent_counts` tallies who's actually browsing
+            -- the site (status < 400, non-local/private IP) each time
+            -- `Db::record_user_agent_hits` runs, and this table accumulates
+            -- those counts across runs rather than replacing them, so it
+            -- reflects lifetime traffic seen, not just the current log
+            -- window (which may itself be rotated/truncated at any time).
+            CREATE TABLE IF NOT EXISTS user_agent_stats (
+                user_agent TEXT PRIMARY KEY,
+                hit_count INTEGER NOT NULL DEFAULT 0,
+                last_seen_at INTEGER NOT NULL
+            );
+
+            -- Literal user agents an admin chose to permanently block from
+            -- the Dashboard's \"Dynamic Protection\" screen — distinct from
+            -- `bots`/`bot_source_entries`: those describe *known,
+            -- publicly-catalogued* bots with category flags and a merge
+            -- cascade across sources, which doesn't fit a one-off exact
+            -- string an admin flagged by hand. Kept as its own small table,
+            -- same shape as `selected_countries`/`firewall_rules`, and
+            -- folded into `Db::compute_blocked_patterns`'s output (see
+            -- there) so it enforces the same way any other blocked pattern
+            -- does, globally and un-overridable per site — matching how a
+            -- global per-bot pin already can't be overridden by a site's
+            -- category override.
+            CREATE TABLE IF NOT EXISTS blocked_user_agents (
+                user_agent TEXT PRIMARY KEY,
+                blocked_at INTEGER NOT NULL
+            );
             ",
         )?;
 
@@ -515,8 +558,10 @@ impl Db {
             .prepare("SELECT 1 FROM pragma_table_info('firewall_rules') WHERE name = 'expires_at'")?
             .exists([])?;
         if !has_expires_at {
-            self.conn
-                .execute("ALTER TABLE firewall_rules ADD COLUMN expires_at INTEGER", [])?;
+            self.conn.execute(
+                "ALTER TABLE firewall_rules ADD COLUMN expires_at INTEGER",
+                [],
+            )?;
         }
 
         // Seed default category policies, matching the product defaults shown
@@ -906,6 +951,149 @@ impl Db {
             .optional()?)
     }
 
+    /// The rule-set signature (see `firewall::rules_signature`) as of the
+    /// last successful firewall render (`App::render_firewall`/
+    /// `render_firewall_for_cron`), or `None` if it's never rendered —
+    /// compared against what `firewall::all_rules` would produce right now
+    /// to tell the Dashboard's Summary panel whether the on-disk script is
+    /// stale. Reuses the `settings` table under one fixed key: there's only
+    /// ever one "current" render to track regardless of which
+    /// backend/output path last produced it (see `rules_signature`'s doc
+    /// for why that's intentional).
+    pub fn get_firewall_rendered_signature(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'firewall_rendered_signature'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records `signature` as the rule set just successfully written to
+    /// disk by a firewall render.
+    pub fn set_firewall_rendered_signature(&self, signature: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('firewall_rendered_signature', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![signature],
+        )?;
+        Ok(())
+    }
+
+    // ---- user agent stats ----
+
+    /// Adds `counts` (user agent -> hit count from one log-parsing pass, see
+    /// `accesslog::successful_user_agent_counts`) onto `user_agent_stats`.
+    /// Additive, not a replacement: a user agent already on file has
+    /// `hit_count` incremented by this pass's count rather than overwritten,
+    /// so repeated runs over overlapping log windows (or a log that's
+    /// rotated between runs) accumulate a running lifetime total instead of
+    /// losing whatever a previous run already saw. `seen_at` (Unix seconds)
+    /// becomes every touched row's `last_seen_at`; only user agents present
+    /// in `counts` are touched.
+    pub fn record_user_agent_hits(
+        &self,
+        counts: &HashMap<String, u64>,
+        seen_at: i64,
+    ) -> Result<()> {
+        for (user_agent, count) in counts {
+            self.conn.execute(
+                "INSERT INTO user_agent_stats (user_agent, hit_count, last_seen_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(user_agent) DO UPDATE SET
+                    hit_count = hit_count + excluded.hit_count,
+                    last_seen_at = excluded.last_seen_at",
+                params![user_agent, *count as i64, seen_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every recorded user agent's accumulated hit count, most-seen first —
+    /// for the CLI's `list-access-stats` and the Dashboard's "Dynamic
+    /// Protection" screen.
+    pub fn list_user_agent_stats(&self) -> Result<Vec<UserAgentStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT user_agent, hit_count, last_seen_at FROM user_agent_stats
+             ORDER BY hit_count DESC, user_agent ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(UserAgentStat {
+                user_agent: row.get(0)?,
+                hit_count: row.get(1)?,
+                last_seen_at: row.get(2)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list user agent stats")
+    }
+
+    /// How many bytes of `log_path`'s content `record_access_stats` had
+    /// already tallied as of its last pass, or `None` if it's never run
+    /// against this path before — reuses the `settings` table (see the
+    /// cron section above), keyed by path so the CLI's `--access-log`
+    /// override and the cron's default path each track their own progress
+    /// independently. Load-bearing for correctness: without this, every
+    /// cron tick re-reads the *entire* current log and would re-tally
+    /// requests it already counted on a previous pass, inflating
+    /// `user_agent_stats.hit_count` further every minute the log goes
+    /// un-rotated.
+    pub fn get_access_log_offset(&self, log_path: &str) -> Result<Option<u64>> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![format!("access_log_offset:{log_path}")],
+                |row| row.get(0),
+            )
+            .optional()?;
+        value
+            .map(|v| v.parse::<u64>().context("corrupt access_log_offset value"))
+            .transpose()
+    }
+
+    /// Records that `record_access_stats` has now tallied `log_path` up to
+    /// `offset` bytes.
+    pub fn set_access_log_offset(&self, log_path: &str, offset: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![format!("access_log_offset:{log_path}"), offset.to_string()],
+        )?;
+        Ok(())
+    }
+
+    // ---- manually blocked user agents ----
+
+    /// Permanently blocks the literal user agent string `user_agent` —
+    /// idempotent (blocking an already-blocked one is a no-op, not an
+    /// error). Storage-only, same as every other table here: it has no
+    /// effect on NGINX until `apply-blocks` (or Site settings' `a`/`A`)
+    /// re-injects the config, since `blocked_user_agent_patterns`/
+    /// `_for_site` (via `compute_blocked_patterns`) both fold this table's
+    /// contents into the patterns they return.
+    pub fn block_user_agent(&self, user_agent: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO blocked_user_agents (user_agent, blocked_at) VALUES (?1, ?2)",
+            params![user_agent, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Every manually-blocked literal user agent, sorted for deterministic
+    /// output. Used both to render the Dynamic Protection screen's blocked
+    /// state and, escaped, folded into `compute_blocked_patterns`.
+    pub fn list_blocked_user_agents(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_agent FROM blocked_user_agents ORDER BY user_agent")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list blocked user agents")
+    }
+
     // ---- sites ----
 
     /// Records that a site with the given `server_name` was discovered in
@@ -1070,8 +1258,44 @@ impl Db {
     /// `ttl_seconds` isn't validated as positive: a zero or negative value
     /// legitimately produces an already-expired row (used by tests to
     /// exercise pruning deterministically without waiting or mocking time).
-    pub fn add_firewall_rule_with_ttl(&self, rule: &NewFirewallRule, ttl_seconds: i64) -> Result<i64> {
+    pub fn add_firewall_rule_with_ttl(
+        &self,
+        rule: &NewFirewallRule,
+        ttl_seconds: i64,
+    ) -> Result<i64> {
         self.insert_firewall_rule(rule, Some(now() + ttl_seconds))
+    }
+
+    /// Ensures `address` ends up with a permanent (`expires_at = NULL`)
+    /// Block rule — the Dynamic Protection screen's "Enter" action, for
+    /// both a not-yet-blocked IP and one already temporarily blocked by
+    /// `block-scanners`/`block-web-scanners` (that TTL is upgraded to
+    /// permanent, since pressing Enter on an already-blocked row is a
+    /// deliberate "make sure this one never lapses" action, not a no-op).
+    /// Prunes expired rows first (same reasoning as
+    /// [`Self::list_firewall_rules`]) so a lapsed row is never mistaken for
+    /// still covering the address. If any row for `address` survives that
+    /// prune, it's updated in place to a permanent Block rule rather than
+    /// inserting a second row for the same address; otherwise a new
+    /// permanent rule is added, same as [`Self::add_firewall_rule`].
+    pub fn block_address_permanently(&self, address: &str) -> Result<()> {
+        if !is_valid_address(address) {
+            anyhow::bail!("invalid firewall rule address: {address}");
+        }
+        self.prune_expired_firewall_rules()?;
+        let changed = self.conn.execute(
+            "UPDATE firewall_rules SET action = 'block', expires_at = NULL, enabled = 1
+             WHERE address = ?1",
+            params![address],
+        )?;
+        if changed == 0 {
+            self.add_firewall_rule(&NewFirewallRule {
+                address: address.to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            })?;
+        }
+        Ok(())
     }
 
     fn insert_firewall_rule(&self, rule: &NewFirewallRule, expires_at: Option<i64>) -> Result<i64> {
@@ -1081,7 +1305,13 @@ impl Db {
         self.conn.execute(
             "INSERT INTO firewall_rules (address, port, action, enabled, created_at, expires_at)
              VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-            params![rule.address, rule.port, rule.action.as_str(), now(), expires_at],
+            params![
+                rule.address,
+                rule.port,
+                rule.action.as_str(),
+                now(),
+                expires_at
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1112,6 +1342,33 @@ impl Db {
         if changed == 0 {
             anyhow::bail!("no firewall rule with id: {id}");
         }
+        Ok(())
+    }
+
+    /// Removes any Block rule for the exact address `address` — the reverse
+    /// of [`Self::block_address_permanently`], backing the Dynamic
+    /// Protection screen's unblock action. A no-op (not an error) if none
+    /// exists, same idempotent spirit as `block_address_permanently`. Only
+    /// ever deletes a row matching this exact address: it never touches a
+    /// CIDR range that happens to contain it, since those are derived
+    /// (`derived_firewall_rules`) and never stored as `firewall_rules` rows
+    /// in the first place — nor an Allow rule that coincidentally shares
+    /// the address, which this action has no business touching.
+    pub fn unblock_address(&self, address: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM firewall_rules WHERE address = ?1 AND action = 'block'",
+            params![address],
+        )?;
+        Ok(())
+    }
+
+    /// Removes `user_agent` from the manually-blocked list — the reverse of
+    /// [`Self::block_user_agent`]. A no-op if it wasn't blocked.
+    pub fn unblock_user_agent(&self, user_agent: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM blocked_user_agents WHERE user_agent = ?1",
+            params![user_agent],
+        )?;
         Ok(())
     }
 
@@ -1419,6 +1676,17 @@ impl Db {
     /// bypass-categories-entirely behavior for an explicit bot pin already
     /// existed before per-site overrides did; this just applies it at both
     /// levels rather than inventing a second rule for the site layer.
+    ///
+    /// Also always appends every literal user agent from
+    /// [`Self::list_blocked_user_agents`] (regex-escaped — see
+    /// [`escape_for_nginx_regex`] — since these are exact strings captured
+    /// from real traffic, not hand-written regex fragments like a bot
+    /// list's `user_agent_pattern`), unconditionally and after the
+    /// bot/category cascade above: a manual block from the Dynamic
+    /// Protection screen is the same kind of "global pin, always wins" the
+    /// per-bot case already is, just for a string with no `bots` row at
+    /// all — so, like a global per-bot pin, it can't be limited or lifted
+    /// by a site's category override.
     fn compute_blocked_patterns(
         &self,
         ai: Policy,
@@ -1449,8 +1717,34 @@ impl Db {
                 patterns.push(bot.user_agent_pattern);
             }
         }
+        patterns.extend(
+            self.list_blocked_user_agents()?
+                .iter()
+                .map(|ua| escape_for_nginx_regex(ua)),
+        );
         Ok(patterns)
     }
+}
+
+/// Escapes every PCRE/NGINX regex metacharacter in `s` so it matches only
+/// itself when embedded (unanchored, same convention as every other
+/// `user_agent_pattern` fragment — see `nginx::join_patterns`) in the
+/// combined `~*` alternation. Hand-rolled rather than pulling in a `regex`
+/// dependency just for this: the only structural requirement is "produce a
+/// literal-matching fragment safe to sit inside a larger `|`-joined
+/// pattern," not full regex parsing.
+fn escape_for_nginx_regex(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '.' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '*' | '+' | '?' | '\\'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -1694,6 +1988,57 @@ mod tests {
         // Defaults: AI blocked, search allowed.
         let blocked = db.blocked_user_agent_patterns().unwrap();
         assert_eq!(blocked, vec!["ai-bot-ua".to_string()]);
+    }
+
+    #[test]
+    fn blocked_user_agent_patterns_includes_manually_blocked_user_agents() {
+        let db = test_db();
+        db.block_user_agent("EvilCrawler/1.0").unwrap();
+
+        assert_eq!(
+            db.blocked_user_agent_patterns().unwrap(),
+            vec!["EvilCrawler/1\\.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn blocked_user_agent_patterns_escapes_regex_metacharacters() {
+        let db = test_db();
+        db.block_user_agent("weird(bot)+[1].0?").unwrap();
+
+        assert_eq!(
+            db.blocked_user_agent_patterns().unwrap(),
+            vec!["weird\\(bot\\)\\+\\[1\\]\\.0\\?".to_string()]
+        );
+    }
+
+    #[test]
+    fn block_user_agent_is_idempotent() {
+        let db = test_db();
+        db.block_user_agent("curl/8.0").unwrap();
+        db.block_user_agent("curl/8.0").unwrap();
+
+        assert_eq!(
+            db.list_blocked_user_agents().unwrap(),
+            vec!["curl/8.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn unblock_user_agent_removes_it() {
+        let db = test_db();
+        db.block_user_agent("curl/8.0").unwrap();
+
+        db.unblock_user_agent("curl/8.0").unwrap();
+
+        assert!(db.list_blocked_user_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unblock_user_agent_is_a_noop_when_never_blocked() {
+        let db = test_db();
+        db.unblock_user_agent("curl/8.0").unwrap();
+        assert!(db.list_blocked_user_agents().unwrap().is_empty());
     }
 
     #[test]
@@ -2084,6 +2429,109 @@ mod tests {
         assert!(expires_at >= before + 60);
     }
 
+    #[test]
+    fn block_address_permanently_adds_a_new_rule_when_none_exists() {
+        let db = Db::open_in_memory().unwrap();
+        db.block_address_permanently("198.51.100.9").unwrap();
+
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].address, "198.51.100.9");
+        assert_eq!(rules[0].action, FirewallAction::Block);
+        assert_eq!(rules[0].expires_at, None);
+    }
+
+    /// The core behavior this method exists for: an IP already temporarily
+    /// blocked by `block-scanners`/`block-web-scanners` must be upgraded to
+    /// a permanent block in place, not left with its TTL or duplicated into
+    /// a second row.
+    #[test]
+    fn block_address_permanently_upgrades_an_existing_temporary_block() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule_with_ttl(
+            &NewFirewallRule {
+                address: "198.51.100.9".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            },
+            60,
+        )
+        .unwrap();
+
+        db.block_address_permanently("198.51.100.9").unwrap();
+
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].expires_at, None);
+    }
+
+    #[test]
+    fn block_address_permanently_is_a_no_op_on_an_already_permanent_rule() {
+        let db = Db::open_in_memory().unwrap();
+        db.block_address_permanently("198.51.100.9").unwrap();
+        db.block_address_permanently("198.51.100.9").unwrap();
+
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn block_address_permanently_rejects_an_invalid_address() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(db.block_address_permanently("not-an-address").is_err());
+    }
+
+    #[test]
+    fn unblock_address_removes_a_permanent_block() {
+        let db = Db::open_in_memory().unwrap();
+        db.block_address_permanently("198.51.100.9").unwrap();
+
+        db.unblock_address("198.51.100.9").unwrap();
+
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unblock_address_removes_a_temporary_block() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule_with_ttl(
+            &NewFirewallRule {
+                address: "198.51.100.9".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+            },
+            3600,
+        )
+        .unwrap();
+
+        db.unblock_address("198.51.100.9").unwrap();
+
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unblock_address_is_a_noop_when_never_blocked() {
+        let db = Db::open_in_memory().unwrap();
+        db.unblock_address("198.51.100.9").unwrap();
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unblock_address_never_touches_an_allow_rule_for_the_same_address() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&NewFirewallRule {
+            address: "198.51.100.9".to_string(),
+            port: None,
+            action: FirewallAction::Allow,
+        })
+        .unwrap();
+
+        db.unblock_address("198.51.100.9").unwrap();
+
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].action, FirewallAction::Allow);
+    }
+
     /// The core property this feature exists for: a rule added with a
     /// negative (or otherwise already-past) TTL is functionally identical
     /// to a rule that expired naturally — real time doesn't need to pass,
@@ -2466,5 +2914,116 @@ mod tests {
                 ("7.8.9.0/24".to_string(), FirewallAction::Block),
             ]
         );
+    }
+
+    #[test]
+    fn firewall_rendered_signature_is_none_before_any_render() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(db.get_firewall_rendered_signature().unwrap(), None);
+    }
+
+    #[test]
+    fn set_firewall_rendered_signature_round_trips_and_updates() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_firewall_rendered_signature("sig-a").unwrap();
+        assert_eq!(
+            db.get_firewall_rendered_signature().unwrap(),
+            Some("sig-a".to_string())
+        );
+
+        db.set_firewall_rendered_signature("sig-b").unwrap();
+        assert_eq!(
+            db.get_firewall_rendered_signature().unwrap(),
+            Some("sig-b".to_string())
+        );
+    }
+
+    #[test]
+    fn access_log_offset_is_none_for_a_path_never_recorded() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(
+            db.get_access_log_offset("/var/log/nginx/access.log")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn set_access_log_offset_round_trips_and_updates() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_access_log_offset("/var/log/nginx/access.log", 1234)
+            .unwrap();
+        assert_eq!(
+            db.get_access_log_offset("/var/log/nginx/access.log")
+                .unwrap(),
+            Some(1234)
+        );
+
+        db.set_access_log_offset("/var/log/nginx/access.log", 5678)
+            .unwrap();
+        assert_eq!(
+            db.get_access_log_offset("/var/log/nginx/access.log")
+                .unwrap(),
+            Some(5678)
+        );
+    }
+
+    #[test]
+    fn access_log_offset_is_tracked_independently_per_path() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_access_log_offset("a.log", 10).unwrap();
+        db.set_access_log_offset("b.log", 20).unwrap();
+
+        assert_eq!(db.get_access_log_offset("a.log").unwrap(), Some(10));
+        assert_eq!(db.get_access_log_offset("b.log").unwrap(), Some(20));
+    }
+
+    #[test]
+    fn record_user_agent_hits_inserts_new_rows() {
+        let db = Db::open_in_memory().unwrap();
+        let mut counts = HashMap::new();
+        counts.insert("Mozilla/5.0".to_string(), 3);
+        counts.insert("curl/8.0".to_string(), 1);
+
+        db.record_user_agent_hits(&counts, 1000).unwrap();
+
+        let stats = db.list_user_agent_stats().unwrap();
+        assert_eq!(stats.len(), 2);
+        let mozilla = stats
+            .iter()
+            .find(|s| s.user_agent == "Mozilla/5.0")
+            .unwrap();
+        assert_eq!(mozilla.hit_count, 3);
+        assert_eq!(mozilla.last_seen_at, 1000);
+    }
+
+    #[test]
+    fn record_user_agent_hits_accumulates_rather_than_replaces() {
+        let db = Db::open_in_memory().unwrap();
+        let mut first = HashMap::new();
+        first.insert("Mozilla/5.0".to_string(), 3);
+        db.record_user_agent_hits(&first, 1000).unwrap();
+
+        let mut second = HashMap::new();
+        second.insert("Mozilla/5.0".to_string(), 2);
+        db.record_user_agent_hits(&second, 2000).unwrap();
+
+        let stats = db.list_user_agent_stats().unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].hit_count, 5);
+        assert_eq!(stats[0].last_seen_at, 2000);
+    }
+
+    #[test]
+    fn list_user_agent_stats_is_sorted_by_hit_count_descending() {
+        let db = Db::open_in_memory().unwrap();
+        let mut counts = HashMap::new();
+        counts.insert("rare-bot".to_string(), 1);
+        counts.insert("common-bot".to_string(), 50);
+        db.record_user_agent_hits(&counts, 1000).unwrap();
+
+        let stats = db.list_user_agent_stats().unwrap();
+        assert_eq!(stats[0].user_agent, "common-bot");
+        assert_eq!(stats[1].user_agent, "rare-bot");
     }
 }

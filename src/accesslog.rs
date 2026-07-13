@@ -38,8 +38,11 @@ use std::path::Path;
 
 /// The conventional NGINX access-log location; unlike SSH logs there's no
 /// second common layout to also try, and no journald fallback — NGINX logs
-/// to a file whether or not the system boots under systemd.
-const DEFAULT_LOG_PATH: &str = "/var/log/nginx/access.log";
+/// to a file whether or not the system boots under systemd. Public so
+/// `accessstats::record_access_stats` can key its persisted read-offset by
+/// path even when the cron job (which only ever uses this default) never
+/// resolves one explicitly itself.
+pub const DEFAULT_LOG_PATH: &str = "/var/log/nginx/access.log";
 
 /// The result of looking for access-log data: distinguishes "found and
 /// read it, here's its text" from "nothing was even readable" (missing
@@ -75,8 +78,13 @@ pub fn find_default_source() -> LogSource {
 /// `"` isolates the quoted request field from the unquoted ip/user/time
 /// prefix and the status/bytes that follow it, which works regardless of
 /// what the timestamp or remote_user contain, since neither can itself
-/// contain a `"`.
-fn parse_line(line: &str) -> Option<(IpAddr, u16, String)> {
+/// contain a `"`. The trailing `"referer" "user_agent"` pair is extracted
+/// the same way: `after_request` still has both quoted fields verbatim, so
+/// splitting *it* on `"` isolates `user_agent` as the second quoted field.
+/// A line with no trailing quoted pair at all (a stripped-down custom log
+/// format) yields an empty `user_agent` rather than failing the whole
+/// parse — status/path are still useful to `scanning_ips` either way.
+fn parse_line(line: &str) -> Option<(IpAddr, u16, String, String)> {
     let ip: IpAddr = line.split_whitespace().next()?.parse().ok()?;
 
     let mut fields = line.splitn(3, '"');
@@ -93,9 +101,14 @@ fn parse_line(line: &str) -> Option<(IpAddr, u16, String)> {
     // endpoint masquerade as many different invalid URLs.
     let path = target.split('?').next().unwrap_or(target).to_string();
 
-    let status: u16 = after_request.split_whitespace().next()?.parse().ok()?;
+    // `after_request` is ` <status> <bytes> "<referer>" "<user_agent>"`;
+    // splitting it on `"` yields [status/bytes, referer, the space between
+    // the two quoted fields, user_agent, ""] — index 3 is the field we want.
+    let quoted: Vec<&str> = after_request.split('"').collect();
+    let status: u16 = quoted.first()?.split_whitespace().next()?.parse().ok()?;
+    let user_agent = quoted.get(3).copied().unwrap_or("").to_string();
 
-    Some((ip, status, path))
+    Some((ip, status, path, user_agent))
 }
 
 /// Every IP with at least `threshold` *distinct* paths that returned 404
@@ -111,7 +124,7 @@ fn parse_line(line: &str) -> Option<(IpAddr, u16, String)> {
 /// with it). Deduplicated and sorted for deterministic output.
 pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
     let mut not_found_paths: HashMap<IpAddr, HashSet<String>> = HashMap::new();
-    for (ip, status, path) in log_text.lines().filter_map(parse_line) {
+    for (ip, status, path, _user_agent) in log_text.lines().filter_map(parse_line) {
         if status == 404 {
             not_found_paths.entry(ip).or_default().insert(path);
         }
@@ -124,6 +137,27 @@ pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
         .collect();
     ips.sort();
     ips
+}
+
+/// The complement to [`scanning_ips`]: instead of flagging bad traffic,
+/// tallies who's actually browsing the site successfully. Counts every
+/// distinct user agent's hits across every *successful* (status < 400 —
+/// 2xx/3xx) line in `log_text`, from a non-local/private source IP (the
+/// same [`is_local_or_private`] exclusion `scanning_ips` uses: an internal
+/// health check or monitoring probe isn't a real visitor). Lines with no
+/// user agent at all, or the conventional `-` NGINX logs for a missing
+/// `User-Agent` header, are excluded — neither identifies an actual client.
+/// Feeds [`crate::db::Db::record_user_agent_hits`] via
+/// `crate::accessstats::record_access_stats`.
+pub fn successful_user_agent_counts(log_text: &str) -> HashMap<String, u64> {
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for (ip, status, _path, user_agent) in log_text.lines().filter_map(parse_line) {
+        if status < 400 && !user_agent.is_empty() && user_agent != "-" && !is_local_or_private(&ip)
+        {
+            *counts.entry(user_agent).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 #[cfg(test)]
@@ -143,11 +177,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_line_extracts_ip_status_and_path() {
+    fn parse_line_extracts_ip_status_path_and_user_agent() {
         let line = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \"GET /wp-login.php HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0\"";
         assert_eq!(
             parse_line(line),
-            Some(("203.0.113.5".parse().unwrap(), 404, "/wp-login.php".to_string()))
+            Some((
+                "203.0.113.5".parse().unwrap(),
+                404,
+                "/wp-login.php".to_string(),
+                "Mozilla/5.0".to_string()
+            ))
         );
     }
 
@@ -155,16 +194,17 @@ mod tests {
     fn parse_line_strips_the_query_string() {
         let line = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \"GET /foo?a=1&b=2 HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0\"";
         assert_eq!(
-            parse_line(line).map(|(_, _, path)| path),
+            parse_line(line).map(|(_, _, path, _)| path),
             Some("/foo".to_string())
         );
     }
 
     #[test]
     fn parse_line_handles_ipv6_addresses() {
-        let line = "2001:db8::1 - - [10/Jul/2026:12:00:00 +0000] \"GET /x HTTP/1.1\" 404 1 \"-\" \"UA\"";
+        let line =
+            "2001:db8::1 - - [10/Jul/2026:12:00:00 +0000] \"GET /x HTTP/1.1\" 404 1 \"-\" \"UA\"";
         assert_eq!(
-            parse_line(line).map(|(ip, _, _)| ip),
+            parse_line(line).map(|(ip, _, _, _)| ip),
             Some("2001:db8::1".parse().unwrap())
         );
     }
@@ -187,13 +227,18 @@ mod tests {
     /// must, even at a lower total count.
     #[test]
     fn scanning_ips_distinguishes_repeated_from_distinct_not_found_paths() {
-        let repeated: String = (0..50).map(|_| not_found_line("198.51.100.9", "/missing")).collect();
+        let repeated: String = (0..50)
+            .map(|_| not_found_line("198.51.100.9", "/missing"))
+            .collect();
         assert!(scanning_ips(&repeated, 10).is_empty());
 
         let distinct: String = (0..10)
             .map(|i| not_found_line("198.51.100.9", &format!("/missing-{i}")))
             .collect();
-        assert_eq!(scanning_ips(&distinct, 10), vec!["198.51.100.9".to_string()]);
+        assert_eq!(
+            scanning_ips(&distinct, 10),
+            vec!["198.51.100.9".to_string()]
+        );
     }
 
     #[test]
@@ -240,6 +285,53 @@ mod tests {
             scanning_ips(&log, 10),
             vec!["198.51.100.2".to_string(), "198.51.100.9".to_string()]
         );
+    }
+
+    fn line_with(ip: &str, status: u16, user_agent: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" {status} 512 \"-\" \"{user_agent}\"\n"
+        )
+    }
+
+    #[test]
+    fn successful_user_agent_counts_tallies_each_distinct_agent() {
+        let mut log = String::new();
+        log.push_str(&line_with("203.0.113.5", 200, "Mozilla/5.0"));
+        log.push_str(&line_with("203.0.113.6", 200, "Mozilla/5.0"));
+        log.push_str(&line_with("203.0.113.7", 304, "curl/8.0"));
+
+        let counts = successful_user_agent_counts(&log);
+        assert_eq!(counts.get("Mozilla/5.0"), Some(&2));
+        assert_eq!(counts.get("curl/8.0"), Some(&1));
+    }
+
+    #[test]
+    fn successful_user_agent_counts_excludes_client_and_server_errors() {
+        let mut log = String::new();
+        log.push_str(&line_with("203.0.113.5", 404, "Mozilla/5.0"));
+        log.push_str(&line_with("203.0.113.5", 500, "Mozilla/5.0"));
+
+        assert!(successful_user_agent_counts(&log).is_empty());
+    }
+
+    #[test]
+    fn successful_user_agent_counts_excludes_missing_user_agent() {
+        let mut log = String::new();
+        log.push_str(&line_with("203.0.113.5", 200, "-"));
+        log.push_str(&ok_line("203.0.113.6", "/")); // has a real UA, sanity check
+
+        let counts = successful_user_agent_counts(&log);
+        assert!(!counts.contains_key("-"));
+        assert_eq!(counts.get("Mozilla/5.0"), Some(&1));
+    }
+
+    #[test]
+    fn successful_user_agent_counts_excludes_loopback_and_private_addresses() {
+        let mut log = String::new();
+        for ip in ["127.0.0.1", "10.0.0.5", "192.168.1.5", "fc00::1"] {
+            log.push_str(&line_with(ip, 200, "curl/8.0"));
+        }
+        assert!(successful_user_agent_counts(&log).is_empty());
     }
 
     #[test]

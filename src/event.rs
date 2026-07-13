@@ -68,16 +68,28 @@ pub enum AppEvent {
         result: Result<Vec<String>, String>,
     },
     /// The internal cron's background fetch for the `UpdateIpRanges` job
-    /// (see `crate::cron`) has finished — the only cron job that needs a
-    /// background task, since it's the only one doing network I/O; the
-    /// other three (`BlockScanners`, `BlockWebScanners`, `RenderFirewall`)
-    /// are pure local log-parsing/file-writing and run inline when due.
-    /// Carries each of the three crawler sources' fetch outcome (parsed
-    /// CIDRs, or a stringified error) so `App` can store whatever succeeded
-    /// and summarize the rest — one source failing (e.g. a transient
-    /// network error) shouldn't discard what the other two got.
+    /// (see `crate::cron`) has finished. Carries each of the three crawler
+    /// sources' fetch outcome (parsed CIDRs, or a stringified error) so
+    /// `App` can store whatever succeeded and summarize the rest — one
+    /// source failing (e.g. a transient network error) shouldn't discard
+    /// what the other two got.
     CronIpRangesFetched {
-        results: Vec<(crate::ipranges::IpRangeSourceKind, Result<Vec<String>, String>)>,
+        results: Vec<(
+            crate::ipranges::IpRangeSourceKind,
+            Result<Vec<String>, String>,
+        )>,
+    },
+    /// A cron job's log source has been resolved on a background thread
+    /// (see `App::start_cron_log_job`). Only the *reading* of the SSH/access
+    /// log (and, for the SSH log, the `journalctl` fallback subprocess) is
+    /// blocking enough to move off the main thread — that's what this event
+    /// carries back. The actual parsing/counting/Db writes for the job stay
+    /// on the main thread in `App::finish_cron_log_job`, same as every other
+    /// `Db` access in this app (`Db` isn't `Sync`). `None` means the log
+    /// source was unavailable.
+    CronLogFetched {
+        job: crate::cron::CronJob,
+        log_text: Option<String>,
     },
 }
 

@@ -830,9 +830,17 @@ fn dashboard_geo_mode_toggle_switches_to_allowlist() {
     session
         .exp_string("Blocklist (block selected countries)")
         .unwrap();
-    session
-        .exp_string("Allowlist (block everything except selected)")
-        .unwrap();
+    // Checked as split substrings, not verbatim, same reasoning as the
+    // confirmation message below: the diffed terminal only retransmits
+    // cells that changed from the *previous actual frame*, so whether a
+    // given run of characters comes across as one contiguous write depends
+    // on everything else the Dashboard drew before this popup opened, not
+    // just the popup's own (unchanged) position.
+    session.exp_string("Allowlist").unwrap();
+    session.exp_string("(block").unwrap();
+    session.exp_string("everything").unwrap();
+    session.exp_string("except").unwrap();
+    session.exp_string("selected)").unwrap();
 
     // Move to "Allowlist" and confirm. The panel title (above the message
     // box in render order) updates in the same frame, so it's checked

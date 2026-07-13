@@ -829,7 +829,9 @@ fn block_web_scanners_ignores_repeated_hits_on_a_single_dead_path() {
     let db_path = db_path.to_str().unwrap();
 
     let log_path = tmp.path().join("access.log");
-    let log: String = (0..50).map(|_| not_found_line("198.51.100.9", "/missing")).collect();
+    let log: String = (0..50)
+        .map(|_| not_found_line("198.51.100.9", "/missing"))
+        .collect();
     fs::write(&log_path, log).unwrap();
 
     Command::cargo_bin("stop-bots")
@@ -1012,10 +1014,7 @@ fn list_firewall_rules_shows_expiry_only_for_temporary_rules() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     let permanent_line = stdout.lines().find(|l| l.contains("9.9.9.9")).unwrap();
-    let temporary_line = stdout
-        .lines()
-        .find(|l| l.contains("198.51.100.9"))
-        .unwrap();
+    let temporary_line = stdout.lines().find(|l| l.contains("198.51.100.9")).unwrap();
     assert!(!permanent_line.contains("expires"));
     assert!(temporary_line.contains("expires in"));
 }

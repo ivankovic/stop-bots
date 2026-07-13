@@ -1,20 +1,30 @@
 # Stop Bots
 
-A TUI that helps you configure your server to stop bad bots and still allow good bots.
+A TUI (and CLI) that helps you configure your server to stop bad bots and still allow good bots.
+
+It works alongside NGINX and your existing firewall (iptables or nftables): it classifies
+known bots by category (scanners, search engines, AI crawlers), blocks or allows them by
+injecting a rule into your NGINX site configs, watches your SSH and NGINX access logs to
+automatically flag IPs that look like scanners, and generates (but never applies) firewall
+scripts for everything else — geo-blocking, ad-hoc IP rules, and the auto-detected scanners.
 
 # Installation
 
-Use cargo install.
+Build from source with cargo:
 
-There are no packages currently available.
+```
+cargo install --path .
+```
+
+There is no published crate or binary package yet.
 
 # Usage
 
-Simply run the binary to launch the TUI.
+Run the binary with no arguments to launch the TUI, or see `stop-bots --help` for the full
+list of CLI subcommands (the TUI and CLI share the same SQLite database and drive the exact
+same underlying logic — everything you can do interactively you can also automate).
 
-You can exit the app at any time by hitting 'q'.
-
-You can exit any popup or submenu by hitting the Escape key. Hitting Escape in the main screen will also exit the app.
+You can exit the app, or back out of a popup/submenu, with 'q' or Escape.
 
 ## Theme
 
@@ -22,39 +32,61 @@ You can switch between the dark and light theme with 'c'. The app will try to au
 but for some terminal and multiplexer combinations there isn't enough information available to make
 the correct choice.
 
-## Main screen
+## Screens
 
-The main screen gives you the overview of the current protections and the most recent overall
-metrics. The general design of the UI is this:
+Tab / Shift+Tab (or Left/Right, or their vim `h`/`l` aliases) cycle through the tabs below;
+`d`/`b`/`s`/`p` jump straight to one; `?` toggles a full key-binding reference at any time.
 
---------------------------------------------------------------------------
-| System-wide setttings                                                  |
-|   - Geo-block [ ALLOWED: CH, DE ]                                      |
-|   - Scanners [ BLOCKED ]                                               |
-|   - Search Bots [ ALLOWED ]                                            |
-|   - AI Bots [ BLOCKED ]                                                |
-|                                                                        |
-| www.example.org (NGINX: /var/www/html/example.org)                     |
-|   - Geo-block [ ALLOWED: CH, DE ]                                      |
-|   - Scanners [ BLOCKED ]                                               |
-|   - Search Bots [ ALLOWED ]                                            |
-|   - AI Bots [ BLOCKED ]                                                |
-| ...                                                                    |
---------------------------------------------------------------------------
-| Time frame                    Scanners   Search      AI                |
---------------------------------------------------------------------------
-| Last 5 minutes                     120       15    2000                |
-| Last hour                        12312      123   41231                |
-| ...                                                                    |
---------------------------------------------------------------------------
+- **Dashboard** (the default screen): system-wide category defaults (Scanners / Search Bots /
+  AI Bots — Allowed or Blocked), host-wide geo-blocking (block or allow-list specific
+  countries), a Summary panel (sites discovered, bot-list source freshness, and whether the
+  firewall script on disk still matches the current rules), and a "Scheduled tasks" panel
+  showing the internal cron's jobs and when they last ran (with a spinner next to any job
+  currently running in the background). Press `f` here to render the current firewall rules
+  to a script — the popup also has an "apply after writing" toggle (Space) for actually
+  enforcing it immediately, instead of applying it by hand afterward.
+- **Bot settings**: lists every known bot-list source (with an action to refresh it) and every
+  individual bot, searchable by name, with a per-bot override (Allowed / Blocked / follow the
+  category default).
+- **Site settings**: every NGINX site discovered on disk, with a live "up to date / stale / not
+  found" status and actions to apply the current policy to one site or all of them; opening a
+  site lets you override its category/bot policy individually.
+- **Dynamic Protection**: a live, actionable view of what's currently hitting the server — "Top
+  IPs attempting SSH connection" and "Top User Agents", each ranked by count and tagged
+  `PENDING`/`BLOCKED` (shown in red). `Tab`/`Shift+Tab` switch which of the two panels
+  `Up`/`Down` apply to; `f` cycles a shared filter (all / pending only / blocked only);
+  `Enter` blocks the selected `PENDING` row, or unblocks it if it's already `BLOCKED`.
+- **Help**: the full key-binding reference.
 
-Using the arrow keys (or vim-hjkl navigation) you can select any of the categories. If you
-press the Enter of Space key, you can open a configuration popup for that particlar setting, e.g.
-the system wide search bot settings.
+## What it actually protects against
 
-For example, opening the "Search Bots" setting allows you to togle "ALLOWED" and "BLOCKED" as the
-default, and then you can override each particular bot, e.g. "Google Search" can be set to
-"BLOCKED", "ALLOWED" or "DEFAULT" individually.
+- **Known bots**, by category (scanner / search engine / AI crawler), sourced from
+  [ArcJet's Well-Known Bots](https://github.com/arcjet/well-known-bots),
+  [ai.robots.txt](https://github.com/ai-robots-txt/ai.robots.txt) and the
+  [NGINX Ultimate Bad Bot Blocker](https://github.com/mitchellkrogza/nginx-ultimate-bad-bot-blocker)
+  list. Blocking a category injects an `if ($http_user_agent ...)` rule into each site's NGINX
+  config (`apply-blocks` / Site settings' `a`/`A`).
+- **SSH and web scanners**, automatically: the internal cron re-reads your SSH log and NGINX
+  access log every minute while the TUI is open, flags IPs with a pile of failed SSH logins or
+  many distinct 404'd paths, and adds a temporary firewall block for each (expiring on its own
+  after a few days, re-added if the behavior continues). Never blocks an IP with a recent
+  successful SSH login, or one inside a known crawler's published IP range.
+- **Whole countries**, via IPdeny's aggregated CIDR lists — block specific countries, or flip
+  to allow-list mode and block everything else.
+- **Anything else**, by hand — add an IP/CIDR allow or block rule directly, or use the Dynamic
+  Protection screen to permanently block a specific IP or user agent you've spotted before it
+  ever crosses an automatic threshold.
+
+Every firewall decision above is *generated*, never applied automatically: `render-firewall`
+(or the Dashboard's `f` key) writes an iptables or nftables script for you to review and apply
+yourself, and refuses to write one that would lock out a currently-connected SSH session. The
+Dashboard's render popup can also apply it for you immediately, but only when you explicitly
+ask it to (the "apply after writing" toggle) — never as a side effect of anything automatic
+like the internal cron.
+
+There's also a plain access-log tally, independent of blocking: `record-access-stats` /
+`list-access-stats` count how often each user agent shows up in successful (non-error)
+requests, so you can see who's actually visiting on top of who's being blocked.
 
 # Contact
 
@@ -133,20 +165,25 @@ Rust's project structure must be followed.
 Some directories don't exist yet but should be created if the need arises.
 
 <root of the repository>
-    |- /src             <- The implementation
-        |- main.rs      <- The main entry point, spawns the background threads and the UI
-        |- app.rs       <- The app controler, responds to events and controlls the UI
-        |- tui/         <- All TUI components go in this directory
-            |- SPECS.md <- TUI specs
-        |- tui.rs       <- The visual elements of the TUI, the view
-        |- db/          <- The db components and specs
-            |- SPECS.md <- Database specs
-        |- db.rs        <- The SQLite ORM layer, stores the config
-        |- nginx.rs     <- Reading and writing NginX config and logs
-        |- iptables.rs  <- Integration with iptables
-        |- nftables.rs  <- Integration with nftables
-    |- /test            <- Integration and end-to-end automated tests
-    |- /benches         <- Benchmarks
+    |- /src               <- The implementation
+        |- main.rs        <- CLI entry point (clap subcommands) and their handlers
+        |- app.rs         <- The TUI app controller, responds to events and controls the UI
+        |- event.rs       <- Terminal event plumbing (ticks, key events, app events)
+        |- tui.rs         <- Outer TUI chrome (tab bar, footer) and screen dispatch
+        |- tui/           <- One file per TUI screen (Dashboard, Bot settings, Site settings, ...)
+        |- db.rs          <- SQLite storage: bots, sites, firewall rules, settings, ...
+        |- botlist/       <- One file per bot-list source parser
+        |- nginx.rs       <- NGINX site discovery and config injection
+        |- sshlog.rs      <- SSH log parsing and scan detection
+        |- accesslog.rs   <- NGINX access log parsing, scan detection and UA tallying
+        |- accessstats.rs <- Shared CLI+cron logic for recording access-log UA stats
+        |- scanblock.rs   <- Shared CLI+cron logic for SSH/web scan detection and blocking
+        |- ipranges/      <- Crawler and country IP-range fetching/storage
+        |- cron.rs        <- The internal cron: which background jobs run how often
+        |- firewall.rs    <- Shared firewall-rendering logic (lockout safety, script writing)
+        |- iptables.rs    <- iptables script generation
+        |- nftables.rs    <- nftables script generation
+    |- /tests           <- Integration and end-to-end automated tests
     |- README.md        <- This file. Only very high level information goes here
     |- AGENTS.md        <- AI-only instructions
     |- SPECS.md         <- Detailed specifications and all decisions that were taken

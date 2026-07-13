@@ -73,7 +73,11 @@ impl ScanBlockOutcome {
                 self.candidates - self.skipped_known_crawlers
             );
         }
-        let verb = if self.dry_run { "would block" } else { "blocked" };
+        let verb = if self.dry_run {
+            "would block"
+        } else {
+            "blocked"
+        };
         format!("{verb} {} IP(s)", self.newly_blocked.len())
     }
 }
@@ -157,7 +161,9 @@ pub fn known_crawler_match(ranges: &[String], ip: &str) -> bool {
     let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
         return false;
     };
-    ranges.iter().any(|cidr| ipranges::cidr_contains(cidr, addr))
+    ranges
+        .iter()
+        .any(|cidr| ipranges::cidr_contains(cidr, addr))
 }
 
 /// Adds a Block rule, expiring after `ttl_days`, for each of `kept` not

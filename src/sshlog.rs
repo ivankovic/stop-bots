@@ -159,21 +159,14 @@ pub fn parse_failed_attempt_ips(log_text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every IP address with at least `threshold` failed-authentication log
-/// lines in `log_text` (see [`parse_failed_attempt_ips`] for exactly what
-/// counts, and note the threshold is a count over *however much of the log
-/// `log_text` happens to hold* — could be a day or a month — not a rate
-/// over a time window; this module doesn't parse timestamps, so pick a
-/// threshold high enough that ordinary typos never reach it. Real scanners
-/// produce dozens to thousands of attempts, not a handful. Two safety
-/// exclusions on top of the threshold: an IP that also has a successful
-/// login anywhere in the same log (see [`parse_accepted_ips`]) is never
-/// included — a few failed attempts before finally getting the password
-/// right is a clumsy human, not a bot, and this must never suggest blocking
-/// a client that's proven itself legitimate — and loopback/private IPs (see
-/// [`is_local_or_private`]) are excluded outright. Deduplicated and sorted
-/// for deterministic output.
-pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
+/// Shared by [`scanning_ips`] and [`failed_attempt_counts`]: every IP's
+/// failed-attempt count in `log_text`, excluding loopback/private addresses
+/// (see [`is_local_or_private`]) and any IP that also has a successful
+/// login anywhere in the same log (see [`parse_accepted_ips`]) — a few
+/// failed attempts before finally getting the password right is a clumsy
+/// human, not a bot, and neither caller must ever suggest blocking a client
+/// that's proven itself legitimate.
+fn candidate_failed_attempt_counts(log_text: &str) -> std::collections::HashMap<IpAddr, usize> {
     let mut counts: std::collections::HashMap<IpAddr, usize> = std::collections::HashMap::new();
     for ip in failed_attempt_ips(log_text) {
         *counts.entry(ip).or_insert(0) += 1;
@@ -181,14 +174,45 @@ pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
 
     let accepted: HashSet<String> = parse_accepted_ips(log_text).into_iter().collect();
 
-    let mut ips: Vec<String> = counts
+    counts
         .into_iter()
-        .filter(|(ip, count)| *count >= threshold && !is_local_or_private(ip))
+        .filter(|(ip, _)| !is_local_or_private(ip) && !accepted.contains(&ip.to_string()))
+        .collect()
+}
+
+/// Every IP address with at least `threshold` failed-authentication log
+/// lines in `log_text` (see [`parse_failed_attempt_ips`] for exactly what
+/// counts, and note the threshold is a count over *however much of the log
+/// `log_text` happens to hold* — could be a day or a month — not a rate
+/// over a time window; this module doesn't parse timestamps, so pick a
+/// threshold high enough that ordinary typos never reach it. Real scanners
+/// produce dozens to thousands of attempts, not a handful. See
+/// [`candidate_failed_attempt_counts`] for the safety exclusions applied
+/// before thresholding. Deduplicated and sorted for deterministic output.
+pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
+    let mut ips: Vec<String> = candidate_failed_attempt_counts(log_text)
+        .into_iter()
+        .filter(|(_, count)| *count >= threshold)
         .map(|(ip, _)| ip.to_string())
-        .filter(|ip| !accepted.contains(ip))
         .collect();
     ips.sort();
     ips
+}
+
+/// Every candidate IP's failed-attempt count in `log_text`, with no
+/// threshold applied — the raw material behind the Dashboard's "Dynamic
+/// Protection" screen, which shows *every* attempting IP ranked by count
+/// (not just ones that already cleared `scanning_ips`'s bar) so an admin
+/// can act on a rising attacker before it does. Same safety exclusions as
+/// `scanning_ips` (see [`candidate_failed_attempt_counts`]): a proven-
+/// legitimate client (successful login anywhere in the log) or a
+/// loopback/private address is never included, so this can never surface
+/// something unsafe to block, only unthresholded.
+pub fn failed_attempt_counts(log_text: &str) -> std::collections::HashMap<String, u64> {
+    candidate_failed_attempt_counts(log_text)
+        .into_iter()
+        .map(|(ip, count)| (ip.to_string(), count as u64))
+        .collect()
 }
 
 #[cfg(test)]
@@ -347,5 +371,30 @@ Jun 12 01:00:01 host sshd[2]: Failed password for invalid user admin from 198.51
             scanning_ips(&log, 10),
             vec!["198.51.100.2".to_string(), "198.51.100.9".to_string()]
         );
+    }
+
+    #[test]
+    fn failed_attempt_counts_reports_every_candidate_ip_with_no_threshold() {
+        let mut log = repeat_failed_attempt("198.51.100.9", 3);
+        log.push_str(&repeat_failed_attempt("198.51.100.2", 1));
+        let counts = failed_attempt_counts(&log);
+        assert_eq!(counts.get("198.51.100.9"), Some(&3));
+        assert_eq!(counts.get("198.51.100.2"), Some(&1));
+    }
+
+    /// Same safety exclusions as `scanning_ips`, just with no threshold to
+    /// also verify: a proven-legitimate client must never show up as a
+    /// blockable candidate, no matter how many failed attempts it has.
+    #[test]
+    fn failed_attempt_counts_excludes_an_ip_that_eventually_logged_in() {
+        let mut log = repeat_failed_attempt("198.51.100.9", 10);
+        log.push_str("Accepted publickey for admin from 198.51.100.9 port 5555 ssh2\n");
+        assert!(failed_attempt_counts(&log).is_empty());
+    }
+
+    #[test]
+    fn failed_attempt_counts_excludes_loopback_and_private_addresses() {
+        let log = repeat_failed_attempt("10.0.0.5", 5);
+        assert!(failed_attempt_counts(&log).is_empty());
     }
 }

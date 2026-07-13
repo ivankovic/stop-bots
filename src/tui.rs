@@ -23,6 +23,7 @@
 
 pub mod bot_settings;
 pub mod dashboard;
+pub mod dynamic_protection;
 pub mod help;
 pub mod site_detail;
 pub mod site_settings;
@@ -89,25 +90,39 @@ impl Theme {
     }
 }
 
-/// The screens the TUI can show. Cycled with Tab/Shift+Tab, jumped to
-/// directly with `d`/`b`/`s`, with Help reachable via `?` from anywhere.
+/// The screens the TUI can show. Cycled with Tab/Shift+Tab, Left/Right, or
+/// their vim `h`/`l` aliases (see `App::handle_key_event`'s global fallback
+/// match — all four only fire once the active screen itself has ignored the
+/// key), jumped to directly with `d`/`b`/`s`/`p`, with Help reachable via
+/// `?` from anywhere. Dynamic Protection itself uses Tab/Shift+Tab
+/// internally (to switch between its SSH/User Agent panels — see
+/// `crate::tui::dynamic_protection`), so it consumes those two keys rather
+/// than cycling screens while it's active; Left/Right/`h`/`l`/`d`/`b`/`s`/
+/// `p`/Esc still work as the way out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
     #[default]
     Dashboard,
     BotSettings,
     SiteSettings,
+    DynamicProtection,
     Help,
 }
 
 impl Screen {
-    pub const TABS: [Screen; 3] = [Screen::Dashboard, Screen::BotSettings, Screen::SiteSettings];
+    pub const TABS: [Screen; 4] = [
+        Screen::Dashboard,
+        Screen::BotSettings,
+        Screen::SiteSettings,
+        Screen::DynamicProtection,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Screen::Dashboard => "Dashboard",
             Screen::BotSettings => "Bot settings",
             Screen::SiteSettings => "Site settings",
+            Screen::DynamicProtection => "Dynamic Protection",
             Screen::Help => "Help",
         }
     }
@@ -116,15 +131,17 @@ impl Screen {
         match self {
             Screen::Dashboard => Screen::BotSettings,
             Screen::BotSettings => Screen::SiteSettings,
-            Screen::SiteSettings | Screen::Help => Screen::Dashboard,
+            Screen::SiteSettings => Screen::DynamicProtection,
+            Screen::DynamicProtection | Screen::Help => Screen::Dashboard,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            Screen::Dashboard => Screen::SiteSettings,
+            Screen::Dashboard => Screen::DynamicProtection,
             Screen::BotSettings => Screen::Dashboard,
             Screen::SiteSettings => Screen::BotSettings,
+            Screen::DynamicProtection => Screen::SiteSettings,
             Screen::Help => Screen::Dashboard,
         }
     }
@@ -163,11 +180,15 @@ pub enum KeyOutcome {
     SelectCountry(String),
     /// The Dashboard's firewall render action was triggered. Carries the
     /// selected backend and output path for `App` to call the render
-    /// function (see `App::render_firewall`).
+    /// function (see `App::render_firewall`). `apply` is the render popup's
+    /// "apply after writing" toggle (Space, see `Popup::RenderFirewall`) —
+    /// when set, `App` also runs `firewall::apply_script` once the write
+    /// succeeds, not just writes the script for the admin to apply by hand.
     RenderFirewall {
         backend: crate::firewall::FirewallBackend,
         out_path: String,
         force: bool,
+        apply: bool,
     },
     /// Site settings wrote at least one changed NGINX config file on disk
     /// (`apply now` / `apply all`). Reloading is a real side effect (shells
@@ -204,9 +225,16 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     render_header(app, frame, header);
 
     match app.screen {
-        Screen::Dashboard => app.dashboard.render(frame, body, app.theme, &app.message),
+        Screen::Dashboard => app.dashboard.render(
+            frame,
+            body,
+            app.theme,
+            &app.message,
+            &app.cron_jobs_in_flight,
+        ),
         Screen::BotSettings => app.bot_settings.render(frame, body, app.theme),
         Screen::SiteSettings => app.site_settings.render(frame, body, app.theme),
+        Screen::DynamicProtection => app.dynamic_protection.render(frame, body, app.theme),
         Screen::Help => help::render(frame, body),
     }
 
@@ -227,7 +255,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let hint = match app.screen {
         Screen::Help => "Esc/q/? back to where you were".to_string(),
         _ => format!(
-            "q quit  Tab/Shift+Tab switch  d/b/s jump  ? help  c theme ({})",
+            "q quit  Tab/Shift+Tab/\u{2190}\u{2192} switch  d/b/s/p jump  ? help  c theme ({})",
             app.theme.label()
         ),
     };
@@ -263,14 +291,15 @@ mod tests {
     }
 
     #[test]
-    fn screen_next_cycles_through_all_tabs_back_to_dashboard() {
+    fn screen_next_cycles_through_every_tab_back_to_dashboard() {
         assert_eq!(Screen::Dashboard.next(), Screen::BotSettings);
         assert_eq!(Screen::BotSettings.next(), Screen::SiteSettings);
-        assert_eq!(Screen::SiteSettings.next(), Screen::Dashboard);
+        assert_eq!(Screen::SiteSettings.next(), Screen::DynamicProtection);
+        assert_eq!(Screen::DynamicProtection.next(), Screen::Dashboard);
     }
 
     #[test]
-    fn screen_previous_is_the_inverse_of_next_for_the_three_tabs() {
+    fn screen_previous_is_the_inverse_of_next_for_every_tab() {
         for screen in Screen::TABS {
             assert_eq!(screen.next().previous(), screen);
         }

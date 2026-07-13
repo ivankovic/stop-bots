@@ -25,8 +25,8 @@
 //! each caller.
 
 use crate::db::{Db, FirewallAction, FirewallRule, GeoMode};
-use crate::{iptables, ipranges, nftables, sshlog};
-use anyhow::Result;
+use crate::{ipranges, iptables, nftables, sshlog};
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// The default output path for a rendered firewall script — shared by the
@@ -154,12 +154,37 @@ pub struct BuiltFirewall {
     pub written: usize,
 }
 
-/// Gathers every firewall rule (admin-managed, from [`Db::list_firewall_rules`],
-/// plus derived crawler/geo rules from [`derived_firewall_rules`]) and
-/// renders them for `backend`. Fails immediately, before gathering or
-/// rendering anything, if `backend` is iptables and geo mode is Allowlist —
-/// see `iptables`'s module docs for why that combination can't be safely
-/// enforced.
+/// Every rule currently in effect — admin-managed (from
+/// [`Db::list_firewall_rules`]) followed by derived crawler/geo rules (from
+/// [`derived_firewall_rules`]) — in the same order [`build_script`] renders
+/// them. Factored out so [`build_script`] and the Dashboard's "needs
+/// updating" staleness check ([`rules_signature`]) share one gathering
+/// implementation and can never drift out of sync with each other.
+pub fn all_rules(db: &Db) -> Result<Vec<FirewallRule>> {
+    let mut rules = db.list_firewall_rules()?;
+    rules.extend(derived_firewall_rules(db)?);
+    Ok(rules)
+}
+
+/// A stable, backend- and path-independent snapshot of `rules` — used only
+/// to detect whether the rule *set* has changed since the firewall was last
+/// rendered (see `Db::get_firewall_rendered_signature`/
+/// `set_firewall_rendered_signature`, and the Dashboard's Summary panel),
+/// never to render anything itself. Deliberately not tied to a specific
+/// backend's rendered text: a render with `--backend iptables` to a custom
+/// path must still correctly mark a subsequent check as "up to date" — what
+/// matters is whether the *rules* changed, not which backend/path last
+/// wrote them. `FirewallRule`'s `Debug` output is a deterministic function
+/// of its fields, so equal rule sets in the same order always produce
+/// identical strings.
+pub fn rules_signature(rules: &[FirewallRule]) -> String {
+    format!("{rules:?}")
+}
+
+/// Gathers every firewall rule (see [`all_rules`]) and renders them for
+/// `backend`. Fails immediately, before gathering or rendering anything, if
+/// `backend` is iptables and geo mode is Allowlist — see `iptables`'s
+/// module docs for why that combination can't be safely enforced.
 pub fn build_script(db: &Db, backend: FirewallBackend) -> Result<BuiltFirewall> {
     if db.get_geo_mode()? == GeoMode::Allowlist && matches!(backend, FirewallBackend::Iptables) {
         anyhow::bail!(
@@ -171,8 +196,7 @@ pub fn build_script(db: &Db, backend: FirewallBackend) -> Result<BuiltFirewall> 
         );
     }
 
-    let mut rules = db.list_firewall_rules()?;
-    rules.extend(derived_firewall_rules(db)?);
+    let rules = all_rules(db)?;
 
     let (script, written) = match backend {
         FirewallBackend::Iptables => {
@@ -211,6 +235,41 @@ pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
         }
     }
     std::fs::write(out, script)
+}
+
+/// Actually enforces a just-written script by running `backend`'s apply
+/// command (`sh <out>` for iptables, `nft -f <out>` for nftables — see
+/// [`FirewallBackend::apply_command`]) against it. This is the one place in
+/// the whole project that executes a generated firewall script rather than
+/// only ever writing it — the Dashboard's render popup's "apply after
+/// writing" toggle (`App::render_firewall`), gated by the same
+/// `apply_firewall`/explicit-confirmation guard `nginx::reload` uses for
+/// NGINX reloads. Never called from anywhere unattended (no cron job calls
+/// this): keeping `README.md`'s "generated, never applied *automatically*"
+/// guarantee intact — this only ever runs from an explicit, interactive
+/// admin action, the same lockout-risk check (`assess_lockout_risk`) having
+/// already run before the script was even written.
+pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
+    let output = match backend {
+        FirewallBackend::Iptables => std::process::Command::new("sh")
+            .arg(out_path)
+            .output()
+            .context("failed to run `sh` on the generated iptables script")?,
+        FirewallBackend::Nftables => std::process::Command::new("nft")
+            .arg("-f")
+            .arg(out_path)
+            .output()
+            .context("failed to run `nft -f` on the generated nftables script")?,
+    };
+    if !output.status.success() {
+        anyhow::bail!(
+            "{} exited with {}: {}",
+            backend.apply_command(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -345,7 +404,10 @@ mod tests {
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
         match assess_lockout_risk(&rules, Some(&log_path)) {
             LockoutStatus::Risks(risks) => {
-                assert_eq!(risks, vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())]);
+                assert_eq!(
+                    risks,
+                    vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())]
+                );
             }
             LockoutStatus::LogUnavailable => panic!("expected the log to be found"),
         }
@@ -401,5 +463,68 @@ mod tests {
 
         let built = build_script(&db, FirewallBackend::Nftables).unwrap();
         assert!(built.script.contains("policy accept"));
+    }
+
+    #[test]
+    fn all_rules_combines_admin_and_derived_rules_in_order() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "9.9.9.9".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+        db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("us", true).unwrap();
+
+        let rules = all_rules(&db).unwrap();
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].address, "9.9.9.9");
+        assert_eq!(rules[1].address, "4.5.6.0/24");
+    }
+
+    #[test]
+    fn rules_signature_is_stable_for_equal_rule_sets() {
+        let a = vec![rule("1.2.3.4", FirewallAction::Block)];
+        let b = vec![rule("1.2.3.4", FirewallAction::Block)];
+        assert_eq!(rules_signature(&a), rules_signature(&b));
+    }
+
+    #[test]
+    fn rules_signature_differs_when_the_rule_set_changes() {
+        let a = vec![rule("1.2.3.4", FirewallAction::Block)];
+        let b = vec![
+            rule("1.2.3.4", FirewallAction::Block),
+            rule("5.6.7.8", FirewallAction::Block),
+        ];
+        assert_ne!(rules_signature(&a), rules_signature(&b));
+    }
+
+    /// Only the `Iptables` branch (`sh <script>`) is exercised here, with
+    /// inert `true`/`false` scripts rather than real firewall commands —
+    /// unlike `nft`, `sh` is universally available, and a trivial exit-code
+    /// script never touches the actual system firewall, so this is safe to
+    /// run in CI. The `Nftables` branch isn't unit tested for the same
+    /// reason `nginx::reload`'s real `systemctl`/`nginx` calls aren't: it
+    /// would require (and actually invoke) a real `nft` against whatever
+    /// host runs the suite.
+    #[test]
+    fn apply_script_succeeds_when_the_command_exits_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("ok.sh");
+        std::fs::write(&script, "true\n").unwrap();
+
+        apply_script(FirewallBackend::Iptables, &script).unwrap();
+    }
+
+    #[test]
+    fn apply_script_reports_a_nonzero_exit_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fail.sh");
+        std::fs::write(&script, "false\n").unwrap();
+
+        let err = apply_script(FirewallBackend::Iptables, &script).unwrap_err();
+        assert!(err.to_string().contains("exited with"), "err was: {err}");
     }
 }

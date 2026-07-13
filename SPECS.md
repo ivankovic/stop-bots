@@ -296,7 +296,7 @@ rewrite:
   (default 5). See "SSH scan detection" below.
 - `block-web-scanners --threshold <n> [--ttl-days <n>] [--access-log <path>] [--dry-run]`
   — find IPs with `>= n` distinct 404-returning paths in the NGINX access
-  log (`stop_bots::accesslog::scanning_ips`; default threshold 15) and add
+  log (`stop_bots::accesslog::scanning_ips`; default threshold 7) and add
   each as a temporary `firewall_rules` Block row, expiring after
   `--ttl-days` (default 1). See "Web scan detection" below. Deliberately
   named separately from `block-scanners` (not
@@ -1234,11 +1234,12 @@ admin who fetches once at setup and only automates `block-web-scanners`
 time. If you're automating this, automate both together.
 
 **Threshold is a count, not a rate — same caveat as `block-scanners`.**
-No timestamp parsing, so `--threshold` (default 15) counts over however
-much of the log got read, not attempts-per-minute. Lower than SSH's
+No timestamp parsing, so `--threshold` (default 7, lowered from an
+original default of 15 to detect scans sooner) counts over however much
+of the log got read, not attempts-per-minute. Lower than SSH's
 default-20 specifically because it's counting *distinct paths*, already a
 much stronger signal than raw line count — a benign visitor essentially
-never racks up 15 different dead links, while scanner tooling (nikto,
+never racks up 7 different dead links, while scanner tooling (nikto,
 dirb-style path enumeration, ...) routinely tries far more than that in
 one pass.
 
@@ -1308,31 +1309,69 @@ and write the exact same state the TUI does, making it a thin follow-on
 rather than a different architecture chosen now.
 
 **Per-job interval, not one blanket tick rate** (see `CronJob::interval`'s
-doc comment for the full reasoning): `UpdateIpRanges` daily, `BlockScanners`
-every 4 hours, `BlockWebScanners` hourly (its Block rules already expire
-in a day, and a URL-enumeration scan is typically one short automated
-pass, so catching it sooner matters more than for SSH brute-forcing's
-longer campaigns), `RenderFirewall` daily. `App::check_cron` itself is
-throttled to checking once a minute against `Event::Tick`'s 30fps rate —
-cheap either way (a handful of `settings` reads), but there's no reason to
-ask 30 times a second what only changes on the order of hours.
+doc comment for the full reasoning): `UpdateIpRanges` and `RenderFirewall`
+stay daily — neither is time-sensitive. The three detection/log jobs
+(`BlockScanners`, `BlockWebScanners`, `RecordAccessStats` — see below)
+originally ran every 4 hours/hourly/hourly respectively, on the reasoning
+that SSH brute-forcing is a longer campaign than a URL-enumeration scan.
+Changed to every 60 seconds, all three: the point of automated detection
+is catching an attack while it's still in progress, and once-a-minute is
+the practical floor anyway, since `App::check_cron` itself only checks
+which jobs are due once a minute (throttled against `Event::Tick`'s 30fps
+rate — cheap either way, a handful of `settings` reads, but no reason to
+ask 30 times a second). A job's own interval can never be shorter than
+that check cadence and have it matter; tightening detection further would
+mean shortening `CRON_CHECK_INTERVAL` itself, not just the job's
+`interval()`.
 
-**Three of the four jobs run inline; only `UpdateIpRanges` spawns a
-background task.** `BlockScanners`/`BlockWebScanners`/`RenderFirewall` are
-pure local log-parsing/`Db`/file-writing work — the same class of
-synchronous call the Dashboard already makes directly elsewhere — so they
-run straight from `App::check_cron` without going through
-`EventHandler`/`AppEvent`. `UpdateIpRanges` is the one job doing network
-I/O (three fetches, one per crawler source), so it follows the existing
-`start_source_update`/`start_country_select` shape: spawn a task that only
-fetches and parses (`Db` isn't `Sync`, so it never touches `self.db`),
-report back via a new `AppEvent::CronIpRangesFetched`, and store the
-result back on the main thread in `finish_cron_update_ip_ranges`. A
-`cron_update_ip_ranges_in_flight` guard stops a slow round-trip from
-starting a second, overlapping fetch if `check_cron` finds the job still
-"due" on a later tick — its `last_run` doesn't update until the fetch
-actually completes, so without the guard every check while one was still
-in flight would start another.
+**All five jobs now start background work rather than running any part of
+themselves inline — this replaced an earlier design where only
+`UpdateIpRanges` did.** The other four (`BlockScanners`/`BlockWebScanners`/
+`RecordAccessStats`/`RenderFirewall`) used to run their log read straight
+from `App::check_cron`, on the reasoning that log-parsing/`Db`/
+file-writing is "pure local work". That reasoning missed that
+`sshlog::find_default_source`/`accesslog::find_default_source` do blocking
+file I/O, and — for the SSH log, when no log file exists — shell out to
+`journalctl` via a fully synchronous `Command::output()`, which can take
+long enough to freeze the whole TUI (no redraw, no input) for the
+duration. Fixed by moving only that log-resolution step to
+`tokio::task::spawn_blocking` (not a plain `tokio::spawn` task, since it's
+blocking I/O/a subprocess call, not async I/O — a plain async task would
+stall a runtime worker the event loop needs) in
+`App::start_cron_log_job`, which reports the resolved text (or `None` if
+unavailable) back via a new `AppEvent::CronLogFetched`. The parsing/
+counting/`Db` writes that follow stay on the main thread in
+`App::finish_cron_log_job`, unchanged from before — they're fast in-memory
+work, and moving them too would mean a second `Db` connection fighting the
+existing `Db`-isn't-`Sync` pattern for no benefit. `UpdateIpRanges` keeps
+its original shape (`start_source_update`/`start_country_select`-style: a
+plain `tokio::spawn` task, since it's real async network I/O, reporting
+via `AppEvent::CronIpRangesFetched`). A single `cron_jobs_in_flight:
+HashSet<CronJob>` (one guard covering all five jobs, replacing the old
+`UpdateIpRanges`-only bool) stops a slow job from starting a second,
+overlapping run if `check_cron` finds it still "due" on a later tick —
+`last_run` doesn't update until a job actually completes, so without the
+guard every check while one was still in flight would start another.
+
+**The Dashboard's "Scheduled tasks" panel shows a braille spinner next to
+whichever job(s) are currently running**, reading `App::cron_jobs_in_flight`
+(threaded into `Dashboard::render` as `running_jobs`) instead of the usual
+"due now"/last-summary text for that job's line. The spinner frame is
+picked from wall-clock time (`SystemTime::now()`, ten-frame braille
+cycle) rather than a counter `Dashboard` would have to own and advance
+itself — since `render` runs on every draw of the TUI's own redraw loop,
+that alone is enough to animate it smoothly. Tests assert the fixed
+"Running now" text only, never a specific frame glyph, since the glyph is
+time-dependent and would flake.
+
+**The manual `f`-key firewall render (`App::render_firewall`) is
+deliberately still fully synchronous, unfixed by this change.** It calls
+the same `assess_lockout_risk` → `sshlog::find_default_source` chain
+internally, so it can hang the TUI too — left alone because the request
+that prompted this fix was specifically about *cron* jobs; the manual path
+is a separate, smaller-blast-radius follow-on if it turns out to matter in
+practice (it's a single explicit keypress, not something firing every
+minute unattended).
 
 **`RenderFirewall` never applies anything — same generate-only design as
 everywhere else `firewall_rules` is touched.** It writes to
@@ -1661,3 +1700,332 @@ asserting `"Press /"` appears exactly once, not just by reading the code —
 this was originally a report from looking at the rendered screen, so the
 regression test renders the screen too rather than only exercising
 `filtered_bots()`/`search_line()` in isolation.
+
+## Successful-access user-agent tracking (`src/accesslog.rs::successful_user_agent_counts`, `src/accessstats.rs`, `Db::user_agent_stats`)
+
+The complement to web scan detection above: instead of flagging bad
+traffic, tallies who's actually browsing the site successfully. New
+`accesslog::successful_user_agent_counts(log_text)` extends `parse_line`
+(now also returning the request's user agent, the second field of the
+trailing `"referer" "user_agent"` quoted pair) and counts each distinct
+user agent's hits across every line with `status < 400` from a
+non-local/private source IP (same `is_local_or_private` exclusion
+`scanning_ips` uses — an internal health check isn't a real visitor
+either). Lines with no user agent, or NGINX's `-` placeholder for a
+missing `User-Agent` header, are excluded — neither identifies a real
+client.
+
+**Storage is additive, not a snapshot.** New `user_agent_stats` table
+(`user_agent` primary key, `hit_count`, `last_seen_at`) and
+`Db::record_user_agent_hits`/`Db::list_user_agent_stats`. Repeated calls
+onto the same user agent add to `hit_count` rather than replacing it, so
+running this repeatedly over overlapping log windows (or a log that gets
+rotated between runs) accumulates a running lifetime total instead of
+losing whatever an earlier run already saw — deliberately different from
+`firewall_rules`, which is about current state, not a running count.
+
+**Fixed: every pass now only tallies bytes appended since the last one,
+not the whole file again.** `RecordAccessStats` runs every 60 seconds (see
+below) and, like every other log-based cron job, re-reads the *entire*
+current log from disk each time (no job here keeps a file handle open
+between ticks). Because storage is additive (previous paragraph), that
+combination silently re-tallied the same still-present requests on every
+single tick for as long as the log went un-rotated — `hit_count` numbers
+grew far past reality, sometimes dramatically, the longer NGINX's
+`access.log` sat between logrotate runs. Fixed by persisting a byte-offset
+watermark per log path: new `settings` keys `access_log_offset:{path}`
+(`Db::get_access_log_offset`/`set_access_log_offset`, same reused-table
+convention as `cron_last_run:{id}`) and a private `accessstats::
+new_content(full, last_offset)` that slices off only the suffix appended
+since the watermark. `record_access_stats` now takes the log's path (not
+just its text) purely as this cache key — nothing is re-read from disk
+with it, so the CLI's `--access-log` override and the cron's fixed
+`accesslog::DEFAULT_LOG_PATH` (now `pub`, for exactly this) each track
+their own progress independently rather than sharing one offset. A file
+shorter than the watermark (a rotate, or `copytruncate`) is treated as
+entirely new rather than partially skipped or panicking on an
+out-of-range slice.
+
+**Shared CLI+cron logic lives in `src/accessstats.rs`, not `scanblock.rs`.**
+Mirrors `scanblock`'s "one implementation, both callers" shape, but kept
+separate since this isn't a blocking decision — no threshold, TTL,
+dry-run or known-crawler exclusion to share with `block_web_scanners`.
+`accessstats::record_access_stats(db, log_text)` parses, tallies and
+persists in one call, returning an `AccessStatsOutcome` (distinct user
+agents, total hits) with the same `summary()`-for-a-status-line shape
+`ScanBlockOutcome` uses.
+
+**CLI:** `record-access-stats` (reads the access log, same
+`--access-log`/auto-detect resolution as `block-web-scanners`) and
+`list-access-stats` (prints every recorded user agent's hit count,
+most-seen first). Both storage-only/idempotent-safe-to-rerun, same spirit
+as every other command touching this database.
+
+**Internal cron:** new `CronJob::RecordAccessStats`, every 60 seconds — same
+cadence as `BlockWebScanners` (both since tightened from hourly, see
+"Internal cron" above) since it reads the identical log, no reason
+to check it on a different schedule. `CronJob::ALL` is now 5 jobs, not 4.
+
+**Dashboard (superseded — see "Dynamic Protection screen" below):** this
+originally folded the top 2 user agents into the "Stats" panel (renamed
+"Summary"), rebalancing Geo-blocking (8→6 lines) and Stats (4→6) to make
+room within this project's 30-row minimum terminal size without growing
+the total past what the Messages panel could give up. That fold-in has
+since been superseded: the Dashboard's own panel heights are back to
+their original 5/8/4/(2+job count) — Geo-blocking back to 8, the renamed
+"Summary" panel back to 4 (just site/source counts, no user agents) —
+and the top-user-agents view moved to its own screen (which also lets an
+admin act on an entry, not just look at it). `list-access-stats` remains
+the CLI's full, unbounded view of the underlying table either way.
+
+**A rendering gotcha surfaced by this change, not a data bug:** the
+Dashboard's popups (`Popup::Category`, `Popup::GeoMode`, ...) center
+themselves on the *whole* body `Rect` passed into `Dashboard::render`, not
+on any of its internal sub-areas — so resizing internal panels alone
+never moves a popup's on-screen position. It can still perturb
+`tests/tui.rs`'s pty-based assertions, though: those diff the terminal's
+*actual previous frame*, and changing what the Dashboard draws underneath
+a popup's fixed footprint changes which characters happen to already
+match between frames, which changes which runs of text arrive as one
+contiguous write versus several (interspersed with cursor-repositioning
+escapes). `dashboard_geo_mode_toggle_switches_to_allowlist` needed its
+`"Allowlist (block everything except selected)"` assertion split into
+three substrings for exactly this reason — same coping pattern the test
+already used elsewhere, not a new kind of fragility.
+
+## Dynamic Protection screen (`src/tui/dynamic_protection.rs`, new `blocked_user_agents` table, `Db::block_address_permanently`)
+
+A new fifth tab, `d`/`b`/`s`/`p` jump keys (was `d`/`b`/`s`), inserted
+between Site settings and Help in the tab cycle. Two panels — "Top IPs
+attempting SSH connection" and "Top User Agents" — each a ranked,
+navigable list tagged `PENDING` or `BLOCKED` (`BLOCKED until <Nd/Nh>` for
+a temporary `firewall_rules` row, bare `BLOCKED` for a permanent one).
+`Tab`/`Shift+Tab` switch which panel `Up`/`Down`/`j`/`k` apply to; `Enter`
+permanently blocks the selected row. This superseded the Dashboard's
+brief "fold top user agents into Stats" detour (see above) — the
+Dashboard's own panels are back to their original sizes, renamed to
+"Summary".
+
+**Why `Tab` is claimed on this screen, and how that's kept from being a
+dead end.** Every other screen leaves `Tab`/`Shift+Tab` to `App`'s global
+handler (cycle screens); this one intercepts them (`KeyOutcome::Consumed`)
+to switch between its own two panels instead, per how the feature was
+asked for. That means Tab-cycling through screens stops advancing once
+you land here — `d`/`b`/`s`/`p` and `Esc`/`q` (back to Dashboard) remain
+the way out, same as any screen already reachable that way.
+
+**The SSH panel has no persisted table — deliberately, unlike the User
+Agent panel.** `Db::list_user_agent_stats` already existed (cheap,
+pre-aggregated, populated on its own cron cadence — see "Successful-access
+user-agent tracking" above), so the User Agent panel just reads it
+directly. Nothing equivalent existed for SSH attempt counts, and this
+screen doesn't add one: it re-parses the live SSH log
+(`sshlog::find_default_source`, no path override, same lookup
+`run_cron_block_scanners` already uses) on every `refresh`. The
+discriminating question that ruled out a new `ssh_attempt_stats`
+table/cron job/CLI command mirroring `accessstats.rs`: does this panel
+need data that outlives the current log? No — it's explicitly a
+real-time "who's hitting me right now" view (the screen's own name), so
+the live log is the right source of truth, not a lifetime tally (that's
+what `sshlog::scanning_ips`/`block-scanners` already are, on their own
+60s cron cadence). New `sshlog::failed_attempt_counts(log_text)` supplies
+the raw counts: refactored out of `scanning_ips` (extracted into a shared
+`candidate_failed_attempt_counts` helper) so both share the same safety
+exclusions — loopback/private addresses and any IP with a successful
+login anywhere in the log are never included, even here, so this screen
+can never surface something unsafe to block, only unthresholded (every
+candidate, not just ones that already cleared `scanning_ips`'s bar).
+
+**"Permanently block" stores intent; it doesn't enforce, same
+generate-only discipline as everywhere else.** Blocking an IP
+(`Db::block_address_permanently`) only ensures a permanent (`expires_at =
+NULL`) `firewall_rules` Block row exists — pruning expired rows first,
+then updating any surviving row for that address in place (upgrading an
+existing temporary `block-scanners` block to permanent, the natural
+reading of pressing Enter on an already-`BLOCKED until` row) or inserting
+a fresh one if none exists. `render-firewall` (then applying the script)
+is what actually enforces it — and its lockout-safety check (see "SSH
+lockout safety net" above) already guards against self-blocking a
+currently-connected SSH session, so this screen doesn't duplicate that
+guard. Blocking a user agent (`Db::block_user_agent`) only inserts a row
+into the new `blocked_user_agents` table (`user_agent TEXT PRIMARY KEY,
+blocked_at INTEGER`); `apply-blocks` (or Site settings' `a`/`A`) is what
+injects it into NGINX config.
+
+**Why `blocked_user_agents` is its own table, not a synthetic `bots` row.**
+`bots`/`bot_source_entries` describe *known, publicly-catalogued* bots —
+category flags, a merge cascade across multiple sources contributing the
+same slug, a foreign key onto `sources`. None of that fits a one-off
+literal string an admin flagged by hand from observed traffic. A
+dedicated table (same shape as `selected_countries`/`firewall_rules`) is
+simpler and avoids inventing a fake `sources` row just to satisfy a
+foreign key. It's folded into `Db::compute_blocked_patterns`'s output
+(both `blocked_user_agent_patterns` and `_for_site` funnel through this),
+regex-escaped (`escape_for_nginx_regex` — hand-rolled, no `regex`
+dependency, since the only requirement is "produce a literal-matching
+fragment safe to embed in a `|`-joined NGINX regex," not full parsing) so
+special characters in a captured real UA string (parentheses, dots, ...)
+don't get interpreted as regex syntax. Appended unconditionally, after
+the bot/category cascade: a manual UA block is the same kind of "global
+pin, always wins" a global per-bot pin already is, just for a string with
+no `bots` row at all, so a site's category override can't limit or lift
+it either.
+
+**A caveat worth knowing, not a bug:** the User Agent panel counts only
+*successful* (non-4xx/5xx) requests (see `accesslog::
+successful_user_agent_counts`), so a user agent already 403'd by an
+existing bot-category block never reaches `user_agent_stats` and so never
+shows up here. This panel is about traffic that's *getting through*, not
+a complete traffic log — by design, not oversight.
+
+## Firewall "needs updating" status and apply-after-write (`src/firewall.rs`, `src/tui/dashboard.rs`, `src/app.rs`)
+
+The `RenderFirewall` cron job only renders daily, while `BlockScanners`/
+`BlockWebScanners` add new `firewall_rules` rows every minute — so the
+on-disk script can silently lag behind the actual rule set for up to a
+day unless an admin happens to press `f`. Added a Summary panel row
+("Firewall rules: up to date" / "needs updating (press f to update)")
+and an "apply after writing" shortcut in the render popup itself.
+
+**Staleness is a persisted signature comparison, never a disk read.**
+`firewall::rules_signature(rules)` is just `format!("{rules:?}")` over the
+same rule set `build_script` renders (`firewall::all_rules`, factored out
+of `build_script` for exactly this reuse — admin-managed rules from
+`Db::list_firewall_rules` followed by derived crawler/geo rules). Every
+successful write (`App::render_firewall`, `render_firewall_for_cron`)
+persists this string via new `Db::set_firewall_rendered_signature`
+(reuses the `settings` table, one fixed key — there's only ever one
+"current" render to track). `Dashboard::refresh` recomputes the current
+signature and compares. Deliberately *not* "does `/etc/stop-bots/
+firewall.nft`'s bytes match a freshly-rendered nftables script": that
+would (a) make `Dashboard::refresh` — called from plain unit tests
+constructing an in-memory `Db` — read a real system path, an
+unnecessary hermeticity violation, and (b) misreport a real render done
+with `--backend iptables` to a custom path as permanently "stale",
+since it'd always be compared against a fresh nftables build. The
+signature is backend/path-independent by construction: what matters is
+whether the *rules* changed since the last render, not which
+backend/path last wrote them.
+
+**Panel height was already at its floor, so this didn't grow the
+Dashboard.** The Summary panel's new third line needed a row, but at
+this project's documented 30-row minimum terminal size, `Constraint::
+Min(1)` on the Messages panel was already down to its bare 3-row floor
+(1 content row + 2 borders — see "Successful-access user-agent
+tracking" above, which hit and rebalanced around this same ceiling
+once already). Geo-blocking (`Constraint::Length(8)` -> `Length(7)`)
+gave up the row instead of Messages or Summary: it's a scrollable
+`List`, which degrades by scrolling to the selected row when its
+viewport shrinks, where `Paragraph`'s fixed lines (Messages, Summary)
+would just silently lose whichever line no longer fits. Total fixed
+height is unchanged (5+7+5+7 = 5+8+4+7 = 24), so the 30-row floor still
+gets the same 3-row Messages panel it always did.
+
+**Apply-after-write uses Space, not a modifier combo, for the popup
+toggle.** Ctrl+Enter was the first idea, but many terminals (plain
+Linux console, tmux without extended keyboard protocols) don't reliably
+distinguish Ctrl+Enter from plain Enter, which would make the shortcut
+silently not fire in exactly the SSH/tmux environments this admin tool
+actually runs in. Space was free to repurpose: the output-path text
+field only ever accepted `is_ascii_punctuation() || is_ascii_alphanumeric()`
+characters, and space is neither, so it was already a no-op keystroke in
+this popup, not text a path could contain. `Popup::RenderFirewall` grew
+an `apply_after_write: bool` field toggled by Space and shown as a
+`[ ]`/`[x]` checkbox line, carried through unchanged by Enter into
+`KeyOutcome::RenderFirewall`'s new `apply` field.
+
+**Applying is still never automatic — only this one explicit, interactive
+path can do it.** New `firewall::apply_script(backend, out_path)` runs
+`sh <out>` (iptables) or `nft -f <out>` (nftables) — the only place in
+the whole project that executes a generated script rather than only
+writing it. No cron job calls it; `App::render_firewall` only reaches it
+when the popup's toggle was on *and* the write itself already succeeded
+(so the same lockout-risk check that gates writing gates applying too,
+transitively). Gated by a new `App::apply_firewall: bool` field, sharing
+`main.rs`'s existing `--no-reload` flag rather than getting its own CLI
+flag — same "don't actually run system-changing commands under test"
+reason `reload_nginx` exists for, and re-running the real `nft -f`/`sh`
+against a freshly generated script from an automated test would mutate
+whatever host runs the suite. `apply_script`'s own unit tests only
+exercise the `Iptables` (`sh <script>`) branch, with inert `true`/`false`
+scripts rather than real firewall commands: unlike `nft`, `sh` is
+universally available and a trivial exit-code script never touches the
+real system firewall, so it's safe in CI the same way `nftables::render`'s
+tests are safe (they only ever produce text, never execute it) — the
+`Nftables` branch has no direct test, for the same reason
+`nginx::reload`'s real `systemctl`/`nginx` calls don't either.
+
+## Left/Right and vim h/l as screen-cycling aliases (`src/app.rs`, `src/tui.rs`, `src/tui/help.rs`)
+
+Tab/Shift+Tab already cycled screens; added Left/Right as equivalents, plus
+`h` (= Left)/`l` (= Right) as their vim aliases, in the same global
+fallback `match` in `App::handle_key_event` that already had Tab/BackTab —
+so all four only ever fire once the active screen's own `handle_key` has
+returned `Ignored` for the key, exactly the same gating Tab/BackTab
+already relied on (a popup's catch-all `_ => Consumed`, or a search box's
+unguarded `Char(c)` catch-all, both already stop them from leaking through
+today for `d`/`b`/`s`/`p`, so they stop Left/Right/`h`/`l` the same way).
+
+**`h`/`l` deliberately do *not* appear everywhere `j`/`k` do.** `j`/`k`
+already alias Up/Down almost everywhere a list is navigated. Left/Right
+had no prior meaning anywhere in the app, so `h`/`l` only needed adding at
+the one place Left/Right themselves now mean something: this global
+screen-cycle fallback. Three places were deliberately *not* given `h`/`l`
+(and don't have `j`/`k` either, on inspection — not an oversight,
+confirmed while auditing every existing Up/Down site for this change):
+Bot settings' and Site detail's `Focus::Search` (a live-filter query box
+where every character, including 'h'/'j'/'k'/'l', must be literal search
+text — `bot.rs`/`site_detail.rs`'s Up/Down there stay arrow-only), and the
+Dashboard's `Popup::RenderFirewall` backend selector (a free-text output
+path field with the exact same problem — see the "Firewall 'needs
+updating'" entry above, which hit this exact bug with 'j'/'k' and fixed it
+the same way: arrows only, no vim aliases, wherever free text entry sits
+right next to a selector).
+
+## Dynamic Protection: red for blocked, a display filter, and unblock (`src/tui/dynamic_protection.rs`, `src/db.rs`)
+
+Three additions to the existing SSH/User Agent panels: `BLOCKED` rows
+render in red (`style_by_status`, mirroring `dashboard.rs::policy_tag`'s
+fixed, theme-independent red/green — not varied per light/dark theme); a
+shared `f`-cycled `Filter` (`All` -> `PendingOnly` -> `BlockedOnly` ->
+`All`) applied to both panels at once; and `Enter` now unblocks an
+already-`Blocked` row instead of only ever (re-)blocking.
+
+**One filter for both panels, not two.** Both panels already share one
+mental model ("what am I looking for right now"), and a per-panel filter
+would need its own title-hint slot in both — one `Filter` field keeps the
+UI and the state simple. `Filter::matches(status)` is the single place
+that decides visibility; `Filter::All` always passes.
+
+**Filtering never mutates `ssh_rows`/`ua_rows` — it's a view.** New
+`visible_ssh_rows`/`visible_ua_rows` filter the full rows fresh on every
+call (render *and* selection resolution both go through them), so there's
+only one source of truth for "what does the current filter show" and it
+can never drift from what's actually on screen. `ListState`'s selected
+index refers to a position in this *filtered* list, not the full
+underlying vector — `toggle_block_selected` resolves through
+`visible_ssh_rows().get(i)`/`visible_ua_rows().get(i)` accordingly, not
+`ssh_rows.get(i)`/`ua_rows.get(i)` directly, and both the filter-change
+handler and `refresh` re-clamp the selection against the *filtered*
+length (`clamp_selections`, replacing the old direct `clamp_selection`
+calls against the raw row counts) — otherwise switching to a filter with
+fewer visible rows than the current selection index would leave the
+selection pointing at a row that's no longer on screen.
+
+**Enter is now a toggle, which is a real, deliberate behavior change from
+before.** Previously Enter always called `block_address_permanently`
+regardless of a row's current status — including upgrading an
+already-temporarily-blocked row (e.g. one `block-scanners` added) to
+permanent, a dedicated convenience with its own test
+(`enter_upgrades_an_already_temporarily_blocked_ssh_row_to_permanent`).
+That convenience is gone: Enter on *any* `Blocked` row (temporary or
+permanent) now unblocks it instead, matching how this app already treats
+Enter as a context-sensitive toggle elsewhere (the Dashboard's Countries
+list: Enter on an existing country removes it directly, no separate key —
+see `tui/dashboard.rs`'s module doc). New `Db::unblock_address`/
+`unblock_user_agent` are the direct reverse of `block_address_permanently`/
+`block_user_agent`: the former only ever deletes a `firewall_rules` row
+matching the exact address *and* `action = 'block'` — never a CIDR range
+(those are derived, never stored as rows) and never an `Allow` rule that
+happens to share the address, which an unblock action has no business
+touching.
