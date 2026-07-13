@@ -42,7 +42,7 @@ fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
     cmd.env("TERM", "xterm-256color");
 
     let session = spawn_command(cmd, Some(TIMEOUT_MS)).expect("failed to spawn stop-bots tui");
-    set_window_size(&session, 30, 100);
+    set_window_size(&session, 32, 100);
     session
 }
 

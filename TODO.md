@@ -1,5 +1,9 @@
 # TODO
 
+* Check if nftables / iptables are installed and recommend only the installed backend.
+
+## Done
+
 - Per-site category and bot overrides are done (TUI only — `site_category_overrides`/
   `site_bot_overrides` tables, `SiteDetail`, `apply-blocks` applies them
   per-file). No CLI verb to set them, matching the existing gap for global
