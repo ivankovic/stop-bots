@@ -2321,3 +2321,72 @@ never fire. The CLI fails loudly and `protection::honeypot_path` falls
 back to the default, rather than leaving a detector that looks switched on
 and does nothing — the same reasoning as `set-probe-paths`' rejection of
 unanchored entries.
+
+## Reputation and cloud-provider CIDR feeds (`src/ipranges/reputation.rs`)
+
+**What they are.** Six built-in third-party CIDR lists: three abuse
+lists (FireHOL level 1, Tor exit nodes, blocklist.de) and three cloud
+providers' published address space (AWS, Google Cloud, DigitalOcean).
+Each is independently switchable; while on, every CIDR it holds becomes a
+derived Block rule at render time, exactly like crawler and country
+ranges — nothing is written to `firewall_rules`.
+
+**Why a separate table and enum, not `ip_range_sources`.** Two silent
+bugs were available here, neither of which would have failed to compile:
+
+1. `Db::blocked_ip_ranges` decides whether an `ip_range_sources` row
+   applies by looking up its **bot category**'s default. A reputation feed
+   has no bot category, and borrowing one would tie "block Spamhaus-listed
+   addresses" to "block AI crawlers".
+2. `scanblock::known_crawler_ranges` iterates `IpRangeSourceKind::ALL` to
+   build the *exemption* list for web-scanner detection. A feed added
+   there would start **exempting** known-abusive addresses from being
+   flagged — the exact opposite of the point.
+
+So: `reputation_sources` / `reputation_ranges` tables (new `CREATE TABLE
+IF NOT EXISTS`, so no migration), and a `ReputationSourceKind` that
+`known_crawler_ranges` never sees.
+
+**Why no Spamhaus DROP entry.** Spamhaus has moved its published format
+more than once — the classic `drop.txt` is deprecated in favour of a JSON
+endpoint — and FireHOL level 1 already *includes* DROP alongside several
+other lists in one stable plain-text format. One well-maintained aggregate
+beats three parsers chasing three upstreams.
+
+**The two halves of this list are not the same kind of thing**, and the
+code says so via `blocks_infrastructure()`/`warning()`. An abuse list
+names addresses that *did something*. A provider list names every address
+a company owns — every VPN endpoint, corporate egress, CI runner and API
+integration hosted there. Real people browse from AWS addresses. That
+warning is surfaced on enable in both the CLI and the TUI, not left in a
+doc comment, because unlike every detector here there is no behavioural
+evidence involved and a wrongly-blocked visitor has no way to tell you.
+All six default to off.
+
+**Fetching and enabling are separate steps**, so refreshing a feed you
+deliberately switched off never silently re-enables it, and switching one
+off keeps its downloaded ranges so turning it back on is instant.
+Enabling a never-fetched feed *from the TUI* does trigger a download
+(`KeyOutcome::FetchReputationSource` → `App::start_reputation_fetch`,
+the same off-thread-fetch/on-thread-store split as country selection),
+because enabling something with no data would otherwise look like it
+worked while doing nothing. If that download fails, the feed stays
+enabled-and-empty — inert, and reported — rather than having an explicit
+choice silently undone by a transient network error.
+
+**An empty parse is an error, not an empty list.** Both `update()` and the
+TUI's completion handler refuse to store a zero-length result: it almost
+always means the upstream format moved or an error page was served, and
+storing it would silently un-block everything the feed covered. The
+per-line parsers also drop anything that doesn't look like an address at
+all, because one bad line in a generated firewall script makes the *whole*
+script fail to apply, taking every other rule down with it.
+
+**Panel placement.** Feeds are rows in the existing "Automatic blocking"
+list rather than a fifth Dashboard panel there is no room for — they
+answer the same question ("what adds firewall blocks without me doing
+anything?"). `ProtectionRow::Feed(usize)` indexes into the loaded source
+list, and `protection_rows()` is recomputed rather than cached so the row
+count can never disagree with the data behind it. A feed's popup offers
+only Off/On, with no TTL rows: its blocks are derived fresh at every
+render, so there is nothing that expires.

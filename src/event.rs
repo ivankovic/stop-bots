@@ -67,6 +67,15 @@ pub enum AppEvent {
         country_code: String,
         result: Result<Vec<String>, String>,
     },
+    /// A background reputation-feed download finished — `Ok(cidrs)` or a
+    /// stringified error (the error can't cross the channel as
+    /// `anyhow::Error`, same as `CountrySelectFinished` above). Storing
+    /// happens back on the main thread for the same `Db`-isn't-`Sync`
+    /// reason.
+    ReputationFetchFinished {
+        source_id: String,
+        result: Result<Vec<String>, String>,
+    },
     /// The internal cron's background fetch for the `UpdateIpRanges` job
     /// (see `crate::cron`) has finished. Carries each of the three crawler
     /// sources' fetch outcome (parsed CIDRs, or a stringified error) so

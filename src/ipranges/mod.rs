@@ -28,6 +28,8 @@
 //! instead of dispatching to per-source modules the way `botlist::SourceKind`
 //! does.
 
+pub mod reputation;
+
 use crate::db::{Category, Db, IpRangeSource};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -135,7 +137,7 @@ struct RawPrefix {
 /// publish into a flat list of CIDR strings (IPv4 and IPv6 mixed together —
 /// same "just a CIDR string" shape `firewall_rules.address` and
 /// `iptables::render`'s `:`-based IPv6 filter already expect).
-fn parse_prefixes_json(raw: &str) -> Result<Vec<String>> {
+pub(crate) fn parse_prefixes_json(raw: &str) -> Result<Vec<String>> {
     let doc: RawPrefixDoc = serde_json::from_str(raw).context("failed to parse IP range JSON")?;
     Ok(doc
         .prefixes

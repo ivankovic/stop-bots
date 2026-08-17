@@ -128,6 +128,12 @@ impl App {
             apply_firewall: reload_nginx,
         };
         botlist::register_all_sources(&app.db)?;
+        // Same reason bot-list sources are registered here: the Dashboard's
+        // feed rows need something to show before any fetch has ever run,
+        // otherwise a fresh install offers no way to turn one on. Safe to
+        // repeat every startup — registration never touches an existing
+        // row's `enabled` flag.
+        crate::ipranges::reputation::register_all_reputation_sources(&app.db)?;
         app.refresh()?;
         Ok(app)
     }
@@ -172,6 +178,9 @@ impl App {
                 result,
             }) => {
                 self.finish_country_select(country_code, result)?;
+            }
+            Event::App(AppEvent::ReputationFetchFinished { source_id, result }) => {
+                self.finish_reputation_fetch(source_id, result)?;
             }
             Event::App(AppEvent::CronIpRangesFetched { results }) => {
                 self.finish_cron_update_ip_ranges(results)?;
@@ -256,6 +265,74 @@ impl App {
                 result,
             }));
         });
+    }
+
+    /// Starts a background download of one reputation/cloud-provider feed
+    /// that the Dashboard just switched on but has never fetched. Only the
+    /// fetch and parse run off-thread; storing happens back on the main
+    /// thread in [`Self::finish_reputation_fetch`], the same
+    /// `Db`-isn't-`Sync` split every other background task here uses.
+    fn start_reputation_fetch(&mut self, source_id: String) {
+        use crate::ipranges::reputation::ReputationSourceKind;
+
+        let name = ReputationSourceKind::from_id(&source_id)
+            .map(|k| k.name().to_string())
+            .unwrap_or_else(|| source_id.clone());
+        self.message = Some(format!("Fetching {name}…"));
+        let sender = self.events.sender();
+        tokio::spawn(async move {
+            let result = async {
+                let kind = ReputationSourceKind::from_id(&source_id)
+                    .with_context(|| format!("unknown reputation source: {source_id}"))?;
+                let raw = kind.fetch().await?;
+                kind.parse(&raw)
+            }
+            .await
+            .map_err(|err: anyhow::Error| err.to_string());
+            let _ = sender.send(Event::App(AppEvent::ReputationFetchFinished {
+                source_id,
+                result,
+            }));
+        });
+    }
+
+    /// Stores a completed reputation-feed download. The source was already
+    /// switched on before the fetch started (that's what triggered it), so
+    /// a failure here leaves a feed that's enabled with nothing in it —
+    /// which is inert rather than wrong, and the message says so. Turning
+    /// it back off on failure would silently undo an explicit choice for a
+    /// reason (a transient network error) that may not recur.
+    fn finish_reputation_fetch(
+        &mut self,
+        source_id: String,
+        result: Result<Vec<String>, String>,
+    ) -> Result<()> {
+        use crate::ipranges::reputation::ReputationSourceKind;
+
+        let name = ReputationSourceKind::from_id(&source_id)
+            .map(|k| k.name().to_string())
+            .unwrap_or_else(|| source_id.clone());
+        match result {
+            Ok(cidrs) if cidrs.is_empty() => {
+                // Same guard as `reputation::update`: an empty parse almost
+                // always means the upstream format moved, and storing it
+                // would wipe whatever was there before.
+                self.message = Some(format!(
+                    "{name} returned no usable addresses — upstream format may have changed"
+                ));
+            }
+            Ok(cidrs) => {
+                let count = self.db.replace_reputation_ranges(&source_id, &cidrs)?;
+                self.message = Some(format!(
+                    "{name}: {count} range(s) stored — render the firewall (f) to apply"
+                ));
+            }
+            Err(err) => {
+                self.message = Some(format!("{name} update failed: {err}"));
+            }
+        }
+        self.refresh()?;
+        Ok(())
     }
 
     /// Stores the fetched CIDRs (on success) and adds the country to the
@@ -714,6 +791,10 @@ impl App {
             }
             KeyOutcome::SelectCountry(country_code) => {
                 self.start_country_select(country_code);
+                return Ok(());
+            }
+            KeyOutcome::FetchReputationSource(source_id) => {
+                self.start_reputation_fetch(source_id);
                 return Ok(());
             }
             KeyOutcome::RenderFirewall {

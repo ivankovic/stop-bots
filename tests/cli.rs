@@ -491,6 +491,138 @@ fn honeypot_path_is_configurable_and_blocks_whatever_fetches_it() {
     assert_eq!(rules[0].address, "203.0.113.9");
 }
 
+/// Reputation feeds end to end, without touching the network: seed ranges
+/// directly, then confirm the on/off switch is what decides whether they
+/// reach the rendered firewall script.
+#[test]
+fn a_reputation_feed_only_reaches_the_firewall_script_once_enabled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let out = tmp.path().join("firewall.nft");
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-reputation-sources", "--db", db_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("firehol-level1"))
+        .stdout(predicate::str::contains("[OFF]"));
+
+    {
+        let db = stop_bots::db::Db::open(&db_path).unwrap();
+        db.replace_reputation_ranges("tor-exits", &["198.51.100.7".to_string()])
+            .unwrap();
+    }
+
+    let render = |db_path: &Path, out: &Path| {
+        Command::cargo_bin("stop-bots")
+            .unwrap()
+            .args([
+                "render-firewall",
+                "--backend",
+                "nftables",
+                "--out",
+                out.to_str().unwrap(),
+                "--db",
+                db_path.to_str().unwrap(),
+                "--ssh-log",
+                "/nonexistent/auth.log",
+            ])
+            .assert()
+            .success();
+    };
+
+    // Fetched but off: the range must not be in the script.
+    render(&db_path, &out);
+    assert!(!fs::read_to_string(&out).unwrap().contains("198.51.100.7"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-reputation-source",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source-id",
+            "tor-exits",
+            "--enabled",
+            "true",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("render-firewall"));
+
+    render(&db_path, &out);
+    assert!(fs::read_to_string(&out).unwrap().contains("198.51.100.7"));
+
+    // And switching it back off removes it again, without losing the data.
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-reputation-source",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source-id",
+            "tor-exits",
+            "--enabled",
+            "false",
+        ])
+        .assert()
+        .success();
+    render(&db_path, &out);
+    assert!(!fs::read_to_string(&out).unwrap().contains("198.51.100.7"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-reputation-sources", "--db", db_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 range(s)"));
+}
+
+/// Enabling a cloud-provider feed must say what it actually does.
+#[test]
+fn enabling_a_provider_feed_warns_and_flags_that_nothing_is_fetched_yet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-reputation-source",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source-id",
+            "aws",
+            "--enabled",
+            "true",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not just bots"))
+        .stdout(predicate::str::contains("No ranges stored yet"));
+}
+
+#[test]
+fn an_unknown_reputation_source_is_rejected_with_the_known_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-reputation-source",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source-id",
+            "not-a-feed",
+            "--enabled",
+            "true",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("firehol-level1"));
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

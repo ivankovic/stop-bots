@@ -94,26 +94,37 @@ enum Focus {
 /// live on the Dashboard rather than Site settings: this project puts
 /// everything that ends up in the *firewall script* here, and everything
 /// that ends up in *NGINX config* on Site settings.
+/// A row in the "Automatic blocking" list: either a log-analysis detector
+/// or a third-party CIDR feed. They share one panel because they answer
+/// the same question — "what adds firewall blocks without me doing
+/// anything?" — and splitting them would mean a fifth Dashboard panel
+/// there is no room for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtectionRow {
     SpoofedCrawlers,
     ProbePaths,
     Honeypot,
+    /// A `reputation_sources` row, by index into
+    /// `Dashboard::reputation` (which is ordered by id, as
+    /// `Db::list_reputation_sources` returns it).
+    Feed(usize),
 }
 
 impl ProtectionRow {
-    const ALL: [ProtectionRow; 3] = [
+    /// The three detectors, always present. Feed rows are appended per
+    /// render/keypress from whatever `reputation_sources` holds, so this
+    /// can't be one fixed array any more — see `Dashboard::protection_rows`.
+    const DETECTORS: [ProtectionRow; 3] = [
         ProtectionRow::SpoofedCrawlers,
         ProtectionRow::ProbePaths,
         ProtectionRow::Honeypot,
     ];
 
-    fn label(self) -> &'static str {
-        match self {
-            ProtectionRow::SpoofedCrawlers => "Forged crawler UAs",
-            ProtectionRow::ProbePaths => "Probe paths",
-            ProtectionRow::Honeypot => "Honeypot path",
-        }
+    /// Whether this row is a detector (whose popup offers Off plus a TTL
+    /// choice) rather than a feed (a plain Off/On, with no TTL — a feed's
+    /// blocks are derived at render time and never expire on their own).
+    fn is_detector(self) -> bool {
+        !matches!(self, ProtectionRow::Feed(_))
     }
 }
 
@@ -186,6 +197,9 @@ pub struct Dashboard {
     /// panel only displays them; `crate::cron`'s jobs read the same values
     /// straight from `Db` when they run.
     protection: crate::protection::ProtectionSettings,
+    /// Every third-party CIDR feed, ordered by id — the order
+    /// `ProtectionRow::Feed`'s index refers to.
+    reputation: Vec<crate::db::ReputationSource>,
     focus: Focus,
     /// The internal cron's per-job state (see `crate::cron`), read-only
     /// here — this panel only displays it, `App` is what actually runs due
@@ -213,6 +227,7 @@ impl Dashboard {
         self.selected_countries = db.list_selected_countries()?;
         self.fetched_countries = db.list_fetched_countries()?;
         self.protection = crate::protection::ProtectionSettings::load(db)?;
+        self.reputation = db.list_reputation_sources()?;
         self.cron_status = crate::cron::status(db)?;
         self.firewall_needs_update = firewall_needs_update(db)?;
         if self.list_state.selected().is_none() {
@@ -367,9 +382,10 @@ impl Dashboard {
             });
         frame.render_stateful_widget(country_list, geo_area, &mut self.countries_state);
 
-        let protection_items: Vec<ListItem> = ProtectionRow::ALL
-            .iter()
-            .map(|row| ListItem::new(self.protection_row_line(*row)))
+        let protection_items: Vec<ListItem> = self
+            .protection_rows()
+            .into_iter()
+            .map(|row| ListItem::new(self.protection_row_line(row)))
             .collect();
         let protection_list = List::new(protection_items)
             .block(
@@ -445,11 +461,37 @@ impl Dashboard {
         ])
     }
 
+    /// The full "Automatic blocking" list: the fixed detectors followed by
+    /// one row per known feed. Recomputed rather than cached so it can
+    /// never disagree with `self.reputation` about how many rows exist —
+    /// a stale count here would let the selection index point past the end.
+    fn protection_rows(&self) -> Vec<ProtectionRow> {
+        ProtectionRow::DETECTORS
+            .iter()
+            .copied()
+            .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
+            .collect()
+    }
+
+    fn protection_label(&self, row: ProtectionRow) -> String {
+        match row {
+            ProtectionRow::SpoofedCrawlers => "Forged crawler UAs".to_string(),
+            ProtectionRow::ProbePaths => "Probe paths".to_string(),
+            ProtectionRow::Honeypot => "Honeypot path".to_string(),
+            ProtectionRow::Feed(i) => self
+                .reputation
+                .get(i)
+                .map(|s| s.name.clone())
+                .unwrap_or_default(),
+        }
+    }
+
     fn protection_enabled(&self, row: ProtectionRow) -> bool {
         match row {
             ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_enabled,
             ProtectionRow::ProbePaths => self.protection.probe_paths_enabled,
             ProtectionRow::Honeypot => self.protection.honeypot_enabled,
+            ProtectionRow::Feed(i) => self.reputation.get(i).is_some_and(|s| s.enabled),
         }
     }
 
@@ -458,6 +500,10 @@ impl Dashboard {
             ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_ttl_days,
             ProtectionRow::ProbePaths => self.protection.probe_paths_ttl_days,
             ProtectionRow::Honeypot => self.protection.honeypot_ttl_days,
+            // Feeds have no TTL: their blocks are derived fresh at
+            // render time from the stored ranges, so there's nothing to
+            // expire.
+            ProtectionRow::Feed(_) => 0,
         }
     }
 
@@ -474,13 +520,19 @@ impl Dashboard {
         } else {
             Span::from("[ OFF ]").dim()
         };
-        let detail = if enabled {
-            format!(" {}d", self.protection_ttl_days(row))
-        } else {
-            String::new()
+        let detail = match row {
+            ProtectionRow::Feed(i) => match self.reputation.get(i) {
+                // "not fetched" is the important state to surface: an
+                // enabled feed with no ranges is silently doing nothing.
+                Some(s) if s.last_fetched_at.is_none() => " not fetched".to_string(),
+                Some(s) => format!(" {}", s.range_count),
+                None => String::new(),
+            },
+            _ if enabled => format!(" {}d", self.protection_ttl_days(row)),
+            _ => String::new(),
         };
         Line::from(vec![
-            Span::from(format!("{:<19}", row.label())),
+            Span::from(format!("{:<19}", self.protection_label(row))),
             tag,
             Span::from(detail),
         ])
@@ -489,8 +541,9 @@ impl Dashboard {
     fn render_popup(&self, frame: &mut Frame, area: Rect, popup: Popup) {
         match popup {
             Popup::Protection { row, selected } => {
-                let title = row.label();
-                let options = protection_options();
+                let title = self.protection_label(row);
+                let title = title.as_str();
+                let options = protection_options(row.is_detector());
                 let content_width = options
                     .iter()
                     .map(|o| o.len())
@@ -718,14 +771,14 @@ impl Dashboard {
                         return Ok(KeyOutcome::Consumed);
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        *selected = (*selected + 1).min(PROTECTION_TTL_CHOICES.len());
+                        let last = protection_options(row.is_detector()).len() - 1;
+                        *selected = (*selected + 1).min(last);
                         return Ok(KeyOutcome::Consumed);
                     }
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         let (row, selected) = (*row, *selected);
                         self.popup = None;
-                        self.commit_protection(db, row, selected, message)?;
-                        return Ok(KeyOutcome::Mutated);
+                        return self.commit_protection(db, row, selected, message);
                     }
                     _ => return Ok(KeyOutcome::Consumed),
                 },
@@ -916,7 +969,8 @@ impl Dashboard {
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.protection_state.selected().unwrap_or(0) + 1 < ProtectionRow::ALL.len()
+                    if self.protection_state.selected().unwrap_or(0) + 1
+                        < self.protection_rows().len()
                     {
                         self.protection_state.select_next();
                     }
@@ -939,12 +993,14 @@ impl Dashboard {
         let Some(row) = self
             .protection_state
             .selected()
-            .and_then(|i| ProtectionRow::ALL.get(i).copied())
+            .and_then(|i| self.protection_rows().get(i).copied())
         else {
             return;
         };
         let selected = if !self.protection_enabled(row) {
             0
+        } else if !row.is_detector() {
+            1
         } else {
             let ttl = self.protection_ttl_days(row);
             let closest = PROTECTION_TTL_CHOICES
@@ -968,7 +1024,10 @@ impl Dashboard {
         row: ProtectionRow,
         selected: usize,
         message: &mut Option<String>,
-    ) -> Result<()> {
+    ) -> Result<KeyOutcome> {
+        if let ProtectionRow::Feed(i) = row {
+            return self.commit_feed(db, i, selected == 1, message);
+        }
         let (enabled_key, ttl_key) = match row {
             ProtectionRow::SpoofedCrawlers => (
                 crate::protection::SPOOFED_CRAWLERS_ENABLED,
@@ -982,11 +1041,15 @@ impl Dashboard {
                 crate::protection::HONEYPOT_ENABLED,
                 crate::protection::HONEYPOT_TTL_DAYS,
             ),
+            // Handled by the early return above; kept explicit rather than
+            // a `_` arm so adding a row variant is a compile error here.
+            ProtectionRow::Feed(_) => unreachable!("feeds are committed by commit_feed"),
         };
+        let label = self.protection_label(row);
         if selected == 0 {
             db.set_bool_setting(enabled_key, false)?;
-            *message = Some(format!("{} detection off", row.label()));
-            return Ok(());
+            *message = Some(format!("{label} detection off"));
+            return Ok(KeyOutcome::Mutated);
         }
         let ttl = PROTECTION_TTL_CHOICES
             .get(selected - 1)
@@ -994,11 +1057,56 @@ impl Dashboard {
             .unwrap_or(PROTECTION_TTL_CHOICES[0]);
         db.set_bool_setting(enabled_key, true)?;
         db.set_int_setting(ttl_key, ttl)?;
+        *message = Some(format!("{label} detection on, blocking for {ttl} day(s)"));
+        Ok(KeyOutcome::Mutated)
+    }
+
+    /// Switches one third-party CIDR feed on or off. Enabling a feed that
+    /// has never been fetched also asks `App` to download it
+    /// (`KeyOutcome::FetchReputationSource`) — enabling something with no
+    /// data would otherwise look like it worked while doing nothing at
+    /// all. Enabling an already-fetched feed needs no network round trip
+    /// and just returns `Mutated`, the same split the country-select
+    /// action already makes.
+    ///
+    /// Disabling never deletes the stored ranges, so switching a feed back
+    /// on is instant.
+    fn commit_feed(
+        &mut self,
+        db: &Db,
+        index: usize,
+        enabled: bool,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(source) = self.reputation.get(index).cloned() else {
+            return Ok(KeyOutcome::Consumed);
+        };
+        if source.enabled == enabled {
+            return Ok(KeyOutcome::Consumed);
+        }
+        db.set_reputation_source_enabled(&source.id, enabled)?;
+        if !enabled {
+            *message = Some(format!("{} off", source.name));
+            return Ok(KeyOutcome::Mutated);
+        }
+
+        // Surfaced on enable, not buried in a doc comment: the provider
+        // feeds block every visitor hosted there, and unlike a detector
+        // there's no behavioural evidence behind it.
+        let warning = crate::ipranges::reputation::ReputationSourceKind::from_id(&source.id)
+            .and_then(|k| k.warning())
+            .map(|w| format!(" — {w}"))
+            .unwrap_or_default();
+
+        if source.last_fetched_at.is_none() {
+            *message = Some(format!("{} on, fetching…{warning}", source.name));
+            return Ok(KeyOutcome::FetchReputationSource(source.id));
+        }
         *message = Some(format!(
-            "{} detection on, blocking for {ttl} day(s)",
-            row.label()
+            "{} on ({} range(s)) — render the firewall (f) to apply{warning}",
+            source.name, source.range_count
         ));
-        Ok(())
+        Ok(KeyOutcome::Mutated)
     }
 
     fn open_category_popup(&mut self) {
@@ -1051,7 +1159,13 @@ impl Dashboard {
 /// the key handler can never disagree about how many rows there are or what
 /// index means what — the same reason Site settings has its own
 /// `setting_options`.
-fn protection_options() -> Vec<String> {
+fn protection_options(is_detector: bool) -> Vec<String> {
+    if !is_detector {
+        // A feed has no TTL to choose: its blocks are derived fresh from
+        // the stored ranges every time the firewall is rendered, so there
+        // is nothing that expires.
+        return vec!["Off".to_string(), "On".to_string()];
+    }
     std::iter::once("Off".to_string())
         .chain(PROTECTION_TTL_CHOICES.iter().map(|days| {
             if *days == 1 {
@@ -2209,7 +2323,7 @@ mod tests {
         }
         assert_eq!(
             dashboard.protection_state.selected(),
-            Some(ProtectionRow::ALL.len() - 1)
+            Some(dashboard.protection_rows().len() - 1)
         );
         assert_eq!(dashboard.focus, Focus::Protection);
     }
@@ -2342,6 +2456,163 @@ mod tests {
             settings.spoofed_crawlers_enabled,
             "the other detector must be untouched"
         );
+    }
+
+    // ---- reputation / provider feed rows ----
+
+    use crate::ipranges::reputation::{register_all_reputation_sources, ReputationSourceKind};
+
+    fn feed_row_index(dashboard: &Dashboard, id: &str) -> usize {
+        dashboard
+            .protection_rows()
+            .iter()
+            .position(|row| match row {
+                ProtectionRow::Feed(i) => dashboard.reputation[*i].id == id,
+                _ => false,
+            })
+            .expect("feed row should exist")
+    }
+
+    #[test]
+    fn feeds_appear_as_rows_after_the_detectors() {
+        let db = Db::open_in_memory().unwrap();
+        register_all_reputation_sources(&db).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let rows = dashboard.protection_rows();
+        assert_eq!(
+            rows.len(),
+            ProtectionRow::DETECTORS.len() + ReputationSourceKind::ALL.len()
+        );
+        assert!(rows[..ProtectionRow::DETECTORS.len()]
+            .iter()
+            .all(|r| r.is_detector()));
+        assert!(rows[ProtectionRow::DETECTORS.len()..]
+            .iter()
+            .all(|r| !r.is_detector()));
+    }
+
+    /// Enabling a never-fetched feed must ask `App` to download it —
+    /// switching one on with no ranges stored looks like it worked while
+    /// doing nothing at all.
+    #[test]
+    fn enabling_an_unfetched_feed_asks_for_a_fetch() {
+        let db = Db::open_in_memory().unwrap();
+        register_all_reputation_sources(&db).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        let target = feed_row_index(&dashboard, ReputationSourceKind::TorExits.id());
+        dashboard.protection_state.select(Some(target));
+        press(&mut dashboard, &db, KeyCode::Enter);
+        press(&mut dashboard, &db, KeyCode::Down); // Off -> On
+        let outcome = press(&mut dashboard, &db, KeyCode::Enter);
+
+        assert_eq!(
+            outcome,
+            KeyOutcome::FetchReputationSource(ReputationSourceKind::TorExits.id().to_string())
+        );
+        // Already switched on, so a failed download leaves it enabled-and-
+        // empty (inert) rather than silently undoing the choice.
+        let source = db
+            .list_reputation_sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == ReputationSourceKind::TorExits.id())
+            .unwrap();
+        assert!(source.enabled);
+    }
+
+    /// An already-fetched feed needs no network round trip.
+    #[test]
+    fn enabling_an_already_fetched_feed_does_not_ask_for_a_fetch() {
+        let db = Db::open_in_memory().unwrap();
+        register_all_reputation_sources(&db).unwrap();
+        db.replace_reputation_ranges(
+            ReputationSourceKind::TorExits.id(),
+            &["1.2.3.4".to_string()],
+        )
+        .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        let target = feed_row_index(&dashboard, ReputationSourceKind::TorExits.id());
+        dashboard.protection_state.select(Some(target));
+        press(&mut dashboard, &db, KeyCode::Enter);
+        press(&mut dashboard, &db, KeyCode::Down);
+        let outcome = press(&mut dashboard, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(db.enabled_reputation_ranges().unwrap(), vec!["1.2.3.4"]);
+    }
+
+    /// A feed's popup has no TTL rows — there's nothing that expires.
+    #[test]
+    fn a_feed_popup_offers_only_off_and_on() {
+        assert_eq!(protection_options(false).len(), 2);
+        assert!(protection_options(true).len() > 2);
+    }
+
+    #[test]
+    fn disabling_a_feed_keeps_its_ranges_for_next_time() {
+        let db = Db::open_in_memory().unwrap();
+        register_all_reputation_sources(&db).unwrap();
+        db.replace_reputation_ranges(ReputationSourceKind::Aws.id(), &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_reputation_source_enabled(ReputationSourceKind::Aws.id(), true)
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        let target = feed_row_index(&dashboard, ReputationSourceKind::Aws.id());
+        dashboard.protection_state.select(Some(target));
+        press(&mut dashboard, &db, KeyCode::Enter);
+        press(&mut dashboard, &db, KeyCode::Up); // On -> Off
+        press(&mut dashboard, &db, KeyCode::Enter);
+
+        assert!(db.enabled_reputation_ranges().unwrap().is_empty());
+        let source = db
+            .list_reputation_sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == ReputationSourceKind::Aws.id())
+            .unwrap();
+        assert_eq!(
+            source.range_count, 1,
+            "ranges must survive being switched off"
+        );
+    }
+
+    /// The provider feeds block real visitors; enabling one must say so.
+    #[test]
+    fn enabling_a_provider_feed_warns_about_blocking_real_visitors() {
+        let db = Db::open_in_memory().unwrap();
+        register_all_reputation_sources(&db).unwrap();
+        db.replace_reputation_ranges(ReputationSourceKind::Aws.id(), &["1.2.3.0/24".to_string()])
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        let target = feed_row_index(&dashboard, ReputationSourceKind::Aws.id());
+        dashboard.protection_state.select(Some(target));
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        let message = message.unwrap();
+        assert!(message.contains("not just bots"), "message was: {message}");
     }
 
     #[test]

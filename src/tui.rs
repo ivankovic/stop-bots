@@ -178,6 +178,14 @@ pub enum KeyOutcome {
     /// it directly and returns `Mutated` instead, since no network
     /// round-trip is needed.
     SelectCountry(String),
+    /// The Dashboard enabled a reputation/cloud-provider CIDR feed that
+    /// has never been fetched, identified by its stable id. `App` spawns
+    /// the download and stores the result — same shape as
+    /// [`Self::SelectCountry`], and for the same reason: the screen's key
+    /// handler must stay free of network I/O so its tests stay fast and
+    /// offline. Enabling an already-fetched feed returns `Mutated`
+    /// instead, since nothing needs downloading.
+    FetchReputationSource(String),
     /// The Dashboard's firewall render action was triggered. Carries the
     /// selected backend and output path for `App` to call the render
     /// function (see `App::render_firewall`). `apply` is the render popup's

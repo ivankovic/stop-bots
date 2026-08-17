@@ -218,6 +218,20 @@ impl BlockResponse {
     }
 }
 
+/// A third-party CIDR feed — an abuse/reputation list, or a cloud
+/// provider's published address space. Unlike [`IpRangeSource`] these have
+/// no bot category: they're either switched on (every CIDR becomes a
+/// derived Block rule) or off, with nothing in between.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReputationSource {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub enabled: bool,
+    pub last_fetched_at: Option<i64>,
+    pub range_count: i64,
+}
+
 /// A bot-list data source that bots can be fetched from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -596,6 +610,30 @@ impl Db {
             -- does, globally and un-overridable per site — matching how a
             -- global per-bot pin already can't be overridden by a site's
             -- category override.
+            -- Third-party reputation and cloud-provider CIDR feeds.
+            -- Deliberately NOT stored in `ip_range_sources`: that table's
+            -- `category` column is a *bot* category, and
+            -- `blocked_ip_ranges` decides whether to apply a source's
+            -- ranges by looking up that category's default. A reputation
+            -- feed has no bot category, and worse, `IpRangeSourceKind::ALL`
+            -- is what `scanblock::known_crawler_ranges` iterates to build
+            -- the *exemption* list for scanner detection — adding feeds
+            -- there would start exempting Spamhaus-listed addresses from
+            -- being flagged as scanners, which is exactly backwards. A
+            -- separate table keeps both concerns from ever meeting.
+            CREATE TABLE IF NOT EXISTS reputation_sources (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                last_fetched_at INTEGER,
+                range_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS reputation_ranges (
+                source_id TEXT NOT NULL REFERENCES reputation_sources(id),
+                cidr TEXT NOT NULL,
+                PRIMARY KEY (source_id, cidr)
+            );
             CREATE TABLE IF NOT EXISTS blocked_user_agents (
                 user_agent TEXT PRIMARY KEY,
                 blocked_at INTEGER NOT NULL
@@ -1805,8 +1843,108 @@ impl Db {
             .into_iter()
             .map(|address| (address, FirewallAction::Block))
             .collect();
+        // Reputation feeds go after crawler ranges and before geo rules.
+        // The only ordering constraint that actually matters is that geo's
+        // Allowlist catch-all stays strictly last (see
+        // `firewall::derived_firewall_rules`); within the Block-only
+        // entries ahead of it, order is irrelevant to the result, since
+        // first-match-wins between two Blocks reaches the same verdict
+        // either way.
+        entries.extend(
+            self.enabled_reputation_ranges()?
+                .into_iter()
+                .map(|address| (address, FirewallAction::Block)),
+        );
         entries.extend(self.geo_firewall_rules()?);
         Ok(entries)
+    }
+
+    // ---- reputation / cloud-provider CIDR feeds ----
+
+    /// Registers `source` if its id isn't known yet, leaving an existing
+    /// row (and crucially its `enabled` flag and fetch state) untouched —
+    /// same never-clobber convention `register_ip_range_source` uses, so
+    /// re-registering the built-in list on every startup can't silently
+    /// switch off a feed the admin turned on.
+    pub fn register_reputation_source(&self, source: &ReputationSource) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO reputation_sources (id, name, url, enabled)
+             VALUES (?1, ?2, ?3, 0)",
+            params![source.id, source.name, source.url],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_reputation_sources(&self) -> Result<Vec<ReputationSource>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, url, enabled, last_fetched_at, range_count
+             FROM reputation_sources ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(ReputationSource {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                url: row.get(2)?,
+                enabled: row.get::<_, i64>(3)? != 0,
+                last_fetched_at: row.get(4)?,
+                range_count: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list reputation sources")
+    }
+
+    pub fn set_reputation_source_enabled(&self, source_id: &str, enabled: bool) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE reputation_sources SET enabled = ?1 WHERE id = ?2",
+            params![i64::from(enabled), source_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("no reputation source with id: {source_id}");
+        }
+        Ok(())
+    }
+
+    /// Replaces every CIDR stored for `source_id`. Same clear-then-reinsert
+    /// idiom as [`Self::replace_ip_ranges`]: an address a feed drops on a
+    /// later fetch stops being blocked, rather than accumulating forever.
+    pub fn replace_reputation_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
+        self.conn.execute(
+            "DELETE FROM reputation_ranges WHERE source_id = ?1",
+            params![source_id],
+        )?;
+        for cidr in cidrs {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO reputation_ranges (source_id, cidr) VALUES (?1, ?2)",
+                params![source_id, cidr],
+            )?;
+        }
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reputation_ranges WHERE source_id = ?1",
+            params![source_id],
+            |row| row.get(0),
+        )?;
+        self.conn.execute(
+            "UPDATE reputation_sources SET last_fetched_at = ?1, range_count = ?2 WHERE id = ?3",
+            params![now(), count, source_id],
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Every CIDR from every *enabled* reputation source. A source that's
+    /// been fetched but switched off contributes nothing, and its stored
+    /// ranges are kept rather than deleted so re-enabling doesn't require
+    /// another download.
+    pub fn enabled_reputation_ranges(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.cidr FROM reputation_ranges r
+             JOIN reputation_sources s ON s.id = r.source_id
+             WHERE s.enabled != 0
+             ORDER BY r.source_id, r.cidr",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list enabled reputation ranges")
     }
 
     /// Computes the user-agent regex alternatives for every bot that should

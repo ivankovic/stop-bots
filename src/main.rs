@@ -357,6 +357,44 @@ enum Command {
         #[arg(long)]
         source_id: String,
     },
+    /// Download and store one third-party CIDR feed: an abuse/reputation
+    /// list (firehol-level1, tor-exits, blocklist-de) or a cloud
+    /// provider's published address space (aws, google-cloud,
+    /// digitalocean). Fetching does *not* switch the feed on — see
+    /// SetReputationSource — so refreshing a feed you deliberately
+    /// disabled never silently re-enables it.
+    UpdateReputationSource {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        source_id: String,
+    },
+    /// Switches a third-party CIDR feed on or off. While on, every CIDR it
+    /// holds becomes a derived Block rule at render-firewall time (nothing
+    /// is written to firewall_rules, same as crawler and country ranges).
+    ///
+    /// All feeds are off by default. Note what the cloud-provider ones
+    /// actually do: they block *every* visitor hosted at that provider,
+    /// including VPN endpoints, corporate egress and API clients — not
+    /// just bots. Unlike the behavioural detectors there's no evidence
+    /// involved, and a wrongly-blocked visitor has no way to tell you.
+    SetReputationSource {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        source_id: String,
+        /// `true` or `false`. Spelled out as a value rather than a bare
+        /// `--enabled` flag so the *off* direction is expressible at all
+        /// — a flag would only ever be able to turn feeds on.
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
+    /// Lists every third-party CIDR feed with its on/off state and how many
+    /// ranges it currently holds
+    ListReputationSources {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+    },
     /// Download and store IPdeny's current aggregated CIDR list for one
     /// country (does not select it — see AddCountry)
     UpdateCountryRanges {
@@ -545,6 +583,15 @@ async fn main() -> Result<()> {
         Some(Command::RecordAccessStats { db, access_log }) => record_access_stats(db, access_log),
         Some(Command::ListAccessStats { db }) => list_access_stats(db),
         Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
+        Some(Command::UpdateReputationSource { db, source_id }) => {
+            update_reputation_source(db, source_id).await
+        }
+        Some(Command::SetReputationSource {
+            db,
+            source_id,
+            enabled,
+        }) => set_reputation_source(db, source_id, enabled),
+        Some(Command::ListReputationSources { db }) => list_reputation_sources(db),
         Some(Command::UpdateCountryRanges { db, country }) => {
             update_country_ranges(db, country).await
         }
@@ -824,6 +871,89 @@ fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
     let mode: stop_bots::db::GeoMode = mode.into();
     db.set_geo_mode(mode)?;
     println!("Geo mode set to {mode:?}");
+    Ok(())
+}
+
+async fn update_reputation_source(db_path: Option<PathBuf>, source_id: String) -> Result<()> {
+    use stop_bots::ipranges::reputation::{self, ReputationSourceKind};
+
+    let db = open_db(db_path)?;
+    let Some(kind) = ReputationSourceKind::from_id(&source_id) else {
+        let known: Vec<&str> = ReputationSourceKind::ALL.iter().map(|k| k.id()).collect();
+        anyhow::bail!("unknown source: {source_id} (known: {})", known.join(", "));
+    };
+    let count = reputation::update(&db, kind).await?;
+    println!("Stored {count} range(s) for {}", kind.name());
+    // Fetching and enabling are separate on purpose; say so, or a fetch
+    // that appears to succeed but changes nothing reads as a bug.
+    let enabled = db
+        .list_reputation_sources()?
+        .into_iter()
+        .any(|s| s.id == kind.id() && s.enabled);
+    if !enabled {
+        println!(
+            "This feed is currently OFF — run `stop-bots set-reputation-source --source-id {} \
+             --enabled true` to apply it.",
+            kind.id()
+        );
+    }
+    Ok(())
+}
+
+fn set_reputation_source(db_path: Option<PathBuf>, source_id: String, enabled: bool) -> Result<()> {
+    use stop_bots::ipranges::reputation::ReputationSourceKind;
+
+    let db = open_db(db_path)?;
+    let Some(kind) = ReputationSourceKind::from_id(&source_id) else {
+        let known: Vec<&str> = ReputationSourceKind::ALL.iter().map(|k| k.id()).collect();
+        anyhow::bail!("unknown source: {source_id} (known: {})", known.join(", "));
+    };
+    db.register_reputation_source(&kind.as_source())?;
+    db.set_reputation_source_enabled(kind.id(), enabled)?;
+    println!(
+        "{} is now {}",
+        kind.name(),
+        if enabled { "ON" } else { "OFF" }
+    );
+    if enabled {
+        if let Some(warning) = kind.warning() {
+            println!("Warning: {warning}.");
+        }
+        let count = db
+            .list_reputation_sources()?
+            .into_iter()
+            .find(|s| s.id == kind.id())
+            .map(|s| s.range_count)
+            .unwrap_or(0);
+        if count == 0 {
+            println!(
+                "No ranges stored yet — run `stop-bots update-reputation-source --source-id {}` \
+                 first, or this does nothing.",
+                kind.id()
+            );
+        }
+        println!("Run render-firewall, then apply the script, to enforce it.");
+    }
+    Ok(())
+}
+
+fn list_reputation_sources(db_path: Option<PathBuf>) -> Result<()> {
+    use stop_bots::ipranges::reputation::{self, ReputationSourceKind};
+
+    let db = open_db(db_path)?;
+    reputation::register_all_reputation_sources(&db)?;
+    for source in db.list_reputation_sources()? {
+        let state = if source.enabled { "ON " } else { "OFF" };
+        let fetched = match source.last_fetched_at {
+            Some(_) => format!("{} range(s)", source.range_count),
+            None => "never fetched".to_string(),
+        };
+        let note = ReputationSourceKind::from_id(&source.id)
+            .and_then(|k| k.warning())
+            .map(|w| format!("  [{w}]"))
+            .unwrap_or_default();
+        println!("[{state}] {:<22} {fetched}{note}", source.id);
+    }
     Ok(())
 }
 
