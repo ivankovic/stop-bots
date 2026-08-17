@@ -61,7 +61,8 @@
 //! against synthetic counts below rather than through a real or faked log
 //! file.
 
-use crate::db::{Db, FirewallAction, UserAgentStat};
+use crate::db::{Bot, Category, Db, FirewallAction, Policy, UserAgentStat};
+use crate::ipranges;
 use crate::sshlog;
 use crate::tui::{KeyOutcome, Theme};
 use anyhow::Result;
@@ -74,6 +75,7 @@ use ratatui::{
     Frame,
 };
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 /// Which of the two panels `Up`/`Down`/`Enter` currently apply to. Switched
 /// with `Tab`/`Shift+Tab` (see the module doc comment for why that claims
@@ -88,11 +90,14 @@ enum Focus {
 /// Whether a row's address/user agent is already covered by a stored
 /// block. `Blocked { until: None }` renders as `BLOCKED`; `Some(t)`
 /// (a temporary `firewall_rules` row, e.g. from `block-scanners`) renders
-/// as `BLOCKED until <relative time>`.
+/// as `BLOCKED until <relative time>`. `Blocklist` means the item is blocked
+/// by the botlist configuration (bot patterns or IP ranges), not by a manual
+/// block action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowStatus {
     Pending,
     Blocked { until: Option<i64> },
+    Blocklist,
 }
 
 impl RowStatus {
@@ -103,11 +108,16 @@ impl RowStatus {
             RowStatus::Blocked {
                 until: Some(expires_at),
             } => format!("BLOCKED until {}", format_until(expires_at)),
+            RowStatus::Blocklist => "BLOCKLIST".to_string(),
         }
     }
 
     fn is_blocked(self) -> bool {
-        matches!(self, RowStatus::Blocked { .. })
+        matches!(self, RowStatus::Blocked { .. } | RowStatus::Blocklist)
+    }
+
+    fn is_blocklist(self) -> bool {
+        matches!(self, RowStatus::Blocklist)
     }
 }
 
@@ -188,14 +198,26 @@ impl DynamicProtection {
             .filter(|rule| rule.action == FirewallAction::Block)
             .map(|rule| (rule.address, rule.expires_at))
             .collect();
+        let blocked_ip_ranges = db.blocked_ip_ranges()?;
         let ssh_counts = match sshlog::find_default_source() {
             sshlog::LogSource::Found(log_text) => sshlog::failed_attempt_counts(&log_text),
             sshlog::LogSource::Unavailable => HashMap::new(),
         };
-        self.ssh_rows = build_ssh_rows(ssh_counts, &firewall_blocks);
+        self.ssh_rows = build_ssh_rows(ssh_counts, &firewall_blocks, &blocked_ip_ranges);
 
         let blocked_uas: HashSet<String> = db.list_blocked_user_agents()?.into_iter().collect();
-        self.ua_rows = build_ua_rows(db.list_user_agent_stats()?, &blocked_uas);
+        let bots = db.list_bots()?;
+        let ai_policy = db.get_category_default(Category::Ai)?;
+        let search_policy = db.get_category_default(Category::Search)?;
+        let scanner_policy = db.get_category_default(Category::Scanner)?;
+        self.ua_rows = build_ua_rows(
+            db.list_user_agent_stats()?,
+            &blocked_uas,
+            &bots,
+            ai_policy,
+            search_policy,
+            scanner_policy,
+        );
 
         self.clamp_selections();
         Ok(())
@@ -277,7 +299,7 @@ impl DynamicProtection {
     /// underlying `ssh_rows`/`ua_rows`): a `NOT BLOCKED` row gets permanently
     /// blocked, a `Blocked` one gets unblocked. A no-op (still `Consumed`,
     /// not `Mutated`) if the panel is empty (or fully filtered out) —
-    /// there's nothing to select.
+    /// there's nothing to select. `Blocklist` rows are skipped (do nothing).
     fn toggle_block_selected(
         &mut self,
         db: &Db,
@@ -292,6 +314,10 @@ impl DynamicProtection {
                 else {
                     return Ok(KeyOutcome::Consumed);
                 };
+                if row.status.is_blocklist() {
+                    // Blocklist items cannot be toggled
+                    return Ok(KeyOutcome::Consumed);
+                }
                 if row.status.is_blocked() {
                     db.unblock_address(&row.address)?;
                     *message = Some(format!(
@@ -315,6 +341,10 @@ impl DynamicProtection {
                 else {
                     return Ok(KeyOutcome::Consumed);
                 };
+                if row.status.is_blocklist() {
+                    // Blocklist items cannot be toggled
+                    return Ok(KeyOutcome::Consumed);
+                }
                 if row.status.is_blocked() {
                     db.unblock_user_agent(&row.user_agent)?;
                     *message = Some(format!(
@@ -385,6 +415,58 @@ impl DynamicProtection {
     }
 }
 
+/// Checks if a user agent string matches any blocked bot pattern.
+/// Uses a simple case-insensitive substring check since we don't have
+/// the regex crate available. This is a best-effort check that may have
+/// false positives/negatives compared to proper regex matching.
+fn ua_matches_blocked_bot_patterns(
+    ua: &str,
+    bots: &[Bot],
+    ai_policy: Policy,
+    search_policy: Policy,
+    scanner_policy: Policy,
+) -> bool {
+    // For each bot that is currently blocked (based on its status and category policies),
+    // check if the UA contains the bot's pattern (case-insensitive).
+    for bot in bots {
+        // Check if this bot is currently blocked
+        let bot_blocked = match bot.status {
+            crate::db::BotStatus::Blocked => true,
+            crate::db::BotStatus::Allowed => false,
+            crate::db::BotStatus::Default => {
+                (bot.is_ai && ai_policy == Policy::Blocked)
+                    || (bot.is_search_engine && search_policy == Policy::Blocked)
+                    || (bot.is_scanner && scanner_policy == Policy::Blocked)
+            }
+        };
+
+        if bot_blocked {
+            // Simple case-insensitive substring check
+            let ua_lower = ua.to_lowercase();
+            let pattern_lower = bot.user_agent_pattern.to_lowercase();
+            // Split pattern by | and check if any alternative matches
+            for alternative in pattern_lower.split('|') {
+                if ua_lower.contains(alternative) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checks if an IP address is in any blocked IP range (crawler ranges).
+fn ip_in_blocked_range(ip_str: &str, blocked_ranges: &[String]) -> bool {
+    if let Ok(ip) = ip_str.parse::<IpAddr>() {
+        for cidr in blocked_ranges {
+            if ipranges::cidr_contains(cidr, ip) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Turns raw failed-attempt `counts` (see [`sshlog::failed_attempt_counts`])
 /// into ranked, status-tagged rows: an address present (with a Block
 /// action) in `firewall_blocks` is `Blocked` (its `Option<i64>` is the
@@ -394,13 +476,18 @@ impl DynamicProtection {
 fn build_ssh_rows(
     counts: HashMap<String, u64>,
     firewall_blocks: &HashMap<String, Option<i64>>,
+    blocked_ip_ranges: &[String],
 ) -> Vec<SshRow> {
     let mut rows: Vec<SshRow> = counts
         .into_iter()
         .map(|(address, count)| {
-            let status = match firewall_blocks.get(&address) {
-                Some(until) => RowStatus::Blocked { until: *until },
-                None => RowStatus::Pending,
+            // Manual blocks take precedence over blocklist
+            let status = if let Some(until) = firewall_blocks.get(&address) {
+                RowStatus::Blocked { until: *until }
+            } else if ip_in_blocked_range(&address, blocked_ip_ranges) {
+                RowStatus::Blocklist
+            } else {
+                RowStatus::Pending
             };
             SshRow {
                 address,
@@ -419,13 +506,30 @@ fn build_ssh_rows(
 
 /// Turns `stats` (already sorted by `Db::list_user_agent_stats`) into
 /// status-tagged rows: a user agent present in `blocked` is permanently
-/// `Blocked` (manual blocks have no TTL); everything else is `NOT BLOCKED`.
-fn build_ua_rows(stats: Vec<UserAgentStat>, blocked: &HashSet<String>) -> Vec<UaRow> {
+/// `Blocked` (manual blocks have no TTL and take precedence); a user agent
+/// matching a blocked bot pattern is `Blocklist`; everything else is `NOT BLOCKED`.
+fn build_ua_rows(
+    stats: Vec<UserAgentStat>,
+    blocked: &HashSet<String>,
+    bots: &[Bot],
+    ai_policy: Policy,
+    search_policy: Policy,
+    scanner_policy: Policy,
+) -> Vec<UaRow> {
     stats
         .into_iter()
         .map(|stat| {
+            // Manual blocks take precedence over blocklist
             let status = if blocked.contains(&stat.user_agent) {
                 RowStatus::Blocked { until: None }
+            } else if ua_matches_blocked_bot_patterns(
+                &stat.user_agent,
+                bots,
+                ai_policy,
+                search_policy,
+                scanner_policy,
+            ) {
+                RowStatus::Blocklist
             } else {
                 RowStatus::Pending
             };
@@ -461,12 +565,14 @@ fn ua_row_line(row: &UaRow) -> Line<'static> {
 /// Red for a blocked row, unstyled for a pending one — shared by both
 /// panels so "blocked" reads the same way everywhere in this app (matches
 /// `dashboard.rs::policy_tag`'s fixed, theme-independent red/green, not
-/// varied per light/dark theme).
+/// varied per light/dark theme). Blocklist items are shown in red on gray
+/// background.
 fn style_by_status(line: Line<'static>, status: RowStatus) -> Line<'static> {
-    if status.is_blocked() {
-        line.red()
-    } else {
-        line
+    use ratatui::style::Color;
+    match status {
+        RowStatus::Blocklist => line.fg(Color::Red).bg(Color::Gray),
+        _ if status.is_blocked() => line.red(),
+        _ => line,
     }
 }
 
@@ -518,6 +624,7 @@ mod tests {
         let rows = build_ssh_rows(
             counts(&[("198.51.100.9", 3), ("198.51.100.2", 9)]),
             &HashMap::new(),
+            &[],
         );
         assert_eq!(rows[0].address, "198.51.100.2");
         assert_eq!(rows[0].count, 9);
@@ -531,6 +638,7 @@ mod tests {
         let rows = build_ssh_rows(
             counts(&[("198.51.100.9", 5), ("198.51.100.2", 5)]),
             &HashMap::new(),
+            &[],
         );
         assert_eq!(rows[0].address, "198.51.100.2");
         assert_eq!(rows[1].address, "198.51.100.9");
@@ -540,7 +648,7 @@ mod tests {
     fn build_ssh_rows_marks_a_permanently_blocked_address() {
         let mut blocks = HashMap::new();
         blocks.insert("198.51.100.9".to_string(), None);
-        let rows = build_ssh_rows(counts(&[("198.51.100.9", 3)]), &blocks);
+        let rows = build_ssh_rows(counts(&[("198.51.100.9", 3)]), &blocks, &[]);
         assert_eq!(rows[0].status, RowStatus::Blocked { until: None });
         assert_eq!(rows[0].status.label(), "BLOCKED");
     }
@@ -549,7 +657,7 @@ mod tests {
     fn build_ssh_rows_marks_a_temporarily_blocked_address_with_its_expiry() {
         let mut blocks = HashMap::new();
         blocks.insert("198.51.100.9".to_string(), Some(999_999_999_999));
-        let rows = build_ssh_rows(counts(&[("198.51.100.9", 3)]), &blocks);
+        let rows = build_ssh_rows(counts(&[("198.51.100.9", 3)]), &blocks, &[]);
         assert!(matches!(
             rows[0].status,
             RowStatus::Blocked { until: Some(_) }
@@ -574,7 +682,14 @@ mod tests {
         let mut blocked = HashSet::new();
         blocked.insert("curl/8.0".to_string());
 
-        let rows = build_ua_rows(stats, &blocked);
+        let rows = build_ua_rows(
+            stats,
+            &blocked,
+            &[],
+            Policy::Blocked,
+            Policy::Blocked,
+            Policy::Blocked,
+        );
         assert_eq!(rows[0].user_agent, "Mozilla/5.0");
         assert_eq!(rows[0].status, RowStatus::Pending);
         assert_eq!(rows[1].user_agent, "curl/8.0");
@@ -931,5 +1046,172 @@ mod tests {
         assert!(content.contains("NOT BLOCKED"));
         assert!(content.contains("Top User Agents"));
         assert!(content.contains("curl/8.0"));
+    }
+
+    #[test]
+    fn build_ssh_rows_marks_ip_in_blocked_range_as_blocklist() {
+        let rows = build_ssh_rows(
+            counts(&[("192.168.1.5", 3)]),
+            &HashMap::new(),
+            &["192.168.1.0/24".to_string()],
+        );
+        assert_eq!(rows[0].address, "192.168.1.5");
+        assert_eq!(rows[0].status, RowStatus::Blocklist);
+        assert_eq!(rows[0].status.label(), "BLOCKLIST");
+    }
+
+    #[test]
+    fn build_ssh_rows_prioritizes_manual_block_over_blocklist() {
+        let mut blocks = HashMap::new();
+        blocks.insert("192.168.1.5".to_string(), None);
+        let rows = build_ssh_rows(
+            counts(&[("192.168.1.5", 3)]),
+            &blocks,
+            &["192.168.1.0/24".to_string()],
+        );
+        assert_eq!(rows[0].address, "192.168.1.5");
+        // Manual block takes precedence over blocklist
+        assert_eq!(rows[0].status, RowStatus::Blocked { until: None });
+    }
+
+    #[test]
+    fn build_ua_rows_marks_ua_matching_bot_pattern_as_blocklist() {
+        let stats = vec![UserAgentStat {
+            user_agent: "Mozilla/5.0 (compatible; Googlebot/2.1)".to_string(),
+            hit_count: 42,
+            last_seen_at: 1000,
+        }];
+        let blocked = HashSet::new();
+        let bots = vec![Bot {
+            id: 1,
+            slug: "googlebot".to_string(),
+            name: "Googlebot".to_string(),
+            is_ai: false,
+            is_search_engine: true,
+            is_scanner: false,
+            user_agent_pattern: "Googlebot".to_string(),
+            status: crate::db::BotStatus::Default,
+            source_id: "test".to_string(),
+            updated_at: 1000,
+        }];
+
+        let rows = build_ua_rows(
+            stats,
+            &blocked,
+            &bots,
+            Policy::Blocked,
+            Policy::Blocked,
+            Policy::Blocked,
+        );
+        assert_eq!(
+            rows[0].user_agent,
+            "Mozilla/5.0 (compatible; Googlebot/2.1)"
+        );
+        assert_eq!(rows[0].status, RowStatus::Blocklist);
+        assert_eq!(rows[0].status.label(), "BLOCKLIST");
+    }
+
+    #[test]
+    fn build_ua_rows_prioritizes_manual_block_over_blocklist() {
+        let stats = vec![UserAgentStat {
+            user_agent: "Mozilla/5.0 (compatible; Googlebot/2.1)".to_string(),
+            hit_count: 42,
+            last_seen_at: 1000,
+        }];
+        let mut blocked = HashSet::new();
+        blocked.insert("Mozilla/5.0 (compatible; Googlebot/2.1)".to_string());
+        let bots = vec![Bot {
+            id: 1,
+            slug: "googlebot".to_string(),
+            name: "Googlebot".to_string(),
+            is_ai: false,
+            is_search_engine: true,
+            is_scanner: false,
+            user_agent_pattern: "Googlebot".to_string(),
+            status: crate::db::BotStatus::Default,
+            source_id: "test".to_string(),
+            updated_at: 1000,
+        }];
+
+        let rows = build_ua_rows(
+            stats,
+            &blocked,
+            &bots,
+            Policy::Blocked,
+            Policy::Blocked,
+            Policy::Blocked,
+        );
+        assert_eq!(
+            rows[0].user_agent,
+            "Mozilla/5.0 (compatible; Googlebot/2.1)"
+        );
+        // Manual block takes precedence over blocklist
+        assert_eq!(rows[0].status, RowStatus::Blocked { until: None });
+    }
+
+    #[test]
+    fn enter_on_blocklist_row_is_a_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = DynamicProtection {
+            ssh_rows: vec![SshRow {
+                address: "192.168.1.5".to_string(),
+                count: 3,
+                status: RowStatus::Blocklist,
+            }],
+            ..Default::default()
+        };
+        screen.ssh_state.select(Some(0));
+
+        let mut message = None;
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(message.is_none());
+        // Verify no firewall rules were added
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn enter_on_blocklist_ua_row_is_a_no_op() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = DynamicProtection {
+            ua_rows: vec![UaRow {
+                user_agent: "Googlebot".to_string(),
+                count: 2,
+                status: RowStatus::Blocklist,
+            }],
+            focus: Focus::UserAgents,
+            ..Default::default()
+        };
+        screen.ua_state.select(Some(0));
+
+        let mut message = None;
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(message.is_none());
+        // Verify no user agents were blocked
+        assert!(db.list_blocked_user_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn blocklist_status_label_is_blocklist() {
+        assert_eq!(RowStatus::Blocklist.label(), "BLOCKLIST");
+    }
+
+    #[test]
+    fn blocklist_status_is_blocked() {
+        assert!(RowStatus::Blocklist.is_blocked());
+    }
+
+    #[test]
+    fn blocklist_status_is_blocklist() {
+        assert!(RowStatus::Blocklist.is_blocklist());
+        assert!(!RowStatus::Pending.is_blocklist());
+        assert!(!RowStatus::Blocked { until: None }.is_blocklist());
     }
 }
