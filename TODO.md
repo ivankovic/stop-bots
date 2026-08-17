@@ -2,6 +2,99 @@
 
 * Check if nftables / iptables are installed and recommend only the installed backend.
 
+## Blocking techniques worth adding
+
+Surveyed against what this codebase can actually do. The organising constraint:
+**there is no runtime component in the request path** — everything is either
+offline log analysis that writes a DB row, or text generated into a config file.
+That decides which of these are cheap and which need a new architecture.
+
+### Offline log analysis (detector → `firewall_rules` row → existing apply step)
+
+* **Spoofed-crawler detection.** A request whose UA claims Googlebot/Bingbot/
+  GPTBot from an IP *outside* that crawler's published CIDR list is lying —
+  the most common cheap disguise there is. The ranges are already fetched
+  (`ipranges::IpRangeSourceKind`) and currently used only for *exclusion* in
+  `scanblock::block_web_scanners`; this inverts them into a detector. No new
+  data source, no new dependency. Note this is the offline stand-in for
+  forward-confirmed rDNS — real rDNS needs a DNS lookup per request, which a
+  generated NGINX `if` block cannot do.
+* **Instant-block probe paths.** `.env`, `.git/config`, `wp-login.php`,
+  `xmlrpc.php`, `/vendor/phpunit/…`, `.aws/credentials`. One hit is
+  conclusive — no human or legitimate crawler ever requests these — so unlike
+  `accesslog::scanning_ips`' ≥7-distinct-404s heuristic this needs no
+  threshold and fires on the first probe.
+* **Honeypot / trap path.** A path published as `Disallow:` in robots.txt and
+  linked invisibly; anything that fetches it is ignoring robots.txt and gets
+  blocked. Near-zero false positives, and it catches bots that pass every UA
+  and rate check. Pairs with robots.txt generation below — the trap only works
+  if the trap path is actually published.
+
+### Config generation (new text in the files we already write)
+
+* **Rate limiting.** `limit_req_zone` + per-`server` `limit_req`. NGINX does the
+  enforcement at request time, so this needs no timestamp parsing and no new
+  detector. Caveat: `limit_req_zone` is an `http`-context directive, so it
+  cannot go in the sentinel block — it needs a separate file in
+  `/etc/nginx/conf.d/`. That is a **new artifact class** for this codebase
+  (everything today is either an in-place sentinel edit or a standalone
+  firewall script): disabling the feature must *delete* that file, not merely
+  stop emitting `limit_req`, or a stale zone keeps applying.
+* **Configurable block response.** `return 444` (close the connection with no
+  response) instead of `403` — cheaper, and gives a scanner no signal to adapt
+  to. One setting, one code path in `nginx::block_snippet`.
+* **Per-`location` scoping / path exemptions.** Policy is currently whole-
+  `server`. Real setups want "block AI bots everywhere except `/blog`". The
+  clean NGINX idiom is a three-statement block
+  (`set $stop_bots_block 0;` / UA `if` sets it / exemption `if` clears it /
+  `if ($stop_bots_block) { return …; }`). Caveat: that is a *second* block
+  shape, so `nginx::site_apply_status` must compare against the block the
+  current settings would generate rather than one fixed template.
+* **robots.txt generation.** For the AI crawlers that honour it, emit
+  `User-agent: … / Disallow: /` from the same bot lists that drive the 403 —
+  the polite layer underneath the hard block. ai.robots.txt ships one already
+  and we parse that source. Also where the honeypot path gets published.
+
+### Reputation / third-party CIDR feeds
+
+* **Public IP reputation lists** — Spamhaus DROP, FireHOL level 1,
+  blocklist.de, Tor exit list. Structurally identical to the IPdeny country
+  lists already implemented: fetch → parse CIDRs → store → derive firewall
+  rules, so `ipranges` absorbs them with little new surface.
+  Two things to get right: these must **not** be added to
+  `ipranges::IpRangeSourceKind`, whose `category()` returns a bot `Category`
+  and whose `ALL` is iterated by `scanblock::known_crawler_ranges` — adding
+  variants there would silently start *exempting* Spamhaus-listed IPs from
+  scanner detection, exactly backwards. Separate enum, and leave
+  `known_crawler_ranges` alone.
+* **ASN / datacenter ranges.** Blocking whole hosting providers (Hetzner, OVH,
+  DigitalOcean, Alibaba, Tencent) is widely used and effective — residential
+  visitors do not originate from datacenter ASNs. **Deferred**, and not for
+  effort reasons: there is no single feed. AWS, GCP and Azure publish three
+  different JSON schemas (Azure behind a download-page indirection), and
+  Hetzner/OVH need real ASN→CIDR resolution we have no source for. A list
+  called "datacenter ranges" that silently covers 30% of them is worse than
+  no list, because this is the one category here that blocks *legitimate*
+  traffic when it fires. Revisit either by scoping to a single named provider
+  with a stable published feed (AWS `ip-ranges.json`) and labelling it that
+  way in the UI, or by finding a real aggregate source worth depending on.
+
+### Needs new machinery (not doable in the current architecture)
+
+* **Timestamp parsing in `sshlog`/`accesslog`.** The highest-leverage item on
+  this list, because it gates an entire category. Both detectors are
+  explicitly count-based today and never parse timestamps, so *nothing*
+  rate-, burst- or sliding-window-based is possible until this exists.
+* **Escalating TTL for repeat offenders** (fail2ban-style: second offence gets
+  a longer ban). The formula is trivial; the blocker is that `firewall_rules`
+  persists only `expires_at`, with no offence count or block history. Needs a
+  schema addition, not just arithmetic.
+* **JS / proof-of-work challenge** (Anubis-style, currently the common OSS
+  answer to AI crawlers) and **TLS/HTTP2 fingerprinting** (JA3/JA4, header-
+  order anomalies). Both require a component sitting in the request path.
+  The honest answer for these is "not without a new architecture", not
+  "another option on the list".
+
 ## Done
 
 - Per-site category and bot overrides are done (TUI only — `site_category_overrides`/
