@@ -54,11 +54,43 @@ fn category_index(category: Category) -> usize {
         .expect("CATEGORIES lists every Category variant")
 }
 
+/// Whether `path` is usable as an exemption prefix, or why not.
+///
+/// Rejected loudly at entry rather than stored and silently ignored: the
+/// generated regex is anchored with `^`, so a value without a leading `/`
+/// could never match, and an exemption that never fires is invisible —
+/// the admin sees a configured exemption and blocked traffic, with
+/// nothing to connect the two.
+///
+/// A literal `"` is rejected for the same reason `nginx::is_embeddable`
+/// rejects it in a user-agent pattern: it would terminate the quoted
+/// config string early and corrupt the whole file.
+fn validate_exempt_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("Enter a path".to_string());
+    }
+    if !path.starts_with('/') {
+        return Err("Must start with /".to_string());
+    }
+    if path.contains('"') {
+        return Err("Cannot contain a double quote".to_string());
+    }
+    if path.contains(char::is_whitespace) {
+        return Err("Cannot contain spaces".to_string());
+    }
+    Ok(())
+}
+
 /// Which panel keyboard input currently goes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Focus {
     #[default]
     Categories,
+    /// The per-site path-exemption list: one row per exempt path plus a
+    /// fixed "+ Add a path" row at index 0, exactly like the Dashboard's
+    /// country list. Reached by `Down` past the last category, left by
+    /// `Up` above its first row — the same no-dedicated-focus-key flow.
+    Exemptions,
     Search,
 }
 
@@ -67,6 +99,13 @@ enum Focus {
 enum PopupTarget {
     Category(Category),
     Bot(i64, String),
+    /// Text entry for a new exempt path. Carries the partially-typed
+    /// value and the last validation error, same shape as the Dashboard's
+    /// add-country popup.
+    AddExemption {
+        input: String,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -88,6 +127,8 @@ pub struct SiteDetail {
     categories_state: ListState,
     bots: Vec<Bot>,
     bot_overrides: Vec<SiteBotOverride>,
+    exempt_paths: Vec<String>,
+    exemptions_state: ListState,
     query: String,
     results_state: ListState,
     focus: Focus,
@@ -107,6 +148,8 @@ impl SiteDetail {
             categories_state,
             bots: Vec::new(),
             bot_overrides: Vec::new(),
+            exempt_paths: Vec::new(),
+            exemptions_state: ListState::default().with_selected(Some(0)),
             query: String::new(),
             results_state: ListState::default(),
             focus: Focus::default(),
@@ -124,6 +167,18 @@ impl SiteDetail {
         }
         self.bots = db.list_bots()?;
         self.bot_overrides = db.site_bot_overrides(self.site.id)?;
+        self.exempt_paths = db.site_path_exemptions(self.site.id)?;
+        // Removing a path shrinks the list; without this the selection
+        // could be left pointing past the new last row until the next
+        // arrow key re-clamped it.
+        let max_row = self.exempt_paths.len(); // +1 for the Add row, -1 for 0-indexing
+        if self
+            .exemptions_state
+            .selected()
+            .is_some_and(|s| s > max_row)
+        {
+            self.exemptions_state.select(Some(max_row));
+        }
         Ok(())
     }
 
@@ -171,10 +226,18 @@ impl SiteDetail {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let [categories_area, details_area] =
-            Layout::vertical([Constraint::Length(5), Constraint::Min(3)]).areas(area);
+        let [categories_area, exemptions_area, details_area] = Layout::vertical([
+            Constraint::Length(5),
+            // Two border lines plus the Add row, plus up to three paths
+            // before it starts scrolling — enough to see a typical setup
+            // at a glance without starving the bot search below it.
+            Constraint::Length(6),
+            Constraint::Min(3),
+        ])
+        .areas(area);
 
         self.render_categories(frame, categories_area, theme);
+        self.render_exemptions(frame, exemptions_area, theme);
         self.render_details(frame, details_area, theme);
 
         if let Some(popup) = &self.popup {
@@ -196,6 +259,28 @@ impl SiteDetail {
             .block(block)
             .highlight_style(ratatui::style::Style::new().reversed());
         frame.render_stateful_widget(list, area, &mut self.categories_state);
+    }
+
+    fn render_exemptions(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let items: Vec<ListItem> =
+            std::iter::once(ListItem::new(Line::from("+ Add an exempt path").italic()))
+                .chain(self.exempt_paths.iter().map(|path| {
+                    ListItem::new(Line::from(vec![
+                        Span::from(format!("{path:<24}")),
+                        Span::from("bots allowed here").dim(),
+                    ]))
+                }))
+                .collect();
+
+        let mut block = Block::bordered().title("Path exemptions — Enter to add/remove");
+        if self.focus == Focus::Exemptions {
+            block = block.fg(theme.accent());
+        }
+        let mut list = List::new(items).block(block);
+        if self.focus == Focus::Exemptions {
+            list = list.highlight_style(ratatui::style::Style::new().reversed());
+        }
+        frame.render_stateful_widget(list, area, &mut self.exemptions_state);
     }
 
     fn category_line(&self, category: Category) -> Line<'static> {
@@ -279,10 +364,13 @@ impl SiteDetail {
     fn search_line(&self) -> Line<'static> {
         match self.focus {
             Focus::Search => format!("/{}\u{2588}", self.query).into(),
-            Focus::Categories if self.query.is_empty() => {
+            // Categories and Exemptions render the search box identically:
+            // it's inactive in both, and which of the two other panels
+            // happens to have focus says nothing about the search state.
+            _ if self.query.is_empty() => {
                 Line::from(Span::from("Press / to search bots by name").dim())
             }
-            Focus::Categories => Line::from(Span::from(format!("/{}", self.query)).dim()),
+            _ => Line::from(Span::from(format!("/{}", self.query)).dim()),
         }
     }
 
@@ -292,7 +380,27 @@ impl SiteDetail {
                 format!("{} on {}", category_label(*category), self.site.server_name)
             }
             PopupTarget::Bot(_, slug) => format!("{slug} on {}", self.site.server_name),
+            PopupTarget::AddExemption { .. } => {
+                format!("Exempt a path on {}", self.site.server_name)
+            }
         };
+
+        if let PopupTarget::AddExemption { input, error } = &popup.target {
+            let hint = "Path prefix, e.g. /blog — Enter to add, Esc to cancel";
+            let mut lines = vec![
+                Line::from(format!("{input}\u{2588}")),
+                Line::from(Span::from(hint).dim()),
+            ];
+            if let Some(error) = error {
+                lines.push(Line::from(Span::from(error.clone()).red()));
+            }
+            let width = hint.len().max(title.len()) as u16 + 4;
+            let popup_area = centered_rect(width, lines.len() as u16 + 2, area);
+            let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
+            frame.render_widget(Clear, popup_area);
+            frame.render_widget(paragraph, popup_area);
+            return;
+        }
 
         let content_width = popup
             .options
@@ -330,6 +438,47 @@ impl SiteDetail {
         db: &Db,
         message: &mut Option<String>,
     ) -> Result<KeyOutcome> {
+        // Text entry owns every printable key, so it has to be handled
+        // before the option-list branch below — otherwise typing "j" in a
+        // path would move the (nonexistent) selection instead.
+        if let Some(Popup {
+            target: PopupTarget::AddExemption { input, error },
+            ..
+        }) = &mut self.popup
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    self.popup = None;
+                    return Ok(KeyOutcome::Consumed);
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    *error = None;
+                    return Ok(KeyOutcome::Consumed);
+                }
+                KeyCode::Char(c) => {
+                    input.push(c);
+                    *error = None;
+                    return Ok(KeyOutcome::Consumed);
+                }
+                KeyCode::Enter => {
+                    let value = input.trim().to_string();
+                    if let Err(err) = validate_exempt_path(&value) {
+                        *error = Some(err);
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    self.popup = None;
+                    db.add_site_path_exemption(self.site.id, &value)?;
+                    *message = Some(format!(
+                        "{value} exempted on {} — apply (a/A) to write it",
+                        self.site.server_name
+                    ));
+                    return Ok(KeyOutcome::Mutated);
+                }
+                _ => return Ok(KeyOutcome::Consumed),
+            }
+        }
+
         if let Some(popup) = &mut self.popup {
             match key.code {
                 KeyCode::Esc => {
@@ -359,8 +508,36 @@ impl SiteDetail {
                 // this `Back` rather than letting it exit to the Dashboard.
                 KeyCode::Esc => return Ok(KeyOutcome::Back),
                 KeyCode::Up | KeyCode::Char('k') => self.categories_state.select_previous(),
-                KeyCode::Down | KeyCode::Char('j') => self.categories_state.select_next(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.categories_state.selected() == Some(CATEGORIES.len() - 1) {
+                        self.focus = Focus::Exemptions;
+                        self.exemptions_state.select(Some(0));
+                    } else {
+                        self.categories_state.select_next();
+                    }
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => self.open_category_popup(),
+                KeyCode::Char('/') => self.focus = Focus::Search,
+                _ => return Ok(KeyOutcome::Ignored),
+            },
+            Focus::Exemptions => match key.code {
+                KeyCode::Esc => return Ok(KeyOutcome::Back),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.exemptions_state.selected() == Some(0) {
+                        self.focus = Focus::Categories;
+                        self.categories_state.select(Some(CATEGORIES.len() - 1));
+                    } else {
+                        self.exemptions_state.select_previous();
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.exemptions_state.selected().unwrap_or(0) < self.exempt_paths.len() {
+                        self.exemptions_state.select_next();
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    return self.activate_exemption_row(db, message)
+                }
                 KeyCode::Char('/') => self.focus = Focus::Search,
                 _ => return Ok(KeyOutcome::Ignored),
             },
@@ -383,6 +560,40 @@ impl SiteDetail {
             },
         }
         Ok(KeyOutcome::Consumed)
+    }
+
+    /// Enter on the exemptions list: row 0 opens the add-path popup, any
+    /// other row removes that path directly. Removal is a single
+    /// reversible action, so it needs no confirmation — the same reasoning
+    /// the Dashboard's country list already uses.
+    fn activate_exemption_row(
+        &mut self,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(selected) = self.exemptions_state.selected() else {
+            return Ok(KeyOutcome::Consumed);
+        };
+        if selected == 0 {
+            self.popup = Some(Popup {
+                target: PopupTarget::AddExemption {
+                    input: String::new(),
+                    error: None,
+                },
+                options: Vec::new(),
+                selected: 0,
+            });
+            return Ok(KeyOutcome::Consumed);
+        }
+        let Some(path) = self.exempt_paths.get(selected - 1).cloned() else {
+            return Ok(KeyOutcome::Consumed);
+        };
+        db.remove_site_path_exemption(self.site.id, &path)?;
+        *message = Some(format!(
+            "{path} no longer exempt on {} — apply (a/A) to write it",
+            self.site.server_name
+        ));
+        Ok(KeyOutcome::Mutated)
     }
 
     fn open_category_popup(&mut self) {
@@ -431,6 +642,12 @@ impl SiteDetail {
             _ => Some(Policy::Blocked),
         };
         match popup.target {
+            // Handled entirely in `handle_key`'s text-entry branch, which
+            // never reaches here. Kept explicit rather than a `_` arm so a
+            // new target variant is a compile error.
+            PopupTarget::AddExemption { .. } => {
+                unreachable!("add-exemption is committed in handle_key")
+            }
             PopupTarget::Category(category) => {
                 db.set_site_category_override(self.site.id, category, policy)?;
                 let label = policy.map_or("use system default".to_string(), |p| format!("{p:?}"));
@@ -765,5 +982,167 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert_eq!(content.matches("Press /").count(), 1);
+    }
+
+    // ---- path exemptions ----
+
+    /// The existing `test_site` takes an already-built `Db`; these tests
+    /// want both, so this wraps the pair.
+    fn exemption_fixture() -> (Db, Site) {
+        let db = test_db();
+        let site = test_site(&db);
+        (db, site)
+    }
+
+    fn press(detail: &mut SiteDetail, db: &Db, code: KeyCode) -> KeyOutcome {
+        let mut message = None;
+        detail
+            .handle_key(KeyEvent::from(code), db, &mut message)
+            .unwrap()
+    }
+
+    fn type_str(detail: &mut SiteDetail, db: &Db, text: &str) {
+        for c in text.chars() {
+            press(detail, db, KeyCode::Char(c));
+        }
+    }
+
+    fn focus_exemptions(detail: &mut SiteDetail, db: &Db) {
+        while detail.focus != Focus::Exemptions {
+            press(detail, db, KeyCode::Down);
+        }
+    }
+
+    #[test]
+    fn focus_flows_from_categories_into_exemptions_and_back() {
+        let (db, site) = exemption_fixture();
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+
+        focus_exemptions(&mut detail, &db);
+        assert_eq!(detail.exemptions_state.selected(), Some(0));
+
+        press(&mut detail, &db, KeyCode::Up);
+        assert_eq!(detail.focus, Focus::Categories);
+    }
+
+    #[test]
+    fn adding_and_removing_an_exempt_path_round_trips() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+        focus_exemptions(&mut detail, &db);
+
+        press(&mut detail, &db, KeyCode::Enter); // opens the add popup
+        type_str(&mut detail, &db, "/blog");
+        let outcome = press(&mut detail, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(db.site_path_exemptions(site_id).unwrap(), vec!["/blog"]);
+
+        detail.refresh(&db).unwrap();
+        press(&mut detail, &db, KeyCode::Down); // onto the /blog row
+        let outcome = press(&mut detail, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(db.site_path_exemptions(site_id).unwrap().is_empty());
+    }
+
+    /// A path that could never match is refused at entry, with the popup
+    /// left open and the reason shown — storing it would leave a
+    /// configured exemption that silently never fires.
+    #[test]
+    fn an_unanchored_path_is_refused_and_the_popup_stays_open() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+        focus_exemptions(&mut detail, &db);
+
+        press(&mut detail, &db, KeyCode::Enter);
+        type_str(&mut detail, &db, "blog");
+        press(&mut detail, &db, KeyCode::Enter);
+
+        assert!(db.site_path_exemptions(site_id).unwrap().is_empty());
+        match &detail.popup.as_ref().unwrap().target {
+            PopupTarget::AddExemption { input, error } => {
+                assert_eq!(input, "blog");
+                assert!(error.as_ref().unwrap().contains("start with /"));
+            }
+            other => panic!("expected the add-exemption popup, got {other:?}"),
+        }
+    }
+
+    /// Typing must reach the text field rather than being read as list
+    /// navigation — `j`/`k` are ordinary characters in a path.
+    #[test]
+    fn typing_j_and_k_into_a_path_does_not_navigate() {
+        let (db, site) = exemption_fixture();
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+        focus_exemptions(&mut detail, &db);
+
+        press(&mut detail, &db, KeyCode::Enter);
+        type_str(&mut detail, &db, "/jk");
+        press(&mut detail, &db, KeyCode::Backspace);
+
+        match &detail.popup.as_ref().unwrap().target {
+            PopupTarget::AddExemption { input, .. } => assert_eq!(input, "/j"),
+            other => panic!("expected the add-exemption popup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn escape_closes_the_add_popup_without_adding_anything() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+        focus_exemptions(&mut detail, &db);
+
+        press(&mut detail, &db, KeyCode::Enter);
+        type_str(&mut detail, &db, "/blog");
+        press(&mut detail, &db, KeyCode::Esc);
+
+        assert!(detail.popup.is_none());
+        assert!(db.site_path_exemptions(site_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn validate_exempt_path_rejects_unusable_values() {
+        assert!(validate_exempt_path("/blog").is_ok());
+        assert!(validate_exempt_path("").is_err());
+        assert!(validate_exempt_path("blog").is_err());
+        assert!(validate_exempt_path("/a b").is_err());
+        assert!(validate_exempt_path("/a\"b").is_err());
+    }
+
+    #[test]
+    fn render_shows_the_exemptions_panel() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let (db, site) = exemption_fixture();
+        db.add_site_path_exemption(site.id, "/blog").unwrap();
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| detail.render(frame, frame.area(), Theme::Dark))
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("Path exemptions"));
+        assert!(content.contains("/blog"));
+        assert!(content.contains("Add an exempt path"));
     }
 }

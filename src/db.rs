@@ -544,6 +544,15 @@ impl Db {
             -- source-entries/merge setup like `bot_source_entries` — two
             -- sources publishing the exact same CIDR is not a real scenario
             -- worth designing for.
+            -- Request-path prefixes where this site's bot block does not
+            -- apply. Per site rather than host-wide because a rule like
+            -- 'block AI bots everywhere except /blog' is inherently a
+            -- property of that site's own URL space.
+            CREATE TABLE IF NOT EXISTS site_path_exemptions (
+                site_id INTEGER NOT NULL REFERENCES sites(id),
+                path TEXT NOT NULL,
+                PRIMARY KEY (site_id, path)
+            );
             CREATE TABLE IF NOT EXISTS ip_range_sources (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -1078,6 +1087,37 @@ impl Db {
 
     pub fn set_text_setting(&self, key: &str, value: &str) -> Result<()> {
         self.set_raw_setting(key, value)
+    }
+
+    // ---- per-site path exemptions ----
+
+    /// Request-path prefixes exempt from `site_id`'s bot block, sorted for
+    /// deterministic generated output — an unstable order would make the
+    /// rendered block differ run to run and every site read as `STALE`
+    /// forever.
+    pub fn site_path_exemptions(&self, site_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM site_path_exemptions WHERE site_id = ?1 ORDER BY path")?;
+        let rows = stmt.query_map(params![site_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list site path exemptions")
+    }
+
+    pub fn add_site_path_exemption(&self, site_id: i64, path: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO site_path_exemptions (site_id, path) VALUES (?1, ?2)",
+            params![site_id, path],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_site_path_exemption(&self, site_id: i64, path: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM site_path_exemptions WHERE site_id = ?1 AND path = ?2",
+            params![site_id, path],
+        )?;
+        Ok(())
     }
 
     /// Whether generated site configs serve this project's `robots.txt`.
@@ -2111,7 +2151,7 @@ impl Db {
 /// dependency just for this: the only structural requirement is "produce a
 /// literal-matching fragment safe to sit inside a larger `|`-joined
 /// pattern," not full regex parsing.
-fn escape_for_nginx_regex(s: &str) -> String {
+pub(crate) fn escape_for_nginx_regex(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
         if matches!(

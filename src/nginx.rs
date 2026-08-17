@@ -367,6 +367,13 @@ pub struct BlockConfig {
     /// [`rate_limit_conf_path`]). Carrying the rate here too would invite
     /// writing it into a `server` block where NGINX rejects it.
     pub rate_limit_burst: Option<u32>,
+    /// Request-path prefixes this site's bot block does not apply to.
+    ///
+    /// Non-empty switches the block to its second shape (see
+    /// [`block_text`]): a `set $stop_bots_block` flag rather than a direct
+    /// `return`, because NGINX has no way to say "match this user agent
+    /// unless the path is one of these" in a single condition.
+    pub exempt_paths: Vec<String>,
 }
 
 impl BlockConfig {
@@ -545,6 +552,7 @@ pub fn block_config_for_site(db: &crate::db::Db, site_id: i64) -> Result<BlockCo
         response: db.get_block_response()?,
         serve_robots_txt: db.get_serve_robots_txt()?,
         rate_limit_burst: rate_limit_burst(db)?,
+        exempt_paths: db.site_path_exemptions(site_id)?,
     })
 }
 
@@ -558,6 +566,9 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
         response: db.get_block_response()?,
         serve_robots_txt: db.get_serve_robots_txt()?,
         rate_limit_burst: rate_limit_burst(db)?,
+        // A block with no site row has no per-site exemptions by
+        // definition — they're keyed on `sites.id`.
+        exempt_paths: Vec::new(),
     })
 }
 
@@ -576,23 +587,49 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
 /// `if`.
 fn block_text(config: &BlockConfig) -> Option<String> {
     let pattern = join_patterns(&config.patterns);
-    // A config that neither blocks anything nor serves robots.txt has no
-    // block to write, which is what makes `apply_block` *remove* an
-    // existing one. Note this is no longer "no patterns" alone: robots.txt
-    // generation is reason enough to keep a block, and treating it as
-    // nothing would delete the block serving it the moment every bot
-    // happened to be allowed.
+    // A config that does none of these three has no block to write, which
+    // is what makes `apply_block` *remove* an existing one. Note this is
+    // no longer "no patterns" alone: robots.txt and rate limiting are each
+    // reason enough to keep a block, and treating them as nothing would
+    // delete the block carrying them the moment every bot was allowed.
     if pattern.is_none() && !config.serve_robots_txt && config.rate_limit_burst.is_none() {
         return None;
     }
     let code = config.response.status_code();
+    let exemptions = exemption_regex(&config.exempt_paths);
 
     let mut out = format!("    {BLOCK_BEGIN}\n");
     if let Some(pattern) = &pattern {
-        for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
-            out.push_str(&format!(
-                "    if ($http_user_agent ~* \"{chunk}\") {{\n        return {code};\n    }}\n"
-            ));
+        match &exemptions {
+            // No exemptions: the direct form, unchanged from before this
+            // feature existed, so an existing install's blocks don't churn.
+            None => {
+                for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
+                    out.push_str(&format!(
+                        "    if ($http_user_agent ~* \"{chunk}\") {{\n        return {code};\n    }}\n"
+                    ));
+                }
+            }
+            // With exemptions, a flag variable. NGINX cannot express
+            // "matches this user agent *and* not one of these paths" as a
+            // single `if` — `if` takes one condition and they don't
+            // compose — so the standard idiom is to set a variable, clear
+            // it for the exempt paths, and act on it last. Order is the
+            // whole mechanism: the clear must come after every set.
+            Some(exemptions) => {
+                out.push_str("    set $stop_bots_block 0;\n");
+                for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
+                    out.push_str(&format!(
+                        "    if ($http_user_agent ~* \"{chunk}\") {{\n        set $stop_bots_block 1;\n    }}\n"
+                    ));
+                }
+                out.push_str(&format!(
+                    "    if ($request_uri ~* \"{exemptions}\") {{\n        set $stop_bots_block 0;\n    }}\n"
+                ));
+                out.push_str(&format!(
+                    "    if ($stop_bots_block) {{\n        return {code};\n    }}\n"
+                ));
+            }
         }
     }
     if let Some(burst) = config.rate_limit_burst {
@@ -621,6 +658,25 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     }
     out.push_str(&format!("    {BLOCK_END}\n"));
     Some(out)
+}
+
+/// Builds the `$request_uri` regex that clears the block flag, or `None`
+/// when there are no usable exemptions.
+///
+/// Anchored with `^` and alternated, so `/blog` exempts `/blog`,
+/// `/blog/post` and `/blog?x=1` but not `/notablog`. Each path is
+/// regex-escaped: these are literal URL prefixes typed by an admin, not
+/// hand-written regex, and an unescaped `.` or `?` in one would quietly
+/// widen the exemption far beyond what was asked for — which, unlike a
+/// too-narrow pattern, fails *open*.
+fn exemption_regex(paths: &[String]) -> Option<String> {
+    let escaped: Vec<String> = paths
+        .iter()
+        .filter(|p| p.starts_with('/'))
+        .filter(|p| is_embeddable(p))
+        .map(|p| crate::db::escape_for_nginx_regex(p))
+        .collect();
+    (!escaped.is_empty()).then(|| format!("^({})", escaped.join("|")))
 }
 
 /// Finds the byte range of an existing sentinel block's lines within
@@ -1474,6 +1530,7 @@ mod tests {
             response: BlockResponse::Forbidden,
             serve_robots_txt: true,
             rate_limit_burst: None,
+            exempt_paths: Vec::new(),
         }
     }
 
@@ -1500,6 +1557,7 @@ mod tests {
             response: BlockResponse::Forbidden,
             serve_robots_txt: true,
             rate_limit_burst: None,
+            exempt_paths: Vec::new(),
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("location = /robots.txt"));
@@ -1639,6 +1697,7 @@ mod tests {
             response: BlockResponse::Forbidden,
             serve_robots_txt: false,
             rate_limit_burst: Some(burst),
+            exempt_paths: Vec::new(),
         }
     }
 
@@ -1681,6 +1740,7 @@ mod tests {
             response: BlockResponse::Forbidden,
             serve_robots_txt: false,
             rate_limit_burst: Some(5),
+            exempt_paths: Vec::new(),
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("limit_req"));
@@ -1720,5 +1780,121 @@ mod tests {
         let path = dir.path().join("nested/deeper/stop-bots-limits.conf");
         write_managed(&path, "x\n").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "x\n");
+    }
+
+    // ---- per-site path exemptions ----
+
+    fn cfg_exempt(patterns: &[&str], paths: &[&str]) -> BlockConfig {
+        BlockConfig {
+            patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            response: BlockResponse::Forbidden,
+            serve_robots_txt: false,
+            rate_limit_burst: None,
+            exempt_paths: paths.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    /// With no exemptions the block keeps its original direct-`return`
+    /// shape, so upgrading doesn't rewrite every already-applied site.
+    #[test]
+    fn no_exemptions_keeps_the_direct_return_form() {
+        let text = block_text(&cfg(&["BadBot"])).unwrap();
+        assert!(text.contains("if ($http_user_agent ~* \"BadBot\") {"));
+        assert!(text.contains("return 403;"));
+        assert!(!text.contains("$stop_bots_block"));
+    }
+
+    #[test]
+    fn exemptions_switch_the_block_to_the_flag_form_in_the_right_order() {
+        let text = block_text(&cfg_exempt(&["BadBot"], &["/blog"])).unwrap();
+
+        let set_zero = text.find("set $stop_bots_block 0;").unwrap();
+        let set_one = text.find("set $stop_bots_block 1;").unwrap();
+        let clear = text.rfind("set $stop_bots_block 0;").unwrap();
+        let act = text.find("if ($stop_bots_block) {").unwrap();
+
+        // Order is the whole mechanism: initialise, set on a UA match,
+        // clear for exempt paths, and only then act.
+        assert!(set_zero < set_one, "initialise before the UA match");
+        assert!(
+            set_one < clear,
+            "the exemption must clear *after* the match"
+        );
+        assert!(clear < act, "act last");
+        assert!(text.contains("if ($request_uri ~* \"^(/blog)\")"));
+        assert!(text.contains("return 403;"));
+    }
+
+    #[test]
+    fn the_exemption_regex_is_anchored_and_alternated() {
+        assert_eq!(
+            exemption_regex(&["/blog".to_string(), "/feed".to_string()]),
+            Some("^(/blog|/feed)".to_string())
+        );
+    }
+
+    /// Unescaped regex metacharacters in a literal URL prefix would widen
+    /// the exemption — which fails *open*, unlike a too-narrow pattern.
+    #[test]
+    fn the_exemption_regex_escapes_metacharacters() {
+        let regex = exemption_regex(&["/a.b?c".to_string()]).unwrap();
+        assert!(regex.contains("\\."), "regex was: {regex}");
+        assert!(regex.contains("\\?"), "regex was: {regex}");
+    }
+
+    #[test]
+    fn the_exemption_regex_drops_unusable_paths() {
+        // Not anchored at the start: could never match, so it's dropped
+        // rather than silently widening or narrowing anything.
+        assert_eq!(exemption_regex(&["blog".to_string()]), None);
+        // Would terminate the quoted config string.
+        assert_eq!(exemption_regex(&["/a\"b".to_string()]), None);
+        assert_eq!(exemption_regex(&[]), None);
+    }
+
+    #[test]
+    fn a_chunked_pattern_list_sets_the_flag_in_every_chunk() {
+        let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
+        let config = BlockConfig {
+            patterns,
+            response: BlockResponse::Forbidden,
+            serve_robots_txt: false,
+            rate_limit_burst: None,
+            exempt_paths: vec!["/blog".to_string()],
+        };
+        let text = block_text(&config).unwrap();
+
+        let ifs = text.matches("if ($http_user_agent").count();
+        assert!(ifs > 1, "expected chunking, got {ifs}");
+        // Every chunk sets the flag; exactly one clears it and one acts.
+        assert_eq!(text.matches("set $stop_bots_block 1;").count(), ifs);
+        assert_eq!(text.matches("if ($request_uri").count(), 1);
+        assert_eq!(text.matches("if ($stop_bots_block) {").count(), 1);
+    }
+
+    #[test]
+    fn site_apply_status_is_stale_when_only_an_exemption_is_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+
+        assert_eq!(
+            site_apply_status(&path, "a.example", &cfg_exempt(&["BadBot"], &["/blog"])),
+            SiteApplyStatus::Stale
+        );
+
+        apply_block_for_site(&path, "a.example", &cfg_exempt(&["BadBot"], &["/blog"])).unwrap();
+        assert_eq!(
+            site_apply_status(&path, "a.example", &cfg_exempt(&["BadBot"], &["/blog"])),
+            SiteApplyStatus::UpToDate
+        );
+    }
+
+    /// An exemption with nothing to exempt from writes no block at all —
+    /// exemptions only ever *narrow* an existing rule.
+    #[test]
+    fn exemptions_alone_do_not_create_a_block() {
+        assert!(block_text(&cfg_exempt(&[], &["/blog"])).is_none());
     }
 }

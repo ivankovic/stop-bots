@@ -2519,3 +2519,61 @@ screens have exactly one interaction pattern (pick one of N), and a
 free-text number would be the sole exception. The CLI takes any value. A
 rate set from the CLI that isn't on the preset list still opens the popup
 as *on*, at the nearest preset, never as "Off".
+
+## Per-site path exemptions (`site_path_exemptions`, `nginx::exemption_regex`)
+
+**What it does.** A per-site list of request-path prefixes the bot block
+doesn't apply to — "block AI bots everywhere except `/blog`". Per site,
+not host-wide, because a site's URL space is its own. Managed from Site
+detail: a "Path exemptions" panel with a `+ Add an exempt path` row and
+direct removal on Enter, the same shape (and the same
+no-confirmation-for-a-reversible-action reasoning) as the Dashboard's
+country list.
+
+**Why the generated block changes shape.** NGINX cannot express "matches
+this user agent *and* the path is not one of these" in one condition:
+`if` takes a single condition and they don't compose. The standard idiom
+is a flag variable:
+
+    set $stop_bots_block 0;
+    if ($http_user_agent ~* "…") { set $stop_bots_block 1; }
+    if ($request_uri ~* "^(/blog)") { set $stop_bots_block 0; }
+    if ($stop_bots_block) { return 403; }
+
+Order *is* the mechanism — the clear has to come after every set, and the
+act after the clear. There's a test asserting that ordering explicitly,
+including with a chunked pattern list where every chunk sets the flag but
+only one statement clears it and one acts.
+
+**A site with no exemptions keeps the original direct-`return` form.**
+Emitting the flag form unconditionally would have been simpler, but it
+would rewrite the sentinel block of every already-applied site on upgrade
+for no behavioural change. This is the second block shape referred to in
+the `BlockConfig` entry above, and it's exactly why staleness compares
+*rendered text* rather than an extracted pattern: with two possible
+shapes, reconstructing one field and comparing it can't tell them apart.
+
+**Exemptions only ever narrow an existing rule.** A config with exemptions
+and nothing to block writes no block at all, rather than an empty flag
+dance.
+
+**Escaping matters more here than elsewhere.** The paths are literal URL
+prefixes typed by an admin, embedded into a `^(a|b)` regex. An unescaped
+`.` or `?` would quietly *widen* the exemption — and unlike a too-narrow
+pattern, a too-wide exemption fails **open**, letting through exactly the
+traffic the rule exists to stop. Every path goes through
+`db::escape_for_nginx_regex` (now `pub(crate)`, previously used only for
+manually-blocked user agents), and the regex is anchored with `^` so
+`/blog` covers `/blog/post` but not `/notablog`.
+
+**Unusable values are rejected at entry, not stored.** A path without a
+leading `/` can never match an anchored regex, and one containing `"`
+would terminate the quoted config string. Both are refused in the TUI with
+the reason shown and the popup left open — the alternative is a
+configured exemption that silently never fires, where the admin sees the
+rule and sees the blocked traffic with nothing connecting the two.
+`exemption_regex` filters both again rather than trusting its caller.
+
+Ordering of paths comes from SQL (`ORDER BY path`) for a reason: an
+unstable order would make the rendered block differ run to run, and every
+site would read as `STALE` forever.

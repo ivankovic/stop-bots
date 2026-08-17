@@ -849,6 +849,82 @@ fn rate_limit_writes_the_zone_file_and_removes_it_only_after_the_directive_goes(
         .stdout(predicate::str::contains("7 req/s"));
 }
 
+/// Per-site path exemptions end to end: the generated block switches to
+/// the flag form, and only the exempted path escapes the rule.
+#[test]
+fn a_site_path_exemption_switches_the_block_to_the_flag_form() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    fs::create_dir_all(&nginx_root).unwrap();
+
+    let site_file = nginx_root.join("site.conf");
+    fs::write(
+        &site_file,
+        "server {\n    listen 80;\n    server_name a.example;\n}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let apply = || {
+        Command::cargo_bin("stop-bots")
+            .unwrap()
+            .args([
+                "apply-blocks",
+                "--root",
+                nginx_root.to_str().unwrap(),
+                "--db",
+                db_path.to_str().unwrap(),
+                "--no-reload",
+            ])
+            .assert()
+            .success();
+    };
+
+    // Without exemptions: the original direct-return shape.
+    apply();
+    let plain = fs::read_to_string(&site_file).unwrap();
+    assert!(plain.contains("return 403;"));
+    assert!(!plain.contains("$stop_bots_block"));
+
+    {
+        let db = stop_bots::db::Db::open(&db_path).unwrap();
+        let site = db.list_sites().unwrap().into_iter().next().unwrap();
+        db.add_site_path_exemption(site.id, "/blog").unwrap();
+    }
+
+    apply();
+    let exempted = fs::read_to_string(&site_file).unwrap();
+    assert!(exempted.contains("set $stop_bots_block 0;"));
+    assert!(exempted.contains("set $stop_bots_block 1;"));
+    assert!(exempted.contains("if ($request_uri ~* \"^(/blog)\")"));
+    assert!(exempted.contains("if ($stop_bots_block) {"));
+    // Exactly one sentinel block still, not a second appended.
+    assert_eq!(exempted.matches("# BEGIN stop-bots").count(), 1);
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();
