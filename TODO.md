@@ -1,17 +1,6 @@
 # TODO
 
 * Check if nftables / iptables are installed and recommend only the installed backend.
-* `tests/tui.rs` is flaky under load. Its PTY expectations use a fixed 5s
-  timeout, and cargo runs the test binaries concurrently, so on a busy
-  machine an `exp_string` can time out on output that does arrive. Every
-  failure seen so far passes on rerun and in isolation. Measured rate:
-  roughly one failed test per two-to-three full runs of the suite, with a
-  different test failing each time. **Confirmed pre-existing** — commit
-  d476c27 (before the blocking-technique work) fails at the same rate, so
-  this is not a regression from any of it. Worth either raising the
-  timeout or making it scale with load, before it costs someone a real
-  debugging session: a suite that cries wolf is how a genuine regression
-  gets waved through.
 
 ## Blocking techniques worth adding
 
@@ -81,6 +70,16 @@ below. What's left:
   rethink rather than one more panel.
 
 ## Done
+
+- Fixed: `tests/tui.rs` was flaky under load, at roughly one spurious failure
+  per two runs of the suite with a different test each time. Cause was a fixed
+  5s `rexpect` expectation timeout, long enough on an idle machine and not on a
+  contended one, so a redraw that *did* arrive was reported as a failure. Now
+  30s, overridable with `STOP_BOTS_TEST_TIMEOUT_MS`. Because the timeout is a
+  ceiling on waiting rather than a budget the tests spend, raising it cost
+  nothing: eight consecutive clean runs afterwards at unchanged wall time.
+  Worth remembering that this predated the blocking-technique work — it was
+  verified against commit d476c27 before being blamed on anything recent.
 
 - **Eight blocking techniques added in one pass** (each its own commit; see
   SPECS.md for the design notes on every one):

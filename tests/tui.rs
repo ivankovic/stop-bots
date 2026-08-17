@@ -11,7 +11,28 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::process::Command;
 
-const TIMEOUT_MS: u64 = 5_000;
+/// How long an `exp_string` waits before declaring failure.
+///
+/// This is a *ceiling on waiting*, not a budget the tests spend: a passing
+/// expectation returns the moment the text arrives, so raising it costs
+/// nothing on the happy path and only slows down a genuine failure.
+///
+/// It used to be 5s, which was long enough on an idle machine and not long
+/// enough on a busy one — several test binaries competing for CPU could push a
+/// redraw past the deadline and fail on output that did arrive. That produced
+/// roughly one spurious failure per two runs of this suite, with a different
+/// test each time, which is the worst possible signal: a suite that cries wolf
+/// is how a real regression gets waved through. 30s is far past any plausible
+/// redraw latency while still bounding a hung child.
+///
+/// `STOP_BOTS_TEST_TIMEOUT_MS` overrides it, for bisecting a real hang without
+/// waiting 30s a time.
+fn timeout_ms() -> u64 {
+    std::env::var("STOP_BOTS_TEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30_000)
+}
 
 /// Spawns `stop-bots tui --db <db_path>` in a pty sized large enough for the
 /// UI to actually draw into. `rexpect`/the kernel default a freshly opened
@@ -41,7 +62,7 @@ fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
     cmd.args(extra_args);
     cmd.env("TERM", "xterm-256color");
 
-    let session = spawn_command(cmd, Some(TIMEOUT_MS)).expect("failed to spawn stop-bots tui");
+    let session = spawn_command(cmd, Some(timeout_ms())).expect("failed to spawn stop-bots tui");
     set_window_size(&session, 32, 100);
     session
 }
