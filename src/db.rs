@@ -1080,6 +1080,18 @@ impl Db {
         self.set_raw_setting(key, value)
     }
 
+    /// Whether generated site configs serve this project's `robots.txt`.
+    /// Off by default: it replaces whatever the site already serves at
+    /// `/robots.txt`, which may well be hand-written and carry rules this
+    /// project knows nothing about.
+    pub fn get_serve_robots_txt(&self) -> Result<bool> {
+        self.get_bool_setting("serve_robots_txt", false)
+    }
+
+    pub fn set_serve_robots_txt(&self, serve: bool) -> Result<()> {
+        self.set_bool_setting("serve_robots_txt", serve)
+    }
+
     pub fn set_block_response(&self, response: BlockResponse) -> Result<()> {
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES ('block_response', ?1)
@@ -1955,6 +1967,30 @@ impl Db {
         let search_default = self.get_category_default(Category::Search)?;
         let scanner_default = self.get_category_default(Category::Scanner)?;
         self.compute_blocked_patterns(ai_default, search_default, scanner_default, &[])
+    }
+
+    /// Whether `bot` is currently blocked under the *global* policy —
+    /// the same cascade [`Self::compute_blocked_patterns`] applies (an
+    /// explicit per-bot pin wins outright, otherwise any of its categories
+    /// being Blocked does it), exposed per bot rather than as a pattern
+    /// list.
+    ///
+    /// Used by robots.txt generation, which needs to name the bots rather
+    /// than join their regexes. Global only, with no per-site variant:
+    /// this project serves one host-wide robots.txt, so a per-site answer
+    /// would have nowhere to go.
+    pub fn bot_is_blocked(&self, bot: &Bot) -> Result<bool> {
+        Ok(match bot.status {
+            BotStatus::Blocked => true,
+            BotStatus::Allowed => false,
+            BotStatus::Default => {
+                (bot.is_ai && self.get_category_default(Category::Ai)? == Policy::Blocked)
+                    || (bot.is_search_engine
+                        && self.get_category_default(Category::Search)? == Policy::Blocked)
+                    || (bot.is_scanner
+                        && self.get_category_default(Category::Scanner)? == Policy::Blocked)
+            }
+        })
     }
 
     /// Shared cascade behind [`Self::blocked_user_agent_patterns`] and

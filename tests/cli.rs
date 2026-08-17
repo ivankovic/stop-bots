@@ -623,6 +623,116 @@ fn an_unknown_reputation_source_is_rejected_with_the_known_ids() {
         .stderr(predicate::str::contains("firehol-level1"));
 }
 
+/// robots.txt generation end to end: the file is written, the site config
+/// aliases it, and disabling removes both.
+#[test]
+fn robots_txt_is_generated_aliased_and_then_removed_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    let managed = tmp.path().join("managed");
+    fs::create_dir_all(&nginx_root).unwrap();
+
+    let site = nginx_root.join("site.conf");
+    fs::write(
+        &site,
+        "server {\n    listen 80;\n    server_name a.example;\n}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let apply = |db_path: &Path, root: &Path, managed: &Path| {
+        Command::cargo_bin("stop-bots")
+            .unwrap()
+            .env("STOP_BOTS_NGINX_DIR", managed)
+            .args([
+                "apply-blocks",
+                "--root",
+                root.to_str().unwrap(),
+                "--db",
+                db_path.to_str().unwrap(),
+                "--no-reload",
+            ])
+            .assert()
+            .success();
+    };
+
+    // Off by default: no location block, no file.
+    apply(&db_path, &nginx_root, &managed);
+    assert!(!fs::read_to_string(&site).unwrap().contains("/robots.txt"));
+    assert!(!managed.join("robots.txt").exists());
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-robots-txt",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--enabled",
+            "true",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("replaces"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["show-robots-txt", "--db", db_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("User-agent:"))
+        // The honeypot trap path is always published.
+        .stdout(predicate::str::contains("stop-bots-trap"));
+
+    apply(&db_path, &nginx_root, &managed);
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(written.contains("location = /robots.txt"));
+    // The alias points at the file that was actually written.
+    let robots = managed.join("robots.txt");
+    assert!(robots.exists(), "robots.txt should have been written");
+    assert!(written.contains(robots.to_str().unwrap()));
+    assert!(fs::read_to_string(&robots).unwrap().contains("User-agent:"));
+
+    // Disabling removes the directive *and* the generated file — a stale
+    // generated artifact left on disk invites being wired back up by hand.
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-robots-txt",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--enabled",
+            "false",
+        ])
+        .assert()
+        .success();
+    apply(&db_path, &nginx_root, &managed);
+    assert!(!fs::read_to_string(&site).unwrap().contains("/robots.txt"));
+    assert!(!robots.exists(), "the generated file should be removed");
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

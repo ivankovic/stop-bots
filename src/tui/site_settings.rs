@@ -85,6 +85,10 @@ fn setting_options(setting: NginxSetting) -> (&'static str, Vec<&'static str>) {
                 BlockResponse::Close.label(),
             ],
         ),
+        NginxSetting::RobotsTxt => (
+            "Serve a generated robots.txt",
+            vec!["Off — leave /robots.txt alone", "On — replace /robots.txt"],
+        ),
     }
 }
 
@@ -119,14 +123,17 @@ struct Popup {
 enum NginxSetting {
     /// `BlockResponse` — 403 vs 444 for a matched request.
     Response,
+    /// Whether to generate and serve a `robots.txt`.
+    RobotsTxt,
 }
 
 impl NginxSetting {
-    const ALL: [NginxSetting; 1] = [NginxSetting::Response];
+    const ALL: [NginxSetting; 2] = [NginxSetting::Response, NginxSetting::RobotsTxt];
 
     fn label(self) -> &'static str {
         match self {
             NginxSetting::Response => "Block response",
+            NginxSetting::RobotsTxt => "robots.txt",
         }
     }
 }
@@ -170,6 +177,7 @@ pub struct SiteSettings {
     settings_state: ListState,
     setting_popup: Option<SettingPopup>,
     block_response: BlockResponse,
+    serve_robots_txt: bool,
 }
 
 impl SiteSettings {
@@ -186,11 +194,13 @@ impl SiteSettings {
             settings_state: ListState::default().with_selected(Some(0)),
             setting_popup: None,
             block_response: BlockResponse::default(),
+            serve_robots_txt: false,
         }
     }
 
     pub fn refresh(&mut self, db: &Db) -> Result<()> {
         self.block_response = db.get_block_response()?;
+        self.serve_robots_txt = db.get_serve_robots_txt()?;
         self.sites = db.list_sites()?;
         self.statuses = self
             .sites
@@ -281,6 +291,13 @@ impl SiteSettings {
             .map(|setting| {
                 let value = match setting {
                     NginxSetting::Response => self.block_response.label(),
+                    NginxSetting::RobotsTxt => {
+                        if self.serve_robots_txt {
+                            "generated"
+                        } else {
+                            "not managed"
+                        }
+                    }
                 };
                 ListItem::new(Line::from(vec![
                     format!("{:<18}", setting.label()).into(),
@@ -587,6 +604,7 @@ impl SiteSettings {
                 BlockResponse::Forbidden => 0,
                 BlockResponse::Close => 1,
             },
+            NginxSetting::RobotsTxt => usize::from(self.serve_robots_txt),
         };
         self.setting_popup = Some(SettingPopup { setting, selected });
     }
@@ -616,6 +634,21 @@ impl SiteSettings {
                     "Block response set to {} — apply (a/A) to update site configs",
                     response.label()
                 ));
+            }
+            NginxSetting::RobotsTxt => {
+                let serve = popup.selected == 1;
+                if serve == self.serve_robots_txt {
+                    return Ok(());
+                }
+                db.set_serve_robots_txt(serve)?;
+                *message = Some(if serve {
+                    "robots.txt will be generated and served — apply (a/A) to write it. It \
+                     replaces whatever each site serves at /robots.txt today."
+                        .to_string()
+                } else {
+                    "robots.txt generation off — apply (a/A) to remove it from site configs"
+                        .to_string()
+                });
             }
         }
         Ok(())
@@ -683,6 +716,9 @@ impl SiteSettings {
 
     fn run_apply_site(&self, db: &Db, index: usize) -> Result<bool> {
         let site = &self.sites[index];
+        // Same ordering as the CLI's apply: the managed file has to exist
+        // before a config that aliases it is reloaded.
+        nginx::write_managed_files(db)?;
         let config = nginx::block_config_for_site(db, site.id)?;
         nginx::apply_block_for_site(Path::new(&site.config_path), &site.server_name, &config)
     }

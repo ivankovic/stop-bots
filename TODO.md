@@ -4,10 +4,14 @@
 * `tests/tui.rs` is flaky under load. Its PTY expectations use a fixed 5s
   timeout, and cargo runs the test binaries concurrently, so on a busy
   machine an `exp_string` can time out on output that does arrive. Every
-  failure seen so far passes on rerun and in isolation (`cargo test --test
-  tui -- --test-threads=1`). Worth either raising the timeout, or making it
-  scale with load, before it costs someone a real debugging session — a
-  test suite that cries wolf is how a genuine regression gets waved through.
+  failure seen so far passes on rerun and in isolation. Measured rate:
+  roughly one failed test per two-to-three full runs of the suite, with a
+  different test failing each time. **Confirmed pre-existing** — commit
+  d476c27 (before the blocking-technique work) fails at the same rate, so
+  this is not a regression from any of it. Worth either raising the
+  timeout or making it scale with load, before it costs someone a real
+  debugging session: a suite that cries wolf is how a genuine regression
+  gets waved through.
 
 ## Blocking techniques worth adding
 

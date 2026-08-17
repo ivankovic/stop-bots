@@ -436,6 +436,30 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Turns generation of a `robots.txt` on or off. When on, ApplyBlocks
+    /// writes one to /etc/stop-bots/nginx/robots.txt and adds a
+    /// `location = /robots.txt` block to each site that serves it: one
+    /// `User-agent:` line per currently-blocked bot under a shared
+    /// `Disallow: /`, plus a `Disallow:` for the honeypot trap path.
+    ///
+    /// Off by default, because it *replaces* whatever the site already
+    /// serves at /robots.txt — which may be hand-written and carry rules
+    /// this tool knows nothing about.
+    ///
+    /// This is the polite layer under the 403, for the crawlers that
+    /// honour it, and it is also what makes the honeypot work at all.
+    SetRobotsTxt {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
+    /// Prints the robots.txt that would currently be generated, without
+    /// writing anything
+    ShowRobotsTxt {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+    },
     /// Sets what NGINX does with a request whose user agent matched the
     /// blocking rule: "forbidden" (`return 403;`, the default) or "close"
     /// (`return 444;`, NGINX's non-standard close-without-responding —
@@ -600,6 +624,8 @@ async fn main() -> Result<()> {
         Some(Command::RemoveCountry { db, country }) => set_country_selected(db, country, false),
         Some(Command::ListSelectedCountries { db }) => list_selected_countries(db),
         Some(Command::SetBlockResponse { db, response }) => set_block_response(db, response),
+        Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
+        Some(Command::ShowRobotsTxt { db }) => show_robots_txt(db),
     }
 }
 
@@ -727,6 +753,9 @@ async fn update_bot_lists(
 
 fn apply_blocks(root: &Path, db_path: Option<PathBuf>, no_reload: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    // Written before any config is touched, so the file the generated
+    // `alias` points at already exists by the time NGINX reloads.
+    nginx::write_managed_files(&db)?;
     let default_config = nginx::default_block_config(&db)?;
     // Sites already known to the db (i.e. previously scanned) — the only
     // ones that can carry a per-site override at all.
@@ -954,6 +983,29 @@ fn list_reputation_sources(db_path: Option<PathBuf>) -> Result<()> {
             .unwrap_or_default();
         println!("[{state}] {:<22} {fetched}{note}", source.id);
     }
+    Ok(())
+}
+
+fn set_robots_txt(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_serve_robots_txt(enabled)?;
+    println!(
+        "robots.txt generation {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    if enabled {
+        println!(
+            "It replaces whatever each site currently serves at /robots.txt. Preview it with \
+             `stop-bots show-robots-txt`."
+        );
+    }
+    println!("Run `stop-bots apply-blocks` to write it into the site configs.");
+    Ok(())
+}
+
+fn show_robots_txt(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+    print!("{}", nginx::robots_txt_body(&db)?);
     Ok(())
 }
 

@@ -2390,3 +2390,72 @@ list, and `protection_rows()` is recomputed rather than cached so the row
 count can never disagree with the data behind it. A feed's popup offers
 only Off/On, with no TTL rows: its blocks are derived fresh at every
 render, so there is nothing that expires.
+
+## robots.txt generation (`nginx::robots_txt_body`, `nginx::write_managed_files`)
+
+**What it does.** When on, `apply-blocks` writes a `robots.txt` and adds a
+`location = /robots.txt` block to each site that serves it: one
+`User-agent:` line per currently-blocked bot under a single shared
+`Disallow: /`, plus a `Disallow:` for the honeypot trap path. The polite
+layer under the 403, for the crawlers that honour it — and what makes the
+honeypot work at all.
+
+**Off by default**, because it *replaces* whatever each site already
+serves at `/robots.txt`, which may be hand-written and carry rules this
+project knows nothing about. That's the one genuinely destructive thing in
+this feature, so it's opt-in and the message says so on both surfaces.
+
+**Aliased from a file, not inlined with `return 200`.** The obvious
+implementation — `return 200 "<body>"` — cannot work: with every AI bot
+listed the body runs to several kilobytes, and NGINX's config parser
+rejects a single quoted parameter past roughly 4KB. That's the same
+ceiling `MAX_PATTERN_CHUNK_LEN` already exists for, and unlike the
+user-agent pattern a robots.txt body can't be split across several
+directives. So `BlockConfig` carries a `serve_robots_txt: bool` flag and
+the block emits an `alias`; the body never appears in config text, which
+also means changing the body alone doesn't churn every site's staleness.
+
+**Grouped under one `Disallow`, not a stanza per bot.** Both are valid
+robots.txt. Grouping roughly halves a file that can list well over a
+thousand agents, and makes the intent readable instead of buried in
+repetition.
+
+**A robots token, not a regex.** `bot.user_agent_pattern` is an NGINX
+regex fragment, often an alternation; robots.txt has no regex. The bot's
+*name* is used, and only when `is_robots_token` accepts it as a plain
+token — anything with whitespace or regex metacharacters is skipped rather
+than emitted as a rule no crawler will ever match, since a `User-agent:`
+line that matches nothing looks like coverage that isn't there.
+
+**The trap path is published whether or not the honeypot detector is on.**
+Publishing is what *creates* the trap; the detector only decides whether
+hits are acted on. Publishing it only when the detector is enabled would
+mean switching the detector on and then waiting for crawlers to re-read
+robots.txt before it could ever fire.
+
+**With nothing blocked the file is still valid** (`User-agent: * /
+Disallow:` plus the trap), not empty — an enabled feature serving an empty
+file reads as broken.
+
+### Managed files: a new artifact class, and its lifecycle
+
+This is the first thing this project writes that is neither a sentinel
+edit inside an admin's file nor a standalone firewall script. Two rules
+came out of that:
+
+- **They live in their own directory** (`/etc/stop-bots/nginx`), not
+  `/etc/nginx/`. Nothing NGINX globs lives there, so a leftover file can't
+  take effect on its own — it's only ever reached through an explicit
+  directive inside a sentinel block.
+- **Disabling deletes the file**, it doesn't merely stop referencing it.
+  A stale generated artifact left on disk invites someone to wire it back
+  up by hand and serve a months-old policy. Removal treats a missing file
+  as success.
+
+`write_managed_files` runs at the start of every apply path (CLI and both
+TUI apply actions), so the file an `alias` points at always exists before
+NGINX reloads. `MANAGED_DIR_ENV` (`STOP_BOTS_NGINX_DIR`) overrides the
+location for the end-to-end tests, which drive the real binary and would
+otherwise only pass as root; it's read in exactly one place so the written
+path and the aliased path can never disagree, and it's deliberately not a
+persisted setting.
