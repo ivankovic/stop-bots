@@ -98,15 +98,21 @@ enum Focus {
 enum ProtectionRow {
     SpoofedCrawlers,
     ProbePaths,
+    Honeypot,
 }
 
 impl ProtectionRow {
-    const ALL: [ProtectionRow; 2] = [ProtectionRow::SpoofedCrawlers, ProtectionRow::ProbePaths];
+    const ALL: [ProtectionRow; 3] = [
+        ProtectionRow::SpoofedCrawlers,
+        ProtectionRow::ProbePaths,
+        ProtectionRow::Honeypot,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             ProtectionRow::SpoofedCrawlers => "Forged crawler UAs",
             ProtectionRow::ProbePaths => "Probe paths",
+            ProtectionRow::Honeypot => "Honeypot path",
         }
     }
 }
@@ -443,6 +449,7 @@ impl Dashboard {
         match row {
             ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_enabled,
             ProtectionRow::ProbePaths => self.protection.probe_paths_enabled,
+            ProtectionRow::Honeypot => self.protection.honeypot_enabled,
         }
     }
 
@@ -450,6 +457,7 @@ impl Dashboard {
         match row {
             ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_ttl_days,
             ProtectionRow::ProbePaths => self.protection.probe_paths_ttl_days,
+            ProtectionRow::Honeypot => self.protection.honeypot_ttl_days,
         }
     }
 
@@ -969,6 +977,10 @@ impl Dashboard {
             ProtectionRow::ProbePaths => (
                 crate::protection::PROBE_PATHS_ENABLED,
                 crate::protection::PROBE_PATHS_TTL_DAYS,
+            ),
+            ProtectionRow::Honeypot => (
+                crate::protection::HONEYPOT_ENABLED,
+                crate::protection::HONEYPOT_TTL_DAYS,
             ),
         };
         if selected == 0 {

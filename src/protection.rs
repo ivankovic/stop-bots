@@ -117,6 +117,51 @@ pub fn probe_paths(db: &Db) -> Result<Vec<String>> {
     Ok(paths)
 }
 
+/// `settings` key: whether honeypot detection runs.
+pub const HONEYPOT_ENABLED: &str = "detect_honeypot";
+/// `settings` key: TTL in days for a block that detection adds.
+pub const HONEYPOT_TTL_DAYS: &str = "detect_honeypot_ttl_days";
+/// `settings` key: the trap path itself.
+pub const HONEYPOT_PATH: &str = "detect_honeypot_path";
+
+/// Honeypot detection defaults to **off**, unlike the other two
+/// path-based detectors. Not because it's risky — it's the most precise
+/// signal available here — but because it does nothing useful until the
+/// trap path is actually *published* as `Disallow:` in a robots.txt that
+/// the site serves (see `nginx`'s robots.txt generation). Defaulting it on
+/// would show an enabled detector that can never fire, which is worse than
+/// an honest off.
+pub const HONEYPOT_ENABLED_DEFAULT: bool = false;
+
+/// Thirty days — the longest TTL of any detector here, because a honeypot
+/// hit is the strongest signal this project can produce. Every other
+/// detector infers intent from behaviour or from a claim that might be
+/// mistaken; this one catches a client fetching a path that exists for no
+/// reason other than being forbidden, which no crawler obeying robots.txt
+/// and no human following a link can do by accident.
+pub const HONEYPOT_TTL_DAYS_DEFAULT: i64 = 30;
+
+/// The default trap path. Deliberately not something that looks valuable
+/// (`/admin`, `/backup`) — a path that sounds like real loot would also be
+/// guessed by scanners that never read robots.txt, which would turn a
+/// precise "ignored robots.txt" signal into just another probe path. The
+/// point is that the *only* way to learn this path is to read the
+/// robots.txt that forbids it.
+pub const HONEYPOT_PATH_DEFAULT: &str = "/stop-bots-trap/";
+
+/// The configured trap path, falling back to [`HONEYPOT_PATH_DEFAULT`].
+/// A stored value that doesn't start with `/`, or is blank, falls back
+/// too: matching is anchored at the start of the request path, so such a
+/// value could never fire and would leave the detector looking switched on
+/// while doing nothing.
+pub fn honeypot_path(db: &Db) -> Result<String> {
+    Ok(db
+        .get_text_setting(HONEYPOT_PATH)?
+        .map(|p| p.trim().to_string())
+        .filter(|p| p.starts_with('/'))
+        .unwrap_or_else(|| HONEYPOT_PATH_DEFAULT.to_string()))
+}
+
 /// Every automatic-detection setting, read in one go. Cheap (a handful of
 /// `settings` lookups) and read fresh at each use rather than cached, so a
 /// toggle flipped in the TUI takes effect on the very next cron tick
@@ -127,6 +172,8 @@ pub struct ProtectionSettings {
     pub spoofed_crawlers_ttl_days: i64,
     pub probe_paths_enabled: bool,
     pub probe_paths_ttl_days: i64,
+    pub honeypot_enabled: bool,
+    pub honeypot_ttl_days: i64,
 }
 
 /// Hand-written rather than derived: a derived `Default` would give
@@ -141,6 +188,8 @@ impl Default for ProtectionSettings {
             spoofed_crawlers_ttl_days: SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT,
             probe_paths_enabled: PROBE_PATHS_ENABLED_DEFAULT,
             probe_paths_ttl_days: PROBE_PATHS_TTL_DAYS_DEFAULT,
+            honeypot_enabled: HONEYPOT_ENABLED_DEFAULT,
+            honeypot_ttl_days: HONEYPOT_TTL_DAYS_DEFAULT,
         }
     }
 }
@@ -156,6 +205,8 @@ impl ProtectionSettings {
                 .get_bool_setting(PROBE_PATHS_ENABLED, PROBE_PATHS_ENABLED_DEFAULT)?,
             probe_paths_ttl_days: db
                 .get_int_setting(PROBE_PATHS_TTL_DAYS, PROBE_PATHS_TTL_DAYS_DEFAULT)?,
+            honeypot_enabled: db.get_bool_setting(HONEYPOT_ENABLED, HONEYPOT_ENABLED_DEFAULT)?,
+            honeypot_ttl_days: db.get_int_setting(HONEYPOT_TTL_DAYS, HONEYPOT_TTL_DAYS_DEFAULT)?,
         })
     }
 }
@@ -261,6 +312,27 @@ mod tests {
                 "{legit} is legitimate on some sites and must not be instant-blocked"
             );
         }
+    }
+
+    #[test]
+    fn honeypot_path_falls_back_for_a_value_that_could_never_match() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(honeypot_path(&db).unwrap(), HONEYPOT_PATH_DEFAULT);
+
+        db.set_text_setting(HONEYPOT_PATH, "no-leading-slash")
+            .unwrap();
+        assert_eq!(honeypot_path(&db).unwrap(), HONEYPOT_PATH_DEFAULT);
+
+        db.set_text_setting(HONEYPOT_PATH, "  /my-trap/  ").unwrap();
+        assert_eq!(honeypot_path(&db).unwrap(), "/my-trap/");
+    }
+
+    /// Off by default, because it cannot fire until the trap path is
+    /// published in a served robots.txt.
+    #[test]
+    fn the_honeypot_is_off_by_default() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(!ProtectionSettings::load(&db).unwrap().honeypot_enabled);
     }
 
     #[test]

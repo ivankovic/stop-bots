@@ -288,6 +288,45 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Scans the NGINX access log for anything that fetched the honeypot
+    /// trap path and adds a temporary Block rule (expiring after
+    /// --ttl-days) for each.
+    ///
+    /// The trap path is published as `Disallow:` in the robots.txt this
+    /// tool generates and is otherwise unreferenced, so fetching it means
+    /// the client either read robots.txt and ignored it, or guessed a path
+    /// that exists for no other reason. That makes this the strongest
+    /// signal here — hence the longest default TTL — and, unlike a
+    /// behavioural threshold, one with essentially no way to trip by
+    /// accident.
+    ///
+    /// Does nothing until the path is actually published: turn on
+    /// robots.txt generation (Site settings, or the robots.txt setting on
+    /// the CLI) and apply, or add the Disallow line yourself.
+    BlockHoneypot {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = stop_bots::protection::HONEYPOT_TTL_DAYS_DEFAULT)]
+        ttl_days: i64,
+        /// Check this NGINX access log file instead of the default
+        /// /var/log/nginx/access.log
+        #[arg(long)]
+        access_log: Option<PathBuf>,
+        /// Show what would be added without writing to the database
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Sets the honeypot trap path. Must start with `/`. Pick something
+    /// that does *not* sound valuable: a path like `/admin` or `/backup`
+    /// would also be guessed by scanners that never read robots.txt, which
+    /// turns a precise "ignored robots.txt" signal into just another probe
+    /// path.
+    SetHoneypotPath {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        path: String,
+    },
     /// Reads the NGINX access log and tallies which user agents made a
     /// successful (non-4xx/5xx) request, adding the counts onto the
     /// `user_agent_stats` table (see stop_bots::accessstats::
@@ -496,6 +535,13 @@ async fn main() -> Result<()> {
         }) => block_probe_paths(db, ttl_days, access_log, dry_run),
         Some(Command::SetProbePaths { db, paths }) => set_probe_paths(db, paths),
         Some(Command::ListProbePaths { db }) => list_probe_paths(db),
+        Some(Command::BlockHoneypot {
+            db,
+            ttl_days,
+            access_log,
+            dry_run,
+        }) => block_honeypot(db, ttl_days, access_log, dry_run),
+        Some(Command::SetHoneypotPath { db, path }) => set_honeypot_path(db, path),
         Some(Command::RecordAccessStats { db, access_log }) => record_access_stats(db, access_log),
         Some(Command::ListAccessStats { db }) => list_access_stats(db),
         Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
@@ -1098,6 +1144,59 @@ fn list_probe_paths(db_path: Option<PathBuf>) -> Result<()> {
             println!("  {path}");
         }
     }
+    Ok(())
+}
+
+fn block_honeypot(
+    db_path: Option<PathBuf>,
+    ttl_days: i64,
+    access_log: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+
+    let source = match access_log.as_deref() {
+        Some(path) => accesslog::read_log_file(path),
+        None => accesslog::find_default_source(),
+    };
+    let log_text = match source {
+        accesslog::LogSource::Found(text) => text,
+        accesslog::LogSource::Unavailable => {
+            anyhow::bail!(
+                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
+                 --access-log, or run as root, for this to work"
+            );
+        }
+    };
+
+    let outcome = stop_bots::scanblock::block_honeypot(&db, ttl_days, &log_text, dry_run)?;
+    if outcome.candidates == 0 {
+        println!(
+            "Nothing fetched the honeypot path ({}).",
+            stop_bots::protection::honeypot_path(&db)?
+        );
+        return Ok(());
+    }
+    print_scan_block_outcome(&outcome);
+    Ok(())
+}
+
+fn set_honeypot_path(db_path: Option<PathBuf>, path: String) -> Result<()> {
+    let db = open_db(db_path)?;
+    let trimmed = path.trim();
+    // Rejected loudly rather than stored and silently ignored: matching is
+    // anchored at the start of the request path, so a path without a
+    // leading slash could never fire, leaving an apparently-enabled
+    // detector that does nothing.
+    if !trimmed.starts_with('/') {
+        anyhow::bail!("the honeypot path must start with '/' (got {trimmed:?})");
+    }
+    db.set_text_setting(stop_bots::protection::HONEYPOT_PATH, trimmed)?;
+    println!("Honeypot path set to {trimmed}");
+    println!(
+        "It only catches anything once it's published — enable robots.txt generation, or add a \
+         Disallow line for it yourself."
+    );
     Ok(())
 }
 

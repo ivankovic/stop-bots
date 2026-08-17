@@ -431,6 +431,66 @@ fn set_probe_paths_adds_extras_and_reports_unanchored_entries() {
     assert_eq!(db.list_firewall_rules().unwrap()[0].address, "203.0.113.9");
 }
 
+/// The honeypot end to end, including its guard against a path that could
+/// never match.
+#[test]
+fn honeypot_path_is_configurable_and_blocks_whatever_fetches_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let access_log = tmp.path().join("access.log");
+    fs::write(
+        &access_log,
+        "203.0.113.9 - - [10/Jul/2026:12:00:00 +0000] \"GET /trap-me/ HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n",
+    )
+    .unwrap();
+
+    // A path with no leading slash can never match, so it's rejected
+    // rather than stored.
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-honeypot-path",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--path",
+            "trap-me",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must start with"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-honeypot-path",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--path",
+            "/trap-me/",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("published"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-honeypot",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--access-log",
+            access_log.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("203.0.113.9"));
+
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    let rules = db.list_firewall_rules().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].address, "203.0.113.9");
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

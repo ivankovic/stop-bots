@@ -2280,3 +2280,44 @@ and is the panel that clips when there isn't enough. That's the right
 thing to lose (it's a status list whose content is also available from the
 CLI), and everything above it, Messages included, always renders. Adding
 another detector no longer risks silently hiding a panel.
+
+## Honeypot trap path (`scanblock::block_honeypot`)
+
+**What it does.** Blocks anything that fetches a path published only as
+`Disallow:` in robots.txt and referenced nowhere else. A client can reach
+it in exactly two ways: by reading robots.txt and ignoring it, or by
+guessing a path that exists for no other purpose. Neither is something a
+human following a link or a crawler obeying robots.txt can do by accident.
+
+**Reuses the probe-path matcher on purpose.** Mechanically this is the
+same "one request to path X is conclusive" match as
+`block_probe_paths`, and it calls `accesslog::probe_path_ips` directly
+rather than growing a second matcher. What makes it a *honeypot* is
+external to the matching — the path being published as forbidden. It's
+still its own detector, with its own toggle, cron job and `ScanKind`,
+because that signal is much stronger than a generic probe and earns a much
+longer TTL; folding the trap path into the probe list instead would give
+it the wrong TTL and the wrong label. There's a test asserting the probe
+detector doesn't also catch it.
+
+**Off by default**, unlike the other two path detectors — not because it's
+risky (it's the most precise signal here) but because it cannot fire until
+the trap path is actually served. An enabled detector that can never fire
+is worse than an honest off.
+
+**TTL 30 days**, the longest of any detector. Every other one infers
+intent from behaviour or from a claim that might be mistaken; this one
+catches a client doing something with no innocent explanation.
+
+**The default path is deliberately boring** (`/stop-bots-trap/`). A trap
+that *sounds* valuable — `/admin`, `/backup` — would also be guessed by
+scanners that never read robots.txt, converting a precise "ignored
+robots.txt" signal into just another probe path. The point is that the
+only way to learn this path is to read the robots.txt forbidding it.
+
+**A path that can't match is rejected, not stored.** Matching is anchored
+at the start of the request path, so a value without a leading `/` would
+never fire. The CLI fails loudly and `protection::honeypot_path` falls
+back to the default, rather than leaving a detector that looks switched on
+and does nothing — the same reasoning as `set-probe-paths`' rejection of
+unanchored entries.

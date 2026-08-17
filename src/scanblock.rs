@@ -41,6 +41,7 @@ pub enum ScanKind {
     Scanning,
     SpoofedCrawler,
     ProbePath,
+    Honeypot,
 }
 
 impl ScanKind {
@@ -51,6 +52,7 @@ impl ScanKind {
             ScanKind::Scanning => "scanning IP",
             ScanKind::SpoofedCrawler => "forged crawler IP",
             ScanKind::ProbePath => "probing IP",
+            ScanKind::Honeypot => "trapped IP",
         }
     }
 }
@@ -287,6 +289,41 @@ pub fn block_probe_paths(
     add_block_rules(
         db,
         ScanKind::ProbePath,
+        found,
+        candidates,
+        0,
+        true,
+        ttl_days,
+        dry_run,
+    )
+}
+
+/// Finds IPs in `log_text` that fetched the configured honeypot path (see
+/// [`crate::protection::honeypot_path`]) and adds a Block rule expiring
+/// after `ttl_days`.
+///
+/// Mechanically the same single-request match as [`block_probe_paths`],
+/// and deliberately reusing [`accesslog::probe_path_ips`] rather than
+/// growing a second matcher. What makes it a *honeypot* rather than one
+/// more probe path is external to the matching: the path is published as
+/// `Disallow:` in the robots.txt this project generates, so fetching it
+/// proves the client read robots.txt and ignored it — or guessed a path
+/// that exists for no other purpose. Kept as its own detector, with its
+/// own toggle and cron job, because that signal is much stronger than a
+/// generic probe and earns a much longer TTL.
+pub fn block_honeypot(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let path = crate::protection::honeypot_path(db)?;
+    let hits = accesslog::probe_path_ips(log_text, &[path]);
+    let found = hits.len();
+    let candidates: Vec<String> = hits.into_iter().map(|(ip, _path)| ip).collect();
+    add_block_rules(
+        db,
+        ScanKind::Honeypot,
         found,
         candidates,
         0,
@@ -691,5 +728,60 @@ mod tests {
 
         assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
         assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    // ---- honeypot ----
+
+    #[test]
+    fn block_honeypot_blocks_a_fetch_of_the_default_trap_path() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", crate::protection::HONEYPOT_PATH_DEFAULT);
+
+        let outcome = block_honeypot(&db, 30, &log, false).unwrap();
+
+        assert_eq!(outcome.kind, ScanKind::Honeypot);
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+        assert_eq!(outcome.summary(), "blocked 1 IP(s)");
+    }
+
+    #[test]
+    fn block_honeypot_uses_a_configured_path() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_text_setting(crate::protection::HONEYPOT_PATH, "/my-trap/")
+            .unwrap();
+
+        let default_hit = probe_line("203.0.113.9", crate::protection::HONEYPOT_PATH_DEFAULT);
+        assert_eq!(
+            block_honeypot(&db, 30, &default_hit, true)
+                .unwrap()
+                .candidates,
+            0
+        );
+
+        let configured_hit = probe_line("203.0.113.9", "/my-trap/anything");
+        assert_eq!(
+            block_honeypot(&db, 30, &configured_hit, true)
+                .unwrap()
+                .candidates,
+            1
+        );
+    }
+
+    #[test]
+    fn block_honeypot_ignores_ordinary_traffic() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", "/");
+        assert_eq!(block_honeypot(&db, 30, &log, false).unwrap().candidates, 0);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// The honeypot and probe-path detectors share one matcher, so this
+    /// guards against the trap path accidentally being folded into the
+    /// probe list (which would give it the wrong TTL and the wrong label).
+    #[test]
+    fn the_probe_path_detector_does_not_also_catch_the_honeypot() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", crate::protection::HONEYPOT_PATH_DEFAULT);
+        assert_eq!(block_probe_paths(&db, 5, &log, true).unwrap().candidates, 0);
     }
 }

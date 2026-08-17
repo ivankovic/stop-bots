@@ -1,6 +1,13 @@
 # TODO
 
 * Check if nftables / iptables are installed and recommend only the installed backend.
+* `tests/tui.rs` is flaky under load. Its PTY expectations use a fixed 5s
+  timeout, and cargo runs the test binaries concurrently, so on a busy
+  machine an `exp_string` can time out on output that does arrive. Every
+  failure seen so far passes on rerun and in isolation (`cargo test --test
+  tui -- --test-threads=1`). Worth either raising the timeout, or making it
+  scale with load, before it costs someone a real debugging session — a
+  test suite that cries wolf is how a genuine regression gets waved through.
 
 ## Blocking techniques worth adding
 
