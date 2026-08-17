@@ -20,13 +20,24 @@ you to review and run yourself.
 
 # Installation
 
-Build from source with cargo:
+From crates.io:
+
+```
+cargo install stop-bots
+```
+
+Or build from a checkout:
 
 ```
 cargo install --path .
 ```
 
-There is no published crate or binary package yet.
+A prebuilt `x86_64` Linux binary is attached to each
+[release](https://github.com/ivankovic/stop-bots/releases).
+
+Requires Rust 1.88 or newer to build. Linux only in practice: it shells out to
+`systemctl`, `nginx -t` and `nft`/`iptables`, so while it compiles elsewhere it won't be
+much use there.
 
 # Usage
 
@@ -168,7 +179,7 @@ requests, so you can see who's actually visiting on top of who's being blocked.
 
 # Contact
 
-You can contact me at [marko@ivankovic.me](marko@ivankovic.me).
+You can contact me at [marko@ivankovic.me](mailto:marko@ivankovic.me).
 
 # License
 
@@ -176,9 +187,11 @@ Copyright (C) 2026 Marko Ivankovic
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU Affero General Public License as published
-by the Free Software Foundation.
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-See the [LICENSE](LICENSE) file for the full text of the License.
+See the [LICENSE](https://github.com/ivankovic/stop-bots/blob/main/LICENSE) file for the
+full text of the License.
 
 ## Can't use AGPL software?
 

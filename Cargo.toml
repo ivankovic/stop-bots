@@ -1,10 +1,34 @@
 [package]
 name = "stop-bots"
-version = "0.1.0"
+# 0.0.x on purpose: cargo treats every 0.0.z bump as a breaking change, which
+# is the honest signal for a crate whose library API is the whole of
+# `src/lib.rs` and is not yet designed to be depended on. The value here is the
+# binary; the lib is published because the integration tests use it.
+version = "0.0.1"
 edition = "2021"
+rust-version = "1.88"
 authors = ["Marko Ivankovic <marko@ivankovic.me>"]
-license = "AGPL-3.0-only"
+# "or-later" to match the header on every source file, which grants
+# "version 3 of the License, or (at your option) any later version".
+license = "AGPL-3.0-or-later"
 description = "A TUI that helps you configure your server to stop bad bots and still allow good bots."
+repository = "https://github.com/ivankovic/stop-bots"
+homepage = "https://github.com/ivankovic/stop-bots"
+readme = "README.md"
+keywords = ["nginx", "firewall", "bots", "crawler", "tui"]
+categories = [
+    "command-line-utilities",
+    "network-programming",
+    "web-programming",
+    "security",
+]
+# Internal working documents, kept in the repository but not shipped to
+# everyone who downloads the crate: AI instructions, a 150KB decision log, a
+# TODO list and a code-review scratchpad. All of them are a click away on
+# GitHub. `exclude` rather than `include` deliberately — with `include`, the
+# day someone adds a fixture directory and forgets to list it, the published
+# crate silently fails to build.
+exclude = [".serena/", "AGENTS.md", "SPECS.md", "TODO.md", "REVIEW.md", "Makefile"]
 
 [dependencies]
 # For TUI

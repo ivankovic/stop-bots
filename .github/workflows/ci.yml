@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      # `-D warnings` goes on the clippy invocation rather than in a global
+      # RUSTFLAGS: RUSTFLAGS reaches dependency compilation too, so a new
+      # compiler lint firing inside some crate we merely depend on would fail
+      # this job for something nobody here can fix.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Plain `cargo test`, in parallel. The pty-driven suite in tests/tui.rs
+      # used to need `--test-threads=1` because its 5s expectation timeout
+      # couldn't survive a contended machine; that timeout is now 30s and
+      # overridable via STOP_BOTS_TEST_TIMEOUT_MS, so if a CI runner ever does
+      # turn out to be slow enough to matter, raise that rather than
+      # serialising the whole suite.
+      - name: Test
+        run: cargo test
+
+  # A separate job so a bump in a dependency's own MSRV shows up as this job
+  # going red, rather than as a confusing failure for someone on an older
+  # toolchain months later.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSRV from Cargo.toml)
+        uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo check --all-targets
+
+  # Catches the class of mistake that only surfaces at publish time: a bad
+  # category slug, a missing required field, or a crate that packages fine but
+  # does not build from its own tarball.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish --dry-run

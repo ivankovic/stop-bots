@@ -1,0 +1,73 @@
+name: Release
+
+# Tag-driven: pushing `v0.0.1` builds the binary and creates the matching
+# GitHub release.
+#
+# This workflow deliberately does NOT run `cargo publish`. A tag can be deleted
+# and re-pushed; a crates.io version cannot — it can only be yanked, and
+# yanking does not free the version number. Publishing stays a manual step run
+# from a checkout, where the dry run and the real thing happen seconds apart
+# with a human watching. See RELEASING.md.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # The tag is the input to everything below, so verify it agrees with the
+  # manifest before building anything. Catches the classic "bumped the version,
+  # tagged the previous one" mistake while it is still cheap to fix.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match Cargo.toml version
+        run: |
+          manifest="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tag" ]; then
+            echo "Tag $GITHUB_REF_NAME implies version $tag, but Cargo.toml says $manifest." >&2
+            exit 1
+          fi
+          echo "Version $manifest matches tag $GITHUB_REF_NAME."
+
+  build:
+    needs: verify-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # x86_64 Linux only. The tool shells out to systemctl, nginx -t and
+      # nft/iptables; it compiles on macOS and Windows and is useless there, so
+      # shipping those artifacts would only invite questions.
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="stop-bots-${version}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${name}"
+          cp target/release/stop-bots README.md LICENSE "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+          # Marked as a pre-release while the version is 0.0.x: cargo treats
+          # every 0.0.z bump as breaking, and the release page should say the
+          # same thing the version number does.
+          prerelease: ${{ startsWith(github.ref_name, 'v0.0.') }}
