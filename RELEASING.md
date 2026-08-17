@@ -24,6 +24,9 @@ No repository secrets are needed — nothing in CI talks to crates.io.
 
 ## Releasing
 
+For the very first release the version and changelog are already in place, so start at
+step 3.
+
 1. **Bump the version** in `Cargo.toml`, and run any cargo command so `Cargo.lock` picks up
    the new version too:
 
@@ -50,28 +53,53 @@ No repository secrets are needed — nothing in CI talks to crates.io.
    the ceiling rather than serialising the suite: `STOP_BOTS_TEST_TIMEOUT_MS=60000 cargo
    test`.
 
-4. **Commit, tag and push.** The tag must match the manifest version; the release workflow
-   checks this and refuses to build otherwise.
+4. **Push the branch first, and let CI finish.**
 
    ```
    git commit -am "release: v0.0.1"
-   git tag -a v0.0.1 -m "v0.0.1"
    git push origin main
+   ```
+
+   Deliberately not in the same breath as the tag. The tag is what triggers the release
+   build, and there is no point discovering a formatting failure or a bad category slug
+   *after* a release has started — especially the first time, when neither workflow has
+   ever executed.
+
+5. **Tag and push the tag**, once CI is green. The tag must match the manifest version;
+   the release workflow checks this and refuses to build otherwise.
+
+   ```
+   git tag -a v0.0.1 -m "v0.0.1"
    git push origin v0.0.1
    ```
 
-   Pushing the tag builds the `x86_64` Linux binary and creates the GitHub release with a
-   tarball and its SHA-256. Releases with a `v0.0.` prefix are marked pre-release
-   automatically.
+   This builds the `x86_64` Linux binary and creates the GitHub release with a tarball and
+   its SHA-256. Releases with a `v0.0.` prefix are marked pre-release automatically.
 
-5. **Watch the release build finish**, then publish the crate:
+6. **Watch the release build finish**, then publish the crate:
 
    ```
    cargo publish
    ```
 
-If something is wrong before step 5, delete the tag (`git push --delete origin v0.0.1`)
-and the draft release, fix it, and start again. After step 5 the version is spent.
+If something is wrong before step 6, delete the tag and the release, fix it, and start
+again:
+
+```
+git push --delete origin v0.0.1
+git tag -d v0.0.1
+```
+
+After step 6 the version is spent — `cargo yank` hides it from new dependants but does not
+free the number.
+
+## A note on `Cargo.lock`
+
+It is tracked, and the release build passes `--locked` while CI does not. That is the
+right way round — CI catches a dependency that has drifted, the release build is
+reproducible — but it does mean a green CI is not proof that the release build will
+resolve the same tree. In practice this only bites if a dependency is yanked between the
+two.
 
 ## Versioning
 
