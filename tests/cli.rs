@@ -274,6 +274,73 @@ fn set_block_response_changes_the_generated_status_code_on_the_next_apply() {
     assert!(!written.contains("return 403;"));
 }
 
+/// Spoofed-crawler detection end to end, including the property that
+/// matters most: it does nothing at all until crawler ranges are fetched.
+#[test]
+fn block_spoofed_crawlers_is_inert_without_ranges_then_blocks_a_forged_googlebot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let access_log = tmp.path().join("access.log");
+
+    let line = |ip: &str, ua: &str| {
+        format!("{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 512 \"-\" \"{ua}\"\n")
+    };
+    fs::write(
+        &access_log,
+        line("203.0.113.9", "Mozilla/5.0 (compatible; Googlebot/2.1)")
+            + &line("66.249.66.1", "Mozilla/5.0 (compatible; Googlebot/2.1)"),
+    )
+    .unwrap();
+
+    let run = |db_path: &Path, log: &Path| {
+        Command::cargo_bin("stop-bots")
+            .unwrap()
+            .args([
+                "block-spoofed-crawlers",
+                "--db",
+                db_path.to_str().unwrap(),
+                "--access-log",
+                log.to_str().unwrap(),
+            ])
+            .assert()
+            .success()
+    };
+
+    // No ranges stored yet: says so explicitly rather than reporting a
+    // clean log, and blocks nothing.
+    run(&db_path, &access_log).stdout(predicate::str::contains("No crawler IP ranges fetched yet"));
+    {
+        let db = stop_bots::db::Db::open(&db_path).unwrap();
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    // Seed Googlebot's published ranges the way `update-ip-ranges` would.
+    {
+        let db = stop_bots::db::Db::open(&db_path).unwrap();
+        db.register_ip_range_source(&stop_bots::db::IpRangeSource {
+            id: "googlebot".to_string(),
+            name: "Googlebot IP ranges".to_string(),
+            url: "https://example.invalid/googlebot.json".to_string(),
+            category: stop_bots::db::Category::Search,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        db.replace_ip_ranges("googlebot", &["66.249.64.0/19".to_string()])
+            .unwrap();
+    }
+
+    run(&db_path, &access_log).stdout(predicate::str::contains("203.0.113.9"));
+
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    let rules = db.list_firewall_rules().unwrap();
+    assert_eq!(rules.len(), 1, "rules were: {rules:?}");
+    // The forged claim is blocked; the address Google actually publishes
+    // is not.
+    assert_eq!(rules[0].address, "203.0.113.9");
+    assert!(rules[0].expires_at.is_some());
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

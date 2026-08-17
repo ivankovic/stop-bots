@@ -31,9 +31,33 @@ use crate::{accesslog, ipranges, sshlog};
 use anyhow::Result;
 use std::collections::HashSet;
 
+/// Which detector produced a [`ScanBlockOutcome`]. Only affects the noun
+/// in [`ScanBlockOutcome::summary`] — "no scanning IPs found" would be
+/// actively misleading on the Dashboard for a pass that was looking for
+/// forged crawler user agents, not scanning behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScanKind {
+    #[default]
+    Scanning,
+    SpoofedCrawler,
+}
+
+impl ScanKind {
+    /// The noun this detector's findings are called, singular — the CLI's
+    /// `print_scan_block_outcome` needs it too, so it isn't private.
+    pub fn noun(self) -> &'static str {
+        match self {
+            ScanKind::Scanning => "scanning IP",
+            ScanKind::SpoofedCrawler => "forged crawler IP",
+        }
+    }
+}
+
 /// What one detection-and-block pass found and did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanBlockOutcome {
+    /// What was being looked for — see [`ScanKind`].
+    pub kind: ScanKind,
     /// How many IPs the raw threshold-based detector flagged, before any
     /// known-crawler exclusion.
     pub candidates: usize,
@@ -64,12 +88,13 @@ impl ScanBlockOutcome {
     /// which reconstructs its own wording directly from this struct's
     /// fields instead of using this method.
     pub fn summary(&self) -> String {
+        let noun = self.kind.noun();
         if self.candidates == 0 {
-            return "no scanning IPs found".to_string();
+            return format!("no {noun}s found");
         }
         if self.newly_blocked.is_empty() {
             return format!(
-                "found {} scanning IP(s), all already covered",
+                "found {} {noun}(s), all already covered",
                 self.candidates - self.skipped_known_crawlers
             );
         }
@@ -97,7 +122,16 @@ pub fn block_ssh_scanners(
 ) -> Result<ScanBlockOutcome> {
     let candidates = sshlog::scanning_ips(log_text, threshold);
     let found = candidates.len();
-    add_block_rules(db, found, candidates, 0, true, ttl_days, dry_run)
+    add_block_rules(
+        db,
+        ScanKind::Scanning,
+        found,
+        candidates,
+        0,
+        true,
+        ttl_days,
+        dry_run,
+    )
 }
 
 /// Finds scanning IPs in `log_text` (an NGINX access log's contents — see
@@ -131,6 +165,7 @@ pub fn block_web_scanners(
 
     add_block_rules(
         db,
+        ScanKind::Scanning,
         found,
         kept,
         skipped_known_crawlers,
@@ -156,6 +191,74 @@ pub fn known_crawler_ranges(db: &Db) -> Result<Vec<String>> {
     Ok(ranges)
 }
 
+/// Builds the [`accesslog::CrawlerClaim`] list for
+/// [`block_spoofed_crawlers`] from whatever crawler ranges `db` currently
+/// holds. **Sources with no stored ranges are dropped**, not included
+/// empty: an empty range list would make every real request from that
+/// crawler look like an impersonation, so a fresh install (or one whose
+/// `update-ip-ranges` has never succeeded) would block the actual
+/// Googlebot. Dropping them makes the detector inert instead, which is the
+/// only safe failure mode here.
+///
+/// The markers are the tokens an impersonator actually copies. They're
+/// matched as lowercase substrings of the user agent, so `Googlebot/2.1`,
+/// `compatible; Googlebot/2.1; +http://...` and a bare `googlebot` all
+/// count — which is the point, since the whole population being detected
+/// is "things that put this word in their UA".
+pub fn crawler_claims(db: &Db) -> Result<Vec<accesslog::CrawlerClaim>> {
+    let mut claims = Vec::new();
+    for kind in ipranges::IpRangeSourceKind::ALL {
+        let ranges = db.ip_ranges_for_source(kind.id())?;
+        if ranges.is_empty() {
+            continue;
+        }
+        let marker = match kind {
+            ipranges::IpRangeSourceKind::GoogleBot => "googlebot",
+            ipranges::IpRangeSourceKind::BingBot => "bingbot",
+            ipranges::IpRangeSourceKind::GptBot => "gptbot",
+        };
+        claims.push(accesslog::CrawlerClaim {
+            marker,
+            name: kind.name(),
+            ranges,
+        });
+    }
+    Ok(claims)
+}
+
+/// Finds IPs in `log_text` (an NGINX access log) claiming to be a crawler
+/// whose operator doesn't publish their address (see
+/// [`accesslog::spoofed_crawler_ips`]) and adds a Block rule, expiring
+/// after `ttl_days`, for each one not already covered by an existing rule
+/// of the same exact address.
+///
+/// No threshold argument, unlike [`block_ssh_scanners`]/
+/// [`block_web_scanners`]: one forged request is already conclusive, so
+/// there's no count to tune. No known-crawler exclusion either — verifying
+/// against exactly those ranges *is* the detection, so an IP that survives
+/// it has already been checked against every range this project knows.
+pub fn block_spoofed_crawlers(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let claims = crawler_claims(db)?;
+    let spoofed = accesslog::spoofed_crawler_ips(log_text, &claims);
+    let found = spoofed.len();
+    let candidates: Vec<String> = spoofed.into_iter().map(|(ip, _name)| ip).collect();
+    add_block_rules(
+        db,
+        ScanKind::SpoofedCrawler,
+        found,
+        candidates,
+        0,
+        !claims.is_empty(),
+        ttl_days,
+        dry_run,
+    )
+}
+
 /// Whether `ip` falls inside any of `ranges`.
 pub fn known_crawler_match(ranges: &[String], ip: &str) -> bool {
     let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
@@ -175,8 +278,10 @@ pub fn known_crawler_match(ranges: &[String], ip: &str) -> bool {
 /// re-flagged, and re-running this after a rule expires would otherwise
 /// leave the address referenced by two rows (one dead, one freshly
 /// inserted) instead of cleanly replacing it.
+#[allow(clippy::too_many_arguments)]
 fn add_block_rules(
     db: &Db,
+    kind: ScanKind,
     found: usize,
     kept: Vec<String>,
     skipped_known_crawlers: usize,
@@ -212,6 +317,7 @@ fn add_block_rules(
     }
 
     Ok(ScanBlockOutcome {
+        kind,
         candidates: found,
         skipped_known_crawlers,
         crawler_exclusion_active,
@@ -325,6 +431,7 @@ mod tests {
     #[test]
     fn summary_describes_each_outcome_shape() {
         let none = ScanBlockOutcome {
+            kind: ScanKind::Scanning,
             candidates: 0,
             skipped_known_crawlers: 0,
             crawler_exclusion_active: true,
@@ -348,5 +455,135 @@ mod tests {
             ..none
         };
         assert_eq!(blocked.summary(), "blocked 1 IP(s)");
+    }
+
+    // ---- spoofed crawler blocking ----
+
+    fn seed_googlebot_ranges(db: &Db) {
+        db.register_ip_range_source(&crate::db::IpRangeSource {
+            id: "googlebot".to_string(),
+            name: "Googlebot IP ranges".to_string(),
+            url: "https://example.invalid/googlebot.json".to_string(),
+            category: crate::db::Category::Search,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        db.replace_ip_ranges("googlebot", &["66.249.64.0/19".to_string()])
+            .unwrap();
+    }
+
+    fn ua_line(ip: &str, ua: &str) -> String {
+        format!("{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 512 \"-\" \"{ua}\"\n")
+    }
+
+    #[test]
+    fn crawler_claims_drops_sources_with_no_fetched_ranges() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(crawler_claims(&db).unwrap().is_empty());
+
+        seed_googlebot_ranges(&db);
+        let claims = crawler_claims(&db).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].marker, "googlebot");
+        assert!(!claims[0].ranges.is_empty());
+    }
+
+    #[test]
+    fn block_spoofed_crawlers_blocks_a_forged_googlebot() {
+        let db = Db::open_in_memory().unwrap();
+        seed_googlebot_ranges(&db);
+        let log = ua_line("203.0.113.9", "Googlebot/2.1");
+
+        let outcome = block_spoofed_crawlers(&db, 1, &log, false).unwrap();
+
+        assert_eq!(outcome.kind, ScanKind::SpoofedCrawler);
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+        assert!(outcome.crawler_exclusion_active);
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].address, "203.0.113.9");
+        assert_eq!(rules[0].action, FirewallAction::Block);
+        assert!(rules[0].expires_at.is_some());
+    }
+
+    #[test]
+    fn block_spoofed_crawlers_leaves_the_real_googlebot_alone() {
+        let db = Db::open_in_memory().unwrap();
+        seed_googlebot_ranges(&db);
+        let log = ua_line("66.249.66.1", "Googlebot/2.1");
+
+        let outcome = block_spoofed_crawlers(&db, 1, &log, false).unwrap();
+
+        assert_eq!(outcome.candidates, 0);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// With nothing fetched the detector must do nothing at all — not
+    /// treat every crawler request as forged. `crawler_exclusion_active`
+    /// being false is what lets the CLI say "nothing was checked" rather
+    /// than "nothing was found".
+    #[test]
+    fn block_spoofed_crawlers_is_inert_before_any_ranges_are_fetched() {
+        let db = Db::open_in_memory().unwrap();
+        let log = ua_line("203.0.113.9", "Googlebot/2.1");
+
+        let outcome = block_spoofed_crawlers(&db, 1, &log, false).unwrap();
+
+        assert_eq!(outcome.candidates, 0);
+        assert!(!outcome.crawler_exclusion_active);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn block_spoofed_crawlers_dry_run_reports_without_writing() {
+        let db = Db::open_in_memory().unwrap();
+        seed_googlebot_ranges(&db);
+        let log = ua_line("203.0.113.9", "Googlebot/2.1");
+
+        let outcome = block_spoofed_crawlers(&db, 1, &log, true).unwrap();
+
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+        assert!(outcome.dry_run);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn block_spoofed_crawlers_skips_an_address_already_covered() {
+        let db = Db::open_in_memory().unwrap();
+        seed_googlebot_ranges(&db);
+        db.add_firewall_rule(&NewFirewallRule {
+            address: "203.0.113.9".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+        let log = ua_line("203.0.113.9", "Googlebot/2.1");
+
+        let outcome = block_spoofed_crawlers(&db, 1, &log, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty());
+        assert_eq!(outcome.already_covered, 1);
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn summary_uses_the_right_noun_for_each_kind() {
+        let base = ScanBlockOutcome {
+            kind: ScanKind::Scanning,
+            candidates: 0,
+            skipped_known_crawlers: 0,
+            crawler_exclusion_active: true,
+            already_covered: 0,
+            newly_blocked: vec![],
+            ttl_days: 1,
+            dry_run: false,
+        };
+        assert_eq!(base.summary(), "no scanning IPs found");
+        let spoofed = ScanBlockOutcome {
+            kind: ScanKind::SpoofedCrawler,
+            ..base
+        };
+        assert_eq!(spoofed.summary(), "no forged crawler IPs found");
     }
 }

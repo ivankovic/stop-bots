@@ -319,6 +319,7 @@ impl App {
             CronJob::UpdateIpRanges => self.start_cron_update_ip_ranges(),
             CronJob::BlockScanners
             | CronJob::BlockWebScanners
+            | CronJob::BlockSpoofedCrawlers
             | CronJob::RecordAccessStats
             | CronJob::RenderFirewall => self.start_cron_log_job(job),
         }
@@ -460,6 +461,31 @@ impl App {
                         Err(err) => format!("error: {err}"),
                     },
                     None => "NGINX access log unavailable".to_string(),
+                }
+            }
+            CronJob::BlockSpoofedCrawlers => {
+                // The toggle is checked here, not in `start_cron_log_job`,
+                // for one reason: the job still has to record a last-run
+                // summary so the Dashboard's "Scheduled tasks" panel says
+                // *why* nothing happened instead of showing a job that
+                // looks permanently overdue. The log read it skips is the
+                // cheap part; the pass over it is what's actually avoided.
+                let settings = crate::protection::ProtectionSettings::load(&self.db)?;
+                if !settings.spoofed_crawlers_enabled {
+                    "disabled".to_string()
+                } else {
+                    match log_text {
+                        Some(text) => match crate::scanblock::block_spoofed_crawlers(
+                            &self.db,
+                            settings.spoofed_crawlers_ttl_days,
+                            &text,
+                            false,
+                        ) {
+                            Ok(outcome) => outcome.summary(),
+                            Err(err) => format!("error: {err}"),
+                        },
+                        None => "NGINX access log unavailable".to_string(),
+                    }
                 }
             }
             CronJob::RecordAccessStats => match log_text {

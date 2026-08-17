@@ -78,13 +78,43 @@ const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 /// The rows of the editable "System-wide settings" list, in display order.
 const CATEGORIES: [Category; 3] = [Category::Scanner, Category::Search, Category::Ai];
 
-/// Which of the Dashboard's two lists arrow keys currently move through.
+/// Which of the Dashboard's three lists arrow keys currently move through.
+/// Ordered as focus flows: `Down` past the last row of one moves into the
+/// next, `Up` above the first row moves back — no dedicated focus key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Focus {
     #[default]
     Categories,
     Countries,
+    Protection,
 }
+
+/// The rows of the "Automatic blocking" list, in display order. Each is a
+/// detector that adds `firewall_rules` rows on its own — which is why they
+/// live on the Dashboard rather than Site settings: this project puts
+/// everything that ends up in the *firewall script* here, and everything
+/// that ends up in *NGINX config* on Site settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectionRow {
+    SpoofedCrawlers,
+}
+
+impl ProtectionRow {
+    const ALL: [ProtectionRow; 1] = [ProtectionRow::SpoofedCrawlers];
+
+    fn label(self) -> &'static str {
+        match self {
+            ProtectionRow::SpoofedCrawlers => "Forged crawler UAs",
+        }
+    }
+}
+
+/// The TTLs offered for a detector, in the order the popup lists them
+/// after its "Off" row. Folding the TTL into the same one-of-N popup as the
+/// on/off choice keeps this screen to a single interaction pattern (every
+/// other Dashboard setting is already "Enter, pick one") instead of adding
+/// a second key and a free-text number entry for one field.
+const PROTECTION_TTL_CHOICES: [i64; 3] = [1, 7, 30];
 
 /// The popup opened by the Dashboard: editing a category default (cycles
 /// between Allowed (0) and Blocked (1), mirroring Bot settings' category
@@ -106,6 +136,15 @@ enum Popup {
     /// enforcement into a default-deny gate for the whole box once
     /// `render-firewall` runs, not just "one more blocked country".
     GeoMode {
+        selected: usize,
+    },
+    /// One "Automatic blocking" row: option 0 is Off, options 1..=N are On
+    /// with each of [`PROTECTION_TTL_CHOICES`]' TTLs. A popup rather than a
+    /// bare Space-toggle so the TTL is visible and settable at the same
+    /// time, and because enabling a detector that adds firewall rules on
+    /// its own deserves a deliberate confirmation.
+    Protection {
+        row: ProtectionRow,
         selected: usize,
     },
     /// Firewall rendering: select backend (0 = iptables, 1 = nftables),
@@ -134,6 +173,11 @@ pub struct Dashboard {
     selected_countries: Vec<String>,
     fetched_countries: Vec<(String, i64, i64)>,
     countries_state: ListState,
+    protection_state: ListState,
+    /// The automatic-detection toggles, reloaded on every `refresh` — the
+    /// panel only displays them; `crate::cron`'s jobs read the same values
+    /// straight from `Db` when they run.
+    protection: crate::protection::ProtectionSettings,
     focus: Focus,
     /// The internal cron's per-job state (see `crate::cron`), read-only
     /// here — this panel only displays it, `App` is what actually runs due
@@ -160,6 +204,7 @@ impl Dashboard {
         self.geo_mode = db.get_geo_mode()?;
         self.selected_countries = db.list_selected_countries()?;
         self.fetched_countries = db.list_fetched_countries()?;
+        self.protection = crate::protection::ProtectionSettings::load(db)?;
         self.cron_status = crate::cron::status(db)?;
         self.firewall_needs_update = firewall_needs_update(db)?;
         if self.list_state.selected().is_none() {
@@ -167,6 +212,9 @@ impl Dashboard {
         }
         if self.countries_state.selected().is_none() {
             self.countries_state.select(Some(0));
+        }
+        if self.protection_state.selected().is_none() {
+            self.protection_state.select(Some(0));
         }
         // Removing a country shrinks `selected_countries`; without this the
         // selection could be left pointing past the new last row (stale
@@ -239,7 +287,7 @@ impl Dashboard {
         // degrades gracefully by scrolling to the selected row when its
         // viewport shrinks, unlike `Paragraph`'s fixed lines, which would
         // just silently lose whichever line no longer fits.
-        let [settings_area, geo_area, stats_area, cron_area, message_area] = Layout::vertical([
+        let [settings_area, middle_area, stats_area, cron_area, message_area] = Layout::vertical([
             Constraint::Length(5),
             Constraint::Length(7),
             Constraint::Length(5),
@@ -248,6 +296,20 @@ impl Dashboard {
             Constraint::Min(1),
         ])
         .areas(area);
+
+        // Geo-blocking and Automatic blocking sit side by side rather than
+        // stacked. Stacking a fourth full-width panel would push the total
+        // past this project's documented 30-row minimum terminal size (the
+        // Scheduled-tasks panel also grows by a row per detector added),
+        // and both of these are scrollable `List`s of the same shape, so
+        // splitting the width costs nothing either can't absorb. Focus
+        // still flows *linearly* through them (Categories -> Countries ->
+        // Protection) via Up/Down, matching how focus already flowed
+        // between the first two — only the focused panel draws a highlight,
+        // so there's never ambiguity about which list the arrows move.
+        let [geo_area, protection_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(middle_area);
 
         let reversed = Style::new().reversed();
 
@@ -283,9 +345,13 @@ impl Dashboard {
         let country_list = List::new(country_items)
             .block(
                 Block::bordered()
-                    .title(format!(
-                        "Geo-blocking (host-wide) — {mode_label} — Enter to add/remove, m for mode"
-                    ))
+                    // Shorter than it was, because this panel is half-width
+                    // now and a title longer than its border is silently
+                    // truncated. The *mode* is the one part that must never
+                    // be what gets cut — Allowlist turns the host into
+                    // default-deny — so it comes first; the add/remove hint
+                    // moved to the Help screen (`?`).
+                    .title(format!("Geo-blocking ({mode_label}) — m for mode"))
                     .fg(theme.accent()),
             )
             .highlight_style(if self.focus == Focus::Countries {
@@ -294,6 +360,23 @@ impl Dashboard {
                 Style::default()
             });
         frame.render_stateful_widget(country_list, geo_area, &mut self.countries_state);
+
+        let protection_items: Vec<ListItem> = ProtectionRow::ALL
+            .iter()
+            .map(|row| ListItem::new(self.protection_row_line(*row)))
+            .collect();
+        let protection_list = List::new(protection_items)
+            .block(
+                Block::bordered()
+                    .title("Automatic blocking — Enter")
+                    .fg(theme.accent()),
+            )
+            .highlight_style(if self.focus == Focus::Protection {
+                reversed
+            } else {
+                Style::default()
+            });
+        frame.render_stateful_widget(protection_list, protection_area, &mut self.protection_state);
 
         let summary = Paragraph::new(vec![
             Line::from(format!("Sites discovered: {}", self.site_count)),
@@ -356,8 +439,72 @@ impl Dashboard {
         ])
     }
 
+    fn protection_enabled(&self, row: ProtectionRow) -> bool {
+        match row {
+            ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_enabled,
+        }
+    }
+
+    fn protection_ttl_days(&self, row: ProtectionRow) -> i64 {
+        match row {
+            ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_ttl_days,
+        }
+    }
+
+    fn protection_row_line(&self, row: ProtectionRow) -> Line<'static> {
+        let enabled = self.protection_enabled(row);
+        // A dedicated ON/OFF tag rather than reusing `policy_tag`: that one
+        // means "traffic is allowed/blocked", and rendering an *enabled*
+        // detector as `[ BLOCKED ]` (or a disabled one as `[ ALLOWED ]`)
+        // would read as the opposite of what it says. Same
+        // theme-independent green as `policy_tag`'s allowed state, so the
+        // two still look like one system.
+        let tag = if enabled {
+            Span::from("[ ON  ]").green()
+        } else {
+            Span::from("[ OFF ]").dim()
+        };
+        let detail = if enabled {
+            format!(" {}d", self.protection_ttl_days(row))
+        } else {
+            String::new()
+        };
+        Line::from(vec![
+            Span::from(format!("{:<19}", row.label())),
+            tag,
+            Span::from(detail),
+        ])
+    }
+
     fn render_popup(&self, frame: &mut Frame, area: Rect, popup: Popup) {
         match popup {
+            Popup::Protection { row, selected } => {
+                let title = row.label();
+                let options = protection_options();
+                let content_width = options
+                    .iter()
+                    .map(|o| o.len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(title.len());
+                let popup_area =
+                    centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
+                let items: Vec<ListItem> = options
+                    .iter()
+                    .enumerate()
+                    .map(|(i, label)| {
+                        let line = if i == selected {
+                            Line::from(label.clone()).reversed()
+                        } else {
+                            Line::from(label.clone())
+                        };
+                        ListItem::new(line)
+                    })
+                    .collect();
+                let list = List::new(items).block(Block::bordered().title(title));
+                frame.render_widget(Clear, popup_area);
+                frame.render_widget(list, popup_area);
+            }
             Popup::Category { category, selected } => {
                 let title = format!("{} default", category_label(category));
                 let options = ["Allowed", "Blocked"];
@@ -551,6 +698,27 @@ impl Dashboard {
                     }
                     _ => return Ok(KeyOutcome::Consumed),
                 },
+                Popup::Protection { row, selected } => match key.code {
+                    KeyCode::Esc => {
+                        self.popup = None;
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        *selected = selected.saturating_sub(1);
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *selected = (*selected + 1).min(PROTECTION_TTL_CHOICES.len());
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                    KeyCode::Enter | KeyCode::Char(' ') => {
+                        let (row, selected) = (*row, *selected);
+                        self.popup = None;
+                        self.commit_protection(db, row, selected, message)?;
+                        return Ok(KeyOutcome::Mutated);
+                    }
+                    _ => return Ok(KeyOutcome::Consumed),
+                },
                 Popup::GeoMode { selected } => match key.code {
                     KeyCode::Esc => {
                         self.popup = None;
@@ -710,14 +878,109 @@ impl Dashboard {
                         self.countries_state.select_previous();
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => self.countries_state.select_next(),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    // The Countries list has one row per selected country
+                    // plus the fixed "+ Add a country" row at index 0, so
+                    // its last index is `len()`, not `len() - 1`.
+                    if self.countries_state.selected() == Some(self.selected_countries.len()) {
+                        self.focus = Focus::Protection;
+                        self.protection_state.select(Some(0));
+                    } else {
+                        self.countries_state.select_next();
+                    }
+                }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     return self.activate_country_row(message, db);
                 }
                 _ => return Ok(KeyOutcome::Ignored),
             },
+            Focus::Protection => match key.code {
+                KeyCode::Esc => return Ok(KeyOutcome::Ignored),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.protection_state.selected() == Some(0) {
+                        self.focus = Focus::Countries;
+                        self.countries_state
+                            .select(Some(self.selected_countries.len()));
+                    } else {
+                        self.protection_state.select_previous();
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.protection_state.selected().unwrap_or(0) + 1 < ProtectionRow::ALL.len()
+                    {
+                        self.protection_state.select_next();
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.open_protection_popup(),
+                _ => return Ok(KeyOutcome::Ignored),
+            },
         }
         Ok(KeyOutcome::Consumed)
+    }
+
+    /// Opens the edit popup for the focused "Automatic blocking" row,
+    /// pre-selected on its current state so confirming without moving is a
+    /// no-op. A currently-enabled detector whose TTL isn't one of
+    /// [`PROTECTION_TTL_CHOICES`] (set via the CLI, which takes any number
+    /// of days) still shows as enabled: it lands on the closest offered
+    /// choice rather than falling back to "Off", which would misrepresent
+    /// the detector as switched off.
+    fn open_protection_popup(&mut self) {
+        let Some(row) = self
+            .protection_state
+            .selected()
+            .and_then(|i| ProtectionRow::ALL.get(i).copied())
+        else {
+            return;
+        };
+        let selected = if !self.protection_enabled(row) {
+            0
+        } else {
+            let ttl = self.protection_ttl_days(row);
+            let closest = PROTECTION_TTL_CHOICES
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, choice)| (*choice - ttl).abs())
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            closest + 1
+        };
+        self.popup = Some(Popup::Protection { row, selected });
+    }
+
+    /// Persists a confirmed "Automatic blocking" popup. Option 0 disables
+    /// the detector and leaves its TTL alone (so re-enabling restores what
+    /// was there rather than resetting it); any other option enables it and
+    /// writes that TTL.
+    fn commit_protection(
+        &mut self,
+        db: &Db,
+        row: ProtectionRow,
+        selected: usize,
+        message: &mut Option<String>,
+    ) -> Result<()> {
+        let (enabled_key, ttl_key) = match row {
+            ProtectionRow::SpoofedCrawlers => (
+                crate::protection::SPOOFED_CRAWLERS_ENABLED,
+                crate::protection::SPOOFED_CRAWLERS_TTL_DAYS,
+            ),
+        };
+        if selected == 0 {
+            db.set_bool_setting(enabled_key, false)?;
+            *message = Some(format!("{} detection off", row.label()));
+            return Ok(());
+        }
+        let ttl = PROTECTION_TTL_CHOICES
+            .get(selected - 1)
+            .copied()
+            .unwrap_or(PROTECTION_TTL_CHOICES[0]);
+        db.set_bool_setting(enabled_key, true)?;
+        db.set_int_setting(ttl_key, ttl)?;
+        *message = Some(format!(
+            "{} detection on, blocking for {ttl} day(s)",
+            row.label()
+        ));
+        Ok(())
     }
 
     fn open_category_popup(&mut self) {
@@ -763,6 +1026,23 @@ impl Dashboard {
         *message = Some(format!("Removed {}", country_code.to_uppercase()));
         Ok(KeyOutcome::Mutated)
     }
+}
+
+/// The "Automatic blocking" popup's options: "Off", then one "On" row per
+/// [`PROTECTION_TTL_CHOICES`] entry. Built in one place so the renderer and
+/// the key handler can never disagree about how many rows there are or what
+/// index means what — the same reason Site settings has its own
+/// `setting_options`.
+fn protection_options() -> Vec<String> {
+    std::iter::once("Off".to_string())
+        .chain(PROTECTION_TTL_CHOICES.iter().map(|days| {
+            if *days == 1 {
+                "On — block for 1 day".to_string()
+            } else {
+                format!("On — block for {days} days")
+            }
+        }))
+        .collect()
 }
 
 fn category_label(category: Category) -> &'static str {
@@ -1517,7 +1797,10 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 28);
+        let backend = // 80 columns, not 60: the Dashboard's middle row now holds
+        // Geo-blocking and Automatic blocking side by side, and 80 is the
+        // universal terminal minimum this layout targets (see SPECS.md).
+        TestBackend::new(80, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -1860,5 +2143,193 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Firewall rules: up to date"));
         assert!(!content.contains("needs updating"));
+    }
+
+    // ---- Automatic blocking panel ----
+
+    use crate::protection::{
+        ProtectionSettings, SPOOFED_CRAWLERS_ENABLED, SPOOFED_CRAWLERS_TTL_DAYS,
+    };
+
+    fn press(dashboard: &mut Dashboard, db: &Db, code: KeyCode) -> KeyOutcome {
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(code), db, &mut message)
+            .unwrap()
+    }
+
+    /// Walks focus from its default (Categories) all the way into the
+    /// Automatic blocking panel, the way a user actually would.
+    fn focus_protection(dashboard: &mut Dashboard, db: &Db) {
+        while dashboard.focus != Focus::Protection {
+            press(dashboard, db, KeyCode::Down);
+        }
+    }
+
+    #[test]
+    fn focus_flows_from_countries_into_the_protection_panel_and_back() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        focus_protection(&mut dashboard, &db);
+        assert_eq!(dashboard.protection_state.selected(), Some(0));
+
+        press(&mut dashboard, &db, KeyCode::Up);
+        assert_eq!(dashboard.focus, Focus::Countries);
+    }
+
+    #[test]
+    fn down_does_not_move_past_the_last_protection_row() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        for _ in 0..5 {
+            press(&mut dashboard, &db, KeyCode::Down);
+        }
+        assert_eq!(
+            dashboard.protection_state.selected(),
+            Some(ProtectionRow::ALL.len() - 1)
+        );
+        assert_eq!(dashboard.focus, Focus::Protection);
+    }
+
+    #[test]
+    fn turning_a_detector_off_persists_it() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        // Enabled by default, so the popup opens on an "On" row; Up lands
+        // on "Off" at index 0.
+        press(&mut dashboard, &db, KeyCode::Enter);
+        assert!(matches!(dashboard.popup, Some(Popup::Protection { .. })));
+        press(&mut dashboard, &db, KeyCode::Up);
+        let outcome = press(&mut dashboard, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(
+            !ProtectionSettings::load(&db)
+                .unwrap()
+                .spoofed_crawlers_enabled
+        );
+    }
+
+    #[test]
+    fn choosing_an_on_option_stores_both_the_toggle_and_its_ttl() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_bool_setting(SPOOFED_CRAWLERS_ENABLED, false)
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        // Opens on "Off" (index 0); two Downs reach the second TTL choice.
+        press(&mut dashboard, &db, KeyCode::Enter);
+        press(&mut dashboard, &db, KeyCode::Down);
+        press(&mut dashboard, &db, KeyCode::Down);
+        press(&mut dashboard, &db, KeyCode::Enter);
+
+        let settings = ProtectionSettings::load(&db).unwrap();
+        assert!(settings.spoofed_crawlers_enabled);
+        assert_eq!(
+            settings.spoofed_crawlers_ttl_days,
+            PROTECTION_TTL_CHOICES[1]
+        );
+    }
+
+    /// Turning a detector off must not throw away its TTL — re-enabling
+    /// should restore what was configured, not silently reset it.
+    #[test]
+    fn disabling_a_detector_preserves_its_ttl() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_int_setting(SPOOFED_CRAWLERS_TTL_DAYS, 30).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        press(&mut dashboard, &db, KeyCode::Enter);
+        press(&mut dashboard, &db, KeyCode::Up);
+        press(&mut dashboard, &db, KeyCode::Up);
+        press(&mut dashboard, &db, KeyCode::Up);
+        press(&mut dashboard, &db, KeyCode::Enter);
+
+        let settings = ProtectionSettings::load(&db).unwrap();
+        assert!(!settings.spoofed_crawlers_enabled);
+        assert_eq!(settings.spoofed_crawlers_ttl_days, 30);
+    }
+
+    /// A TTL set outside the offered choices (via the CLI, which takes any
+    /// number) must still open as *enabled* rather than reading as "Off".
+    #[test]
+    fn the_popup_opens_enabled_for_a_ttl_that_is_not_an_offered_choice() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_bool_setting(SPOOFED_CRAWLERS_ENABLED, true).unwrap();
+        db.set_int_setting(SPOOFED_CRAWLERS_TTL_DAYS, 3).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        press(&mut dashboard, &db, KeyCode::Enter);
+        let Some(Popup::Protection { selected, .. }) = dashboard.popup else {
+            panic!("expected the protection popup");
+        };
+        assert_ne!(selected, 0, "3 days must not read as Off");
+    }
+
+    #[test]
+    fn escape_closes_the_protection_popup_without_changing_anything() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        press(&mut dashboard, &db, KeyCode::Enter);
+        press(&mut dashboard, &db, KeyCode::Up);
+        press(&mut dashboard, &db, KeyCode::Esc);
+
+        assert!(dashboard.popup.is_none());
+        assert!(
+            ProtectionSettings::load(&db)
+                .unwrap()
+                .spoofed_crawlers_enabled
+        );
+    }
+
+    #[test]
+    fn render_shows_the_automatic_blocking_panel() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_bool_setting(SPOOFED_CRAWLERS_ENABLED, false)
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(80, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("Automatic blocking"));
+        assert!(content.contains("Forged crawler"));
+        assert!(content.contains("[ OFF ]"));
     }
 }

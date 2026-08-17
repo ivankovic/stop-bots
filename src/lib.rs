@@ -28,6 +28,7 @@ pub mod ipranges;
 pub mod iptables;
 pub mod nftables;
 pub mod nginx;
+pub mod protection;
 pub mod scanblock;
 pub mod sshlog;
 pub mod tui;

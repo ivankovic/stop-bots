@@ -969,6 +969,79 @@ impl Db {
         Ok(value.map_or_else(BlockResponse::default, |v| BlockResponse::from_str(&v)))
     }
 
+    // ---- generic settings accessors ----
+    //
+    // The `settings` table is already this project's catch-all key/value
+    // store (category defaults, geo mode, cron bookkeeping — see the
+    // internal-cron comment below). Automatic-detection toggles and their
+    // TTLs use it too rather than growing a column per knob: they're all
+    // scalar, host-wide, and independently defaulted, which is exactly what
+    // a key/value table is for. Every one of them reads through `Option`
+    // and falls back to a caller-supplied default, so a database written
+    // before a given setting existed keeps behaving the way it did.
+
+    fn get_raw_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn set_raw_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// A boolean setting, stored as the literal text `"true"`/`"false"`.
+    /// Anything else — including a value from a future version this build
+    /// doesn't understand — reads as `default` rather than erroring, the
+    /// same never-fail-a-read-over-a-stored-enum convention the enums here
+    /// already use.
+    pub fn get_bool_setting(&self, key: &str, default: bool) -> Result<bool> {
+        Ok(match self.get_raw_setting(key)?.as_deref() {
+            Some("true") => true,
+            Some("false") => false,
+            _ => default,
+        })
+    }
+
+    pub fn set_bool_setting(&self, key: &str, value: bool) -> Result<()> {
+        self.set_raw_setting(key, if value { "true" } else { "false" })
+    }
+
+    /// An integer setting. An unparseable or negative stored value reads as
+    /// `default`: every integer setting here is a count of days or requests
+    /// where a negative would be meaningless, and silently clamping beats
+    /// failing a whole detection pass over one corrupt row.
+    pub fn get_int_setting(&self, key: &str, default: i64) -> Result<i64> {
+        Ok(self
+            .get_raw_setting(key)?
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| *v >= 0)
+            .unwrap_or(default))
+    }
+
+    pub fn set_int_setting(&self, key: &str, value: i64) -> Result<()> {
+        self.set_raw_setting(key, &value.to_string())
+    }
+
+    /// A free-text setting, `None` when never set.
+    pub fn get_text_setting(&self, key: &str) -> Result<Option<String>> {
+        self.get_raw_setting(key)
+    }
+
+    pub fn set_text_setting(&self, key: &str, value: &str) -> Result<()> {
+        self.set_raw_setting(key, value)
+    }
+
     pub fn set_block_response(&self, response: BlockResponse) -> Result<()> {
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES ('block_response', ?1)

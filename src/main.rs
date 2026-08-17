@@ -206,6 +206,43 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Scans the NGINX access log for IP addresses that claimed, via their
+    /// User-Agent, to be Googlebot, Bingbot or GPTBot while connecting from
+    /// an address that crawler's own operator does not publish — the
+    /// cheapest and most common bot disguise there is — and adds a
+    /// temporary Block rule (expiring after --ttl-days) for each.
+    ///
+    /// This is the offline stand-in for forward-confirmed reverse DNS:
+    /// real rDNS needs a lookup per request, which nothing here is in a
+    /// position to do, but the operators' published CIDR lists answer the
+    /// same "is this actually Google?" question against a log after the
+    /// fact. There is deliberately no --threshold: one forged request is
+    /// already conclusive, unlike the behavioural counting BlockScanners
+    /// and BlockWebScanners do.
+    ///
+    /// Inert until UpdateIpRanges has fetched at least one crawler's
+    /// ranges — with no ranges stored, every real crawler request would
+    /// look forged, so those sources are skipped rather than treated as
+    /// "nothing is legitimate". Same storage-only, expiry-enforced-on-read
+    /// caveats as BlockScanners.
+    BlockSpoofedCrawlers {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// How many days an added block rule lasts. Short by default: if a
+        /// crawler operator publishes a new range faster than the daily
+        /// range refresh picks it up, this bounds how long a real crawler
+        /// address stays blocked. A genuine impersonator is re-flagged on
+        /// its next request anyway.
+        #[arg(long, default_value_t = stop_bots::protection::SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT)]
+        ttl_days: i64,
+        /// Check this NGINX access log file instead of the default
+        /// /var/log/nginx/access.log
+        #[arg(long)]
+        access_log: Option<PathBuf>,
+        /// Show what would be added without writing to the database
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Reads the NGINX access log and tallies which user agents made a
     /// successful (non-4xx/5xx) request, adding the counts onto the
     /// `user_agent_stats` table (see stop_bots::accessstats::
@@ -400,6 +437,12 @@ async fn main() -> Result<()> {
             access_log,
             dry_run,
         }) => block_web_scanners(db, threshold, ttl_days, access_log, dry_run),
+        Some(Command::BlockSpoofedCrawlers {
+            db,
+            ttl_days,
+            access_log,
+            dry_run,
+        }) => block_spoofed_crawlers(db, ttl_days, access_log, dry_run),
         Some(Command::RecordAccessStats { db, access_log }) => record_access_stats(db, access_log),
         Some(Command::ListAccessStats { db }) => list_access_stats(db),
         Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
@@ -891,6 +934,48 @@ fn block_web_scanners(
     Ok(())
 }
 
+fn block_spoofed_crawlers(
+    db_path: Option<PathBuf>,
+    ttl_days: i64,
+    access_log: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+
+    let source = match access_log.as_deref() {
+        Some(path) => accesslog::read_log_file(path),
+        None => accesslog::find_default_source(),
+    };
+    let log_text = match source {
+        accesslog::LogSource::Found(text) => text,
+        accesslog::LogSource::Unavailable => {
+            anyhow::bail!(
+                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
+                 --access-log, or run as root, for this to work"
+            );
+        }
+    };
+
+    let outcome = stop_bots::scanblock::block_spoofed_crawlers(&db, ttl_days, &log_text, dry_run)?;
+
+    // Distinct from "found nothing": with no ranges stored there was
+    // nothing to check against, so a clean result here means the detector
+    // never ran, not that the log is clean.
+    if !outcome.crawler_exclusion_active {
+        println!(
+            "No crawler IP ranges fetched yet — run `stop-bots update-ip-ranges --source-id \
+             googlebot` (and bingbot/gptbot) first. Nothing was checked."
+        );
+        return Ok(());
+    }
+    if outcome.candidates == 0 {
+        println!("No forged crawler user agents found.");
+        return Ok(());
+    }
+    print_scan_block_outcome(&outcome);
+    Ok(())
+}
+
 /// Prints the per-IP and summary lines shared by [`block_scanners`] and
 /// [`block_web_scanners`], reconstructing the wording each used to print
 /// directly (back when the detection/insertion logic itself lived here)
@@ -908,8 +993,9 @@ fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
     }
     if outcome.newly_blocked.is_empty() {
         println!(
-            "Found {} scanning IP(s), all already covered by an existing firewall rule.",
-            outcome.already_covered
+            "Found {} {}(s), all already covered by an existing firewall rule.",
+            outcome.already_covered,
+            outcome.kind.noun()
         );
     } else if outcome.dry_run {
         println!(

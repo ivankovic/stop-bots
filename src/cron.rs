@@ -62,6 +62,13 @@ pub enum CronJob {
     /// same reason: catch a URL-enumeration scan while it's still in
     /// progress.
     BlockWebScanners,
+    /// Runs `scanblock::block_spoofed_crawlers` against the auto-detected
+    /// NGINX access log — flags IPs claiming to be Googlebot/Bingbot/GPTBot
+    /// from outside those crawlers' published ranges. Same tightest cadence
+    /// as the other two detectors, and gated by
+    /// `protection::SPOOFED_CRAWLERS_ENABLED` (a disabled detector skips
+    /// the whole pass, including reading the log).
+    BlockSpoofedCrawlers,
     /// Runs `accessstats::record_access_stats` against the auto-detected
     /// NGINX access log — tallies successful-request user agents into
     /// `user_agent_stats`, independent of (and against the same log as)
@@ -75,10 +82,11 @@ pub enum CronJob {
 }
 
 impl CronJob {
-    pub const ALL: [CronJob; 5] = [
+    pub const ALL: [CronJob; 6] = [
         CronJob::UpdateIpRanges,
         CronJob::BlockScanners,
         CronJob::BlockWebScanners,
+        CronJob::BlockSpoofedCrawlers,
         CronJob::RecordAccessStats,
         CronJob::RenderFirewall,
     ];
@@ -91,6 +99,7 @@ impl CronJob {
             CronJob::UpdateIpRanges => "update_ip_ranges",
             CronJob::BlockScanners => "block_scanners",
             CronJob::BlockWebScanners => "block_web_scanners",
+            CronJob::BlockSpoofedCrawlers => "block_spoofed_crawlers",
             CronJob::RecordAccessStats => "record_access_stats",
             CronJob::RenderFirewall => "render_firewall",
         }
@@ -102,6 +111,7 @@ impl CronJob {
             CronJob::UpdateIpRanges => "Update crawler IP ranges",
             CronJob::BlockScanners => "Block SSH scanners",
             CronJob::BlockWebScanners => "Block web scanners",
+            CronJob::BlockSpoofedCrawlers => "Block forged crawler UAs",
             CronJob::RecordAccessStats => "Record access-log stats",
             CronJob::RenderFirewall => "Render firewall script",
         }
@@ -111,7 +121,8 @@ impl CronJob {
     /// blanket interval:
     /// - `UpdateIpRanges`: daily — crawler ranges change slowly; this only
     ///   needs to stay roughly current.
-    /// - `BlockScanners`/`BlockWebScanners`: every minute — both are
+    /// - `BlockScanners`/`BlockWebScanners`/`BlockSpoofedCrawlers`: every
+    ///   minute — all three are
     ///   detection, and the whole point of detection is catching an attack
     ///   while it's still happening rather than finding out about it after
     ///   the fact. A minute is also the practical floor: `App::check_cron`
@@ -131,6 +142,7 @@ impl CronJob {
             CronJob::UpdateIpRanges => Duration::from_secs(24 * 60 * 60),
             CronJob::BlockScanners => Duration::from_secs(60),
             CronJob::BlockWebScanners => Duration::from_secs(60),
+            CronJob::BlockSpoofedCrawlers => Duration::from_secs(60),
             CronJob::RecordAccessStats => Duration::from_secs(60),
             CronJob::RenderFirewall => Duration::from_secs(24 * 60 * 60),
         }

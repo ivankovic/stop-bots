@@ -31,7 +31,7 @@
 //! monitoring probe or health check hammering a stale internal endpoint
 //! isn't an internet scanner on either log.
 
-use crate::ipranges::is_local_or_private;
+use crate::ipranges::{cidr_contains, is_local_or_private};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
@@ -134,6 +134,94 @@ pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
         .into_iter()
         .filter(|(ip, paths)| paths.len() >= threshold && !is_local_or_private(ip))
         .map(|(ip, _)| ip.to_string())
+        .collect();
+    ips.sort();
+    ips
+}
+
+/// One crawler that can be impersonated: a marker that identifies it in a
+/// `User-Agent` string, plus the CIDRs its operator actually publishes.
+/// Built by `crate::scanblock::crawler_claims` from the same
+/// `ipranges::IpRangeSourceKind` data `update-ip-ranges` fetches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawlerClaim {
+    /// Lowercase substring that identifies a claim to be this crawler
+    /// (`"googlebot"`, `"bingbot"`, `"gptbot"`). A substring rather than a
+    /// full pattern because that's exactly what an impersonator copies —
+    /// the recognisable token, embedded in whatever surrounding string
+    /// they please.
+    pub marker: &'static str,
+    /// A human-readable name, for the "why was this blocked" message.
+    pub name: &'static str,
+    /// Every CIDR the operator publishes for this crawler. **Never empty**
+    /// — see [`spoofed_crawler_ips`] for why an empty list must mean "skip
+    /// this crawler entirely" rather than "nothing is legitimate".
+    pub ranges: Vec<String>,
+}
+
+/// Every IP that claimed to be one of `claims`' crawlers from an address
+/// that crawler's operator doesn't publish. This is the offline stand-in
+/// for forward-confirmed reverse DNS: real rDNS needs a lookup per request,
+/// which nothing in this codebase sits in a position to do, but the
+/// published CIDR lists answer the same question — "is this actually
+/// Google?" — against a log after the fact.
+///
+/// Unlike [`scanning_ips`] there is no threshold: a single request claiming
+/// to be Googlebot from a non-Google address is already conclusive. Nothing
+/// legitimate has a reason to put `googlebot` in its user agent from an
+/// address Google doesn't own, and the published lists are complete by
+/// construction (that's what publishing them is *for*).
+///
+/// **A crawler with no fetched ranges is skipped, not treated as
+/// all-spoofed.** `CrawlerClaim::ranges` being empty means
+/// `update-ip-ranges` has never successfully run for that source, in which
+/// case every real crawler request would look like an impersonation — the
+/// single worst failure this detector could have, since it would block the
+/// actual Googlebot on a fresh install. The caller
+/// (`crate::scanblock::crawler_claims`) filters those out, and this
+/// function defends against it a second time rather than trusting that.
+///
+/// Loopback/private source IPs are excluded, same as [`scanning_ips`].
+/// Deduplicated and sorted for deterministic output.
+pub fn spoofed_crawler_ips(log_text: &str, claims: &[CrawlerClaim]) -> Vec<(String, String)> {
+    let active: Vec<&CrawlerClaim> = claims.iter().filter(|c| !c.ranges.is_empty()).collect();
+    if active.is_empty() {
+        return Vec::new();
+    }
+
+    let mut found: HashMap<IpAddr, &'static str> = HashMap::new();
+    for (ip, _status, _path, user_agent) in log_text.lines().filter_map(parse_line) {
+        if is_local_or_private(&ip) {
+            continue;
+        }
+        let ua_lower = user_agent.to_lowercase();
+        let matched: Vec<&&CrawlerClaim> = active
+            .iter()
+            .filter(|claim| ua_lower.contains(claim.marker))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        // Verification is per *request*, not per claim: if any crawler this
+        // user agent named vouches for the address, the request is
+        // legitimate and the other names it happens to mention prove
+        // nothing on their own. Checking per claim instead would flag the
+        // real Googlebot the moment its UA string contained some other
+        // crawler's token.
+        if matched
+            .iter()
+            .any(|claim| claim.ranges.iter().any(|cidr| cidr_contains(cidr, ip)))
+        {
+            continue;
+        }
+        if let Some(first) = matched.first() {
+            found.entry(ip).or_insert(first.name);
+        }
+    }
+
+    let mut ips: Vec<(String, String)> = found
+        .into_iter()
+        .map(|(ip, name)| (ip.to_string(), name.to_string()))
         .collect();
     ips.sort();
     ips
@@ -352,5 +440,105 @@ mod tests {
             LogSource::Found(content) => assert!(content.contains("1.2.3.4")),
             LogSource::Unavailable => panic!("expected the file to be readable"),
         }
+    }
+
+    // ---- spoofed crawler detection ----
+
+    fn claim(marker: &'static str, name: &'static str, ranges: &[&str]) -> CrawlerClaim {
+        CrawlerClaim {
+            marker,
+            name,
+            ranges: ranges.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    fn ua_line(ip: &str, ua: &str) -> String {
+        format!("{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 512 \"-\" \"{ua}\"\n")
+    }
+
+    fn googlebot_claim() -> CrawlerClaim {
+        claim("googlebot", "Googlebot IP ranges", &["66.249.64.0/19"])
+    }
+
+    #[test]
+    fn spoofed_crawler_ips_flags_a_googlebot_claim_from_outside_googles_ranges() {
+        let log = ua_line("203.0.113.9", "Mozilla/5.0 (compatible; Googlebot/2.1)");
+        assert_eq!(
+            spoofed_crawler_ips(&log, &[googlebot_claim()]),
+            vec![("203.0.113.9".to_string(), "Googlebot IP ranges".to_string())]
+        );
+    }
+
+    #[test]
+    fn spoofed_crawler_ips_leaves_the_real_googlebot_alone() {
+        let log = ua_line("66.249.66.1", "Mozilla/5.0 (compatible; Googlebot/2.1)");
+        assert!(spoofed_crawler_ips(&log, &[googlebot_claim()]).is_empty());
+    }
+
+    #[test]
+    fn spoofed_crawler_ips_ignores_a_user_agent_that_claims_nothing() {
+        let log = ua_line("203.0.113.9", "Mozilla/5.0 (X11; Linux x86_64)");
+        assert!(spoofed_crawler_ips(&log, &[googlebot_claim()]).is_empty());
+    }
+
+    #[test]
+    fn spoofed_crawler_ips_matches_the_marker_case_insensitively() {
+        let log = ua_line("203.0.113.9", "GOOGLEBOT");
+        assert_eq!(spoofed_crawler_ips(&log, &[googlebot_claim()]).len(), 1);
+    }
+
+    /// The single most important property here: with no ranges fetched,
+    /// every real crawler request looks forged. Skipping the crawler
+    /// entirely is the only safe reading of "we have no data".
+    #[test]
+    fn spoofed_crawler_ips_skips_a_crawler_with_no_fetched_ranges() {
+        let empty = claim("googlebot", "Googlebot IP ranges", &[]);
+        let log = ua_line("203.0.113.9", "Googlebot/2.1");
+        assert!(spoofed_crawler_ips(&log, &[empty]).is_empty());
+    }
+
+    #[test]
+    fn spoofed_crawler_ips_is_empty_with_no_claims_at_all() {
+        let log = ua_line("203.0.113.9", "Googlebot/2.1");
+        assert!(spoofed_crawler_ips(&log, &[]).is_empty());
+    }
+
+    #[test]
+    fn spoofed_crawler_ips_excludes_local_and_private_sources() {
+        let log = ua_line("10.0.0.5", "Googlebot/2.1") + &ua_line("127.0.0.1", "Googlebot/2.1");
+        assert!(spoofed_crawler_ips(&log, &[googlebot_claim()]).is_empty());
+    }
+
+    #[test]
+    fn spoofed_crawler_ips_deduplicates_and_sorts() {
+        let log = ua_line("203.0.113.9", "Googlebot/2.1")
+            + &ua_line("203.0.113.9", "Googlebot/2.1")
+            + &ua_line("198.51.100.2", "bingbot/2.0");
+        let found = spoofed_crawler_ips(
+            &log,
+            &[
+                googlebot_claim(),
+                claim("bingbot", "Bingbot IP ranges", &["40.77.167.0/24"]),
+            ],
+        );
+        let ips: Vec<&str> = found.iter().map(|(ip, _)| ip.as_str()).collect();
+        assert_eq!(ips, vec!["198.51.100.2", "203.0.113.9"]);
+    }
+
+    /// An IP verified against one crawler's ranges must not be flagged by a
+    /// *different* claim it also happens to mention.
+    #[test]
+    fn spoofed_crawler_ips_does_not_flag_a_verified_ip_for_another_claim() {
+        let log = ua_line("66.249.66.1", "Googlebot/2.1 bingbot/2.0");
+        let found = spoofed_crawler_ips(
+            &log,
+            &[
+                googlebot_claim(),
+                claim("bingbot", "Bingbot IP ranges", &["40.77.167.0/24"]),
+            ],
+        );
+        // Verified as Googlebot, so the stray "bingbot" token isn't
+        // treated as an impersonation of Bing on its own.
+        assert!(found.is_empty(), "unexpectedly flagged: {found:?}");
     }
 }

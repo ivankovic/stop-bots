@@ -2104,3 +2104,119 @@ moving is a no-op rather than a silent change to the first option.
 the TUI's status message says the same, because every applied site
 flipping to STALE is otherwise easy to misread as "already live". This is
 the same generate-then-apply discipline the firewall side already follows.
+
+## Spoofed-crawler detection (`accesslog::spoofed_crawler_ips`, `scanblock::block_spoofed_crawlers`, `src/protection.rs`)
+
+**What it does.** Flags any IP whose request claimed — via its
+`User-Agent` — to be Googlebot, Bingbot or GPTBot while connecting from an
+address that crawler's own operator doesn't publish, and adds a temporary
+Block rule for it. Available as `block-spoofed-crawlers` on the CLI, as the
+`BlockSpoofedCrawlers` internal-cron job, and as an "Automatic blocking"
+row on the Dashboard.
+
+**Why this and not reverse DNS.** Forward-confirmed rDNS is the canonical
+crawler check, but it needs a DNS lookup *per request*, at request time —
+nothing in this codebase sits in the request path, and a generated NGINX
+`if` block cannot do a lookup. The published CIDR lists answer the same
+"is this actually Google?" question offline, against a log after the fact.
+The data was already here: `ipranges::IpRangeSourceKind` fetches all three
+lists, and until now they were only used for *exclusion* (never
+auto-blocking a verified crawler in `block_web_scanners`). This inverts
+the same data into a detector.
+
+**No threshold, unlike the other two detectors.** `block-scanners` needs
+≥20 failed logins and `block-web-scanners` ≥7 distinct 404s because
+behaviour is a matter of degree. A forged crawler UA isn't: one request is
+already conclusive, because nothing legitimate has a reason to put
+`googlebot` in its user agent from an address Google doesn't own, and the
+published lists are complete by construction — that's what publishing them
+is for. So there is no count to tune and no `--threshold` flag.
+
+**The one dangerous failure mode, and the two guards against it.** With no
+ranges stored, *every* real crawler request looks forged — a fresh install
+would block the actual Googlebot, which is SEO damage rather than a
+nuisance. Guard one: `scanblock::crawler_claims` drops any source with an
+empty range list rather than including it empty, so the detector is inert
+until `update-ip-ranges` has actually succeeded. Guard two:
+`spoofed_crawler_ips` re-checks the same condition instead of trusting its
+caller. `ScanBlockOutcome::crawler_exclusion_active` carries the
+distinction outward, so the CLI can say "nothing was checked" rather than
+the much worse "nothing was found".
+
+**Verification is per request, not per claim.** A user agent naming two
+crawlers is verified if *any* of the named crawlers vouches for the
+address. Checking each claim separately would flag the real Googlebot the
+moment its UA string happened to contain another crawler's token — the
+detector's own `googlebot`-verified line would still be reported as a
+Bing impersonation. There is a regression test for exactly this.
+
+**Defaults: on, with a 1-day TTL.** On, because unlike the threshold
+detectors there's no tuning to get wrong and it's inert without data. One
+day rather than `block-scanners`' five because the realistic false
+positive is a crawler operator publishing a new range faster than the
+daily `UpdateIpRanges` job picks it up; a short TTL bounds how long a real
+crawler address stays blocked, and a genuine impersonator is re-flagged on
+its very next request anyway.
+
+**`ScanKind`.** `ScanBlockOutcome` gained a `kind` so `summary()` says "no
+forged crawler IPs found" instead of "no scanning IPs found" — on the
+Dashboard's Scheduled-tasks panel the old noun would have described the
+wrong thing entirely.
+
+## Automatic-blocking settings (`src/protection.rs`) and the Dashboard panel
+
+**Where the toggles live, and the rule behind it.** Host-wide settings
+that shape the *firewall script* go on the Dashboard; host-wide settings
+that shape *NGINX config text* go on Site settings. Detectors write
+`firewall_rules` rows, so they're Dashboard-side. This is the organising
+rule for any future toggle, and it's why the block-response setting went
+to the other screen.
+
+`protection.rs` holds every detector's `settings` key, its default, and
+the reasoning for that default in one place, so the cron job, the CLI and
+the TUI panel can't disagree. `Db` grew generic
+`get_bool_setting`/`get_int_setting`/`get_text_setting` accessors (plus
+setters) over the existing key/value `settings` table rather than a column
+per knob — these are all scalar, host-wide and independently defaulted.
+Every read falls back to a caller-supplied default, so a database written
+before a setting existed keeps behaving exactly as it did, and a corrupt
+or hand-edited value falls back rather than failing a detection pass.
+`ProtectionSettings::default()` is hand-written (not derived) so it agrees
+with `load()` on an untouched database — a derived `false`/`0` would make
+the panel show one thing before its first refresh and another after.
+
+**A disabled detector is skipped, not run-and-discarded**, but it still
+records a `"disabled"` last-run summary so the Scheduled-tasks panel
+explains itself rather than showing a job that looks permanently overdue.
+Turning a detector off never removes rules it already added: those expire
+on their own TTL. "Stop detecting" and "undo what was detected" are
+deliberately separate, the latter being the admin's call via Dynamic
+Protection or `remove-firewall-rule`.
+
+**Panel layout.** Geo-blocking and Automatic blocking now sit *side by
+side* in the Dashboard's middle row. Stacking a fourth full-width panel
+would have pushed past the documented 30-row minimum terminal height —
+and the Scheduled-tasks panel grows by a row for every detector added, so
+that ceiling gets closer with each one. Both are scrollable `List`s of the
+same shape, so splitting the width costs neither anything it can't absorb.
+The consequence is a **width** floor of ~80 columns (the universal
+terminal minimum), since a title longer than its half-width border is
+silently truncated; the Geo-blocking title was shortened accordingly, with
+the *mode* kept first because Allowlist turning the host default-deny is
+the one thing that must never be what gets cut. Focus still flows
+linearly, Up/Down, System-wide settings → Geo-blocking → Automatic
+blocking, and only the focused panel draws a highlight.
+
+**One popup, not a toggle plus a number entry.** Enter on a detector row
+opens a one-of-N popup: "Off", then one "On — block for N days" row per
+`PROTECTION_TTL_CHOICES` entry. That folds the TTL into the interaction
+this screen already uses everywhere else, instead of adding a second key
+and free-text numeric entry for one field. Choosing "Off" leaves the
+stored TTL alone, so re-enabling restores what was configured. A TTL set
+outside the offered choices (the CLI takes any number of days) opens on
+the *closest* choice rather than falling back to "Off", which would
+misrepresent an enabled detector as switched off.
+
+The ON/OFF tag is deliberately not `policy_tag`: that one means "traffic
+is allowed/blocked", so an enabled detector rendered as `[ BLOCKED ]`
+would read as the opposite of what it says.
