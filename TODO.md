@@ -69,10 +69,6 @@ below. What's left:
   is wrong. Worth one manual pass on a real box: enable everything, apply, and
   run `nginx -t`.
 
-* The README still describes the pre-existing feature set. AGENTS.md says not
-  to touch README.md unless explicitly asked, so it was left alone — but it now
-  omits four detectors, the reputation feeds, robots.txt generation, rate
-  limiting, path exemptions and the 403/444 setting.
 * `ua_matches_blocked_bot_patterns` in `tui/dynamic_protection.rs` does
   case-insensitive *substring* matching over `|`-split alternatives, while
   NGINX enforces a real `~*` regex. The `BLOCKLIST` tag can therefore disagree
