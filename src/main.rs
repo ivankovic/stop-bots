@@ -1202,19 +1202,7 @@ fn block_scanners(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let source = match ssh_log.as_deref() {
-        Some(path) => sshlog::read_log_file(path),
-        None => sshlog::find_default_source(),
-    };
-    let log_text = match source {
-        sshlog::LogSource::Found(text) => text,
-        sshlog::LogSource::Unavailable => {
-            anyhow::bail!(
-                "couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — \
-                 pass --ssh-log, or run as root, for this to work"
-            );
-        }
-    };
+    let log_text = read_ssh_log(ssh_log.as_deref())?;
 
     let outcome =
         stop_bots::scanblock::block_ssh_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
@@ -1241,19 +1229,7 @@ fn block_web_scanners(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let source = match access_log.as_deref() {
-        Some(path) => accesslog::read_log_file(path),
-        None => accesslog::find_default_source(),
-    };
-    let log_text = match source {
-        accesslog::LogSource::Found(text) => text,
-        accesslog::LogSource::Unavailable => {
-            anyhow::bail!(
-                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
-                 --access-log, or run as root, for this to work"
-            );
-        }
-    };
+    let log_text = read_access_log(access_log.as_deref())?;
 
     let outcome =
         stop_bots::scanblock::block_web_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
@@ -1291,19 +1267,7 @@ fn block_spoofed_crawlers(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let source = match access_log.as_deref() {
-        Some(path) => accesslog::read_log_file(path),
-        None => accesslog::find_default_source(),
-    };
-    let log_text = match source {
-        accesslog::LogSource::Found(text) => text,
-        accesslog::LogSource::Unavailable => {
-            anyhow::bail!(
-                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
-                 --access-log, or run as root, for this to work"
-            );
-        }
-    };
+    let log_text = read_access_log(access_log.as_deref())?;
 
     let outcome = stop_bots::scanblock::block_spoofed_crawlers(&db, ttl_days, &log_text, dry_run)?;
 
@@ -1333,19 +1297,7 @@ fn block_probe_paths(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let source = match access_log.as_deref() {
-        Some(path) => accesslog::read_log_file(path),
-        None => accesslog::find_default_source(),
-    };
-    let log_text = match source {
-        accesslog::LogSource::Found(text) => text,
-        accesslog::LogSource::Unavailable => {
-            anyhow::bail!(
-                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
-                 --access-log, or run as root, for this to work"
-            );
-        }
-    };
+    let log_text = read_access_log(access_log.as_deref())?;
 
     let outcome = stop_bots::scanblock::block_probe_paths(&db, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
@@ -1405,19 +1357,7 @@ fn block_honeypot(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let source = match access_log.as_deref() {
-        Some(path) => accesslog::read_log_file(path),
-        None => accesslog::find_default_source(),
-    };
-    let log_text = match source {
-        accesslog::LogSource::Found(text) => text,
-        accesslog::LogSource::Unavailable => {
-            anyhow::bail!(
-                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
-                 --access-log, or run as root, for this to work"
-            );
-        }
-    };
+    let log_text = read_access_log(access_log.as_deref())?;
 
     let outcome = stop_bots::scanblock::block_honeypot(&db, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
@@ -1448,6 +1388,46 @@ fn set_honeypot_path(db_path: Option<PathBuf>, path: String) -> Result<()> {
          Disallow line for it yourself."
     );
     Ok(())
+}
+
+/// Reads the NGINX access log for a detector subcommand: `--access-log` if
+/// given, the conventional path otherwise.
+///
+/// Every access-log detector needs exactly this, including the same failure
+/// message — the two likely causes are a non-standard path and not being
+/// root, and naming both is what turns "couldn't read the log" from a dead
+/// end into something actionable. Shared so a sixth detector can't quietly
+/// ship a seventh wording of it.
+fn read_access_log(access_log: Option<&Path>) -> Result<String> {
+    let source = match access_log {
+        Some(path) => accesslog::read_log_file(path),
+        None => accesslog::find_default_source(),
+    };
+    match source {
+        accesslog::LogSource::Found(text) => Ok(text),
+        accesslog::LogSource::Unavailable => anyhow::bail!(
+            "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
+             --access-log, or run as root, for this to work"
+        ),
+    }
+}
+
+/// The SSH-log counterpart of [`read_access_log`]. Separate rather than
+/// generic over the two `LogSource` types: they are distinct enums with
+/// distinct fallback chains, and the error text has to name the right
+/// paths and the right flag to be worth printing at all.
+fn read_ssh_log(ssh_log: Option<&Path>) -> Result<String> {
+    let source = match ssh_log {
+        Some(path) => sshlog::read_log_file(path),
+        None => sshlog::find_default_source(),
+    };
+    match source {
+        sshlog::LogSource::Found(text) => Ok(text),
+        sshlog::LogSource::Unavailable => anyhow::bail!(
+            "couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — \
+             pass --ssh-log, or run as root, for this to work"
+        ),
+    }
 }
 
 /// Prints the per-IP and summary lines shared by [`block_scanners`] and
@@ -1500,19 +1480,7 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
     let log_path = access_log
         .clone()
         .unwrap_or_else(|| PathBuf::from(accesslog::DEFAULT_LOG_PATH));
-    let source = match access_log.as_deref() {
-        Some(path) => accesslog::read_log_file(path),
-        None => accesslog::find_default_source(),
-    };
-    let log_text = match source {
-        accesslog::LogSource::Found(text) => text,
-        accesslog::LogSource::Unavailable => {
-            anyhow::bail!(
-                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
-                 --access-log, or run as root, for this to work"
-            );
-        }
-    };
+    let log_text = read_access_log(access_log.as_deref())?;
 
     let outcome =
         stop_bots::accessstats::record_access_stats(&db, &log_path.to_string_lossy(), &log_text)?;

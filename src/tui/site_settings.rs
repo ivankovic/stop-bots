@@ -475,75 +475,12 @@ impl SiteSettings {
             });
         }
 
-        if let Some(popup) = &mut self.popup {
-            match key.code {
-                KeyCode::Esc => {
-                    self.popup = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    popup.selected = popup.selected.saturating_sub(1);
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    popup.selected = (popup.selected + 1).min(popup.options.len() - 1);
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    let popup = self.popup.take().expect("checked above");
-                    if popup.selected != 1 {
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    let (result_message, wrote_nginx_config) = match popup.action {
-                        PopupAction::Scan => (self.scan(db), false),
-                        PopupAction::Apply(index) => self.apply_site(db, index),
-                        PopupAction::ApplyAll => self.apply_all(db),
-                    };
-                    *message = Some(result_message);
-                    // Neither of these necessarily writes to the db
-                    // (applying only touches nginx files), but `Mutated` is
-                    // also how every screen's state gets refreshed —
-                    // needed here so the status tags reflect the files we
-                    // just wrote. An apply that actually changed a file
-                    // asks `App` to reload NGINX on top of that (see
-                    // `KeyOutcome::ReloadNginx`'s doc comment for why that
-                    // happens there and not inline here).
-                    return Ok(if wrote_nginx_config {
-                        KeyOutcome::ReloadNginx
-                    } else {
-                        KeyOutcome::Mutated
-                    });
-                }
-                _ => return Ok(KeyOutcome::Consumed),
-            }
+        if self.popup.is_some() {
+            return self.handle_confirm_popup_key(key, db, message);
         }
 
-        if let Some(popup) = &mut self.setting_popup {
-            let option_count = setting_options(popup.setting).1.len();
-            match key.code {
-                KeyCode::Esc => {
-                    self.setting_popup = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    popup.selected = popup.selected.saturating_sub(1);
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    popup.selected = (popup.selected + 1).min(option_count - 1);
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    let popup = self.setting_popup.take().expect("checked above");
-                    self.commit_setting(db, &popup, message)?;
-                    // `Mutated`, never `ReloadNginx`: this only changes what
-                    // *would* be written. Nothing on disk moves until the
-                    // admin applies, which is exactly why every site's tag
-                    // flipping to STALE right now is the useful feedback.
-                    return Ok(KeyOutcome::Mutated);
-                }
-                _ => return Ok(KeyOutcome::Consumed),
-            }
+        if self.setting_popup.is_some() {
+            return self.handle_setting_popup_key(key, db, message);
         }
 
         // Tab moves focus between this screen's two lists rather than
@@ -562,27 +499,130 @@ impl SiteSettings {
             return Ok(KeyOutcome::Consumed);
         }
 
-        if self.focus == Focus::Settings {
-            return Ok(match key.code {
-                KeyCode::Esc => KeyOutcome::Back,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.settings_state.select_previous();
-                    KeyOutcome::Consumed
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if self.settings_state.selected().unwrap_or(0) + 1 < NginxSetting::ALL.len() {
-                        self.settings_state.select_next();
-                    }
-                    KeyOutcome::Consumed
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    self.open_setting_popup();
-                    KeyOutcome::Consumed
-                }
-                _ => KeyOutcome::Ignored,
-            });
+        match self.focus {
+            Focus::Settings => self.handle_settings_panel_key(key),
+            Focus::Sites => self.handle_site_list_key(key, db),
         }
+    }
 
+    /// The Cancel/confirm popup shared by scan, apply-one and apply-all.
+    /// Option 1 is always the affirmative one; anything else cancels.
+    fn handle_confirm_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(popup) = &mut self.popup else {
+            unreachable!("dispatched on this popup")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                popup.selected = popup.selected.saturating_sub(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                popup.selected = (popup.selected + 1).min(popup.options.len() - 1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let popup = self.popup.take().expect("checked above");
+                if popup.selected != 1 {
+                    return Ok(KeyOutcome::Consumed);
+                }
+                let (result_message, wrote_nginx_config) = match popup.action {
+                    PopupAction::Scan => (self.scan(db), false),
+                    PopupAction::Apply(index) => self.apply_site(db, index),
+                    PopupAction::ApplyAll => self.apply_all(db),
+                };
+                *message = Some(result_message);
+                // Neither of these necessarily writes to the db
+                // (applying only touches nginx files), but `Mutated` is
+                // also how every screen's state gets refreshed —
+                // needed here so the status tags reflect the files we
+                // just wrote. An apply that actually changed a file
+                // asks `App` to reload NGINX on top of that (see
+                // `KeyOutcome::ReloadNginx`'s doc comment for why that
+                // happens there and not inline here).
+                Ok(if wrote_nginx_config {
+                    KeyOutcome::ReloadNginx
+                } else {
+                    KeyOutcome::Mutated
+                })
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// The host-wide NGINX-setting popup. Its option count comes from
+    /// `setting_options` rather than a literal, so the down-clamp stays
+    /// right when a setting with a different number of choices is added.
+    fn handle_setting_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(popup) = &mut self.setting_popup else {
+            unreachable!("dispatched on this popup")
+        };
+        let option_count = setting_options(popup.setting).1.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.setting_popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                popup.selected = popup.selected.saturating_sub(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                popup.selected = (popup.selected + 1).min(option_count - 1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let popup = self.setting_popup.take().expect("checked above");
+                self.commit_setting(db, &popup, message)?;
+                // `Mutated`, never `ReloadNginx`: this only changes what
+                // *would* be written. Nothing on disk moves until the
+                // admin applies, which is exactly why every site's tag
+                // flipping to STALE right now is the useful feedback.
+                Ok(KeyOutcome::Mutated)
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// Keys for the NGINX settings panel, when it has focus.
+    fn handle_settings_panel_key(&mut self, key: KeyEvent) -> Result<KeyOutcome> {
+        Ok(match key.code {
+            KeyCode::Esc => KeyOutcome::Back,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_state.select_previous();
+                KeyOutcome::Consumed
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.settings_state.selected().unwrap_or(0) + 1 < NginxSetting::ALL.len() {
+                    self.settings_state.select_next();
+                }
+                KeyOutcome::Consumed
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                self.open_setting_popup();
+                KeyOutcome::Consumed
+            }
+            _ => KeyOutcome::Ignored,
+        })
+    }
+
+    /// Keys for the site list, the screen's default focus. Every binding
+    /// that existed before the settings panel was added lives here, which
+    /// is why `Focus` defaults to `Sites`: none of them changed.
+    fn handle_site_list_key(&mut self, key: KeyEvent, db: &Db) -> Result<KeyOutcome> {
         match key.code {
             KeyCode::Esc => Ok(KeyOutcome::Back),
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1692,5 +1732,101 @@ mod tests {
         assert!(content.contains("NGINX settings"));
         assert!(content.contains("Block response"));
         assert!(content.contains("444"));
+    }
+
+    // ---- popup key coverage ----
+    //
+    // These characterise the *existing* key handling rather than testing new
+    // behaviour. Both popups on this screen accept Space as a synonym for
+    // Enter and Up as navigation, and neither had a test for either — so a
+    // refactor of `handle_key` could have silently dropped one and stayed
+    // green. Written before that refactor, deliberately.
+
+    #[test]
+    fn up_navigates_within_the_scan_popup() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = test_screen();
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('r')), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        assert_eq!(screen.popup.as_ref().unwrap().selected, 1);
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Up), &db, &mut message)
+            .unwrap();
+        assert_eq!(screen.popup.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn space_confirms_the_scan_popup_like_enter() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = test_screen();
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('r')), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char(' ')), &db, &mut message)
+            .unwrap();
+
+        assert!(
+            screen.popup.is_none(),
+            "Space should confirm, not be ignored"
+        );
+        assert!(message.unwrap().contains("site(s)"));
+    }
+
+    #[test]
+    fn up_navigates_within_the_nginx_setting_popup() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_block_response(BlockResponse::Close).unwrap();
+        let mut screen = test_screen();
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert_eq!(screen.setting_popup.as_ref().unwrap().selected, 1);
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Up), &db, &mut message)
+            .unwrap();
+        assert_eq!(screen.setting_popup.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn space_confirms_the_nginx_setting_popup_like_enter() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = test_screen();
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char(' ')), &db, &mut message)
+            .unwrap();
+        assert!(screen.setting_popup.is_some(), "Space should open it");
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char(' ')), &db, &mut message)
+            .unwrap();
+
+        assert!(screen.setting_popup.is_none());
+        assert_eq!(db.get_block_response().unwrap(), BlockResponse::Close);
     }
 }

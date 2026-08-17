@@ -441,65 +441,18 @@ impl SiteDetail {
         // Text entry owns every printable key, so it has to be handled
         // before the option-list branch below — otherwise typing "j" in a
         // path would move the (nonexistent) selection instead.
-        if let Some(Popup {
-            target: PopupTarget::AddExemption { input, error },
-            ..
-        }) = &mut self.popup
-        {
-            match key.code {
-                KeyCode::Esc => {
-                    self.popup = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Backspace => {
-                    input.pop();
-                    *error = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Char(c) => {
-                    input.push(c);
-                    *error = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Enter => {
-                    let value = input.trim().to_string();
-                    if let Err(err) = validate_exempt_path(&value) {
-                        *error = Some(err);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    self.popup = None;
-                    db.add_site_path_exemption(self.site.id, &value)?;
-                    *message = Some(format!(
-                        "{value} exempted on {} — apply (a/A) to write it",
-                        self.site.server_name
-                    ));
-                    return Ok(KeyOutcome::Mutated);
-                }
-                _ => return Ok(KeyOutcome::Consumed),
-            }
+        if matches!(
+            self.popup,
+            Some(Popup {
+                target: PopupTarget::AddExemption { .. },
+                ..
+            })
+        ) {
+            return self.handle_add_exemption_key(key, db, message);
         }
 
-        if let Some(popup) = &mut self.popup {
-            match key.code {
-                KeyCode::Esc => {
-                    self.popup = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    popup.selected = popup.selected.saturating_sub(1);
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    popup.selected = (popup.selected + 1).min(popup.options.len() - 1);
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    let popup = self.popup.take().expect("checked above");
-                    *message = Some(self.apply_popup(db, popup)?);
-                    return Ok(KeyOutcome::Mutated);
-                }
-                _ => return Ok(KeyOutcome::Consumed),
-            }
+        if self.popup.is_some() {
+            return self.handle_option_popup_key(key, db, message);
         }
 
         match self.focus {
@@ -560,6 +513,90 @@ impl SiteDetail {
             },
         }
         Ok(KeyOutcome::Consumed)
+    }
+
+    /// The add-exempt-path text field.
+    ///
+    /// Matched before the option-list popup below and before any focus
+    /// handling: it owns every printable key, so a `j` typed into a path
+    /// must reach the field rather than move a selection. There is a
+    /// regression test for exactly that.
+    fn handle_add_exemption_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup {
+            target: PopupTarget::AddExemption { input, error },
+            ..
+        }) = &mut self.popup
+        else {
+            unreachable!("dispatched on this popup")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter => {
+                let value = input.trim().to_string();
+                if let Err(err) = validate_exempt_path(&value) {
+                    *error = Some(err);
+                    return Ok(KeyOutcome::Consumed);
+                }
+                self.popup = None;
+                db.add_site_path_exemption(self.site.id, &value)?;
+                *message = Some(format!(
+                    "{value} exempted on {} — apply (a/A) to write it",
+                    self.site.server_name
+                ));
+                Ok(KeyOutcome::Mutated)
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// The category and per-bot override popups: pick one of three.
+    fn handle_option_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(popup) = &mut self.popup else {
+            unreachable!("dispatched on this popup")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                popup.selected = popup.selected.saturating_sub(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                popup.selected = (popup.selected + 1).min(popup.options.len() - 1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let popup = self.popup.take().expect("checked above");
+                *message = Some(self.apply_popup(db, popup)?);
+                Ok(KeyOutcome::Mutated)
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
     }
 
     /// Enter on the exemptions list: row 0 opens the add-path popup, any
@@ -1144,5 +1181,29 @@ mod tests {
         assert!(content.contains("Path exemptions"));
         assert!(content.contains("/blog"));
         assert!(content.contains("Add an exempt path"));
+    }
+
+    /// Characterises existing behaviour before `handle_key` is split: the
+    /// category and bot popups accept Space as a synonym for Enter, and
+    /// nothing tested that.
+    #[test]
+    fn space_confirms_a_category_popup_like_enter() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+
+        press(&mut detail, &db, KeyCode::Char(' '));
+        assert!(detail.popup.is_some(), "Space should open the popup");
+        press(&mut detail, &db, KeyCode::Down);
+        press(&mut detail, &db, KeyCode::Down);
+        press(&mut detail, &db, KeyCode::Char(' '));
+
+        assert!(detail.popup.is_none());
+        assert_eq!(
+            db.get_site_category_override(site_id, CATEGORIES[0])
+                .unwrap(),
+            Some(Policy::Blocked)
+        );
     }
 }

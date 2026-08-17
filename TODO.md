@@ -46,6 +46,32 @@ below. What's left:
   The honest answer for these is "not without a new architecture", not
   "another option on the list".
 
+### Structural debt, measured
+
+Both of these are real and neither is urgent. Recording the size so the
+decision to do them is made on evidence rather than on how the code felt that
+day.
+
+* **Adding a detector touches seven files.** Counting references to the
+  spoofed-crawler detector alone: `protection.rs` 29, `dashboard.rs` 21,
+  `scanblock.rs` 18, `cron.rs` 8, `main.rs` 6, `app.rs` 5. Each is a parallel
+  switch — a settings-key pair, a `ProtectionSettings` field, a `Default` arm,
+  a `load` arm, a `CronJob` variant with three match arms, a `ProtectionRow`
+  variant with four match arms, and a CLI subcommand. Nothing is *wrong*, and
+  the compiler catches a missed match arm, but it does mean the fifth detector
+  costs about what the fourth did. A table-driven `Detector` descriptor
+  (id, label, settings keys, default TTL, the detect fn) would collapse most of
+  it. Worth doing before adding a fifth, not before then.
+* **`db.rs` is ~2500 lines of code across fourteen concerns**, already marked
+  out by `// ---- section ----` comments: sources, bots, settings, per-site
+  overrides, firewall rules, crawler ranges, country ranges, reputation feeds,
+  cron state, user-agent stats, and more. Those comment banners are precisely
+  where a `db/` module split would fall, one file per banner. The reason not to
+  do it yet is that `Db` is one struct with one connection, so a split means
+  either `impl Db` blocks spread across files (legal, and arguably clearer) or
+  a genuine decomposition into per-concern types. The first is a mechanical
+  hour; the second is a design exercise.
+
 ### Loose ends from the work that shipped
 
 * **None of the newly generated NGINX syntax has been checked against a real

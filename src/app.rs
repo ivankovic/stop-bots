@@ -543,67 +543,49 @@ impl App {
                 }
             }
             CronJob::BlockSpoofedCrawlers => {
-                // The toggle is checked here, not in `start_cron_log_job`,
-                // for one reason: the job still has to record a last-run
-                // summary so the Dashboard's "Scheduled tasks" panel says
-                // *why* nothing happened instead of showing a job that
-                // looks permanently overdue. The log read it skips is the
-                // cheap part; the pass over it is what's actually avoided.
                 let settings = crate::protection::ProtectionSettings::load(&self.db)?;
-                if !settings.spoofed_crawlers_enabled {
-                    "disabled".to_string()
-                } else {
-                    match log_text {
-                        Some(text) => match crate::scanblock::block_spoofed_crawlers(
-                            &self.db,
+                self.run_toggled_detector(
+                    settings.spoofed_crawlers_enabled,
+                    log_text.as_deref(),
+                    |db, text| {
+                        crate::scanblock::block_spoofed_crawlers(
+                            db,
                             settings.spoofed_crawlers_ttl_days,
-                            &text,
+                            text,
                             false,
-                        ) {
-                            Ok(outcome) => outcome.summary(),
-                            Err(err) => format!("error: {err}"),
-                        },
-                        None => "NGINX access log unavailable".to_string(),
-                    }
-                }
+                        )
+                    },
+                )
             }
             CronJob::BlockProbePaths => {
                 let settings = crate::protection::ProtectionSettings::load(&self.db)?;
-                if !settings.probe_paths_enabled {
-                    "disabled".to_string()
-                } else {
-                    match log_text {
-                        Some(text) => match crate::scanblock::block_probe_paths(
-                            &self.db,
+                self.run_toggled_detector(
+                    settings.probe_paths_enabled,
+                    log_text.as_deref(),
+                    |db, text| {
+                        crate::scanblock::block_probe_paths(
+                            db,
                             settings.probe_paths_ttl_days,
-                            &text,
+                            text,
                             false,
-                        ) {
-                            Ok(outcome) => outcome.summary(),
-                            Err(err) => format!("error: {err}"),
-                        },
-                        None => "NGINX access log unavailable".to_string(),
-                    }
-                }
+                        )
+                    },
+                )
             }
             CronJob::BlockHoneypot => {
                 let settings = crate::protection::ProtectionSettings::load(&self.db)?;
-                if !settings.honeypot_enabled {
-                    "disabled".to_string()
-                } else {
-                    match log_text {
-                        Some(text) => match crate::scanblock::block_honeypot(
-                            &self.db,
+                self.run_toggled_detector(
+                    settings.honeypot_enabled,
+                    log_text.as_deref(),
+                    |db, text| {
+                        crate::scanblock::block_honeypot(
+                            db,
                             settings.honeypot_ttl_days,
-                            &text,
+                            text,
                             false,
-                        ) {
-                            Ok(outcome) => outcome.summary(),
-                            Err(err) => format!("error: {err}"),
-                        },
-                        None => "NGINX access log unavailable".to_string(),
-                    }
-                }
+                        )
+                    },
+                )
             }
             CronJob::RecordAccessStats => match log_text {
                 Some(text) => match crate::accessstats::record_access_stats(
@@ -629,6 +611,37 @@ impl App {
         self.db.set_cron_last_run(job.id(), now_secs(), &summary)?;
         self.refresh()?;
         Ok(())
+    }
+
+    /// Runs one switchable access-log detector and turns the result into the
+    /// one-line summary the Dashboard's "Scheduled tasks" panel shows.
+    ///
+    /// The three detectors that go through here differ only in which toggle
+    /// gates them, which TTL they use and which function they call; before
+    /// this existed, each restated the same enabled/log-missing/error/summary
+    /// ladder, and the fourth one added would have restated it again.
+    ///
+    /// **A disabled detector still records a summary.** Skipping the write
+    /// entirely would leave the job looking permanently overdue in the panel
+    /// rather than saying why nothing happened. What is actually skipped is
+    /// the pass over the log, which is the expensive part; the read already
+    /// happened off-thread.
+    fn run_toggled_detector(
+        &self,
+        enabled: bool,
+        log_text: Option<&str>,
+        detect: impl FnOnce(&Db, &str) -> Result<crate::scanblock::ScanBlockOutcome>,
+    ) -> String {
+        if !enabled {
+            return "disabled".to_string();
+        }
+        let Some(text) = log_text else {
+            return "NGINX access log unavailable".to_string();
+        };
+        match detect(&self.db, text) {
+            Ok(outcome) => outcome.summary(),
+            Err(err) => format!("error: {err}"),
+        }
     }
 
     /// The actual work behind the `RenderFirewall` job: writes the current

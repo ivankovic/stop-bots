@@ -332,8 +332,30 @@ impl Dashboard {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(middle_area);
 
-        let reversed = Style::new().reversed();
+        self.render_categories(frame, settings_area, theme);
+        self.render_geo(frame, geo_area, theme);
+        self.render_protection(frame, protection_area, theme);
+        self.render_summary(frame, stats_area);
+        self.render_cron(frame, cron_area, running_jobs);
+        self.render_message(frame, message_area, message);
 
+        if let Some(popup) = self.popup.clone() {
+            self.render_popup(frame, area, popup);
+        }
+    }
+
+    /// Highlighting only ever applies to the list that currently has focus,
+    /// so three reversed rows can never be on screen at once — which is what
+    /// makes a single linear Up/Down flow across three panels readable.
+    fn highlight_for(&self, focus: Focus) -> Style {
+        if self.focus == focus {
+            Style::new().reversed()
+        } else {
+            Style::default()
+        }
+    }
+
+    fn render_categories(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         let items: Vec<ListItem> = CATEGORIES
             .iter()
             .map(|&category| ListItem::new(self.row_line(category)))
@@ -344,14 +366,12 @@ impl Dashboard {
                     .title("System-wide settings")
                     .fg(theme.accent()),
             )
-            .highlight_style(if self.focus == Focus::Categories {
-                reversed
-            } else {
-                Style::default()
-            });
-        frame.render_stateful_widget(list, settings_area, &mut self.list_state);
+            .highlight_style(self.highlight_for(Focus::Categories));
+        frame.render_stateful_widget(list, area, &mut self.list_state);
+    }
 
-        let country_items: Vec<ListItem> =
+    fn render_geo(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let items: Vec<ListItem> =
             std::iter::once(ListItem::new(Line::from("+ Add a country").italic()))
                 .chain(
                     self.selected_countries
@@ -363,43 +383,38 @@ impl Dashboard {
             GeoMode::Blocklist => "Blocklist",
             GeoMode::Allowlist => "Allowlist",
         };
-        let country_list = List::new(country_items)
+        let list = List::new(items)
             .block(
                 Block::bordered()
-                    // Shorter than it was, because this panel is half-width
-                    // now and a title longer than its border is silently
-                    // truncated. The *mode* is the one part that must never
-                    // be what gets cut — Allowlist turns the host into
-                    // default-deny — so it comes first; the add/remove hint
-                    // moved to the Help screen (`?`).
+                    // Short, because this panel is half-width and a title
+                    // longer than its border is silently truncated. The
+                    // *mode* is the one part that must never be what gets
+                    // cut — Allowlist turns the host into default-deny — so
+                    // it comes first; the add/remove hint moved to Help.
                     .title(format!("Geo-blocking ({mode_label}) — m for mode"))
                     .fg(theme.accent()),
             )
-            .highlight_style(if self.focus == Focus::Countries {
-                reversed
-            } else {
-                Style::default()
-            });
-        frame.render_stateful_widget(country_list, geo_area, &mut self.countries_state);
+            .highlight_style(self.highlight_for(Focus::Countries));
+        frame.render_stateful_widget(list, area, &mut self.countries_state);
+    }
 
-        let protection_items: Vec<ListItem> = self
+    fn render_protection(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let items: Vec<ListItem> = self
             .protection_rows()
             .into_iter()
             .map(|row| ListItem::new(self.protection_row_line(row)))
             .collect();
-        let protection_list = List::new(protection_items)
+        let list = List::new(items)
             .block(
                 Block::bordered()
                     .title("Automatic blocking — Enter")
                     .fg(theme.accent()),
             )
-            .highlight_style(if self.focus == Focus::Protection {
-                reversed
-            } else {
-                Style::default()
-            });
-        frame.render_stateful_widget(protection_list, protection_area, &mut self.protection_state);
+            .highlight_style(self.highlight_for(Focus::Protection));
+        frame.render_stateful_widget(list, area, &mut self.protection_state);
+    }
 
+    fn render_summary(&self, frame: &mut Frame, area: Rect) {
         let summary = Paragraph::new(vec![
             Line::from(format!("Sites discovered: {}", self.site_count)),
             Line::from(format!(
@@ -414,26 +429,33 @@ impl Dashboard {
             }),
         ])
         .block(Block::bordered().title("Summary"));
-        frame.render_widget(summary, stats_area);
+        frame.render_widget(summary, area);
+    }
 
-        let cron_lines: Vec<Line> = self
+    fn render_cron(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        running_jobs: &std::collections::HashSet<crate::cron::CronJob>,
+    ) {
+        let lines: Vec<Line> = self
             .cron_status
             .iter()
             .map(|status| cron_status_line(status, running_jobs.contains(&status.job)))
             .collect();
-        let cron_panel = Paragraph::new(cron_lines).block(
+        let panel = Paragraph::new(lines).block(
             Block::bordered()
                 .title("Scheduled tasks (internal cron — runs only while this TUI is open)"),
         );
-        frame.render_widget(cron_panel, cron_area);
+        frame.render_widget(panel, area);
+    }
 
-        let message_text = message.as_deref().unwrap_or("No recent actions.");
-        let messages = Paragraph::new(message_text).block(Block::bordered().title("Messages"));
-        frame.render_widget(messages, message_area);
-
-        if let Some(popup) = self.popup.clone() {
-            self.render_popup(frame, area, popup);
-        }
+    fn render_message(&self, frame: &mut Frame, area: Rect, message: &Option<String>) {
+        let text = message.as_deref().unwrap_or("No recent actions.");
+        frame.render_widget(
+            Paragraph::new(text).block(Block::bordered().title("Messages")),
+            area,
+        );
     }
 
     fn row_line(&self, category: Category) -> Line<'static> {
@@ -540,61 +562,34 @@ impl Dashboard {
 
     fn render_popup(&self, frame: &mut Frame, area: Rect, popup: Popup) {
         match popup {
-            Popup::Protection { row, selected } => {
-                let title = self.protection_label(row);
-                let title = title.as_str();
-                let options = protection_options(row.is_detector());
-                let content_width = options
-                    .iter()
-                    .map(|o| o.len())
-                    .max()
-                    .unwrap_or(0)
-                    .max(title.len());
-                let popup_area =
-                    centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
-                let items: Vec<ListItem> = options
-                    .iter()
-                    .enumerate()
-                    .map(|(i, label)| {
-                        let line = if i == selected {
-                            Line::from(label.clone()).reversed()
-                        } else {
-                            Line::from(label.clone())
-                        };
-                        ListItem::new(line)
-                    })
-                    .collect();
-                let list = List::new(items).block(Block::bordered().title(title));
-                frame.render_widget(Clear, popup_area);
-                frame.render_widget(list, popup_area);
-            }
-            Popup::Category { category, selected } => {
-                let title = format!("{} default", category_label(category));
-                let options = ["Allowed", "Blocked"];
-                let content_width = options
-                    .iter()
-                    .map(|o| o.len())
-                    .max()
-                    .unwrap_or(0)
-                    .max(title.len());
-                let popup_area =
-                    centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
-                let items: Vec<ListItem> = options
-                    .iter()
-                    .enumerate()
-                    .map(|(i, label)| {
-                        let line = if i == selected {
-                            Line::from(*label).reversed()
-                        } else {
-                            Line::from(*label)
-                        };
-                        ListItem::new(line)
-                    })
-                    .collect();
-                let list = List::new(items).block(Block::bordered().title(title));
-                frame.render_widget(Clear, popup_area);
-                frame.render_widget(list, popup_area);
-            }
+            // Three of the five popups are the same widget with different
+            // strings: a centred list, one row per option, the selected row
+            // reversed. Only the two that are *not* option lists — a text
+            // field, and a multi-field form — get their own arm.
+            Popup::Protection { row, selected } => render_option_list(
+                frame,
+                area,
+                &self.protection_label(row),
+                &protection_options(row.is_detector()),
+                selected,
+            ),
+            Popup::Category { category, selected } => render_option_list(
+                frame,
+                area,
+                &format!("{} default", category_label(category)),
+                &["Allowed".to_string(), "Blocked".to_string()],
+                selected,
+            ),
+            Popup::GeoMode { selected } => render_option_list(
+                frame,
+                area,
+                "Geo mode",
+                &[
+                    "Blocklist (block selected countries)".to_string(),
+                    "Allowlist (block everything except selected)".to_string(),
+                ],
+                selected,
+            ),
             Popup::AddCountry { input, error } => {
                 let title = "Add a country (2-letter code)";
                 let width = 40u16;
@@ -608,31 +603,6 @@ impl Dashboard {
                 let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(paragraph, popup_area);
-            }
-            Popup::GeoMode { selected } => {
-                let title = "Geo mode";
-                let options = [
-                    "Blocklist (block selected countries)",
-                    "Allowlist (block everything except selected)",
-                ];
-                let content_width = options.iter().map(|o| o.len()).max().unwrap_or(0);
-                let popup_area =
-                    centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
-                let items: Vec<ListItem> = options
-                    .iter()
-                    .enumerate()
-                    .map(|(i, label)| {
-                        let line = if i == selected {
-                            Line::from(*label).reversed()
-                        } else {
-                            Line::from(*label)
-                        };
-                        ListItem::new(line)
-                    })
-                    .collect();
-                let list = List::new(items).block(Block::bordered().title(title));
-                frame.render_widget(Clear, popup_area);
-                frame.render_widget(list, popup_area);
             }
             Popup::RenderFirewall {
                 backend_selected,
@@ -685,212 +655,20 @@ impl Dashboard {
         db: &Db,
         message: &mut Option<String>,
     ) -> Result<KeyOutcome> {
-        if let Some(popup) = &mut self.popup {
-            match popup {
-                Popup::Category { selected, .. } => match key.code {
-                    KeyCode::Esc => {
-                        self.popup = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *selected = selected.saturating_sub(1);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        *selected = (*selected + 1).min(1);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        let Some(Popup::Category { category, selected }) = self.popup.take() else {
-                            unreachable!("checked above")
-                        };
-                        let policy = match selected {
-                            0 => Policy::Allowed,
-                            _ => Policy::Blocked,
-                        };
-                        db.set_category_default(category, policy)?;
-                        *message = Some(format!(
-                            "{} default set to {policy:?}",
-                            category_label(category)
-                        ));
-                        return Ok(KeyOutcome::Mutated);
-                    }
-                    _ => return Ok(KeyOutcome::Consumed),
-                },
-                Popup::AddCountry { input, error } => match key.code {
-                    KeyCode::Esc => {
-                        self.popup = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Backspace => {
-                        input.pop();
-                        *error = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Char(c) if c.is_ascii_alphabetic() && input.len() < 2 => {
-                        input.push(c.to_ascii_lowercase());
-                        *error = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Enter => {
-                        let code = input.clone();
-                        match ipranges::validate_country_code(&code) {
-                            Err(_) => {
-                                *error = Some("Enter a 2-letter country code".to_string());
-                                return Ok(KeyOutcome::Consumed);
-                            }
-                            Ok(cc) => {
-                                self.popup = None;
-                                if self.selected_countries.iter().any(|b| b == &cc) {
-                                    *message =
-                                        Some(format!("{} is already selected", cc.to_uppercase()));
-                                    return Ok(KeyOutcome::Consumed);
-                                }
-                                if self.fetched_countries.iter().any(|(c, _, _)| c == &cc) {
-                                    db.set_country_selected(&cc, true)?;
-                                    let verb = match self.geo_mode {
-                                        GeoMode::Blocklist => "Blocked",
-                                        GeoMode::Allowlist => "Allowed",
-                                    };
-                                    *message = Some(format!("{verb} {}", cc.to_uppercase()));
-                                    return Ok(KeyOutcome::Mutated);
-                                }
-                                return Ok(KeyOutcome::SelectCountry(cc));
-                            }
-                        }
-                    }
-                    _ => return Ok(KeyOutcome::Consumed),
-                },
-                Popup::Protection { row, selected } => match key.code {
-                    KeyCode::Esc => {
-                        self.popup = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *selected = selected.saturating_sub(1);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        let last = protection_options(row.is_detector()).len() - 1;
-                        *selected = (*selected + 1).min(last);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        let (row, selected) = (*row, *selected);
-                        self.popup = None;
-                        return self.commit_protection(db, row, selected, message);
-                    }
-                    _ => return Ok(KeyOutcome::Consumed),
-                },
-                Popup::GeoMode { selected } => match key.code {
-                    KeyCode::Esc => {
-                        self.popup = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        *selected = selected.saturating_sub(1);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        *selected = (*selected + 1).min(1);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Enter | KeyCode::Char(' ') => {
-                        let Some(Popup::GeoMode { selected }) = self.popup.take() else {
-                            unreachable!("checked above")
-                        };
-                        let mode = match selected {
-                            0 => GeoMode::Blocklist,
-                            _ => GeoMode::Allowlist,
-                        };
-                        db.set_geo_mode(mode)?;
-                        *message = Some(match mode {
-                            GeoMode::Blocklist => {
-                                "Geo mode set to Blocklist: selected countries are blocked, everything else is allowed".to_string()
-                            }
-                            GeoMode::Allowlist => {
-                                "Geo mode set to Allowlist: selected countries are the ONLY ones allowed, everything else will be blocked host-wide once render-firewall runs".to_string()
-                            }
-                        });
-                        return Ok(KeyOutcome::Mutated);
-                    }
-                    _ => return Ok(KeyOutcome::Consumed),
-                },
-                Popup::RenderFirewall {
-                    backend_selected,
-                    out_path,
-                    apply_after_write,
-                    error,
-                } => match key.code {
-                    KeyCode::Esc => {
-                        self.popup = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    // Arrow keys only here, deliberately no `j`/`k` vim
-                    // aliases (unlike every other popup/list in this app):
-                    // this popup has a free-text output-path field, and
-                    // `j`/`k` are common path characters — aliasing them to
-                    // navigation would silently eat any literal 'j'/'k' the
-                    // admin tries to type instead of appending it (caught by
-                    // `pressing_f_then_enter_refreshes_the_dashboards_stale_indicator`
-                    // flaking whenever a temp-dir path happened to contain
-                    // one).
-                    KeyCode::Up => {
-                        *backend_selected = backend_selected.saturating_sub(1);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Down => {
-                        *backend_selected = (*backend_selected + 1).min(1);
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Char(' ') => {
-                        *apply_after_write = !*apply_after_write;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Char(c) if c.is_ascii_punctuation() || c.is_ascii_alphanumeric() => {
-                        out_path.push(c);
-                        *error = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Backspace => {
-                        out_path.pop();
-                        *error = None;
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    KeyCode::Enter => {
-                        let Some(Popup::RenderFirewall {
-                            backend_selected,
-                            out_path,
-                            apply_after_write,
-                            ..
-                        }) = self.popup.take()
-                        else {
-                            unreachable!("checked above")
-                        };
-                        let backend = match backend_selected {
-                            0 => crate::firewall::FirewallBackend::Nftables,
-                            _ => crate::firewall::FirewallBackend::Iptables,
-                        };
-                        // Validate the path is not empty
-                        if out_path.is_empty() {
-                            self.popup = Some(Popup::RenderFirewall {
-                                backend_selected,
-                                out_path,
-                                apply_after_write,
-                                error: Some("Enter an output path".to_string()),
-                            });
-                            return Ok(KeyOutcome::Consumed);
-                        }
-                        return Ok(KeyOutcome::RenderFirewall {
-                            backend,
-                            out_path,
-                            force: false,
-                            apply: apply_after_write,
-                        });
-                    }
-                    _ => return Ok(KeyOutcome::Consumed),
-                },
-            }
+        // One method per popup variant. They are genuinely different
+        // interactions — two of them are text fields that must swallow every
+        // printable key, the rest are option lists with different clamps —
+        // so this dispatches rather than trying to share a handler. What is
+        // shared is the shape: each returns early, and each owns its own
+        // commit.
+        if self.popup.is_some() {
+            return match self.popup.as_mut().expect("checked above") {
+                Popup::Category { .. } => self.handle_category_popup_key(key, db, message),
+                Popup::AddCountry { .. } => self.handle_add_country_popup_key(key, db, message),
+                Popup::Protection { .. } => self.handle_protection_popup_key(key, db, message),
+                Popup::GeoMode { .. } => self.handle_geo_mode_popup_key(key, db, message),
+                Popup::RenderFirewall { .. } => self.handle_render_firewall_popup_key(key),
+            };
         }
 
         if key.code == KeyCode::Char('m') {
@@ -1109,6 +887,272 @@ impl Dashboard {
         Ok(KeyOutcome::Mutated)
     }
 
+    /// One category default: Allowed (0) or Blocked (1).
+    fn handle_category_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup::Category { selected, .. }) = &mut self.popup else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1).min(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let Some(Popup::Category { category, selected }) = self.popup.take() else {
+                    unreachable!("checked above")
+                };
+                let policy = match selected {
+                    0 => Policy::Allowed,
+                    _ => Policy::Blocked,
+                };
+                db.set_category_default(category, policy)?;
+                *message = Some(format!(
+                    "{} default set to {policy:?}",
+                    category_label(category)
+                ));
+                Ok(KeyOutcome::Mutated)
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// The add-a-country text field. Owns every printable key, so it
+    /// must be matched before anything that reads a bare `Char` as a
+    /// command.
+    fn handle_add_country_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup::AddCountry { input, error }) = &mut self.popup else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Char(c) if c.is_ascii_alphabetic() && input.len() < 2 => {
+                input.push(c.to_ascii_lowercase());
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter => {
+                let code = input.clone();
+                match ipranges::validate_country_code(&code) {
+                    Err(_) => {
+                        *error = Some("Enter a 2-letter country code".to_string());
+                        Ok(KeyOutcome::Consumed)
+                    }
+                    Ok(cc) => {
+                        self.popup = None;
+                        if self.selected_countries.iter().any(|b| b == &cc) {
+                            *message = Some(format!("{} is already selected", cc.to_uppercase()));
+                            return Ok(KeyOutcome::Consumed);
+                        }
+                        if self.fetched_countries.iter().any(|(c, _, _)| c == &cc) {
+                            db.set_country_selected(&cc, true)?;
+                            let verb = match self.geo_mode {
+                                GeoMode::Blocklist => "Blocked",
+                                GeoMode::Allowlist => "Allowed",
+                            };
+                            *message = Some(format!("{verb} {}", cc.to_uppercase()));
+                            return Ok(KeyOutcome::Mutated);
+                        }
+                        Ok(KeyOutcome::SelectCountry(cc))
+                    }
+                }
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// One "Automatic blocking" row. Its option count varies by row kind
+    /// — a detector offers Off plus a TTL per choice, a feed only Off/On —
+    /// so the down-clamp is computed rather than a literal.
+    fn handle_protection_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup::Protection { row, selected }) = &mut self.popup else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let last = protection_options(row.is_detector()).len() - 1;
+                *selected = (*selected + 1).min(last);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let (row, selected) = (*row, *selected);
+                self.popup = None;
+                self.commit_protection(db, row, selected, message)
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// Blocklist (0) or Allowlist (1).
+    fn handle_geo_mode_popup_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup::GeoMode { selected }) = &mut self.popup else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *selected = selected.saturating_sub(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected = (*selected + 1).min(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let Some(Popup::GeoMode { selected }) = self.popup.take() else {
+                    unreachable!("checked above")
+                };
+                let mode = match selected {
+                    0 => GeoMode::Blocklist,
+                    _ => GeoMode::Allowlist,
+                };
+                db.set_geo_mode(mode)?;
+                *message = Some(match mode {
+                    GeoMode::Blocklist => {
+                        "Geo mode set to Blocklist: selected countries are blocked, everything else is allowed".to_string()
+                    }
+                    GeoMode::Allowlist => {
+                        "Geo mode set to Allowlist: selected countries are the ONLY ones allowed, everything else will be blocked host-wide once render-firewall runs".to_string()
+                    }
+                });
+                Ok(KeyOutcome::Mutated)
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// The firewall render form: a backend choice, an editable output
+    /// path, and an apply-after-write toggle. The only popup here whose
+    /// `Char` handling is text entry rather than navigation, which is why
+    /// `j`/`k` must reach the path field — there is a regression test for
+    /// exactly that.
+    fn handle_render_firewall_popup_key(&mut self, key: KeyEvent) -> Result<KeyOutcome> {
+        let Some(Popup::RenderFirewall {
+            backend_selected,
+            out_path,
+            apply_after_write,
+            error,
+        }) = &mut self.popup
+        else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            // Arrow keys only here, deliberately no `j`/`k` vim
+            // aliases (unlike every other popup/list in this app):
+            // this popup has a free-text output-path field, and
+            // `j`/`k` are common path characters — aliasing them to
+            // navigation would silently eat any literal 'j'/'k' the
+            // admin tries to type instead of appending it (caught by
+            // `pressing_f_then_enter_refreshes_the_dashboards_stale_indicator`
+            // flaking whenever a temp-dir path happened to contain
+            // one).
+            KeyCode::Up => {
+                *backend_selected = backend_selected.saturating_sub(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down => {
+                *backend_selected = (*backend_selected + 1).min(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Char(' ') => {
+                *apply_after_write = !*apply_after_write;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Char(c) if c.is_ascii_punctuation() || c.is_ascii_alphanumeric() => {
+                out_path.push(c);
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Backspace => {
+                out_path.pop();
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter => {
+                let Some(Popup::RenderFirewall {
+                    backend_selected,
+                    out_path,
+                    apply_after_write,
+                    ..
+                }) = self.popup.take()
+                else {
+                    unreachable!("checked above")
+                };
+                let backend = match backend_selected {
+                    0 => crate::firewall::FirewallBackend::Nftables,
+                    _ => crate::firewall::FirewallBackend::Iptables,
+                };
+                // Validate the path is not empty
+                if out_path.is_empty() {
+                    self.popup = Some(Popup::RenderFirewall {
+                        backend_selected,
+                        out_path,
+                        apply_after_write,
+                        error: Some("Enter an output path".to_string()),
+                    });
+                    return Ok(KeyOutcome::Consumed);
+                }
+                Ok(KeyOutcome::RenderFirewall {
+                    backend,
+                    out_path,
+                    force: false,
+                    apply: apply_after_write,
+                })
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
     fn open_category_popup(&mut self) {
         let Some(selected) = self.list_state.selected() else {
             return;
@@ -1152,6 +1196,41 @@ impl Dashboard {
         *message = Some(format!("Removed {}", country_code.to_uppercase()));
         Ok(KeyOutcome::Mutated)
     }
+}
+
+/// Renders a centred "pick one of these" popup: one row per option, the
+/// selected row reversed, sized to the widest of the options and the title.
+///
+/// Shared by every option-list popup on this screen. The two that are not
+/// option lists — the country text field and the firewall render form —
+/// deliberately keep their own rendering, since neither is a list and
+/// forcing them through here would mean parameters that only one caller
+/// ever uses.
+fn render_option_list(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    options: &[String],
+    selected: usize,
+) {
+    let content_width = options
+        .iter()
+        .map(|o| o.len())
+        .max()
+        .unwrap_or(0)
+        .max(title.len());
+    let popup_area = centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
+    let items: Vec<ListItem> = options
+        .iter()
+        .enumerate()
+        .map(|(i, label)| {
+            let line = Line::from(label.clone());
+            ListItem::new(if i == selected { line.reversed() } else { line })
+        })
+        .collect();
+    let list = List::new(items).block(Block::bordered().title(title.to_string()));
+    frame.render_widget(Clear, popup_area);
+    frame.render_widget(list, popup_area);
 }
 
 /// The "Automatic blocking" popup's options: "Off", then one "On" row per

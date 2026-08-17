@@ -8,6 +8,74 @@ use std::fs;
 use std::path::Path;
 use walkdir::WalkDir;
 
+// Every end-to-end test below drives the real binary against a throwaway
+// database and NGINX root. The helpers here wrap the incantations that made
+// up 20-40 lines of identical scaffolding in each of them.
+
+/// Runs `stop-bots` with `args`, asserting it succeeded, and returns the
+/// assertion so a caller can go on to check stdout.
+fn stop_bots(args: &[&str]) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(args)
+        .assert()
+        .success()
+}
+
+/// Seeds the bot list from the checked-in sample, so tests never touch the
+/// network.
+fn seed_bots(db: &Path) {
+    stop_bots(&[
+        "update-bot-lists",
+        "--db",
+        db.to_str().unwrap(),
+        "--source",
+        "tests/fixtures/botlists/well-known-bots-sample.json",
+    ]);
+}
+
+fn scan_sites(db: &Path, root: &Path) -> assert_cmd::assert::Assert {
+    stop_bots(&[
+        "scan-sites",
+        "--root",
+        root.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+    ])
+}
+
+/// `--no-reload` throughout: these run on whatever machine hosts the test
+/// suite, and an apply without it shells out to the real `nginx -t` and
+/// `systemctl reload nginx`.
+fn apply_blocks(db: &Path, root: &Path) -> assert_cmd::assert::Assert {
+    stop_bots(&[
+        "apply-blocks",
+        "--root",
+        root.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--no-reload",
+    ])
+}
+
+/// One `server` block with `server_name`, written to `root/<name>.conf`.
+fn write_site(root: &Path, name: &str) -> std::path::PathBuf {
+    let path = root.join(format!("{name}.conf"));
+    fs::write(
+        &path,
+        format!("server {{\n    listen 80;\n    server_name {name};\n}}\n"),
+    )
+    .unwrap();
+    path
+}
+
+/// One NGINX combined-format access-log line.
+fn access_line(ip: &str, path: &str, status: u16, ua: &str) -> String {
+    format!(
+        "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" {status} 0 \"-\" \"{ua}\"\n"
+    )
+}
+
 fn copy_dir_all(src: &Path, dst: &Path) {
     for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
         let rel = entry.path().strip_prefix(src).unwrap();
@@ -41,18 +109,7 @@ fn update_scan_and_apply_blocks_happy_path() {
         .success()
         .stdout(predicate::str::contains("Stored 4 bot(s)"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Discovered 2 site(s)"));
+    scan_sites(&db_path, &nginx_root).stdout(predicate::str::contains("Discovered 2 site(s)"));
 
     // `--no-reload`: this test's "nginx root" is a throwaway temp dir, not
     // the real system config, so there's nothing for a real `nginx -t` /
@@ -125,30 +182,9 @@ fn apply_blocks_scopes_a_site_override_to_its_own_file_even_with_a_shared_server
     )
     .unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Discovered 2 site(s)"));
+    scan_sites(&db_path, &nginx_root).stdout(predicate::str::contains("Discovered 2 site(s)"));
 
     // Override the Search category to Blocked, but only for the site row
     // whose config_path is file_a.
@@ -168,18 +204,7 @@ fn apply_blocks_scopes_a_site_override_to_its_own_file_even_with_a_shared_server
         .unwrap();
     }
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "apply-blocks",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-            "--no-reload",
-        ])
-        .assert()
-        .success();
+    apply_blocks(&db_path, &nginx_root);
 
     let a = fs::read_to_string(&file_a).unwrap();
     let b = fs::read_to_string(&file_b).unwrap();
@@ -204,49 +229,13 @@ fn set_block_response_changes_the_generated_status_code_on_the_next_apply() {
     fs::create_dir_all(&nginx_root).unwrap();
     let db_path = tmp.path().join("db.sqlite3");
 
-    let site = nginx_root.join("site.conf");
-    fs::write(
-        &site,
-        "server {\n    listen 80;\n    server_name a.example;\n}\n",
-    )
-    .unwrap();
+    let site = write_site(&nginx_root, "a.example");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
 
     let apply = |db_path: &Path, root: &Path| {
-        Command::cargo_bin("stop-bots")
-            .unwrap()
-            .args([
-                "apply-blocks",
-                "--root",
-                root.to_str().unwrap(),
-                "--db",
-                db_path.to_str().unwrap(),
-                "--no-reload",
-            ])
-            .assert()
-            .success();
+        apply_blocks(db_path, root);
     };
 
     apply(&db_path, &nginx_root);
@@ -282,9 +271,7 @@ fn block_spoofed_crawlers_is_inert_without_ranges_then_blocks_a_forged_googlebot
     let db_path = tmp.path().join("db.sqlite3");
     let access_log = tmp.path().join("access.log");
 
-    let line = |ip: &str, ua: &str| {
-        format!("{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 512 \"-\" \"{ua}\"\n")
-    };
+    let line = |ip: &str, ua: &str| access_line(ip, "/", 200, ua);
     fs::write(
         &access_log,
         line("203.0.113.9", "Mozilla/5.0 (compatible; Googlebot/2.1)")
@@ -349,9 +336,7 @@ fn block_probe_paths_blocks_a_dotenv_probe_but_not_a_wordpress_login() {
     let db_path = tmp.path().join("db.sqlite3");
     let access_log = tmp.path().join("access.log");
 
-    let line = |ip: &str, path: &str| {
-        format!("{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n")
-    };
+    let line = |ip: &str, path: &str| access_line(ip, path, 404, "curl/8");
     fs::write(
         &access_log,
         line("203.0.113.9", "/.env") + &line("198.51.100.2", "/wp-login.php"),
@@ -389,7 +374,7 @@ fn set_probe_paths_adds_extras_and_reports_unanchored_entries() {
     let access_log = tmp.path().join("access.log");
     fs::write(
         &access_log,
-        "203.0.113.9 - - [10/Jul/2026:12:00:00 +0000] \"GET /internal/dump HTTP/1.1\" 200 0 \"-\" \"curl/8\"\n",
+        access_line("203.0.113.9", "/internal/dump", 200, "curl/8"),
     )
     .unwrap();
 
@@ -440,7 +425,7 @@ fn honeypot_path_is_configurable_and_blocks_whatever_fetches_it() {
     let access_log = tmp.path().join("access.log");
     fs::write(
         &access_log,
-        "203.0.113.9 - - [10/Jul/2026:12:00:00 +0000] \"GET /trap-me/ HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n",
+        access_line("203.0.113.9", "/trap-me/", 404, "curl/8"),
     )
     .unwrap();
 
@@ -633,35 +618,10 @@ fn robots_txt_is_generated_aliased_and_then_removed_again() {
     let managed = tmp.path().join("managed");
     fs::create_dir_all(&nginx_root).unwrap();
 
-    let site = nginx_root.join("site.conf");
-    fs::write(
-        &site,
-        "server {\n    listen 80;\n    server_name a.example;\n}\n",
-    )
-    .unwrap();
+    let site = write_site(&nginx_root, "a.example");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
 
     let apply = |db_path: &Path, root: &Path, managed: &Path| {
         Command::cargo_bin("stop-bots")
@@ -745,24 +705,9 @@ fn rate_limit_writes_the_zone_file_and_removes_it_only_after_the_directive_goes(
     let conf_d = tmp.path().join("conf.d");
     fs::create_dir_all(&nginx_root).unwrap();
 
-    let site = nginx_root.join("site.conf");
-    fs::write(
-        &site,
-        "server {\n    listen 80;\n    server_name a.example;\n}\n",
-    )
-    .unwrap();
+    let site = write_site(&nginx_root, "a.example");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    scan_sites(&db_path, &nginx_root);
 
     let apply = || {
         Command::cargo_bin("stop-bots")
@@ -858,49 +803,13 @@ fn a_site_path_exemption_switches_the_block_to_the_flag_form() {
     let nginx_root = tmp.path().join("nginx");
     fs::create_dir_all(&nginx_root).unwrap();
 
-    let site_file = nginx_root.join("site.conf");
-    fs::write(
-        &site_file,
-        "server {\n    listen 80;\n    server_name a.example;\n}\n",
-    )
-    .unwrap();
+    let site_file = write_site(&nginx_root, "a.example");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
 
     let apply = || {
-        Command::cargo_bin("stop-bots")
-            .unwrap()
-            .args([
-                "apply-blocks",
-                "--root",
-                nginx_root.to_str().unwrap(),
-                "--db",
-                db_path.to_str().unwrap(),
-                "--no-reload",
-            ])
-            .assert()
-            .success();
+        apply_blocks(&db_path, &nginx_root);
     };
 
     // Without exemptions: the original direct-return shape.
