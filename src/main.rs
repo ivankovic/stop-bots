@@ -277,6 +277,22 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Sets what NGINX does with a request whose user agent matched the
+    /// blocking rule: "forbidden" (`return 403;`, the default) or "close"
+    /// (`return 444;`, NGINX's non-standard close-without-responding —
+    /// cheaper, and gives a scanner no status code to adapt to, at the cost
+    /// of being indistinguishable from the server being down for anything
+    /// caught by mistake).
+    ///
+    /// Host-wide, and only changes what *would* be written: run ApplyBlocks
+    /// afterwards to get the new response code into the site configs. Until
+    /// then Site settings shows every applied site as STALE.
+    SetBlockResponse {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        response: BlockResponseArg,
+    },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
         #[arg(long, help = DB_HELP)]
@@ -310,6 +326,25 @@ impl From<GeoModeArg> for stop_bots::db::GeoMode {
         match arg {
             GeoModeArg::Blocklist => stop_bots::db::GeoMode::Blocklist,
             GeoModeArg::Allowlist => stop_bots::db::GeoMode::Allowlist,
+        }
+    }
+}
+
+/// Named rather than numeric (`--response forbidden`, not `--response
+/// 403`): "444" means nothing without knowing NGINX's non-standard codes,
+/// and a bare number invites passing an arbitrary one this tool doesn't
+/// support.
+#[derive(Clone, Copy, ValueEnum)]
+enum BlockResponseArg {
+    Forbidden,
+    Close,
+}
+
+impl From<BlockResponseArg> for stop_bots::db::BlockResponse {
+    fn from(arg: BlockResponseArg) -> Self {
+        match arg {
+            BlockResponseArg::Forbidden => stop_bots::db::BlockResponse::Forbidden,
+            BlockResponseArg::Close => stop_bots::db::BlockResponse::Close,
         }
     }
 }
@@ -375,6 +410,7 @@ async fn main() -> Result<()> {
         Some(Command::AddCountry { db, country }) => set_country_selected(db, country, true),
         Some(Command::RemoveCountry { db, country }) => set_country_selected(db, country, false),
         Some(Command::ListSelectedCountries { db }) => list_selected_countries(db),
+        Some(Command::SetBlockResponse { db, response }) => set_block_response(db, response),
     }
 }
 
@@ -502,7 +538,7 @@ async fn update_bot_lists(
 
 fn apply_blocks(root: &Path, db_path: Option<PathBuf>, no_reload: bool) -> Result<()> {
     let db = open_db(db_path)?;
-    let default_patterns = db.blocked_user_agent_patterns()?;
+    let default_config = nginx::default_block_config(&db)?;
     // Sites already known to the db (i.e. previously scanned) — the only
     // ones that can carry a per-site override at all.
     let known_sites = db.list_sites()?;
@@ -525,18 +561,18 @@ fn apply_blocks(root: &Path, db_path: Option<PathBuf>, no_reload: bool) -> Resul
         // same-named block in a different file. Note this join is a
         // textual `config_path` match, only valid when `--root` here
         // matches whatever `--root` was used at scan time — a mismatch
-        // just falls through to `default_patterns` below, not an error.
-        let site_patterns: Vec<(String, Vec<String>)> = known_sites
+        // just falls through to `default_config` below, not an error.
+        let site_configs: Vec<(String, nginx::BlockConfig)> = known_sites
             .iter()
             .filter(|s| Path::new(&s.config_path) == path.as_path())
             .map(|s| {
                 Ok((
                     s.server_name.clone(),
-                    db.blocked_user_agent_patterns_for_site(s.id)?,
+                    nginx::block_config_for_site(&db, s.id)?,
                 ))
             })
             .collect::<Result<_>>()?;
-        if nginx::apply_blocks_to_file(path, &site_patterns, &default_patterns)? {
+        if nginx::apply_blocks_to_file(path, &site_configs, &default_config)? {
             changed += 1;
         }
     }
@@ -646,6 +682,18 @@ fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
     let mode: stop_bots::db::GeoMode = mode.into();
     db.set_geo_mode(mode)?;
     println!("Geo mode set to {mode:?}");
+    Ok(())
+}
+
+fn set_block_response(db_path: Option<PathBuf>, response: BlockResponseArg) -> Result<()> {
+    let db = open_db(db_path)?;
+    let response: stop_bots::db::BlockResponse = response.into();
+    db.set_block_response(response)?;
+    println!("Block response set to {}", response.label());
+    // Nothing on disk has changed yet, and silently leaving that implicit
+    // is exactly how an admin ends up believing 444 is live while every
+    // site still returns 403.
+    println!("Run `stop-bots apply-blocks` to write it into the site configs.");
     Ok(())
 }
 

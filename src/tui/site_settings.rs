@@ -37,6 +37,17 @@
 //! currently computed rule — this is a live disk check on every refresh,
 //! not a cached flag, so it stays correct if the file is edited by hand.
 //!
+//! Above the site list sits a small "NGINX settings" panel holding the
+//! host-wide knobs that shape *generated NGINX config text* (currently just
+//! the block response, 403 vs 444). They live here rather than on the
+//! Dashboard because that's where this project splits the two enforcement
+//! planes: the Dashboard owns everything that ends up in the firewall
+//! script, this screen owns everything that ends up in a site's config
+//! file. `Tab` moves focus between the panel and the list. Changing any of
+//! them re-renders the sentinel block differently, so every applied site
+//! immediately flips to `STALE` — which is exactly the feedback wanted,
+//! since nothing on disk changes until `a`/`A`.
+//!
 //! A failed apply opens a dismissible `alert` popup rather than relying on
 //! `App`'s shared `message` field: that field is only ever rendered by
 //! `Dashboard::render` (see `tui.rs`'s render dispatch), so a failure
@@ -47,20 +58,35 @@
 //! `/etc/nginx` is normally root-owned) with a "Try running as root"
 //! suggestion.
 
-use crate::db::{Db, Site};
+use crate::db::{BlockResponse, Db, Site};
 use crate::nginx::{self, SiteApplyStatus};
 use crate::tui::site_detail::SiteDetail;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    layout::Rect,
+    layout::{Constraint, Layout, Rect},
     style::Stylize,
     text::{Line, Span},
     widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use std::path::{Path, PathBuf};
+
+/// The popup title and its options, in the order [`SettingPopup::selected`]
+/// indexes them. One function so the renderer and the key handler can never
+/// disagree about how many options there are or what index means what.
+fn setting_options(setting: NginxSetting) -> (&'static str, Vec<&'static str>) {
+    match setting {
+        NginxSetting::Response => (
+            "Response for blocked requests",
+            vec![
+                BlockResponse::Forbidden.label(),
+                BlockResponse::Close.label(),
+            ],
+        ),
+    }
+}
 
 /// What confirming a popup actually does.
 #[derive(Debug)]
@@ -79,6 +105,53 @@ struct Popup {
     selected: usize,
 }
 
+/// The host-wide NGINX-generation settings shown in this screen's top
+/// panel, in display order. These live here rather than on the Dashboard
+/// because they shape the text written into *site config files* — the
+/// Dashboard owns everything that ends up in the firewall script instead.
+///
+/// Every row here changes the generated sentinel block, which means every
+/// applied site goes `STALE` the moment one is changed (see
+/// `nginx::site_apply_status`, which compares rendered block text). That's
+/// intended and visible: the list below immediately shows what needs
+/// re-applying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NginxSetting {
+    /// `BlockResponse` — 403 vs 444 for a matched request.
+    Response,
+}
+
+impl NginxSetting {
+    const ALL: [NginxSetting; 1] = [NginxSetting::Response];
+
+    fn label(self) -> &'static str {
+        match self {
+            NginxSetting::Response => "Block response",
+        }
+    }
+}
+
+/// Which of this screen's two lists arrow keys currently move through.
+/// Defaults to `Sites` so every pre-existing key (`Enter`/`a`/`A`/`r`)
+/// keeps working exactly as before without first having to move focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Focus {
+    Settings,
+    #[default]
+    Sites,
+}
+
+/// The popup for editing one [`NginxSetting`]. A popup rather than a direct
+/// Space-toggle because these are "choose one of N", the same reasoning the
+/// Dashboard's category/geo-mode popups already use — and because changing
+/// one invalidates every applied site, which deserves a deliberate
+/// confirmation rather than a stray keypress.
+#[derive(Debug, Clone)]
+struct SettingPopup {
+    setting: NginxSetting,
+    selected: usize,
+}
+
 #[derive(Debug)]
 pub struct SiteSettings {
     root: PathBuf,
@@ -93,6 +166,10 @@ pub struct SiteSettings {
     /// popup (see the module doc comment for why this can't just go
     /// through `App`'s shared `message` field).
     alert: Option<String>,
+    focus: Focus,
+    settings_state: ListState,
+    setting_popup: Option<SettingPopup>,
+    block_response: BlockResponse,
 }
 
 impl SiteSettings {
@@ -105,20 +182,25 @@ impl SiteSettings {
             popup: None,
             detail: None,
             alert: None,
+            focus: Focus::default(),
+            settings_state: ListState::default().with_selected(Some(0)),
+            setting_popup: None,
+            block_response: BlockResponse::default(),
         }
     }
 
     pub fn refresh(&mut self, db: &Db) -> Result<()> {
+        self.block_response = db.get_block_response()?;
         self.sites = db.list_sites()?;
         self.statuses = self
             .sites
             .iter()
             .map(|site| {
-                let patterns = db.blocked_user_agent_patterns_for_site(site.id)?;
+                let config = nginx::block_config_for_site(db, site.id)?;
                 Ok(nginx::site_apply_status(
                     Path::new(&site.config_path),
                     &site.server_name,
-                    &patterns,
+                    &config,
                 ))
             })
             .collect::<Result<_>>()?;
@@ -136,6 +218,15 @@ impl SiteSettings {
             detail.render(frame, area, theme);
             return;
         }
+
+        // The settings panel is fixed-height (one row per setting plus the
+        // border) so the sites list — the screen's real content — keeps
+        // every remaining line.
+        let settings_height = NginxSetting::ALL.len() as u16 + 2;
+        let [settings_area, sites_area] =
+            Layout::vertical([Constraint::Length(settings_height), Constraint::Min(0)]).areas(area);
+        self.render_settings(frame, settings_area, theme);
+        let area = sites_area;
 
         if self.sites.is_empty() {
             let placeholder = Paragraph::new(format!(
@@ -173,9 +264,66 @@ impl SiteSettings {
         if let Some(popup) = &self.popup {
             self.render_popup(frame, area, popup);
         }
+        if let Some(popup) = &self.setting_popup {
+            self.render_setting_popup(frame, area, popup);
+        }
         if let Some(alert) = &self.alert {
             self.render_alert(frame, area, alert);
         }
+    }
+
+    /// The host-wide "how do we write NGINX config" panel above the site
+    /// list. Only highlights its selection while it actually has focus, so
+    /// there's never a second reversed row competing with the site list's.
+    fn render_settings(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let items: Vec<ListItem> = NginxSetting::ALL
+            .iter()
+            .map(|setting| {
+                let value = match setting {
+                    NginxSetting::Response => self.block_response.label(),
+                };
+                ListItem::new(Line::from(vec![
+                    format!("{:<18}", setting.label()).into(),
+                    value.bold(),
+                ]))
+            })
+            .collect();
+
+        let mut list = List::new(items).block(
+            Block::bordered()
+                .title("NGINX settings — Tab to focus, Enter to change")
+                .fg(theme.accent()),
+        );
+        if self.focus == Focus::Settings {
+            list = list.highlight_style(ratatui::style::Style::new().reversed());
+        }
+        frame.render_stateful_widget(list, area, &mut self.settings_state);
+    }
+
+    fn render_setting_popup(&self, frame: &mut Frame, area: Rect, popup: &SettingPopup) {
+        let (title, options) = setting_options(popup.setting);
+        let content_width = options
+            .iter()
+            .map(|o| o.len())
+            .max()
+            .unwrap_or(0)
+            .max(title.len());
+        let popup_area = centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
+        let items: Vec<ListItem> = options
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                let line = if i == popup.selected {
+                    Line::from(*label).reversed()
+                } else {
+                    Line::from(*label)
+                };
+                ListItem::new(line)
+            })
+            .collect();
+        let list = List::new(items).block(Block::bordered().title(title));
+        frame.render_widget(Clear, popup_area);
+        frame.render_widget(list, popup_area);
     }
 
     fn render_alert(&self, frame: &mut Frame, area: Rect, alert: &str) {
@@ -310,6 +458,71 @@ impl SiteSettings {
             }
         }
 
+        if let Some(popup) = &mut self.setting_popup {
+            let option_count = setting_options(popup.setting).1.len();
+            match key.code {
+                KeyCode::Esc => {
+                    self.setting_popup = None;
+                    return Ok(KeyOutcome::Consumed);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    popup.selected = popup.selected.saturating_sub(1);
+                    return Ok(KeyOutcome::Consumed);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    popup.selected = (popup.selected + 1).min(option_count - 1);
+                    return Ok(KeyOutcome::Consumed);
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    let popup = self.setting_popup.take().expect("checked above");
+                    self.commit_setting(db, &popup, message)?;
+                    // `Mutated`, never `ReloadNginx`: this only changes what
+                    // *would* be written. Nothing on disk moves until the
+                    // admin applies, which is exactly why every site's tag
+                    // flipping to STALE right now is the useful feedback.
+                    return Ok(KeyOutcome::Mutated);
+                }
+                _ => return Ok(KeyOutcome::Consumed),
+            }
+        }
+
+        // Tab moves focus between this screen's two lists rather than
+        // cycling screens — the same narrower override Dynamic Protection
+        // already makes for its own two panels (see `App::handle_key_event`,
+        // which only sees Tab when the active screen returns `Ignored`).
+        // Screen cycling stays available here via Right/`l`/BackTab's
+        // aliases and the direct `d`/`b`/`s`/`p` jumps. BackTab is treated
+        // as the same toggle rather than a reverse one: with exactly two
+        // lists there's no distinct "previous".
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = match self.focus {
+                Focus::Sites => Focus::Settings,
+                Focus::Settings => Focus::Sites,
+            };
+            return Ok(KeyOutcome::Consumed);
+        }
+
+        if self.focus == Focus::Settings {
+            return Ok(match key.code {
+                KeyCode::Esc => KeyOutcome::Back,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.settings_state.select_previous();
+                    KeyOutcome::Consumed
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.settings_state.selected().unwrap_or(0) + 1 < NginxSetting::ALL.len() {
+                        self.settings_state.select_next();
+                    }
+                    KeyOutcome::Consumed
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    self.open_setting_popup();
+                    KeyOutcome::Consumed
+                }
+                _ => KeyOutcome::Ignored,
+            });
+        }
+
         match key.code {
             KeyCode::Esc => Ok(KeyOutcome::Back),
             KeyCode::Up | KeyCode::Char('k') => {
@@ -356,6 +569,56 @@ impl SiteSettings {
             }
             _ => Ok(KeyOutcome::Ignored),
         }
+    }
+
+    /// Opens the edit popup for the focused NGINX setting, pre-selecting
+    /// whatever that setting is currently set to — so confirming without
+    /// moving is a no-op rather than a silent change to the first option.
+    fn open_setting_popup(&mut self) {
+        let Some(setting) = self
+            .settings_state
+            .selected()
+            .and_then(|i| NginxSetting::ALL.get(i).copied())
+        else {
+            return;
+        };
+        let selected = match setting {
+            NginxSetting::Response => match self.block_response {
+                BlockResponse::Forbidden => 0,
+                BlockResponse::Close => 1,
+            },
+        };
+        self.setting_popup = Some(SettingPopup { setting, selected });
+    }
+
+    /// Persists a confirmed setting popup and reports what changed. The
+    /// message spells out the consequence ("sites need re-applying")
+    /// because nothing on disk changes here — without it, a user could
+    /// reasonably read the new value in the panel as already in effect.
+    fn commit_setting(
+        &mut self,
+        db: &Db,
+        popup: &SettingPopup,
+        message: &mut Option<String>,
+    ) -> Result<()> {
+        match popup.setting {
+            NginxSetting::Response => {
+                let response = if popup.selected == 1 {
+                    BlockResponse::Close
+                } else {
+                    BlockResponse::Forbidden
+                };
+                if response == self.block_response {
+                    return Ok(());
+                }
+                db.set_block_response(response)?;
+                *message = Some(format!(
+                    "Block response set to {} — apply (a/A) to update site configs",
+                    response.label()
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Opens the selected site's detail view, loading its current overrides
@@ -420,8 +683,8 @@ impl SiteSettings {
 
     fn run_apply_site(&self, db: &Db, index: usize) -> Result<bool> {
         let site = &self.sites[index];
-        let patterns = db.blocked_user_agent_patterns_for_site(site.id)?;
-        nginx::apply_block_for_site(Path::new(&site.config_path), &site.server_name, &patterns)
+        let config = nginx::block_config_for_site(db, site.id)?;
+        nginx::apply_block_for_site(Path::new(&site.config_path), &site.server_name, &config)
     }
 
     /// Applies every known site's own rule to its own config file — the
@@ -1122,5 +1385,163 @@ mod tests {
         let alert = screen.alert.as_ref().unwrap();
         assert!(alert.contains("b.example"));
         assert!(alert.contains("Try running as root"));
+    }
+
+    // ---- NGINX settings panel (Tab-focused, host-wide) ----
+
+    #[test]
+    fn tab_moves_focus_between_the_site_list_and_the_settings_panel() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = test_screen();
+        let mut message = None;
+
+        assert_eq!(screen.focus, Focus::Sites);
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .unwrap();
+        assert_eq!(screen.focus, Focus::Settings);
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .unwrap();
+        assert_eq!(screen.focus, Focus::Sites);
+    }
+
+    #[test]
+    fn changing_the_block_response_persists_it_and_reports_the_apply_step() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = test_screen();
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(db.get_block_response().unwrap(), BlockResponse::Close);
+        let message = message.unwrap();
+        assert!(message.contains("444"), "message was: {message}");
+        assert!(message.contains("apply"), "message was: {message}");
+    }
+
+    /// The popup opens on the *current* value, so confirming straight away
+    /// never silently rewrites the setting to the first option.
+    #[test]
+    fn the_setting_popup_preselects_the_current_value() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_block_response(BlockResponse::Close).unwrap();
+        let mut screen = test_screen();
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert_eq!(screen.setting_popup.as_ref().unwrap().selected, 1);
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert_eq!(db.get_block_response().unwrap(), BlockResponse::Close);
+        // Unchanged, so nothing worth telling the user about.
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn escape_closes_the_setting_popup_without_changing_anything() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = test_screen();
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Esc), &db, &mut message)
+            .unwrap();
+
+        assert!(screen.setting_popup.is_none());
+        assert_eq!(db.get_block_response().unwrap(), BlockResponse::Forbidden);
+    }
+
+    /// Changing a host-wide NGINX setting must make every already-applied
+    /// site read as STALE — that tag is the only signal that the config on
+    /// disk no longer matches what the tool would write.
+    #[test]
+    fn changing_the_response_marks_an_applied_site_stale() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.example");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_site("a.example", path.to_str().unwrap()).unwrap();
+        db.block_user_agent("BadBot-UA").unwrap();
+
+        let mut screen = test_screen();
+        screen.refresh(&db).unwrap();
+        let mut message = None;
+
+        // Apply with the default 403, then confirm it reads as up to date.
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('a')), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        screen.refresh(&db).unwrap();
+        assert_eq!(screen.statuses[0], SiteApplyStatus::UpToDate);
+
+        db.set_block_response(BlockResponse::Close).unwrap();
+        screen.refresh(&db).unwrap();
+        assert_eq!(screen.statuses[0], SiteApplyStatus::Stale);
+    }
+
+    #[test]
+    fn render_shows_the_nginx_settings_panel_with_the_current_value() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_block_response(BlockResponse::Close).unwrap();
+        let mut screen = test_screen();
+        screen.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(content.contains("NGINX settings"));
+        assert!(content.contains("Block response"));
+        assert!(content.contains("444"));
     }
 }

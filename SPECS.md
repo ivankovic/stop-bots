@@ -2029,3 +2029,78 @@ matching the exact address *and* `action = 'block'` — never a CIDR range
 (those are derived, never stored as rows) and never an `Allow` rule that
 happens to share the address, which an unblock action has no business
 touching.
+
+## Configurable block response, and `BlockConfig` (`src/nginx.rs`, `Db::BlockResponse`)
+
+**What changed.** The generated sentinel block's `return 403;` is now a
+setting: `Db::BlockResponse` (`settings` key `block_response`) is either
+`Forbidden` (403 — the default) or `Close` (444). Surfaced three ways: a
+new "NGINX settings" panel on the Site settings screen, the CLI's
+`set-block-response --response forbidden|close`, and `nginx::BlockConfig`
+which is what actually renders it.
+
+**Why 444 at all.** `return 444;` is NGINX's non-standard "close the
+connection without any response". It's cheaper (nothing is generated or
+sent) and it gives a scanner no status code to adapt its probing to —
+both real reasons operators prefer it. It stays *opt-in* because it is
+indistinguishable from the server being down: a legitimate client caught
+by an over-broad pattern gets no way to tell it was blocked deliberately.
+403 remains the default so an existing install's generated blocks don't
+change shape on upgrade.
+
+**Why the setting is host-wide, not per-site.** Every existing per-site
+knob (`site_category_overrides`, `site_bot_overrides`) answers "*which*
+bots are blocked here". This answers "*how* do we turn bots away", which
+is a house style rather than a per-site policy decision. It's still
+carried *through* `BlockConfig` per site, because that's what the
+rendering and staleness paths need.
+
+**The `BlockConfig` refactor, and why it wasn't optional.** Before this,
+`site_apply_status` compared *the user-agent pattern extracted back out of
+the on-disk block* against the pattern that would be computed now
+(`current_block_pattern`, which scraped `~* "` occurrences and rejoined
+them). That works only as long as the pattern is the *sole* thing that can
+differ between two valid blocks. The moment the response code became
+configurable it stopped being true: flipping 403 → 444 leaves the patterns
+identical, so every already-applied site would have kept reading `UP TO
+DATE` while its config still returned 403 — a silent lie in the one
+indicator that exists for "does disk match policy". Both callers of that
+status (Site settings' row tags) and the apply paths now share one struct:
+
+    pub struct BlockConfig { patterns: Vec<String>, response: BlockResponse }
+
+`block_text(&BlockConfig) -> Option<String>` renders it (`None` = nothing
+to block, which *removes* an existing block), and `site_apply_status`
+compares that rendered text against `current_block_text` — the whole
+sentinel region verbatim, still anchored to the sentinel markers so an
+unrelated hand-written `if ($http_user_agent ...)` elsewhere in the same
+`server { }` is never mistaken for ours. Rendered-text-vs-rendered-text
+has no blind spot and stays correct for free as `BlockConfig` grows, which
+matters because the remaining planned NGINX features (path exemptions,
+rate limiting, robots.txt) all add fields to it.
+
+**The invariant this establishes**, documented on the module and on
+`BlockConfig` itself: anything that changes the generated block goes *on
+`BlockConfig`*. A knob smuggled into `block_text` as a separate argument
+would render correctly and still break staleness detection.
+
+`nginx::block_config_for_site(db, site_id)` / `default_block_config(db)`
+assemble the struct, so a future host-wide field reaches all three call
+sites (`apply-blocks`, Site settings' refresh, Site settings' apply) at
+once instead of being wired up three times.
+
+**TUI placement.** Host-wide settings that shape *NGINX config text* live
+on Site settings; host-wide settings that shape the *firewall script* live
+on the Dashboard. That split is the organising rule for where any future
+toggle goes. `Tab` switches focus between the new panel and the site list
+— a narrower override of the global screen-cycling Tab, exactly like
+Dynamic Protection already does for its two panels (screen cycling stays
+reachable via Right/`l` and the direct `d`/`b`/`s`/`p` jumps). The setting
+opens a popup pre-selected on its current value, so confirming without
+moving is a no-op rather than a silent change to the first option.
+
+**Nothing is applied implicitly.** Changing the response only changes what
+*would* be written; the CLI prints an explicit "run apply-blocks" line and
+the TUI's status message says the same, because every applied site
+flipping to STALE is otherwise easy to misread as "already live". This is
+the same generate-then-apply discipline the firewall side already follows.

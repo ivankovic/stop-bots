@@ -194,6 +194,86 @@ fn apply_blocks_scopes_a_site_override_to_its_own_file_even_with_a_shared_server
     assert!(b.contains("AISearchBot"));
 }
 
+/// The block-response setting end to end: change it, apply, and confirm
+/// the generated config carries the new code — the whole point being that
+/// setting it alone changes nothing on disk until `apply-blocks` runs.
+#[test]
+fn set_block_response_changes_the_generated_status_code_on_the_next_apply() {
+    let tmp = tempfile::tempdir().unwrap();
+    let nginx_root = tmp.path().join("nginx");
+    fs::create_dir_all(&nginx_root).unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    let site = nginx_root.join("site.conf");
+    fs::write(
+        &site,
+        "server {\n    listen 80;\n    server_name a.example;\n}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let apply = |db_path: &Path, root: &Path| {
+        Command::cargo_bin("stop-bots")
+            .unwrap()
+            .args([
+                "apply-blocks",
+                "--root",
+                root.to_str().unwrap(),
+                "--db",
+                db_path.to_str().unwrap(),
+                "--no-reload",
+            ])
+            .assert()
+            .success();
+    };
+
+    apply(&db_path, &nginx_root);
+    assert!(fs::read_to_string(&site).unwrap().contains("return 403;"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-block-response",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--response",
+            "close",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("apply-blocks"));
+
+    // Still 403 on disk: setting it is not applying it.
+    assert!(fs::read_to_string(&site).unwrap().contains("return 403;"));
+
+    apply(&db_path, &nginx_root);
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(written.contains("return 444;"));
+    assert!(!written.contains("return 403;"));
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

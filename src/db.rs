@@ -157,6 +157,67 @@ impl GeoMode {
     }
 }
 
+/// What NGINX should do with a request whose user agent matched the
+/// sentinel block's pattern — the right-hand side of the generated
+/// `if ($http_user_agent ~* "...") { ... }` (see `nginx::block_text`).
+/// Host-wide rather than per-site: it's a house style ("how do we turn
+/// bots away"), not a per-site policy decision, and every existing
+/// per-site knob is about *which* bots are blocked rather than *how*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockResponse {
+    /// `return 403;` — a normal HTTP "Forbidden" response. The default,
+    /// and what every config this project has ever written used before
+    /// this setting existed, so an existing install's generated blocks
+    /// don't change shape on upgrade.
+    #[default]
+    Forbidden,
+    /// `return 444;` — NGINX's non-standard "close the connection without
+    /// any response at all". Cheaper (no response is generated or sent)
+    /// and gives a scanner no status code to adapt its probing to. The
+    /// trade-off is that it's indistinguishable from the server being
+    /// down, so a *legitimate* client caught by an over-broad pattern gets
+    /// no way to tell it was blocked on purpose — which is why 403 stays
+    /// the default.
+    Close,
+}
+
+impl BlockResponse {
+    fn as_str(self) -> &'static str {
+        match self {
+            BlockResponse::Forbidden => "403",
+            BlockResponse::Close => "444",
+        }
+    }
+
+    /// Falls back to `Forbidden` for any unrecognized value, same
+    /// never-fail-a-read-over-a-stored-enum convention [`GeoMode::from_str`]
+    /// uses — the column is only ever written by [`Self::as_str`].
+    fn from_str(s: &str) -> Self {
+        match s {
+            "444" => BlockResponse::Close,
+            _ => BlockResponse::Forbidden,
+        }
+    }
+
+    /// The NGINX status code this renders as.
+    pub fn status_code(self) -> u16 {
+        match self {
+            BlockResponse::Forbidden => 403,
+            BlockResponse::Close => 444,
+        }
+    }
+
+    /// A short label for the TUI, spelling out what the code actually does
+    /// — "444" alone is meaningless to anyone who hasn't memorised NGINX's
+    /// non-standard codes.
+    pub fn label(self) -> &'static str {
+        match self {
+            BlockResponse::Forbidden => "403 Forbidden",
+            BlockResponse::Close => "444 close connection",
+        }
+    }
+}
+
 /// A bot-list data source that bots can be fetched from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Source {
@@ -886,6 +947,33 @@ impl Db {
             "INSERT INTO settings (key, value) VALUES ('geo_mode', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![mode.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// How a matched request is turned away in generated NGINX configs.
+    /// Unlike [`Self::get_geo_mode`], this reads through `Option` rather
+    /// than requiring a row: the key is not seeded by `CREATE TABLE`, so a
+    /// database written before this setting existed simply has no row and
+    /// gets [`BlockResponse::default`] (403 — exactly what those older
+    /// configs were already generating).
+    pub fn get_block_response(&self) -> Result<BlockResponse> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'block_response'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value.map_or_else(BlockResponse::default, |v| BlockResponse::from_str(&v)))
+    }
+
+    pub fn set_block_response(&self, response: BlockResponse) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('block_response', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![response.as_str()],
         )?;
         Ok(())
     }

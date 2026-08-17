@@ -17,13 +17,22 @@
  */
 
 //! Discovers NGINX sites by walking a config directory, and injects/removes a
-//! sentinel-marked `if ($http_user_agent ...) { return 403; }` block inside
+//! sentinel-marked `if ($http_user_agent ...) { return <code>; }` block inside
 //! each site's `server { ... }` block to block unwanted bots.
 //!
 //! The sentinel comments make the edit idempotent and easy to spot/undo by
 //! hand: re-running only ever replaces the marked lines, never anything else
 //! in the file.
+//!
+//! Everything that shapes the generated text lives in one [`BlockConfig`],
+//! and [`site_apply_status`] compares the *rendered block* against what's on
+//! disk rather than reconstructing individual fields back out of it. That's
+//! the invariant to preserve when adding a knob here: put it on
+//! `BlockConfig` and the staleness check keeps working; smuggle it in as a
+//! separate argument to `block_text` and an already-applied site will read
+//! as up to date while its config still carries the old text.
 
+use crate::db::BlockResponse;
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -256,23 +265,79 @@ fn chunk_pattern(full: &str, max_len: usize) -> Vec<String> {
     chunks
 }
 
+/// Everything that shapes one site's generated sentinel block. Grouped into
+/// a struct rather than passed as loose arguments because the block's
+/// *content* is what [`site_apply_status`] compares against disk: every
+/// field here is something that, when changed, must make an
+/// already-applied site read as `Stale`. Adding a knob that affects the
+/// generated text without adding it here would silently break that check.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BlockConfig {
+    /// The per-site blocked user-agent patterns, as computed by
+    /// `Db::blocked_user_agent_patterns_for_site`. Empty means "block
+    /// nothing", which removes any existing sentinel block.
+    pub patterns: Vec<String>,
+    /// How a matched request is turned away — host-wide, but carried here
+    /// per site since it's part of the rendered text.
+    pub response: BlockResponse,
+}
+
+impl BlockConfig {
+    /// The common case: patterns plus the host-wide response setting.
+    pub fn new(patterns: Vec<String>, response: BlockResponse) -> Self {
+        BlockConfig { patterns, response }
+    }
+}
+
+/// The [`BlockConfig`] currently in effect for one site — its own resolved
+/// patterns (per-site overrides layered over the global cascade) plus every
+/// host-wide setting that shapes the generated text. Every caller that
+/// applies or status-checks a *specific* site goes through here rather than
+/// assembling the struct itself, so a newly added host-wide knob reaches
+/// all of them at once.
+pub fn block_config_for_site(db: &crate::db::Db, site_id: i64) -> Result<BlockConfig> {
+    Ok(BlockConfig::new(
+        db.blocked_user_agent_patterns_for_site(site_id)?,
+        db.get_block_response()?,
+    ))
+}
+
+/// The [`BlockConfig`] for a `server` block with no site-specific overrides
+/// — the global cascade only. Used as `apply_blocks_to_file`'s
+/// `default_config` for blocks discovered on disk that were never scanned
+/// into the database.
+pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
+    Ok(BlockConfig::new(
+        db.blocked_user_agent_patterns()?,
+        db.get_block_response()?,
+    ))
+}
+
 /// Renders the sentinel block content (without surrounding blank lines) for
-/// the given combined user-agent regex `pattern`, split (via
-/// [`chunk_pattern`]) into one `if` statement per chunk if it's long enough
-/// to need it. Multiple sequential `if ($http_user_agent ~* "...") { return
-/// 403; }` statements are equivalent to one big alternation — whichever
-/// fires first returns 403 — so splitting changes nothing about what gets
-/// blocked, only how it's written, and a pattern short enough for one chunk
-/// renders exactly as before (a single `if`).
-fn block_text(pattern: &str) -> String {
+/// `config`, or `None` when there's nothing to block — an empty pattern
+/// list, or one whose every entry [`is_embeddable`] rejects. `None` is what
+/// makes [`apply_block`] *remove* an existing block rather than write an
+/// empty one.
+///
+/// The pattern is split (via [`chunk_pattern`]) into one `if` statement per
+/// chunk when it's long enough to need it. Multiple sequential
+/// `if ($http_user_agent ~* "...") { return <code>; }` statements are
+/// equivalent to one big alternation — whichever fires first returns — so
+/// splitting changes nothing about what gets blocked, only how it's
+/// written, and a pattern short enough for one chunk renders as a single
+/// `if`.
+fn block_text(config: &BlockConfig) -> Option<String> {
+    let pattern = join_patterns(&config.patterns)?;
+    let code = config.response.status_code();
+
     let mut out = format!("    {BLOCK_BEGIN}\n");
-    for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
+    for chunk in chunk_pattern(&pattern, MAX_PATTERN_CHUNK_LEN) {
         out.push_str(&format!(
-            "    if ($http_user_agent ~* \"{chunk}\") {{\n        return 403;\n    }}\n"
+            "    if ($http_user_agent ~* \"{chunk}\") {{\n        return {code};\n    }}\n"
         ));
     }
     out.push_str(&format!("    {BLOCK_END}\n"));
-    out
+    Some(out)
 }
 
 /// Finds the byte range of an existing sentinel block's lines within
@@ -294,10 +359,11 @@ fn locate_existing_block(content: &str, block: &ServerBlock) -> Option<(usize, u
 }
 
 /// Inserts, replaces or removes the sentinel bot-blocking block inside
-/// `block`. Pass `None` (or an empty pattern) to remove any existing block.
-/// Idempotent: applying the same pattern twice yields identical output.
-fn apply_block(content: &str, block: &ServerBlock, pattern: Option<&str>) -> String {
-    let new_block = pattern.filter(|p| !p.is_empty()).map(block_text);
+/// `block`. A `config` that renders to nothing (see [`block_text`]) removes
+/// any existing block. Idempotent: applying the same config twice yields
+/// identical output.
+fn apply_block(content: &str, block: &ServerBlock, config: &BlockConfig) -> String {
+    let new_block = block_text(config);
 
     match locate_existing_block(content, block) {
         Some((start, end)) => {
@@ -350,21 +416,21 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
 }
 
 /// Applies the bot-blocking rule to every `server { ... }` block found in
-/// `config_path`. Each block gets the pattern list from `site_patterns`
+/// `config_path`. Each block gets the [`BlockConfig`] from `site_configs`
 /// belonging to its own `server_name` (its `names.first()`), or
-/// `default_patterns` if that name isn't in `site_patterns` at all (e.g. a
-/// block discovered on disk that was never scanned into the db yet). An
-/// empty pattern list for a block removes any existing block there. Returns
-/// whether the file was actually changed on disk.
+/// `default_config` if that name isn't in `site_configs` at all (e.g. a
+/// block discovered on disk that was never scanned into the db yet). A
+/// config that renders to nothing removes any existing block there.
+/// Returns whether the file was actually changed on disk.
 ///
 /// Two blocks sharing the same `server_name` (e.g. a port-80-redirect block
 /// plus the real port-443 block for the same site) resolve to the same
-/// `site_patterns` entry and so still get the same rule; two blocks with
+/// `site_configs` entry and so still get the same rule; two blocks with
 /// *different* names in the same file now correctly get independent rules.
 pub fn apply_blocks_to_file(
     config_path: &Path,
-    site_patterns: &[(String, Vec<String>)],
-    default_patterns: &[String],
+    site_configs: &[(String, BlockConfig)],
+    default_config: &BlockConfig,
 ) -> Result<bool> {
     let mut content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
@@ -382,14 +448,13 @@ pub fn apply_blocks_to_file(
     for i in 0..block_count {
         let blocks = parse_server_blocks(&content);
         let block = &blocks[i];
-        let patterns = block
+        let config = block
             .names
             .first()
-            .and_then(|name| site_patterns.iter().find(|(n, _)| n == name))
-            .map(|(_, patterns)| patterns.as_slice())
-            .unwrap_or(default_patterns);
-        let pattern = join_patterns(patterns);
-        let updated = apply_block(&content, block, pattern.as_deref());
+            .and_then(|name| site_configs.iter().find(|(n, _)| n == name))
+            .map(|(_, config)| config)
+            .unwrap_or(default_config);
+        let updated = apply_block(&content, block, config);
         if updated != content {
             changed = true;
             content = updated;
@@ -421,43 +486,32 @@ pub enum SiteApplyStatus {
     NotFound,
 }
 
-/// Extracts the user-agent pattern currently applied inside `block`'s
-/// sentinel rule, if any. Anchored to the sentinel's own line range (via
-/// `locate_existing_block`), not just searched for anywhere in the whole
-/// block — a hand-written `if ($http_user_agent ~* "...")` or similar
-/// regex condition elsewhere in the same `server { ... }` would otherwise
-/// be picked up as "the" applied pattern and make an up-to-date site
-/// permanently read as stale.
-fn current_block_pattern(content: &str, block: &ServerBlock) -> Option<String> {
+/// The exact text of the sentinel block currently written inside `block`,
+/// if one is present at all. Anchored to the sentinel's own line range (via
+/// `locate_existing_block`), not searched for anywhere in the whole block —
+/// a hand-written `if ($http_user_agent ~* "...")` or similar elsewhere in
+/// the same `server { ... }` must never be mistaken for ours.
+///
+/// Deliberately the *whole* block text rather than just the user-agent
+/// pattern extracted back out of it, which is what this used to compare.
+/// Once anything besides the pattern can vary between two valid blocks —
+/// the response code, and later exemptions/rate limiting — reconstructing
+/// one field and comparing only that would report a site as `UpToDate`
+/// while its on-disk block still returns the old code. Comparing rendered
+/// text against rendered text has no such blind spot, and it stays correct
+/// for free as `BlockConfig` grows.
+fn current_block_text(content: &str, block: &ServerBlock) -> Option<String> {
     let (start, end) = locate_existing_block(content, block)?;
-    let region = &content[start..end];
-
-    // A pattern long enough to need [`chunk_pattern`]'s splitting renders as
-    // more than one `if` statement (see `block_text`), so every occurrence
-    // has to be collected and rejoined with `|` to reconstruct the full
-    // pattern — not just the first one. Safe to search for a bare `"` as
-    // each chunk's end even though patterns can contain arbitrary text: no
-    // pattern ever contains a literal `"` itself (`is_embeddable` rejects
-    // those before they're ever written), so the first `"` after each
-    // `~* "` marker is always that chunk's real closing quote.
-    let mut patterns = Vec::new();
-    let mut rest = region;
-    while let Some(marker) = rest.find("~* \"") {
-        let after = &rest[marker + 4..];
-        let Some(end) = after.find('"') else { break };
-        patterns.push(&after[..end]);
-        rest = &after[end + 1..];
-    }
-    (!patterns.is_empty()).then(|| patterns.join("|"))
+    Some(content[start..end].to_string())
 }
 
 /// Compares what's actually written in `config_path` for `server_name`
-/// against `patterns` (the currently computed blocking rule for that
-/// site) without changing anything on disk.
+/// against `config` (the currently computed blocking rule for that site)
+/// without changing anything on disk.
 pub fn site_apply_status(
     config_path: &Path,
     server_name: &str,
-    patterns: &[String],
+    config: &BlockConfig,
 ) -> SiteApplyStatus {
     let Ok(content) = fs::read_to_string(config_path) else {
         return SiteApplyStatus::NotFound;
@@ -470,10 +524,10 @@ pub fn site_apply_status(
     if matching.is_empty() {
         return SiteApplyStatus::NotFound;
     }
-    let expected = join_patterns(patterns);
+    let expected = block_text(config);
     if matching
         .iter()
-        .all(|block| current_block_pattern(&content, block) == expected)
+        .all(|block| current_block_text(&content, block) == expected)
     {
         SiteApplyStatus::UpToDate
     } else {
@@ -481,24 +535,23 @@ pub fn site_apply_status(
     }
 }
 
-/// Applies `patterns` only to the `server { ... }` block(s) in
-/// `config_path` whose first `server_name` is `server_name`, leaving
-/// every other block in the file completely untouched — unlike
-/// [`apply_blocks_to_file`], which resets every block it has no explicit
-/// entry for back to `default_patterns`. This backs the TUI's per-site
-/// "Apply now" action: applying one site's overrides must never silently
-/// rewrite an unrelated site sharing the same file. Returns whether the
-/// file was actually changed on disk.
+/// Applies `config` only to the `server { ... }` block(s) in `config_path`
+/// whose first `server_name` is `server_name`, leaving every other block in
+/// the file completely untouched — unlike [`apply_blocks_to_file`], which
+/// resets every block it has no explicit entry for back to
+/// `default_config`. This backs the TUI's per-site "Apply now" action:
+/// applying one site's overrides must never silently rewrite an unrelated
+/// site sharing the same file. Returns whether the file was actually
+/// changed on disk.
 pub fn apply_block_for_site(
     config_path: &Path,
     server_name: &str,
-    patterns: &[String],
+    config: &BlockConfig,
 ) -> Result<bool> {
     let mut content = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
 
     let block_count = parse_server_blocks(&content).len();
-    let pattern = join_patterns(patterns);
 
     // Same re-parse-before-each-edit approach as apply_blocks_to_file:
     // editing a block shifts the byte offsets of every block after it.
@@ -509,7 +562,7 @@ pub fn apply_block_for_site(
         if block.names.first().map(String::as_str) != Some(server_name) {
             continue;
         }
-        let updated = apply_block(&content, block, pattern.as_deref());
+        let updated = apply_block(&content, block, config);
         if updated != content {
             changed = true;
             content = updated;
@@ -568,6 +621,15 @@ mod tests {
 
     const FIXTURES_ROOT: &str = "tests/fixtures/nginx";
 
+    /// A [`BlockConfig`] with the default 403 response, for the many tests
+    /// that only care about which patterns end up in the file.
+    fn cfg(patterns: &[&str]) -> BlockConfig {
+        BlockConfig::new(
+            patterns.iter().map(|p| p.to_string()).collect(),
+            BlockResponse::Forbidden,
+        )
+    }
+
     #[test]
     fn discover_sites_finds_both_fixture_sites() {
         let mut sites = discover_sites(Path::new(FIXTURES_ROOT)).unwrap();
@@ -599,13 +661,13 @@ mod tests {
         let content = "server {\n    listen 80;\n}\n".to_string();
         let block = parse_server_blocks(&content).remove(0);
 
-        let once = apply_block(&content, &block, Some("BadBot|EvilCrawler"));
+        let once = apply_block(&content, &block, &cfg(&["BadBot|EvilCrawler"]));
         assert!(once.contains(BLOCK_BEGIN));
         assert!(once.contains("BadBot|EvilCrawler"));
         assert!(once.contains("return 403;"));
 
         let block_again = parse_server_blocks(&once).remove(0);
-        let twice = apply_block(&once, &block_again, Some("BadBot|EvilCrawler"));
+        let twice = apply_block(&once, &block_again, &cfg(&["BadBot|EvilCrawler"]));
         assert_eq!(once, twice);
     }
 
@@ -613,10 +675,10 @@ mod tests {
     fn apply_block_replaces_pattern_on_update() {
         let content = "server {\n    listen 80;\n}\n".to_string();
         let block = parse_server_blocks(&content).remove(0);
-        let first = apply_block(&content, &block, Some("OldBot"));
+        let first = apply_block(&content, &block, &cfg(&["OldBot"]));
 
         let block_again = parse_server_blocks(&first).remove(0);
-        let second = apply_block(&first, &block_again, Some("NewBot"));
+        let second = apply_block(&first, &block_again, &cfg(&["NewBot"]));
 
         assert!(!second.contains("OldBot"));
         assert!(second.contains("NewBot"));
@@ -627,10 +689,10 @@ mod tests {
     fn apply_block_with_no_patterns_removes_existing_block() {
         let content = "server {\n    listen 80;\n}\n".to_string();
         let block = parse_server_blocks(&content).remove(0);
-        let with_block = apply_block(&content, &block, Some("BadBot"));
+        let with_block = apply_block(&content, &block, &cfg(&["BadBot"]));
 
         let block_again = parse_server_blocks(&with_block).remove(0);
-        let removed = apply_block(&with_block, &block_again, None);
+        let removed = apply_block(&with_block, &block_again, &BlockConfig::default());
 
         assert!(!removed.contains(BLOCK_BEGIN));
         assert!(removed.contains("listen 80;"));
@@ -647,7 +709,7 @@ mod tests {
             .iter()
             .find(|b| b.names == vec!["b.example"])
             .unwrap();
-        let updated = apply_block(content, target, Some("BadBot"));
+        let updated = apply_block(content, target, &cfg(&["BadBot"]));
 
         let updated_blocks = parse_server_blocks(&updated);
         let a_region = &updated[updated_blocks[0].open..updated_blocks[0].close];
@@ -666,15 +728,15 @@ mod tests {
         )
         .unwrap();
 
-        let patterns = vec!["BadBot".to_string(), "EvilCrawler".to_string()];
-        let changed = apply_blocks_to_file(&path, &[], &patterns).unwrap();
+        let config = cfg(&["BadBot", "EvilCrawler"]);
+        let changed = apply_blocks_to_file(&path, &[], &config).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains(BLOCK_BEGIN));
         assert!(written.contains("BadBot|EvilCrawler"));
 
-        let changed_again = apply_blocks_to_file(&path, &[], &patterns).unwrap();
+        let changed_again = apply_blocks_to_file(&path, &[], &config).unwrap();
         assert!(!changed_again);
     }
 
@@ -684,7 +746,7 @@ mod tests {
         let path = dir.path().join("nginx.conf");
         fs::write(&path, "events {}\nhttp {\n    include conf.d/*.conf;\n}\n").unwrap();
 
-        let changed = apply_blocks_to_file(&path, &[], &["BadBot".to_string()]).unwrap();
+        let changed = apply_blocks_to_file(&path, &[], &cfg(&["BadBot"])).unwrap();
         assert!(!changed);
         assert!(!fs::read_to_string(&path).unwrap().contains(BLOCK_BEGIN));
     }
@@ -703,7 +765,7 @@ mod tests {
         )
         .unwrap();
 
-        let changed = apply_blocks_to_file(&path, &[], &["BadBot".to_string()]).unwrap();
+        let changed = apply_blocks_to_file(&path, &[], &cfg(&["BadBot"])).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -728,11 +790,11 @@ mod tests {
         )
         .unwrap();
 
-        let site_patterns = vec![
-            ("a.example".to_string(), vec!["OnlyOnA".to_string()]),
-            ("b.example".to_string(), vec!["OnlyOnB".to_string()]),
+        let site_configs = vec![
+            ("a.example".to_string(), cfg(&["OnlyOnA"])),
+            ("b.example".to_string(), cfg(&["OnlyOnB"])),
         ];
-        let changed = apply_blocks_to_file(&path, &site_patterns, &[]).unwrap();
+        let changed = apply_blocks_to_file(&path, &site_configs, &BlockConfig::default()).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -757,7 +819,7 @@ mod tests {
 
         // No entry for "unscanned.example" in site_patterns at all (as if
         // it was just discovered on disk but never scanned into the db).
-        let changed = apply_blocks_to_file(&path, &[], &["GlobalDefaultBot".to_string()]).unwrap();
+        let changed = apply_blocks_to_file(&path, &[], &cfg(&["GlobalDefaultBot"])).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -769,7 +831,7 @@ mod tests {
         let status = site_apply_status(
             Path::new("/nonexistent/does-not-exist.conf"),
             "example.com",
-            &["BadBot".to_string()],
+            &cfg(&["BadBot"]),
         );
         assert_eq!(status, SiteApplyStatus::NotFound);
     }
@@ -780,7 +842,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        let status = site_apply_status(&path, "b.example", &["BadBot".to_string()]);
+        let status = site_apply_status(&path, "b.example", &cfg(&["BadBot"]));
         assert_eq!(status, SiteApplyStatus::NotFound);
     }
 
@@ -790,7 +852,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        let status = site_apply_status(&path, "a.example", &[]);
+        let status = site_apply_status(&path, "a.example", &BlockConfig::default());
         assert_eq!(status, SiteApplyStatus::UpToDate);
     }
 
@@ -800,7 +862,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        let status = site_apply_status(&path, "a.example", &["BadBot".to_string()]);
+        let status = site_apply_status(&path, "a.example", &cfg(&["BadBot"]));
         assert_eq!(status, SiteApplyStatus::Stale);
     }
 
@@ -809,18 +871,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(
-            &path,
-            "a.example",
-            &["BadBot".to_string(), "EvilBot".to_string()],
-        )
-        .unwrap();
+        apply_block_for_site(&path, "a.example", &cfg(&["BadBot", "EvilBot"])).unwrap();
 
-        let status = site_apply_status(
-            &path,
-            "a.example",
-            &["BadBot".to_string(), "EvilBot".to_string()],
-        );
+        let status = site_apply_status(&path, "a.example", &cfg(&["BadBot", "EvilBot"]));
         assert_eq!(status, SiteApplyStatus::UpToDate);
     }
 
@@ -836,9 +889,9 @@ mod tests {
             "server {\n    server_name a.example;\n    if ($http_user_agent ~* \"AdminBot\") { return 403; }\n}\n",
         )
         .unwrap();
-        apply_block_for_site(&path, "a.example", &["BadBot".to_string()]).unwrap();
+        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
 
-        let status = site_apply_status(&path, "a.example", &["BadBot".to_string()]);
+        let status = site_apply_status(&path, "a.example", &cfg(&["BadBot"]));
         assert_eq!(status, SiteApplyStatus::UpToDate);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -851,9 +904,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &["OldBot".to_string()]).unwrap();
+        apply_block_for_site(&path, "a.example", &cfg(&["OldBot"])).unwrap();
 
-        let status = site_apply_status(&path, "a.example", &["NewBot".to_string()]);
+        let status = site_apply_status(&path, "a.example", &cfg(&["NewBot"]));
         assert_eq!(status, SiteApplyStatus::Stale);
     }
 
@@ -868,7 +921,7 @@ mod tests {
         )
         .unwrap();
 
-        let changed = apply_block_for_site(&path, "a.example", &["OnlyOnA".to_string()]).unwrap();
+        let changed = apply_block_for_site(&path, "a.example", &cfg(&["OnlyOnA"])).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -885,8 +938,8 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        assert!(apply_block_for_site(&path, "a.example", &["BadBot".to_string()]).unwrap());
-        assert!(!apply_block_for_site(&path, "a.example", &["BadBot".to_string()]).unwrap());
+        assert!(apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap());
+        assert!(!apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap());
     }
 
     #[test]
@@ -896,8 +949,7 @@ mod tests {
         let original = "server {\n    server_name a.example;\n}\n";
         fs::write(&path, original).unwrap();
 
-        let changed =
-            apply_block_for_site(&path, "unknown.example", &["BadBot".to_string()]).unwrap();
+        let changed = apply_block_for_site(&path, "unknown.example", &cfg(&["BadBot"])).unwrap();
         assert!(!changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
@@ -954,8 +1006,8 @@ mod tests {
         )
         .unwrap();
 
-        let patterns = vec!["GoodBot".to_string(), "TrailingBackslash\\".to_string()];
-        apply_blocks_to_file(&path, &[], &patterns).unwrap();
+        let config = cfg(&["GoodBot", "TrailingBackslash\\"]);
+        apply_blocks_to_file(&path, &[], &config).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("GoodBot"));
@@ -1015,7 +1067,8 @@ mod tests {
 
         // Comfortably more than MAX_PATTERN_CHUNK_LEN once joined with `|`.
         let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
-        apply_blocks_to_file(&path, &[], &patterns).unwrap();
+        let config = BlockConfig::new(patterns, BlockResponse::Forbidden);
+        apply_blocks_to_file(&path, &[], &config).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         let if_count = written.matches("if ($http_user_agent").count();
@@ -1043,9 +1096,90 @@ mod tests {
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
         let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
-        apply_block_for_site(&path, "a.example", &patterns).unwrap();
+        let config = BlockConfig::new(patterns, BlockResponse::Forbidden);
+        apply_block_for_site(&path, "a.example", &config).unwrap();
 
-        let status = site_apply_status(&path, "a.example", &patterns);
+        let status = site_apply_status(&path, "a.example", &config);
         assert_eq!(status, SiteApplyStatus::UpToDate);
+    }
+
+    // ---- BlockResponse (403 vs 444) ----
+
+    fn cfg_444(patterns: &[&str]) -> BlockConfig {
+        BlockConfig::new(
+            patterns.iter().map(|p| p.to_string()).collect(),
+            BlockResponse::Close,
+        )
+    }
+
+    #[test]
+    fn block_text_renders_the_configured_response_code() {
+        let forbidden = block_text(&cfg(&["BadBot"])).unwrap();
+        assert!(forbidden.contains("return 403;"));
+        assert!(!forbidden.contains("return 444;"));
+
+        let close = block_text(&cfg_444(&["BadBot"])).unwrap();
+        assert!(close.contains("return 444;"));
+        assert!(!close.contains("return 403;"));
+    }
+
+    #[test]
+    fn block_text_is_none_when_there_is_nothing_to_block() {
+        assert!(block_text(&BlockConfig::default()).is_none());
+        // Every pattern rejected by `is_embeddable` is the same case as an
+        // empty list: nothing safe left to write.
+        assert!(block_text(&cfg(&["Quoted\"Bot"])).is_none());
+    }
+
+    #[test]
+    fn a_chunked_pattern_list_renders_the_response_code_in_every_chunk() {
+        let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
+        let config = BlockConfig::new(patterns, BlockResponse::Close);
+        let text = block_text(&config).unwrap();
+
+        let if_count = text.matches("if ($http_user_agent").count();
+        assert!(if_count > 1, "expected chunking, got {if_count} if(s)");
+        assert_eq!(text.matches("return 444;").count(), if_count);
+    }
+
+    /// The whole point of comparing rendered text rather than an extracted
+    /// pattern: the patterns are identical here, only the response code
+    /// differs, and the old pattern-only check reported this as up to date.
+    #[test]
+    fn site_apply_status_is_stale_when_only_the_response_code_differs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+
+        assert_eq!(
+            site_apply_status(&path, "a.example", &cfg(&["BadBot"])),
+            SiteApplyStatus::UpToDate
+        );
+        assert_eq!(
+            site_apply_status(&path, "a.example", &cfg_444(&["BadBot"])),
+            SiteApplyStatus::Stale
+        );
+    }
+
+    #[test]
+    fn re_applying_with_a_new_response_code_rewrites_the_block_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+
+        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+        let changed = apply_block_for_site(&path, "a.example", &cfg_444(&["BadBot"])).unwrap();
+        assert!(changed);
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("return 444;"));
+        assert!(!written.contains("return 403;"));
+        // Still exactly one sentinel block, not a second one appended.
+        assert_eq!(written.matches(BLOCK_BEGIN).count(), 1);
+        assert_eq!(
+            site_apply_status(&path, "a.example", &cfg_444(&["BadBot"])),
+            SiteApplyStatus::UpToDate
+        );
     }
 }
