@@ -341,6 +341,96 @@ fn block_spoofed_crawlers_is_inert_without_ranges_then_blocks_a_forged_googlebot
     assert!(rules[0].expires_at.is_some());
 }
 
+/// Probe-path detection end to end, including the property the built-in
+/// list is chosen for: a legitimate admin path must survive it.
+#[test]
+fn block_probe_paths_blocks_a_dotenv_probe_but_not_a_wordpress_login() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let access_log = tmp.path().join("access.log");
+
+    let line = |ip: &str, path: &str| {
+        format!("{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n")
+    };
+    fs::write(
+        &access_log,
+        line("203.0.113.9", "/.env") + &line("198.51.100.2", "/wp-login.php"),
+    )
+    .unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-probe-paths",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--access-log",
+            access_log.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("203.0.113.9"));
+
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    let rules = db.list_firewall_rules().unwrap();
+    assert_eq!(rules.len(), 1, "rules were: {rules:?}");
+    assert_eq!(rules[0].address, "203.0.113.9");
+
+    // The site's own administrator signing in is not a probe.
+    assert!(!rules.iter().any(|r| r.address == "198.51.100.2"));
+}
+
+/// Extra probe paths are configurable, and entries that could never match
+/// are reported rather than silently dropped.
+#[test]
+fn set_probe_paths_adds_extras_and_reports_unanchored_entries() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let access_log = tmp.path().join("access.log");
+    fs::write(
+        &access_log,
+        "203.0.113.9 - - [10/Jul/2026:12:00:00 +0000] \"GET /internal/dump HTTP/1.1\" 200 0 \"-\" \"curl/8\"\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-probe-paths",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--paths",
+            "/internal\nnot-anchored",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 accepted"))
+        .stdout(predicate::str::contains("Ignored 1"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(["list-probe-paths", "--db", db_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/.env"))
+        .stdout(predicate::str::contains("/internal"));
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-probe-paths",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--access-log",
+            access_log.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    assert_eq!(db.list_firewall_rules().unwrap()[0].address, "203.0.113.9");
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

@@ -97,14 +97,16 @@ enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtectionRow {
     SpoofedCrawlers,
+    ProbePaths,
 }
 
 impl ProtectionRow {
-    const ALL: [ProtectionRow; 1] = [ProtectionRow::SpoofedCrawlers];
+    const ALL: [ProtectionRow; 2] = [ProtectionRow::SpoofedCrawlers, ProtectionRow::ProbePaths];
 
     fn label(self) -> &'static str {
         match self {
             ProtectionRow::SpoofedCrawlers => "Forged crawler UAs",
+            ProtectionRow::ProbePaths => "Probe paths",
         }
     }
 }
@@ -276,24 +278,22 @@ impl Dashboard {
         message: &Option<String>,
         running_jobs: &std::collections::HashSet<crate::cron::CronJob>,
     ) {
-        // Geo-blocking gives up 1 row (8 -> 7) to Summary (4 -> 5, for the
-        // new firewall-status line below) so the total stays exactly what
-        // it was — this project's documented 30-row minimum terminal size
-        // leaves the Messages panel (`Constraint::Min(1)`) no slack to
-        // absorb a net increase (see SPECS.md's "Successful-access
-        // user-agent tracking" entry, which hit the same ceiling and
-        // rebalanced the same way). Geo-blocking is the one to shrink, not
-        // Messages or Bot list sources: it's a scrollable `List`, which
-        // degrades gracefully by scrolling to the selected row when its
-        // viewport shrinks, unlike `Paragraph`'s fixed lines, which would
-        // just silently lose whichever line no longer fits.
+        // Panel heights, and which panel absorbs a short terminal. Every
+        // detector added grows Scheduled tasks by a row, so a layout of
+        // all-fixed heights inevitably pushes the *last* panel off screen
+        // — which used to be Messages, i.e. the one that reports what just
+        // happened. Scheduled tasks is `Min` instead: it takes whatever is
+        // left over and is the panel that clips when there isn't enough,
+        // which is the right thing to lose (it's a status list, and the
+        // same information is in `stop-bots`' CLI output). Everything
+        // above it, including Messages, always renders.
         let [settings_area, middle_area, stats_area, cron_area, message_area] = Layout::vertical([
             Constraint::Length(5),
             Constraint::Length(7),
             Constraint::Length(5),
-            // 2 border lines + one line per known job.
-            Constraint::Length(2 + crate::cron::CronJob::ALL.len() as u16),
-            Constraint::Min(1),
+            // 2 border lines + one line per known job, when there's room.
+            Constraint::Min(3),
+            Constraint::Length(3),
         ])
         .areas(area);
 
@@ -442,12 +442,14 @@ impl Dashboard {
     fn protection_enabled(&self, row: ProtectionRow) -> bool {
         match row {
             ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_enabled,
+            ProtectionRow::ProbePaths => self.protection.probe_paths_enabled,
         }
     }
 
     fn protection_ttl_days(&self, row: ProtectionRow) -> i64 {
         match row {
             ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_ttl_days,
+            ProtectionRow::ProbePaths => self.protection.probe_paths_ttl_days,
         }
     }
 
@@ -963,6 +965,10 @@ impl Dashboard {
             ProtectionRow::SpoofedCrawlers => (
                 crate::protection::SPOOFED_CRAWLERS_ENABLED,
                 crate::protection::SPOOFED_CRAWLERS_TTL_DAYS,
+            ),
+            ProtectionRow::ProbePaths => (
+                crate::protection::PROBE_PATHS_ENABLED,
+                crate::protection::PROBE_PATHS_TTL_DAYS,
             ),
         };
         if selected == 0 {
@@ -2299,6 +2305,33 @@ mod tests {
         );
     }
 
+    /// Each row must drive its *own* settings keys — a copy-paste slip in
+    /// `commit_protection`'s match would silently make one detector's
+    /// popup rewrite another's.
+    #[test]
+    fn each_protection_row_writes_only_its_own_settings() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        focus_protection(&mut dashboard, &db);
+
+        // Move to the Probe paths row and switch it off.
+        press(&mut dashboard, &db, KeyCode::Down);
+        assert_eq!(dashboard.protection_state.selected(), Some(1));
+        press(&mut dashboard, &db, KeyCode::Enter);
+        for _ in 0..PROTECTION_TTL_CHOICES.len() {
+            press(&mut dashboard, &db, KeyCode::Up);
+        }
+        press(&mut dashboard, &db, KeyCode::Enter);
+
+        let settings = ProtectionSettings::load(&db).unwrap();
+        assert!(!settings.probe_paths_enabled);
+        assert!(
+            settings.spoofed_crawlers_enabled,
+            "the other detector must be untouched"
+        );
+    }
+
     #[test]
     fn render_shows_the_automatic_blocking_panel() {
         let db = Db::open_in_memory().unwrap();
@@ -2330,6 +2363,7 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Automatic blocking"));
         assert!(content.contains("Forged crawler"));
+        assert!(content.contains("Probe paths"));
         assert!(content.contains("[ OFF ]"));
     }
 }

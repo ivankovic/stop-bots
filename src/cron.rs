@@ -69,6 +69,11 @@ pub enum CronJob {
     /// `protection::SPOOFED_CRAWLERS_ENABLED` (a disabled detector skips
     /// the whole pass, including reading the log).
     BlockSpoofedCrawlers,
+    /// Runs `scanblock::block_probe_paths` against the auto-detected NGINX
+    /// access log — flags IPs requesting paths nothing legitimate ever asks
+    /// for (`/.env`, `/.git/config`, ...). Same tightest cadence as the
+    /// other detectors, gated by `protection::PROBE_PATHS_ENABLED`.
+    BlockProbePaths,
     /// Runs `accessstats::record_access_stats` against the auto-detected
     /// NGINX access log — tallies successful-request user agents into
     /// `user_agent_stats`, independent of (and against the same log as)
@@ -82,11 +87,12 @@ pub enum CronJob {
 }
 
 impl CronJob {
-    pub const ALL: [CronJob; 6] = [
+    pub const ALL: [CronJob; 7] = [
         CronJob::UpdateIpRanges,
         CronJob::BlockScanners,
         CronJob::BlockWebScanners,
         CronJob::BlockSpoofedCrawlers,
+        CronJob::BlockProbePaths,
         CronJob::RecordAccessStats,
         CronJob::RenderFirewall,
     ];
@@ -100,6 +106,7 @@ impl CronJob {
             CronJob::BlockScanners => "block_scanners",
             CronJob::BlockWebScanners => "block_web_scanners",
             CronJob::BlockSpoofedCrawlers => "block_spoofed_crawlers",
+            CronJob::BlockProbePaths => "block_probe_paths",
             CronJob::RecordAccessStats => "record_access_stats",
             CronJob::RenderFirewall => "render_firewall",
         }
@@ -112,6 +119,7 @@ impl CronJob {
             CronJob::BlockScanners => "Block SSH scanners",
             CronJob::BlockWebScanners => "Block web scanners",
             CronJob::BlockSpoofedCrawlers => "Block forged crawler UAs",
+            CronJob::BlockProbePaths => "Block probe paths",
             CronJob::RecordAccessStats => "Record access-log stats",
             CronJob::RenderFirewall => "Render firewall script",
         }
@@ -143,6 +151,7 @@ impl CronJob {
             CronJob::BlockScanners => Duration::from_secs(60),
             CronJob::BlockWebScanners => Duration::from_secs(60),
             CronJob::BlockSpoofedCrawlers => Duration::from_secs(60),
+            CronJob::BlockProbePaths => Duration::from_secs(60),
             CronJob::RecordAccessStats => Duration::from_secs(60),
             CronJob::RenderFirewall => Duration::from_secs(24 * 60 * 60),
         }

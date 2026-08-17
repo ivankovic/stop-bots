@@ -227,6 +227,78 @@ pub fn spoofed_crawler_ips(log_text: &str, claims: &[CrawlerClaim]) -> Vec<(Stri
     ips
 }
 
+/// Request paths that no human, browser or legitimate crawler ever asks
+/// for, matched case-insensitively as a prefix of the request path.
+///
+/// The selection rule is strict, because this detector blocks on a
+/// **single** request with no threshold: a path only belongs here if it is
+/// never legitimate *on any site*, not merely suspicious. That rules out
+/// several of the most commonly probed paths on purpose —
+/// `/wp-login.php` and `/wp-admin/` are how real WordPress admins sign in,
+/// `/xmlrpc.php` is how Jetpack and pingbacks work, `/phpmyadmin` exists
+/// on plenty of hosts that installed it deliberately. Blocking a site's
+/// own administrator on their first login attempt would be a far worse
+/// bug than missing one scanner, which the ≥7-distinct-404s detector
+/// catches anyway.
+///
+/// What's left is credential and source-tree exposure — files that only
+/// ever exist because of a deployment mistake, and that only ever get
+/// requested by something looking for that mistake.
+pub const DEFAULT_PROBE_PATHS: [&str; 10] = [
+    "/.env",            // and /.env.local, /.env.backup, ... (prefix match)
+    "/.git/",           // /.git/config, /.git/HEAD, ...
+    "/.svn/",           //
+    "/.hg/",            //
+    "/.aws/",           // /.aws/credentials
+    "/.ssh/",           // /.ssh/id_rsa
+    "/wp-config.php",   // never served as content, only ever probed
+    "/vendor/phpunit/", // the eval-stdin.php RCE probe and friends
+    "/.DS_Store",       // leaks a directory listing
+    "/.htpasswd",       //
+];
+
+/// Every IP that requested one of `probe_paths`, paired with the path it
+/// asked for. No threshold and no status-code filter: one request is
+/// conclusive (see [`DEFAULT_PROBE_PATHS`] for how strictly that list is
+/// chosen), and the *response* is irrelevant — an attacker who gets a 200
+/// for `/.env` is a bigger problem than one who gets a 404, so keying on
+/// 404 like [`scanning_ips`] does would skip exactly the worst case.
+///
+/// Matching is a case-insensitive prefix test against the request path,
+/// which is already query-string-stripped by `parse_line`. Prefix rather
+/// than exact so `/.env.local` and `/.git/config` are covered by one entry
+/// each; anchored at the start so a legitimate path that merely *contains*
+/// one of these strings later on (`/blog/how-to-secure-your-env`) doesn't
+/// match.
+///
+/// Loopback/private source IPs are excluded, same as [`scanning_ips`] —
+/// an internal backup job walking a checkout isn't an attacker.
+/// Deduplicated (first matching path wins per IP) and sorted.
+pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, String)> {
+    if probe_paths.is_empty() {
+        return Vec::new();
+    }
+    let needles: Vec<String> = probe_paths.iter().map(|p| p.to_lowercase()).collect();
+
+    let mut found: HashMap<IpAddr, String> = HashMap::new();
+    for (ip, _status, path, _user_agent) in log_text.lines().filter_map(parse_line) {
+        if is_local_or_private(&ip) {
+            continue;
+        }
+        let path_lower = path.to_lowercase();
+        if needles.iter().any(|n| path_lower.starts_with(n.as_str())) {
+            found.entry(ip).or_insert(path);
+        }
+    }
+
+    let mut ips: Vec<(String, String)> = found
+        .into_iter()
+        .map(|(ip, path)| (ip.to_string(), path))
+        .collect();
+    ips.sort();
+    ips
+}
+
 /// The complement to [`scanning_ips`]: instead of flagging bad traffic,
 /// tallies who's actually browsing the site successfully. Counts every
 /// distinct user agent's hits across every *successful* (status < 400 —
@@ -540,5 +612,91 @@ mod tests {
         // Verified as Googlebot, so the stray "bingbot" token isn't
         // treated as an impersonation of Bing on its own.
         assert!(found.is_empty(), "unexpectedly flagged: {found:?}");
+    }
+
+    // ---- probe-path detection ----
+
+    fn probe_line(ip: &str, path: &str, status: u16) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" {status} 0 \"-\" \"curl/8\"\n"
+        )
+    }
+
+    fn default_probes() -> Vec<String> {
+        DEFAULT_PROBE_PATHS.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn probe_path_ips_flags_a_single_dotenv_request() {
+        let log = probe_line("203.0.113.9", "/.env", 404);
+        assert_eq!(
+            probe_path_ips(&log, &default_probes()),
+            vec![("203.0.113.9".to_string(), "/.env".to_string())]
+        );
+    }
+
+    /// The response is irrelevant — a 200 for `/.env` is the *worse* case,
+    /// so keying on 404 the way `scanning_ips` does would skip it.
+    #[test]
+    fn probe_path_ips_flags_a_successful_probe_too() {
+        let log = probe_line("203.0.113.9", "/.env", 200);
+        assert_eq!(probe_path_ips(&log, &default_probes()).len(), 1);
+    }
+
+    #[test]
+    fn probe_path_ips_matches_by_prefix_and_case_insensitively() {
+        let log = probe_line("203.0.113.9", "/.ENV.local", 404)
+            + &probe_line("198.51.100.2", "/.git/config", 404);
+        let found = probe_path_ips(&log, &default_probes());
+        let ips: Vec<&str> = found.iter().map(|(ip, _)| ip.as_str()).collect();
+        assert_eq!(ips, vec!["198.51.100.2", "203.0.113.9"]);
+    }
+
+    /// Anchored at the start, so an ordinary page whose URL merely contains
+    /// one of these strings is not a probe.
+    #[test]
+    fn probe_path_ips_does_not_match_mid_path() {
+        let log = probe_line("203.0.113.9", "/blog/how-to-secure-your/.env-file", 200);
+        assert!(probe_path_ips(&log, &default_probes()).is_empty());
+    }
+
+    #[test]
+    fn probe_path_ips_ignores_ordinary_requests() {
+        let log = probe_line("203.0.113.9", "/", 200) + &probe_line("203.0.113.9", "/about", 200);
+        assert!(probe_path_ips(&log, &default_probes()).is_empty());
+    }
+
+    #[test]
+    fn probe_path_ips_excludes_local_and_private_sources() {
+        let log = probe_line("127.0.0.1", "/.env", 404) + &probe_line("10.0.0.5", "/.git/", 404);
+        assert!(probe_path_ips(&log, &default_probes()).is_empty());
+    }
+
+    #[test]
+    fn probe_path_ips_is_empty_with_no_configured_paths() {
+        let log = probe_line("203.0.113.9", "/.env", 404);
+        assert!(probe_path_ips(&log, &[]).is_empty());
+    }
+
+    #[test]
+    fn probe_path_ips_reports_one_row_per_ip() {
+        let log = probe_line("203.0.113.9", "/.env", 404)
+            + &probe_line("203.0.113.9", "/.git/config", 404);
+        assert_eq!(probe_path_ips(&log, &default_probes()).len(), 1);
+    }
+
+    #[test]
+    fn probe_path_ips_honours_an_extra_configured_path() {
+        let log = probe_line("203.0.113.9", "/my-secret/key", 404);
+        assert!(probe_path_ips(&log, &default_probes()).is_empty());
+        assert_eq!(probe_path_ips(&log, &["/my-secret".to_string()]).len(), 1);
+    }
+
+    /// Query strings are already stripped by `parse_line`, so a probe that
+    /// tacks one on is still caught.
+    #[test]
+    fn probe_path_ips_matches_despite_a_query_string() {
+        let log = probe_line("203.0.113.9", "/.env?cachebust=1", 404);
+        assert_eq!(probe_path_ips(&log, &default_probes()).len(), 1);
     }
 }

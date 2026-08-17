@@ -40,6 +40,7 @@ pub enum ScanKind {
     #[default]
     Scanning,
     SpoofedCrawler,
+    ProbePath,
 }
 
 impl ScanKind {
@@ -49,6 +50,7 @@ impl ScanKind {
         match self {
             ScanKind::Scanning => "scanning IP",
             ScanKind::SpoofedCrawler => "forged crawler IP",
+            ScanKind::ProbePath => "probing IP",
         }
     }
 }
@@ -254,6 +256,41 @@ pub fn block_spoofed_crawlers(
         candidates,
         0,
         !claims.is_empty(),
+        ttl_days,
+        dry_run,
+    )
+}
+
+/// Finds IPs in `log_text` (an NGINX access log) that requested one of the
+/// configured probe paths (see [`crate::protection::probe_paths`] and
+/// [`accesslog::probe_path_ips`]) and adds a Block rule, expiring after
+/// `ttl_days`, for each one not already covered.
+///
+/// Like [`block_spoofed_crawlers`] and unlike the two behavioural
+/// detectors, there's no threshold: the path list is chosen so that a
+/// single request to any entry is conclusive on its own.
+///
+/// No known-crawler exclusion, deliberately. A search crawler has no
+/// business requesting `/.env` either — if one ever did, that request is
+/// exactly as unwelcome as anyone else's, and unlike the 404-counting
+/// detector there's no risk of mistaking ordinary link-chasing for it.
+pub fn block_probe_paths(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let paths = crate::protection::probe_paths(db)?;
+    let hits = accesslog::probe_path_ips(log_text, &paths);
+    let found = hits.len();
+    let candidates: Vec<String> = hits.into_iter().map(|(ip, _path)| ip).collect();
+    add_block_rules(
+        db,
+        ScanKind::ProbePath,
+        found,
+        candidates,
+        0,
+        true,
         ttl_days,
         dry_run,
     )
@@ -585,5 +622,74 @@ mod tests {
             ..base
         };
         assert_eq!(spoofed.summary(), "no forged crawler IPs found");
+    }
+
+    // ---- probe-path blocking ----
+
+    fn probe_line(ip: &str, path: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n"
+        )
+    }
+
+    #[test]
+    fn block_probe_paths_blocks_a_single_dotenv_request() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", "/.env");
+
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(outcome.kind, ScanKind::ProbePath);
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules[0].address, "203.0.113.9");
+        assert!(rules[0].expires_at.is_some());
+    }
+
+    #[test]
+    fn block_probe_paths_ignores_ordinary_traffic() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", "/about");
+
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(outcome.candidates, 0);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// Unlike spoofed-crawler detection this needs no fetched data, so it
+    /// works on a completely fresh database.
+    #[test]
+    fn block_probe_paths_works_without_any_fetched_ranges() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", "/.git/config");
+        assert_eq!(
+            block_probe_paths(&db, 5, &log, false)
+                .unwrap()
+                .newly_blocked,
+            vec!["203.0.113.9".to_string()]
+        );
+    }
+
+    #[test]
+    fn block_probe_paths_picks_up_extra_configured_paths() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", "/internal-only/dump");
+        assert_eq!(block_probe_paths(&db, 5, &log, true).unwrap().candidates, 0);
+
+        db.set_text_setting(crate::protection::PROBE_PATHS_EXTRA, "/internal-only")
+            .unwrap();
+        assert_eq!(block_probe_paths(&db, 5, &log, true).unwrap().candidates, 1);
+    }
+
+    #[test]
+    fn block_probe_paths_dry_run_writes_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.9", "/.env");
+
+        let outcome = block_probe_paths(&db, 5, &log, true).unwrap();
+
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
     }
 }

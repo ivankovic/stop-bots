@@ -243,6 +243,51 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Scans the NGINX access log for IP addresses that requested a path
+    /// nothing legitimate ever asks for — `/.env`, `/.git/config`,
+    /// `/wp-config.php`, `/vendor/phpunit/...` and friends — and adds a
+    /// temporary Block rule (expiring after --ttl-days) for each.
+    ///
+    /// No --threshold, unlike BlockWebScanners: one request to any of
+    /// these is already conclusive. The built-in list is chosen strictly
+    /// for that reason and deliberately excludes commonly-probed paths
+    /// that are *also* legitimate somewhere — `/wp-login.php`,
+    /// `/wp-admin/`, `/xmlrpc.php`, `/phpmyadmin` — since instant-blocking
+    /// a site's own administrator would be far worse than missing a
+    /// scanner that BlockWebScanners catches anyway. Add site-specific
+    /// paths with SetProbePaths.
+    ///
+    /// Same storage-only, expiry-enforced-on-read caveats as BlockScanners.
+    BlockProbePaths {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long, default_value_t = stop_bots::protection::PROBE_PATHS_TTL_DAYS_DEFAULT)]
+        ttl_days: i64,
+        /// Check this NGINX access log file instead of the default
+        /// /var/log/nginx/access.log
+        #[arg(long)]
+        access_log: Option<PathBuf>,
+        /// Show what would be added without writing to the database
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Replaces the extra probe paths checked by BlockProbePaths, on top of
+    /// the built-in list (which is never removable — turn the detector off
+    /// instead). One path per line; blank lines and `#` comments are
+    /// ignored, and every entry must start with `/` since matching is
+    /// anchored at the start of the request path.
+    SetProbePaths {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Newline-separated paths. Pass an empty string to clear.
+        #[arg(long)]
+        paths: String,
+    },
+    /// Lists every probe path currently checked, built-in and extra
+    ListProbePaths {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+    },
     /// Reads the NGINX access log and tallies which user agents made a
     /// successful (non-4xx/5xx) request, adding the counts onto the
     /// `user_agent_stats` table (see stop_bots::accessstats::
@@ -443,6 +488,14 @@ async fn main() -> Result<()> {
             access_log,
             dry_run,
         }) => block_spoofed_crawlers(db, ttl_days, access_log, dry_run),
+        Some(Command::BlockProbePaths {
+            db,
+            ttl_days,
+            access_log,
+            dry_run,
+        }) => block_probe_paths(db, ttl_days, access_log, dry_run),
+        Some(Command::SetProbePaths { db, paths }) => set_probe_paths(db, paths),
+        Some(Command::ListProbePaths { db }) => list_probe_paths(db),
         Some(Command::RecordAccessStats { db, access_log }) => record_access_stats(db, access_log),
         Some(Command::ListAccessStats { db }) => list_access_stats(db),
         Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
@@ -973,6 +1026,78 @@ fn block_spoofed_crawlers(
         return Ok(());
     }
     print_scan_block_outcome(&outcome);
+    Ok(())
+}
+
+fn block_probe_paths(
+    db_path: Option<PathBuf>,
+    ttl_days: i64,
+    access_log: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+
+    let source = match access_log.as_deref() {
+        Some(path) => accesslog::read_log_file(path),
+        None => accesslog::find_default_source(),
+    };
+    let log_text = match source {
+        accesslog::LogSource::Found(text) => text,
+        accesslog::LogSource::Unavailable => {
+            anyhow::bail!(
+                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
+                 --access-log, or run as root, for this to work"
+            );
+        }
+    };
+
+    let outcome = stop_bots::scanblock::block_probe_paths(&db, ttl_days, &log_text, dry_run)?;
+    if outcome.candidates == 0 {
+        println!("No probe-path requests found.");
+        return Ok(());
+    }
+    print_scan_block_outcome(&outcome);
+    Ok(())
+}
+
+fn set_probe_paths(db_path: Option<PathBuf>, paths: String) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_text_setting(stop_bots::protection::PROBE_PATHS_EXTRA, &paths)?;
+    let accepted = stop_bots::protection::extra_probe_paths(&db)?;
+    println!("Extra probe paths set ({} accepted).", accepted.len());
+    // Report what was dropped rather than silently ignoring it: an entry
+    // that doesn't start with `/` can never match, and finding that out
+    // from a detector that quietly never fires is much worse.
+    let offered = paths
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .count();
+    if offered > accepted.len() {
+        println!(
+            "Ignored {} entr(y/ies) that don't start with '/' — matching is anchored at the \
+             start of the request path.",
+            offered - accepted.len()
+        );
+    }
+    Ok(())
+}
+
+fn list_probe_paths(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+    let extra = stop_bots::protection::extra_probe_paths(&db)?;
+    println!("Built-in (always checked):");
+    for path in stop_bots::accesslog::DEFAULT_PROBE_PATHS {
+        println!("  {path}");
+    }
+    if extra.is_empty() {
+        println!("Extra: none (set with set-probe-paths)");
+    } else {
+        println!("Extra:");
+        for path in &extra {
+            println!("  {path}");
+        }
+    }
     Ok(())
 }
 

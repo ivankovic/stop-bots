@@ -2220,3 +2220,63 @@ misrepresent an enabled detector as switched off.
 The ON/OFF tag is deliberately not `policy_tag`: that one means "traffic
 is allowed/blocked", so an enabled detector rendered as `[ BLOCKED ]`
 would read as the opposite of what it says.
+
+## Instant-block probe paths (`accesslog::probe_path_ips`, `scanblock::block_probe_paths`)
+
+**What it does.** Blocks any IP that requests a path nothing legitimate
+ever asks for — `/.env`, `/.git/config`, `/wp-config.php`,
+`/vendor/phpunit/...` — on the *first* request, with no threshold.
+Complements `block-web-scanners`' ≥7-distinct-404s heuristic, which is
+deliberately slow by comparison.
+
+**The selection rule for `DEFAULT_PROBE_PATHS`, which is the whole design.**
+A path belongs on the list only if it is never legitimate *on any site*,
+not merely if it's commonly probed. That excludes several of the most
+frequently attacked paths on purpose: `/wp-login.php` and `/wp-admin/` are
+how real WordPress administrators sign in, `/xmlrpc.php` is how Jetpack
+and pingbacks work, `/phpmyadmin` exists deliberately on plenty of hosts.
+Instant-blocking a site's own admin on their first login attempt would be
+a far worse bug than missing a scanner — and the 404-counting detector
+catches that scanner anyway. What's left is credential and source-tree
+exposure: files that only exist because of a deployment mistake and are
+only ever requested by something hunting for that mistake. There's a unit
+test asserting the legitimate paths stay off the list, so a future "helpful"
+addition fails loudly.
+
+**No status-code filter, unlike `scanning_ips`.** Keying on 404 would skip
+the worst case: an attacker who gets a **200** for `/.env` has already won.
+The response is irrelevant; the request is the signal.
+
+**Prefix matching, anchored at the start.** One entry covers `/.env`,
+`/.env.local` and `/.env.backup`; anchoring means an ordinary URL that
+merely contains the string later on (`/blog/how-to-secure-your/.env-file`)
+doesn't match. Query strings are already stripped by `parse_line`, so a
+cache-busted probe is still caught.
+
+**Extra paths, but no removals.** `set-probe-paths` stores a newline-
+separated list in `settings` (`detect_probe_paths_extra`), appended to the
+built-ins; `list-probe-paths` shows both. Entries not starting with `/`
+are rejected *and reported*, because matching is anchored and a bare
+`wp-config.php` would silently never fire — a detector that quietly does
+nothing is the worst failure mode available. The built-ins can't be
+removed individually: an admin who doesn't want them turns the whole
+detector off, which is a clearer thing to reason about than a partially
+disabled list.
+
+**TTL 5 days**, matching `block-scanners` rather than spoofed-crawler
+detection's 1. The difference is who gets caught by mistake: a
+mis-detected crawler is a real service you want back quickly, whereas
+anything requesting `/.env` has no legitimate business here at all.
+
+## Dashboard layout: which panel absorbs a short terminal
+
+Adding detectors grows the Scheduled-tasks panel by one row each, and with
+every panel on a fixed `Constraint::Length` that pushed the *last* one —
+Messages, which reports what just happened — off a 28-row screen. Fixed
+heights made the least important thing the most protected.
+
+Scheduled tasks is now `Constraint::Min(3)`: it takes the leftover space
+and is the panel that clips when there isn't enough. That's the right
+thing to lose (it's a status list whose content is also available from the
+CLI), and everything above it, Messages included, always renders. Adding
+another detector no longer risks silently hiding a panel.

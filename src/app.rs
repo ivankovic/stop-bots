@@ -320,6 +320,7 @@ impl App {
             CronJob::BlockScanners
             | CronJob::BlockWebScanners
             | CronJob::BlockSpoofedCrawlers
+            | CronJob::BlockProbePaths
             | CronJob::RecordAccessStats
             | CronJob::RenderFirewall => self.start_cron_log_job(job),
         }
@@ -478,6 +479,25 @@ impl App {
                         Some(text) => match crate::scanblock::block_spoofed_crawlers(
                             &self.db,
                             settings.spoofed_crawlers_ttl_days,
+                            &text,
+                            false,
+                        ) {
+                            Ok(outcome) => outcome.summary(),
+                            Err(err) => format!("error: {err}"),
+                        },
+                        None => "NGINX access log unavailable".to_string(),
+                    }
+                }
+            }
+            CronJob::BlockProbePaths => {
+                let settings = crate::protection::ProtectionSettings::load(&self.db)?;
+                if !settings.probe_paths_enabled {
+                    "disabled".to_string()
+                } else {
+                    match log_text {
+                        Some(text) => match crate::scanblock::block_probe_paths(
+                            &self.db,
+                            settings.probe_paths_ttl_days,
                             &text,
                             false,
                         ) {
