@@ -1092,6 +1092,49 @@ impl Db {
         self.set_bool_setting("serve_robots_txt", serve)
     }
 
+    /// Whether generated site configs carry a `limit_req`. Off by
+    /// default: a rate limit tuned for the wrong site turns away real
+    /// visitors, and unlike a bot-pattern block there's no user agent to
+    /// inspect afterwards to work out who was caught.
+    pub fn get_rate_limit_enabled(&self) -> Result<bool> {
+        self.get_bool_setting("rate_limit_enabled", false)
+    }
+
+    pub fn set_rate_limit_enabled(&self, enabled: bool) -> Result<()> {
+        self.set_bool_setting("rate_limit_enabled", enabled)
+    }
+
+    /// Sustained requests per second per client address. 10/s is
+    /// deliberately generous: a browser opening one page can easily fire a
+    /// dozen requests for assets, so anything tighter would need
+    /// `location`-level exemptions to be usable at all.
+    pub fn get_rate_limit_rps(&self) -> Result<i64> {
+        Ok(self.get_int_setting("rate_limit_rps", 10)?.max(1))
+    }
+
+    pub fn set_rate_limit_rps(&self, rps: i64) -> Result<()> {
+        self.set_int_setting("rate_limit_rps", rps.max(1))
+    }
+
+    /// How many requests may exceed the rate before any are refused. 20 —
+    /// twice the default rate — absorbs the burst of a single page load
+    /// without letting a sustained flood through.
+    pub fn get_rate_limit_burst(&self) -> Result<i64> {
+        Ok(self.get_int_setting("rate_limit_burst", 20)?.max(0))
+    }
+
+    pub fn set_rate_limit_burst(&self, burst: i64) -> Result<()> {
+        self.set_int_setting("rate_limit_burst", burst.max(0))
+    }
+
+    /// Shared-memory size for the rate-limit zone, in megabytes. 10MB
+    /// tracks on the order of 160k distinct client addresses with
+    /// `$binary_remote_addr`; NGINX starts evicting (and logging) beyond
+    /// that rather than failing.
+    pub fn get_rate_limit_zone_mb(&self) -> Result<i64> {
+        Ok(self.get_int_setting("rate_limit_zone_mb", 10)?.max(1))
+    }
+
     pub fn set_block_response(&self, response: BlockResponse) -> Result<()> {
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES ('block_response', ?1)

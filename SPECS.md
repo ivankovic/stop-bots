@@ -2459,3 +2459,63 @@ location for the end-to-end tests, which drive the real binary and would
 otherwise only pass as root; it's read in exactly one place so the written
 path and the aliased path can never disagree, and it's deliberately not a
 persisted setting.
+
+## NGINX rate limiting (`limit_req_zone` + `limit_req`)
+
+**What it does.** When on, `apply-blocks` writes a `limit_req_zone` to
+`/etc/nginx/conf.d/stop-bots-limits.conf` and adds
+`limit_req zone=stop_bots burst=N nodelay; limit_req_status 429;` to each
+site's sentinel block. NGINX enforces it at request time — the only
+feature here that doesn't go through log analysis.
+
+**The zone cannot live in the sentinel block.** `limit_req_zone` is an
+`http`-context directive; the sentinel block is inside `server { }`. Hence
+the separate file, in a directory the stock `nginx.conf` already globs
+(`include /etc/nginx/conf.d/*.conf;`). That's the important difference
+from `MANAGED_DIR`: a leftover file *there* is inert, a leftover file in
+`conf.d` is **live** and keeps allocating its shared memory zone forever.
+
+**The ordering is load-bearing, not tidiness.** A `server` block
+containing `limit_req zone=stop_bots;` whose zone has been deleted is not
+a degraded config — NGINX refuses to load with "unknown limit_req_zone",
+so `nginx -t` fails and the *entire* reload is rejected, every unrelated
+site included. So the managed-file lifecycle is split in two:
+
+- `write_managed_files` runs **before** any config is rewritten, so a file
+  the new config references always exists first.
+- `remove_unused_managed_files` runs **after** every config is rewritten,
+  so a file is only deleted once nothing references it.
+
+Between the two the config on disk is valid at every point, which means an
+apply that dies half way (a permission error on one file) leaves a working
+NGINX rather than one that won't reload at all. In the TUI this is why
+single-site apply (`a`) *never* cleans up — the other sites on the host
+still carry the directive — and only apply-all (`A`), and only when every
+site succeeded, does.
+
+**`nodelay` and 429.** `nodelay` serves a visitor who briefly exceeds the
+rate immediately from the burst allowance instead of queueing them;
+queueing makes an ordinary page load feel broken while doing nothing extra
+to a bot, which just waits. 429 rather than NGINX's default 503 because a
+rate-limited client is not being told the server is unavailable, and a
+well-behaved one backs off correctly when told the truth.
+
+**Defaults: off, 10 req/s, burst 20, 10MB zone.** Off because a limit
+tuned for the wrong site turns away real visitors, and unlike a
+bot-pattern block there's no user agent to inspect afterwards to work out
+who was caught. 10/s is deliberately generous — one page load can fire a
+dozen asset requests — and burst 20 absorbs that without letting a
+sustained flood through. The zone is keyed on `$binary_remote_addr`
+(4 bytes v4, 16 v6) rather than the string form, fitting roughly four
+times as many clients into the same memory.
+
+**One zone-name constant** shared by the block and the file. A mismatch
+between them is not subtle: NGINX refuses to start. There's a test
+asserting the two agree.
+
+The TUI offers three presets rather than a numeric entry field, for the
+same reason the Dashboard's detector popup offers fixed TTLs: these
+screens have exactly one interaction pattern (pick one of N), and a
+free-text number would be the sole exception. The CLI takes any value. A
+rate set from the CLI that isn't on the preset list still opens the popup
+as *on*, at the nearest preset, never as "Off".

@@ -436,6 +436,32 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Turns NGINX rate limiting on or off, and sets its parameters.
+    ///
+    /// When on, ApplyBlocks writes a `limit_req_zone` to
+    /// /etc/nginx/conf.d/stop-bots-limits.conf (it has to live in `http`
+    /// context, so it can't go in the per-site block) and adds a
+    /// `limit_req ... burst=N nodelay; limit_req_status 429;` to each
+    /// site. NGINX then does the enforcement itself, at request time —
+    /// unlike everything else here, no log analysis is involved.
+    ///
+    /// Off by default: a limit tuned for the wrong site turns away real
+    /// visitors, and unlike a bot-pattern block there's no user agent to
+    /// inspect afterwards to work out who was caught.
+    SetRateLimit {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+        /// Sustained requests per second per client address. Generous by
+        /// default (10): one page load can easily fire a dozen requests
+        /// for assets.
+        #[arg(long)]
+        rps: Option<i64>,
+        /// How many requests may exceed the rate before any are refused.
+        #[arg(long)]
+        burst: Option<i64>,
+    },
     /// Turns generation of a `robots.txt` on or off. When on, ApplyBlocks
     /// writes one to /etc/stop-bots/nginx/robots.txt and adds a
     /// `location = /robots.txt` block to each site that serves it: one
@@ -624,6 +650,12 @@ async fn main() -> Result<()> {
         Some(Command::RemoveCountry { db, country }) => set_country_selected(db, country, false),
         Some(Command::ListSelectedCountries { db }) => list_selected_countries(db),
         Some(Command::SetBlockResponse { db, response }) => set_block_response(db, response),
+        Some(Command::SetRateLimit {
+            db,
+            enabled,
+            rps,
+            burst,
+        }) => set_rate_limit(db, enabled, rps, burst),
         Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
         Some(Command::ShowRobotsTxt { db }) => show_robots_txt(db),
     }
@@ -800,6 +832,12 @@ fn apply_blocks(root: &Path, db_path: Option<PathBuf>, no_reload: bool) -> Resul
         config_paths.len(),
         changed
     );
+
+    // Only now that every config has been rewritten is it safe to delete a
+    // generated file the new config no longer references — see
+    // `nginx::remove_unused_managed_files` for why the order is
+    // load-bearing rather than tidy.
+    nginx::remove_unused_managed_files(&db)?;
 
     // Writing the sentinel block does nothing until NGINX re-reads it — no
     // point reloading when nothing actually changed on disk.
@@ -983,6 +1021,36 @@ fn list_reputation_sources(db_path: Option<PathBuf>) -> Result<()> {
             .unwrap_or_default();
         println!("[{state}] {:<22} {fetched}{note}", source.id);
     }
+    Ok(())
+}
+
+fn set_rate_limit(
+    db_path: Option<PathBuf>,
+    enabled: bool,
+    rps: Option<i64>,
+    burst: Option<i64>,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    // Parameters are stored even when disabling, so `--enabled false
+    // --rps 5` then `--enabled true` uses 5 rather than silently
+    // reverting to the default.
+    if let Some(rps) = rps {
+        db.set_rate_limit_rps(rps)?;
+    }
+    if let Some(burst) = burst {
+        db.set_rate_limit_burst(burst)?;
+    }
+    db.set_rate_limit_enabled(enabled)?;
+    if enabled {
+        println!(
+            "Rate limiting on: {} req/s per client, burst {}, then 429.",
+            db.get_rate_limit_rps()?,
+            db.get_rate_limit_burst()?
+        );
+    } else {
+        println!("Rate limiting off.");
+    }
+    println!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
     Ok(())
 }
 

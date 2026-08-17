@@ -73,6 +73,10 @@ use ratatui::{
 };
 use std::path::{Path, PathBuf};
 
+/// The `(requests per second, burst)` pairs the Rate limit popup offers,
+/// in the order it lists them after its "Off" row.
+const RATE_LIMIT_PRESETS: [(i64, i64); 3] = [(5, 10), (10, 20), (30, 60)];
+
 /// The popup title and its options, in the order [`SettingPopup::selected`]
 /// indexes them. One function so the renderer and the key handler can never
 /// disagree about how many options there are or what index means what.
@@ -88,6 +92,20 @@ fn setting_options(setting: NginxSetting) -> (&'static str, Vec<&'static str>) {
         NginxSetting::RobotsTxt => (
             "Serve a generated robots.txt",
             vec!["Off — leave /robots.txt alone", "On — replace /robots.txt"],
+        ),
+        // Rates rather than a free-text number, for the same reason the
+        // Dashboard's detector popup offers fixed TTLs: this screen has
+        // one interaction pattern (pick one of N) and a numeric entry
+        // field would be the only exception to it. The CLI takes any
+        // value for anyone who needs one off this list.
+        NginxSetting::RateLimit => (
+            "Rate limit per client address",
+            vec![
+                "Off",
+                "On — 5 req/s, burst 10",
+                "On — 10 req/s, burst 20",
+                "On — 30 req/s, burst 60",
+            ],
         ),
     }
 }
@@ -125,15 +143,22 @@ enum NginxSetting {
     Response,
     /// Whether to generate and serve a `robots.txt`.
     RobotsTxt,
+    /// Whether NGINX rate-limits requests per client address.
+    RateLimit,
 }
 
 impl NginxSetting {
-    const ALL: [NginxSetting; 2] = [NginxSetting::Response, NginxSetting::RobotsTxt];
+    const ALL: [NginxSetting; 3] = [
+        NginxSetting::Response,
+        NginxSetting::RobotsTxt,
+        NginxSetting::RateLimit,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             NginxSetting::Response => "Block response",
             NginxSetting::RobotsTxt => "robots.txt",
+            NginxSetting::RateLimit => "Rate limit",
         }
     }
 }
@@ -178,6 +203,9 @@ pub struct SiteSettings {
     setting_popup: Option<SettingPopup>,
     block_response: BlockResponse,
     serve_robots_txt: bool,
+    rate_limit_enabled: bool,
+    rate_limit_rps: i64,
+    rate_limit_burst: i64,
 }
 
 impl SiteSettings {
@@ -195,12 +223,18 @@ impl SiteSettings {
             setting_popup: None,
             block_response: BlockResponse::default(),
             serve_robots_txt: false,
+            rate_limit_enabled: false,
+            rate_limit_rps: 0,
+            rate_limit_burst: 0,
         }
     }
 
     pub fn refresh(&mut self, db: &Db) -> Result<()> {
         self.block_response = db.get_block_response()?;
         self.serve_robots_txt = db.get_serve_robots_txt()?;
+        self.rate_limit_enabled = db.get_rate_limit_enabled()?;
+        self.rate_limit_rps = db.get_rate_limit_rps()?;
+        self.rate_limit_burst = db.get_rate_limit_burst()?;
         self.sites = db.list_sites()?;
         self.statuses = self
             .sites
@@ -286,6 +320,14 @@ impl SiteSettings {
     /// list. Only highlights its selection while it actually has focus, so
     /// there's never a second reversed row competing with the site list's.
     fn render_settings(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let rate_limit_label = if self.rate_limit_enabled {
+            format!(
+                "{} req/s, burst {}",
+                self.rate_limit_rps, self.rate_limit_burst
+            )
+        } else {
+            "off".to_string()
+        };
         let items: Vec<ListItem> = NginxSetting::ALL
             .iter()
             .map(|setting| {
@@ -298,6 +340,7 @@ impl SiteSettings {
                             "not managed"
                         }
                     }
+                    NginxSetting::RateLimit => &rate_limit_label,
                 };
                 ListItem::new(Line::from(vec![
                     format!("{:<18}", setting.label()).into(),
@@ -605,6 +648,27 @@ impl SiteSettings {
                 BlockResponse::Close => 1,
             },
             NginxSetting::RobotsTxt => usize::from(self.serve_robots_txt),
+            NginxSetting::RateLimit => {
+                if !self.rate_limit_enabled {
+                    0
+                } else {
+                    // Land on whichever preset matches the stored rate, or
+                    // the nearest one — a rate set from the CLI that isn't
+                    // on this list must still open as *on*, never as "Off".
+                    RATE_LIMIT_PRESETS
+                        .iter()
+                        .position(|(rps, _)| *rps == self.rate_limit_rps)
+                        .unwrap_or_else(|| {
+                            RATE_LIMIT_PRESETS
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, (rps, _))| (rps - self.rate_limit_rps).abs())
+                                .map(|(i, _)| i)
+                                .unwrap_or(0)
+                        })
+                        + 1
+                }
+            }
         };
         self.setting_popup = Some(SettingPopup { setting, selected });
     }
@@ -634,6 +698,32 @@ impl SiteSettings {
                     "Block response set to {} — apply (a/A) to update site configs",
                     response.label()
                 ));
+            }
+            NginxSetting::RateLimit => {
+                let chosen = popup
+                    .selected
+                    .checked_sub(1)
+                    .and_then(|i| RATE_LIMIT_PRESETS.get(i).copied());
+                match chosen {
+                    None => {
+                        if !self.rate_limit_enabled {
+                            return Ok(());
+                        }
+                        db.set_rate_limit_enabled(false)?;
+                        *message = Some(
+                            "Rate limiting off — apply (a/A) to remove it from site configs"
+                                .to_string(),
+                        );
+                    }
+                    Some((rps, burst)) => {
+                        db.set_rate_limit_rps(rps)?;
+                        db.set_rate_limit_burst(burst)?;
+                        db.set_rate_limit_enabled(true)?;
+                        *message = Some(format!(
+                            "Rate limit {rps} req/s, burst {burst} — apply (a/A) to write it"
+                        ));
+                    }
+                }
             }
             NginxSetting::RobotsTxt => {
                 let serve = popup.selected == 1;
@@ -698,6 +788,12 @@ impl SiteSettings {
     /// reload NGINX. On failure, also sets `self.alert` so the error is
     /// actually visible on this screen; a permission-denied write gets an
     /// extra, actionable suggestion.
+    /// Applying *one* site never removes a generated file, even when the
+    /// feature that produced it is now off: the other sites on this host
+    /// still carry the directive that references it, and deleting a
+    /// rate-limit zone out from under them makes NGINX refuse to load at
+    /// all. Only `apply_all`, which brings every site into line, can
+    /// safely clean up.
     fn apply_site(&mut self, db: &Db, index: usize) -> (String, bool) {
         let server_name = self.sites[index].server_name.clone();
         match self.run_apply_site(db, index) {
@@ -735,6 +831,10 @@ impl SiteSettings {
     /// `apply_site`'s.
     fn apply_all(&mut self, db: &Db) -> (String, bool) {
         let total = self.sites.len();
+        // Deliberately not removing unused managed files here: `apply_all`
+        // can partially fail, and deleting a rate-limit zone while some
+        // site still references it makes NGINX refuse to load entirely.
+        // The cleanup happens once every site succeeded, below.
         let mut applied = 0;
         let mut unchanged = 0;
         let mut failures = Vec::new();
@@ -748,6 +848,19 @@ impl SiteSettings {
                     any_permission_denied |= is_permission_denied(&err);
                     failures.push(format!("{}: {err}", self.sites[index].server_name));
                 }
+            }
+        }
+
+        if failures.is_empty() {
+            // Every site is now in line with the current settings, so a
+            // file none of them references any more is safe to delete.
+            // A failure here is reported but doesn't undo the apply: the
+            // config on disk is valid either way, just with a stale file
+            // left behind.
+            if let Err(err) = nginx::remove_unused_managed_files(db) {
+                self.alert = Some(format!(
+                    "Applied, but cleaning up generated files failed:\n{err}"
+                ));
             }
         }
 

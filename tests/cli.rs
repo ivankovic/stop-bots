@@ -733,6 +733,122 @@ fn robots_txt_is_generated_aliased_and_then_removed_again() {
     assert!(!robots.exists(), "the generated file should be removed");
 }
 
+/// Rate limiting end to end, and specifically the ordering that keeps the
+/// config valid: the http-context zone file must exist while any server
+/// block references it, and must only be deleted once none does.
+#[test]
+fn rate_limit_writes_the_zone_file_and_removes_it_only_after_the_directive_goes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    let managed = tmp.path().join("managed");
+    let conf_d = tmp.path().join("conf.d");
+    fs::create_dir_all(&nginx_root).unwrap();
+
+    let site = nginx_root.join("site.conf");
+    fs::write(
+        &site,
+        "server {\n    listen 80;\n    server_name a.example;\n}\n",
+    )
+    .unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let apply = || {
+        Command::cargo_bin("stop-bots")
+            .unwrap()
+            .env("STOP_BOTS_NGINX_DIR", &managed)
+            .env("STOP_BOTS_NGINX_CONF_D", &conf_d)
+            .args([
+                "apply-blocks",
+                "--root",
+                nginx_root.to_str().unwrap(),
+                "--db",
+                db_path.to_str().unwrap(),
+                "--no-reload",
+            ])
+            .assert()
+            .success();
+    };
+
+    let zone_file = conf_d.join("stop-bots-limits.conf");
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-rate-limit",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--enabled",
+            "true",
+            "--rps",
+            "7",
+            "--burst",
+            "14",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("7 req/s"));
+
+    apply();
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(written.contains("limit_req zone=stop_bots burst=14 nodelay;"));
+    assert!(written.contains("limit_req_status 429;"));
+
+    let zone = fs::read_to_string(&zone_file).expect("zone file should exist");
+    assert!(zone.contains("rate=7r/s"));
+    // The zone the server block references is the zone that was defined.
+    assert!(zone.contains("zone=stop_bots:"));
+
+    // Parameters persist across a disable, so re-enabling doesn't silently
+    // revert to defaults.
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-rate-limit",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--enabled",
+            "false",
+        ])
+        .assert()
+        .success();
+
+    // Still present until an apply actually rewrites the config — deleting
+    // it while the directive is live would make nginx -t fail outright.
+    assert!(zone_file.exists());
+
+    apply();
+    assert!(!fs::read_to_string(&site).unwrap().contains("limit_req"));
+    assert!(
+        !zone_file.exists(),
+        "zone file should be removed after apply"
+    );
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-rate-limit",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--enabled",
+            "true",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("7 req/s"));
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();
