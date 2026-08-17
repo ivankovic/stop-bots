@@ -59,6 +59,16 @@ below. What's left:
 
 ### Loose ends from the work that shipped
 
+* **None of the newly generated NGINX syntax has been checked against a real
+  `nginx -t`** — nginx isn't installed in the development environment, the same
+  caveat already recorded below for `iptables::render`/`nftables::render`. Five
+  new directive forms went in unvalidated: the `set $stop_bots_block` flag
+  idiom, `limit_req`, `limit_req_status`, `location = /robots.txt` with
+  `alias`, and the `^(...)` `$request_uri` regex. The tests assert the strings
+  we *generate*, which is exactly the check that still passes when the syntax
+  is wrong. Worth one manual pass on a real box: enable everything, apply, and
+  run `nginx -t`.
+
 * The README still describes the pre-existing feature set. AGENTS.md says not
   to touch README.md unless explicitly asked, so it was left alone — but it now
   omits four detectors, the reputation feeds, robots.txt generation, rate

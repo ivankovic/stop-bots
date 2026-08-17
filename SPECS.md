@@ -2577,3 +2577,27 @@ rule and sees the blocked traffic with nothing connecting the two.
 Ordering of paths comes from SQL (`ORDER BY path`) for a reason: an
 unstable order would make the rendered block differ run to run, and every
 site would read as `STALE` forever.
+
+## robots.txt and the block are in the same phase — the implicit exemption
+
+A bug caught only by reasoning through NGINX's request phases, because
+every test here asserts generated text rather than served behaviour.
+
+Server-level `if`/`return` (the `ngx_http_rewrite_module` directives the
+sentinel block is built from) execute in the **server rewrite phase**,
+which runs *before* location selection. So a user agent matched by the
+block is finalised with 403/444 before NGINX ever considers the
+`location = /robots.txt` sitting a few lines below it in the same block.
+
+The consequence was that the generated robots.txt listed exactly the user
+agents that could never fetch it. The polite layer would have been pure
+decoration, and the honeypot's `Disallow:` line would only ever have been
+readable by clients that weren't being blocked anyway.
+
+`effective_exempt_paths` therefore adds `/robots.txt` to the exemption
+list whenever the block serves it, which forces the flag form (the direct
+`return` form has nowhere to put an exemption). Serving robots.txt to a
+blocked crawler is also the behaviour worth wanting independently: a bot
+that can read the file can learn to stop asking, whereas one that gets a
+bare 403 on everything learns nothing and keeps coming back — for the cost
+of one small static file.

@@ -596,7 +596,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         return None;
     }
     let code = config.response.status_code();
-    let exemptions = exemption_regex(&config.exempt_paths);
+    let exemptions = exemption_regex(&effective_exempt_paths(config));
 
     let mut out = format!("    {BLOCK_BEGIN}\n");
     if let Some(pattern) = &pattern {
@@ -658,6 +658,29 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     }
     out.push_str(&format!("    {BLOCK_END}\n"));
     Some(out)
+}
+
+/// The exemptions actually applied: the site's configured ones, plus
+/// `/robots.txt` itself whenever this block serves it.
+///
+/// That addition is not a convenience, it's what makes robots.txt work at
+/// all. Server-level `if`/`return` run in NGINX's **server rewrite
+/// phase**, which happens *before* location selection — so a user agent
+/// caught by the block never reaches the `location = /robots.txt` block
+/// underneath it. Without this, the generated robots.txt would list
+/// exactly the agents that can never read it, and the polite layer would
+/// be pure decoration.
+///
+/// Letting a blocked crawler read robots.txt is also the behaviour worth
+/// wanting on its own: a bot that can fetch the file can learn to stop
+/// asking, whereas one that gets a bare 403 on everything learns nothing
+/// and keeps coming back. Serving it costs a single small static file.
+fn effective_exempt_paths(config: &BlockConfig) -> Vec<String> {
+    let mut paths = config.exempt_paths.clone();
+    if config.serve_robots_txt {
+        paths.push("/robots.txt".to_string());
+    }
+    paths
 }
 
 /// Builds the `$request_uri` regex that clears the block flag, or `None`
@@ -1850,6 +1873,55 @@ mod tests {
         // Would terminate the quoted config string.
         assert_eq!(exemption_regex(&["/a\"b".to_string()]), None);
         assert_eq!(exemption_regex(&[]), None);
+    }
+
+    /// The bug this guards against: server-level `if`/`return` run before
+    /// location selection, so without an implicit `/robots.txt` exemption
+    /// the generated robots.txt would be 403'd for precisely the user
+    /// agents it names.
+    #[test]
+    fn serving_robots_txt_exempts_robots_txt_from_the_block() {
+        let config = BlockConfig {
+            patterns: vec!["BadBot".to_string()],
+            response: BlockResponse::Forbidden,
+            serve_robots_txt: true,
+            rate_limit_burst: None,
+            exempt_paths: Vec::new(),
+        };
+        let text = block_text(&config).unwrap();
+
+        // The presence of robots.txt alone forces the flag form, because
+        // the direct-`return` form has nowhere to put an exemption.
+        assert!(text.contains("$stop_bots_block"));
+        assert!(text.contains("/robots\\.txt"), "text was:\n{text}");
+        // And the clear still happens after the set, before the act.
+        let set_one = text.find("set $stop_bots_block 1;").unwrap();
+        let clear = text.rfind("set $stop_bots_block 0;").unwrap();
+        let act = text.find("if ($stop_bots_block) {").unwrap();
+        assert!(set_one < clear && clear < act);
+    }
+
+    #[test]
+    fn robots_txt_exemption_combines_with_configured_ones() {
+        let config = BlockConfig {
+            patterns: vec!["BadBot".to_string()],
+            response: BlockResponse::Forbidden,
+            serve_robots_txt: true,
+            rate_limit_burst: None,
+            exempt_paths: vec!["/blog".to_string()],
+        };
+        let text = block_text(&config).unwrap();
+        assert!(text.contains("/blog"));
+        assert!(text.contains("/robots\\.txt"));
+    }
+
+    /// Not serving robots.txt means no implicit exemption, so a site with
+    /// no configured exemptions keeps the direct-`return` form.
+    #[test]
+    fn no_robots_txt_means_no_implicit_exemption() {
+        let text = block_text(&cfg(&["BadBot"])).unwrap();
+        assert!(!text.contains("$stop_bots_block"));
+        assert!(!text.contains("robots"));
     }
 
     #[test]
