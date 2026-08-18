@@ -5,11 +5,185 @@
 //! source and opens its update-confirmation popup -> quit.
 
 use assert_cmd::Command as AssertCommand;
-use rexpect::session::{spawn_command, PtySession};
-use rexpect::ReadUntil;
-use std::os::fd::AsRawFd;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+// ---- pty harness ----
+//
+// A deliberately small pty driver, in-repo, instead of a pty crate. The
+// specific reason: rexpect (used previously) sleeps a fixed 100ms between
+// polls inside `expect`, so every expectation that doesn't match on the
+// very first read pays up to a 100ms quantum — and these tests make six to
+// twenty expectations each, which put a hard floor of over a second under
+// every test regardless of how fast the application actually was (first
+// draw: ~150ms; a keystroke round-trip: single-digit ms). Owning the loop
+// makes the poll interval 2ms and the harness fully inspectable.
+
+struct PtySession {
+    master: File,
+    child: Child,
+    /// Everything read from the pty and not yet consumed by a match. An
+    /// expectation consumes the buffer up to and including its needle, so
+    /// successive expectations scan strictly forward through the output —
+    /// the same semantics the tests were written against.
+    buf: String,
+    timeout: Duration,
+}
+
+fn spawn_in_pty(mut cmd: Command, rows: u16, cols: u16, timeout: Duration) -> PtySession {
+    let mut master_fd: libc::c_int = 0;
+    let mut slave_fd: libc::c_int = 0;
+    // The window size is set at open. A fresh pty defaults to 0x0, which
+    // makes every ratatui widget render into a zero-area Rect — nothing
+    // visible, ever — so this must happen before the child's first draw.
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            &winsize,
+        )
+    };
+    assert_eq!(rc, 0, "openpty failed");
+    let master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    unsafe {
+        let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    cmd.stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave));
+    unsafe {
+        cmd.pre_exec(|| {
+            // New session, and make the pty slave (already dup'ed onto
+            // stdin by the time pre_exec closures run) the controlling
+            // terminal, so the child's /dev/tty resolves to our pty.
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0);
+            Ok(())
+        });
+    }
+    let child = cmd.spawn().expect("failed to spawn in pty");
+    PtySession {
+        master,
+        child,
+        buf: String::new(),
+        timeout,
+    }
+}
+
+impl PtySession {
+    /// Drains whatever the child has written so far into `buf`. Returns
+    /// whether the stream has ended (EOF, or EIO — which is how Linux
+    /// reports "the last slave handle closed" to the master side).
+    fn read_available(&mut self) -> bool {
+        let mut tmp = [0u8; 65536];
+        loop {
+            match self.master.read(&mut tmp) {
+                Ok(0) => return true,
+                Ok(n) => self.buf.push_str(&String::from_utf8_lossy(&tmp[..n])),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+                Err(_) => return true,
+            }
+        }
+    }
+
+    fn consume_through(&mut self, pos: usize, len: usize) {
+        self.buf.drain(..pos + len);
+    }
+
+    /// Waits until `needle` appears in the output, consuming through it.
+    pub fn exp_string(&mut self, needle: &str) -> Result<(), String> {
+        self.exp_any(&[needle]).map(|_| ())
+    }
+
+    /// Waits until the earliest of `needles` appears, consuming through it
+    /// and returning the one that matched.
+    pub fn exp_any(&mut self, needles: &[&str]) -> Result<String, String> {
+        let start = Instant::now();
+        loop {
+            let eof = self.read_available();
+            let earliest = needles
+                .iter()
+                .filter_map(|n| self.buf.find(n).map(|pos| (pos, *n)))
+                .min_by_key(|(pos, _)| *pos);
+            if let Some((pos, matched)) = earliest {
+                self.consume_through(pos, matched.len());
+                return Ok(matched.to_string());
+            }
+            if eof {
+                return Err(format!(
+                    "stream ended while waiting for {needles:?}; unconsumed output: {:?}",
+                    tail(&self.buf)
+                ));
+            }
+            if start.elapsed() > self.timeout {
+                return Err(format!(
+                    "timed out ({:?}) waiting for {needles:?}; unconsumed output: {:?}",
+                    self.timeout,
+                    tail(&self.buf)
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Waits for the child to close its side of the pty and exit.
+    pub fn exp_eof(&mut self) -> Result<(), String> {
+        let start = Instant::now();
+        loop {
+            if self.read_available() {
+                let _ = self.child.wait();
+                return Ok(());
+            }
+            if start.elapsed() > self.timeout {
+                return Err(format!(
+                    "timed out ({:?}) waiting for the process to exit",
+                    self.timeout
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    pub fn send(&mut self, keys: &str) -> Result<(), String> {
+        self.master
+            .write_all(keys.as_bytes())
+            .and_then(|()| self.master.flush())
+            .map_err(|e| format!("failed to write to pty: {e}"))
+    }
+}
+
+/// A child left running after a panicking test would outlive the test
+/// binary and hold the pty open; kill it. Killing an already-exited child
+/// is a harmless error.
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The last part of the unconsumed buffer, for failure messages — enough
+/// to see what the screen actually said without dumping kilobytes of
+/// escape sequences.
+fn tail(buf: &str) -> &str {
+    &buf[buf.len().saturating_sub(600)..]
+}
 
 /// How long an `exp_string` waits before declaring failure.
 ///
@@ -51,7 +225,28 @@ fn spawn_tui_with_root(db_path: &Path, root: &Path) -> PtySession {
     spawn_tui_with_args(db_path, &["--root", root.to_str().unwrap()])
 }
 
+/// Marks every internal-cron job as freshly run, so the TUI under test
+/// never starts background work of its own. On a brand-new database every
+/// job is due immediately, so without this each pty test silently kicked
+/// off three real HTTP fetches (crawler IP ranges) and a `journalctl`
+/// subprocess in the background — a network and system dependency nothing
+/// here asserts on, and part of the fixed cost every test in this file
+/// used to carry. Seeding goes through the real `Db` interface, not a
+/// test-only knob in the product.
+fn seed_cron_state(db_path: &Path) {
+    let db = stop_bots::db::Db::open(db_path).expect("failed to open the test db");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    for job in stop_bots::cron::CronJob::ALL {
+        db.set_cron_last_run(job.id(), now, "skipped for test")
+            .expect("failed to seed cron state");
+    }
+}
+
 fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
+    seed_cron_state(db_path);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
     // `--no-reload`: some of these tests drive a real Site settings apply
     // through this real spawned process, and without this it would shell
@@ -59,34 +254,46 @@ fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
     // machine runs the test suite (see `main.rs`'s `apply-blocks
     // --no-reload`, the same escape hatch for the CLI's own apply path).
     cmd.args(["tui", "--db", db_path.to_str().unwrap(), "--no-reload"]);
+    // A fixture SSH log, for the same reason the CLI tests pass --ssh-log:
+    // auto-detection reads whatever log the host machine has — or shells
+    // out to `journalctl`, which costs upwards of half a second per
+    // Dynamic Protection refresh on some hosts and made every test in this
+    // file carry that as fixed overhead.
+    cmd.args(["--ssh-log", "tests/fixtures/logs/auth.log"]);
     cmd.args(extra_args);
     cmd.env("TERM", "xterm-256color");
 
-    let session = spawn_command(cmd, Some(timeout_ms())).expect("failed to spawn stop-bots tui");
-    set_window_size(&session, 32, 100);
-    session
+    spawn_in_pty(cmd, 32, 100, Duration::from_millis(timeout_ms()))
 }
 
-fn set_window_size(session: &PtySession, rows: u16, cols: u16) {
-    let file = session
-        .process()
-        .get_file_handle()
-        .expect("failed to get pty file handle");
-    let winsize = libc::winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    let result = unsafe { libc::ioctl(file.as_raw_fd(), libc::TIOCSWINSZ, &winsize) };
-    assert_eq!(result, 0, "failed to set pty window size");
+/// Like [`spawn_tui`], but *without* `--no-reload` and with `fakebin`
+/// prepended to the child's PATH — for tests that exercise the code paths
+/// which really execute external tools (`nft -f`, `nginx -t`,
+/// `systemctl`), against fake executables rather than by skipping the
+/// execution. `--no-reload` is the escape hatch that avoids running the
+/// tools at all; this is the opposite: run them, and control what they
+/// resolve to.
+fn spawn_tui_with_fake_tools(db_path: &Path, fakebin: &Path) -> PtySession {
+    seed_cron_state(db_path);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
+    cmd.args(["tui", "--db", db_path.to_str().unwrap()]);
+    cmd.args(["--ssh-log", "tests/fixtures/logs/auth.log"]);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env(
+        "PATH",
+        format!(
+            "{}:{}",
+            fakebin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    spawn_in_pty(cmd, 32, 100, Duration::from_millis(timeout_ms()))
 }
 
-/// Sends a raw key sequence (no implicit newline) and flushes it, so the
-/// child sees it immediately even when it doesn't itself end in `\n`.
+/// Sends a raw key sequence (no implicit newline); the pty write is
+/// unbuffered, so the child sees it immediately.
 fn send_key(session: &mut PtySession, keys: &str) {
     session.send(keys).unwrap();
-    session.flush().unwrap();
 }
 
 /// Sends a bare Escape, separated from whatever comes next by a short
@@ -118,12 +325,7 @@ fn send_escape(session: &mut PtySession) {
 /// to the label first is what makes the assertion specific to that row.
 fn expect_status_after(session: &mut PtySession, anchor: &str) -> &'static str {
     session.exp_string(anchor).unwrap();
-    let (_, matched) = session
-        .exp_any(vec![
-            ReadUntil::String("[ ALLOWED ]".to_string()),
-            ReadUntil::String("[ BLOCKED ]".to_string()),
-        ])
-        .unwrap();
+    let matched = session.exp_any(&["[ ALLOWED ]", "[ BLOCKED ]"]).unwrap();
     if matched.contains("ALLOWED") {
         "ALLOWED"
     } else {
@@ -881,4 +1083,63 @@ fn dashboard_geo_mode_toggle_switches_to_allowlist() {
     session
         .exp_eof()
         .expect("process should exit after q on the Dashboard");
+}
+
+/// The one code path in the whole project that *executes* a generated
+/// firewall script — the render popup's "apply after writing" toggle —
+/// driven end to end against a fake `nft` on PATH. Everything real runs:
+/// the popup, the path editing, the render, the write, the process spawn,
+/// the exit-code handling; only the binary that PATH resolves is ours.
+#[test]
+fn dashboard_render_popup_applies_the_script_through_nft() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let out_path = tmp.path().join("fw.nft");
+
+    // A fake nft that records its argv and succeeds.
+    let fakebin = tmp.path().join("fakebin");
+    fs::create_dir_all(&fakebin).unwrap();
+    let calls = tmp.path().join("calls.log");
+    fs::write(
+        fakebin.join("nft"),
+        format!(
+            "#!/bin/sh\necho \"nft $@\" >> \"{}\"\nexit 0\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(fakebin.join("nft"), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut session = spawn_tui_with_fake_tools(&db_path, &fakebin);
+    session.exp_string("Dashboard").unwrap();
+
+    // Open the render popup; replace the default output path with ours.
+    send_key(&mut session, "f");
+    // Single-word needles throughout: the diffed terminal only transmits
+    // cells that changed, and the spaces between words routinely land on
+    // cells that were already blank — so a multi-word needle may never
+    // arrive contiguously even though every word is on screen.
+    session.exp_string("writing:").unwrap();
+    for _ in 0.."/etc/stop-bots/firewall.nft".len() {
+        send_key(&mut session, "\x7f");
+    }
+    for c in out_path.to_str().unwrap().chars() {
+        send_key(&mut session, &c.to_string());
+    }
+    // Space toggles "apply after writing"; Enter confirms (backend defaults
+    // to nftables).
+    send_key(&mut session, " ");
+    send_key(&mut session, "\r");
+    session.exp_string("applied").unwrap();
+
+    let script = fs::read_to_string(&out_path).expect("the script should have been written");
+    assert!(script.contains("table"), "script was: {script}");
+    let log = fs::read_to_string(&calls).expect("nft should have been invoked");
+    assert_eq!(log.trim(), format!("nft -f {}", out_path.display()));
+
+    send_key(&mut session, "q");
+    session.exp_eof().unwrap();
 }
