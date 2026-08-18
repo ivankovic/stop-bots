@@ -14,6 +14,9 @@ need.
   so a pointed answer to an AI crawler), `418` (RFC 2324's teapot), `444` (close without
   replying), or a tarpit that answers 403 with the body throttled to a byte per second. Each
   option states what it is for in the chooser. Existing `403`/`444` settings are unchanged.
+- Payment terms for the 402 response: a price and a contact, sent as the response body so a
+  crawler's operator learns what access costs and where to arrange it (`set-payment-terms` /
+  `show-payment-terms`, or the two rows that appear on Site settings once 402 is chosen).
 
 - Six per-site request-shape rules (Site settings → open a site → Request rules), each its
   own toggle and each off by default: reject HTTP/1.0-1.1, a missing `Accept`, a missing

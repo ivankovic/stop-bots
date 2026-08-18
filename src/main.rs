@@ -462,6 +462,34 @@ enum Command {
         #[arg(long)]
         burst: Option<i64>,
     },
+    /// Sets the price and contact advertised in a `402 Payment Required`
+    /// response. Only used when the block response is `payment-required`.
+    ///
+    /// Both are free text — a line a human operating a crawler can read
+    /// and act on. There is no interoperable machine-readable format a
+    /// generated NGINX config could emit here: the emerging ones (x402's
+    /// JSON challenge, pay-per-crawl's signed headers) need a payment
+    /// endpoint and a settlement path, which this tool does not own.
+    /// Neither value may contain a double quote or end in a backslash —
+    /// both would corrupt the generated config.
+    ///
+    /// Pass empty strings to clear.
+    SetPaymentTerms {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// e.g. "USD 0.01 per request" or "EUR 500/month"
+        #[arg(long, default_value = "")]
+        price: String,
+        /// A URL or email address where access can be arranged
+        #[arg(long, default_value = "")]
+        contact: String,
+    },
+    /// Prints the 402 body that would currently be sent, without writing
+    /// anything
+    ShowPaymentTerms {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+    },
     /// Turns generation of a `robots.txt` on or off. When on, ApplyBlocks
     /// writes one to /etc/stop-bots/nginx/robots.txt and adds a
     /// `location = /robots.txt` block to each site that serves it: one
@@ -697,6 +725,10 @@ async fn main() -> Result<()> {
             rps,
             burst,
         }) => set_rate_limit(db, enabled, rps, burst),
+        Some(Command::SetPaymentTerms { db, price, contact }) => {
+            set_payment_terms(db, price, contact)
+        }
+        Some(Command::ShowPaymentTerms { db }) => show_payment_terms(db),
         Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
         Some(Command::ShowRobotsTxt { db }) => show_robots_txt(db),
     }
@@ -1097,6 +1129,43 @@ fn set_rate_limit(
         println!("Rate limiting off.");
     }
     println!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    Ok(())
+}
+
+fn set_payment_terms(db_path: Option<PathBuf>, price: String, contact: String) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_payment_terms(&price, &contact)?;
+    if price.trim().is_empty() && contact.trim().is_empty() {
+        println!("Payment terms cleared.");
+        return Ok(());
+    }
+    println!("Payment terms set.");
+    // Said explicitly, because the terms are stored regardless and it
+    // would otherwise look as though nothing happened.
+    if db.get_block_response()? != stop_bots::db::BlockResponse::PaymentRequired {
+        println!(
+            "Note: the block response is currently {}, so these terms aren't sent. Run \
+             `stop-bots set-block-response --response payment-required` to use them.",
+            db.get_block_response()?.label()
+        );
+    }
+    println!("Run `stop-bots apply-blocks` to write it into the site configs.");
+    Ok(())
+}
+
+fn show_payment_terms(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+    let body = nginx::payment_body(&db)?;
+    if body.is_empty() {
+        println!(
+            "No 402 body would be sent (needs the payment-required response and at least one \
+             of --price / --contact)."
+        );
+        return Ok(());
+    }
+    // Stored with literal `\n` escapes, because that is what goes into the
+    // NGINX config; unescape them so this prints as the client sees it.
+    print!("{}", body.replace("\\n", "\n"));
     Ok(())
 }
 

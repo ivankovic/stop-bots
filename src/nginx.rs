@@ -506,6 +506,12 @@ pub struct BlockConfig {
     /// `return`, because NGINX has no way to say "match this user agent
     /// unless the path is one of these" in a single condition.
     pub exempt_paths: Vec<String>,
+    /// The body sent with a `402 Payment Required`, or empty for none.
+    ///
+    /// Only ever non-empty when `response` is `PaymentRequired`, and only
+    /// when the admin actually set terms — a bare 402 with no explanation
+    /// tells a crawler operator nothing they can act on.
+    pub payment_body: String,
     /// Per-site [`RequestRule`]s switched on for this site.
     ///
     /// These decide a request is unwanted from its shape rather than from
@@ -707,7 +713,48 @@ pub fn block_config_for_site(db: &crate::db::Db, site_id: i64) -> Result<BlockCo
         rate_limit_burst: rate_limit_burst(db)?,
         exempt_paths: db.site_path_exemptions(site_id)?,
         request_rules: site_request_rules(db, site_id)?,
+        payment_body: payment_body(db)?,
     })
+}
+
+/// The body to send with a `402`, assembled from the stored terms.
+///
+/// Empty unless the response actually *is* 402 and at least one term is
+/// set: attaching a payment notice to a 403 would be nonsense, and a 402
+/// with an empty body is what an unconfigured install already sends.
+///
+/// The text is deliberately plain and short. There is no interoperable
+/// machine-readable format a generated NGINX config could emit that a
+/// crawler would reliably parse — the emerging ones (x402's JSON
+/// challenge, pay-per-crawl's signed headers) need a payment endpoint and
+/// a settlement path this tool has no business owning. What it *can* do
+/// is make sure the human operating that crawler is told the price and
+/// where to arrange access, which is the part that actually gets a
+/// licence signed.
+///
+/// `\n` is a real escape in an NGINX quoted string, so the body is
+/// genuinely multi-line. It stays well under the ~4KB single-parameter
+/// ceiling that forced robots.txt into a separate file
+/// (`MAX_PATTERN_CHUNK_LEN`'s doc comment has the details).
+pub fn payment_body(db: &crate::db::Db) -> Result<String> {
+    if db.get_block_response()? != BlockResponse::PaymentRequired {
+        return Ok(String::new());
+    }
+    let price = db.get_payment_price()?;
+    let contact = db.get_payment_contact()?;
+    if price.is_empty() && contact.is_empty() {
+        return Ok(String::new());
+    }
+
+    let mut body = String::from("402 Payment Required\\n\\n");
+    body.push_str("Automated access to this site requires a licence.\\n");
+    if !price.is_empty() {
+        body.push_str(&format!("Price: {price}\\n"));
+    }
+    if !contact.is_empty() {
+        body.push_str(&format!("Arrange access: {contact}\\n"));
+    }
+    Ok(body)
 }
 
 /// The request-shape rules switched on for one site, in a stable order.
@@ -738,6 +785,7 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
         // definition — both are keyed on `sites.id`.
         exempt_paths: Vec::new(),
         request_rules: Vec::new(),
+        payment_body: payment_body(db)?,
     })
 }
 
@@ -804,10 +852,24 @@ fn block_text(config: &BlockConfig) -> Option<String> {
 
     // The tail shared by every blocker's `if`: set the flag, or return
     // directly when there's only one reason and nothing to exempt.
+    // `return <code> "<body>"` when there's something to say, plain
+    // `return <code>` otherwise.
+    //
+    // Everything the client is told has to fit in this body: `add_header`
+    // is not allowed in an `if` at `server` level (its contexts are http,
+    // server, location, and `if in location`), and hoisting it to server
+    // level would attach the header to every ordinary response too. So no
+    // `Link: rel="payment"` header — the body carries it all.
+    let returns = if config.payment_body.is_empty() {
+        format!("return {code};")
+    } else {
+        format!("return {code} \"{}\";", config.payment_body)
+    };
+
     let set_blocked = if uses_flag {
         "set $stop_bots_block 1;\n    }\n".to_string()
     } else {
-        format!("{throttle}return {code};\n    }}\n")
+        format!("{throttle}{returns}\n    }}\n")
     };
 
     if let Some(pattern) = &pattern {
@@ -830,7 +892,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     }
     if uses_flag {
         out.push_str(&format!(
-            "    if ($stop_bots_block) {{\n        {throttle}return {code};\n    }}\n"
+            "    if ($stop_bots_block) {{\n        {throttle}{returns}\n    }}\n"
         ));
     }
 
@@ -1818,6 +1880,7 @@ mod tests {
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
             request_rules: Vec::new(),
+            payment_body: String::new(),
         }
     }
 
@@ -1849,6 +1912,7 @@ mod tests {
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
             request_rules: Vec::new(),
+            payment_body: String::new(),
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("location = /robots.txt"), "text was:\n{text}");
@@ -1990,6 +2054,7 @@ mod tests {
             rate_limit_burst: Some(burst),
             exempt_paths: Vec::new(),
             request_rules: Vec::new(),
+            payment_body: String::new(),
         }
     }
 
@@ -2040,6 +2105,7 @@ mod tests {
             rate_limit_burst: Some(5),
             exempt_paths: Vec::new(),
             request_rules: Vec::new(),
+            payment_body: String::new(),
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("limit_req"), "text was:\n{text}");
@@ -2091,6 +2157,7 @@ mod tests {
             rate_limit_burst: None,
             exempt_paths: paths.iter().map(|p| p.to_string()).collect(),
             request_rules: Vec::new(),
+            payment_body: String::new(),
         }
     }
 
@@ -2171,6 +2238,7 @@ mod tests {
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
             request_rules: Vec::new(),
+            payment_body: String::new(),
         };
         let text = block_text(&config).unwrap();
 
@@ -2194,6 +2262,7 @@ mod tests {
             rate_limit_burst: None,
             exempt_paths: vec!["/blog".to_string()],
             request_rules: Vec::new(),
+            payment_body: String::new(),
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("/blog"), "text was:\n{text}");
@@ -2219,6 +2288,7 @@ mod tests {
             rate_limit_burst: None,
             exempt_paths: vec!["/blog".to_string()],
             request_rules: Vec::new(),
+            payment_body: String::new(),
         };
         let text = block_text(&config).unwrap();
 
@@ -2279,6 +2349,7 @@ mod tests {
             rate_limit_burst: Some(20),
             exempt_paths: vec!["/blog".to_string(), "/feed.xml".to_string()],
             request_rules: Vec::new(),
+            payment_body: String::new(),
         };
         let text = block_text(&config).unwrap();
         crate::golden::assert_golden("nginx-block-full.conf", &text);
@@ -2306,6 +2377,7 @@ mod tests {
     fn cfg_http1x(patterns: &[&str]) -> BlockConfig {
         BlockConfig {
             request_rules: vec![RequestRule::Http1x],
+            payment_body: String::new(),
             ..cfg(patterns)
         }
     }
@@ -2373,6 +2445,7 @@ mod tests {
     fn rejecting_http_1x_alone_still_writes_a_block() {
         let config = BlockConfig {
             request_rules: vec![RequestRule::Http1x],
+            payment_body: String::new(),
             ..BlockConfig::default()
         };
         let text = block_text(&config).unwrap();
@@ -2461,6 +2534,7 @@ mod tests {
     fn http_1x_rejection_matches_the_golden() {
         let config = BlockConfig {
             request_rules: vec![RequestRule::Http1x],
+            payment_body: String::new(),
             ..cfg(&["BadBot"])
         };
         crate::golden::assert_golden("nginx-block-http1x.conf", &block_text(&config).unwrap());
@@ -2579,6 +2653,7 @@ mod tests {
     fn every_request_rule_together_matches_the_golden() {
         let config = BlockConfig {
             request_rules: RequestRule::ALL.to_vec(),
+            payment_body: String::new(),
             ..cfg(&["BadBot"])
         };
         crate::golden::assert_golden(
@@ -2689,5 +2764,139 @@ mod tests {
             "nginx-block-tarpit.conf",
             &block_text(&cfg_response(BlockResponse::Tarpit)).unwrap(),
         );
+    }
+
+    // ---- 402 payment terms ----
+
+    fn db_with_terms(price: &str, contact: &str) -> crate::db::Db {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_block_response(BlockResponse::PaymentRequired)
+            .unwrap();
+        db.set_payment_terms(price, contact).unwrap();
+        db
+    }
+
+    #[test]
+    fn payment_body_carries_the_price_and_the_contact() {
+        let db = db_with_terms("USD 0.01 per request", "https://example.test/licensing");
+        let body = payment_body(&db).unwrap();
+        assert!(
+            body.contains("Price: USD 0.01 per request"),
+            "body was: {body}"
+        );
+        assert!(
+            body.contains("Arrange access: https://example.test/licensing"),
+            "body was: {body}"
+        );
+    }
+
+    /// Terms are stored regardless of the chosen response, so that
+    /// switching to 402 later doesn't lose them — but they must not be
+    /// attached to a 403.
+    #[test]
+    fn payment_body_is_empty_unless_the_response_is_402() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_payment_terms("USD 1", "https://example.test/")
+            .unwrap();
+        assert!(payment_body(&db).unwrap().is_empty());
+
+        db.set_block_response(BlockResponse::PaymentRequired)
+            .unwrap();
+        assert!(!payment_body(&db).unwrap().is_empty());
+    }
+
+    /// A 402 with no terms set is what an unconfigured install already
+    /// sends; adding an empty notice to it would be noise.
+    #[test]
+    fn payment_body_is_empty_when_no_terms_are_set() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_block_response(BlockResponse::PaymentRequired)
+            .unwrap();
+        assert!(payment_body(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn either_term_alone_is_enough_to_produce_a_body() {
+        assert!(payment_body(&db_with_terms("USD 1", ""))
+            .unwrap()
+            .contains("Price:"));
+        let contact_only = payment_body(&db_with_terms("", "billing@example.test")).unwrap();
+        assert!(contact_only.contains("Arrange access:"), "{contact_only}");
+        assert!(!contact_only.contains("Price:"), "{contact_only}");
+    }
+
+    #[test]
+    fn a_payment_body_is_returned_as_the_response_text() {
+        let config = BlockConfig {
+            response: BlockResponse::PaymentRequired,
+            payment_body: "402 Payment Required\\nPrice: USD 1\\n".to_string(),
+            ..cfg(&["BadBot"])
+        };
+        let text = block_text(&config).unwrap();
+        assert!(
+            text.contains(r#"return 402 "402 Payment Required\nPrice: USD 1\n";"#),
+            "text was:\n{text}"
+        );
+    }
+
+    #[test]
+    fn no_payment_body_leaves_a_bare_return() {
+        let config = BlockConfig {
+            response: BlockResponse::PaymentRequired,
+            ..cfg(&["BadBot"])
+        };
+        let text = block_text(&config).unwrap();
+        assert!(text.contains("return 402;"), "text was:\n{text}");
+    }
+
+    /// A quote would terminate the generated config's string early and
+    /// corrupt every directive after it. Rejected at the point of entry
+    /// rather than dropped silently at render time.
+    #[test]
+    fn payment_terms_that_would_corrupt_the_config_are_refused() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        assert!(db.set_payment_terms(r#"USD "cheap""#, "").is_err());
+        assert!(db.set_payment_terms("", "https://x.test/\\").is_err());
+        assert!(db.set_payment_terms(&"x".repeat(201), "").is_err());
+        // ...and nothing was stored by the failed attempts.
+        assert!(db.get_payment_price().unwrap().is_empty());
+    }
+
+    #[test]
+    fn changing_payment_terms_makes_an_applied_site_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+
+        let with_terms = BlockConfig {
+            response: BlockResponse::PaymentRequired,
+            payment_body: "Price: USD 1\\n".to_string(),
+            ..cfg(&["BadBot"])
+        };
+        apply_block_for_site(&path, "a.example", &with_terms).unwrap();
+        assert_eq!(
+            site_apply_status(&path, "a.example", &with_terms),
+            SiteApplyStatus::UpToDate
+        );
+
+        let changed = BlockConfig {
+            payment_body: "Price: USD 2\\n".to_string(),
+            ..with_terms
+        };
+        assert_eq!(
+            site_apply_status(&path, "a.example", &changed),
+            SiteApplyStatus::Stale
+        );
+    }
+
+    #[test]
+    fn payment_required_matches_the_golden() {
+        let db = db_with_terms("USD 0.01 per request", "https://example.test/licensing");
+        let config = BlockConfig {
+            response: BlockResponse::PaymentRequired,
+            payment_body: payment_body(&db).unwrap(),
+            ..cfg(&["BadBot"])
+        };
+        crate::golden::assert_golden("nginx-block-402.conf", &block_text(&config).unwrap());
     }
 }

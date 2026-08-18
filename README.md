@@ -147,10 +147,29 @@ catch:
 | `404 Not Found` | hides that anything was blocked at all |
 | `410 Gone` | asks well-behaved crawlers to drop the URL **for good** — prefer this over 403 when you're turning away crawlers rather than attackers |
 | `429 Too Many Requests` | tells a polite client to back off and retry |
-| `402 Payment Required` | the closest thing to a standard "this content isn't free" — pay-per-crawl schemes have settled on it, which makes it a pointed answer to an AI crawler |
+| `402 Payment Required` | the closest thing to a standard "this content isn't free" — pay-per-crawl schemes have settled on it, which makes it a pointed answer to an AI crawler. Can carry your price and contact — see below |
 | `418 I'm a teapot` | RFC 2324's joke. It works; it just isn't IANA-registered, and NGINX sends it with an empty body |
 | `444 close connection` | no reply at all; cheapest, but indistinguishable from the server being down |
 | `Tarpit` | answers 403 but trickles the body at one byte per second, so the client waits instead of moving on |
+
+If you choose 402, two extra rows appear on the same panel: a **price** and a **contact**.
+Set either and the 402 carries them as its body:
+
+```
+402 Payment Required
+
+Automated access to this site requires a licence.
+Price: USD 0.01 per request
+Arrange access: https://example.com/licensing
+```
+
+Both are free text, and deliberately so. There is no interoperable machine-readable format a
+generated NGINX config can emit that a crawler will reliably parse — the emerging ones
+(x402's JSON challenge, pay-per-crawl's signed headers) need a payment endpoint and a
+settlement path this tool has no business owning. What it *can* do is make sure the person
+operating that crawler is told the price and where to arrange access, which is the part that
+actually gets a licence signed. Set them with `set-payment-terms`, preview with
+`show-payment-terms`.
 
 The tarpit is the gentlest option for a false positive — a wrongly caught client is slowed,
 not refused — and the harshest on cost for a bot, whose connection sits idle. Two things to

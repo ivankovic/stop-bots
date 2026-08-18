@@ -1087,6 +1087,65 @@ fn each_block_response_reaches_the_generated_config() {
     assert!(written.contains("return 403;"), "written was:\n{written}");
 }
 
+/// 402 payment terms end to end: they reach the generated config as the
+/// response body, and are only attached when the response is actually
+/// 402.
+#[test]
+fn payment_terms_reach_the_config_only_when_the_response_is_402() {
+    let fx = Fixture::new();
+    let site = fx.write_site("a.example");
+    fx.seed_bots();
+    fx.scan_sites();
+
+    fx.run(&[
+        "set-payment-terms",
+        "--price",
+        "USD 0.01 per request",
+        "--contact",
+        "https://example.test/licensing",
+    ])
+    // Stored, but inert until the response is switched — said plainly,
+    // since it would otherwise look as though nothing happened.
+    .stdout(predicate::str::contains("aren't sent"));
+
+    fx.apply_blocks();
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(
+        !written.contains("Payment Required"),
+        "terms must not attach to a 403; written was:\n{written}"
+    );
+
+    fx.run(&["set-block-response", "--response", "payment-required"]);
+    fx.run(&["show-payment-terms"])
+        .stdout(predicate::str::contains("USD 0.01 per request"));
+
+    fx.apply_blocks();
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(written.contains("return 402 "), "written was:\n{written}");
+    assert!(
+        written.contains("Price: USD 0.01 per request"),
+        "written was:\n{written}"
+    );
+    assert!(
+        written.contains("Arrange access: https://example.test/licensing"),
+        "written was:\n{written}"
+    );
+}
+
+/// A value that would corrupt the generated config is refused, and
+/// nothing is stored.
+#[test]
+fn payment_terms_containing_a_quote_are_rejected() {
+    let fx = Fixture::new();
+    fx.cmd(&["set-payment-terms", "--price", "USD \"cheap\""])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("double quote"));
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    assert!(db.get_payment_price().unwrap().is_empty());
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

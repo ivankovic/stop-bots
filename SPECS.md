@@ -2989,3 +2989,52 @@ which cuts both ways.
 `return`, in both block shapes, with a test asserting exactly that and
 that it appears once. `set $limit_rate` at server level would throttle
 every visitor on the site.
+
+## Making 402 say something: payment terms
+
+A bare `402` tells a crawler operator nothing they can act on. Two
+host-wide free-text settings — a price and a contact — are sent as the
+response body when the block response is 402 and at least one is set.
+
+**Why free text, and not a machine-readable challenge.** There are two
+real efforts here: x402's JSON payment challenge (client pays, retries
+with a payment header) and pay-per-crawl (signed crawler identity, a price
+header, a mediated settlement). Both need a payment endpoint and a
+settlement path — this project generates NGINX config and owns neither.
+Emitting a half-implementation of either would advertise a protocol
+nothing here can complete. What a generated config *can* do is put the
+price and a contact in front of the human operating the crawler, which is
+the step that actually ends in a licence.
+
+**Why the body and not headers.** `add_header` is not permitted in an `if`
+at `server` level (its contexts are http, server, location, and `if in
+location`), so a `Link: rel="payment"` header could not be attached to
+just the blocked responses. Hoisting it to `server` level would attach it
+to every ordinary response too — defensible as site-wide licensing
+discovery, but a wider change than asked for. The body carries everything
+instead, and needs no http-context file, no `map`, and no new failure
+mode.
+
+Size is not a concern the way it was for robots.txt: a payment notice is a
+few hundred bytes, far under the ~4KB single-parameter ceiling that forced
+robots.txt into a separate file, and `\n` is a real escape in an NGINX
+quoted string so the body is genuinely multi-line.
+
+**Validation at the point of entry.** A `"` would terminate the generated
+config's string early and corrupt every directive after it; a trailing
+backslash escapes the closing quote with the same result. These are the
+two characters `is_embeddable` already rejects in a user-agent pattern —
+except that a pattern arrives from a bot list and is silently dropped,
+whereas this arrives from a person typing, so it is rejected with a reason
+instead. `Db::set_payment_terms` owns that check, which is what makes the
+CLI and the TUI reject exactly the same values; the TUI popup stays open
+showing the error rather than discarding what was typed.
+
+**Terms are stored regardless of the chosen response**, so switching to
+402 later doesn't lose them — but they are only *rendered* when the
+response is 402. Both the CLI and the panel say so: setting terms while
+the response is 403 prints a note that they aren't being sent, which
+otherwise looks like nothing happened.
+
+The two TUI rows appear only when 402 is chosen. A permanently-greyed pair
+of rows for a setting most installs never touch is worse than none.

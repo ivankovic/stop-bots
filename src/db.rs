@@ -1389,6 +1389,52 @@ impl Db {
         Ok(self.get_int_setting("rate_limit_zone_mb", 10)?.max(1))
     }
 
+    /// The price advertised in a `402 Payment Required` body, free text
+    /// (`"USD 0.01 per request"`, `"EUR 500/month"`). Empty when unset.
+    ///
+    /// Free text rather than a structured amount on purpose: there is no
+    /// interoperable machine format for this that a generated NGINX
+    /// config could emit and a crawler would reliably parse, so the honest
+    /// thing is a line a human operating that crawler can read and act on.
+    pub fn get_payment_price(&self) -> Result<String> {
+        Ok(self.get_text_setting("payment_price")?.unwrap_or_default())
+    }
+
+    /// Where to arrange access — a URL or an email address. Empty when
+    /// unset.
+    pub fn get_payment_contact(&self) -> Result<String> {
+        Ok(self
+            .get_text_setting("payment_contact")?
+            .unwrap_or_default())
+    }
+
+    /// Stores payment terms, rejecting anything that can't be embedded in
+    /// the generated config.
+    ///
+    /// A double quote would terminate NGINX's quoted string early and
+    /// corrupt every directive after it; a trailing backslash escapes the
+    /// closing quote with the same result. These are the same two
+    /// characters `nginx::is_embeddable` rejects in a user-agent pattern,
+    /// and for the same reason — except that here the value comes straight
+    /// from a person typing into a box, so it's rejected at the point of
+    /// entry rather than silently dropped at render time.
+    pub fn set_payment_terms(&self, price: &str, contact: &str) -> Result<()> {
+        for (name, value) in [("price", price), ("contact", contact)] {
+            if value.contains('"') || value.ends_with('\\') {
+                anyhow::bail!(
+                    "the payment {name} cannot contain a double quote or end in a backslash \
+                     — both would corrupt the generated NGINX config"
+                );
+            }
+            if value.chars().count() > 200 {
+                anyhow::bail!("the payment {name} is too long (max 200 characters)");
+            }
+        }
+        self.set_text_setting("payment_price", price.trim())?;
+        self.set_text_setting("payment_contact", contact.trim())?;
+        Ok(())
+    }
+
     pub fn set_block_response(&self, response: BlockResponse) -> Result<()> {
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES ('block_response', ?1)
