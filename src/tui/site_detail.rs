@@ -33,6 +33,7 @@
 //! for its own Escape handling, one level deeper.
 
 use crate::db::{Bot, BotStatus, Category, Db, Policy, Site, SiteBotOverride};
+use crate::nginx::RequestRule;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -132,7 +133,8 @@ pub struct SiteDetail {
     categories_state: ListState,
     bots: Vec<Bot>,
     bot_overrides: Vec<SiteBotOverride>,
-    reject_http_1x: bool,
+    /// Which request-shape rules are on for this site.
+    request_rules: Vec<RequestRule>,
     options_state: ListState,
     exempt_paths: Vec<String>,
     exemptions_state: ListState,
@@ -155,7 +157,7 @@ impl SiteDetail {
             categories_state,
             bots: Vec::new(),
             bot_overrides: Vec::new(),
-            reject_http_1x: false,
+            request_rules: Vec::new(),
             options_state: ListState::default().with_selected(Some(0)),
             exempt_paths: Vec::new(),
             exemptions_state: ListState::default().with_selected(Some(0)),
@@ -176,7 +178,7 @@ impl SiteDetail {
         }
         self.bots = db.list_bots()?;
         self.bot_overrides = db.site_bot_overrides(self.site.id)?;
-        self.reject_http_1x = db.site_rejects_http_1x(self.site.id)?;
+        self.request_rules = crate::nginx::site_request_rules(db, self.site.id)?;
         self.exempt_paths = db.site_path_exemptions(self.site.id)?;
         // Removing a path shrinks the list; without this the selection
         // could be left pointing past the new last row until the next
@@ -238,8 +240,8 @@ impl SiteDetail {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         let [categories_area, options_area, exemptions_area, details_area] = Layout::vertical([
             Constraint::Length(5),
-            // Two border lines plus one row per option.
-            Constraint::Length(3),
+            // Two border lines plus one row per request rule.
+            Constraint::Length(RequestRule::ALL.len() as u16 + 2),
             // Two border lines plus the Add row, plus up to three paths
             // before it starts scrolling — enough to see a typical setup
             // at a glance without starving the bot search below it.
@@ -275,25 +277,28 @@ impl SiteDetail {
     }
 
     fn render_options(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        // The label says "HTTP/1.x requests" and the tag says
-        // Allowed/Blocked, matching the categories panel above — the whole
-        // screen answers one question per row, "is this allowed here".
-        let items = vec![ListItem::new(Line::from(vec![
-            Span::from(format!("{:<20}", "HTTP/1.x requests")),
-            policy_tag(if self.reject_http_1x {
-                Policy::Blocked
-            } else {
-                Policy::Allowed
-            }),
-            Span::from(if self.reject_http_1x {
-                "  HTTPS blocks only; /.well-known stays open"
-            } else {
-                ""
+        // One row per rule, each with its own tag and its own caveat.
+        // Deliberately not one "strict requests" switch: if these hid
+        // behind a single toggle and someone's monitoring broke, they'd
+        // have no way to tell which rule did it.
+        let items: Vec<ListItem> = RequestRule::ALL
+            .iter()
+            .map(|rule| {
+                let on = self.request_rules.contains(rule);
+                ListItem::new(Line::from(vec![
+                    Span::from(format!("{:<20}", rule.label())),
+                    policy_tag(if on { Policy::Blocked } else { Policy::Allowed }),
+                    Span::from(if on {
+                        format!("  {}", rule.caveat())
+                    } else {
+                        String::new()
+                    })
+                    .dim(),
+                ]))
             })
-            .dim(),
-        ]))];
+            .collect();
 
-        let mut block = Block::bordered().title("Site options — Enter to change");
+        let mut block = Block::bordered().title("Request rules — Enter to change");
         if self.focus == Focus::Options {
             block = block.fg(theme.accent());
         }
@@ -519,15 +524,23 @@ impl SiteDetail {
             Focus::Options => match key.code {
                 KeyCode::Esc => return Ok(KeyOutcome::Back),
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.focus = Focus::Categories;
-                    self.categories_state.select(Some(CATEGORIES.len() - 1));
+                    if self.options_state.selected() == Some(0) {
+                        self.focus = Focus::Categories;
+                        self.categories_state.select(Some(CATEGORIES.len() - 1));
+                    } else {
+                        self.options_state.select_previous();
+                    }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.focus = Focus::Exemptions;
-                    self.exemptions_state.select(Some(0));
+                    if self.options_state.selected().unwrap_or(0) + 1 < RequestRule::ALL.len() {
+                        self.options_state.select_next();
+                    } else {
+                        self.focus = Focus::Exemptions;
+                        self.exemptions_state.select(Some(0));
+                    }
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    return self.toggle_http_1x(db, message);
+                    return self.toggle_request_rule(db, message);
                 }
                 KeyCode::Char('/') => self.focus = Focus::Search,
                 _ => return Ok(KeyOutcome::Ignored),
@@ -658,27 +671,35 @@ impl SiteDetail {
         }
     }
 
-    /// Flips this site's HTTP/1.x rejection.
+    /// Flips the selected request rule for this site.
     ///
     /// A direct toggle rather than a popup: it's a single reversible
     /// change, the same reasoning the Dashboard's country list uses. The
-    /// message spells out the two things that surprise people — it only
-    /// takes effect on HTTPS blocks, and it turns away non-browser clients
-    /// — because the row itself has no room and the consequences show up
-    /// somewhere other than this screen.
-    fn toggle_http_1x(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
-        let reject = !self.reject_http_1x;
-        db.set_site_rejects_http_1x(self.site.id, reject)?;
-        *message = Some(if reject {
+    /// message carries the rule's caveat because the consequences show up
+    /// somewhere other than this screen — and, for the TLS-only rules,
+    /// that they apply to HTTPS blocks only.
+    fn toggle_request_rule(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
+        let Some(rule) = self
+            .options_state
+            .selected()
+            .and_then(|i| RequestRule::ALL.get(i).copied())
+        else {
+            return Ok(KeyOutcome::Consumed);
+        };
+        let enable = !self.request_rules.contains(&rule);
+        db.set_site_request_rule(self.site.id, rule.id(), enable)?;
+        *message = Some(if enable {
             format!(
-                "{}: rejecting HTTP/1.x on HTTPS blocks only. This also turns away crawlers \
-                 and API clients that don't speak HTTP/2 — apply (a/A) to write it",
-                self.site.server_name
+                "{}: blocking {} — {}. Apply (a/A) to write it",
+                self.site.server_name,
+                rule.label(),
+                rule.caveat()
             )
         } else {
             format!(
-                "{}: HTTP/1.x allowed again — apply (a/A) to write it",
-                self.site.server_name
+                "{}: {} allowed again — apply (a/A) to write it",
+                self.site.server_name,
+                rule.label()
             )
         });
         Ok(KeyOutcome::Mutated)
@@ -1310,23 +1331,36 @@ mod tests {
         }
     }
 
+    /// Selects `rule`'s row rather than assuming its position, so adding
+    /// a rule can't silently move these tests onto a different one.
+    fn select_rule(detail: &mut SiteDetail, rule: RequestRule) {
+        let index = RequestRule::ALL.iter().position(|r| *r == rule).unwrap();
+        detail.options_state.select(Some(index));
+    }
+
     #[test]
-    fn enter_toggles_http_1x_rejection_for_this_site_only() {
+    fn enter_toggles_a_request_rule_for_this_site_only() {
         let (db, site) = exemption_fixture();
         let site_id = site.id;
         let mut detail = SiteDetail::new(site);
         detail.refresh(&db).unwrap();
         focus_options(&mut detail, &db);
+        select_rule(&mut detail, RequestRule::NoUserAgent);
 
-        assert!(!db.site_rejects_http_1x(site_id).unwrap());
+        assert!(db.site_request_rules(site_id).unwrap().is_empty());
         let outcome = press(&mut detail, &db, KeyCode::Enter);
         assert_eq!(outcome, KeyOutcome::Mutated);
-        assert!(db.site_rejects_http_1x(site_id).unwrap());
+        assert_eq!(
+            db.site_request_rules(site_id).unwrap(),
+            vec![RequestRule::NoUserAgent.id().to_string()],
+            "only the selected rule may be switched on"
+        );
 
         detail.refresh(&db).unwrap();
+        select_rule(&mut detail, RequestRule::NoUserAgent);
         press(&mut detail, &db, KeyCode::Enter);
         assert!(
-            !db.site_rejects_http_1x(site_id).unwrap(),
+            db.site_request_rules(site_id).unwrap().is_empty(),
             "Enter is a toggle, not a one-way switch"
         );
     }
@@ -1335,11 +1369,12 @@ mod tests {
     /// and on clients that aren't browsers — so the confirmation has to
     /// say both.
     #[test]
-    fn turning_http_1x_rejection_on_warns_about_what_it_actually_does() {
+    fn turning_a_request_rule_on_states_what_else_it_turns_away() {
         let (db, site) = exemption_fixture();
         let mut detail = SiteDetail::new(site);
         detail.refresh(&db).unwrap();
         focus_options(&mut detail, &db);
+        select_rule(&mut detail, RequestRule::Http1x);
 
         let mut message = None;
         detail
@@ -1347,17 +1382,20 @@ mod tests {
             .unwrap();
 
         let message = message.unwrap();
-        assert!(message.contains("HTTPS"), "message was: {message}");
-        assert!(message.contains("HTTP/2"), "message was: {message}");
+        assert!(
+            message.contains(RequestRule::Http1x.caveat()),
+            "message was: {message}"
+        );
     }
 
     #[test]
-    fn render_shows_the_site_options_panel() {
+    fn render_shows_every_request_rule_and_the_state_of_each() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
 
         let (db, site) = exemption_fixture();
-        db.set_site_rejects_http_1x(site.id, true).unwrap();
+        db.set_site_request_rule(site.id, RequestRule::Http1x.id(), true)
+            .unwrap();
         let mut detail = SiteDetail::new(site);
         detail.refresh(&db).unwrap();
 
@@ -1374,11 +1412,16 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
 
-        assert!(content.contains("Site options"), "content was:\n{content}");
-        assert!(
-            content.contains("HTTP/1.x requests"),
-            "content was:\n{content}"
-        );
+        assert!(content.contains("Request rules"), "content was:\n{content}");
+        for rule in RequestRule::ALL {
+            assert!(
+                content.contains(rule.label()),
+                "{} should be listed; content was:\n{content}",
+                rule.label()
+            );
+        }
+        // Only the one switched on reads as blocked.
         assert!(content.contains("BLOCKED"), "content was:\n{content}");
+        assert!(content.contains("ALLOWED"), "content was:\n{content}");
     }
 }

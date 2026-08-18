@@ -9,17 +9,27 @@ need.
 
 ### Added
 
-- Per-site rejection of HTTP/1.0 and HTTP/1.1 requests (Site settings → open a site → Site
-  options). Off by default. Only written into HTTPS `server` blocks, since browsers don't
-  negotiate HTTP/2 without TLS and a plain port-80 block sees nothing but 1.1; `/.well-known/`
-  is always exempt so ACME certificate renewal keeps working. Note it also turns away
-  search-engine crawlers and API clients that still speak 1.1.
+- Six per-site request-shape rules (Site settings → open a site → Request rules), each its
+  own toggle and each off by default: reject HTTP/1.0-1.1, a missing `Accept`, a missing
+  `Accept-Language`, an empty `User-Agent`, a bare-IP `Host`, or TLS 1.0/1.1. The two
+  TLS-dependent rules are only written into HTTPS `server` blocks, since browsers don't
+  negotiate HTTP/2 without TLS and a plain port-80 block sees nothing but 1.1;
+  `/.well-known/` is always exempt so ACME certificate renewal keeps working. Each rule
+  states in the UI what it turns away besides bots.
+- Three behavioural detectors, all off by default and all exempting verified crawlers:
+  fetches-no-assets, rotating user agent, and referer-less deep crawling. Each has a false
+  positive it can't rule out — see the README.
+- Optional IPv4 `/24` escalation when several addresses in one subnet are flagged together.
 - `tui --ssh-log` — the same SSH-log override every SSH-reading subcommand
   already took, now for the TUI too. Without it, hosts without a readable
   `/var/log/auth.log` paid a `journalctl` invocation (0.5s or more) on every
   refresh of the Dynamic Protection screen.
 
 ### Fixed
+
+- IPv6 detections now block the `/64` rather than the single `/128`. A `/64` is the smallest
+  allocation anyone gets — one LAN, the same thing a single IPv4 address represents — so
+  blocking one address stopped nothing while costing a firewall rule per request.
 
 - Opening a fresh database no longer takes ~450ms: schema creation ran one
   fsync per table; it is now a single transaction.

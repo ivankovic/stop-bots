@@ -569,6 +569,15 @@ impl Db {
             CREATE TABLE IF NOT EXISTS site_reject_http_1x (
                 site_id INTEGER PRIMARY KEY REFERENCES sites(id)
             );
+            -- One row per (site, enabled request-shape rule). Same
+            -- row-presence shape as the table above; a table rather than
+            -- more boolean columns so a new rule is a new `RequestRule`
+            -- variant and no schema change.
+            CREATE TABLE IF NOT EXISTS site_request_rules (
+                site_id INTEGER NOT NULL REFERENCES sites(id),
+                rule TEXT NOT NULL,
+                PRIMARY KEY (site_id, rule)
+            );
             CREATE TABLE IF NOT EXISTS ip_range_sources (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -1165,6 +1174,33 @@ impl Db {
             "DELETE FROM site_path_exemptions WHERE site_id = ?1 AND path = ?2",
             params![site_id, path],
         )?;
+        Ok(())
+    }
+
+    /// Every request-shape rule switched on for `site_id`, sorted so the
+    /// generated block is byte-stable run to run (an unstable order would
+    /// make every site read `STALE` forever).
+    pub fn site_request_rules(&self, site_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rule FROM site_request_rules WHERE site_id = ?1 ORDER BY rule")?;
+        let rows = stmt.query_map(params![site_id], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list site request rules")
+    }
+
+    pub fn set_site_request_rule(&self, site_id: i64, rule: &str, enabled: bool) -> Result<()> {
+        if enabled {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO site_request_rules (site_id, rule) VALUES (?1, ?2)",
+                params![site_id, rule],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM site_request_rules WHERE site_id = ?1 AND rule = ?2",
+                params![site_id, rule],
+            )?;
+        }
         Ok(())
     }
 

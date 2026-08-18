@@ -323,6 +323,34 @@ impl Detector {
     }
 }
 
+/// `settings` key: whether a detector that flags several addresses in one
+/// IPv4 `/24` blocks the whole `/24` instead.
+pub const SUBNET_ESCALATION: &str = "detect_subnet_escalation";
+pub const SUBNET_ESCALATION_DEFAULT: bool = false;
+
+/// How many addresses in one `/24` must be flagged in a single pass
+/// before it escalates.
+pub const SUBNET_ESCALATION_MIN: &str = "detect_subnet_escalation_min";
+pub const SUBNET_ESCALATION_MIN_DEFAULT: i64 = 3;
+
+/// Whether IPv4 `/24` escalation is on, and its threshold.
+///
+/// Deliberately separate from the unconditional IPv6 `/64` widening in
+/// `scanblock::blockable_address`, which is a *correctness* equivalence —
+/// a `/64` is one LAN, the same thing one IPv4 address represents. This is
+/// a *policy* choice: blocking 256 addresses because three misbehaved is
+/// collateral by design, so it gets a switch, a threshold, and an off
+/// default.
+pub fn subnet_escalation(db: &Db) -> Result<Option<usize>> {
+    if !db.get_bool_setting(SUBNET_ESCALATION, SUBNET_ESCALATION_DEFAULT)? {
+        return Ok(None);
+    }
+    let min = db
+        .get_int_setting(SUBNET_ESCALATION_MIN, SUBNET_ESCALATION_MIN_DEFAULT)?
+        .max(2) as usize;
+    Ok(Some(min))
+}
+
 /// Threshold for the asset-ratio detector: distinct successful page URLs
 /// fetched with no accompanying asset. High, and *distinct* rather than a
 /// request count, because the false positive to avoid is a legitimate API

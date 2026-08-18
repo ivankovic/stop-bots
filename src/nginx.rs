@@ -361,6 +361,110 @@ pub fn rate_limit_conf_path() -> PathBuf {
 /// refuses to start with "unknown limit_req_zone".
 const RATE_LIMIT_ZONE: &str = "stop_bots";
 
+/// An optional per-site rule that decides a request is unwanted from its
+/// *shape* rather than from a user-agent pattern.
+///
+/// Each is a separate toggle rather than one "strict requests" switch, and
+/// deliberately so: if four rules hid behind one setting and an admin's
+/// monitoring stopped working, they'd have no way to tell which one did
+/// it. Every variant is off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RequestRule {
+    /// HTTP/1.0 and HTTP/1.1. Only emitted in TLS blocks — see
+    /// [`for_block`].
+    Http1x,
+    /// No `Accept` header. Every browser sends one; a fair amount of
+    /// tooling sends nothing.
+    NoAccept,
+    /// No `Accept-Language`. Browsers send it; most scripts don't. Weaker
+    /// than `NoAccept` — some privacy configurations strip it.
+    NoAcceptLanguage,
+    /// Empty or absent `User-Agent`. Distinct from bot-pattern matching,
+    /// which can only catch agents that identify themselves.
+    NoUserAgent,
+    /// A `Host` that is a bare IP address rather than a name. Scanners
+    /// sweep address ranges; real visitors arrive by hostname.
+    IpLiteralHost,
+    /// TLS 1.0 and 1.1. The same "only modern clients" argument as
+    /// [`Self::Http1x`] but on firmer ground — both are formally
+    /// deprecated and no current browser offers them. Inert outside a TLS
+    /// block, where `$ssl_protocol` is empty.
+    OldTls,
+}
+
+impl RequestRule {
+    pub const ALL: [RequestRule; 6] = [
+        RequestRule::Http1x,
+        RequestRule::NoAccept,
+        RequestRule::NoAcceptLanguage,
+        RequestRule::NoUserAgent,
+        RequestRule::IpLiteralHost,
+        RequestRule::OldTls,
+    ];
+
+    /// Stable id — a `site_request_rules.rule` value in every installed
+    /// database, so never rename one without a migration.
+    pub fn id(self) -> &'static str {
+        match self {
+            RequestRule::Http1x => "http_1x",
+            RequestRule::NoAccept => "no_accept",
+            RequestRule::NoAcceptLanguage => "no_accept_language",
+            RequestRule::NoUserAgent => "no_user_agent",
+            RequestRule::IpLiteralHost => "ip_literal_host",
+            RequestRule::OldTls => "old_tls",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<RequestRule> {
+        RequestRule::ALL.into_iter().find(|r| r.id() == id)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RequestRule::Http1x => "HTTP/1.x requests",
+            RequestRule::NoAccept => "No Accept header",
+            RequestRule::NoAcceptLanguage => "No Accept-Language",
+            RequestRule::NoUserAgent => "No User-Agent",
+            RequestRule::IpLiteralHost => "Host is an IP",
+            RequestRule::OldTls => "TLS 1.0 / 1.1",
+        }
+    }
+
+    /// A one-line note on what this turns away besides bots, shown next to
+    /// the toggle. Every one of these has collateral; saying so at the
+    /// point of the decision is the whole point.
+    pub fn caveat(self) -> &'static str {
+        match self {
+            RequestRule::Http1x => "also turns away crawlers and API clients",
+            RequestRule::NoAccept => "some API clients send none",
+            RequestRule::NoAcceptLanguage => "privacy tooling strips it",
+            RequestRule::NoUserAgent => "scripts and health checks often omit it",
+            RequestRule::IpLiteralHost => "breaks reaching the site by IP",
+            RequestRule::OldTls => "very old clients only",
+        }
+    }
+
+    /// Whether the rule can only work in a TLS-terminating block.
+    fn needs_tls(self) -> bool {
+        matches!(self, RequestRule::Http1x | RequestRule::OldTls)
+    }
+
+    /// The NGINX condition, without the surrounding `if (...)`.
+    fn condition(self) -> &'static str {
+        match self {
+            RequestRule::Http1x => r#"$server_protocol ~ "^HTTP/1\.""#,
+            RequestRule::NoAccept => r#"$http_accept = """#,
+            RequestRule::NoAcceptLanguage => r#"$http_accept_language = """#,
+            RequestRule::NoUserAgent => r#"$http_user_agent = """#,
+            // Anchored, and matching both an IPv4 literal and a bracketed
+            // IPv6 one. `$host` is already lowercased and port-stripped by
+            // NGINX, which `$http_host` is not.
+            RequestRule::IpLiteralHost => r#"$host ~ "^(\d+\.\d+\.\d+\.\d+|\[)""#,
+            RequestRule::OldTls => r#"$ssl_protocol ~ "^TLSv1(\.[01])?$""#,
+        }
+    }
+}
+
 /// Everything that shapes one site's generated sentinel block. Grouped into
 /// a struct rather than passed as loose arguments because the block's
 /// *content* is what [`site_apply_status`] compares against disk: every
@@ -402,31 +506,27 @@ pub struct BlockConfig {
     /// `return`, because NGINX has no way to say "match this user agent
     /// unless the path is one of these" in a single condition.
     pub exempt_paths: Vec<String>,
-    /// Reject HTTP/1.0 and HTTP/1.1 requests outright (per site).
+    /// Per-site [`RequestRule`]s switched on for this site.
     ///
-    /// The premise is sound as far as it goes: current browsers negotiate
-    /// HTTP/2, and a lot of scraping tooling still speaks 1.1. It is also
-    /// the bluntest instrument in this project, and the two things that
-    /// make it survivable are enforced rather than documented:
+    /// These decide a request is unwanted from its shape rather than from
+    /// a user-agent pattern, and they are the bluntest instruments in the
+    /// project. Two things make them survivable, and both are enforced
+    /// rather than documented:
     ///
-    /// 1. **Only emitted in a TLS-terminating block** (`ServerBlock::is_tls`).
-    ///    Browsers do not do HTTP/2 without TLS, so on a `listen 80` block
-    ///    every single request is 1.1 — including the redirect a browser
-    ///    makes on its way to HTTPS. A site's port-80 and port-443 blocks
-    ///    usually share one `server_name`, so a per-site setting reaches
-    ///    both; without this guard, switching it on would take the site
-    ///    off the internet.
-    /// 2. **`/.well-known/` is always exempt** (see
-    ///    `effective_exempt_paths`). ACME HTTP-01 validation is fetched
-    ///    over HTTP/1.1 by a non-browser client; blocking it doesn't fail
-    ///    now, it fails at certificate renewal weeks later, which is close
-    ///    to the worst possible failure to trace.
+    /// 1. **TLS-only rules are dropped in non-TLS blocks** (see
+    ///    [`for_block`]). Browsers don't negotiate HTTP/2 without TLS, so
+    ///    on a `listen 80` block every request is HTTP/1.1 — and a site's
+    ///    port-80 and port-443 blocks routinely share one `server_name`,
+    ///    which is what a per-site setting keys on.
+    /// 2. **`/.well-known/` is always exempt** whenever any of these is on
+    ///    (see `effective_exempt_paths`). ACME HTTP-01 validation is
+    ///    fetched over HTTP/1.1 by a non-browser client with no `Accept`
+    ///    and often no `User-Agent`; blocking it doesn't fail now, it
+    ///    fails at certificate renewal weeks later.
     ///
-    /// What it still costs, and what no guard can fix: Googlebot and
-    /// Bingbot crawl plenty of sites over HTTP/1.1, as do RSS readers,
-    /// webhooks, monitoring and most API clients. This is off by default
-    /// and per site for that reason.
-    pub reject_http_1x: bool,
+    /// What no guard fixes: each rule turns away some legitimate
+    /// non-browser client. See [`RequestRule::caveat`].
+    pub request_rules: Vec<RequestRule>,
 }
 
 impl BlockConfig {
@@ -606,8 +706,22 @@ pub fn block_config_for_site(db: &crate::db::Db, site_id: i64) -> Result<BlockCo
         serve_robots_txt: db.get_serve_robots_txt()?,
         rate_limit_burst: rate_limit_burst(db)?,
         exempt_paths: db.site_path_exemptions(site_id)?,
-        reject_http_1x: db.site_rejects_http_1x(site_id)?,
+        request_rules: site_request_rules(db, site_id)?,
     })
+}
+
+/// The request-shape rules switched on for one site, in a stable order.
+/// An unrecognised stored id is skipped rather than erroring: a database
+/// written by a newer build must not stop an older one from applying
+/// anything at all.
+pub fn site_request_rules(db: &crate::db::Db, site_id: i64) -> Result<Vec<RequestRule>> {
+    let mut rules: Vec<RequestRule> = db
+        .site_request_rules(site_id)?
+        .iter()
+        .filter_map(|id| RequestRule::from_id(id))
+        .collect();
+    rules.sort();
+    Ok(rules)
 }
 
 /// The [`BlockConfig`] for a `server` block with no site-specific overrides
@@ -623,7 +737,7 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
         // A block with no site row has no per-site settings by
         // definition — both are keyed on `sites.id`.
         exempt_paths: Vec::new(),
-        reject_http_1x: false,
+        request_rules: Vec::new(),
     })
 }
 
@@ -651,7 +765,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     if pattern.is_none()
         && !config.serve_robots_txt
         && config.rate_limit_burst.is_none()
-        && !config.reject_http_1x
+        && config.request_rules.is_empty()
     {
         return None;
     }
@@ -669,7 +783,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     //
     // A single reason with no exemptions keeps the older direct-`return`
     // form, so a plain bot-blocking site's config doesn't churn.
-    let uses_flag = exemptions.is_some() || (pattern.is_some() && config.reject_http_1x);
+    let uses_flag = exemptions.is_some() || (pattern.is_some() && !config.request_rules.is_empty());
 
     if uses_flag {
         out.push_str("    set $stop_bots_block 0;\n");
@@ -689,13 +803,10 @@ fn block_text(config: &BlockConfig) -> Option<String> {
             ));
         }
     }
-    if config.reject_http_1x {
-        // `$server_protocol` is the request line's version verbatim
-        // ("HTTP/1.1", "HTTP/2.0"), so anchoring on "HTTP/1." catches 1.0
-        // and 1.1 and nothing else. This is only ever emitted into a
-        // TLS-terminating block — see `BlockConfig::reject_http_1x`.
+    for rule in &config.request_rules {
         out.push_str(&format!(
-            "    if ($server_protocol ~ \"^HTTP/1\\.\") {{\n        {set_blocked}"
+            "    if ({}) {{\n        {set_blocked}",
+            rule.condition()
         ));
     }
     if let Some(exemptions) = &exemptions {
@@ -757,7 +868,7 @@ fn effective_exempt_paths(config: &BlockConfig) -> Vec<String> {
     if config.serve_robots_txt {
         paths.push("/robots.txt".to_string());
     }
-    if config.reject_http_1x {
+    if !config.request_rules.is_empty() {
         // Never optional, and never surfaced as a setting to switch off.
         // `/.well-known/` is where ACME HTTP-01 validation is fetched
         // from, by a non-browser client speaking HTTP/1.1. Rejecting it
@@ -787,13 +898,18 @@ fn effective_exempt_paths(config: &BlockConfig) -> Vec<String> {
 /// omitted from its plain-HTTP block still reads as `UP TO DATE` rather
 /// than permanently `STALE`.
 fn for_block(config: &BlockConfig, block: &ServerBlock) -> BlockConfig {
-    if config.reject_http_1x && !block.is_tls {
-        return BlockConfig {
-            reject_http_1x: false,
-            ..config.clone()
-        };
+    if block.is_tls {
+        return config.clone();
     }
-    config.clone()
+    BlockConfig {
+        request_rules: config
+            .request_rules
+            .iter()
+            .copied()
+            .filter(|rule| !rule.needs_tls())
+            .collect(),
+        ..config.clone()
+    }
 }
 
 /// Builds the `$request_uri` regex that clears the block flag, or `None`
@@ -1687,7 +1803,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         }
     }
 
@@ -1718,7 +1834,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("location = /robots.txt"), "text was:\n{text}");
@@ -1859,7 +1975,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: Some(burst),
             exempt_paths: Vec::new(),
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         }
     }
 
@@ -1909,7 +2025,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: Some(5),
             exempt_paths: Vec::new(),
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("limit_req"), "text was:\n{text}");
@@ -1960,7 +2076,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: None,
             exempt_paths: paths.iter().map(|p| p.to_string()).collect(),
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         }
     }
 
@@ -2040,7 +2156,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         };
         let text = block_text(&config).unwrap();
 
@@ -2063,7 +2179,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: vec!["/blog".to_string()],
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("/blog"), "text was:\n{text}");
@@ -2088,7 +2204,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: None,
             exempt_paths: vec!["/blog".to_string()],
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         };
         let text = block_text(&config).unwrap();
 
@@ -2148,7 +2264,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: Some(20),
             exempt_paths: vec!["/blog".to_string(), "/feed.xml".to_string()],
-            reject_http_1x: false,
+            request_rules: Vec::new(),
         };
         let text = block_text(&config).unwrap();
         crate::golden::assert_golden("nginx-block-full.conf", &text);
@@ -2175,7 +2291,7 @@ mod tests {
 
     fn cfg_http1x(patterns: &[&str]) -> BlockConfig {
         BlockConfig {
-            reject_http_1x: true,
+            request_rules: vec![RequestRule::Http1x],
             ..cfg(patterns)
         }
     }
@@ -2242,7 +2358,7 @@ mod tests {
     #[test]
     fn rejecting_http_1x_alone_still_writes_a_block() {
         let config = BlockConfig {
-            reject_http_1x: true,
+            request_rules: vec![RequestRule::Http1x],
             ..BlockConfig::default()
         };
         let text = block_text(&config).unwrap();
@@ -2330,9 +2446,130 @@ mod tests {
     #[test]
     fn http_1x_rejection_matches_the_golden() {
         let config = BlockConfig {
-            reject_http_1x: true,
+            request_rules: vec![RequestRule::Http1x],
             ..cfg(&["BadBot"])
         };
         crate::golden::assert_golden("nginx-block-http1x.conf", &block_text(&config).unwrap());
+    }
+
+    // ---- request-shape rules ----
+
+    fn cfg_rules(rules: &[RequestRule]) -> BlockConfig {
+        BlockConfig {
+            request_rules: rules.to_vec(),
+            ..cfg(&["BadBot"])
+        }
+    }
+
+    #[test]
+    fn every_request_rule_has_a_distinct_stable_id() {
+        let mut ids: Vec<&str> = RequestRule::ALL.iter().map(|r| r.id()).collect();
+        let count = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), count);
+        for rule in RequestRule::ALL {
+            assert_eq!(RequestRule::from_id(rule.id()), Some(rule));
+        }
+        assert_eq!(RequestRule::from_id("nope"), None);
+    }
+
+    /// Each rule is its own toggle, so each must emit its own condition —
+    /// a shared one would make them indistinguishable in the config too.
+    #[test]
+    fn each_rule_emits_its_own_condition() {
+        for rule in RequestRule::ALL {
+            let text = block_text(&cfg_rules(&[rule])).unwrap();
+            assert!(
+                text.contains(rule.condition()),
+                "{} should emit {:?}; text was:\n{text}",
+                rule.label(),
+                rule.condition()
+            );
+        }
+    }
+
+    /// Every rule carries collateral, and the UI shows the caveat next to
+    /// the toggle. An empty one would render as a bare switch and quietly
+    /// imply there's no downside.
+    #[test]
+    fn every_rule_states_what_else_it_turns_away() {
+        for rule in RequestRule::ALL {
+            assert!(!rule.caveat().is_empty(), "{} needs a caveat", rule.label());
+        }
+    }
+
+    #[test]
+    fn any_request_rule_forces_the_well_known_exemption() {
+        for rule in RequestRule::ALL {
+            let text = block_text(&cfg_rules(&[rule])).unwrap();
+            assert!(
+                text.contains(r"/\.well-known/"),
+                "{} must not break ACME renewal; text was:\n{text}",
+                rule.label()
+            );
+        }
+    }
+
+    /// Only the two rules that depend on TLS are dropped in a plain block.
+    /// The header-shape rules work identically over HTTP, so dropping them
+    /// there would silently disable them on a redirect block.
+    #[test]
+    fn only_the_tls_dependent_rules_are_dropped_in_a_plain_block() {
+        let plain = ServerBlock {
+            names: vec!["a.example".to_string()],
+            is_tls: false,
+            open: 0,
+            close: 0,
+        };
+        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), &plain);
+
+        assert!(!narrowed.request_rules.contains(&RequestRule::Http1x));
+        assert!(!narrowed.request_rules.contains(&RequestRule::OldTls));
+        assert!(narrowed.request_rules.contains(&RequestRule::NoAccept));
+        assert!(narrowed.request_rules.contains(&RequestRule::NoUserAgent));
+        assert!(narrowed.request_rules.contains(&RequestRule::IpLiteralHost));
+    }
+
+    #[test]
+    fn a_tls_block_keeps_every_rule() {
+        let tls = ServerBlock {
+            names: vec!["a.example".to_string()],
+            is_tls: true,
+            open: 0,
+            close: 0,
+        };
+        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), &tls);
+        assert_eq!(narrowed.request_rules.len(), RequestRule::ALL.len());
+    }
+
+    /// A stored id from a newer build must not stop an older one applying
+    /// anything at all.
+    #[test]
+    fn an_unrecognised_stored_rule_id_is_skipped_not_fatal() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.upsert_site("a.example", "/etc/nginx/a.conf").unwrap();
+        let site = db.list_sites().unwrap().into_iter().next().unwrap();
+        db.set_site_request_rule(site.id, "from_the_future", true)
+            .unwrap();
+        db.set_site_request_rule(site.id, RequestRule::NoAccept.id(), true)
+            .unwrap();
+
+        assert_eq!(
+            site_request_rules(&db, site.id).unwrap(),
+            vec![RequestRule::NoAccept]
+        );
+    }
+
+    #[test]
+    fn every_request_rule_together_matches_the_golden() {
+        let config = BlockConfig {
+            request_rules: RequestRule::ALL.to_vec(),
+            ..cfg(&["BadBot"])
+        };
+        crate::golden::assert_golden(
+            "nginx-block-request-rules.conf",
+            &block_text(&config).unwrap(),
+        );
     }
 }

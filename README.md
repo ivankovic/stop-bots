@@ -85,8 +85,8 @@ everything that ends up in **NGINX config**. That split decides where any given 
   discovered on disk, each with a live "up to date / stale / not found" status and actions to
   apply the current policy to one site or all of them. Changing any of those settings flips
   every applied site to `STALE`, which is your cue to re-apply. Opening a site lets you
-  override its category/bot policy, reject HTTP/1.x for that site, and list paths exempt from
-  blocking.
+  override its category/bot policy, switch on any of the six request-shape rules, and list
+  paths exempt from blocking.
 - **Dynamic Protection**: a live, actionable view of what's currently hitting the server — "Top
   IPs attempting SSH connection" and "Top User Agents", each ranked by count and tagged
   `NOT BLOCKED`/`BLOCKED` (shown in red). `Tab`/`Shift+Tab` switch which of the two panels
@@ -114,19 +114,28 @@ everything that ends up in **NGINX config**. That split decides where any given 
   replaces whatever your site serves at `/robots.txt` today.
 - **Except where you say otherwise** — per-site path exemptions, so you can block AI crawlers
   everywhere except `/blog`.
-- **Anything still speaking HTTP/1.x**, per site. Current browsers negotiate HTTP/2 and a lot
-  of scraping tooling doesn't, so this is a cheap filter — but it is the bluntest thing here,
-  and worth understanding before switching it on:
-  - It is only ever written into **HTTPS** `server` blocks. Browsers don't do HTTP/2 without
-    TLS, so on a plain `listen 80` block *every* request is HTTP/1.1, including the redirect a
-    browser makes on its way to HTTPS. Your port-80 and port-443 blocks usually share a
-    `server_name`, so the setting reaches both; only the TLS one gets the rule.
-  - `/.well-known/` is always exempt, and not optionally. That's where Let's Encrypt fetches
-    its HTTP-01 challenge, over HTTP/1.1 — without the exemption your certificate stops
-    renewing weeks later.
-  - **It will turn away more than scrapers.** Googlebot and Bingbot crawl plenty of sites over
-    HTTP/1.1, as do RSS readers, webhooks, uptime monitors and most API clients. Off by
-    default, per site, for exactly that reason.
+- **Requests that don't look like a browser**, per site. Six independent rules, each its own
+  toggle and each off by default — one switch per rule so that if something of yours stops
+  working, you can tell which rule did it:
+
+  | Rule | Turns away, besides bots |
+  |---|---|
+  | HTTP/1.0 and HTTP/1.1 | crawlers and API clients that don't speak HTTP/2 |
+  | No `Accept` header | some API clients send none |
+  | No `Accept-Language` | privacy tooling strips it |
+  | Empty/absent `User-Agent` | scripts and health checks often omit it |
+  | `Host` is a bare IP | breaks reaching the site by IP |
+  | TLS 1.0 / 1.1 | very old clients only |
+
+  Two safeguards apply to all of them, and are enforced rather than left to you:
+  - The two TLS-dependent rules are only written into **HTTPS** `server` blocks. Browsers
+    don't do HTTP/2 without TLS, so on a plain `listen 80` block every request is HTTP/1.1 —
+    including the redirect a browser makes on its way to HTTPS. Your port-80 and port-443
+    blocks usually share a `server_name`, so the setting reaches both; only the TLS one gets
+    those rules. The header-shape rules work over plain HTTP and are written to both.
+  - `/.well-known/` is always exempt as soon as any rule is on. That's where Let's Encrypt
+    fetches its HTTP-01 challenge, over HTTP/1.1 with no `Accept` and often no `User-Agent` —
+    without the exemption your certificate stops renewing weeks later.
 
 ### From your logs, automatically
 
@@ -157,6 +166,21 @@ from a real cron if you want that, since none of them applies anything by itself
   the strongest signal here, and the longest block. Needs robots.txt generation turned on to
   work at all.
 
+Three more look at how a client *behaves* rather than what it asks for. All three are off by
+default, because each has a false positive it cannot rule out on its own — and all three
+exempt verified search-engine crawlers, which would otherwise match every one of them:
+
+- **Fetches no assets**: many distinct pages and not one stylesheet, script or image. Browsers
+  load what goes with a page. Won't catch an API client (it counts *distinct* paths, and an
+  API client hits few) or a well-cached returning visitor (a `304` counts as a fetched asset).
+  Can't help you on a site that serves no assets at all — a pure JSON API.
+- **Rotating user agent**: several identities from one address. *Weakened considerably by
+  NAT*: a carrier, campus or office gateway presents many real browsers on one IP, and without
+  timestamp parsing there's no way to tell that apart from one scraper cycling agents.
+- **Crawls with no referer**: many distinct deep pages, never a `Referer`. Weakened by
+  `Referrer-Policy: no-referrer` and privacy tooling; the distinct-path threshold is what
+  makes it usable at all.
+
 ### By address
 
 - **Whole countries**, via IPdeny's aggregated CIDR lists — block specific countries, or flip
@@ -167,6 +191,12 @@ from a real cron if you want that, since none of them applies anything by itself
   and residential visitors don't browse from it. These are blunt instruments and labelled as
   such — they block *every* visitor hosted there, including VPN endpoints, corporate egress
   and API clients, not just bots. Off by default, with a warning when you switch one on.
+- **Neighbouring addresses**, optionally: when several addresses in one IPv4 `/24` are flagged
+  in the same pass, block the `/24`. Off by default — blocking 256 addresses because three
+  misbehaved is collateral by design. (IPv6 is different and needs no switch: a detection
+  always blocks the `/64`, because a `/64` is one LAN, the same thing a single IPv4 address
+  represents. Blocking the single address an IPv6 attacker happened to use would stop nothing
+  — they have 2^64 more.)
 - **Anything else**, by hand — add an IP/CIDR allow or block rule directly, or use the Dynamic
   Protection screen to permanently block a specific IP or user agent you've spotted before it
   ever crosses an automatic threshold.

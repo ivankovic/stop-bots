@@ -2825,3 +2825,95 @@ the flag idiom is needed (`uses_flag`) and emits each reason as a
 `set $stop_bots_block 1`, or keeps the older direct-`return` form for the
 single-reason-no-exemptions case so a plain bot-blocking site's config
 doesn't churn.
+
+## Detectors become table-driven, and three more arrive
+
+TODO.md recorded that adding a detector touched seven files and said to do
+the descriptor refactor "before a fifth". Three were about to be added, so
+it went first — and was then validated by being used three times
+immediately.
+
+`protection::Detector` is now an enum with a `DetectorSpec` (id, labels,
+defaults, which log it reads). `CronJob::Detect(Detector)` and
+`ProtectionRow::Detect(Detector)` replace a variant per detector, which
+took `cron.rs` from 41 per-detector references to 12 and deleted four
+parallel match arms from the Dashboard. Settings moved from a named struct
+field per detector to keys derived from the id.
+
+**The ids are pinned by a test.** They are live `settings` keys
+(`cron_last_run:block_scanners`) and cron job ids in every installed
+database; renaming one silently orphans a stored toggle *and* resets that
+job's schedule so everything re-runs at once.
+
+A visible side effect worth knowing: SSH and web scanner detection are now
+Dashboard rows like everything else. They previously ran unconditionally,
+with thresholds hardcoded in `app.rs` and no way to switch them off.
+
+### The three behavioural detectors
+
+All off by default, all sharing `scanblock::behavioural()` — and the
+shared helper exists for one reason: it applies the known-crawler
+exclusion. Googlebot fetches no CSS, presents several user agents and
+sends no referer, so it matches all three *by design*. Without the
+exclusion these would block search engines, which is the opposite of the
+project's purpose.
+
+- **Asset ratio.** Many distinct pages, not one asset. Two guards make it
+  viable: *distinct* paths rather than request count (the false positive
+  to avoid is an API client, which hammers few endpoints), and a `304`
+  counts as a fetched asset (a returning browser with a warm cache would
+  otherwise be indistinguishable from a scraper). Cannot help on a site
+  that serves no assets at all.
+- **Rotating user agent.** Honestly the weakest of the three: CGNAT means
+  a carrier or campus presents hundreds of real browsers on one address,
+  and with no timestamp parsing there is no window in which to distinguish
+  that from one scraper cycling agents. A threshold is the only control
+  available and pretending otherwise would add false confidence.
+- **Referer-less crawling.** Weakened by `Referrer-Policy: no-referrer`
+  and privacy tooling. The distinct-deep-path threshold does the work; one
+  or two referer-less hits are ordinary, twenty-five are a crawl.
+
+`parse_line` grew a `referer` field it had been parsing and discarding,
+and became a named struct — `line.status` reads where `line.1` didn't.
+
+## Request-shape rules, and why `reject_http_1x` generalised
+
+The HTTP/1.x work had already restructured `block_text` around "a request
+can be unwanted for more than one reason". `RequestRule` makes that a
+list: six rules, each its own toggle, each with a `caveat()` shown next to
+it in the UI (a test asserts none is empty — a bare switch with no stated
+downside is the thing to avoid).
+
+One toggle per rule rather than a "strict requests" bundle, deliberately:
+if four rules hid behind one switch and an admin's monitoring broke, they
+would have no way to tell which one did it.
+
+`for_block` now filters on `RequestRule::needs_tls()` rather than a single
+flag. Verified rather than assumed: only HTTP/1.x and old-TLS are dropped
+in a plain block — the header-shape rules work identically over HTTP, and
+dropping them there would silently disable them on a redirect block. There
+is a test for each direction, and the e2e test asserts a two-block site
+gets `$server_protocol` once and `$http_user_agent = ""` twice.
+
+An unrecognised stored rule id is skipped rather than fatal, so a database
+written by a newer build doesn't stop an older one applying anything.
+
+## IPv6 `/64` and IPv4 `/24` are different things
+
+Split deliberately, because shipping them together would mean the safe
+half couldn't be enabled without the risky half:
+
+- **IPv6 `/64` is a correctness equivalence**, unconditional and with no
+  threshold. A `/64` is one LAN, one household, one mobile subscriber —
+  the same thing a single IPv4 address represents. Blocking the `/128` we
+  observed was the equivalent of blocking one TCP source port.
+- **IPv4 `/24` escalation is a policy choice** — deliberately blocking 256
+  addresses because three misbehaved — so it has a toggle, a threshold and
+  an off default. Scoped to a single pass: three neighbours misbehaving
+  *now* is evidence about the subnet; three over six months is a busy ISP.
+
+Writing the `/64` test surfaced a latent bug: `add_block_rules` read the
+existing-rules set once before its loop, so two addresses collapsing onto
+one `/64` both got inserted. It now tracks what the pass itself adds. That
+couldn't happen before — two distinct addresses were never equal — so the
+widening created it.

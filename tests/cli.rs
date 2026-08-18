@@ -1018,7 +1018,11 @@ fn rejecting_http_1x_applies_only_to_the_tls_server_block() {
     {
         let db = stop_bots::db::Db::open(&fx.db).unwrap();
         let s = db.list_sites().unwrap().into_iter().next().unwrap();
-        db.set_site_rejects_http_1x(s.id, true).unwrap();
+        db.set_site_request_rule(s.id, "http_1x", true).unwrap();
+        // A header-shape rule alongside it: those are not TLS-dependent
+        // and must reach *both* blocks.
+        db.set_site_request_rule(s.id, "no_user_agent", true)
+            .unwrap();
     }
 
     fx.apply_blocks();
@@ -1027,6 +1031,12 @@ fn rejecting_http_1x_applies_only_to_the_tls_server_block() {
         written.matches("$server_protocol").count(),
         1,
         "only the TLS block may reject HTTP/1.x; written was:\n{written}"
+    );
+    assert_eq!(
+        written.matches(r#"$http_user_agent = """#).count(),
+        2,
+        "a header-shape rule works over plain HTTP too, so both blocks \
+         get it; written was:\n{written}"
     );
     // Certificate renewal has to keep working: ACME fetches
     // /.well-known/ over HTTP/1.1.

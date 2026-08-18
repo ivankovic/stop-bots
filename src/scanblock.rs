@@ -29,7 +29,7 @@
 use crate::db::{Db, FirewallAction, NewFirewallRule};
 use crate::{accesslog, ipranges, sshlog};
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Which detector produced a [`ScanBlockOutcome`]. Only affects the noun
 /// in [`ScanBlockOutcome::summary`] — "no scanning IPs found" would be
@@ -465,6 +465,49 @@ pub fn blockable_address(observed: &str) -> String {
     format!("{}/64", std::net::Ipv6Addr::from(octets))
 }
 
+/// Collapses IPv4 addresses into their `/24` where at least `min` of them
+/// were flagged in the same pass, leaving everything else untouched.
+///
+/// Only ever called when the admin switched escalation on — see
+/// [`crate::protection::subnet_escalation`] for why this is a policy knob
+/// and IPv6 `/64` widening isn't. Scoped to one pass on purpose: "three
+/// neighbours misbehaving right now" is evidence about the subnet,
+/// whereas three over six months is just a busy ISP.
+fn escalate_subnets(addresses: Vec<String>, min: usize) -> Vec<String> {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    let mut by_subnet: HashMap<[u8; 3], Vec<String>> = HashMap::new();
+    let mut untouched = Vec::new();
+    for address in addresses {
+        match address.parse::<IpAddr>() {
+            Ok(IpAddr::V4(v4)) => {
+                let o = v4.octets();
+                by_subnet
+                    .entry([o[0], o[1], o[2]])
+                    .or_default()
+                    .push(address);
+            }
+            // IPv6 is already widened to its /64, and a bare CIDR or an
+            // unparseable string has nothing to escalate.
+            _ => untouched.push(address),
+        }
+    }
+
+    let mut out = untouched;
+    for (prefix, members) in by_subnet {
+        if members.len() >= min {
+            out.push(format!(
+                "{}/24",
+                Ipv4Addr::new(prefix[0], prefix[1], prefix[2], 0)
+            ));
+        } else {
+            out.extend(members);
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Adds a Block rule, expiring after `ttl_days`, for each of `kept` not
 /// already covered by an existing firewall rule of the same exact address.
 /// The existence check reads through [`Db::list_firewall_rules`], which
@@ -496,6 +539,11 @@ fn add_block_rules(
         .into_iter()
         .map(|rule| rule.address)
         .collect();
+
+    let kept = match crate::protection::subnet_escalation(db)? {
+        Some(min) => escalate_subnets(kept, min),
+        None => kept,
+    };
 
     let ttl_seconds = ttl_days * 24 * 60 * 60;
     let mut newly_blocked = Vec::new();
@@ -1077,5 +1125,85 @@ mod tests {
         let outcome = block_refererless(&db, 5, &log, false).unwrap();
 
         assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+    }
+
+    // ---- IPv4 /24 escalation ----
+
+    fn probe_ip(ip: &str) -> String {
+        probe_line(ip, "/.env")
+    }
+
+    #[test]
+    fn escalation_is_off_unless_switched_on() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_ip("203.0.113.1") + &probe_ip("203.0.113.2") + &probe_ip("203.0.113.3");
+
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(
+            outcome.newly_blocked.len(),
+            3,
+            "{:?}",
+            outcome.newly_blocked
+        );
+    }
+
+    #[test]
+    fn enough_neighbours_in_one_24_escalate_to_the_subnet() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_bool_setting(crate::protection::SUBNET_ESCALATION, true)
+            .unwrap();
+        let log = probe_ip("203.0.113.1") + &probe_ip("203.0.113.2") + &probe_ip("203.0.113.3");
+
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.0/24".to_string()]);
+    }
+
+    #[test]
+    fn too_few_neighbours_are_left_as_individual_addresses() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_bool_setting(crate::protection::SUBNET_ESCALATION, true)
+            .unwrap();
+        let log = probe_ip("203.0.113.1") + &probe_ip("203.0.113.2");
+
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(
+            outcome.newly_blocked,
+            vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()]
+        );
+    }
+
+    /// Escalation is IPv4-only: IPv6 is already widened to its /64, and
+    /// widening further would be a second, unasked-for escalation.
+    #[test]
+    fn escalation_leaves_ipv6_alone() {
+        let escalated = escalate_subnets(
+            vec![
+                "2001:db8:1:2::/64".to_string(),
+                "2001:db8:1:3::/64".to_string(),
+                "2001:db8:1:4::/64".to_string(),
+            ],
+            3,
+        );
+        assert_eq!(escalated.len(), 3, "{escalated:?}");
+    }
+
+    #[test]
+    fn escalation_only_groups_addresses_actually_in_the_same_24() {
+        let escalated = escalate_subnets(
+            vec![
+                "203.0.113.1".to_string(),
+                "203.0.113.2".to_string(),
+                "203.0.113.3".to_string(),
+                "198.51.100.7".to_string(),
+            ],
+            3,
+        );
+        assert_eq!(
+            escalated,
+            vec!["198.51.100.7".to_string(), "203.0.113.0/24".to_string()]
+        );
     }
 }
