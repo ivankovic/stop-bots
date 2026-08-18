@@ -1416,8 +1416,8 @@ mod tests {
             due: true,
         };
         let rendered = cron_status_line(&status, false).to_string();
-        assert!(rendered.contains("never"));
-        assert!(rendered.contains("due now"));
+        assert!(rendered.contains("never"), "rendered was:\n{rendered}");
+        assert!(rendered.contains("due now"), "rendered was:\n{rendered}");
     }
 
     #[test]
@@ -1429,9 +1429,12 @@ mod tests {
             due: false,
         };
         let rendered = cron_status_line(&status, false).to_string();
-        assert!(rendered.contains("1h ago"));
-        assert!(rendered.contains("blocked 2 IP(s)"));
-        assert!(!rendered.contains("due now"));
+        assert!(rendered.contains("1h ago"), "rendered was:\n{rendered}");
+        assert!(
+            rendered.contains("blocked 2 IP(s)"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(!rendered.contains("due now"), "rendered was:\n{rendered}");
     }
 
     /// `running` must override both "due now" and any stale summary with a
@@ -1489,11 +1492,23 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Scheduled tasks"));
-        assert!(content.contains("Block SSH scanners"));
-        assert!(content.contains("blocked 3 IP(s)"));
-        assert!(content.contains("Update crawler IP ranges"));
-        assert!(content.contains("due now"));
+        assert!(
+            content.contains("Scheduled tasks"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("Block SSH scanners"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("blocked 3 IP(s)"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("Update crawler IP ranges"),
+            "content was:\n{content}"
+        );
+        assert!(content.contains("due now"), "content was:\n{content}");
     }
 
     #[test]
@@ -1560,8 +1575,11 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Summary"));
-        assert!(content.contains("Sites discovered: 1"));
+        assert!(content.contains("Summary"), "content was:\n{content}");
+        assert!(
+            content.contains("Sites discovered: 1"),
+            "content was:\n{content}"
+        );
     }
 
     #[test]
@@ -1652,10 +1670,16 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Scanners"));
-        assert!(content.contains("BLOCKED"));
-        assert!(content.contains("Sites discovered: 1"));
-        assert!(content.contains("Stored 4 bot(s)"));
+        assert!(content.contains("Scanners"), "content was:\n{content}");
+        assert!(content.contains("BLOCKED"), "content was:\n{content}");
+        assert!(
+            content.contains("Sites discovered: 1"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("Stored 4 bot(s)"),
+            "content was:\n{content}"
+        );
     }
 
     #[test]
@@ -2032,11 +2056,11 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Geo-blocking"));
-        assert!(content.contains("Blocklist"));
-        assert!(content.contains("Add a country"));
-        assert!(content.contains("NL"));
-        assert!(content.contains("1 range(s)"));
+        assert!(content.contains("Geo-blocking"), "content was:\n{content}");
+        assert!(content.contains("Blocklist"), "content was:\n{content}");
+        assert!(content.contains("Add a country"), "content was:\n{content}");
+        assert!(content.contains("NL"), "content was:\n{content}");
+        assert!(content.contains("1 range(s)"), "content was:\n{content}");
     }
 
     #[test]
@@ -2317,8 +2341,14 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Firewall rules: needs updating"));
-        assert!(content.contains("press f to update"));
+        assert!(
+            content.contains("Firewall rules: needs updating"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("press f to update"),
+            "content was:\n{content}"
+        );
     }
 
     #[test]
@@ -2352,8 +2382,14 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Firewall rules: up to date"));
-        assert!(!content.contains("needs updating"));
+        assert!(
+            content.contains("Firewall rules: up to date"),
+            "content was:\n{content}"
+        );
+        assert!(
+            !content.contains("needs updating"),
+            "content was:\n{content}"
+        );
     }
 
     // ---- Automatic blocking panel ----
@@ -2723,10 +2759,16 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Automatic blocking"));
-        assert!(content.contains("Forged crawler"));
-        assert!(content.contains("Probe paths"));
-        assert!(content.contains("[ OFF ]"));
+        assert!(
+            content.contains("Automatic blocking"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("Forged crawler"),
+            "content was:\n{content}"
+        );
+        assert!(content.contains("Probe paths"), "content was:\n{content}");
+        assert!(content.contains("[ OFF ]"), "content was:\n{content}");
     }
 
     /// The render-firewall popup, rendered rather than only key-driven —

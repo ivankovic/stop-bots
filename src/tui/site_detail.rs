@@ -1178,9 +1178,15 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Path exemptions"));
-        assert!(content.contains("/blog"));
-        assert!(content.contains("Add an exempt path"));
+        assert!(
+            content.contains("Path exemptions"),
+            "content was:\n{content}"
+        );
+        assert!(content.contains("/blog"), "content was:\n{content}");
+        assert!(
+            content.contains("Add an exempt path"),
+            "content was:\n{content}"
+        );
     }
 
     /// Characterises existing behaviour before `handle_key` is split: the

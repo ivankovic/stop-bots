@@ -970,9 +970,9 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("203.0.113.5"));
-        assert!(!content.contains("198.51.100.9"));
-        assert!(content.contains("blocked only"));
+        assert!(content.contains("203.0.113.5"), "content was:\n{content}");
+        assert!(!content.contains("198.51.100.9"), "content was:\n{content}");
+        assert!(content.contains("blocked only"), "content was:\n{content}");
     }
 
     /// Changing the filter must re-clamp each panel's selection against the
@@ -1052,11 +1052,17 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Top IPs attempting SSH connection"));
-        assert!(content.contains("198.51.100.9"));
-        assert!(content.contains("NOT BLOCKED"));
-        assert!(content.contains("Top User Agents"));
-        assert!(content.contains("curl/8.0"));
+        assert!(
+            content.contains("Top IPs attempting SSH connection"),
+            "content was:\n{content}"
+        );
+        assert!(content.contains("198.51.100.9"), "content was:\n{content}");
+        assert!(content.contains("NOT BLOCKED"), "content was:\n{content}");
+        assert!(
+            content.contains("Top User Agents"),
+            "content was:\n{content}"
+        );
+        assert!(content.contains("curl/8.0"), "content was:\n{content}");
     }
 
     #[test]

@@ -1025,8 +1025,8 @@ mod tests {
 
         let once = apply_block(&content, &block, &cfg(&["BadBot|EvilCrawler"]));
         assert!(once.contains(BLOCK_BEGIN));
-        assert!(once.contains("BadBot|EvilCrawler"));
-        assert!(once.contains("return 403;"));
+        assert!(once.contains("BadBot|EvilCrawler"), "once was:\n{once}");
+        assert!(once.contains("return 403;"), "once was:\n{once}");
 
         let block_again = parse_server_blocks(&once).remove(0);
         let twice = apply_block(&once, &block_again, &cfg(&["BadBot|EvilCrawler"]));
@@ -1042,8 +1042,8 @@ mod tests {
         let block_again = parse_server_blocks(&first).remove(0);
         let second = apply_block(&first, &block_again, &cfg(&["NewBot"]));
 
-        assert!(!second.contains("OldBot"));
-        assert!(second.contains("NewBot"));
+        assert!(!second.contains("OldBot"), "second was:\n{second}");
+        assert!(second.contains("NewBot"), "second was:\n{second}");
         assert_eq!(second.matches(BLOCK_BEGIN).count(), 1);
     }
 
@@ -1057,7 +1057,7 @@ mod tests {
         let removed = apply_block(&with_block, &block_again, &BlockConfig::default());
 
         assert!(!removed.contains(BLOCK_BEGIN));
-        assert!(removed.contains("listen 80;"));
+        assert!(removed.contains("listen 80;"), "removed was:\n{removed}");
     }
 
     #[test]
@@ -1096,7 +1096,10 @@ mod tests {
 
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains(BLOCK_BEGIN));
-        assert!(written.contains("BadBot|EvilCrawler"));
+        assert!(
+            written.contains("BadBot|EvilCrawler"),
+            "written was:\n{written}"
+        );
 
         let changed_again = apply_blocks_to_file(&path, &[], &config).unwrap();
         assert!(!changed_again);
@@ -1163,10 +1166,10 @@ mod tests {
         let blocks = parse_server_blocks(&written);
         let a_region = &written[blocks[0].open..blocks[0].close];
         let b_region = &written[blocks[1].open..blocks[1].close];
-        assert!(a_region.contains("OnlyOnA"));
-        assert!(!a_region.contains("OnlyOnB"));
-        assert!(b_region.contains("OnlyOnB"));
-        assert!(!b_region.contains("OnlyOnA"));
+        assert!(a_region.contains("OnlyOnA"), "a_region was:\n{a_region}");
+        assert!(!a_region.contains("OnlyOnB"), "a_region was:\n{a_region}");
+        assert!(b_region.contains("OnlyOnB"), "b_region was:\n{b_region}");
+        assert!(!b_region.contains("OnlyOnA"), "b_region was:\n{b_region}");
     }
 
     #[test]
@@ -1185,7 +1188,10 @@ mod tests {
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
-        assert!(written.contains("GlobalDefaultBot"));
+        assert!(
+            written.contains("GlobalDefaultBot"),
+            "written was:\n{written}"
+        );
     }
 
     #[test]
@@ -1257,8 +1263,8 @@ mod tests {
         assert_eq!(status, SiteApplyStatus::UpToDate);
 
         let written = fs::read_to_string(&path).unwrap();
-        assert!(written.contains("AdminBot"));
-        assert!(written.contains("BadBot"));
+        assert!(written.contains("AdminBot"), "written was:\n{written}");
+        assert!(written.contains("BadBot"), "written was:\n{written}");
     }
 
     #[test]
@@ -1290,7 +1296,7 @@ mod tests {
         let blocks = parse_server_blocks(&written);
         let a_region = &written[blocks[0].open..blocks[0].close];
         let b_region = &written[blocks[1].open..blocks[1].close];
-        assert!(a_region.contains("OnlyOnA"));
+        assert!(a_region.contains("OnlyOnA"), "a_region was:\n{a_region}");
         assert!(!b_region.contains(BLOCK_BEGIN));
     }
 
@@ -1372,12 +1378,18 @@ mod tests {
         apply_blocks_to_file(&path, &[], &config).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
-        assert!(written.contains("GoodBot"));
-        assert!(!written.contains("TrailingBackslash"));
+        assert!(written.contains("GoodBot"), "written was:\n{written}");
+        assert!(
+            !written.contains("TrailingBackslash"),
+            "written was:\n{written}"
+        );
         // The sentinel's own closing quote must be the last character
         // before the closing paren, i.e. immediately followed by `) {` —
         // not swallowed into an unterminated string.
-        assert!(written.contains("~* \"GoodBot\") {"));
+        assert!(
+            written.contains("~* \"GoodBot\") {"),
+            "written was:\n{written}"
+        );
     }
 
     #[test]
@@ -1442,8 +1454,11 @@ mod tests {
                 line.len()
             );
         }
-        assert!(written.contains("BadBot0Agent"));
-        assert!(written.contains("BadBot499Agent"));
+        assert!(written.contains("BadBot0Agent"), "written was:\n{written}");
+        assert!(
+            written.contains("BadBot499Agent"),
+            "written was:\n{written}"
+        );
     }
 
     /// A chunked block (multiple `if` statements) must still be read back
@@ -1477,12 +1492,18 @@ mod tests {
     #[test]
     fn block_text_renders_the_configured_response_code() {
         let forbidden = block_text(&cfg(&["BadBot"])).unwrap();
-        assert!(forbidden.contains("return 403;"));
-        assert!(!forbidden.contains("return 444;"));
+        assert!(
+            forbidden.contains("return 403;"),
+            "forbidden was:\n{forbidden}"
+        );
+        assert!(
+            !forbidden.contains("return 444;"),
+            "forbidden was:\n{forbidden}"
+        );
 
         let close = block_text(&cfg_444(&["BadBot"])).unwrap();
-        assert!(close.contains("return 444;"));
-        assert!(!close.contains("return 403;"));
+        assert!(close.contains("return 444;"), "close was:\n{close}");
+        assert!(!close.contains("return 403;"), "close was:\n{close}");
     }
 
     #[test]
@@ -1535,8 +1556,8 @@ mod tests {
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
-        assert!(written.contains("return 444;"));
-        assert!(!written.contains("return 403;"));
+        assert!(written.contains("return 444;"), "written was:\n{written}");
+        assert!(!written.contains("return 403;"), "written was:\n{written}");
         // Still exactly one sentinel block, not a second one appended.
         assert_eq!(written.matches(BLOCK_BEGIN).count(), 1);
         assert_eq!(
@@ -1560,14 +1581,17 @@ mod tests {
     #[test]
     fn block_text_emits_a_robots_location_only_when_enabled() {
         let without = block_text(&cfg(&["BadBot"])).unwrap();
-        assert!(!without.contains("/robots.txt"));
+        assert!(!without.contains("/robots.txt"), "without was:\n{without}");
 
         let with = block_text(&cfg_robots(&["BadBot"])).unwrap();
-        assert!(with.contains("location = /robots.txt"));
-        assert!(with.contains("default_type text/plain;"));
+        assert!(with.contains("location = /robots.txt"), "with was:\n{with}");
+        assert!(
+            with.contains("default_type text/plain;"),
+            "with was:\n{with}"
+        );
         // The body is aliased, never inlined — see `serve_robots_txt`.
-        assert!(with.contains("alias "));
-        assert!(!with.contains("User-agent:"));
+        assert!(with.contains("alias "), "with was:\n{with}");
+        assert!(!with.contains("User-agent:"), "with was:\n{with}");
     }
 
     /// Serving robots.txt is reason enough to keep a sentinel block even
@@ -1583,8 +1607,8 @@ mod tests {
             exempt_paths: Vec::new(),
         };
         let text = block_text(&config).unwrap();
-        assert!(text.contains("location = /robots.txt"));
-        assert!(!text.contains("if ($http_user_agent"));
+        assert!(text.contains("location = /robots.txt"), "text was:\n{text}");
+        assert!(!text.contains("if ($http_user_agent"), "text was:\n{text}");
     }
 
     #[test]
@@ -1642,8 +1666,8 @@ mod tests {
 
         let body = robots_txt_body(&db).unwrap();
 
-        assert!(body.contains("User-agent: GPTBot\n"));
-        assert!(body.contains("User-agent: CCBot\n"));
+        assert!(body.contains("User-agent: GPTBot\n"), "body was:\n{body}");
+        assert!(body.contains("User-agent: CCBot\n"), "body was:\n{body}");
         // One shared Disallow: / for the whole group, not one per bot.
         assert_eq!(body.matches("Disallow: /\n").count(), 1);
     }
@@ -1653,7 +1677,7 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
         seed_bot(&db, "spacey", "Some AI Crawler", true);
         let body = robots_txt_body(&db).unwrap();
-        assert!(!body.contains("Some AI Crawler"));
+        assert!(!body.contains("Some AI Crawler"), "body was:\n{body}");
     }
 
     #[test]
@@ -1664,7 +1688,7 @@ mod tests {
             .unwrap();
 
         let body = robots_txt_body(&db).unwrap();
-        assert!(!body.contains("GPTBot"));
+        assert!(!body.contains("GPTBot"), "body was:\n{body}");
     }
 
     /// The trap path is published whether or not the honeypot detector is
@@ -1686,8 +1710,8 @@ mod tests {
     fn robots_txt_body_is_valid_with_nothing_blocked() {
         let db = crate::db::Db::open_in_memory().unwrap();
         let body = robots_txt_body(&db).unwrap();
-        assert!(body.contains("User-agent: *"));
-        assert!(body.contains("Disallow:"));
+        assert!(body.contains("User-agent: *"), "body was:\n{body}");
+        assert!(body.contains("Disallow:"), "body was:\n{body}");
     }
 
     #[test]
@@ -1727,11 +1751,14 @@ mod tests {
     #[test]
     fn block_text_emits_limit_req_only_when_enabled() {
         let without = block_text(&cfg(&["BadBot"])).unwrap();
-        assert!(!without.contains("limit_req"));
+        assert!(!without.contains("limit_req"), "without was:\n{without}");
 
         let with = block_text(&cfg_rate(20)).unwrap();
-        assert!(with.contains("limit_req zone=stop_bots burst=20 nodelay;"));
-        assert!(with.contains("limit_req_status 429;"));
+        assert!(
+            with.contains("limit_req zone=stop_bots burst=20 nodelay;"),
+            "with was:\n{with}"
+        );
+        assert!(with.contains("limit_req_status 429;"), "with was:\n{with}");
     }
 
     /// The zone name in the server-level directive and the one in the
@@ -1748,9 +1775,12 @@ mod tests {
     #[test]
     fn rate_limit_conf_body_uses_the_binary_address_key_and_given_rate() {
         let conf = rate_limit_conf_body(30, 16);
-        assert!(conf.contains("limit_req_zone $binary_remote_addr"));
-        assert!(conf.contains("zone=stop_bots:16m"));
-        assert!(conf.contains("rate=30r/s"));
+        assert!(
+            conf.contains("limit_req_zone $binary_remote_addr"),
+            "conf was:\n{conf}"
+        );
+        assert!(conf.contains("zone=stop_bots:16m"), "conf was:\n{conf}");
+        assert!(conf.contains("rate=30r/s"), "conf was:\n{conf}");
     }
 
     /// Rate limiting alone is reason enough to keep a sentinel block, the
@@ -1766,8 +1796,8 @@ mod tests {
             exempt_paths: Vec::new(),
         };
         let text = block_text(&config).unwrap();
-        assert!(text.contains("limit_req"));
-        assert!(!text.contains("if ($http_user_agent"));
+        assert!(text.contains("limit_req"), "text was:\n{text}");
+        assert!(!text.contains("if ($http_user_agent"), "text was:\n{text}");
     }
 
     #[test]
@@ -1822,9 +1852,12 @@ mod tests {
     #[test]
     fn no_exemptions_keeps_the_direct_return_form() {
         let text = block_text(&cfg(&["BadBot"])).unwrap();
-        assert!(text.contains("if ($http_user_agent ~* \"BadBot\") {"));
-        assert!(text.contains("return 403;"));
-        assert!(!text.contains("$stop_bots_block"));
+        assert!(
+            text.contains("if ($http_user_agent ~* \"BadBot\") {"),
+            "text was:\n{text}"
+        );
+        assert!(text.contains("return 403;"), "text was:\n{text}");
+        assert!(!text.contains("$stop_bots_block"), "text was:\n{text}");
     }
 
     #[test]
@@ -1844,8 +1877,11 @@ mod tests {
             "the exemption must clear *after* the match"
         );
         assert!(clear < act, "act last");
-        assert!(text.contains("if ($request_uri ~* \"^(/blog)\")"));
-        assert!(text.contains("return 403;"));
+        assert!(
+            text.contains("if ($request_uri ~* \"^(/blog)\")"),
+            "text was:\n{text}"
+        );
+        assert!(text.contains("return 403;"), "text was:\n{text}");
     }
 
     #[test]
@@ -1892,7 +1928,7 @@ mod tests {
 
         // The presence of robots.txt alone forces the flag form, because
         // the direct-`return` form has nowhere to put an exemption.
-        assert!(text.contains("$stop_bots_block"));
+        assert!(text.contains("$stop_bots_block"), "text was:\n{text}");
         assert!(text.contains("/robots\\.txt"), "text was:\n{text}");
         // And the clear still happens after the set, before the act.
         let set_one = text.find("set $stop_bots_block 1;").unwrap();
@@ -1911,8 +1947,8 @@ mod tests {
             exempt_paths: vec!["/blog".to_string()],
         };
         let text = block_text(&config).unwrap();
-        assert!(text.contains("/blog"));
-        assert!(text.contains("/robots\\.txt"));
+        assert!(text.contains("/blog"), "text was:\n{text}");
+        assert!(text.contains("/robots\\.txt"), "text was:\n{text}");
     }
 
     /// Not serving robots.txt means no implicit exemption, so a site with
@@ -1920,8 +1956,8 @@ mod tests {
     #[test]
     fn no_robots_txt_means_no_implicit_exemption() {
         let text = block_text(&cfg(&["BadBot"])).unwrap();
-        assert!(!text.contains("$stop_bots_block"));
-        assert!(!text.contains("robots"));
+        assert!(!text.contains("$stop_bots_block"), "text was:\n{text}");
+        assert!(!text.contains("robots"), "text was:\n{text}");
     }
 
     #[test]
