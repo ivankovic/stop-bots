@@ -1,0 +1,12 @@
+# Per-test time budgets (documented in README.md): unit tests in src/ get
+# 300ms, the end-to-end binaries in tests/ get 1s. `cargo nextest run`
+# reports any test past its budget as SLOW; a test past the terminate
+# multiple is killed and failed. The kill thresholds are deliberately far
+# above the budgets — the first test in a CI run pays cold-binary page-in,
+# and a killed run should mean "hung", never "the runner was busy".
+[profile.default]
+slow-timeout = { period = "300ms", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = "binary(cli) | binary(tui)"
+slow-timeout = { period = "1s", terminate-after = 15 }

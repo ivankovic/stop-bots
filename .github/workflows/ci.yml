@@ -31,14 +31,20 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      # Plain `cargo test`, in parallel. The pty-driven suite in tests/tui.rs
-      # used to need `--test-threads=1` because its 5s expectation timeout
-      # couldn't survive a contended machine; that timeout is now 30s and
-      # overridable via STOP_BOTS_TEST_TIMEOUT_MS, so if a CI runner ever does
-      # turn out to be slow enough to matter, raise that rather than
-      # serialising the whole suite.
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # nextest rather than plain `cargo test`, for one reason: it reports
+      # per-test wall time and flags any test that exceeds the budgets in
+      # .config/nextest.toml (300ms per unit test, 1s per e2e test) as
+      # SLOW — which is what keeps those budgets a practice instead of a
+      # sentence in the README. Runaway tests are killed at a generous
+      # multiple of the budget, so a hang fails the build rather than
+      # stalling it.
       - name: Test
-        run: cargo test
+        run: cargo nextest run
 
   # A separate job so a bump in a dependency's own MSRV shows up as this job
   # going red, rather than as a confusing failure for someone on an older

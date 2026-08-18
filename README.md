@@ -231,23 +231,47 @@ Benchmarks should be used to measure quality. These should be run on demand.
 
 ### Automated tests
 
-Each file in src/ should end with the test module for that file, as is typicall in Rust. These tests
-should test both happy-path and corner cases.
+Each file in src/ should end with the test module for that file, as is typical in Rust. These
+tests should test both happy-path and corner cases.
 
-**Tests in src/ must run in under 1 second**.
+**Each test in src/ must run in under 300ms** — in practice they are in-memory and finish in
+microseconds.
 
-Each general user flow should have a test in test/. These should all
-be happy-path tests, they should not test errors unless the error is a general user flow.
+Each general user flow should have a test in tests/. These should all be happy-path tests;
+they should not test errors unless the error is a general user flow.
 
-**Tests in tests/ must run in under 5 seconds.**
+**Each test in tests/ must run in under 1 second.**
+
+The budgets are enforced, not aspirational: `cargo nextest run` (what CI uses) flags any test
+that exceeds them as SLOW, per `.config/nextest.toml`. Plain `cargo test` works identically,
+it just doesn't report per-test time.
 
 ### How should tests handle dependencies?
 
-*No mocks*. Mocks prevent testing through the interface and are brittle.
+*No mocks*. Mocks prevent testing through the interface and are brittle — they test the mock
+of the interface, not the interface.
 
-Ideally, the real implementation is used.
+Ideally, the real implementation is used. Where it can't be, in order of preference:
 
-When necessary, e.g. for filesystem or database access, fake in-memory implementations should be used.
+- **In-memory fakes** for storage: SQLite's in-memory database (`Db::open_in_memory`) and
+  tempdirs. These *are* the real implementation, just on throwaway backing.
+- **Injected inputs** for everything the product reads from the system: `--ssh-log`,
+  `--access-log`, `--root`, `STOP_BOTS_NGINX_DIR`/`STOP_BOTS_NGINX_CONF_D`. These are real
+  product flags, not test back-doors — the same override an admin with a non-standard layout
+  would use. A test must never read the host's real logs or config; auto-detection can shell
+  out to `journalctl`, which is nondeterministic and slow.
+- **Fake executables on PATH** for the external tools the product drives (`nginx`,
+  `systemctl`, `nft`): tiny scripts that record their argv and exit 0 (or 1, to stage a
+  failure). The product resolves and runs them exactly as it would the real tools — the
+  process spawn, argument building, exit-code and ordering logic all execute for real; only
+  the binary PATH finds is ours. See `fake_tools` in tests/cli.rs.
+- **Golden files** (tests/golden/) for every generated artifact: firewall scripts, NGINX
+  blocks, robots.txt. They lock exact bytes, and double as the samples to hand to the real
+  `nft -c -f` / `nginx -t` once per change on a machine that has them. Regenerate with
+  `UPDATE_GOLDENS=1 cargo test`, then review the diff.
+
+The pty harness that drives the TUI end to end lives in tests/tui.rs itself (on raw `libc`);
+see the comment there for why it isn't a crate.
 
 ## Code structure
 

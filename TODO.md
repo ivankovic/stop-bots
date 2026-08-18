@@ -74,15 +74,15 @@ day.
 
 ### Loose ends from the work that shipped
 
-* **None of the newly generated NGINX syntax has been checked against a real
-  `nginx -t`** — nginx isn't installed in the development environment, the same
-  caveat already recorded below for `iptables::render`/`nftables::render`. Five
-  new directive forms went in unvalidated: the `set $stop_bots_block` flag
-  idiom, `limit_req`, `limit_req_status`, `location = /robots.txt` with
-  `alias`, and the `^(...)` `$request_uri` regex. The tests assert the strings
-  we *generate*, which is exactly the check that still passes when the syntax
-  is wrong. Worth one manual pass on a real box: enable everything, apply, and
-  run `nginx -t`.
+* **The generated NGINX and nftables syntax still needs one pass against the
+  real parsers** — nginx and nft aren't installed in the development
+  environment. What changed: `tests/golden/` now pins the exact bytes of every
+  generated artifact (both firewall backends, the NGINX block in plain and
+  kitchen-sink form, robots.txt, the rate-limit zone file), so this is a
+  *bounded* step, not a standing hope: on a box with the tools, feed
+  `tests/golden/firewall*.nft` to `nft -c -f`, paste the `nginx-block-*.conf`
+  goldens into a server block and run `nginx -t`, once — and thereafter any
+  change to generated output fails a golden test and tells you to re-check.
 
 * `ua_matches_blocked_bot_patterns` in `tui/dynamic_protection.rs` does
   case-insensitive *substring* matching over `|`-split alternatives, while

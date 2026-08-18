@@ -7,6 +7,20 @@ need.
 
 ## [Unreleased]
 
+### Added
+
+- `tui --ssh-log` — the same SSH-log override every SSH-reading subcommand
+  already took, now for the TUI too. Without it, hosts without a readable
+  `/var/log/auth.log` paid a `journalctl` invocation (0.5s or more) on every
+  refresh of the Dynamic Protection screen.
+
+### Fixed
+
+- Opening a fresh database no longer takes ~450ms: schema creation ran one
+  fsync per table; it is now a single transaction.
+- Storing a bot list no longer fsyncs once per bot — with the ~700-entry
+  real lists that was seconds of disk waits per fetch.
+
 ## [0.0.1] — 2026-08-18
 
 First published release. Everything below already existed in the repository; this is the

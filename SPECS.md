@@ -2601,3 +2601,101 @@ blocked crawler is also the behaviour worth wanting independently: a bot
 that can read the file can learn to stop asking, whereas one that gets a
 bare 403 on everything learns nothing and keeps coming back — for the cost
 of one small static file.
+
+## Testing without nginx, iptables or the network (the whole strategy)
+
+The question this answers: how does a project whose entire job is driving
+NGINX, a firewall and system logs get tested end to end on a machine that
+has none of them? The policy (README "For Developers"): no mocks — a mock
+tests the mock of the interface — with per-test budgets of 300ms in `src/`
+and 1s in `tests/`. The mechanisms, in order of preference:
+
+**1. The real implementation on throwaway backing.** SQLite in-memory for
+every unit test, a tempdir file database for every e2e test, tempdir NGINX
+roots. Nothing is faked; only the location is.
+
+**2. Injected inputs, as real product flags.** `--ssh-log`, `--access-log`,
+`--root`, `STOP_BOTS_NGINX_DIR`, `STOP_BOTS_NGINX_CONF_D` — every place the
+product reads the *system* has an override, and each override is the same
+one an admin with a non-standard layout would use, not a test back-door.
+This pass added the last missing one: `tui --ssh-log`. Without it the
+Dynamic Protection screen auto-detected the SSH log on every refresh, which
+on a host without a readable `auth.log` means shelling out to `journalctl`
+— measured at 0.5–7s per call. Every pty test paid it, and so did every
+real refresh on such hosts; the flag fixed a product latency problem and a
+test problem with one change, which is the recurring pattern here.
+
+**3. Fake executables on PATH**, for the three tools the product actually
+runs (`nginx`, `systemctl`, `nft`). Shell scripts that append their argv to
+a log and exit 0 — or print a staged error and exit 1. The product's real
+code executes: PATH resolution, argument building, exit-code handling,
+ordering. What this bought that was previously untestable anywhere:
+- `apply-blocks` *with* reload: asserts `nginx -t` runs before
+  `systemctl reload nginx`, and that a failing `-t` stops the reload cold
+  with nginx's own error surfaced (`tests/cli.rs`).
+- The render popup's apply-after-write toggle — the one code path in the
+  project that executes a generated firewall script — end to end through
+  the real TUI against a fake `nft` (`tests/tui.rs`).
+These are fakes, not mocks, in the sense the policy cares about: nothing in
+the product knows it is under test.
+
+**4. Golden files** (`tests/golden/`), for every generated artifact: both
+firewall backends (including the Allowlist catch-all shape), the NGINX
+block in plain and kitchen-sink form, robots.txt, the rate-limit zone file.
+Substring assertions say a directive is present; a golden pins the exact
+bytes, so reordering, a lost newline or a broken quote fails a test instead
+of reaching a server. They double as the exact samples to hand to
+`nft -c -f` / `nginx -t` once per change on a machine that has them —
+which converts TODO's "generated syntax never validated" from a standing
+hope into a bounded manual step. `UPDATE_GOLDENS=1 cargo test` regenerates;
+the diff is then reviewed like code.
+
+**The pty harness is now in-repo** (`tests/tui.rs`, on raw `libc`),
+replacing rexpect. Not invented for fun: rexpect sleeps a fixed 100ms per
+unmatched poll inside `expect`, and these tests make 6–20 expectations
+each, which put a >1s floor under every test regardless of how fast the
+app was. Measured app reality: ~150ms to first draw, single-digit ms per
+keystroke round-trip, 1ms from `q` to exit. The replacement polls at 2ms,
+preserves rexpect's consume-through-the-match semantics the tests were
+written against, and kills the child on drop so a panicking test can't
+leak a TUI holding the pty.
+
+**Two product-level performance bugs the budgets flushed out** (the
+budgets' real value — neither was visible before measuring):
+- Fresh-database open took ~450ms: `init_schema`'s ~16 CREATE TABLEs each
+  autocommitted, one fsync apiece. Now one transaction, one fsync (~80ms
+  total open). Every CLI test paid this per spawned process; so does every
+  real first run.
+- `botlist::store` paid one fsync *per bot* — 700+ for a real fetch, i.e.
+  seconds of pure disk waits. Now wrapped in a single transaction via the
+  new `Db::batch` (BEGIN IMMEDIATE/COMMIT with rollback-on-error;
+  deliberately not re-entrant, documented on the method).
+  `set_cron_last_run` similarly collapsed two statements into one, which
+  also made its documented "timestamp and summary are set together"
+  promise actually atomic.
+
+**Background work is seeded away, through the front door.** On a fresh
+database every internal-cron job is due the moment the TUI opens, so each
+pty test used to fire three real HTTP fetches (crawler ranges) and a
+`journalctl` in the background. Tests now mark every job as freshly run
+via the public `Db::set_cron_last_run` before spawning — real interface,
+no test-only knob in the product.
+
+**Budgets are enforced, not aspirational**: `.config/nextest.toml` flags
+any unit test over 300ms or e2e test over 1s as SLOW (CI runs
+`cargo nextest run`), and kills at a generous multiple so a hang fails
+the build rather than stalling it. Measured after the work: unit tests
+are microseconds; the slowest cli test is ~240ms; the slowest pty test
+~700ms warm. The known residual is cold-binary page-in on a test suite's
+first pty test (up to a few seconds on a cold cache), which is why the
+kill threshold is a multiple of the budget rather than the budget.
+
+**A false alarm worth recording**: while writing the `nft`-apply pty test,
+the render popup appeared genuinely broken in the live TUI — key traced to
+the handler, popup set, nothing on screen. The actual cause: the diffed
+terminal only transmits changed cells, and the spaces inside a multi-word
+needle land on cells that were already blank, so `"Apply after writing"`
+never arrives as contiguous bytes even though every word is on screen.
+The file's own older tests document this gotcha; the rule is single-word
+needles, always. One real gap did fall out of the chase: no unit test had
+ever *rendered* the RenderFirewall popup arm — there is one now.
