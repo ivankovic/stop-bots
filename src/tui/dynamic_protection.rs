@@ -53,10 +53,9 @@
 //! manually-blocked user agent is always permanent, since
 //! [`crate::db::Db::block_user_agent`] has no TTL concept.
 //!
-//! `refresh` itself (which resolves the live SSH log via
-//! `sshlog::find_default_source`, the same fixed-paths-or-journalctl
-//! lookup `run_cron_block_scanners` uses, with no test-injectable
-//! override) is deliberately thin: all the actual row-building logic lives
+//! `refresh` itself (which resolves the live SSH log — the `tui --ssh-log`
+//! override if one was given, else the same fixed-paths-or-journalctl
+//! lookup the cron jobs use) is deliberately thin: all the actual row-building logic lives
 //! in [`build_ssh_rows`]/[`build_ua_rows`], pure functions tested directly
 //! against synthetic counts below rather than through a real or faked log
 //! file.
@@ -191,7 +190,10 @@ impl DynamicProtection {
     /// Reloads both panels. See the module doc comment for the SSH panel's
     /// live-log-read caveat and why the actual row-building logic lives in
     /// [`build_ssh_rows`]/[`build_ua_rows`] instead of here.
-    pub fn refresh(&mut self, db: &Db) -> Result<()> {
+    /// `ssh_log` overrides SSH-log auto-detection (see `App`'s field of the
+    /// same name) — auto-detection can shell out to `journalctl`, and this
+    /// runs on every refresh.
+    pub fn refresh(&mut self, db: &Db, ssh_log: Option<&std::path::Path>) -> Result<()> {
         let firewall_blocks: HashMap<String, Option<i64>> = db
             .list_firewall_rules()?
             .into_iter()
@@ -199,7 +201,11 @@ impl DynamicProtection {
             .map(|rule| (rule.address, rule.expires_at))
             .collect();
         let blocked_ip_ranges = db.blocked_ip_ranges()?;
-        let ssh_counts = match sshlog::find_default_source() {
+        let source = match ssh_log {
+            Some(path) => sshlog::read_log_file(path),
+            None => sshlog::find_default_source(),
+        };
+        let ssh_counts = match source {
             sshlog::LogSource::Found(log_text) => sshlog::failed_attempt_counts(&log_text),
             sshlog::LogSource::Unavailable => HashMap::new(),
         };
@@ -716,7 +722,12 @@ mod tests {
         db.block_user_agent("Mozilla/5.0").unwrap();
 
         let mut screen = DynamicProtection::default();
-        screen.refresh(&db).unwrap();
+        screen
+            .refresh(
+                &db,
+                Some(std::path::Path::new("/nonexistent/test-auth.log")),
+            )
+            .unwrap();
 
         assert_eq!(screen.ua_rows.len(), 1);
         assert_eq!(screen.ua_rows[0].user_agent, "Mozilla/5.0");

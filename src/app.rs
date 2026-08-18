@@ -75,6 +75,14 @@ pub struct App {
     /// runs the test suite (see `main.rs`'s `tui --no-reload` flag, the
     /// same escape hatch `apply-blocks --no-reload` uses).
     reload_nginx: bool,
+    /// SSH log override (`tui --ssh-log`). `None` auto-detects, which can
+    /// mean shelling out to `journalctl` — on some hosts more than half a
+    /// second per call, and this is consulted on every refresh of the
+    /// Dynamic Protection screen, every `BlockScanners` cron pass and every
+    /// firewall render's lockout check. The override makes all three
+    /// deterministic (and fast) for tests, and usable on hosts with a
+    /// non-standard log path.
+    ssh_log: Option<std::path::PathBuf>,
     /// Whether a render popup confirmed with "apply after writing" actually
     /// calls `firewall::apply_script()`. Same shape and same reason as
     /// `reload_nginx`: always `true` for real usage, `false` only for tests
@@ -94,7 +102,12 @@ impl App {
     /// popup confirmed with "apply after writing" actually applies it (see
     /// both fields' doc comments) — one flag for both, since they exist for
     /// the same reason.
-    pub fn new(db: Db, root: std::path::PathBuf, reload_nginx: bool) -> Result<Self> {
+    pub fn new(
+        db: Db,
+        root: std::path::PathBuf,
+        reload_nginx: bool,
+        ssh_log: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
         let mut app = Self {
             running: true,
             events: EventHandler::new(),
@@ -126,6 +139,7 @@ impl App {
             cron_jobs_in_flight: std::collections::HashSet::new(),
             reload_nginx,
             apply_firewall: reload_nginx,
+            ssh_log,
         };
         botlist::register_all_sources(&app.db)?;
         // Same reason bot-list sources are registered here: the Dashboard's
@@ -143,7 +157,8 @@ impl App {
         self.dashboard.refresh(&self.db)?;
         self.bot_settings.refresh(&self.db)?;
         self.site_settings.refresh(&self.db)?;
-        self.dynamic_protection.refresh(&self.db)?;
+        self.dynamic_protection
+            .refresh(&self.db, self.ssh_log.as_deref())?;
         Ok(())
     }
 
@@ -491,9 +506,14 @@ impl App {
         }
         let sender = self.events.sender();
         let uses_ssh_log = matches!(job, CronJob::BlockScanners | CronJob::RenderFirewall);
+        let ssh_log = self.ssh_log.clone();
         tokio::task::spawn_blocking(move || {
             let log_text = if uses_ssh_log {
-                match crate::sshlog::find_default_source() {
+                let source = match ssh_log.as_deref() {
+                    Some(path) => crate::sshlog::read_log_file(path),
+                    None => crate::sshlog::find_default_source(),
+                };
+                match source {
                     crate::sshlog::LogSource::Found(text) => Some(text),
                     crate::sshlog::LogSource::Unavailable => None,
                 }
@@ -902,6 +922,12 @@ mod tests {
             Db::open_in_memory().unwrap(),
             std::path::PathBuf::from("/etc/nginx"),
             false,
+            // A nonexistent path rather than `None`: auto-detection would
+            // read whatever SSH log the machine running the tests happens
+            // to have, or shell out to `journalctl` — nondeterministic and,
+            // on some hosts, slow enough to blow the unit-test budget on
+            // its own.
+            Some(std::path::PathBuf::from("/nonexistent/test-auth.log")),
         )
         .unwrap()
     }

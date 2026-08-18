@@ -515,6 +515,13 @@ enum Command {
         /// fixture root, where there's no real NGINX install to reload)
         #[arg(long)]
         no_reload: bool,
+        /// Read this SSH log file instead of auto-detecting one — the same
+        /// override every SSH-reading CLI subcommand already takes, and for
+        /// the same two audiences: a host with a non-standard log location,
+        /// and tests, where auto-detection would otherwise shell out to
+        /// `journalctl` on every refresh of the Dynamic Protection screen
+        #[arg(long)]
+        ssh_log: Option<PathBuf>,
     },
 }
 
@@ -563,12 +570,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => run_tui(None, PathBuf::from(DEFAULT_NGINX_ROOT), false).await,
+        None => run_tui(None, PathBuf::from(DEFAULT_NGINX_ROOT), false, None).await,
         Some(Command::Tui {
             db,
             root,
             no_reload,
-        }) => run_tui(db, root, no_reload).await,
+            ssh_log,
+        }) => run_tui(db, root, no_reload, ssh_log).await,
         Some(Command::ScanSites { root, db }) => scan_sites(&root, db),
         Some(Command::UpdateBotLists {
             db,
@@ -740,9 +748,14 @@ fn resolve_user_db_path(
     Ok(data_home.join("stop-bots").join("db.sqlite3"))
 }
 
-async fn run_tui(db_path: Option<PathBuf>, root: PathBuf, no_reload: bool) -> Result<()> {
+async fn run_tui(
+    db_path: Option<PathBuf>,
+    root: PathBuf,
+    no_reload: bool,
+    ssh_log: Option<PathBuf>,
+) -> Result<()> {
     let db = open_db(db_path)?;
-    let app = stop_bots::app::App::new(db, root, !no_reload)?;
+    let app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
     let terminal = ratatui::init();
     let result = app.run(terminal).await;
     ratatui::restore();
