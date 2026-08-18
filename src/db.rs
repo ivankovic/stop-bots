@@ -450,8 +450,16 @@ impl Db {
     }
 
     fn init_schema(&self) -> Result<()> {
+        // The whole batch runs inside one transaction. Not for atomicity —
+        // every statement is `IF NOT EXISTS`, so a partial schema would
+        // heal on the next open — but for durability cost: in autocommit
+        // mode each CREATE TABLE is its own transaction with its own
+        // fsync, and on an ordinary disk that made a *fresh database open
+        // take ~450ms*. One transaction is one fsync. This is first-run
+        // and test-suite time, and it was almost all of both.
         self.conn.execute_batch(
             "
+            BEGIN;
             CREATE TABLE IF NOT EXISTS sources (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -647,6 +655,7 @@ impl Db {
                 user_agent TEXT PRIMARY KEY,
                 blocked_at INTEGER NOT NULL
             );
+            COMMIT;
             ",
         )?;
 
@@ -694,6 +703,37 @@ impl Db {
         )?;
 
         Ok(())
+    }
+
+    /// Runs `f` inside a single transaction, committing on `Ok` and rolling
+    /// back on `Err`.
+    ///
+    /// This exists for bulk writes, and the reason is durability cost, not
+    /// atomicity: every ordinary `Db` method autocommits, which means one
+    /// fsync per call — invisible for a single settings write, but a
+    /// bot-list store is 700+ rows, and at one fsync each that turned a
+    /// sub-millisecond amount of work into multiple seconds of disk waits
+    /// (and made every test that seeds a bot list pay the same).
+    ///
+    /// Not re-entrant: SQLite has no nested `BEGIN`, so only top-level
+    /// operations (a whole `botlist::store`, not the helpers it calls) may
+    /// wrap themselves in this.
+    pub fn batch<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f() {
+            Ok(value) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(err) => {
+                // Rollback failure is deliberately swallowed: the original
+                // error is the one worth reporting, and an aborted
+                // transaction rolls back on its own when the connection
+                // drops anyway.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
     }
 
     // ---- sources ----
@@ -1220,15 +1260,19 @@ impl Db {
     /// a caller reading the Dashboard's job list never sees a fresh
     /// timestamp next to a stale summary from a previous run, or vice versa.
     pub fn set_cron_last_run(&self, job_id: &str, ran_at: i64, summary: &str) -> Result<()> {
+        // One statement, and therefore one transaction and one fsync, for
+        // both keys — which also makes the "a caller never sees a fresh
+        // timestamp next to a stale summary" promise in the doc comment
+        // actually atomic instead of merely usually true.
         self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+            "INSERT INTO settings (key, value) VALUES (?1, ?2), (?3, ?4)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![format!("cron_last_run:{job_id}"), ran_at.to_string()],
-        )?;
-        self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![format!("cron_last_summary:{job_id}"), summary],
+            params![
+                format!("cron_last_run:{job_id}"),
+                ran_at.to_string(),
+                format!("cron_last_summary:{job_id}"),
+                summary
+            ],
         )?;
         Ok(())
     }

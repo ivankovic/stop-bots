@@ -150,6 +150,12 @@ pub fn register_all_sources(db: &Db) -> Result<()> {
 /// since a source can have internal duplicates that collapse to fewer
 /// distinct slugs than it parsed.
 pub fn store(db: &Db, kind: SourceKind, bots: &[NewBot]) -> Result<usize> {
+    // One transaction for the whole store — see `Db::batch`: at one
+    // autocommit fsync per row, a 700-bot list took seconds to store.
+    db.batch(|| store_inner(db, kind, bots))
+}
+
+fn store_inner(db: &Db, kind: SourceKind, bots: &[NewBot]) -> Result<usize> {
     db.upsert_source(&kind.as_source())?;
 
     let previously_contributed = db.clear_source_bot_entries(kind.id())?;
