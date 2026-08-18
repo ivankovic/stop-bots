@@ -2767,3 +2767,61 @@ name — the pass found ten different names for near-identical helpers
 (`test_db`, `test_db_with_bot`, `sample_bot`, `seed_bot`, `rule`,
 `test_screen`, `test_site`, `test_app`, …). Renaming them all was judged
 low-value churn; converge opportunistically.
+
+## Per-site HTTP/1.x rejection
+
+**What it does.** An optional per-site rule rejecting HTTP/1.0 and
+HTTP/1.1 requests: `if ($server_protocol ~ "^HTTP/1\.")`, folded into the
+same flag form as the other blockers so exemptions still apply. Stored as
+row presence in `site_reject_http_1x` (the `selected_countries` shape), a
+per-site table rather than a column on `sites` because `sites` rows are
+rewritten by every scan and a setting must not be lost to re-running
+discovery.
+
+**The premise, and its limit.** Current browsers negotiate HTTP/2, and a
+lot of scraping tooling doesn't, so this is a cheap filter. It is also the
+bluntest instrument in the project, and two of its failure modes are bad
+enough to be *enforced* rather than documented.
+
+**Guard 1: only emitted in TLS-terminating blocks.** Browsers do not speak
+HTTP/2 without TLS — h2c is effectively unused on the public web — so on a
+`listen 80` block every single request is HTTP/1.1, including the redirect
+a browser makes on its way to HTTPS. And a site's port-80 and port-443
+blocks routinely share one `server_name`, which is exactly what a per-site
+setting keys on. Without the guard, switching this on would take the site
+off the internet.
+
+`ServerBlock` therefore gained `is_tls`, detected while parsing from
+either `listen ... ssl` or an `ssl_certificate` directive (configs express
+it both ways, and neither is required to come first). `for_block()`
+narrows a site's config per server block, and — importantly — both the
+apply path and `site_apply_status` go through it, so a plain-HTTP block
+that *correctly* lacks the rule reads as `UP TO DATE` rather than
+permanently `STALE`.
+
+Silently narrowing beats the alternatives: refusing to apply would make a
+legitimate setting unusable on an ordinary two-block site, and emitting it
+anyway would be an outage.
+
+**Guard 2: `/.well-known/` is always exempt**, with no way to switch it
+off. ACME HTTP-01 validation is fetched over HTTP/1.1 by a non-browser
+client. Blocking it doesn't fail now — it fails at certificate renewal
+weeks later, which is close to the least traceable failure this project
+could ship. The same prefix carries security.txt and other
+machine-fetched documents that don't negotiate HTTP/2 either.
+
+**What no guard can fix, and why it's off by default.** Googlebot and
+Bingbot crawl plenty of sites over HTTP/1.1, as do RSS readers, webhooks,
+uptime monitors and most API clients. For a tool whose stated purpose is
+"stop bad bots and still allow good bots" that is a real tension, so the
+feature is per site, off by default, and the TUI's confirmation message
+says both things that surprise people (HTTPS-only, and that it turns away
+non-browser clients) rather than only the reassuring one.
+
+**`block_text` restructured.** There are now two things that can decide a
+request is unwanted — user agent and protocol version — and NGINX's `if`
+takes one condition with no composition. The function now computes whether
+the flag idiom is needed (`uses_flag`) and emits each reason as a
+`set $stop_bots_block 1`, or keeps the older direct-`return` form for the
+single-reason-no-exemptions case so a plain bot-blocking site's config
+doesn't churn.

@@ -561,6 +561,14 @@ impl Db {
                 path TEXT NOT NULL,
                 PRIMARY KEY (site_id, path)
             );
+            -- Row presence means the site rejects HTTP/1.0 and HTTP/1.1 —
+            -- the same shape `selected_countries` uses. A per-site flag
+            -- rather than a column on `sites` because `sites` rows are
+            -- rewritten wholesale by every scan, and a setting must not be
+            -- lost because someone re-ran discovery.
+            CREATE TABLE IF NOT EXISTS site_reject_http_1x (
+                site_id INTEGER PRIMARY KEY REFERENCES sites(id)
+            );
             CREATE TABLE IF NOT EXISTS ip_range_sources (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -1157,6 +1165,31 @@ impl Db {
             "DELETE FROM site_path_exemptions WHERE site_id = ?1 AND path = ?2",
             params![site_id, path],
         )?;
+        Ok(())
+    }
+
+    /// Whether `site_id` rejects HTTP/1.0 and HTTP/1.1 requests.
+    pub fn site_rejects_http_1x(&self, site_id: i64) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM site_reject_http_1x WHERE site_id = ?1",
+            params![site_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn set_site_rejects_http_1x(&self, site_id: i64, reject: bool) -> Result<()> {
+        if reject {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO site_reject_http_1x (site_id) VALUES (?1)",
+                params![site_id],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM site_reject_http_1x WHERE site_id = ?1",
+                params![site_id],
+            )?;
+        }
         Ok(())
     }
 

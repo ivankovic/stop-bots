@@ -9,6 +9,11 @@ need.
 
 ### Added
 
+- Per-site rejection of HTTP/1.0 and HTTP/1.1 requests (Site settings → open a site → Site
+  options). Off by default. Only written into HTTPS `server` blocks, since browsers don't
+  negotiate HTTP/2 without TLS and a plain port-80 block sees nothing but 1.1; `/.well-known/`
+  is always exempt so ACME certificate renewal keeps working. Note it also turns away
+  search-engine crawlers and API clients that still speak 1.1.
 - `tui --ssh-log` — the same SSH-log override every SSH-reading subcommand
   already took, now for the TUI too. Without it, hosts without a readable
   `/var/log/auth.log` paid a `journalctl` invocation (0.5s or more) on every

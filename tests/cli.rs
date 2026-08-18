@@ -988,6 +988,54 @@ fn a_failing_nginx_config_check_stops_the_reload() {
     );
 }
 
+/// Per-site HTTP/1.x rejection end to end, including the guard that keeps
+/// it from taking a site offline: a site's port-80 and port-443 blocks
+/// share one `server_name`, so the setting reaches both, and only the TLS
+/// one may carry the rule.
+#[test]
+fn rejecting_http_1x_applies_only_to_the_tls_server_block() {
+    let fx = Fixture::new();
+    let site = fx.nginx_root.join("a.example.conf");
+    fs::write(
+        &site,
+        concat!(
+            "server {\n    listen 80;\n    server_name a.example;\n}\n",
+            "server {\n    listen 443 ssl;\n    server_name a.example;\n}\n"
+        ),
+    )
+    .unwrap();
+    fx.seed_bots();
+    fx.scan_sites();
+
+    // Off by default.
+    fx.apply_blocks();
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(
+        !written.contains("$server_protocol"),
+        "written was:\n{written}"
+    );
+
+    {
+        let db = stop_bots::db::Db::open(&fx.db).unwrap();
+        let s = db.list_sites().unwrap().into_iter().next().unwrap();
+        db.set_site_rejects_http_1x(s.id, true).unwrap();
+    }
+
+    fx.apply_blocks();
+    let written = fs::read_to_string(&site).unwrap();
+    assert_eq!(
+        written.matches("$server_protocol").count(),
+        1,
+        "only the TLS block may reject HTTP/1.x; written was:\n{written}"
+    );
+    // Certificate renewal has to keep working: ACME fetches
+    // /.well-known/ over HTTP/1.1.
+    assert!(
+        written.contains(r"/\.well-known/"),
+        "written was:\n{written}"
+    );
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

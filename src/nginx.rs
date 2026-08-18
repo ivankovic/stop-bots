@@ -45,6 +45,18 @@ const BLOCK_END: &str = "# END stop-bots";
 #[derive(Debug, Clone)]
 pub struct ServerBlock {
     pub names: Vec<String>,
+    /// Whether this block terminates TLS — `listen ... ssl`, or an
+    /// `ssl_certificate` directive.
+    ///
+    /// Load-bearing for exactly one thing: HTTP/1.x rejection. Browsers
+    /// only negotiate HTTP/2 over TLS (h2c is effectively unused on the
+    /// public web), so on a plain-`listen 80` block *every* request is
+    /// HTTP/1.1 — the redirect a visitor's browser makes before it ever
+    /// reaches the HTTPS block, ACME validation, everything. Emitting the
+    /// rejection there would be 100% false positives, and a typical site
+    /// has both blocks under one `server_name`, so a per-site setting
+    /// reaches both. See `BlockConfig::reject_http_1x`.
+    pub is_tls: bool,
     open: usize,
     close: usize,
 }
@@ -127,6 +139,9 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
 
     let mut stack: Vec<(usize, bool)> = Vec::new();
     let mut names_stack: Vec<Vec<String>> = Vec::new();
+    // Parallel to `names_stack`: whether the block currently being scanned
+    // has shown any sign of terminating TLS.
+    let mut tls_stack: Vec<bool> = Vec::new();
     let mut blocks = Vec::new();
     let mut prev_word: Option<&str> = None;
 
@@ -139,6 +154,7 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
                 stack.push((*off, is_server));
                 if is_server {
                     names_stack.push(Vec::new());
+                    tls_stack.push(false);
                 }
                 prev_word = None;
             }
@@ -146,8 +162,10 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
                 if let Some((open, is_server)) = stack.pop() {
                     if is_server {
                         let names = names_stack.pop().unwrap_or_default();
+                        let is_tls = tls_stack.pop().unwrap_or(false);
                         blocks.push(ServerBlock {
                             names,
+                            is_tls,
                             open,
                             close: *off,
                         });
@@ -159,6 +177,16 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
             word => {
                 let directly_in_server =
                     stack.last().map(|(_, is_server)| *is_server) == Some(true);
+                // Two independent signals, because configs express TLS
+                // both ways: `listen 443 ssl;` (the `ssl` parameter, which
+                // arrives as its own token) and a bare `ssl_certificate`
+                // directive alongside a `listen` that doesn't say `ssl`.
+                // Either is enough; neither is required to be first.
+                if directly_in_server && (word == "ssl" || word.starts_with("ssl_certificate")) {
+                    if let Some(top) = tls_stack.last_mut() {
+                        *top = true;
+                    }
+                }
                 if word == "server_name" && directly_in_server {
                     let mut j = idx + 1;
                     let mut names = Vec::new();
@@ -374,6 +402,31 @@ pub struct BlockConfig {
     /// `return`, because NGINX has no way to say "match this user agent
     /// unless the path is one of these" in a single condition.
     pub exempt_paths: Vec<String>,
+    /// Reject HTTP/1.0 and HTTP/1.1 requests outright (per site).
+    ///
+    /// The premise is sound as far as it goes: current browsers negotiate
+    /// HTTP/2, and a lot of scraping tooling still speaks 1.1. It is also
+    /// the bluntest instrument in this project, and the two things that
+    /// make it survivable are enforced rather than documented:
+    ///
+    /// 1. **Only emitted in a TLS-terminating block** (`ServerBlock::is_tls`).
+    ///    Browsers do not do HTTP/2 without TLS, so on a `listen 80` block
+    ///    every single request is 1.1 — including the redirect a browser
+    ///    makes on its way to HTTPS. A site's port-80 and port-443 blocks
+    ///    usually share one `server_name`, so a per-site setting reaches
+    ///    both; without this guard, switching it on would take the site
+    ///    off the internet.
+    /// 2. **`/.well-known/` is always exempt** (see
+    ///    `effective_exempt_paths`). ACME HTTP-01 validation is fetched
+    ///    over HTTP/1.1 by a non-browser client; blocking it doesn't fail
+    ///    now, it fails at certificate renewal weeks later, which is close
+    ///    to the worst possible failure to trace.
+    ///
+    /// What it still costs, and what no guard can fix: Googlebot and
+    /// Bingbot crawl plenty of sites over HTTP/1.1, as do RSS readers,
+    /// webhooks, monitoring and most API clients. This is off by default
+    /// and per site for that reason.
+    pub reject_http_1x: bool,
 }
 
 impl BlockConfig {
@@ -553,6 +606,7 @@ pub fn block_config_for_site(db: &crate::db::Db, site_id: i64) -> Result<BlockCo
         serve_robots_txt: db.get_serve_robots_txt()?,
         rate_limit_burst: rate_limit_burst(db)?,
         exempt_paths: db.site_path_exemptions(site_id)?,
+        reject_http_1x: db.site_rejects_http_1x(site_id)?,
     })
 }
 
@@ -566,9 +620,10 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
         response: db.get_block_response()?,
         serve_robots_txt: db.get_serve_robots_txt()?,
         rate_limit_burst: rate_limit_burst(db)?,
-        // A block with no site row has no per-site exemptions by
-        // definition — they're keyed on `sites.id`.
+        // A block with no site row has no per-site settings by
+        // definition — both are keyed on `sites.id`.
         exempt_paths: Vec::new(),
+        reject_http_1x: false,
     })
 }
 
@@ -587,51 +642,73 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
 /// `if`.
 fn block_text(config: &BlockConfig) -> Option<String> {
     let pattern = join_patterns(&config.patterns);
-    // A config that does none of these three has no block to write, which
+    // Nothing to block and nothing to serve means no block at all, which
     // is what makes `apply_block` *remove* an existing one. Note this is
-    // no longer "no patterns" alone: robots.txt and rate limiting are each
-    // reason enough to keep a block, and treating them as nothing would
-    // delete the block carrying them the moment every bot was allowed.
-    if pattern.is_none() && !config.serve_robots_txt && config.rate_limit_burst.is_none() {
+    // not "no patterns" alone: robots.txt, rate limiting and HTTP/1.x
+    // rejection are each reason enough to keep a block, and treating any
+    // of them as nothing would delete the block carrying it the moment
+    // every bot happened to be allowed.
+    if pattern.is_none()
+        && !config.serve_robots_txt
+        && config.rate_limit_burst.is_none()
+        && !config.reject_http_1x
+    {
         return None;
     }
     let code = config.response.status_code();
     let exemptions = exemption_regex(&effective_exempt_paths(config));
 
     let mut out = format!("    {BLOCK_BEGIN}\n");
+
+    // Two things can decide a request is unwanted: its user agent, and
+    // (optionally) its HTTP version. NGINX's `if` takes exactly one
+    // condition and they don't compose, so more than one reason — or any
+    // reason at all combined with an exemption — means the flag idiom:
+    // initialise a variable, let each reason set it, clear it for exempt
+    // paths, and act on it last. Order is the whole mechanism.
+    //
+    // A single reason with no exemptions keeps the older direct-`return`
+    // form, so a plain bot-blocking site's config doesn't churn.
+    let uses_flag = exemptions.is_some() || (pattern.is_some() && config.reject_http_1x);
+
+    if uses_flag {
+        out.push_str("    set $stop_bots_block 0;\n");
+    }
+    // The tail shared by every blocker's `if`: set the flag, or return
+    // directly when there's only one reason and nothing to exempt.
+    let set_blocked = if uses_flag {
+        "set $stop_bots_block 1;\n    }\n".to_string()
+    } else {
+        format!("return {code};\n    }}\n")
+    };
+
     if let Some(pattern) = &pattern {
-        match &exemptions {
-            // No exemptions: the direct form, unchanged from before this
-            // feature existed, so an existing install's blocks don't churn.
-            None => {
-                for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
-                    out.push_str(&format!(
-                        "    if ($http_user_agent ~* \"{chunk}\") {{\n        return {code};\n    }}\n"
-                    ));
-                }
-            }
-            // With exemptions, a flag variable. NGINX cannot express
-            // "matches this user agent *and* not one of these paths" as a
-            // single `if` — `if` takes one condition and they don't
-            // compose — so the standard idiom is to set a variable, clear
-            // it for the exempt paths, and act on it last. Order is the
-            // whole mechanism: the clear must come after every set.
-            Some(exemptions) => {
-                out.push_str("    set $stop_bots_block 0;\n");
-                for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
-                    out.push_str(&format!(
-                        "    if ($http_user_agent ~* \"{chunk}\") {{\n        set $stop_bots_block 1;\n    }}\n"
-                    ));
-                }
-                out.push_str(&format!(
-                    "    if ($request_uri ~* \"{exemptions}\") {{\n        set $stop_bots_block 0;\n    }}\n"
-                ));
-                out.push_str(&format!(
-                    "    if ($stop_bots_block) {{\n        return {code};\n    }}\n"
-                ));
-            }
+        for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
+            out.push_str(&format!(
+                "    if ($http_user_agent ~* \"{chunk}\") {{\n        {set_blocked}"
+            ));
         }
     }
+    if config.reject_http_1x {
+        // `$server_protocol` is the request line's version verbatim
+        // ("HTTP/1.1", "HTTP/2.0"), so anchoring on "HTTP/1." catches 1.0
+        // and 1.1 and nothing else. This is only ever emitted into a
+        // TLS-terminating block — see `BlockConfig::reject_http_1x`.
+        out.push_str(&format!(
+            "    if ($server_protocol ~ \"^HTTP/1\\.\") {{\n        {set_blocked}"
+        ));
+    }
+    if let Some(exemptions) = &exemptions {
+        out.push_str(&format!(
+            "    if ($request_uri ~* \"{exemptions}\") {{\n        set $stop_bots_block 0;\n    }}\n"
+        ));
+    }
+    if uses_flag {
+        out.push_str(&format!(
+            "    if ($stop_bots_block) {{\n        return {code};\n    }}\n"
+        ));
+    }
+
     if let Some(burst) = config.rate_limit_burst {
         // `nodelay` so a visitor who briefly exceeds the rate is served
         // immediately from the burst allowance rather than queued —
@@ -680,7 +757,43 @@ fn effective_exempt_paths(config: &BlockConfig) -> Vec<String> {
     if config.serve_robots_txt {
         paths.push("/robots.txt".to_string());
     }
+    if config.reject_http_1x {
+        // Never optional, and never surfaced as a setting to switch off.
+        // `/.well-known/` is where ACME HTTP-01 validation is fetched
+        // from, by a non-browser client speaking HTTP/1.1. Rejecting it
+        // doesn't break anything today — it breaks certificate renewal
+        // weeks later, which is about the least traceable failure this
+        // project could ship. The same path prefix carries security.txt
+        // and a pile of other machine-fetched documents, none of which
+        // negotiate HTTP/2 either.
+        paths.push("/.well-known/".to_string());
+    }
     paths
+}
+
+/// Narrows a site's config to what is actually safe to emit into *this*
+/// `server` block.
+///
+/// Only one setting needs this today: HTTP/1.x rejection is dropped in a
+/// block that doesn't terminate TLS. Browsers don't speak HTTP/2 without
+/// it, so there every request is 1.1 and the rule would reject all
+/// traffic — and a site's port-80 redirect and port-443 blocks routinely
+/// share a `server_name`, which means one per-site setting reaches both.
+/// Silently narrowing beats both alternatives: refusing to apply would
+/// make a legitimate setting unusable on a normal two-block site, and
+/// emitting it anyway would take the site down.
+///
+/// Status checks go through here too, so a site whose rule is correctly
+/// omitted from its plain-HTTP block still reads as `UP TO DATE` rather
+/// than permanently `STALE`.
+fn for_block(config: &BlockConfig, block: &ServerBlock) -> BlockConfig {
+    if config.reject_http_1x && !block.is_tls {
+        return BlockConfig {
+            reject_http_1x: false,
+            ..config.clone()
+        };
+    }
+    config.clone()
 }
 
 /// Builds the `$request_uri` regex that clears the block flag, or `None`
@@ -725,7 +838,7 @@ fn locate_existing_block(content: &str, block: &ServerBlock) -> Option<(usize, u
 /// any existing block. Idempotent: applying the same config twice yields
 /// identical output.
 fn apply_block(content: &str, block: &ServerBlock, config: &BlockConfig) -> String {
-    let new_block = block_text(config);
+    let new_block = block_text(&for_block(config, block));
 
     match locate_existing_block(content, block) {
         Some((start, end)) => {
@@ -886,10 +999,9 @@ pub fn site_apply_status(
     if matching.is_empty() {
         return SiteApplyStatus::NotFound;
     }
-    let expected = block_text(config);
     if matching
         .iter()
-        .all(|block| current_block_text(&content, block) == expected)
+        .all(|block| current_block_text(&content, block) == block_text(&for_block(config, block)))
     {
         SiteApplyStatus::UpToDate
     } else {
@@ -1575,6 +1687,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
+            reject_http_1x: false,
         }
     }
 
@@ -1605,6 +1718,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
+            reject_http_1x: false,
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("location = /robots.txt"), "text was:\n{text}");
@@ -1745,6 +1859,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: Some(burst),
             exempt_paths: Vec::new(),
+            reject_http_1x: false,
         }
     }
 
@@ -1794,6 +1909,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: Some(5),
             exempt_paths: Vec::new(),
+            reject_http_1x: false,
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("limit_req"), "text was:\n{text}");
@@ -1844,6 +1960,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: None,
             exempt_paths: paths.iter().map(|p| p.to_string()).collect(),
+            reject_http_1x: false,
         }
     }
 
@@ -1923,6 +2040,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
+            reject_http_1x: false,
         };
         let text = block_text(&config).unwrap();
 
@@ -1945,6 +2063,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: vec!["/blog".to_string()],
+            reject_http_1x: false,
         };
         let text = block_text(&config).unwrap();
         assert!(text.contains("/blog"), "text was:\n{text}");
@@ -1969,6 +2088,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: None,
             exempt_paths: vec!["/blog".to_string()],
+            reject_http_1x: false,
         };
         let text = block_text(&config).unwrap();
 
@@ -2028,6 +2148,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: Some(20),
             exempt_paths: vec!["/blog".to_string(), "/feed.xml".to_string()],
+            reject_http_1x: false,
         };
         let text = block_text(&config).unwrap();
         crate::golden::assert_golden("nginx-block-full.conf", &text);
@@ -2048,5 +2169,170 @@ mod tests {
     #[test]
     fn rate_limit_conf_matches_the_golden() {
         crate::golden::assert_golden("stop-bots-limits.conf", &rate_limit_conf_body(10, 10));
+    }
+
+    // ---- HTTP/1.x rejection ----
+
+    fn cfg_http1x(patterns: &[&str]) -> BlockConfig {
+        BlockConfig {
+            reject_http_1x: true,
+            ..cfg(patterns)
+        }
+    }
+
+    #[test]
+    fn parse_detects_tls_from_a_listen_ssl_parameter() {
+        let content = "server {\n    listen 443 ssl;\n    server_name a.example;\n}\n";
+        assert!(parse_server_blocks(content)[0].is_tls);
+    }
+
+    #[test]
+    fn parse_detects_tls_from_an_ssl_certificate_directive() {
+        let content = concat!(
+            "server {\n",
+            "    listen 8443;\n",
+            "    ssl_certificate /etc/ssl/a.pem;\n",
+            "    server_name a.example;\n}\n"
+        );
+        assert!(parse_server_blocks(content)[0].is_tls);
+    }
+
+    #[test]
+    fn parse_marks_a_plain_listen_block_as_not_tls() {
+        let content = "server {\n    listen 80;\n    server_name a.example;\n}\n";
+        assert!(!parse_server_blocks(content)[0].is_tls);
+    }
+
+    #[test]
+    fn rejecting_http_1x_emits_a_server_protocol_condition() {
+        let text = block_text(&cfg_http1x(&["BadBot"])).unwrap();
+        assert!(
+            text.contains(r#"if ($server_protocol ~ "^HTTP/1\.")"#),
+            "text was:\n{text}"
+        );
+        // Two reasons to block now, so the flag form rather than a direct
+        // return — otherwise the two conditions couldn't both apply.
+        assert!(
+            text.contains("set $stop_bots_block 1;"),
+            "text was:\n{text}"
+        );
+        assert!(
+            text.contains("if ($stop_bots_block) {"),
+            "text was:\n{text}"
+        );
+    }
+
+    /// The guard that keeps certificate renewal working. ACME HTTP-01 is
+    /// fetched over HTTP/1.1 by a non-browser client; without this the
+    /// site keeps working until its certificate expires weeks later.
+    #[test]
+    fn rejecting_http_1x_always_exempts_well_known() {
+        let text = block_text(&cfg_http1x(&["BadBot"])).unwrap();
+        assert!(text.contains(r"/\.well-known/"), "text was:\n{text}");
+    }
+
+    #[test]
+    fn not_rejecting_http_1x_leaves_well_known_alone() {
+        let text = block_text(&cfg(&["BadBot"])).unwrap();
+        assert!(!text.contains("well-known"), "text was:\n{text}");
+    }
+
+    /// Rejection alone, with nothing else configured, is still a block
+    /// worth writing.
+    #[test]
+    fn rejecting_http_1x_alone_still_writes_a_block() {
+        let config = BlockConfig {
+            reject_http_1x: true,
+            ..BlockConfig::default()
+        };
+        let text = block_text(&config).unwrap();
+        assert!(text.contains("$server_protocol"), "text was:\n{text}");
+        assert!(
+            !text.contains("$http_user_agent"),
+            "nothing to match on the UA; text was:\n{text}"
+        );
+    }
+
+    /// The guard that keeps the feature from taking a site offline: a
+    /// site's port-80 and port-443 blocks share one `server_name`, so the
+    /// setting reaches both, and on the plain one every request is 1.1.
+    #[test]
+    fn rejecting_http_1x_is_dropped_in_a_non_tls_server_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.example");
+        fs::write(
+            &path,
+            concat!(
+                "server {\n    listen 80;\n    server_name a.example;\n}\n",
+                "server {\n    listen 443 ssl;\n    server_name a.example;\n}\n"
+            ),
+        )
+        .unwrap();
+
+        apply_block_for_site(&path, "a.example", &cfg_http1x(&["BadBot"])).unwrap();
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written.matches("$server_protocol").count(),
+            1,
+            "only the TLS block may reject HTTP/1.x; written was:\n{written}"
+        );
+        let blocks = parse_server_blocks(&written);
+        let plain = &written[blocks[0].open..blocks[0].close];
+        assert!(
+            !plain.contains("$server_protocol"),
+            "the plain-HTTP block must not reject HTTP/1.x; it was:\n{plain}"
+        );
+        // ...and it still gets the ordinary user-agent blocking.
+        assert!(plain.contains("$http_user_agent"), "plain was:\n{plain}");
+    }
+
+    /// The narrowing has to apply to the status check too, or the
+    /// plain-HTTP block reads as permanently STALE.
+    #[test]
+    fn a_correctly_narrowed_non_tls_block_reads_as_up_to_date() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.example");
+        fs::write(
+            &path,
+            concat!(
+                "server {\n    listen 80;\n    server_name a.example;\n}\n",
+                "server {\n    listen 443 ssl;\n    server_name a.example;\n}\n"
+            ),
+        )
+        .unwrap();
+
+        let config = cfg_http1x(&["BadBot"]);
+        apply_block_for_site(&path, "a.example", &config).unwrap();
+        assert_eq!(
+            site_apply_status(&path, "a.example", &config),
+            SiteApplyStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn site_apply_status_is_stale_when_http_1x_rejection_is_switched_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(
+            &path,
+            "server {\n    listen 443 ssl;\n    server_name a.example;\n}\n",
+        )
+        .unwrap();
+        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+
+        assert_eq!(
+            site_apply_status(&path, "a.example", &cfg_http1x(&["BadBot"])),
+            SiteApplyStatus::Stale
+        );
+    }
+
+    #[test]
+    fn http_1x_rejection_matches_the_golden() {
+        let config = BlockConfig {
+            reject_http_1x: true,
+            ..cfg(&["BadBot"])
+        };
+        crate::golden::assert_golden("nginx-block-http1x.conf", &block_text(&config).unwrap());
     }
 }

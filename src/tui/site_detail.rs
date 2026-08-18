@@ -91,6 +91,11 @@ enum Focus {
     /// country list. Reached by `Down` past the last category, left by
     /// `Up` above its first row — the same no-dedicated-focus-key flow.
     Exemptions,
+    /// The per-site NGINX options list — currently one row, the HTTP/1.x
+    /// rejection toggle. Its own panel rather than a row in the
+    /// categories list above: a category is Allowed/Blocked for *bots*,
+    /// and this is a protocol-level rule that applies to every client.
+    Options,
     Search,
 }
 
@@ -127,6 +132,8 @@ pub struct SiteDetail {
     categories_state: ListState,
     bots: Vec<Bot>,
     bot_overrides: Vec<SiteBotOverride>,
+    reject_http_1x: bool,
+    options_state: ListState,
     exempt_paths: Vec<String>,
     exemptions_state: ListState,
     query: String,
@@ -148,6 +155,8 @@ impl SiteDetail {
             categories_state,
             bots: Vec::new(),
             bot_overrides: Vec::new(),
+            reject_http_1x: false,
+            options_state: ListState::default().with_selected(Some(0)),
             exempt_paths: Vec::new(),
             exemptions_state: ListState::default().with_selected(Some(0)),
             query: String::new(),
@@ -167,6 +176,7 @@ impl SiteDetail {
         }
         self.bots = db.list_bots()?;
         self.bot_overrides = db.site_bot_overrides(self.site.id)?;
+        self.reject_http_1x = db.site_rejects_http_1x(self.site.id)?;
         self.exempt_paths = db.site_path_exemptions(self.site.id)?;
         // Removing a path shrinks the list; without this the selection
         // could be left pointing past the new last row until the next
@@ -226,8 +236,10 @@ impl SiteDetail {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let [categories_area, exemptions_area, details_area] = Layout::vertical([
+        let [categories_area, options_area, exemptions_area, details_area] = Layout::vertical([
             Constraint::Length(5),
+            // Two border lines plus one row per option.
+            Constraint::Length(3),
             // Two border lines plus the Add row, plus up to three paths
             // before it starts scrolling — enough to see a typical setup
             // at a glance without starving the bot search below it.
@@ -237,6 +249,7 @@ impl SiteDetail {
         .areas(area);
 
         self.render_categories(frame, categories_area, theme);
+        self.render_options(frame, options_area, theme);
         self.render_exemptions(frame, exemptions_area, theme);
         self.render_details(frame, details_area, theme);
 
@@ -259,6 +272,36 @@ impl SiteDetail {
             .block(block)
             .highlight_style(ratatui::style::Style::new().reversed());
         frame.render_stateful_widget(list, area, &mut self.categories_state);
+    }
+
+    fn render_options(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        // The label says "HTTP/1.x requests" and the tag says
+        // Allowed/Blocked, matching the categories panel above — the whole
+        // screen answers one question per row, "is this allowed here".
+        let items = vec![ListItem::new(Line::from(vec![
+            Span::from(format!("{:<20}", "HTTP/1.x requests")),
+            policy_tag(if self.reject_http_1x {
+                Policy::Blocked
+            } else {
+                Policy::Allowed
+            }),
+            Span::from(if self.reject_http_1x {
+                "  HTTPS blocks only; /.well-known stays open"
+            } else {
+                ""
+            })
+            .dim(),
+        ]))];
+
+        let mut block = Block::bordered().title("Site options — Enter to change");
+        if self.focus == Focus::Options {
+            block = block.fg(theme.accent());
+        }
+        let mut list = List::new(items).block(block);
+        if self.focus == Focus::Options {
+            list = list.highlight_style(ratatui::style::Style::new().reversed());
+        }
+        frame.render_stateful_widget(list, area, &mut self.options_state);
     }
 
     fn render_exemptions(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
@@ -463,8 +506,8 @@ impl SiteDetail {
                 KeyCode::Up | KeyCode::Char('k') => self.categories_state.select_previous(),
                 KeyCode::Down | KeyCode::Char('j') => {
                     if self.categories_state.selected() == Some(CATEGORIES.len() - 1) {
-                        self.focus = Focus::Exemptions;
-                        self.exemptions_state.select(Some(0));
+                        self.focus = Focus::Options;
+                        self.options_state.select(Some(0));
                     } else {
                         self.categories_state.select_next();
                     }
@@ -473,12 +516,28 @@ impl SiteDetail {
                 KeyCode::Char('/') => self.focus = Focus::Search,
                 _ => return Ok(KeyOutcome::Ignored),
             },
+            Focus::Options => match key.code {
+                KeyCode::Esc => return Ok(KeyOutcome::Back),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.focus = Focus::Categories;
+                    self.categories_state.select(Some(CATEGORIES.len() - 1));
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.focus = Focus::Exemptions;
+                    self.exemptions_state.select(Some(0));
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    return self.toggle_http_1x(db, message);
+                }
+                KeyCode::Char('/') => self.focus = Focus::Search,
+                _ => return Ok(KeyOutcome::Ignored),
+            },
             Focus::Exemptions => match key.code {
                 KeyCode::Esc => return Ok(KeyOutcome::Back),
                 KeyCode::Up | KeyCode::Char('k') => {
                     if self.exemptions_state.selected() == Some(0) {
-                        self.focus = Focus::Categories;
-                        self.categories_state.select(Some(CATEGORIES.len() - 1));
+                        self.focus = Focus::Options;
+                        self.options_state.select(Some(0));
                     } else {
                         self.exemptions_state.select_previous();
                     }
@@ -597,6 +656,32 @@ impl SiteDetail {
             }
             _ => Ok(KeyOutcome::Consumed),
         }
+    }
+
+    /// Flips this site's HTTP/1.x rejection.
+    ///
+    /// A direct toggle rather than a popup: it's a single reversible
+    /// change, the same reasoning the Dashboard's country list uses. The
+    /// message spells out the two things that surprise people — it only
+    /// takes effect on HTTPS blocks, and it turns away non-browser clients
+    /// — because the row itself has no room and the consequences show up
+    /// somewhere other than this screen.
+    fn toggle_http_1x(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
+        let reject = !self.reject_http_1x;
+        db.set_site_rejects_http_1x(self.site.id, reject)?;
+        *message = Some(if reject {
+            format!(
+                "{}: rejecting HTTP/1.x on HTTPS blocks only. This also turns away crawlers \
+                 and API clients that don't speak HTTP/2 — apply (a/A) to write it",
+                self.site.server_name
+            )
+        } else {
+            format!(
+                "{}: HTTP/1.x allowed again — apply (a/A) to write it",
+                self.site.server_name
+            )
+        });
+        Ok(KeyOutcome::Mutated)
     }
 
     /// Enter on the exemptions list: row 0 opens the add-path popup, any
@@ -1051,14 +1136,18 @@ mod tests {
     }
 
     #[test]
-    fn focus_flows_from_categories_into_exemptions_and_back() {
+    fn focus_flows_down_through_every_panel_and_back_up() {
         let (db, site) = exemption_fixture();
         let mut detail = SiteDetail::new(site);
         detail.refresh(&db).unwrap();
 
+        // Down walks Categories -> Options -> Exemptions...
         focus_exemptions(&mut detail, &db);
         assert_eq!(detail.exemptions_state.selected(), Some(0));
 
+        // ...and Up walks back the same way, one panel at a time.
+        press(&mut detail, &db, KeyCode::Up);
+        assert_eq!(detail.focus, Focus::Options);
         press(&mut detail, &db, KeyCode::Up);
         assert_eq!(detail.focus, Focus::Categories);
     }
@@ -1211,5 +1300,85 @@ mod tests {
                 .unwrap(),
             Some(Policy::Blocked)
         );
+    }
+
+    // ---- HTTP/1.x rejection ----
+
+    fn focus_options(detail: &mut SiteDetail, db: &Db) {
+        while detail.focus != Focus::Options {
+            press(detail, db, KeyCode::Down);
+        }
+    }
+
+    #[test]
+    fn enter_toggles_http_1x_rejection_for_this_site_only() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+        focus_options(&mut detail, &db);
+
+        assert!(!db.site_rejects_http_1x(site_id).unwrap());
+        let outcome = press(&mut detail, &db, KeyCode::Enter);
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(db.site_rejects_http_1x(site_id).unwrap());
+
+        detail.refresh(&db).unwrap();
+        press(&mut detail, &db, KeyCode::Enter);
+        assert!(
+            !db.site_rejects_http_1x(site_id).unwrap(),
+            "Enter is a toggle, not a one-way switch"
+        );
+    }
+
+    /// The consequences land outside this screen — on HTTPS blocks only,
+    /// and on clients that aren't browsers — so the confirmation has to
+    /// say both.
+    #[test]
+    fn turning_http_1x_rejection_on_warns_about_what_it_actually_does() {
+        let (db, site) = exemption_fixture();
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+        focus_options(&mut detail, &db);
+
+        let mut message = None;
+        detail
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        let message = message.unwrap();
+        assert!(message.contains("HTTPS"), "message was: {message}");
+        assert!(message.contains("HTTP/2"), "message was: {message}");
+    }
+
+    #[test]
+    fn render_shows_the_site_options_panel() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let (db, site) = exemption_fixture();
+        db.set_site_rejects_http_1x(site.id, true).unwrap();
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| detail.render(frame, frame.area(), Theme::Dark))
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+
+        assert!(content.contains("Site options"), "content was:\n{content}");
+        assert!(
+            content.contains("HTTP/1.x requests"),
+            "content was:\n{content}"
+        );
+        assert!(content.contains("BLOCKED"), "content was:\n{content}");
     }
 }

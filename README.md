@@ -85,7 +85,8 @@ everything that ends up in **NGINX config**. That split decides where any given 
   discovered on disk, each with a live "up to date / stale / not found" status and actions to
   apply the current policy to one site or all of them. Changing any of those settings flips
   every applied site to `STALE`, which is your cue to re-apply. Opening a site lets you
-  override its category/bot policy and list paths exempt from blocking.
+  override its category/bot policy, reject HTTP/1.x for that site, and list paths exempt from
+  blocking.
 - **Dynamic Protection**: a live, actionable view of what's currently hitting the server — "Top
   IPs attempting SSH connection" and "Top User Agents", each ranked by count and tagged
   `NOT BLOCKED`/`BLOCKED` (shown in red). `Tab`/`Shift+Tab` switch which of the two panels
@@ -113,6 +114,19 @@ everything that ends up in **NGINX config**. That split decides where any given 
   replaces whatever your site serves at `/robots.txt` today.
 - **Except where you say otherwise** — per-site path exemptions, so you can block AI crawlers
   everywhere except `/blog`.
+- **Anything still speaking HTTP/1.x**, per site. Current browsers negotiate HTTP/2 and a lot
+  of scraping tooling doesn't, so this is a cheap filter — but it is the bluntest thing here,
+  and worth understanding before switching it on:
+  - It is only ever written into **HTTPS** `server` blocks. Browsers don't do HTTP/2 without
+    TLS, so on a plain `listen 80` block *every* request is HTTP/1.1, including the redirect a
+    browser makes on its way to HTTPS. Your port-80 and port-443 blocks usually share a
+    `server_name`, so the setting reaches both; only the TLS one gets the rule.
+  - `/.well-known/` is always exempt, and not optionally. That's where Let's Encrypt fetches
+    its HTTP-01 challenge, over HTTP/1.1 — without the exemption your certificate stops
+    renewing weeks later.
+  - **It will turn away more than scrapers.** Googlebot and Bingbot crawl plenty of sites over
+    HTTP/1.1, as do RSS readers, webhooks, uptime monitors and most API clients. Off by
+    default, per site, for exactly that reason.
 
 ### From your logs, automatically
 
