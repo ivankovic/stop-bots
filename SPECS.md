@@ -2940,6 +2940,21 @@ none is empty. The distinctions that actually matter:
 - **404** denies a scanner the signal that it was noticed.
 - **444** is cheapest and most opaque, at the cost of being
   indistinguishable from an outage.
+- **402** looks like a novelty and isn't one. It was reserved and unused
+  for most of HTTP's life, and has since become the de facto "this content
+  is not free" signal that pay-per-crawl schemes build on — which makes it
+  the most pointed answer available to an AI crawler, and worth listing
+  above the joke rather than beside it.
+- **418** is the joke, included because it is a good one. Two caveats it
+  carries in its own doc comment: it is not IANA-registered, so an
+  intermediary that only understands registered codes may not pass it
+  through cleanly, and NGINX has no canned error page for it — the client
+  gets a status line and an empty body.
+
+Adding these two broke one test, correctly: `an_unrecognised_stored_response_falls_back_to_403`
+had used `"418"` as its example of a value this build has no variant for.
+It now uses a code that stays unrecognised, and the failure is worth
+recording as the check doing its job rather than an inconvenience.
 
 ### The tarpit, and why it's `$limit_rate` rather than `limit_req`
 

@@ -147,6 +147,8 @@ catch:
 | `404 Not Found` | hides that anything was blocked at all |
 | `410 Gone` | asks well-behaved crawlers to drop the URL **for good** — prefer this over 403 when you're turning away crawlers rather than attackers |
 | `429 Too Many Requests` | tells a polite client to back off and retry |
+| `402 Payment Required` | the closest thing to a standard "this content isn't free" — pay-per-crawl schemes have settled on it, which makes it a pointed answer to an AI crawler |
+| `418 I'm a teapot` | RFC 2324's joke. It works; it just isn't IANA-registered, and NGINX sends it with an empty body |
 | `444 close connection` | no reply at all; cheapest, but indistinguishable from the server being down |
 | `Tarpit` | answers 403 but trickles the body at one byte per second, so the client waits instead of moving on |
 

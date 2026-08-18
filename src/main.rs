@@ -496,6 +496,10 @@ enum Command {
     /// well-behaved crawler to drop the URL permanently — prefer it over
     /// 403 when you're turning away crawlers rather than attackers.
     /// "too-many-requests" (429) tells a polite client to retry later.
+    /// "payment-required" (402) is what pay-per-crawl schemes have settled
+    /// on, which makes it the most pointed answer available to an AI
+    /// crawler. "teapot" (418) is RFC 2324's joke — it works, but it is
+    /// not IANA-registered and NGINX sends it with an empty body.
     /// "close" (444) sends nothing at all, which is cheapest but
     /// indistinguishable from the server being down. "tarpit" answers 403
     /// but throttles the body to a byte per second, holding the client's
@@ -568,6 +572,10 @@ enum BlockResponseArg {
     Gone,
     /// 429 — tells a polite client to back off and retry
     TooManyRequests,
+    /// 402 — what pay-per-crawl schemes use; pointed at AI crawlers
+    PaymentRequired,
+    /// 418 — a joke (RFC 2324); unregistered, and sends an empty body
+    Teapot,
     /// 444 — close without replying at all
     Close,
     /// A 403 whose body is throttled to one byte per second
@@ -582,6 +590,8 @@ impl From<BlockResponseArg> for stop_bots::db::BlockResponse {
             BlockResponseArg::NotFound => R::NotFound,
             BlockResponseArg::Gone => R::Gone,
             BlockResponseArg::TooManyRequests => R::TooManyRequests,
+            BlockResponseArg::PaymentRequired => R::PaymentRequired,
+            BlockResponseArg::Teapot => R::Teapot,
             BlockResponseArg::Close => R::Close,
             BlockResponseArg::Tarpit => R::Tarpit,
         }

@@ -1060,6 +1060,8 @@ fn each_block_response_reaches_the_generated_config() {
         ("not-found", "return 404;"),
         ("gone", "return 410;"),
         ("too-many-requests", "return 429;"),
+        ("payment-required", "return 402;"),
+        ("teapot", "return 418;"),
         ("close", "return 444;"),
     ] {
         fx.run(&["set-block-response", "--response", arg]);
