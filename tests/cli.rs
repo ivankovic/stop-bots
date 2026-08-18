@@ -12,6 +12,99 @@ use walkdir::WalkDir;
 // database and NGINX root. The helpers here wrap the incantations that made
 // up 20-40 lines of identical scaffolding in each of them.
 
+/// A throwaway world for one end-to-end test: a database, an NGINX config
+/// root, and the two directories the product writes its own generated
+/// files into.
+///
+/// Every command run through this has the managed-directory overrides set,
+/// which is a safety property and not just convenience: without them,
+/// `apply-blocks` writes generated files under `/etc`. Today only
+/// robots.txt and rate limiting do that and both default to off, so the
+/// eight tests that never set the overrides happen to be harmless — one
+/// setting away from not being. Making the fixture own them removes the
+/// footgun rather than documenting it.
+struct Fixture {
+    // Held for its Drop: the directory is deleted when the fixture is.
+    _tmp: tempfile::TempDir,
+    db: std::path::PathBuf,
+    nginx_root: std::path::PathBuf,
+    /// `MANAGED_DIR` — where the generated robots.txt goes.
+    managed: std::path::PathBuf,
+    /// `conf.d` — where the generated rate-limit zone goes.
+    conf_d: std::path::PathBuf,
+}
+
+impl Fixture {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let nginx_root = tmp.path().join("nginx");
+        fs::create_dir_all(&nginx_root).unwrap();
+        Fixture {
+            db: tmp.path().join("db.sqlite3"),
+            nginx_root,
+            managed: tmp.path().join("managed"),
+            conf_d: tmp.path().join("conf.d"),
+            _tmp: tmp,
+        }
+    }
+
+    /// Runs `stop-bots` with `args` plus `--db`, asserting success and
+    /// returning the assertion so a caller can check stdout.
+    fn run(&self, args: &[&str]) -> assert_cmd::assert::Assert {
+        self.cmd(args).assert().success()
+    }
+
+    /// The same, without asserting success — for the tests that expect a
+    /// failure and check stderr.
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::cargo_bin("stop-bots").unwrap();
+        cmd.env("STOP_BOTS_NGINX_DIR", &self.managed)
+            .env("STOP_BOTS_NGINX_CONF_D", &self.conf_d)
+            .args(args)
+            .args(["--db", self.db.to_str().unwrap()]);
+        cmd
+    }
+
+    /// Seeds the bot list from the checked-in sample, so tests never touch
+    /// the network.
+    fn seed_bots(&self) {
+        self.run(&[
+            "update-bot-lists",
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ]);
+    }
+
+    fn scan_sites(&self) -> assert_cmd::assert::Assert {
+        self.run(&["scan-sites", "--root", self.nginx_root.to_str().unwrap()])
+    }
+
+    /// `--no-reload` throughout: these run on whatever machine hosts the
+    /// test suite, and an apply without it shells out to the real
+    /// `nginx -t` and `systemctl reload nginx`.
+    fn apply_blocks(&self) -> assert_cmd::assert::Assert {
+        self.run(&[
+            "apply-blocks",
+            "--root",
+            self.nginx_root.to_str().unwrap(),
+            "--no-reload",
+        ])
+    }
+
+    /// One `server` block named `name`, in this fixture's config root.
+    fn write_site(&self, name: &str) -> std::path::PathBuf {
+        write_site(&self.nginx_root, name)
+    }
+
+    fn robots_txt(&self) -> std::path::PathBuf {
+        self.managed.join("robots.txt")
+    }
+
+    fn rate_limit_conf(&self) -> std::path::PathBuf {
+        self.conf_d.join("stop-bots-limits.conf")
+    }
+}
+
 /// Runs `stop-bots` with `args`, asserting it succeeded, and returns the
 /// assertion so a caller can go on to check stdout.
 fn stop_bots(args: &[&str]) -> assert_cmd::assert::Assert {
@@ -179,11 +272,20 @@ fn update_scan_and_apply_blocks_happy_path() {
         .stdout(predicate::str::contains("2 file(s) changed"));
 
     let example_com = fs::read_to_string(nginx_root.join("sites-enabled/example.com")).unwrap();
-    assert!(example_com.contains("# BEGIN stop-bots"));
-    assert!(example_com.contains("AISearchBot"));
+    assert!(
+        example_com.contains("# BEGIN stop-bots"),
+        "example_com was:\n{example_com}"
+    );
+    assert!(
+        example_com.contains("AISearchBot"),
+        "example_com was:\n{example_com}"
+    );
     // The search-engine and unknown-category bots default to allowed, so
     // only the AI bot's pattern should show up in the generated rule.
-    assert!(!example_com.contains("Googlebot"));
+    assert!(
+        !example_com.contains("Googlebot"),
+        "example_com was:\n{example_com}"
+    );
 
     // Re-running apply-blocks should be a no-op.
     Command::cargo_bin("stop-bots")
@@ -258,13 +360,13 @@ fn apply_blocks_scopes_a_site_override_to_its_own_file_even_with_a_shared_server
     let b = fs::read_to_string(&file_b).unwrap();
     // file_a's site overrides Search to Blocked: the search-engine bot's
     // pattern should show up there.
-    assert!(a.contains("Googlebot"));
+    assert!(a.contains("Googlebot"), "a was:\n{a}");
     // file_b's same-named site has no override of its own and must not
     // pick up file_a's — it follows the global default (Search allowed).
     // It still gets a block, just for the AI bot (blocked by default),
     // not the search-engine one.
-    assert!(!b.contains("Googlebot"));
-    assert!(b.contains("AISearchBot"));
+    assert!(!b.contains("Googlebot"), "b was:\n{b}");
+    assert!(b.contains("AISearchBot"), "b was:\n{b}");
 }
 
 /// The block-response setting end to end: change it, apply, and confirm
@@ -307,8 +409,8 @@ fn set_block_response_changes_the_generated_status_code_on_the_next_apply() {
 
     apply(&db_path, &nginx_root);
     let written = fs::read_to_string(&site).unwrap();
-    assert!(written.contains("return 444;"));
-    assert!(!written.contains("return 403;"));
+    assert!(written.contains("return 444;"), "written was:\n{written}");
+    assert!(!written.contains("return 403;"), "written was:\n{written}");
 }
 
 /// Spoofed-crawler detection end to end, including the property that
@@ -660,83 +762,42 @@ fn an_unknown_reputation_source_is_rejected_with_the_known_ids() {
 /// aliases it, and disabling removes both.
 #[test]
 fn robots_txt_is_generated_aliased_and_then_removed_again() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("db.sqlite3");
-    let nginx_root = tmp.path().join("nginx");
-    let managed = tmp.path().join("managed");
-    fs::create_dir_all(&nginx_root).unwrap();
-
-    let site = write_site(&nginx_root, "a.example");
-
-    seed_bots(&db_path);
-    scan_sites(&db_path, &nginx_root);
-
-    let apply = |db_path: &Path, root: &Path, managed: &Path| {
-        Command::cargo_bin("stop-bots")
-            .unwrap()
-            .env("STOP_BOTS_NGINX_DIR", managed)
-            .args([
-                "apply-blocks",
-                "--root",
-                root.to_str().unwrap(),
-                "--db",
-                db_path.to_str().unwrap(),
-                "--no-reload",
-            ])
-            .assert()
-            .success();
-    };
+    let fx = Fixture::new();
+    let site = fx.write_site("a.example");
+    fx.seed_bots();
+    fx.scan_sites();
 
     // Off by default: no location block, no file.
-    apply(&db_path, &nginx_root, &managed);
+    fx.apply_blocks();
     assert!(!fs::read_to_string(&site).unwrap().contains("/robots.txt"));
-    assert!(!managed.join("robots.txt").exists());
+    assert!(!fx.robots_txt().exists());
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "set-robots-txt",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--enabled",
-            "true",
-        ])
-        .assert()
-        .success()
+    fx.run(&["set-robots-txt", "--enabled", "true"])
         .stdout(predicate::str::contains("replaces"));
-
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args(["show-robots-txt", "--db", db_path.to_str().unwrap()])
-        .assert()
-        .success()
+    fx.run(&["show-robots-txt"])
         .stdout(predicate::str::contains("User-agent:"))
         // The honeypot trap path is always published.
         .stdout(predicate::str::contains("stop-bots-trap"));
 
-    apply(&db_path, &nginx_root, &managed);
+    fx.apply_blocks();
     let written = fs::read_to_string(&site).unwrap();
-    assert!(written.contains("location = /robots.txt"));
+    assert!(
+        written.contains("location = /robots.txt"),
+        "written was:\n{written}"
+    );
     // The alias points at the file that was actually written.
-    let robots = managed.join("robots.txt");
+    let robots = fx.robots_txt();
     assert!(robots.exists(), "robots.txt should have been written");
-    assert!(written.contains(robots.to_str().unwrap()));
+    assert!(
+        written.contains(robots.to_str().unwrap()),
+        "written was:\n{written}"
+    );
     assert!(fs::read_to_string(&robots).unwrap().contains("User-agent:"));
 
     // Disabling removes the directive *and* the generated file — a stale
     // generated artifact left on disk invites being wired back up by hand.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "set-robots-txt",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--enabled",
-            "false",
-        ])
-        .assert()
-        .success();
-    apply(&db_path, &nginx_root, &managed);
+    fx.run(&["set-robots-txt", "--enabled", "false"]);
+    fx.apply_blocks();
     assert!(!fs::read_to_string(&site).unwrap().contains("/robots.txt"));
     assert!(!robots.exists(), "the generated file should be removed");
 }
@@ -746,99 +807,54 @@ fn robots_txt_is_generated_aliased_and_then_removed_again() {
 /// block references it, and must only be deleted once none does.
 #[test]
 fn rate_limit_writes_the_zone_file_and_removes_it_only_after_the_directive_goes() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("db.sqlite3");
-    let nginx_root = tmp.path().join("nginx");
-    let managed = tmp.path().join("managed");
-    let conf_d = tmp.path().join("conf.d");
-    fs::create_dir_all(&nginx_root).unwrap();
+    let fx = Fixture::new();
+    let site = fx.write_site("a.example");
+    fx.scan_sites();
 
-    let site = write_site(&nginx_root, "a.example");
+    fx.run(&[
+        "set-rate-limit",
+        "--enabled",
+        "true",
+        "--rps",
+        "7",
+        "--burst",
+        "14",
+    ])
+    .stdout(predicate::str::contains("7 req/s"));
 
-    scan_sites(&db_path, &nginx_root);
-
-    let apply = || {
-        Command::cargo_bin("stop-bots")
-            .unwrap()
-            .env("STOP_BOTS_NGINX_DIR", &managed)
-            .env("STOP_BOTS_NGINX_CONF_D", &conf_d)
-            .args([
-                "apply-blocks",
-                "--root",
-                nginx_root.to_str().unwrap(),
-                "--db",
-                db_path.to_str().unwrap(),
-                "--no-reload",
-            ])
-            .assert()
-            .success();
-    };
-
-    let zone_file = conf_d.join("stop-bots-limits.conf");
-
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "set-rate-limit",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--enabled",
-            "true",
-            "--rps",
-            "7",
-            "--burst",
-            "14",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("7 req/s"));
-
-    apply();
+    fx.apply_blocks();
     let written = fs::read_to_string(&site).unwrap();
-    assert!(written.contains("limit_req zone=stop_bots burst=14 nodelay;"));
-    assert!(written.contains("limit_req_status 429;"));
+    assert!(
+        written.contains("limit_req zone=stop_bots burst=14 nodelay;"),
+        "written was:\n{written}"
+    );
+    assert!(
+        written.contains("limit_req_status 429;"),
+        "written was:\n{written}"
+    );
 
-    let zone = fs::read_to_string(&zone_file).expect("zone file should exist");
-    assert!(zone.contains("rate=7r/s"));
+    let zone = fs::read_to_string(fx.rate_limit_conf()).expect("zone file should exist");
+    assert!(zone.contains("rate=7r/s"), "zone was:\n{zone}");
     // The zone the server block references is the zone that was defined.
-    assert!(zone.contains("zone=stop_bots:"));
+    assert!(zone.contains("zone=stop_bots:"), "zone was:\n{zone}");
 
-    // Parameters persist across a disable, so re-enabling doesn't silently
-    // revert to defaults.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "set-rate-limit",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--enabled",
-            "false",
-        ])
-        .assert()
-        .success();
+    fx.run(&["set-rate-limit", "--enabled", "false"]);
 
     // Still present until an apply actually rewrites the config — deleting
     // it while the directive is live would make nginx -t fail outright.
-    assert!(zone_file.exists());
+    assert!(fx.rate_limit_conf().exists());
 
-    apply();
-    assert!(!fs::read_to_string(&site).unwrap().contains("limit_req"));
+    fx.apply_blocks();
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(!written.contains("limit_req"), "written was:\n{written}");
     assert!(
-        !zone_file.exists(),
+        !fx.rate_limit_conf().exists(),
         "zone file should be removed after apply"
     );
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "set-rate-limit",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--enabled",
-            "true",
-        ])
-        .assert()
-        .success()
+    // Parameters persist across a disable, so re-enabling doesn't silently
+    // revert to defaults.
+    fx.run(&["set-rate-limit", "--enabled", "true"])
         .stdout(predicate::str::contains("7 req/s"));
 }
 
@@ -863,8 +879,8 @@ fn a_site_path_exemption_switches_the_block_to_the_flag_form() {
     // Without exemptions: the original direct-return shape.
     apply();
     let plain = fs::read_to_string(&site_file).unwrap();
-    assert!(plain.contains("return 403;"));
-    assert!(!plain.contains("$stop_bots_block"));
+    assert!(plain.contains("return 403;"), "plain was:\n{plain}");
+    assert!(!plain.contains("$stop_bots_block"), "plain was:\n{plain}");
 
     {
         let db = stop_bots::db::Db::open(&db_path).unwrap();
@@ -874,10 +890,22 @@ fn a_site_path_exemption_switches_the_block_to_the_flag_form() {
 
     apply();
     let exempted = fs::read_to_string(&site_file).unwrap();
-    assert!(exempted.contains("set $stop_bots_block 0;"));
-    assert!(exempted.contains("set $stop_bots_block 1;"));
-    assert!(exempted.contains("if ($request_uri ~* \"^(/blog)\")"));
-    assert!(exempted.contains("if ($stop_bots_block) {"));
+    assert!(
+        exempted.contains("set $stop_bots_block 0;"),
+        "exempted was:\n{exempted}"
+    );
+    assert!(
+        exempted.contains("set $stop_bots_block 1;"),
+        "exempted was:\n{exempted}"
+    );
+    assert!(
+        exempted.contains("if ($request_uri ~* \"^(/blog)\")"),
+        "exempted was:\n{exempted}"
+    );
+    assert!(
+        exempted.contains("if ($stop_bots_block) {"),
+        "exempted was:\n{exempted}"
+    );
     // Exactly one sentinel block still, not a second appended.
     assert_eq!(exempted.matches("# BEGIN stop-bots").count(), 1);
 }
@@ -1019,12 +1047,18 @@ fn firewall_add_list_render_remove_happy_path() {
         .stdout(predicate::str::contains("Wrote 2 rule(s)"));
 
     let script = fs::read_to_string(&script_path).unwrap();
-    assert!(script.contains("-A STOP-BOTS -s 1.2.3.4 -j DROP"));
-    assert!(script.contains("-A STOP-BOTS -s 66.249.64.0/19 -j ACCEPT"));
+    assert!(
+        script.contains("-A STOP-BOTS -s 1.2.3.4 -j DROP"),
+        "script was:\n{script}"
+    );
+    assert!(
+        script.contains("-A STOP-BOTS -s 66.249.64.0/19 -j ACCEPT"),
+        "script was:\n{script}"
+    );
     // This is the safety property that matters most: the script must never
     // touch chains/policies outside our own dedicated STOP-BOTS chain.
-    assert!(!script.contains("*filter"));
-    assert!(!script.contains("COMMIT"));
+    assert!(!script.contains("*filter"), "script was:\n{script}");
+    assert!(!script.contains("COMMIT"), "script was:\n{script}");
 
     Command::cargo_bin("stop-bots")
         .unwrap()
@@ -1093,8 +1127,11 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.matches("WARNING").count(), 1);
-    assert!(stderr.contains("4.5.6.7"));
-    assert!(stderr.contains("Refusing to write"));
+    assert!(stderr.contains("4.5.6.7"), "stderr was:\n{stderr}");
+    assert!(
+        stderr.contains("Refusing to write"),
+        "stderr was:\n{stderr}"
+    );
     assert!(!script_path.exists());
 
     // With --force: still warns (once), but writes the script.
@@ -1117,7 +1154,7 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
     assert!(output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(stderr.matches("WARNING").count(), 1);
-    assert!(stderr.contains("4.5.6.7"));
+    assert!(stderr.contains("4.5.6.7"), "stderr was:\n{stderr}");
     assert!(fs::read_to_string(&script_path)
         .unwrap()
         .contains("4.5.6.0/24"));
@@ -1365,9 +1402,18 @@ fn render_firewall_allowlist_mode_does_not_warn_when_an_earlier_allow_rule_cover
         .stderr(predicate::str::contains("WARNING").not());
 
     let script = fs::read_to_string(&script_path).unwrap();
-    assert!(script.contains("ip saddr 4.5.6.7 accept"));
-    assert!(script.contains("ip saddr 0.0.0.0/0 drop"));
-    assert!(script.contains("ip6 saddr ::/0 drop"));
+    assert!(
+        script.contains("ip saddr 4.5.6.7 accept"),
+        "script was:\n{script}"
+    );
+    assert!(
+        script.contains("ip saddr 0.0.0.0/0 drop"),
+        "script was:\n{script}"
+    );
+    assert!(
+        script.contains("ip6 saddr ::/0 drop"),
+        "script was:\n{script}"
+    );
 }
 
 fn repeat_failed_attempt(ip: &str, times: usize) -> String {
@@ -1781,6 +1827,12 @@ fn list_firewall_rules_shows_expiry_only_for_temporary_rules() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let permanent_line = stdout.lines().find(|l| l.contains("9.9.9.9")).unwrap();
     let temporary_line = stdout.lines().find(|l| l.contains("198.51.100.9")).unwrap();
-    assert!(!permanent_line.contains("expires"));
-    assert!(temporary_line.contains("expires in"));
+    assert!(
+        !permanent_line.contains("expires"),
+        "permanent_line was:\n{permanent_line}"
+    );
+    assert!(
+        temporary_line.contains("expires in"),
+        "temporary_line was:\n{temporary_line}"
+    );
 }
