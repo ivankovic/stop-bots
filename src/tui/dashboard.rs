@@ -2728,4 +2728,43 @@ mod tests {
         assert!(content.contains("Probe paths"));
         assert!(content.contains("[ OFF ]"));
     }
+
+    /// The render-firewall popup, rendered rather than only key-driven —
+    /// this arm of `render_popup` had no rendering test, which let a pty
+    /// test failure point suspicion at it for a while.
+    #[test]
+    fn pressing_f_opens_a_render_firewall_popup_that_actually_renders() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('f')), &db, &mut message)
+            .unwrap();
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            content.contains("Apply after writing"),
+            "popup did not render"
+        );
+    }
 }

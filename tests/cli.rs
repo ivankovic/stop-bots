@@ -76,6 +76,54 @@ fn access_line(ip: &str, path: &str, status: u16, ua: &str) -> String {
     )
 }
 
+/// Creates fake `nginx`, `systemctl` and `nft` executables in a directory
+/// meant to be prepended to a child's PATH, so tests can exercise the real
+/// reload and apply code paths — the process spawn, the argument building,
+/// the exit-code handling, the ordering — on a machine where none of those
+/// tools exist.
+///
+/// This is a fake, not a mock, in the sense that matters: nothing in the
+/// product knows it's under test. The product resolves a command name
+/// through PATH and interprets an exit code, exactly as in production; only
+/// the binary found is ours. Each fake appends its name and arguments to
+/// `calls.log` (returned) and exits 0 — unless a file named `fail-<tool>`
+/// exists next to it, in which case it prints that file's contents to
+/// stderr and exits 1, which is how a test stages e.g. a failing
+/// `nginx -t`.
+fn fake_tools(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = dir.join("fakebin");
+    fs::create_dir_all(&bin).unwrap();
+    let log = dir.join("calls.log");
+    for tool in ["nginx", "systemctl", "nft"] {
+        let path = bin.join(tool);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"{tool} $@\" >> \"{log}\"\n\
+                 if [ -f \"{dir}/fail-{tool}\" ]; then cat \"{dir}/fail-{tool}\" >&2; exit 1; fi\n\
+                 exit 0\n",
+                log = log.display(),
+                dir = dir.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    (bin, log)
+}
+
+/// PATH with `bin` in front, for handing to a spawned child.
+fn path_with(bin: &Path) -> String {
+    format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    )
+}
+
 fn copy_dir_all(src: &Path, dst: &Path) {
     for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
         let rel = entry.path().strip_prefix(src).unwrap();
@@ -832,6 +880,84 @@ fn a_site_path_exemption_switches_the_block_to_the_flag_form() {
     assert!(exempted.contains("if ($stop_bots_block) {"));
     // Exactly one sentinel block still, not a second appended.
     assert_eq!(exempted.matches("# BEGIN stop-bots").count(), 1);
+}
+
+/// The reload path end to end, with no real NGINX anywhere: apply-blocks
+/// without --no-reload must run `nginx -t` and then `systemctl reload
+/// nginx`, in that order — validation before reload is the property, since
+/// reloading an invalid config is how every site goes down at once.
+#[test]
+fn apply_blocks_reloads_nginx_after_validating_the_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    fs::create_dir_all(&nginx_root).unwrap();
+    write_site(&nginx_root, "a.example");
+    let (bin, calls) = fake_tools(tmp.path());
+
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .env("PATH", path_with(&bin))
+        .args([
+            "apply-blocks",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reloaded NGINX"));
+
+    let log = fs::read_to_string(&calls).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines[0], "nginx -t", "validate first; log was: {log}");
+    assert_eq!(lines[1], "systemctl reload nginx");
+    assert_eq!(lines.len(), 2, "no extra tool invocations; log was: {log}");
+}
+
+/// A config that fails validation stops the reload cold: `systemctl` must
+/// never run, and the error the admin sees is nginx's own message rather
+/// than a pointer at systemctl status.
+#[test]
+fn a_failing_nginx_config_check_stops_the_reload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    fs::create_dir_all(&nginx_root).unwrap();
+    write_site(&nginx_root, "a.example");
+    let (bin, calls) = fake_tools(tmp.path());
+    fs::write(
+        tmp.path().join("fail-nginx"),
+        "nginx: [emerg] unexpected end of file\n",
+    )
+    .unwrap();
+
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .env("PATH", path_with(&bin))
+        .args([
+            "apply-blocks",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected end of file"));
+
+    let log = fs::read_to_string(&calls).unwrap();
+    assert!(
+        !log.contains("systemctl"),
+        "an invalid config must never be reloaded; log was: {log}"
+    );
 }
 
 #[test]
