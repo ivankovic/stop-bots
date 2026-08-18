@@ -246,4 +246,88 @@ mod tests {
         let rendered = render(&rules);
         assert!(rendered.contains("ip saddr 203.0.113.7 tcp dport 443 drop"));
     }
+
+    /// A representative rule set, locked byte-for-byte. The golden file is
+    /// also the exact script to hand to `nft -c -f` on a machine that has
+    /// it — see `crate::golden`.
+    #[test]
+    fn rendered_script_matches_the_golden() {
+        let rules = vec![
+            FirewallRule {
+                id: 1,
+                address: "203.0.113.7".to_string(),
+                port: None,
+                action: FirewallAction::Allow,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 2,
+                address: "198.51.100.0/24".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 3,
+                address: "192.0.2.9".to_string(),
+                port: Some(22),
+                action: FirewallAction::Block,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 4,
+                address: "2001:db8::/32".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+                enabled: true,
+                expires_at: None,
+            },
+            // Disabled: must leave no trace in the script.
+            FirewallRule {
+                id: 5,
+                address: "10.0.0.1".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+                enabled: false,
+                expires_at: None,
+            },
+        ];
+        crate::golden::assert_golden("firewall.nft", &render(&rules));
+    }
+
+    /// Allowlist geo mode's shape: explicit Allows followed by the v4 and
+    /// v6 catch-alls, strictly last.
+    #[test]
+    fn rendered_allowlist_script_matches_the_golden() {
+        let rules = vec![
+            FirewallRule {
+                id: 1,
+                address: "203.0.113.0/24".to_string(),
+                port: None,
+                action: FirewallAction::Allow,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 0,
+                address: "0.0.0.0/0".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 0,
+                address: "::/0".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+                enabled: true,
+                expires_at: None,
+            },
+        ];
+        crate::golden::assert_golden("firewall-allowlist.nft", &render(&rules));
+    }
 }

@@ -265,4 +265,55 @@ mod tests {
         let rendered = render(&rules);
         assert!(rendered.contains("-A STOP-BOTS -s 203.0.113.7 -p tcp --dport 443 -j DROP"));
     }
+
+    /// The same rule set as `nftables`' golden, rendered for iptables —
+    /// which silently skips the IPv6 rule (see the module docs). The golden
+    /// is the exact script to hand to `sh -n` / a real `iptables-restore`
+    /// review on a machine that has one.
+    #[test]
+    fn rendered_script_matches_the_golden() {
+        let rules = vec![
+            FirewallRule {
+                id: 1,
+                address: "203.0.113.7".to_string(),
+                port: None,
+                action: FirewallAction::Allow,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 2,
+                address: "198.51.100.0/24".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 3,
+                address: "192.0.2.9".to_string(),
+                port: Some(22),
+                action: FirewallAction::Block,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 4,
+                address: "2001:db8::/32".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+                enabled: true,
+                expires_at: None,
+            },
+            FirewallRule {
+                id: 5,
+                address: "10.0.0.1".to_string(),
+                port: None,
+                action: FirewallAction::Block,
+                enabled: false,
+                expires_at: None,
+            },
+        ];
+        crate::golden::assert_golden("firewall.iptables.sh", &render(&rules));
+    }
 }

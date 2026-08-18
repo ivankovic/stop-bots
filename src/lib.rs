@@ -24,6 +24,8 @@ pub mod cron;
 pub mod db;
 pub mod event;
 pub mod firewall;
+#[cfg(test)]
+mod golden;
 pub mod ipranges;
 pub mod iptables;
 pub mod nftables;

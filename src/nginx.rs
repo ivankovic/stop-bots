@@ -1969,4 +1969,48 @@ mod tests {
     fn exemptions_alone_do_not_create_a_block() {
         assert!(block_text(&cfg_exempt(&[], &["/blog"])).is_none());
     }
+
+    // ---- goldens ----
+
+    /// The plain form: patterns and a 403, nothing else. This is the block
+    /// most installs run, so its exact shape is worth pinning.
+    #[test]
+    fn simple_block_matches_the_golden() {
+        let text = block_text(&cfg(&["BadBot", "EvilCrawler"])).unwrap();
+        crate::golden::assert_golden("nginx-block-simple.conf", &text);
+    }
+
+    /// Every feature at once: 444, exemptions (which force the flag form),
+    /// rate limiting and robots.txt. The golden is the exact text to paste
+    /// into a server block and hand to `nginx -t` on a machine that has
+    /// one — see `crate::golden`.
+    #[test]
+    fn kitchen_sink_block_matches_the_golden() {
+        let config = BlockConfig {
+            patterns: vec!["BadBot".to_string(), "EvilCrawler".to_string()],
+            response: BlockResponse::Close,
+            serve_robots_txt: true,
+            rate_limit_burst: Some(20),
+            exempt_paths: vec!["/blog".to_string(), "/feed.xml".to_string()],
+        };
+        let text = block_text(&config).unwrap();
+        crate::golden::assert_golden("nginx-block-full.conf", &text);
+    }
+
+    #[test]
+    fn robots_txt_matches_the_golden() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        seed_bot(&db, "gptbot", "GPTBot", true);
+        seed_bot(&db, "ccbot", "CCBot", true);
+        // Allowed bots must not appear.
+        seed_bot(&db, "goodbot", "GoodBot", true);
+        db.set_bot_status("goodbot", crate::db::BotStatus::Allowed)
+            .unwrap();
+        crate::golden::assert_golden("robots.txt", &robots_txt_body(&db).unwrap());
+    }
+
+    #[test]
+    fn rate_limit_conf_matches_the_golden() {
+        crate::golden::assert_golden("stop-bots-limits.conf", &rate_limit_conf_body(10, 10));
+    }
 }
