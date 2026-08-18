@@ -239,7 +239,7 @@ fn seed_cron_state(db_path: &Path) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    for job in stop_bots::cron::CronJob::ALL {
+    for job in stop_bots::cron::CronJob::all() {
         db.set_cron_last_run(job.id(), now, "skipped for test")
             .expect("failed to seed cron state");
     }

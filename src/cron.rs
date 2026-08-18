@@ -40,80 +40,43 @@
 //! different, much riskier feature than this one.
 
 use crate::db::Db;
+use crate::protection::Detector;
 use anyhow::Result;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// One of the background jobs the internal cron schedules. Each variant
-/// name matches (mod case) the CLI subcommand or lib function it wraps.
+/// One of the background jobs the internal cron schedules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CronJob {
-    /// Refetches Googlebot/Bingbot/GPTBot's published CIDR ranges — see
-    /// `ipranges::update`. Keeps `block_web_scanners`'s known-crawler
-    /// exclusion from silently going stale (documented as a manual
-    /// "automate both together" caveat before this feature existed).
+    /// Refetches Googlebot/Bingbot/GPTBot's published CIDR ranges.
     UpdateIpRanges,
-    /// Runs `scanblock::block_ssh_scanners` against the auto-detected SSH
-    /// log — on [`CronJob::interval`]'s tightest cadence, so an ongoing
-    /// brute-force attempt gets blocked while it's still running rather
-    /// than hours later.
-    BlockScanners,
-    /// Runs `scanblock::block_web_scanners` against the auto-detected
-    /// NGINX access log — same tightest cadence as `BlockScanners`, for the
-    /// same reason: catch a URL-enumeration scan while it's still in
-    /// progress.
-    BlockWebScanners,
-    /// Runs `scanblock::block_spoofed_crawlers` against the auto-detected
-    /// NGINX access log — flags IPs claiming to be Googlebot/Bingbot/GPTBot
-    /// from outside those crawlers' published ranges. Same tightest cadence
-    /// as the other two detectors, and gated by
-    /// `protection::SPOOFED_CRAWLERS_ENABLED` (a disabled detector skips
-    /// the whole pass, including reading the log).
-    BlockSpoofedCrawlers,
-    /// Runs `scanblock::block_probe_paths` against the auto-detected NGINX
-    /// access log — flags IPs requesting paths nothing legitimate ever asks
-    /// for (`/.env`, `/.git/config`, ...). Same tightest cadence as the
-    /// other detectors, gated by `protection::PROBE_PATHS_ENABLED`.
-    BlockProbePaths,
-    /// Runs `scanblock::block_honeypot` against the auto-detected NGINX
-    /// access log — flags anything that fetched the published trap path.
-    /// Same cadence as the other detectors, gated by
-    /// `protection::HONEYPOT_ENABLED` (off by default).
-    BlockHoneypot,
-    /// Runs `accessstats::record_access_stats` against the auto-detected
-    /// NGINX access log — tallies successful-request user agents into
-    /// `user_agent_stats`, independent of (and against the same log as)
-    /// `BlockWebScanners`'s bad-traffic detection.
+    /// One switchable log-analysis detector — see [`crate::protection::Detector`].
+    /// Every detector shares this variant rather than adding its own, which
+    /// is what stopped a new detector meaning three more match arms here.
+    Detect(Detector),
+    /// Tallies successful-request user agents into `user_agent_stats`.
     RecordAccessStats,
-    /// Renders the current firewall rules to the same default path the
-    /// Dashboard's `f`-key popup defaults to, using the nftables backend
-    /// (handles allowlist geo mode; iptables doesn't — see
-    /// `firewall::build_script`). Does not apply it.
+    /// Renders the current firewall rules to disk. Does not apply them.
     RenderFirewall,
 }
 
 impl CronJob {
-    pub const ALL: [CronJob; 8] = [
-        CronJob::UpdateIpRanges,
-        CronJob::BlockScanners,
-        CronJob::BlockWebScanners,
-        CronJob::BlockSpoofedCrawlers,
-        CronJob::BlockProbePaths,
-        CronJob::BlockHoneypot,
-        CronJob::RecordAccessStats,
-        CronJob::RenderFirewall,
-    ];
+    /// Every job: the two fixed ones on either side of every detector.
+    pub fn all() -> Vec<CronJob> {
+        std::iter::once(CronJob::UpdateIpRanges)
+            .chain(Detector::ALL.into_iter().map(CronJob::Detect))
+            .chain([CronJob::RecordAccessStats, CronJob::RenderFirewall])
+            .collect()
+    }
 
     /// The key this job's state is stored under in `Db`'s cron methods —
     /// stable across releases (used as a `settings` table key), so never
-    /// rename an existing variant's id without a migration thought.
+    /// change an existing id without a migration thought. The detector ids
+    /// come from `DetectorSpec::id` and are the exact strings this enum
+    /// used before detectors were table-driven.
     pub fn id(self) -> &'static str {
         match self {
             CronJob::UpdateIpRanges => "update_ip_ranges",
-            CronJob::BlockScanners => "block_scanners",
-            CronJob::BlockWebScanners => "block_web_scanners",
-            CronJob::BlockSpoofedCrawlers => "block_spoofed_crawlers",
-            CronJob::BlockProbePaths => "block_probe_paths",
-            CronJob::BlockHoneypot => "block_honeypot",
+            CronJob::Detect(detector) => detector.id(),
             CronJob::RecordAccessStats => "record_access_stats",
             CronJob::RenderFirewall => "render_firewall",
         }
@@ -123,46 +86,24 @@ impl CronJob {
     pub fn label(self) -> &'static str {
         match self {
             CronJob::UpdateIpRanges => "Update crawler IP ranges",
-            CronJob::BlockScanners => "Block SSH scanners",
-            CronJob::BlockWebScanners => "Block web scanners",
-            CronJob::BlockSpoofedCrawlers => "Block forged crawler UAs",
-            CronJob::BlockProbePaths => "Block probe paths",
-            CronJob::BlockHoneypot => "Block honeypot hits",
+            CronJob::Detect(detector) => detector.spec().job_label,
             CronJob::RecordAccessStats => "Record access-log stats",
             CronJob::RenderFirewall => "Render firewall script",
         }
     }
 
-    /// How often this job should run. Chosen per-job rather than one
-    /// blanket interval:
-    /// - `UpdateIpRanges`: daily — crawler ranges change slowly; this only
-    ///   needs to stay roughly current.
-    /// - `BlockScanners`/`BlockWebScanners`/`BlockSpoofedCrawlers`: every
-    ///   minute — all three are
-    ///   detection, and the whole point of detection is catching an attack
-    ///   while it's still happening rather than finding out about it after
-    ///   the fact. A minute is also the practical floor: `App::check_cron`
-    ///   only re-checks which jobs are due once a minute
-    ///   (`CRON_CHECK_INTERVAL` in `crate::app`), so anything shorter
-    ///   wouldn't actually run any sooner, just get asked for more often.
-    /// - `RecordAccessStats`: every minute, same as `BlockWebScanners` — it
-    ///   reads the same log, so there's no reason to check it on a
-    ///   different cadence; unlike detection there's no urgency here
-    ///   either way, but matching the cadence keeps both jobs seeing
-    ///   comparable log windows.
-    /// - `RenderFirewall`: daily — just needs to stay reasonably in sync
-    ///   with whatever's accumulated in `firewall_rules` since the last
-    ///   render; nothing about it is time-sensitive the way detection is.
+    /// How often this job should run.
+    ///
+    /// - `UpdateIpRanges`: daily — crawler ranges change slowly.
+    /// - every detector: every minute. Detection exists to catch an attack
+    ///   while it is still happening, and a minute is the practical floor
+    ///   anyway (`App::check_cron` only re-checks that often).
+    /// - `RecordAccessStats`: every minute, same log as most detectors.
+    /// - `RenderFirewall`: daily — nothing about it is time-sensitive.
     pub fn interval(self) -> Duration {
         match self {
-            CronJob::UpdateIpRanges => Duration::from_secs(24 * 60 * 60),
-            CronJob::BlockScanners => Duration::from_secs(60),
-            CronJob::BlockWebScanners => Duration::from_secs(60),
-            CronJob::BlockSpoofedCrawlers => Duration::from_secs(60),
-            CronJob::BlockProbePaths => Duration::from_secs(60),
-            CronJob::BlockHoneypot => Duration::from_secs(60),
-            CronJob::RecordAccessStats => Duration::from_secs(60),
-            CronJob::RenderFirewall => Duration::from_secs(24 * 60 * 60),
+            CronJob::UpdateIpRanges | CronJob::RenderFirewall => Duration::from_secs(24 * 60 * 60),
+            CronJob::Detect(_) | CronJob::RecordAccessStats => Duration::from_secs(60),
         }
     }
 }
@@ -196,9 +137,9 @@ pub fn is_due(db: &Db, job: CronJob) -> Result<bool> {
     })
 }
 
-/// Every job that's currently due, in [`CronJob::ALL`] order.
+/// Every job that's currently due, in [`CronJob::all()`] order.
 pub fn due_jobs(db: &Db) -> Result<Vec<CronJob>> {
-    CronJob::ALL
+    CronJob::all()
         .into_iter()
         .filter_map(|job| match is_due(db, job) {
             Ok(true) => Some(Ok(job)),
@@ -209,9 +150,9 @@ pub fn due_jobs(db: &Db) -> Result<Vec<CronJob>> {
 }
 
 /// Every job's current state, for display — always all four, in
-/// [`CronJob::ALL`] order, regardless of due-ness.
+/// [`CronJob::all()`] order, regardless of due-ness.
 pub fn status(db: &Db) -> Result<Vec<JobStatus>> {
-    CronJob::ALL
+    CronJob::all()
         .into_iter()
         .map(|job| {
             Ok(JobStatus {
@@ -231,40 +172,48 @@ mod tests {
     #[test]
     fn a_job_that_has_never_run_is_due() {
         let db = Db::open_in_memory().unwrap();
-        assert!(is_due(&db, CronJob::BlockScanners).unwrap());
+        assert!(is_due(&db, CronJob::Detect(Detector::SshScanners)).unwrap());
     }
 
     #[test]
     fn a_job_run_just_now_is_not_due() {
         let db = Db::open_in_memory().unwrap();
-        db.set_cron_last_run(CronJob::BlockScanners.id(), now(), "ran")
+        db.set_cron_last_run(CronJob::Detect(Detector::SshScanners).id(), now(), "ran")
             .unwrap();
-        assert!(!is_due(&db, CronJob::BlockScanners).unwrap());
+        assert!(!is_due(&db, CronJob::Detect(Detector::SshScanners)).unwrap());
     }
 
     #[test]
     fn a_job_run_past_its_interval_is_due_again() {
         let db = Db::open_in_memory().unwrap();
-        let interval = CronJob::BlockWebScanners.interval().as_secs() as i64;
-        db.set_cron_last_run(CronJob::BlockWebScanners.id(), now() - interval - 60, "ran")
-            .unwrap();
-        assert!(is_due(&db, CronJob::BlockWebScanners).unwrap());
+        let interval = CronJob::Detect(Detector::WebScanners).interval().as_secs() as i64;
+        db.set_cron_last_run(
+            CronJob::Detect(Detector::WebScanners).id(),
+            now() - interval - 60,
+            "ran",
+        )
+        .unwrap();
+        assert!(is_due(&db, CronJob::Detect(Detector::WebScanners)).unwrap());
     }
 
     #[test]
     fn a_job_run_within_its_interval_is_not_due() {
         let db = Db::open_in_memory().unwrap();
-        let interval = CronJob::BlockWebScanners.interval().as_secs() as i64;
-        db.set_cron_last_run(CronJob::BlockWebScanners.id(), now() - interval + 60, "ran")
-            .unwrap();
-        assert!(!is_due(&db, CronJob::BlockWebScanners).unwrap());
+        let interval = CronJob::Detect(Detector::WebScanners).interval().as_secs() as i64;
+        db.set_cron_last_run(
+            CronJob::Detect(Detector::WebScanners).id(),
+            now() - interval + 60,
+            "ran",
+        )
+        .unwrap();
+        assert!(!is_due(&db, CronJob::Detect(Detector::WebScanners)).unwrap());
     }
 
     #[test]
     fn due_jobs_on_a_fresh_database_includes_every_job() {
         let db = Db::open_in_memory().unwrap();
         let due = due_jobs(&db).unwrap();
-        assert_eq!(due.len(), CronJob::ALL.len());
+        assert_eq!(due.len(), CronJob::all().len());
     }
 
     #[test]
@@ -274,21 +223,25 @@ mod tests {
             .unwrap();
         let due = due_jobs(&db).unwrap();
         assert!(!due.contains(&CronJob::UpdateIpRanges));
-        assert_eq!(due.len(), CronJob::ALL.len() - 1);
+        assert_eq!(due.len(), CronJob::all().len() - 1);
     }
 
     #[test]
     fn status_reports_every_job_with_its_persisted_state() {
         let db = Db::open_in_memory().unwrap();
-        db.set_cron_last_run(CronJob::BlockScanners.id(), now(), "blocked 2 IP(s)")
-            .unwrap();
+        db.set_cron_last_run(
+            CronJob::Detect(Detector::SshScanners).id(),
+            now(),
+            "blocked 2 IP(s)",
+        )
+        .unwrap();
 
         let statuses = status(&db).unwrap();
-        assert_eq!(statuses.len(), CronJob::ALL.len());
+        assert_eq!(statuses.len(), CronJob::all().len());
 
         let ssh = statuses
             .iter()
-            .find(|s| s.job == CronJob::BlockScanners)
+            .find(|s| s.job == CronJob::Detect(Detector::SshScanners))
             .unwrap();
         assert_eq!(ssh.last_run, Some(now()));
         assert_eq!(ssh.last_summary, Some("blocked 2 IP(s)".to_string()));
@@ -296,7 +249,7 @@ mod tests {
 
         let web = statuses
             .iter()
-            .find(|s| s.job == CronJob::BlockWebScanners)
+            .find(|s| s.job == CronJob::Detect(Detector::WebScanners))
             .unwrap();
         assert_eq!(web.last_run, None);
         assert!(web.due);
@@ -304,9 +257,9 @@ mod tests {
 
     #[test]
     fn every_job_id_is_distinct() {
-        let mut ids: Vec<&str> = CronJob::ALL.iter().map(|j| j.id()).collect();
+        let mut ids: Vec<&str> = CronJob::all().iter().map(|j| j.id()).collect();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), CronJob::ALL.len());
+        assert_eq!(ids.len(), CronJob::all().len());
     }
 }

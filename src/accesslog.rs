@@ -84,7 +84,7 @@ pub fn find_default_source() -> LogSource {
 /// A line with no trailing quoted pair at all (a stripped-down custom log
 /// format) yields an empty `user_agent` rather than failing the whole
 /// parse — status/path are still useful to `scanning_ips` either way.
-fn parse_line(line: &str) -> Option<(IpAddr, u16, String, String)> {
+fn parse_line(line: &str) -> Option<ParsedLine> {
     let ip: IpAddr = line.split_whitespace().next()?.parse().ok()?;
 
     let mut fields = line.splitn(3, '"');
@@ -106,9 +106,29 @@ fn parse_line(line: &str) -> Option<(IpAddr, u16, String, String)> {
     // the two quoted fields, user_agent, ""] — index 3 is the field we want.
     let quoted: Vec<&str> = after_request.split('"').collect();
     let status: u16 = quoted.first()?.split_whitespace().next()?.parse().ok()?;
+    let referer = quoted.get(1).copied().unwrap_or("").to_string();
     let user_agent = quoted.get(3).copied().unwrap_or("").to_string();
 
-    Some((ip, status, path, user_agent))
+    Some(ParsedLine {
+        ip,
+        status,
+        path,
+        referer,
+        user_agent,
+    })
+}
+
+/// One parsed access-log line. A struct rather than a tuple since it grew
+/// past three fields — `line.status` reads where `line.1` doesn't.
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedLine {
+    ip: IpAddr,
+    status: u16,
+    path: String,
+    /// NGINX logs a missing `Referer` as `-`, which is what
+    /// [`refererless_crawl_ips`] treats as absent.
+    referer: String,
+    user_agent: String,
 }
 
 /// Every IP with at least `threshold` *distinct* paths that returned 404
@@ -124,9 +144,12 @@ fn parse_line(line: &str) -> Option<(IpAddr, u16, String, String)> {
 /// with it). Deduplicated and sorted for deterministic output.
 pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
     let mut not_found_paths: HashMap<IpAddr, HashSet<String>> = HashMap::new();
-    for (ip, status, path, _user_agent) in log_text.lines().filter_map(parse_line) {
-        if status == 404 {
-            not_found_paths.entry(ip).or_default().insert(path);
+    for line in log_text.lines().filter_map(parse_line) {
+        if line.status == 404 {
+            not_found_paths
+                .entry(line.ip)
+                .or_default()
+                .insert(line.path);
         }
     }
 
@@ -190,11 +213,12 @@ pub fn spoofed_crawler_ips(log_text: &str, claims: &[CrawlerClaim]) -> Vec<(Stri
     }
 
     let mut found: HashMap<IpAddr, &'static str> = HashMap::new();
-    for (ip, _status, _path, user_agent) in log_text.lines().filter_map(parse_line) {
+    for line in log_text.lines().filter_map(parse_line) {
+        let ip = line.ip;
         if is_local_or_private(&ip) {
             continue;
         }
-        let ua_lower = user_agent.to_lowercase();
+        let ua_lower = line.user_agent.to_lowercase();
         let matched: Vec<&&CrawlerClaim> = active
             .iter()
             .filter(|claim| ua_lower.contains(claim.marker))
@@ -281,19 +305,160 @@ pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, St
     let needles: Vec<String> = probe_paths.iter().map(|p| p.to_lowercase()).collect();
 
     let mut found: HashMap<IpAddr, String> = HashMap::new();
-    for (ip, _status, path, _user_agent) in log_text.lines().filter_map(parse_line) {
-        if is_local_or_private(&ip) {
+    for line in log_text.lines().filter_map(parse_line) {
+        if is_local_or_private(&line.ip) {
             continue;
         }
-        let path_lower = path.to_lowercase();
+        let path_lower = line.path.to_lowercase();
         if needles.iter().any(|n| path_lower.starts_with(n.as_str())) {
-            found.entry(ip).or_insert(path);
+            found.entry(line.ip).or_insert(line.path);
         }
     }
 
     let mut ips: Vec<(String, String)> = found
         .into_iter()
         .map(|(ip, path)| (ip.to_string(), path))
+        .collect();
+    ips.sort();
+    ips
+}
+
+/// Filename extensions treated as "an asset a browser fetches alongside a
+/// page". Deliberately generous — a miss here means a real browser looks
+/// asset-less, which is the false positive that matters.
+const ASSET_EXTENSIONS: [&str; 18] = [
+    ".css",
+    ".js",
+    ".mjs",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".webp",
+    ".avif",
+    ".ico",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".otf",
+    ".eot",
+    ".map",
+    ".webmanifest",
+];
+
+fn is_asset(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    ASSET_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Every IP that fetched at least `min_pages` *distinct* pages and not one
+/// asset. Browsers load the CSS, JS, fonts and images that go with a page;
+/// scrapers pull the HTML and leave.
+///
+/// Three deliberate choices, each guarding a specific false positive:
+///
+/// - **Distinct pages, not request count.** The client this could wrongly
+///   catch is a legitimate API consumer, which hammers a handful of
+///   endpoints. A high distinct-URL count means something walked the site.
+/// - **An asset counts at any status below 400, including 304.** A
+///   returning browser with a warm cache gets `304 Not Modified` for every
+///   asset. Counting only 200s would make well-cached real visitors look
+///   exactly like scrapers.
+/// - **Only successful page requests count**, so this doesn't re-flag the
+///   404-sweeping already covered by [`scanning_ips`].
+///
+/// The false positive it *cannot* rule out: a site that serves no assets
+/// at all — a pure JSON API — where every client looks like this. That is
+/// why the detector is off by default.
+pub fn asset_less_ips(log_text: &str, min_pages: usize) -> Vec<String> {
+    let mut pages: HashMap<IpAddr, HashSet<String>> = HashMap::new();
+    let mut fetched_asset: HashSet<IpAddr> = HashSet::new();
+
+    for line in log_text.lines().filter_map(parse_line) {
+        if is_local_or_private(&line.ip) || line.status >= 400 {
+            continue;
+        }
+        if is_asset(&line.path) {
+            fetched_asset.insert(line.ip);
+        } else {
+            pages.entry(line.ip).or_default().insert(line.path);
+        }
+    }
+
+    let mut ips: Vec<String> = pages
+        .into_iter()
+        .filter(|(ip, paths)| paths.len() >= min_pages && !fetched_asset.contains(ip))
+        .map(|(ip, _)| ip.to_string())
+        .collect();
+    ips.sort();
+    ips
+}
+
+/// Every IP that presented at least `min_agents` distinct user agents.
+/// A single client has one; rotating them is a deliberate evasion.
+///
+/// **The false positive this cannot rule out is large: NAT.** A corporate
+/// gateway, a university, or any mobile carrier doing CGNAT presents
+/// hundreds of real users behind one address, each with their own browser.
+/// Without timestamps (see TODO.md) there is no way to distinguish "twenty
+/// agents over a day from a campus" from "twenty agents in ten seconds
+/// from one scraper", and a threshold is the only control available.
+/// Off by default, and the threshold should be read as "how many distinct
+/// browsers might legitimately share one address here".
+pub fn rotating_user_agent_ips(log_text: &str, min_agents: usize) -> Vec<String> {
+    let mut agents: HashMap<IpAddr, HashSet<String>> = HashMap::new();
+    for line in log_text.lines().filter_map(parse_line) {
+        if is_local_or_private(&line.ip) || line.user_agent.is_empty() || line.user_agent == "-" {
+            continue;
+        }
+        agents.entry(line.ip).or_default().insert(line.user_agent);
+    }
+
+    let mut ips: Vec<String> = agents
+        .into_iter()
+        .filter(|(_, seen)| seen.len() >= min_agents)
+        .map(|(ip, _)| ip.to_string())
+        .collect();
+    ips.sort();
+    ips
+}
+
+/// Every IP that fetched at least `min_paths` distinct *deep* pages (not
+/// `/`) without ever sending a `Referer`. A person browsing arrives at
+/// deep pages by following links, which sets one; a crawler working from
+/// a sitemap or a URL list doesn't.
+///
+/// **Weaker than it looks, and off by default.** `Referrer-Policy:
+/// no-referrer` is increasingly common, privacy tooling strips the header,
+/// and typing a URL or opening a bookmark legitimately sends none — so
+/// this is really "arrived at many distinct deep pages, every time with no
+/// referer". The distinct-path threshold is doing all the work: one or two
+/// referer-less deep hits are ordinary, twenty-five are a crawl.
+pub fn refererless_crawl_ips(log_text: &str, min_paths: usize) -> Vec<String> {
+    let mut deep_no_referer: HashMap<IpAddr, HashSet<String>> = HashMap::new();
+    let mut sent_referer: HashSet<IpAddr> = HashSet::new();
+
+    for line in log_text.lines().filter_map(parse_line) {
+        if is_local_or_private(&line.ip) || line.status >= 400 {
+            continue;
+        }
+        // NGINX logs a missing Referer as "-".
+        let has_referer = !line.referer.is_empty() && line.referer != "-";
+        if has_referer {
+            sent_referer.insert(line.ip);
+        } else if line.path != "/" {
+            deep_no_referer
+                .entry(line.ip)
+                .or_default()
+                .insert(line.path);
+        }
+    }
+
+    let mut ips: Vec<String> = deep_no_referer
+        .into_iter()
+        .filter(|(ip, paths)| paths.len() >= min_paths && !sent_referer.contains(ip))
+        .map(|(ip, _)| ip.to_string())
         .collect();
     ips.sort();
     ips
@@ -311,10 +476,13 @@ pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, St
 /// `crate::accessstats::record_access_stats`.
 pub fn successful_user_agent_counts(log_text: &str) -> HashMap<String, u64> {
     let mut counts: HashMap<String, u64> = HashMap::new();
-    for (ip, status, _path, user_agent) in log_text.lines().filter_map(parse_line) {
-        if status < 400 && !user_agent.is_empty() && user_agent != "-" && !is_local_or_private(&ip)
+    for line in log_text.lines().filter_map(parse_line) {
+        if line.status < 400
+            && !line.user_agent.is_empty()
+            && line.user_agent != "-"
+            && !is_local_or_private(&line.ip)
         {
-            *counts.entry(user_agent).or_insert(0) += 1;
+            *counts.entry(line.user_agent).or_insert(0) += 1;
         }
     }
     counts
@@ -337,26 +505,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_line_extracts_ip_status_path_and_user_agent() {
-        let line = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \"GET /wp-login.php HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0\"";
-        assert_eq!(
-            parse_line(line),
-            Some((
-                "203.0.113.5".parse().unwrap(),
-                404,
-                "/wp-login.php".to_string(),
-                "Mozilla/5.0".to_string()
-            ))
-        );
+    fn parse_line_extracts_every_field_including_the_referer() {
+        let line = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \"GET /wp-login.php HTTP/1.1\" 404 162 \"https://ref.example/from\" \"Mozilla/5.0\"";
+        let parsed = parse_line(line).expect("the standard combined format should parse");
+        assert_eq!(parsed.ip, "203.0.113.5".parse::<IpAddr>().unwrap());
+        assert_eq!(parsed.status, 404);
+        assert_eq!(parsed.path, "/wp-login.php");
+        assert_eq!(parsed.referer, "https://ref.example/from");
+        assert_eq!(parsed.user_agent, "Mozilla/5.0");
+    }
+
+    #[test]
+    fn parse_line_reads_a_missing_referer_as_nginx_writes_it() {
+        let line = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"curl/8\"";
+        assert_eq!(parse_line(line).unwrap().referer, "-");
     }
 
     #[test]
     fn parse_line_strips_the_query_string() {
         let line = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \"GET /foo?a=1&b=2 HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0\"";
-        assert_eq!(
-            parse_line(line).map(|(_, _, path, _)| path),
-            Some("/foo".to_string())
-        );
+        assert_eq!(parse_line(line).map(|l| l.path), Some("/foo".to_string()));
     }
 
     #[test]
@@ -364,7 +532,7 @@ mod tests {
         let line =
             "2001:db8::1 - - [10/Jul/2026:12:00:00 +0000] \"GET /x HTTP/1.1\" 404 1 \"-\" \"UA\"";
         assert_eq!(
-            parse_line(line).map(|(ip, _, _, _)| ip),
+            parse_line(line).map(|l| l.ip),
             Some("2001:db8::1".parse().unwrap())
         );
     }
@@ -698,5 +866,142 @@ mod tests {
     fn probe_path_ips_matches_despite_a_query_string() {
         let log = probe_line("203.0.113.9", "/.env?cachebust=1", 404);
         assert_eq!(probe_path_ips(&log, &default_probes()).len(), 1);
+    }
+
+    // ---- behavioural detectors ----
+
+    fn line(ip: &str, path: &str, status: u16, referer: &str, ua: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" {status} 9 \"{referer}\" \"{ua}\"\n"
+        )
+    }
+
+    fn pages(ip: &str, n: usize) -> String {
+        (0..n)
+            .map(|i| line(ip, &format!("/page{i}"), 200, "-", "UA"))
+            .collect()
+    }
+
+    #[test]
+    fn asset_less_ips_flags_a_client_that_fetched_pages_and_no_assets() {
+        let log = pages("203.0.113.9", 20);
+        assert_eq!(asset_less_ips(&log, 15), vec!["203.0.113.9".to_string()]);
+    }
+
+    #[test]
+    fn asset_less_ips_ignores_a_client_below_the_page_threshold() {
+        let log = pages("203.0.113.9", 5);
+        assert!(asset_less_ips(&log, 15).is_empty());
+    }
+
+    /// A browser fetches the CSS that goes with the page. One asset is
+    /// enough to clear the client.
+    #[test]
+    fn asset_less_ips_clears_a_client_that_fetched_any_asset() {
+        let log = pages("203.0.113.9", 20) + &line("203.0.113.9", "/style.css", 200, "-", "UA");
+        assert!(asset_less_ips(&log, 15).is_empty());
+    }
+
+    /// The false positive that would hit real, well-behaved visitors: a
+    /// returning browser gets 304 Not Modified for every cached asset.
+    /// Counting only 200s would make them indistinguishable from scrapers.
+    #[test]
+    fn asset_less_ips_counts_a_304_as_a_fetched_asset() {
+        let log = pages("203.0.113.9", 20) + &line("203.0.113.9", "/app.js", 304, "-", "UA");
+        assert!(
+            asset_less_ips(&log, 15).is_empty(),
+            "a cached asset still means the client fetches assets"
+        );
+    }
+
+    /// Distinct paths, not request count — the client this must not catch
+    /// is an API consumer hammering a handful of endpoints.
+    #[test]
+    fn asset_less_ips_counts_distinct_paths_not_requests() {
+        let log: String = (0..50)
+            .map(|_| line("203.0.113.9", "/api/status", 200, "-", "UA"))
+            .collect();
+        assert!(
+            asset_less_ips(&log, 15).is_empty(),
+            "50 hits on one endpoint is not a site crawl"
+        );
+    }
+
+    #[test]
+    fn asset_less_ips_ignores_failed_requests() {
+        let log: String = (0..20)
+            .map(|i| line("203.0.113.9", &format!("/missing{i}"), 404, "-", "UA"))
+            .collect();
+        assert!(
+            asset_less_ips(&log, 15).is_empty(),
+            "404 sweeping is scanning_ips' job, not this one"
+        );
+    }
+
+    #[test]
+    fn asset_less_ips_excludes_local_and_private_sources() {
+        assert!(asset_less_ips(&pages("10.0.0.5", 20), 15).is_empty());
+    }
+
+    #[test]
+    fn rotating_user_agent_ips_flags_many_agents_from_one_address() {
+        let log: String = (0..10)
+            .map(|i| line("203.0.113.9", "/", 200, "-", &format!("Agent{i}")))
+            .collect();
+        assert_eq!(
+            rotating_user_agent_ips(&log, 8),
+            vec!["203.0.113.9".to_string()]
+        );
+    }
+
+    #[test]
+    fn rotating_user_agent_ips_ignores_one_agent_used_many_times() {
+        let log: String = (0..50)
+            .map(|_| line("203.0.113.9", "/", 200, "-", "Mozilla/5.0"))
+            .collect();
+        assert!(rotating_user_agent_ips(&log, 8).is_empty());
+    }
+
+    #[test]
+    fn rotating_user_agent_ips_ignores_a_missing_user_agent() {
+        // "-" is how NGINX writes an absent header; it isn't an identity.
+        let log: String = (0..10)
+            .map(|_| line("203.0.113.9", "/", 200, "-", "-"))
+            .collect();
+        assert!(rotating_user_agent_ips(&log, 8).is_empty());
+    }
+
+    #[test]
+    fn refererless_crawl_ips_flags_a_deep_crawl_with_no_referer() {
+        let log = pages("203.0.113.9", 30);
+        assert_eq!(
+            refererless_crawl_ips(&log, 25),
+            vec!["203.0.113.9".to_string()]
+        );
+    }
+
+    /// Someone who follows a link has sent a referer at least once; that
+    /// clears them entirely, which is what keeps ordinary direct
+    /// navigation from accumulating into a false positive.
+    #[test]
+    fn refererless_crawl_ips_clears_a_client_that_ever_sent_a_referer() {
+        let log = pages("203.0.113.9", 30)
+            + &line("203.0.113.9", "/other", 200, "https://example.test/", "UA");
+        assert!(refererless_crawl_ips(&log, 25).is_empty());
+    }
+
+    /// Hitting the front page with no referer is what every bookmark and
+    /// typed URL looks like.
+    #[test]
+    fn refererless_crawl_ips_ignores_the_root_path() {
+        let log: String = (0..40)
+            .map(|_| line("203.0.113.9", "/", 200, "-", "UA"))
+            .collect();
+        assert!(refererless_crawl_ips(&log, 25).is_empty());
+    }
+
+    #[test]
+    fn refererless_crawl_ips_ignores_a_client_below_the_threshold() {
+        assert!(refererless_crawl_ips(&pages("203.0.113.9", 5), 25).is_empty());
     }
 }

@@ -162,116 +162,250 @@ pub fn honeypot_path(db: &Db) -> Result<String> {
         .unwrap_or_else(|| HONEYPOT_PATH_DEFAULT.to_string()))
 }
 
-/// Every automatic-detection setting, read in one go. Cheap (a handful of
-/// `settings` lookups) and read fresh at each use rather than cached, so a
-/// toggle flipped in the TUI takes effect on the very next cron tick
-/// without any invalidation plumbing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProtectionSettings {
-    pub spoofed_crawlers_enabled: bool,
-    pub spoofed_crawlers_ttl_days: i64,
-    pub probe_paths_enabled: bool,
-    pub probe_paths_ttl_days: i64,
-    pub honeypot_enabled: bool,
-    pub honeypot_ttl_days: i64,
+/// One switchable log-analysis detector, described rather than
+/// hand-wired.
+///
+/// Before this existed, adding a detector meant editing seven files:
+/// a settings-key pair here, a field on the settings struct, a `Default`
+/// arm, a `load` arm, a `CronJob` variant with three match arms, a
+/// `ProtectionRow` variant with four, and a CLI subcommand. The compiler
+/// caught a missed arm, but the fifth detector cost what the fourth did.
+/// Now a detector is one entry in [`Detector::ALL`] plus one arm where its
+/// behaviour genuinely differs — running it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Detector {
+    SshScanners,
+    WebScanners,
+    SpoofedCrawlers,
+    ProbePaths,
+    Honeypot,
+    AssetRatio,
+    RotatingUserAgent,
+    RefererlessCrawl,
 }
 
-/// Hand-written rather than derived: a derived `Default` would give
-/// `false`/`0`, which is not what an unset database means. This must agree
-/// with what [`ProtectionSettings::load`] produces for a database that has
-/// never set anything, so the TUI's pre-`refresh` state matches what the
-/// first refresh will show.
-impl Default for ProtectionSettings {
-    fn default() -> Self {
-        ProtectionSettings {
-            spoofed_crawlers_enabled: SPOOFED_CRAWLERS_ENABLED_DEFAULT,
-            spoofed_crawlers_ttl_days: SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT,
-            probe_paths_enabled: PROBE_PATHS_ENABLED_DEFAULT,
-            probe_paths_ttl_days: PROBE_PATHS_TTL_DAYS_DEFAULT,
-            honeypot_enabled: HONEYPOT_ENABLED_DEFAULT,
-            honeypot_ttl_days: HONEYPOT_TTL_DAYS_DEFAULT,
+/// The static facts about a detector: how it's stored, what it's called,
+/// and what it does if nobody changes anything.
+pub struct DetectorSpec {
+    /// Stable id. **Also the `settings` key suffix and the cron job id**,
+    /// so renaming one silently orphans an installed database's stored
+    /// toggle *and* its cron state. Never rename without a migration.
+    pub id: &'static str,
+    /// Short label for the Dashboard row.
+    pub label: &'static str,
+    /// Label for the Scheduled-tasks panel, which describes the job
+    /// rather than the switch.
+    pub job_label: &'static str,
+    pub enabled_default: bool,
+    pub ttl_days_default: i64,
+    /// Whether this reads the SSH log rather than the NGINX access log.
+    pub uses_ssh_log: bool,
+}
+
+impl Detector {
+    pub const ALL: [Detector; 8] = [
+        Detector::SshScanners,
+        Detector::WebScanners,
+        Detector::SpoofedCrawlers,
+        Detector::ProbePaths,
+        Detector::Honeypot,
+        Detector::AssetRatio,
+        Detector::RotatingUserAgent,
+        Detector::RefererlessCrawl,
+    ];
+
+    pub fn spec(self) -> DetectorSpec {
+        match self {
+            // ids match the pre-existing `CronJob::id()` strings exactly:
+            // they are live `settings` keys in every installed database.
+            Detector::SshScanners => DetectorSpec {
+                id: "block_scanners",
+                label: "SSH scanners",
+                job_label: "Block SSH scanners",
+                enabled_default: true,
+                ttl_days_default: 5,
+                uses_ssh_log: true,
+            },
+            Detector::WebScanners => DetectorSpec {
+                id: "block_web_scanners",
+                label: "Web scanners",
+                job_label: "Block web scanners",
+                enabled_default: true,
+                ttl_days_default: 1,
+                uses_ssh_log: false,
+            },
+            Detector::SpoofedCrawlers => DetectorSpec {
+                id: "block_spoofed_crawlers",
+                label: "Forged crawler UAs",
+                job_label: "Block forged crawler UAs",
+                enabled_default: SPOOFED_CRAWLERS_ENABLED_DEFAULT,
+                ttl_days_default: SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT,
+                uses_ssh_log: false,
+            },
+            Detector::ProbePaths => DetectorSpec {
+                id: "block_probe_paths",
+                label: "Probe paths",
+                job_label: "Block probe paths",
+                enabled_default: PROBE_PATHS_ENABLED_DEFAULT,
+                ttl_days_default: PROBE_PATHS_TTL_DAYS_DEFAULT,
+                uses_ssh_log: false,
+            },
+            Detector::Honeypot => DetectorSpec {
+                id: "block_honeypot",
+                label: "Honeypot path",
+                job_label: "Block honeypot hits",
+                enabled_default: HONEYPOT_ENABLED_DEFAULT,
+                ttl_days_default: HONEYPOT_TTL_DAYS_DEFAULT,
+                uses_ssh_log: false,
+            },
+            // The three below are off by default. Each has a false
+            // positive it cannot rule out on its own; see the detector
+            // functions in `accesslog` for what and why.
+            Detector::AssetRatio => DetectorSpec {
+                id: "block_asset_ratio",
+                label: "Fetches no assets",
+                job_label: "Block asset-less clients",
+                enabled_default: false,
+                ttl_days_default: 5,
+                uses_ssh_log: false,
+            },
+            Detector::RotatingUserAgent => DetectorSpec {
+                id: "block_rotating_ua",
+                label: "Rotating user agent",
+                job_label: "Block rotating user agents",
+                enabled_default: false,
+                ttl_days_default: 5,
+                uses_ssh_log: false,
+            },
+            Detector::RefererlessCrawl => DetectorSpec {
+                id: "block_refererless",
+                label: "Crawls with no referer",
+                job_label: "Block referer-less crawling",
+                enabled_default: false,
+                ttl_days_default: 5,
+                uses_ssh_log: false,
+            },
         }
     }
-}
 
-impl ProtectionSettings {
-    pub fn load(db: &Db) -> Result<Self> {
-        Ok(ProtectionSettings {
-            spoofed_crawlers_enabled: db
-                .get_bool_setting(SPOOFED_CRAWLERS_ENABLED, SPOOFED_CRAWLERS_ENABLED_DEFAULT)?,
-            spoofed_crawlers_ttl_days: db
-                .get_int_setting(SPOOFED_CRAWLERS_TTL_DAYS, SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT)?,
-            probe_paths_enabled: db
-                .get_bool_setting(PROBE_PATHS_ENABLED, PROBE_PATHS_ENABLED_DEFAULT)?,
-            probe_paths_ttl_days: db
-                .get_int_setting(PROBE_PATHS_TTL_DAYS, PROBE_PATHS_TTL_DAYS_DEFAULT)?,
-            honeypot_enabled: db.get_bool_setting(HONEYPOT_ENABLED, HONEYPOT_ENABLED_DEFAULT)?,
-            honeypot_ttl_days: db.get_int_setting(HONEYPOT_TTL_DAYS, HONEYPOT_TTL_DAYS_DEFAULT)?,
-        })
+    pub fn id(self) -> &'static str {
+        self.spec().id
+    }
+
+    pub fn from_id(id: &str) -> Option<Detector> {
+        Detector::ALL.into_iter().find(|d| d.id() == id)
+    }
+
+    /// `settings` key for this detector's on/off switch.
+    pub fn enabled_key(self) -> String {
+        format!("detect:{}:enabled", self.id())
+    }
+
+    /// `settings` key for its block TTL, in days.
+    pub fn ttl_key(self) -> String {
+        format!("detect:{}:ttl_days", self.id())
+    }
+
+    pub fn is_enabled(self, db: &Db) -> Result<bool> {
+        db.get_bool_setting(&self.enabled_key(), self.spec().enabled_default)
+    }
+
+    pub fn ttl_days(self, db: &Db) -> Result<i64> {
+        db.get_int_setting(&self.ttl_key(), self.spec().ttl_days_default)
+    }
+
+    pub fn set_enabled(self, db: &Db, enabled: bool) -> Result<()> {
+        db.set_bool_setting(&self.enabled_key(), enabled)
+    }
+
+    pub fn set_ttl_days(self, db: &Db, days: i64) -> Result<()> {
+        db.set_int_setting(&self.ttl_key(), days)
     }
 }
+
+/// Threshold for the asset-ratio detector: distinct successful page URLs
+/// fetched with no accompanying asset. High, and *distinct* rather than a
+/// request count, because the false positive to avoid is a legitimate API
+/// client — which hammers a handful of endpoints rather than walking a
+/// site.
+pub const ASSET_RATIO_MIN_PAGES: &str = "detect_asset_ratio_min_pages";
+pub const ASSET_RATIO_MIN_PAGES_DEFAULT: i64 = 15;
+
+/// Threshold for the rotating-user-agent detector: distinct user agents
+/// from one address.
+pub const ROTATING_UA_MIN: &str = "detect_rotating_ua_min";
+pub const ROTATING_UA_MIN_DEFAULT: i64 = 8;
+
+/// Threshold for the referer-less detector: distinct deep (non-root) URLs
+/// fetched with no `Referer`.
+pub const REFERERLESS_MIN_PATHS: &str = "detect_refererless_min_paths";
+pub const REFERERLESS_MIN_PATHS_DEFAULT: i64 = 25;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn every_detector_has_a_distinct_stable_id() {
+        let mut ids: Vec<&str> = Detector::ALL.iter().map(|d| d.id()).collect();
+        let count = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), count, "detector ids must be unique");
+        for d in Detector::ALL {
+            assert_eq!(Detector::from_id(d.id()), Some(d));
+        }
+        assert_eq!(Detector::from_id("nope"), None);
+    }
+
+    /// These strings are live `settings` keys and cron-job ids in every
+    /// installed database. Changing one silently orphans a stored toggle
+    /// and resets that job's schedule, so they are pinned here rather than
+    /// left to a careless rename.
+    #[test]
+    fn the_pre_existing_detector_ids_are_unchanged() {
+        assert_eq!(Detector::SshScanners.id(), "block_scanners");
+        assert_eq!(Detector::WebScanners.id(), "block_web_scanners");
+        assert_eq!(Detector::SpoofedCrawlers.id(), "block_spoofed_crawlers");
+        assert_eq!(Detector::ProbePaths.id(), "block_probe_paths");
+        assert_eq!(Detector::Honeypot.id(), "block_honeypot");
+    }
+
+    #[test]
     fn defaults_apply_to_a_database_that_has_never_set_them() {
         let db = Db::open_in_memory().unwrap();
-        let settings = ProtectionSettings::load(&db).unwrap();
-
-        assert_eq!(
-            settings.spoofed_crawlers_enabled,
-            SPOOFED_CRAWLERS_ENABLED_DEFAULT
-        );
-        assert_eq!(
-            settings.spoofed_crawlers_ttl_days,
-            SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT
-        );
-    }
-
-    /// `Default` is what the TUI shows before its first refresh; it
-    /// drifting from `load`'s unset-database result would make the panel
-    /// flicker between two values on startup.
-    #[test]
-    fn default_matches_load_on_an_untouched_database() {
-        let db = Db::open_in_memory().unwrap();
-        assert_eq!(
-            ProtectionSettings::load(&db).unwrap(),
-            ProtectionSettings::default()
-        );
+        for d in Detector::ALL {
+            assert_eq!(d.is_enabled(&db).unwrap(), d.spec().enabled_default);
+            assert_eq!(d.ttl_days(&db).unwrap(), d.spec().ttl_days_default);
+        }
     }
 
     #[test]
-    fn stored_values_override_the_defaults() {
+    fn stored_values_override_the_defaults_per_detector() {
         let db = Db::open_in_memory().unwrap();
-        db.set_bool_setting(SPOOFED_CRAWLERS_ENABLED, false)
-            .unwrap();
-        db.set_int_setting(SPOOFED_CRAWLERS_TTL_DAYS, 9).unwrap();
+        Detector::Honeypot.set_enabled(&db, true).unwrap();
+        Detector::Honeypot.set_ttl_days(&db, 9).unwrap();
 
-        let settings = ProtectionSettings::load(&db).unwrap();
-        assert!(!settings.spoofed_crawlers_enabled);
-        assert_eq!(settings.spoofed_crawlers_ttl_days, 9);
+        assert!(Detector::Honeypot.is_enabled(&db).unwrap());
+        assert_eq!(Detector::Honeypot.ttl_days(&db).unwrap(), 9);
+        // ...and only that detector.
+        assert_eq!(
+            Detector::ProbePaths.ttl_days(&db).unwrap(),
+            Detector::ProbePaths.spec().ttl_days_default
+        );
     }
 
-    /// A corrupt or hand-edited row must not take a detector down with it.
+    /// The three behavioural detectors each have a false positive they
+    /// can't rule out (see their doc comments), so none may ship on.
     #[test]
-    fn an_unparseable_stored_value_falls_back_to_the_default() {
-        let db = Db::open_in_memory().unwrap();
-        db.set_text_setting(SPOOFED_CRAWLERS_ENABLED, "yes")
-            .unwrap();
-        db.set_text_setting(SPOOFED_CRAWLERS_TTL_DAYS, "soon")
-            .unwrap();
-
-        let settings = ProtectionSettings::load(&db).unwrap();
-        assert_eq!(
-            settings.spoofed_crawlers_enabled,
-            SPOOFED_CRAWLERS_ENABLED_DEFAULT
-        );
-        assert_eq!(
-            settings.spoofed_crawlers_ttl_days,
-            SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT
-        );
+    fn the_behavioural_detectors_are_off_by_default() {
+        for d in [
+            Detector::AssetRatio,
+            Detector::RotatingUserAgent,
+            Detector::RefererlessCrawl,
+        ] {
+            assert!(!d.spec().enabled_default, "{} must default off", d.id());
+        }
     }
 
     #[test]
@@ -298,7 +432,6 @@ mod tests {
         );
         let all = probe_paths(&db).unwrap();
         assert_eq!(all.len(), crate::accesslog::DEFAULT_PROBE_PATHS.len() + 2);
-        // The built-ins are never removed by configuring extras.
         assert!(all.contains(&"/.env".to_string()));
     }
 
@@ -325,26 +458,5 @@ mod tests {
 
         db.set_text_setting(HONEYPOT_PATH, "  /my-trap/  ").unwrap();
         assert_eq!(honeypot_path(&db).unwrap(), "/my-trap/");
-    }
-
-    /// Off by default, because it cannot fire until the trap path is
-    /// published in a served robots.txt.
-    #[test]
-    fn the_honeypot_is_off_by_default() {
-        let db = Db::open_in_memory().unwrap();
-        assert!(!ProtectionSettings::load(&db).unwrap().honeypot_enabled);
-    }
-
-    #[test]
-    fn a_negative_ttl_falls_back_to_the_default() {
-        let db = Db::open_in_memory().unwrap();
-        db.set_int_setting(SPOOFED_CRAWLERS_TTL_DAYS, -3).unwrap();
-
-        assert_eq!(
-            ProtectionSettings::load(&db)
-                .unwrap()
-                .spoofed_crawlers_ttl_days,
-            SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT
-        );
     }
 }

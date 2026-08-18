@@ -25,6 +25,7 @@ use crate::db::Db;
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::ipranges;
 use crate::nginx;
+use crate::protection::Detector;
 use crate::tui::{self, KeyOutcome, Screen, Theme};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -409,13 +410,9 @@ impl App {
     fn run_cron_job(&mut self, job: CronJob) -> Result<()> {
         match job {
             CronJob::UpdateIpRanges => self.start_cron_update_ip_ranges(),
-            CronJob::BlockScanners
-            | CronJob::BlockWebScanners
-            | CronJob::BlockSpoofedCrawlers
-            | CronJob::BlockProbePaths
-            | CronJob::BlockHoneypot
-            | CronJob::RecordAccessStats
-            | CronJob::RenderFirewall => self.start_cron_log_job(job),
+            CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
+                self.start_cron_log_job(job)
+            }
         }
         Ok(())
     }
@@ -505,7 +502,11 @@ impl App {
             return;
         }
         let sender = self.events.sender();
-        let uses_ssh_log = matches!(job, CronJob::BlockScanners | CronJob::RenderFirewall);
+        let uses_ssh_log = match job {
+            CronJob::Detect(detector) => detector.spec().uses_ssh_log,
+            CronJob::RenderFirewall => true,
+            _ => false,
+        };
         let ssh_log = self.ssh_log.clone();
         tokio::task::spawn_blocking(move || {
             let log_text = if uses_ssh_log {
@@ -536,77 +537,11 @@ impl App {
         self.cron_jobs_in_flight.remove(&job);
 
         let summary = match job {
-            CronJob::BlockScanners => {
-                const THRESHOLD: usize = 20;
-                const TTL_DAYS: i64 = 5;
-                match log_text {
-                    Some(text) => match crate::scanblock::block_ssh_scanners(
-                        &self.db, THRESHOLD, TTL_DAYS, &text, false,
-                    ) {
-                        Ok(outcome) => outcome.summary(),
-                        Err(err) => format!("error: {err}"),
-                    },
-                    None => "SSH log unavailable".to_string(),
-                }
-            }
-            CronJob::BlockWebScanners => {
-                const THRESHOLD: usize = 7;
-                const TTL_DAYS: i64 = 1;
-                match log_text {
-                    Some(text) => match crate::scanblock::block_web_scanners(
-                        &self.db, THRESHOLD, TTL_DAYS, &text, false,
-                    ) {
-                        Ok(outcome) => outcome.summary(),
-                        Err(err) => format!("error: {err}"),
-                    },
-                    None => "NGINX access log unavailable".to_string(),
-                }
-            }
-            CronJob::BlockSpoofedCrawlers => {
-                let settings = crate::protection::ProtectionSettings::load(&self.db)?;
-                self.run_toggled_detector(
-                    settings.spoofed_crawlers_enabled,
-                    log_text.as_deref(),
-                    |db, text| {
-                        crate::scanblock::block_spoofed_crawlers(
-                            db,
-                            settings.spoofed_crawlers_ttl_days,
-                            text,
-                            false,
-                        )
-                    },
-                )
-            }
-            CronJob::BlockProbePaths => {
-                let settings = crate::protection::ProtectionSettings::load(&self.db)?;
-                self.run_toggled_detector(
-                    settings.probe_paths_enabled,
-                    log_text.as_deref(),
-                    |db, text| {
-                        crate::scanblock::block_probe_paths(
-                            db,
-                            settings.probe_paths_ttl_days,
-                            text,
-                            false,
-                        )
-                    },
-                )
-            }
-            CronJob::BlockHoneypot => {
-                let settings = crate::protection::ProtectionSettings::load(&self.db)?;
-                self.run_toggled_detector(
-                    settings.honeypot_enabled,
-                    log_text.as_deref(),
-                    |db, text| {
-                        crate::scanblock::block_honeypot(
-                            db,
-                            settings.honeypot_ttl_days,
-                            text,
-                            false,
-                        )
-                    },
-                )
-            }
+            // Every detector runs through one arm. What differs between
+            // them — the log they read, the threshold, the function — is
+            // either on the spec or in `run_detector`, so a new detector
+            // adds no code here at all.
+            CronJob::Detect(detector) => self.run_detector(detector, log_text.as_deref())?,
             CronJob::RecordAccessStats => match log_text {
                 Some(text) => match crate::accessstats::record_access_stats(
                     &self.db,
@@ -633,35 +568,41 @@ impl App {
         Ok(())
     }
 
-    /// Runs one switchable access-log detector and turns the result into the
-    /// one-line summary the Dashboard's "Scheduled tasks" panel shows.
-    ///
-    /// The three detectors that go through here differ only in which toggle
-    /// gates them, which TTL they use and which function they call; before
-    /// this existed, each restated the same enabled/log-missing/error/summary
-    /// ladder, and the fourth one added would have restated it again.
+    /// Runs one detector, if it is switched on, and turns the result into
+    /// the one-line summary the Dashboard's "Scheduled tasks" panel shows.
     ///
     /// **A disabled detector still records a summary.** Skipping the write
-    /// entirely would leave the job looking permanently overdue in the panel
-    /// rather than saying why nothing happened. What is actually skipped is
-    /// the pass over the log, which is the expensive part; the read already
-    /// happened off-thread.
-    fn run_toggled_detector(
-        &self,
-        enabled: bool,
-        log_text: Option<&str>,
-        detect: impl FnOnce(&Db, &str) -> Result<crate::scanblock::ScanBlockOutcome>,
-    ) -> String {
-        if !enabled {
-            return "disabled".to_string();
+    /// entirely would leave the job looking permanently overdue in the
+    /// panel rather than saying why nothing happened.
+    fn run_detector(&self, detector: Detector, log_text: Option<&str>) -> Result<String> {
+        use crate::protection::Detector as D;
+
+        if !detector.is_enabled(&self.db)? {
+            return Ok("disabled".to_string());
         }
         let Some(text) = log_text else {
-            return "NGINX access log unavailable".to_string();
+            return Ok(if detector.spec().uses_ssh_log {
+                "SSH log unavailable".to_string()
+            } else {
+                "NGINX access log unavailable".to_string()
+            });
         };
-        match detect(&self.db, text) {
+        let ttl = detector.ttl_days(&self.db)?;
+        let db = &self.db;
+        let outcome = match detector {
+            D::SshScanners => crate::scanblock::block_ssh_scanners(db, 20, ttl, text, false),
+            D::WebScanners => crate::scanblock::block_web_scanners(db, 7, ttl, text, false),
+            D::SpoofedCrawlers => crate::scanblock::block_spoofed_crawlers(db, ttl, text, false),
+            D::ProbePaths => crate::scanblock::block_probe_paths(db, ttl, text, false),
+            D::Honeypot => crate::scanblock::block_honeypot(db, ttl, text, false),
+            D::AssetRatio => crate::scanblock::block_asset_ratio(db, ttl, text, false),
+            D::RotatingUserAgent => crate::scanblock::block_rotating_ua(db, ttl, text, false),
+            D::RefererlessCrawl => crate::scanblock::block_refererless(db, ttl, text, false),
+        };
+        Ok(match outcome {
             Ok(outcome) => outcome.summary(),
             Err(err) => format!("error: {err}"),
-        }
+        })
     }
 
     /// The actual work behind the `RenderFirewall` job: writes the current
@@ -1181,12 +1122,12 @@ mod tests {
 
         assert!(app
             .db
-            .get_cron_last_run(CronJob::BlockScanners.id())
+            .get_cron_last_run(CronJob::Detect(Detector::SshScanners).id())
             .unwrap()
             .is_some());
         assert!(app
             .db
-            .get_cron_last_run(CronJob::BlockWebScanners.id())
+            .get_cron_last_run(CronJob::Detect(Detector::WebScanners).id())
             .unwrap()
             .is_some());
     }
@@ -1212,12 +1153,12 @@ mod tests {
 
         assert!(app
             .db
-            .get_cron_last_run(CronJob::BlockScanners.id())
+            .get_cron_last_run(CronJob::Detect(Detector::SshScanners).id())
             .unwrap()
             .is_some());
         assert!(app
             .db
-            .get_cron_last_run(CronJob::BlockWebScanners.id())
+            .get_cron_last_run(CronJob::Detect(Detector::WebScanners).id())
             .unwrap()
             .is_some());
         assert!(app
@@ -1248,7 +1189,7 @@ mod tests {
         drain_cron_events(&mut app).await;
         let first = app
             .db
-            .get_cron_last_run(CronJob::BlockScanners.id())
+            .get_cron_last_run(CronJob::Detect(Detector::SshScanners).id())
             .unwrap();
         assert!(first.is_some());
 
@@ -1259,7 +1200,7 @@ mod tests {
         app.check_cron().unwrap();
         let second = app
             .db
-            .get_cron_last_run(CronJob::BlockScanners.id())
+            .get_cron_last_run(CronJob::Detect(Detector::SshScanners).id())
             .unwrap();
         assert_eq!(first, second);
     }

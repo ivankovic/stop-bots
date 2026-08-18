@@ -59,6 +59,7 @@
 
 use crate::db::{Category, Db, GeoMode, Policy, Source};
 use crate::ipranges;
+use crate::protection::Detector;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -101,9 +102,10 @@ enum Focus {
 /// there is no room for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProtectionRow {
-    SpoofedCrawlers,
-    ProbePaths,
-    Honeypot,
+    /// One log-analysis detector. Every detector shares this variant —
+    /// the per-detector facts live on `DetectorSpec`, so adding one costs
+    /// nothing here.
+    Detect(Detector),
     /// A `reputation_sources` row, by index into
     /// `Dashboard::reputation` (which is ordered by id, as
     /// `Db::list_reputation_sources` returns it).
@@ -111,15 +113,6 @@ enum ProtectionRow {
 }
 
 impl ProtectionRow {
-    /// The three detectors, always present. Feed rows are appended per
-    /// render/keypress from whatever `reputation_sources` holds, so this
-    /// can't be one fixed array any more — see `Dashboard::protection_rows`.
-    const DETECTORS: [ProtectionRow; 3] = [
-        ProtectionRow::SpoofedCrawlers,
-        ProtectionRow::ProbePaths,
-        ProtectionRow::Honeypot,
-    ];
-
     /// Whether this row is a detector (whose popup offers Off plus a TTL
     /// choice) rather than a feed (a plain Off/On, with no TTL — a feed's
     /// blocks are derived at render time and never expire on their own).
@@ -196,7 +189,10 @@ pub struct Dashboard {
     /// The automatic-detection toggles, reloaded on every `refresh` — the
     /// panel only displays them; `crate::cron`'s jobs read the same values
     /// straight from `Db` when they run.
-    protection: crate::protection::ProtectionSettings,
+    /// Each detector's (enabled, ttl_days), reloaded on every `refresh`.
+    /// A map rather than a struct of named fields, so a new detector is a
+    /// row in `Detector::ALL` and nothing here.
+    detectors: std::collections::HashMap<Detector, (bool, i64)>,
     /// Every third-party CIDR feed, ordered by id — the order
     /// `ProtectionRow::Feed`'s index refers to.
     reputation: Vec<crate::db::ReputationSource>,
@@ -226,7 +222,10 @@ impl Dashboard {
         self.geo_mode = db.get_geo_mode()?;
         self.selected_countries = db.list_selected_countries()?;
         self.fetched_countries = db.list_fetched_countries()?;
-        self.protection = crate::protection::ProtectionSettings::load(db)?;
+        self.detectors = Detector::ALL
+            .into_iter()
+            .map(|d| Ok((d, (d.is_enabled(db)?, d.ttl_days(db)?))))
+            .collect::<Result<_>>()?;
         self.reputation = db.list_reputation_sources()?;
         self.cron_status = crate::cron::status(db)?;
         self.firewall_needs_update = firewall_needs_update(db)?;
@@ -488,18 +487,16 @@ impl Dashboard {
     /// never disagree with `self.reputation` about how many rows exist —
     /// a stale count here would let the selection index point past the end.
     fn protection_rows(&self) -> Vec<ProtectionRow> {
-        ProtectionRow::DETECTORS
-            .iter()
-            .copied()
+        Detector::ALL
+            .into_iter()
+            .map(ProtectionRow::Detect)
             .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
             .collect()
     }
 
     fn protection_label(&self, row: ProtectionRow) -> String {
         match row {
-            ProtectionRow::SpoofedCrawlers => "Forged crawler UAs".to_string(),
-            ProtectionRow::ProbePaths => "Probe paths".to_string(),
-            ProtectionRow::Honeypot => "Honeypot path".to_string(),
+            ProtectionRow::Detect(detector) => detector.spec().label.to_string(),
             ProtectionRow::Feed(i) => self
                 .reputation
                 .get(i)
@@ -510,18 +507,22 @@ impl Dashboard {
 
     fn protection_enabled(&self, row: ProtectionRow) -> bool {
         match row {
-            ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_enabled,
-            ProtectionRow::ProbePaths => self.protection.probe_paths_enabled,
-            ProtectionRow::Honeypot => self.protection.honeypot_enabled,
+            ProtectionRow::Detect(detector) => self
+                .detectors
+                .get(&detector)
+                .map(|(enabled, _)| *enabled)
+                .unwrap_or(false),
             ProtectionRow::Feed(i) => self.reputation.get(i).is_some_and(|s| s.enabled),
         }
     }
 
     fn protection_ttl_days(&self, row: ProtectionRow) -> i64 {
         match row {
-            ProtectionRow::SpoofedCrawlers => self.protection.spoofed_crawlers_ttl_days,
-            ProtectionRow::ProbePaths => self.protection.probe_paths_ttl_days,
-            ProtectionRow::Honeypot => self.protection.honeypot_ttl_days,
+            ProtectionRow::Detect(detector) => self
+                .detectors
+                .get(&detector)
+                .map(|(_, ttl)| *ttl)
+                .unwrap_or(0),
             // Feeds have no TTL: their blocks are derived fresh at
             // render time from the stored ranges, so there's nothing to
             // expire.
@@ -806,26 +807,12 @@ impl Dashboard {
         if let ProtectionRow::Feed(i) = row {
             return self.commit_feed(db, i, selected == 1, message);
         }
-        let (enabled_key, ttl_key) = match row {
-            ProtectionRow::SpoofedCrawlers => (
-                crate::protection::SPOOFED_CRAWLERS_ENABLED,
-                crate::protection::SPOOFED_CRAWLERS_TTL_DAYS,
-            ),
-            ProtectionRow::ProbePaths => (
-                crate::protection::PROBE_PATHS_ENABLED,
-                crate::protection::PROBE_PATHS_TTL_DAYS,
-            ),
-            ProtectionRow::Honeypot => (
-                crate::protection::HONEYPOT_ENABLED,
-                crate::protection::HONEYPOT_TTL_DAYS,
-            ),
-            // Handled by the early return above; kept explicit rather than
-            // a `_` arm so adding a row variant is a compile error here.
-            ProtectionRow::Feed(_) => unreachable!("feeds are committed by commit_feed"),
+        let ProtectionRow::Detect(detector) = row else {
+            unreachable!("feeds are committed by commit_feed")
         };
         let label = self.protection_label(row);
         if selected == 0 {
-            db.set_bool_setting(enabled_key, false)?;
+            detector.set_enabled(db, false)?;
             *message = Some(format!("{label} detection off"));
             return Ok(KeyOutcome::Mutated);
         }
@@ -833,8 +820,8 @@ impl Dashboard {
             .get(selected - 1)
             .copied()
             .unwrap_or(PROTECTION_TTL_CHOICES[0]);
-        db.set_bool_setting(enabled_key, true)?;
-        db.set_int_setting(ttl_key, ttl)?;
+        detector.set_enabled(db, true)?;
+        detector.set_ttl_days(db, ttl)?;
         *message = Some(format!("{label} detection on, blocking for {ttl} day(s)"));
         Ok(KeyOutcome::Mutated)
     }
@@ -1410,7 +1397,7 @@ mod tests {
     #[test]
     fn cron_status_line_shows_never_and_due_now_for_an_unrun_job() {
         let status = crate::cron::JobStatus {
-            job: crate::cron::CronJob::BlockScanners,
+            job: crate::cron::CronJob::Detect(Detector::SshScanners),
             last_run: None,
             last_summary: None,
             due: true,
@@ -1423,7 +1410,7 @@ mod tests {
     #[test]
     fn cron_status_line_shows_last_run_and_summary_for_a_completed_job() {
         let status = crate::cron::JobStatus {
-            job: crate::cron::CronJob::BlockWebScanners,
+            job: crate::cron::CronJob::Detect(Detector::WebScanners),
             last_run: Some(now_secs() - 3_600),
             last_summary: Some("blocked 2 IP(s)".to_string()),
             due: false,
@@ -1462,7 +1449,7 @@ mod tests {
     fn render_shows_the_scheduled_tasks_panel() {
         let db = Db::open_in_memory().unwrap();
         db.set_cron_last_run(
-            crate::cron::CronJob::BlockScanners.id(),
+            crate::cron::CronJob::Detect(Detector::SshScanners).id(),
             now_secs(),
             "blocked 3 IP(s)",
         )
@@ -1515,7 +1502,7 @@ mod tests {
     fn render_shows_running_now_for_a_job_in_the_running_set() {
         let db = Db::open_in_memory().unwrap();
         db.set_cron_last_run(
-            crate::cron::CronJob::BlockScanners.id(),
+            crate::cron::CronJob::Detect(Detector::SshScanners).id(),
             now_secs(),
             "blocked 3 IP(s)",
         )
@@ -1524,7 +1511,8 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let running_jobs = std::collections::HashSet::from([crate::cron::CronJob::BlockScanners]);
+        let running_jobs =
+            std::collections::HashSet::from([crate::cron::CronJob::Detect(Detector::SshScanners)]);
         let backend = TestBackend::new(60, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -2394,10 +2382,6 @@ mod tests {
 
     // ---- Automatic blocking panel ----
 
-    use crate::protection::{
-        ProtectionSettings, SPOOFED_CRAWLERS_ENABLED, SPOOFED_CRAWLERS_TTL_DAYS,
-    };
-
     fn press(dashboard: &mut Dashboard, db: &Db, code: KeyCode) -> KeyOutcome {
         let mut message = None;
         dashboard
@@ -2433,7 +2417,7 @@ mod tests {
         dashboard.refresh(&db).unwrap();
         focus_protection(&mut dashboard, &db);
 
-        for _ in 0..5 {
+        for _ in 0..dashboard.protection_rows().len() + 3 {
             press(&mut dashboard, &db, KeyCode::Down);
         }
         assert_eq!(
@@ -2449,6 +2433,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         focus_protection(&mut dashboard, &db);
+        select_detector(&mut dashboard, Detector::SpoofedCrawlers);
 
         // Enabled by default, so the popup opens on an "On" row; Up lands
         // on "Off" at index 0.
@@ -2458,21 +2443,17 @@ mod tests {
         let outcome = press(&mut dashboard, &db, KeyCode::Enter);
 
         assert_eq!(outcome, KeyOutcome::Mutated);
-        assert!(
-            !ProtectionSettings::load(&db)
-                .unwrap()
-                .spoofed_crawlers_enabled
-        );
+        assert!(!Detector::SpoofedCrawlers.is_enabled(&db).unwrap());
     }
 
     #[test]
     fn choosing_an_on_option_stores_both_the_toggle_and_its_ttl() {
         let db = Db::open_in_memory().unwrap();
-        db.set_bool_setting(SPOOFED_CRAWLERS_ENABLED, false)
-            .unwrap();
+        Detector::SpoofedCrawlers.set_enabled(&db, false).unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         focus_protection(&mut dashboard, &db);
+        select_detector(&mut dashboard, Detector::SpoofedCrawlers);
 
         // Opens on "Off" (index 0); two Downs reach the second TTL choice.
         press(&mut dashboard, &db, KeyCode::Enter);
@@ -2480,10 +2461,9 @@ mod tests {
         press(&mut dashboard, &db, KeyCode::Down);
         press(&mut dashboard, &db, KeyCode::Enter);
 
-        let settings = ProtectionSettings::load(&db).unwrap();
-        assert!(settings.spoofed_crawlers_enabled);
+        assert!(Detector::SpoofedCrawlers.is_enabled(&db).unwrap());
         assert_eq!(
-            settings.spoofed_crawlers_ttl_days,
+            Detector::SpoofedCrawlers.ttl_days(&db).unwrap(),
             PROTECTION_TTL_CHOICES[1]
         );
     }
@@ -2493,20 +2473,19 @@ mod tests {
     #[test]
     fn disabling_a_detector_preserves_its_ttl() {
         let db = Db::open_in_memory().unwrap();
-        db.set_int_setting(SPOOFED_CRAWLERS_TTL_DAYS, 30).unwrap();
+        Detector::SpoofedCrawlers.set_ttl_days(&db, 30).unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         focus_protection(&mut dashboard, &db);
-
+        select_detector(&mut dashboard, Detector::SpoofedCrawlers);
         press(&mut dashboard, &db, KeyCode::Enter);
         press(&mut dashboard, &db, KeyCode::Up);
         press(&mut dashboard, &db, KeyCode::Up);
         press(&mut dashboard, &db, KeyCode::Up);
         press(&mut dashboard, &db, KeyCode::Enter);
 
-        let settings = ProtectionSettings::load(&db).unwrap();
-        assert!(!settings.spoofed_crawlers_enabled);
-        assert_eq!(settings.spoofed_crawlers_ttl_days, 30);
+        assert!(!Detector::SpoofedCrawlers.is_enabled(&db).unwrap());
+        assert_eq!(Detector::SpoofedCrawlers.ttl_days(&db).unwrap(), 30);
     }
 
     /// A TTL set outside the offered choices (via the CLI, which takes any
@@ -2514,12 +2493,12 @@ mod tests {
     #[test]
     fn the_popup_opens_enabled_for_a_ttl_that_is_not_an_offered_choice() {
         let db = Db::open_in_memory().unwrap();
-        db.set_bool_setting(SPOOFED_CRAWLERS_ENABLED, true).unwrap();
-        db.set_int_setting(SPOOFED_CRAWLERS_TTL_DAYS, 3).unwrap();
+        Detector::SpoofedCrawlers.set_enabled(&db, true).unwrap();
+        Detector::SpoofedCrawlers.set_ttl_days(&db, 3).unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         focus_protection(&mut dashboard, &db);
-
+        select_detector(&mut dashboard, Detector::SpoofedCrawlers);
         press(&mut dashboard, &db, KeyCode::Enter);
         let Some(Popup::Protection { selected, .. }) = dashboard.popup else {
             panic!("expected the protection popup");
@@ -2533,17 +2512,13 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
         focus_protection(&mut dashboard, &db);
-
+        select_detector(&mut dashboard, Detector::SpoofedCrawlers);
         press(&mut dashboard, &db, KeyCode::Enter);
         press(&mut dashboard, &db, KeyCode::Up);
         press(&mut dashboard, &db, KeyCode::Esc);
 
         assert!(dashboard.popup.is_none());
-        assert!(
-            ProtectionSettings::load(&db)
-                .unwrap()
-                .spoofed_crawlers_enabled
-        );
+        assert!(Detector::SpoofedCrawlers.is_enabled(&db).unwrap());
     }
 
     /// Each row must drive its *own* settings keys — a copy-paste slip in
@@ -2556,19 +2531,17 @@ mod tests {
         dashboard.refresh(&db).unwrap();
         focus_protection(&mut dashboard, &db);
 
-        // Move to the Probe paths row and switch it off.
-        press(&mut dashboard, &db, KeyCode::Down);
-        assert_eq!(dashboard.protection_state.selected(), Some(1));
+        // Switch Probe paths off, and assert nothing else moved.
+        select_detector(&mut dashboard, Detector::ProbePaths);
         press(&mut dashboard, &db, KeyCode::Enter);
         for _ in 0..PROTECTION_TTL_CHOICES.len() {
             press(&mut dashboard, &db, KeyCode::Up);
         }
         press(&mut dashboard, &db, KeyCode::Enter);
 
-        let settings = ProtectionSettings::load(&db).unwrap();
-        assert!(!settings.probe_paths_enabled);
+        assert!(!Detector::ProbePaths.is_enabled(&db).unwrap());
         assert!(
-            settings.spoofed_crawlers_enabled,
+            Detector::SpoofedCrawlers.is_enabled(&db).unwrap(),
             "the other detector must be untouched"
         );
     }
@@ -2576,6 +2549,19 @@ mod tests {
     // ---- reputation / provider feed rows ----
 
     use crate::ipranges::reputation::{register_all_reputation_sources, ReputationSourceKind};
+
+    /// Selects `detector`'s row, by searching rather than by assuming a
+    /// position — the list is `Detector::ALL` plus one row per feed, so
+    /// any new detector would otherwise silently shift these tests onto a
+    /// different row and keep passing.
+    fn select_detector(dashboard: &mut Dashboard, detector: Detector) {
+        let index = dashboard
+            .protection_rows()
+            .iter()
+            .position(|row| *row == ProtectionRow::Detect(detector))
+            .expect("detector row should exist");
+        dashboard.protection_state.select(Some(index));
+    }
 
     fn feed_row_index(dashboard: &Dashboard, id: &str) -> usize {
         dashboard
@@ -2598,14 +2584,10 @@ mod tests {
         let rows = dashboard.protection_rows();
         assert_eq!(
             rows.len(),
-            ProtectionRow::DETECTORS.len() + ReputationSourceKind::ALL.len()
+            Detector::ALL.len() + ReputationSourceKind::ALL.len()
         );
-        assert!(rows[..ProtectionRow::DETECTORS.len()]
-            .iter()
-            .all(|r| r.is_detector()));
-        assert!(rows[ProtectionRow::DETECTORS.len()..]
-            .iter()
-            .all(|r| !r.is_detector()));
+        assert!(rows[..Detector::ALL.len()].iter().all(|r| r.is_detector()));
+        assert!(rows[Detector::ALL.len()..].iter().all(|r| !r.is_detector()));
     }
 
     /// Enabling a never-fetched feed must ask `App` to download it —
@@ -2733,8 +2715,7 @@ mod tests {
     #[test]
     fn render_shows_the_automatic_blocking_panel() {
         let db = Db::open_in_memory().unwrap();
-        db.set_bool_setting(SPOOFED_CRAWLERS_ENABLED, false)
-            .unwrap();
+        Detector::SpoofedCrawlers.set_enabled(&db, false).unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 

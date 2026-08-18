@@ -42,6 +42,9 @@ pub enum ScanKind {
     SpoofedCrawler,
     ProbePath,
     Honeypot,
+    /// The three behavioural detectors share a noun: each finds a client
+    /// that doesn't act like a browser, by a different tell.
+    NonBrowser,
 }
 
 impl ScanKind {
@@ -53,6 +56,7 @@ impl ScanKind {
             ScanKind::SpoofedCrawler => "forged crawler IP",
             ScanKind::ProbePath => "probing IP",
             ScanKind::Honeypot => "trapped IP",
+            ScanKind::NonBrowser => "non-browser IP",
         }
     }
 }
@@ -328,6 +332,93 @@ pub fn block_honeypot(
         candidates,
         0,
         true,
+        ttl_days,
+        dry_run,
+    )
+}
+
+/// Blocks clients that fetched pages but never an asset — see
+/// [`accesslog::asset_less_ips`] for the three guards that make this
+/// usable and the one false positive it can't rule out.
+pub fn block_asset_ratio(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let min_pages = db.get_int_setting(
+        crate::protection::ASSET_RATIO_MIN_PAGES,
+        crate::protection::ASSET_RATIO_MIN_PAGES_DEFAULT,
+    )? as usize;
+    let candidates = accesslog::asset_less_ips(log_text, min_pages);
+    behavioural(db, candidates, ttl_days, dry_run)
+}
+
+/// Blocks clients presenting many distinct user agents — see
+/// [`accesslog::rotating_user_agent_ips`], and note the NAT caveat there.
+pub fn block_rotating_ua(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let min_agents = db.get_int_setting(
+        crate::protection::ROTATING_UA_MIN,
+        crate::protection::ROTATING_UA_MIN_DEFAULT,
+    )? as usize;
+    let candidates = accesslog::rotating_user_agent_ips(log_text, min_agents);
+    behavioural(db, candidates, ttl_days, dry_run)
+}
+
+/// Blocks clients that walked many deep pages without ever sending a
+/// `Referer` — see [`accesslog::refererless_crawl_ips`].
+pub fn block_refererless(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let min_paths = db.get_int_setting(
+        crate::protection::REFERERLESS_MIN_PATHS,
+        crate::protection::REFERERLESS_MIN_PATHS_DEFAULT,
+    )? as usize;
+    let candidates = accesslog::refererless_crawl_ips(log_text, min_paths);
+    behavioural(db, candidates, ttl_days, dry_run)
+}
+
+/// Shared tail for the three behavioural detectors.
+///
+/// Unlike the other access-log detectors these *do* apply the known-crawler
+/// exclusion, and that is the whole reason this helper exists rather than
+/// three copies. All three describe "doesn't behave like a browser", which
+/// is exactly true of Googlebot: it fetches no CSS, it uses more than one
+/// user agent, and it never sends a referer. Without the exclusion these
+/// three detectors would block search engines by design.
+fn behavioural(
+    db: &Db,
+    candidates: Vec<String>,
+    ttl_days: i64,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let found = candidates.len();
+    let crawler_ranges = known_crawler_ranges(db)?;
+    let crawler_exclusion_active = !crawler_ranges.is_empty();
+    let mut kept = Vec::new();
+    let mut skipped_known_crawlers = 0;
+    for ip in candidates {
+        if known_crawler_match(&crawler_ranges, &ip) {
+            skipped_known_crawlers += 1;
+        } else {
+            kept.push(ip);
+        }
+    }
+    add_block_rules(
+        db,
+        ScanKind::NonBrowser,
+        found,
+        kept,
+        skipped_known_crawlers,
+        crawler_exclusion_active,
         ttl_days,
         dry_run,
     )
@@ -915,5 +1006,76 @@ mod tests {
             )],
             "an admin connected from inside the blocked /64 must be flagged"
         );
+    }
+
+    // ---- behavioural detectors: the crawler exclusion ----
+
+    fn page_line(ip: &str, path: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 200 9 \"-\" \"UA\"\n"
+        )
+    }
+
+    fn asset_less_log(ip: &str) -> String {
+        (0..20).map(|i| page_line(ip, &format!("/p{i}"))).collect()
+    }
+
+    #[test]
+    fn block_asset_ratio_blocks_a_client_that_never_fetches_assets() {
+        let db = Db::open_in_memory().unwrap();
+        let outcome = block_asset_ratio(&db, 5, &asset_less_log("203.0.113.9"), false).unwrap();
+
+        assert_eq!(outcome.kind, ScanKind::NonBrowser);
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+    }
+
+    /// The reason these three share `behavioural()`. Googlebot fetches no
+    /// CSS, uses several user agents and sends no referer — it matches all
+    /// three by design. Without the known-crawler exclusion these
+    /// detectors would block search engines, which is the opposite of what
+    /// this project is for.
+    #[test]
+    fn the_behavioural_detectors_never_block_a_verified_crawler() {
+        let db = Db::open_in_memory().unwrap();
+        seed_googlebot_ranges(&db);
+        // An address inside Google's published range.
+        let log = asset_less_log("66.249.66.1");
+
+        let outcome = block_asset_ratio(&db, 5, &log, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped_known_crawlers, 1);
+        assert!(outcome.crawler_exclusion_active);
+    }
+
+    #[test]
+    fn block_rotating_ua_respects_its_configured_threshold() {
+        let db = Db::open_in_memory().unwrap();
+        let log: String = (0..4)
+            .map(|i| {
+                format!(
+                    "203.0.113.9 - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 9 \"-\" \"A{i}\"\n"
+                )
+            })
+            .collect();
+
+        // Four agents, default threshold is higher.
+        assert_eq!(block_rotating_ua(&db, 5, &log, true).unwrap().candidates, 0);
+
+        db.set_int_setting(crate::protection::ROTATING_UA_MIN, 3)
+            .unwrap();
+        assert_eq!(block_rotating_ua(&db, 5, &log, true).unwrap().candidates, 1);
+    }
+
+    #[test]
+    fn block_refererless_blocks_a_deep_crawl_with_no_referer() {
+        let db = Db::open_in_memory().unwrap();
+        let log: String = (0..30)
+            .map(|i| page_line("203.0.113.9", &format!("/p{i}")))
+            .collect();
+
+        let outcome = block_refererless(&db, 5, &log, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
     }
 }
