@@ -2699,3 +2699,71 @@ never arrives as contiguous bytes even though every word is on screen.
 The file's own older tests document this gotcha; the rule is single-word
 needles, always. One real gap did fall out of the chase: no unit test had
 ever *rendered* the RenderFirewall popup arm — there is one now.
+
+## Test readability pass
+
+Measured before changing anything: 551 tests, 13,044 lines of test code,
+average 23 lines per test, 16 tests over 60 lines, and 234 assertions that
+printed nothing useful when they failed.
+
+**Shared fixtures (`src/testing.rs`).** Two setups were being hand-written
+across the tree: `FirewallRule` literals (54 sites, 8 files — two of which
+had already independently grown a private `rule()` helper) and the
+`upsert_source` + `upsert_bot` + `set_bot_status` incantation (~20 lines,
+11 sites). Now `block("10.0.0.1")`, `allow(...)`, `block_port(...)`,
+`disabled(...)`, `blocked_bot(&db, slug, pattern)`. The clearest case:
+nftables' IPv4-vs-IPv6 test went from 20 lines of struct literal to one
+line that says what it means.
+
+The bar recorded on the module is *the call site reads better*, not *it is
+shorter* — and two categories are deliberately left duplicated: the
+`NewBot` literals in `botlist/*`'s parser tests (there the literal is the
+expected parse result, so a builder would hide the thing under test) and
+the Dashboard's source-freshness rows (same reason). `tests/cli.rs` and
+`tests/tui.rs` can't see a `#[cfg(test)]` module at all; their own local
+helpers stay.
+
+Builders take `&Db` and mutate rather than returning one — a helper that
+hands back a database hides which database the test is using.
+
+**Diagnostic assertions.** 170 assertions of the shape
+`assert!(x.contains("..."))` now carry `, "x was:\n{x}"`. Verified by
+breaking `block_text` on purpose: the failure prints the generated NGINX
+config with `~=` visible where `~*` belonged, instead of a line number.
+The first attempt at this expanded each assert to five lines — a net
+readability *loss* — and was redone in the two-line form: the needle is
+already on the assert line, so only the actual value needs printing.
+The 61 remaining bare ones are on expressions too complex to rewrite
+mechanically.
+
+**A table instead of a run of asserts.** nftables' fixture test was six
+near-identical `contains` checks; it is now a `(shape, expected line)`
+table, which both reads as a list of supported input shapes and names
+which shape broke.
+
+**One test split.** `site_detail_search_and_override_a_site_from_the_tui`
+(116 lines) walked through a category override *and* a bot search *and* a
+bot override, so a failure localised to nothing. Split into two tests
+sharing an `open_site_detail` helper. This was only affordable because pty
+spawn is now ~150ms; at the old 1.5s it would have been a bad trade. The
+other long tests are sequential narratives where the ordering *is* the
+assertion (`rate_limit_writes_the_zone_file_and_removes_it_only_after_the_directive_goes`
+is precisely about what exists at each step) and are left whole.
+
+**A `Fixture` for the CLI tests, which closed a real hole.** It owns the
+tempdir, database, NGINX root and both managed-output directories, and
+sets `STOP_BOTS_NGINX_DIR`/`STOP_BOTS_NGINX_CONF_D` on *every* command it
+runs. That is a safety property, not a convenience: of the ten CLI tests
+that run `apply-blocks`, only two set those overrides — the other eight
+were one settings change away from writing generated files under `/etc`
+on a developer's machine. Both features that write there default to off,
+so nothing had actually escaped; the fixture removes the footgun instead
+of documenting it.
+
+Result: 552 tests, longest 84 lines (was 116), 11 over 60 lines (was 16),
+64 opaque assertions (was 234). Conventions written into AGENTS.md so the
+next contributor follows them rather than inventing an eleventh helper
+name — the pass found ten different names for near-identical helpers
+(`test_db`, `test_db_with_bot`, `sample_bot`, `seed_bot`, `rule`,
+`test_screen`, `test_site`, `test_app`, …). Renaming them all was judged
+low-value churn; converge opportunistically.

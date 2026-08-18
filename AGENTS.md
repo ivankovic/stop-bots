@@ -24,6 +24,41 @@ that directory.
 - Avoid churn: don’t refactor between equivalent forms (Span::styled ↔ set_style, Line::from ↔ .into()) without a clear readability or functional gain; follow file‑local conventions and do not introduce type annotations solely to satisfy .into().
 - Compactness: prefer the form that stays on one line after rustfmt; if only one of Line::from(vec![…]) or vec![…].into() avoids wrapping, choose that. If both wrap, pick the one with fewer wrapped lines.
 
+## Tests
+
+Beyond the policy in README.md (no mocks; in-memory fakes, injected inputs,
+fake executables on PATH, golden files; 300ms per test in `src/`, 1s in
+`tests/`), the conventions that keep them readable:
+
+- **A test should read as a claim, not a script.** The name states the
+  property; the body should get to the interesting part within a few lines.
+  Setup longer than the assertion is a sign a fixture is missing.
+- **Shared fixtures live in `src/testing.rs`** (unit tests) and in the
+  helpers at the top of each file in `tests/` (integration tests, which
+  cannot see a `#[cfg(test)]` module). Prefer them over hand-rolled struct
+  literals: `block("10.0.0.1")` says what an eight-field `FirewallRule`
+  literal makes you decode.
+- **The bar for a new fixture is that the call site reads better**, not
+  that it is shorter. A helper whose name doesn't carry its meaning makes a
+  test worse — now you have to go and look it up.
+- **Don't hide the thing under test.** Where a literal *is* the expected
+  value (the `NewBot`s in `botlist/*`'s parser tests, the source rows in
+  the Dashboard's freshness tests), leave it inline.
+- **Every assertion should say what happened when it fails.**
+  `assert!(x.contains(y))` prints nothing useful; add `, "x was:\n{x}"`.
+  For several related checks, prefer a table of `(description, expected)`
+  over a run of near-identical asserts.
+- **Pin generated output with a golden** (`tests/golden/`) rather than a
+  wall of substring checks. Keep a substring assert only where it names a
+  property a golden can't — "skips disabled rules", "uses `ip6 saddr` for
+  v6".
+- **`tests/tui.rs` expectations must be single words.** The terminal output
+  is diffed, so the spaces inside a multi-word needle routinely land on
+  cells that were already blank and never transmit, even though every word
+  is on screen.
+- **One property per test where splitting is cheap.** A test that walks
+  through four unrelated features doesn't localise a failure.
+
 <!-- rtk-instructions v2 -->
 # RTK (Rust Token Killer) - Token-Optimized Commands
 
