@@ -187,12 +187,6 @@ pub enum BlockResponse {
     /// preferring over 403 when the traffic you're turning away is
     /// crawlers rather than attackers.
     Gone,
-    /// `402` — "payment required". Reserved and unused for most of
-    /// HTTP's life, and now the closest thing there is to a standard way
-    /// of saying "this content is not free": pay-per-crawl schemes have
-    /// settled on it. Which makes it the most pointed answer available to
-    /// an AI crawler, and more than the joke it looks like.
-    PaymentRequired,
     /// `418` — "I'm a teapot", from RFC 2324's April Fools' coffee-pot
     /// protocol. A joke, included because it is a good one, with two
     /// practical notes: it is not registered with IANA, and NGINX has no
@@ -229,14 +223,13 @@ pub enum BlockResponse {
 
 impl BlockResponse {
     /// Every option, in the order the TUI lists them: the four that a
-    /// client can act on, then the two unusual ones, then the two that
-    /// answer with nothing useful at all.
-    pub const ALL: [BlockResponse; 8] = [
+    /// client can act on, then the joke, then the two that answer with
+    /// nothing useful at all.
+    pub const ALL: [BlockResponse; 7] = [
         BlockResponse::Forbidden,
         BlockResponse::NotFound,
         BlockResponse::Gone,
         BlockResponse::TooManyRequests,
-        BlockResponse::PaymentRequired,
         BlockResponse::Teapot,
         BlockResponse::Close,
         BlockResponse::Tarpit,
@@ -253,7 +246,6 @@ impl BlockResponse {
             BlockResponse::Forbidden => "403",
             BlockResponse::NotFound => "404",
             BlockResponse::Gone => "410",
-            BlockResponse::PaymentRequired => "402",
             BlockResponse::Teapot => "418",
             BlockResponse::TooManyRequests => "429",
             BlockResponse::Close => "444",
@@ -278,7 +270,6 @@ impl BlockResponse {
             BlockResponse::Forbidden | BlockResponse::Tarpit => 403,
             BlockResponse::NotFound => 404,
             BlockResponse::Gone => 410,
-            BlockResponse::PaymentRequired => 402,
             BlockResponse::Teapot => 418,
             BlockResponse::TooManyRequests => 429,
             BlockResponse::Close => 444,
@@ -299,7 +290,6 @@ impl BlockResponse {
             BlockResponse::Forbidden => "403 Forbidden",
             BlockResponse::NotFound => "404 Not Found",
             BlockResponse::Gone => "410 Gone",
-            BlockResponse::PaymentRequired => "402 Payment Required",
             BlockResponse::Teapot => "418 I'm a teapot",
             BlockResponse::TooManyRequests => "429 Too Many Requests",
             BlockResponse::Close => "444 close connection",
@@ -315,7 +305,6 @@ impl BlockResponse {
             BlockResponse::NotFound => "hides that anything was blocked at all",
             BlockResponse::Gone => "asks well-behaved crawlers to drop the URL for good",
             BlockResponse::TooManyRequests => "tells a polite client to back off and retry",
-            BlockResponse::PaymentRequired => "what pay-per-crawl uses; pointed at AI crawlers",
             BlockResponse::Teapot => "a joke (RFC 2324); unregistered, empty body",
             BlockResponse::Close => "no reply at all; looks like the server is down",
             BlockResponse::Tarpit => "holds their connection open — and one of yours",
@@ -1387,52 +1376,6 @@ impl Db {
     /// that rather than failing.
     pub fn get_rate_limit_zone_mb(&self) -> Result<i64> {
         Ok(self.get_int_setting("rate_limit_zone_mb", 10)?.max(1))
-    }
-
-    /// The price advertised in a `402 Payment Required` body, free text
-    /// (`"USD 0.01 per request"`, `"EUR 500/month"`). Empty when unset.
-    ///
-    /// Free text rather than a structured amount on purpose: there is no
-    /// interoperable machine format for this that a generated NGINX
-    /// config could emit and a crawler would reliably parse, so the honest
-    /// thing is a line a human operating that crawler can read and act on.
-    pub fn get_payment_price(&self) -> Result<String> {
-        Ok(self.get_text_setting("payment_price")?.unwrap_or_default())
-    }
-
-    /// Where to arrange access — a URL or an email address. Empty when
-    /// unset.
-    pub fn get_payment_contact(&self) -> Result<String> {
-        Ok(self
-            .get_text_setting("payment_contact")?
-            .unwrap_or_default())
-    }
-
-    /// Stores payment terms, rejecting anything that can't be embedded in
-    /// the generated config.
-    ///
-    /// A double quote would terminate NGINX's quoted string early and
-    /// corrupt every directive after it; a trailing backslash escapes the
-    /// closing quote with the same result. These are the same two
-    /// characters `nginx::is_embeddable` rejects in a user-agent pattern,
-    /// and for the same reason — except that here the value comes straight
-    /// from a person typing into a box, so it's rejected at the point of
-    /// entry rather than silently dropped at render time.
-    pub fn set_payment_terms(&self, price: &str, contact: &str) -> Result<()> {
-        for (name, value) in [("price", price), ("contact", contact)] {
-            if value.contains('"') || value.ends_with('\\') {
-                anyhow::bail!(
-                    "the payment {name} cannot contain a double quote or end in a backslash \
-                     — both would corrupt the generated NGINX config"
-                );
-            }
-            if value.chars().count() > 200 {
-                anyhow::bail!("the payment {name} is too long (max 200 characters)");
-            }
-        }
-        self.set_text_setting("payment_price", price.trim())?;
-        self.set_text_setting("payment_contact", contact.trim())?;
-        Ok(())
     }
 
     pub fn set_block_response(&self, response: BlockResponse) -> Result<()> {
@@ -3730,9 +3673,9 @@ mod tests {
     #[test]
     fn an_unrecognised_stored_response_falls_back_to_403() {
         // A value written by a newer build must not break an older one.
-        // Deliberately a code this build has no variant for — an earlier
-        // version of this test used "418" and started failing the moment
-        // that became a real option, which is the check working.
+        // "402" is here on purpose: it was briefly a real option, so a
+        // database written during that window must still open cleanly.
+        assert_eq!(BlockResponse::from_stored("402"), BlockResponse::Forbidden);
         assert_eq!(BlockResponse::from_stored("451"), BlockResponse::Forbidden);
         assert_eq!(
             BlockResponse::from_stored("banana"),

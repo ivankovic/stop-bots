@@ -104,11 +104,6 @@ fn setting_options(setting: NginxSetting) -> (&'static str, Vec<String>) {
         // one interaction pattern (pick one of N) and a numeric entry
         // field would be the only exception to it. The CLI takes any
         // value for anyone who needs one off this list.
-        // Text settings are edited in their own popup and never reach
-        // here; kept explicit rather than a `_` arm so a new setting is a
-        // compile error.
-        NginxSetting::PaymentPrice => ("Price for automated access", Vec::new()),
-        NginxSetting::PaymentContact => ("Where to arrange access", Vec::new()),
         NginxSetting::RateLimit => (
             "Rate limit per client address",
             [
@@ -159,48 +154,20 @@ enum NginxSetting {
     RobotsTxt,
     /// Whether NGINX rate-limits requests per client address.
     RateLimit,
-    /// The price advertised in a 402 body. Only listed when the response
-    /// is actually 402 — see [`NginxSetting::for_response`].
-    PaymentPrice,
-    /// Where to arrange access, advertised in the same 402 body.
-    PaymentContact,
 }
 
 impl NginxSetting {
-    /// The rows shown for `response`.
-    ///
-    /// The two payment rows appear only when the response is 402: they
-    /// are meaningless otherwise, and a permanently-greyed pair of rows
-    /// for a setting most installs never touch is worse than none.
-    fn for_response(response: BlockResponse) -> Vec<NginxSetting> {
-        let mut rows = vec![
-            NginxSetting::Response,
-            NginxSetting::RobotsTxt,
-            NginxSetting::RateLimit,
-        ];
-        if response == BlockResponse::PaymentRequired {
-            rows.push(NginxSetting::PaymentPrice);
-            rows.push(NginxSetting::PaymentContact);
-        }
-        rows
-    }
-
-    /// Whether this setting is edited as free text rather than picked
-    /// from a list.
-    fn is_text(self) -> bool {
-        matches!(
-            self,
-            NginxSetting::PaymentPrice | NginxSetting::PaymentContact
-        )
-    }
+    const ALL: [NginxSetting; 3] = [
+        NginxSetting::Response,
+        NginxSetting::RobotsTxt,
+        NginxSetting::RateLimit,
+    ];
 
     fn label(self) -> &'static str {
         match self {
             NginxSetting::Response => "Block response",
             NginxSetting::RobotsTxt => "robots.txt",
             NginxSetting::RateLimit => "Rate limit",
-            NginxSetting::PaymentPrice => "402 price",
-            NginxSetting::PaymentContact => "402 contact",
         }
     }
 }
@@ -223,13 +190,7 @@ enum Focus {
 #[derive(Debug, Clone)]
 struct SettingPopup {
     setting: NginxSetting,
-    /// Index into `setting_options`, for the list-style settings.
     selected: usize,
-    /// The value being typed, for the free-text ones. Carries the last
-    /// validation error alongside it, same shape as Site detail's
-    /// add-exempt-path popup.
-    input: String,
-    error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -250,8 +211,6 @@ pub struct SiteSettings {
     settings_state: ListState,
     setting_popup: Option<SettingPopup>,
     block_response: BlockResponse,
-    payment_price: String,
-    payment_contact: String,
     serve_robots_txt: bool,
     rate_limit_enabled: bool,
     rate_limit_rps: i64,
@@ -272,8 +231,6 @@ impl SiteSettings {
             settings_state: ListState::default().with_selected(Some(0)),
             setting_popup: None,
             block_response: BlockResponse::default(),
-            payment_price: String::new(),
-            payment_contact: String::new(),
             serve_robots_txt: false,
             rate_limit_enabled: false,
             rate_limit_rps: 0,
@@ -283,8 +240,6 @@ impl SiteSettings {
 
     pub fn refresh(&mut self, db: &Db) -> Result<()> {
         self.block_response = db.get_block_response()?;
-        self.payment_price = db.get_payment_price()?;
-        self.payment_contact = db.get_payment_contact()?;
         self.serve_robots_txt = db.get_serve_robots_txt()?;
         self.rate_limit_enabled = db.get_rate_limit_enabled()?;
         self.rate_limit_rps = db.get_rate_limit_rps()?;
@@ -320,7 +275,7 @@ impl SiteSettings {
         // The settings panel is fixed-height (one row per setting plus the
         // border) so the sites list — the screen's real content — keeps
         // every remaining line.
-        let settings_height = self.settings_rows().len() as u16 + 2;
+        let settings_height = NginxSetting::ALL.len() as u16 + 2;
         let [settings_area, sites_area] =
             Layout::vertical([Constraint::Length(settings_height), Constraint::Min(0)]).areas(area);
         self.render_settings(frame, settings_area, theme);
@@ -382,8 +337,7 @@ impl SiteSettings {
         } else {
             "off".to_string()
         };
-        let rows = self.settings_rows();
-        let items: Vec<ListItem> = rows
+        let items: Vec<ListItem> = NginxSetting::ALL
             .iter()
             .map(|setting| {
                 let value = match setting {
@@ -396,20 +350,6 @@ impl SiteSettings {
                         }
                     }
                     NginxSetting::RateLimit => &rate_limit_label,
-                    NginxSetting::PaymentPrice => {
-                        if self.payment_price.is_empty() {
-                            "not set"
-                        } else {
-                            &self.payment_price
-                        }
-                    }
-                    NginxSetting::PaymentContact => {
-                        if self.payment_contact.is_empty() {
-                            "not set"
-                        } else {
-                            &self.payment_contact
-                        }
-                    }
                 };
                 ListItem::new(Line::from(vec![
                     format!("{:<18}", setting.label()).into(),
@@ -431,24 +371,6 @@ impl SiteSettings {
 
     fn render_setting_popup(&self, frame: &mut Frame, area: Rect, popup: &SettingPopup) {
         let (title, options) = setting_options(popup.setting);
-
-        if popup.setting.is_text() {
-            let hint = "Enter to save, Esc to cancel — leave empty to clear";
-            let mut lines = vec![
-                Line::from(format!("{}\u{2588}", popup.input)),
-                Line::from(hint).dim(),
-            ];
-            if let Some(error) = &popup.error {
-                lines.push(Line::from(error.as_str()).red());
-            }
-            let width = hint.len().max(title.len()).max(popup.input.len()) as u16 + 4;
-            let popup_area = centered_rect(width, lines.len() as u16 + 2, area);
-            let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
-            frame.render_widget(Clear, popup_area);
-            frame.render_widget(paragraph, popup_area);
-            return;
-        }
-
         let content_width = options
             .iter()
             .map(|o| o.len())
@@ -657,50 +579,6 @@ impl SiteSettings {
         let Some(popup) = &mut self.setting_popup else {
             unreachable!("dispatched on this popup")
         };
-
-        // Text entry owns every printable key, so it's handled before the
-        // option-list branch — otherwise a `j` in a price would move a
-        // selection instead of being typed.
-        if popup.setting.is_text() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.setting_popup = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Backspace => {
-                    popup.input.pop();
-                    popup.error = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Char(c) => {
-                    popup.input.push(c);
-                    popup.error = None;
-                    return Ok(KeyOutcome::Consumed);
-                }
-                KeyCode::Enter => {
-                    let setting = popup.setting;
-                    let value = popup.input.trim().to_string();
-                    let (price, contact) = match setting {
-                        NginxSetting::PaymentPrice => (value, self.payment_contact.clone()),
-                        _ => (self.payment_price.clone(), value),
-                    };
-                    // Validation lives on `Db::set_payment_terms`, so the
-                    // CLI and the TUI reject exactly the same values. The
-                    // popup stays open with the reason shown.
-                    if let Err(err) = db.set_payment_terms(&price, &contact) {
-                        popup.error = Some(err.to_string());
-                        return Ok(KeyOutcome::Consumed);
-                    }
-                    self.setting_popup = None;
-                    *message = Some(format!(
-                        "{} saved — apply (a/A) to write it into the site configs",
-                        setting.label()
-                    ));
-                    return Ok(KeyOutcome::Mutated);
-                }
-                _ => return Ok(KeyOutcome::Consumed),
-            }
-        }
         let option_count = setting_options(popup.setting).1.len();
         match key.code {
             KeyCode::Esc => {
@@ -737,7 +615,7 @@ impl SiteSettings {
                 KeyOutcome::Consumed
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.settings_state.selected().unwrap_or(0) + 1 < self.settings_rows().len() {
+                if self.settings_state.selected().unwrap_or(0) + 1 < NginxSetting::ALL.len() {
                     self.settings_state.select_next();
                 }
                 KeyOutcome::Consumed
@@ -805,41 +683,20 @@ impl SiteSettings {
     /// Opens the edit popup for the focused NGINX setting, pre-selecting
     /// whatever that setting is currently set to — so confirming without
     /// moving is a no-op rather than a silent change to the first option.
-    /// The settings rows currently shown, which depend on the chosen
-    /// response — see [`NginxSetting::for_response`].
-    fn settings_rows(&self) -> Vec<NginxSetting> {
-        NginxSetting::for_response(self.block_response)
-    }
-
     fn open_setting_popup(&mut self) {
         let Some(setting) = self
             .settings_state
             .selected()
-            .and_then(|i| self.settings_rows().get(i).copied())
+            .and_then(|i| NginxSetting::ALL.get(i).copied())
         else {
             return;
         };
-        if setting.is_text() {
-            let input = match setting {
-                NginxSetting::PaymentPrice => self.payment_price.clone(),
-                _ => self.payment_contact.clone(),
-            };
-            self.setting_popup = Some(SettingPopup {
-                setting,
-                selected: 0,
-                input,
-                error: None,
-            });
-            return;
-        }
         let selected = match setting {
             NginxSetting::Response => BlockResponse::ALL
                 .iter()
                 .position(|r| *r == self.block_response)
                 .unwrap_or(0),
             NginxSetting::RobotsTxt => usize::from(self.serve_robots_txt),
-            // Text settings returned above.
-            NginxSetting::PaymentPrice | NginxSetting::PaymentContact => 0,
             NginxSetting::RateLimit => {
                 if !self.rate_limit_enabled {
                     0
@@ -862,12 +719,7 @@ impl SiteSettings {
                 }
             }
         };
-        self.setting_popup = Some(SettingPopup {
-            setting,
-            selected,
-            input: String::new(),
-            error: None,
-        });
+        self.setting_popup = Some(SettingPopup { setting, selected });
     }
 
     /// Persists a confirmed setting popup and reports what changed. The
@@ -920,9 +772,6 @@ impl SiteSettings {
                         ));
                     }
                 }
-            }
-            NginxSetting::PaymentPrice | NginxSetting::PaymentContact => {
-                unreachable!("text settings are committed in handle_setting_popup_key")
             }
             NginxSetting::RobotsTxt => {
                 let serve = popup.selected == 1;
@@ -1952,154 +1801,5 @@ mod tests {
 
         assert!(screen.setting_popup.is_none());
         assert_eq!(db.get_block_response().unwrap(), BlockResponse::Close);
-    }
-
-    // ---- 402 payment terms ----
-
-    fn open_payment_row(screen: &mut SiteSettings, db: &Db, setting: NginxSetting) {
-        let mut message = None;
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Tab), db, &mut message)
-            .unwrap();
-        let target = screen
-            .settings_rows()
-            .iter()
-            .position(|s| *s == setting)
-            .expect("row should be shown");
-        screen.settings_state.select(Some(target));
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), db, &mut message)
-            .unwrap();
-    }
-
-    fn type_into(screen: &mut SiteSettings, db: &Db, text: &str) {
-        let mut message = None;
-        for c in text.chars() {
-            screen
-                .handle_key(KeyEvent::from(KeyCode::Char(c)), db, &mut message)
-                .unwrap();
-        }
-    }
-
-    /// The payment rows are meaningless for any other response, so they
-    /// only appear once 402 is chosen.
-    #[test]
-    fn the_payment_rows_appear_only_for_the_402_response() {
-        let db = Db::open_in_memory().unwrap();
-        let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
-        assert!(!screen.settings_rows().contains(&NginxSetting::PaymentPrice));
-
-        db.set_block_response(BlockResponse::PaymentRequired)
-            .unwrap();
-        screen.refresh(&db).unwrap();
-        assert!(screen.settings_rows().contains(&NginxSetting::PaymentPrice));
-        assert!(screen
-            .settings_rows()
-            .contains(&NginxSetting::PaymentContact));
-    }
-
-    #[test]
-    fn typing_a_price_stores_it() {
-        let db = Db::open_in_memory().unwrap();
-        db.set_block_response(BlockResponse::PaymentRequired)
-            .unwrap();
-        let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
-
-        open_payment_row(&mut screen, &db, NginxSetting::PaymentPrice);
-        type_into(&mut screen, &db, "USD 0.01 per request");
-        let mut message = None;
-        let outcome = screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
-
-        assert_eq!(outcome, KeyOutcome::Mutated);
-        assert_eq!(db.get_payment_price().unwrap(), "USD 0.01 per request");
-        assert!(message.unwrap().contains("apply"));
-    }
-
-    /// The popup opens on the stored value, so editing doesn't mean
-    /// retyping it.
-    #[test]
-    fn the_payment_popup_opens_on_the_current_value() {
-        let db = Db::open_in_memory().unwrap();
-        db.set_block_response(BlockResponse::PaymentRequired)
-            .unwrap();
-        db.set_payment_terms("EUR 500/month", "").unwrap();
-        let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
-
-        open_payment_row(&mut screen, &db, NginxSetting::PaymentPrice);
-        assert_eq!(
-            screen.setting_popup.as_ref().unwrap().input,
-            "EUR 500/month"
-        );
-    }
-
-    /// Same validation as the CLI, because both go through
-    /// `Db::set_payment_terms` — and the popup stays open with the reason
-    /// rather than silently discarding what was typed.
-    #[test]
-    fn a_price_that_would_corrupt_the_config_is_refused_in_place() {
-        let db = Db::open_in_memory().unwrap();
-        db.set_block_response(BlockResponse::PaymentRequired)
-            .unwrap();
-        let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
-
-        open_payment_row(&mut screen, &db, NginxSetting::PaymentPrice);
-        type_into(&mut screen, &db, "USD \"cheap\"");
-        let mut message = None;
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
-
-        assert!(db.get_payment_price().unwrap().is_empty());
-        let popup = screen
-            .setting_popup
-            .as_ref()
-            .expect("popup should stay open");
-        assert!(popup.error.as_ref().unwrap().contains("double quote"));
-    }
-
-    /// `j`/`k` are ordinary characters in a price.
-    #[test]
-    fn typing_j_into_a_price_does_not_navigate() {
-        let db = Db::open_in_memory().unwrap();
-        db.set_block_response(BlockResponse::PaymentRequired)
-            .unwrap();
-        let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
-
-        open_payment_row(&mut screen, &db, NginxSetting::PaymentContact);
-        type_into(&mut screen, &db, "jk@example.test");
-        assert_eq!(
-            screen.setting_popup.as_ref().unwrap().input,
-            "jk@example.test"
-        );
-    }
-
-    #[test]
-    fn clearing_a_price_is_saving_an_empty_one() {
-        let db = Db::open_in_memory().unwrap();
-        db.set_block_response(BlockResponse::PaymentRequired)
-            .unwrap();
-        db.set_payment_terms("USD 1", "").unwrap();
-        let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
-
-        open_payment_row(&mut screen, &db, NginxSetting::PaymentPrice);
-        let mut message = None;
-        for _ in 0.."USD 1".len() {
-            screen
-                .handle_key(KeyEvent::from(KeyCode::Backspace), &db, &mut message)
-                .unwrap();
-        }
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
-
-        assert!(db.get_payment_price().unwrap().is_empty());
     }
 }
