@@ -343,6 +343,37 @@ pub fn known_crawler_match(ranges: &[String], ip: &str) -> bool {
         .any(|cidr| ipranges::cidr_contains(cidr, addr))
 }
 
+/// The address a detector should actually block, given the address it
+/// observed.
+///
+/// **IPv4 is returned unchanged. IPv6 is widened to its `/64`.**
+///
+/// This is a correctness fix rather than a policy choice. The smallest
+/// IPv6 allocation anyone receives is a `/64` — that is the standard
+/// subnet for one LAN, one household, one mobile subscriber — so blocking
+/// the single `/128` we happened to see is the equivalent of blocking one
+/// TCP source port. An attacker holding a `/64` has 2^64 addresses to
+/// rotate through and would cost one firewall rule per request while never
+/// actually being blocked.
+///
+/// A `/64` is therefore the IPv6 counterpart of a single IPv4 address, not
+/// an escalation: both block roughly "one customer". Widening further (to
+/// the `/56` or `/48` a site may hold) *would* be an escalation, and is
+/// deliberately not done here.
+///
+/// An unparseable address is passed through untouched — this runs on
+/// strings that already came from a parsed log, and a detector should not
+/// silently drop a candidate because this helper didn't recognise it.
+pub fn blockable_address(observed: &str) -> String {
+    let Ok(std::net::IpAddr::V6(v6)) = observed.parse::<std::net::IpAddr>() else {
+        return observed.to_string();
+    };
+    let mut octets = v6.octets();
+    // Zero the host half (the low 64 bits); the network half is the /64.
+    octets[8..].fill(0);
+    format!("{}/64", std::net::Ipv6Addr::from(octets))
+}
+
 /// Adds a Block rule, expiring after `ttl_days`, for each of `kept` not
 /// already covered by an existing firewall rule of the same exact address.
 /// The existence check reads through [`Db::list_firewall_rules`], which
@@ -363,7 +394,13 @@ fn add_block_rules(
     ttl_days: i64,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
-    let existing: HashSet<String> = db
+    // Seeded from what's already stored, then *added to as we go*. The
+    // second part matters more than it used to: before IPv6 widening, two
+    // candidates were only ever equal if the same address appeared twice
+    // in the input (already deduped upstream). Now two different addresses
+    // can collapse onto one /64, so a pass can produce a duplicate of its
+    // own making unless it remembers what it just added.
+    let mut existing: HashSet<String> = db
         .list_firewall_rules()?
         .into_iter()
         .map(|rule| rule.address)
@@ -372,7 +409,17 @@ fn add_block_rules(
     let ttl_seconds = ttl_days * 24 * 60 * 60;
     let mut newly_blocked = Vec::new();
     let mut already_covered = 0;
-    for ip in kept {
+    for observed in kept {
+        // What gets stored is not always what was seen: an IPv6 address is
+        // widened to its /64 (see `blockable_address`). Dedup happens on
+        // the stored form, so a second address in the same /64 correctly
+        // counts as already covered rather than adding a duplicate rule.
+        //
+        // One wrinkle on upgrade: a /128 row written before this change
+        // won't match the /64 now computed for the same address, so both
+        // can briefly exist. Harmless — the /128 is inside the /64, and it
+        // expires on its own TTL.
+        let ip = blockable_address(&observed);
         if existing.contains(&ip) {
             already_covered += 1;
             continue;
@@ -387,6 +434,7 @@ fn add_block_rules(
                 ttl_seconds,
             )?;
         }
+        existing.insert(ip.clone());
         newly_blocked.push(ip);
     }
 
@@ -783,5 +831,89 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let log = probe_line("203.0.113.9", crate::protection::HONEYPOT_PATH_DEFAULT);
         assert_eq!(block_probe_paths(&db, 5, &log, true).unwrap().candidates, 0);
+    }
+
+    // ---- IPv6 /64 aggregation ----
+
+    #[test]
+    fn ipv4_addresses_are_blocked_exactly_as_observed() {
+        assert_eq!(blockable_address("203.0.113.9"), "203.0.113.9");
+    }
+
+    #[test]
+    fn ipv6_addresses_are_widened_to_their_64() {
+        assert_eq!(
+            blockable_address("2001:db8:1:2:aaaa:bbbb:cccc:dddd"),
+            "2001:db8:1:2::/64"
+        );
+        assert_eq!(blockable_address("::1"), "::/64");
+    }
+
+    #[test]
+    fn an_unparseable_address_passes_through_untouched() {
+        // A detector must not silently lose a candidate because this
+        // helper didn't recognise the string.
+        assert_eq!(blockable_address("not-an-address"), "not-an-address");
+        assert_eq!(blockable_address("1.2.3.0/24"), "1.2.3.0/24");
+    }
+
+    /// The point of the whole change: two different addresses in one /64
+    /// are one block, not two — otherwise an attacker holding a /64 costs
+    /// a firewall rule per request and is never actually stopped.
+    #[test]
+    fn two_addresses_in_one_ipv6_subnet_produce_a_single_block() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("2001:db8:1:2::1", "/.env") + &probe_line("2001:db8:1:2::2", "/.env");
+
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, vec!["2001:db8:1:2::/64".to_string()]);
+        assert_eq!(outcome.already_covered, 1);
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1, "rules were: {rules:?}");
+        assert_eq!(rules[0].address, "2001:db8:1:2::/64");
+    }
+
+    #[test]
+    fn addresses_in_different_ipv6_subnets_are_blocked_separately() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("2001:db8:1:2::1", "/.env") + &probe_line("2001:db8:1:3::1", "/.env");
+
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(
+            outcome.newly_blocked.len(),
+            2,
+            "{:?}",
+            outcome.newly_blocked
+        );
+    }
+
+    /// A /64 block covers far more than the address that was seen, so the
+    /// lockout guard has to notice when the admin's own IPv6 session is
+    /// inside it. This is the case where the widening could plausibly lock
+    /// someone out, and the existing guard is what prevents it.
+    #[test]
+    fn the_lockout_check_sees_an_admin_inside_a_blocked_ipv6_64() {
+        let rules = vec![crate::db::FirewallRule {
+            id: 0,
+            address: blockable_address("2001:db8:1:2::99"),
+            port: None,
+            action: FirewallAction::Block,
+            enabled: true,
+            expires_at: None,
+        }];
+        let connected = vec!["2001:db8:1:2::5".to_string()];
+
+        let risks = crate::firewall::lockout_risks(&rules, &connected);
+
+        assert_eq!(
+            risks,
+            vec![(
+                "2001:db8:1:2::5".to_string(),
+                "2001:db8:1:2::/64".to_string()
+            )],
+            "an admin connected from inside the blocked /64 must be flagged"
+        );
     }
 }
