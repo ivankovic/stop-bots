@@ -9,6 +9,11 @@ need.
 
 ### Added
 
+- Six choices for what a blocked request gets back, rather than two: `403`, `404`, `410`
+  (asks crawlers to drop the URL permanently), `429`, `444` (close without replying), or a
+  tarpit that answers 403 with the body throttled to a byte per second. Each option states
+  what it is for in the chooser. Existing `403`/`444` settings are unchanged.
+
 - Six per-site request-shape rules (Site settings → open a site → Request rules), each its
   own toggle and each off by default: reject HTTP/1.0-1.1, a missing `Accept`, a missing
   `Accept-Language`, an empty `User-Agent`, a bare-IP `Host`, or TLS 1.0/1.1. The two

@@ -486,12 +486,20 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
-    /// Sets what NGINX does with a request whose user agent matched the
-    /// blocking rule: "forbidden" (`return 403;`, the default) or "close"
-    /// (`return 444;`, NGINX's non-standard close-without-responding —
-    /// cheaper, and gives a scanner no status code to adapt to, at the cost
-    /// of being indistinguishable from the server being down for anything
-    /// caught by mistake).
+    /// Sets what NGINX does with a request the blocking rules caught.
+    ///
+    /// These are not interchangeable status codes; each says something
+    /// different, and the difference matters most for clients caught by
+    /// mistake. "forbidden" (403, the default) is the only one that tells
+    /// a wrongly-caught human what happened. "not-found" (404) hides that
+    /// anything was blocked. "gone" (410) is the one that asks a
+    /// well-behaved crawler to drop the URL permanently — prefer it over
+    /// 403 when you're turning away crawlers rather than attackers.
+    /// "too-many-requests" (429) tells a polite client to retry later.
+    /// "close" (444) sends nothing at all, which is cheapest but
+    /// indistinguishable from the server being down. "tarpit" answers 403
+    /// but throttles the body to a byte per second, holding the client's
+    /// connection open — and one of yours.
     ///
     /// Host-wide, and only changes what *would* be written: run ApplyBlocks
     /// afterwards to get the new response code into the site configs. Until
@@ -552,15 +560,30 @@ impl From<GeoModeArg> for stop_bots::db::GeoMode {
 /// support.
 #[derive(Clone, Copy, ValueEnum)]
 enum BlockResponseArg {
+    /// 403 — says the block was deliberate
     Forbidden,
+    /// 404 — hides that anything was blocked
+    NotFound,
+    /// 410 — asks well-behaved crawlers to drop the URL for good
+    Gone,
+    /// 429 — tells a polite client to back off and retry
+    TooManyRequests,
+    /// 444 — close without replying at all
     Close,
+    /// A 403 whose body is throttled to one byte per second
+    Tarpit,
 }
 
 impl From<BlockResponseArg> for stop_bots::db::BlockResponse {
     fn from(arg: BlockResponseArg) -> Self {
+        use stop_bots::db::BlockResponse as R;
         match arg {
-            BlockResponseArg::Forbidden => stop_bots::db::BlockResponse::Forbidden,
-            BlockResponseArg::Close => stop_bots::db::BlockResponse::Close,
+            BlockResponseArg::Forbidden => R::Forbidden,
+            BlockResponseArg::NotFound => R::NotFound,
+            BlockResponseArg::Gone => R::Gone,
+            BlockResponseArg::TooManyRequests => R::TooManyRequests,
+            BlockResponseArg::Close => R::Close,
+            BlockResponseArg::Tarpit => R::Tarpit,
         }
     }
 }

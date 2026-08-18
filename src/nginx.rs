@@ -788,12 +788,26 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     if uses_flag {
         out.push_str("    set $stop_bots_block 0;\n");
     }
+    // Tarpit is a normal rejection whose body is throttled to a crawl:
+    // `$limit_rate` is a writable NGINX variable, and one byte per second
+    // turns the few hundred bytes of a default error page into minutes of
+    // held connection. Chosen over the `limit_req`-without-`nodelay`
+    // idiom deliberately — that one needs an http-context `map` over
+    // `$stop_bots_block`, and if the variable is ever undefined NGINX
+    // refuses to start. This fails the other way: if a small body turns
+    // out not to be throttled, the client simply gets an ordinary 403.
+    let throttle = if config.response.is_tarpit() {
+        "set $limit_rate 1;\n        "
+    } else {
+        ""
+    };
+
     // The tail shared by every blocker's `if`: set the flag, or return
     // directly when there's only one reason and nothing to exempt.
     let set_blocked = if uses_flag {
         "set $stop_bots_block 1;\n    }\n".to_string()
     } else {
-        format!("return {code};\n    }}\n")
+        format!("{throttle}return {code};\n    }}\n")
     };
 
     if let Some(pattern) = &pattern {
@@ -816,7 +830,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     }
     if uses_flag {
         out.push_str(&format!(
-            "    if ($stop_bots_block) {{\n        return {code};\n    }}\n"
+            "    if ($stop_bots_block) {{\n        {throttle}return {code};\n    }}\n"
         ));
     }
 
@@ -2570,6 +2584,110 @@ mod tests {
         crate::golden::assert_golden(
             "nginx-block-request-rules.conf",
             &block_text(&config).unwrap(),
+        );
+    }
+
+    // ---- block responses ----
+
+    fn cfg_response(response: BlockResponse) -> BlockConfig {
+        BlockConfig {
+            response,
+            ..cfg(&["BadBot"])
+        }
+    }
+
+    #[test]
+    fn every_response_renders_its_own_status_code() {
+        for response in BlockResponse::ALL {
+            let text = block_text(&cfg_response(response)).unwrap();
+            assert!(
+                text.contains(&format!("return {};", response.status_code())),
+                "{} should return {}; text was:\n{text}",
+                response.label(),
+                response.status_code()
+            );
+        }
+    }
+
+    /// Every option needs to say what it is *for*, or the chooser reads as
+    /// five interchangeable numbers.
+    #[test]
+    fn every_response_explains_itself() {
+        for response in BlockResponse::ALL {
+            assert!(!response.rationale().is_empty(), "{:?}", response);
+            assert!(!response.label().is_empty(), "{:?}", response);
+        }
+    }
+
+    #[test]
+    fn only_tarpit_throttles_the_response_body() {
+        for response in BlockResponse::ALL {
+            let text = block_text(&cfg_response(response)).unwrap();
+            let throttled = text.contains("set $limit_rate 1;");
+            assert_eq!(
+                throttled,
+                response.is_tarpit(),
+                "{} throttling should be {}; text was:\n{text}",
+                response.label(),
+                response.is_tarpit()
+            );
+        }
+    }
+
+    /// The throttle has to land inside the same `if` as the return, in
+    /// both block shapes — `$limit_rate` set anywhere else would apply to
+    /// every visitor.
+    #[test]
+    fn the_tarpit_throttle_sits_with_the_return_in_both_block_shapes() {
+        // Direct form: no exemptions, one reason.
+        let direct = block_text(&cfg_response(BlockResponse::Tarpit)).unwrap();
+        assert!(
+            direct.contains("set $limit_rate 1;\n        return 403;"),
+            "direct form was:\n{direct}"
+        );
+
+        // Flag form: an exemption forces it.
+        let flagged = block_text(&BlockConfig {
+            response: BlockResponse::Tarpit,
+            exempt_paths: vec!["/blog".to_string()],
+            ..cfg(&["BadBot"])
+        })
+        .unwrap();
+        assert!(
+            flagged.contains(
+                "if ($stop_bots_block) {\n        set $limit_rate 1;\n        return 403;"
+            ),
+            "flag form was:\n{flagged}"
+        );
+        assert_eq!(
+            flagged.matches("set $limit_rate").count(),
+            1,
+            "throttling must apply once, to blocked requests only; was:\n{flagged}"
+        );
+    }
+
+    #[test]
+    fn changing_the_response_makes_an_applied_site_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+        apply_block_for_site(&path, "a.example", &cfg_response(BlockResponse::Gone)).unwrap();
+
+        assert_eq!(
+            site_apply_status(&path, "a.example", &cfg_response(BlockResponse::Gone)),
+            SiteApplyStatus::UpToDate
+        );
+        assert_eq!(
+            site_apply_status(&path, "a.example", &cfg_response(BlockResponse::Tarpit)),
+            SiteApplyStatus::Stale
+        );
+    }
+
+    #[test]
+    fn tarpit_matches_the_golden() {
+        crate::golden::assert_golden(
+            "nginx-block-tarpit.conf",
+            &block_text(&cfg_response(BlockResponse::Tarpit)).unwrap(),
         );
     }
 }

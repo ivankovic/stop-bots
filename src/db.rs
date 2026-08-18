@@ -158,62 +158,143 @@ impl GeoMode {
 }
 
 /// What NGINX should do with a request whose user agent matched the
-/// sentinel block's pattern — the right-hand side of the generated
-/// `if ($http_user_agent ~* "...") { ... }` (see `nginx::block_text`).
+/// sentinel block's pattern, or that one of the request-shape rules
+/// caught — the body of the generated `if`.
+///
 /// Host-wide rather than per-site: it's a house style ("how do we turn
-/// bots away"), not a per-site policy decision, and every existing
-/// per-site knob is about *which* bots are blocked rather than *how*.
+/// bots away"), not a per-site policy decision, and every per-site knob is
+/// about *which* requests are blocked rather than *how*.
+///
+/// The options are not five numbers to pick between; each says something
+/// different to the client, and the difference matters most for the
+/// clients you *didn't* mean to catch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BlockResponse {
-    /// `return 403;` — a normal HTTP "Forbidden" response. The default,
-    /// and what every config this project has ever written used before
-    /// this setting existed, so an existing install's generated blocks
-    /// don't change shape on upgrade.
+    /// `403` — "I can see who you are, and no." The default, and what
+    /// every config this project has ever written used before this
+    /// setting existed, so an existing install's blocks don't change
+    /// shape on upgrade. The only option that tells a wrongly-caught
+    /// human what happened.
     #[default]
     Forbidden,
-    /// `return 444;` — NGINX's non-standard "close the connection without
-    /// any response at all". Cheaper (no response is generated or sent)
-    /// and gives a scanner no status code to adapt its probing to. The
-    /// trade-off is that it's indistinguishable from the server being
-    /// down, so a *legitimate* client caught by an over-broad pattern gets
-    /// no way to tell it was blocked on purpose — which is why 403 stays
-    /// the default.
+    /// `404` — pretend the resource isn't there. Gives a scanner nothing
+    /// to distinguish "blocked" from "doesn't exist", so it can't tell it
+    /// has been noticed and has nothing to adapt to.
+    NotFound,
+    /// `410` — "gone, permanently". The one option that asks a
+    /// well-behaved crawler to *stop coming back*: unlike 403 or 404, a
+    /// 410 is a signal to drop the URL from an index for good. Worth
+    /// preferring over 403 when the traffic you're turning away is
+    /// crawlers rather than attackers.
+    Gone,
+    /// `429` — "too many requests". Tells a well-behaved client to back
+    /// off and retry later rather than that it is unwelcome, which is the
+    /// honest answer when the rule that caught it was about volume.
+    TooManyRequests,
+    /// `444` — NGINX's non-standard "close the connection without any
+    /// response at all". Cheapest (nothing is generated or sent) and
+    /// gives a scanner no status code whatsoever. The trade-off is that
+    /// it's indistinguishable from the server being down, so a legitimate
+    /// client caught by an over-broad rule has no way to tell it was
+    /// deliberate.
     Close,
+    /// Hold the connection open instead of answering quickly: a `403`
+    /// whose response body is throttled to one byte per second, so the
+    /// client waits rather than being freed to make its next request.
+    ///
+    /// The point is cost asymmetry — a blocked client's connection slot is
+    /// occupied for the duration while ours costs almost nothing — and it
+    /// is the *gentlest* option for a false positive, since a wrongly
+    /// caught client is slowed rather than refused.
+    ///
+    /// Two honest caveats. It holds one of *your* worker connections too,
+    /// so a flood of tarpitted clients competes with real ones for
+    /// `worker_connections`. And how long it actually lasts depends on how
+    /// NGINX chooses to write a small error body; see SPECS.md.
+    Tarpit,
 }
 
 impl BlockResponse {
-    fn as_str(self) -> &'static str {
+    /// Every option, in the order the TUI lists them: increasing
+    /// unhelpfulness to the client.
+    pub const ALL: [BlockResponse; 6] = [
+        BlockResponse::Forbidden,
+        BlockResponse::NotFound,
+        BlockResponse::Gone,
+        BlockResponse::TooManyRequests,
+        BlockResponse::Close,
+        BlockResponse::Tarpit,
+    ];
+
+    /// Stored form. The two original values are unchanged so an existing
+    /// database keeps its setting.
+    ///
+    /// Named `stored`/`from_stored` rather than `as_str`/`from_str`: this
+    /// is a database representation, not a display one, and `from_str` on
+    /// an inherent impl reads as `std::str::FromStr` when it isn't.
+    pub fn stored(self) -> &'static str {
         match self {
             BlockResponse::Forbidden => "403",
+            BlockResponse::NotFound => "404",
+            BlockResponse::Gone => "410",
+            BlockResponse::TooManyRequests => "429",
             BlockResponse::Close => "444",
+            BlockResponse::Tarpit => "tarpit",
         }
     }
 
     /// Falls back to `Forbidden` for any unrecognized value, same
     /// never-fail-a-read-over-a-stored-enum convention [`GeoMode::from_str`]
     /// uses — the column is only ever written by [`Self::as_str`].
-    fn from_str(s: &str) -> Self {
-        match s {
-            "444" => BlockResponse::Close,
-            _ => BlockResponse::Forbidden,
-        }
+    pub fn from_stored(s: &str) -> Self {
+        BlockResponse::ALL
+            .into_iter()
+            .find(|r| r.stored() == s)
+            .unwrap_or(BlockResponse::Forbidden)
     }
 
-    /// The NGINX status code this renders as.
+    /// The NGINX status code this renders as. Tarpit is a 403 that is
+    /// merely slow to arrive.
     pub fn status_code(self) -> u16 {
         match self {
-            BlockResponse::Forbidden => 403,
+            BlockResponse::Forbidden | BlockResponse::Tarpit => 403,
+            BlockResponse::NotFound => 404,
+            BlockResponse::Gone => 410,
+            BlockResponse::TooManyRequests => 429,
             BlockResponse::Close => 444,
         }
     }
 
-    /// A short label for the TUI, spelling out what the code actually does
-    /// — "444" alone is meaningless to anyone who hasn't memorised NGINX's
-    /// non-standard codes.
+    /// Whether the response body should be throttled to a crawl.
+    pub fn is_tarpit(self) -> bool {
+        matches!(self, BlockResponse::Tarpit)
+    }
+
+    /// A short label for the TUI. Spelled out rather than left as a
+    /// number — "444" means nothing to anyone who hasn't memorised
+    /// NGINX's non-standard codes, and "410" reads as an arbitrary
+    /// alternative to 403 unless you're told what it's *for*.
     pub fn label(self) -> &'static str {
         match self {
             BlockResponse::Forbidden => "403 Forbidden",
+            BlockResponse::NotFound => "404 Not Found",
+            BlockResponse::Gone => "410 Gone",
+            BlockResponse::TooManyRequests => "429 Too Many Requests",
             BlockResponse::Close => "444 close connection",
+            BlockResponse::Tarpit => "Tarpit (slow 403)",
+        }
+    }
+
+    /// One line on what this option is *for*, shown beside it in the
+    /// chooser. Without it the list reads as five interchangeable numbers.
+    pub fn rationale(self) -> &'static str {
+        match self {
+            BlockResponse::Forbidden => "says it was deliberate; a caught human can tell",
+            BlockResponse::NotFound => "hides that anything was blocked at all",
+            BlockResponse::Gone => "asks well-behaved crawlers to drop the URL for good",
+            BlockResponse::TooManyRequests => "tells a polite client to back off and retry",
+            BlockResponse::Close => "no reply at all; looks like the server is down",
+            BlockResponse::Tarpit => "holds their connection open — and one of yours",
         }
     }
 }
@@ -1070,7 +1151,7 @@ impl Db {
                 |row| row.get(0),
             )
             .optional()?;
-        Ok(value.map_or_else(BlockResponse::default, |v| BlockResponse::from_str(&v)))
+        Ok(value.map_or_else(BlockResponse::default, |v| BlockResponse::from_stored(&v)))
     }
 
     // ---- generic settings accessors ----
@@ -1288,7 +1369,7 @@ impl Db {
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES ('block_response', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![response.as_str()],
+            params![response.stored()],
         )?;
         Ok(())
     }
@@ -3556,5 +3637,30 @@ mod tests {
         let stats = db.list_user_agent_stats().unwrap();
         assert_eq!(stats[0].user_agent, "common-bot");
         assert_eq!(stats[1].user_agent, "rare-bot");
+    }
+
+    #[test]
+    fn every_block_response_round_trips_through_storage() {
+        for response in BlockResponse::ALL {
+            assert_eq!(BlockResponse::from_stored(response.stored()), response);
+        }
+    }
+
+    /// The two values that predate the wider set must keep meaning what
+    /// they meant, or an upgrade silently changes what an installed site
+    /// returns.
+    #[test]
+    fn the_original_stored_values_are_unchanged() {
+        assert_eq!(BlockResponse::from_stored("403"), BlockResponse::Forbidden);
+        assert_eq!(BlockResponse::from_stored("444"), BlockResponse::Close);
+        assert_eq!(BlockResponse::Forbidden.stored(), "403");
+        assert_eq!(BlockResponse::Close.stored(), "444");
+    }
+
+    #[test]
+    fn an_unrecognised_stored_response_falls_back_to_403() {
+        // A value written by a newer build must not break an older one.
+        assert_eq!(BlockResponse::from_stored("418"), BlockResponse::Forbidden);
+        assert_eq!(BlockResponse::from_stored(""), BlockResponse::Forbidden);
     }
 }

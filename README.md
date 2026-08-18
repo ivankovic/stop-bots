@@ -80,7 +80,7 @@ everything that ends up in **NGINX config**. That split decides where any given 
   individual bot, searchable by name, with a per-bot override (Allowed / Blocked / follow the
   category default).
 - **Site settings**: an "NGINX settings" panel (`Tab` to focus it) holding the host-wide
-  choices that shape generated config — the response for a blocked request (403 or 444),
+  choices that shape generated config — what a blocked request gets back (see below),
   whether to serve a generated `robots.txt`, and rate limiting — above every NGINX site
   discovered on disk, each with a live "up to date / stale / not found" status and actions to
   apply the current policy to one site or all of them. Changing any of those settings flips
@@ -103,9 +103,7 @@ everything that ends up in **NGINX config**. That split decides where any given 
   [ai.robots.txt](https://github.com/ai-robots-txt/ai.robots.txt) and the
   [NGINX Ultimate Bad Bot Blocker](https://github.com/mitchellkrogza/nginx-ultimate-bad-bot-blocker)
   list. Blocking a category injects an `if ($http_user_agent ...)` rule into each site's NGINX
-  config (`apply-blocks` / Site settings' `a`/`A`). You choose whether a match gets a `403` or
-  a `444` (close the connection without answering — cheaper, and gives a scanner no status
-  code to adapt to).
+  config (`apply-blocks` / Site settings' `a`/`A`).
 - **Too many requests**, via NGINX's own rate limiting. Unlike everything else here this is
   enforced by NGINX at request time rather than by analysing a log afterwards. Off by default:
   a limit tuned for the wrong site turns away real visitors.
@@ -136,6 +134,28 @@ everything that ends up in **NGINX config**. That split decides where any given 
   - `/.well-known/` is always exempt as soon as any rule is on. That's where Let's Encrypt
     fetches its HTTP-01 challenge, over HTTP/1.1 with no `Accept` and often no `User-Agent` —
     without the exemption your certificate stops renewing weeks later.
+
+### What a blocked request actually gets
+
+One host-wide choice, on Site settings. These aren't interchangeable status codes — each says
+something different, and the difference matters most for the clients you *didn't* mean to
+catch:
+
+| Option | What it's for |
+|---|---|
+| `403 Forbidden` (default) | says the block was deliberate; the only one a wrongly-caught human can act on |
+| `404 Not Found` | hides that anything was blocked at all |
+| `410 Gone` | asks well-behaved crawlers to drop the URL **for good** — prefer this over 403 when you're turning away crawlers rather than attackers |
+| `429 Too Many Requests` | tells a polite client to back off and retry |
+| `444 close connection` | no reply at all; cheapest, but indistinguishable from the server being down |
+| `Tarpit` | answers 403 but trickles the body at one byte per second, so the client waits instead of moving on |
+
+The tarpit is the gentlest option for a false positive — a wrongly caught client is slowed,
+not refused — and the harshest on cost for a bot, whose connection sits idle. Two things to
+know before choosing it: it holds one of *your* worker connections for the duration too, so
+a flood of tarpitted clients competes with real visitors for `worker_connections`; and how
+long it actually lasts depends on how NGINX chooses to write a small error body, which is
+noted in TODO.md as needing a check against a real server.
 
 ### From your logs, automatically
 

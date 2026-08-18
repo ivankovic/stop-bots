@@ -1046,6 +1046,45 @@ fn rejecting_http_1x_applies_only_to_the_tls_server_block() {
     );
 }
 
+/// Every block-response option end to end: each has to reach the config
+/// as its own status code, and tarpit has to bring its throttle with it.
+#[test]
+fn each_block_response_reaches_the_generated_config() {
+    let fx = Fixture::new();
+    let site = fx.write_site("a.example");
+    fx.seed_bots();
+    fx.scan_sites();
+
+    for (arg, expected) in [
+        ("forbidden", "return 403;"),
+        ("not-found", "return 404;"),
+        ("gone", "return 410;"),
+        ("too-many-requests", "return 429;"),
+        ("close", "return 444;"),
+    ] {
+        fx.run(&["set-block-response", "--response", arg]);
+        fx.apply_blocks();
+        let written = fs::read_to_string(&site).unwrap();
+        assert!(
+            written.contains(expected),
+            "{arg} should render {expected}; written was:\n{written}"
+        );
+        assert!(
+            !written.contains("set $limit_rate"),
+            "{arg} must not throttle; written was:\n{written}"
+        );
+    }
+
+    fx.run(&["set-block-response", "--response", "tarpit"]);
+    fx.apply_blocks();
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(
+        written.contains("set $limit_rate 1;"),
+        "written was:\n{written}"
+    );
+    assert!(written.contains("return 403;"), "written was:\n{written}");
+}
+
 #[test]
 fn firewall_add_list_render_remove_happy_path() {
     let tmp = tempfile::tempdir().unwrap();

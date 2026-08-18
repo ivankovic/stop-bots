@@ -2917,3 +2917,60 @@ existing-rules set once before its loop, so two addresses collapsing onto
 one `/64` both got inserted. It now tracks what the pass itself adds. That
 couldn't happen before — two distinct addresses were never equal — so the
 widening created it.
+
+## Choosing what a blocked request gets back
+
+`BlockResponse` went from two options to six: 403, 404, 410, 429, 444 and
+a tarpit. The stored values for the original two are unchanged (`"403"`,
+`"444"`) so an installed database keeps its setting, and there's a test
+pinning that — an upgrade silently changing what a live site returns would
+be a bad way to find out.
+
+**They are not five interchangeable numbers, and the UI says so.** Each
+carries a `rationale()` shown beside it in the chooser, and a test asserts
+none is empty. The distinctions that actually matter:
+
+- **403** is the only option that tells a wrongly-caught human what
+  happened. That is why it stays the default.
+- **410** is the only one that asks a well-behaved crawler to stop coming
+  back — it's a signal to drop the URL from an index permanently. For a
+  tool whose main quarry is crawlers, that makes it arguably the better
+  choice than 403 in many setups, which is worth saying out loud rather
+  than leaving buried in a status-code table.
+- **404** denies a scanner the signal that it was noticed.
+- **444** is cheapest and most opaque, at the cost of being
+  indistinguishable from an outage.
+
+### The tarpit, and why it's `$limit_rate` rather than `limit_req`
+
+Tarpit renders as a normal `return 403` preceded by
+`set $limit_rate 1;` inside the same `if`. `$limit_rate` is a writable
+NGINX variable, so a few hundred bytes of default error page becomes
+minutes of held connection. Cost asymmetry is the point: their connection
+slot is occupied, ours costs almost nothing.
+
+The obvious alternative was the standard nginx tarpit idiom —
+`limit_req` *without* `nodelay`, which queues rather than rejects. It was
+rejected for a specific reason: it needs an `http`-context `map` over
+`$stop_bots_block` to scope the limiter to matched requests only, and if
+that variable is ever undefined (any config where no `server` block emits
+our flag form) **NGINX refuses to start**. This project generates config
+onto machines it cannot test against, so between two approaches the one
+that fails harmless wins: if `$limit_rate` turns out not to throttle a
+body that small, the client simply gets an ordinary 403 and nothing
+breaks.
+
+That uncertainty is real and recorded in TODO.md rather than glossed: the
+dwell time has not been measured against a real server, and NGINX may
+write a small body in one go before the throttle engages.
+
+Two honest costs are stated in the UI and README rather than only here: a
+tarpitted client holds one of *our* worker connections too, so a flood of
+them competes with real visitors for `worker_connections`; and unlike
+every other option it is the *gentlest* outcome for a false positive,
+which cuts both ways.
+
+**Placement matters.** The throttle is emitted inside the same `if` as the
+`return`, in both block shapes, with a test asserting exactly that and
+that it appears once. `set $limit_rate` at server level would throttle
+every visitor on the site.

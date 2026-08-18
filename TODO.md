@@ -64,6 +64,15 @@ day.
 
 ### Loose ends from the work that shipped
 
+* **The tarpit's actual dwell time is unverified.** `set $limit_rate 1;` throttles the
+  response body, and a default error page is a few hundred bytes, so in principle a
+  tarpitted client waits minutes. How much NGINX writes before the throttle engages on a
+  body that small hasn't been measured — it may send the whole thing in the first write, in
+  which case the tarpit degrades to an ordinary 403. That is why this approach was chosen
+  over the `limit_req`-without-`nodelay` idiom, which needs an http-context `map` over
+  `$stop_bots_block` and refuses to start NGINX at all if the variable is undefined: this
+  one fails harmless. Worth timing `curl` against a tarpitted request on a real server, and
+  switching approach if it turns out not to bite.
 * **The generated NGINX and nftables syntax still needs one pass against the
   real parsers** — nginx and nft aren't installed in the development
   environment. What changed: `tests/golden/` now pins the exact bytes of every

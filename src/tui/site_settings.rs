@@ -80,18 +80,24 @@ const RATE_LIMIT_PRESETS: [(i64, i64); 3] = [(5, 10), (10, 20), (30, 60)];
 /// The popup title and its options, in the order [`SettingPopup::selected`]
 /// indexes them. One function so the renderer and the key handler can never
 /// disagree about how many options there are or what index means what.
-fn setting_options(setting: NginxSetting) -> (&'static str, Vec<&'static str>) {
+fn setting_options(setting: NginxSetting) -> (&'static str, Vec<String>) {
     match setting {
+        // Each option carries what it's *for*, not just its number: the
+        // list would otherwise read as five interchangeable status codes,
+        // and the difference matters most for clients caught by mistake.
         NginxSetting::Response => (
             "Response for blocked requests",
-            vec![
-                BlockResponse::Forbidden.label(),
-                BlockResponse::Close.label(),
-            ],
+            BlockResponse::ALL
+                .iter()
+                .map(|r| format!("{:<24} {}", r.label(), r.rationale()))
+                .collect(),
         ),
         NginxSetting::RobotsTxt => (
             "Serve a generated robots.txt",
-            vec!["Off — leave /robots.txt alone", "On — replace /robots.txt"],
+            vec![
+                "Off — leave /robots.txt alone".to_string(),
+                "On — replace /robots.txt".to_string(),
+            ],
         ),
         // Rates rather than a free-text number, for the same reason the
         // Dashboard's detector popup offers fixed TTLs: this screen has
@@ -100,12 +106,15 @@ fn setting_options(setting: NginxSetting) -> (&'static str, Vec<&'static str>) {
         // value for anyone who needs one off this list.
         NginxSetting::RateLimit => (
             "Rate limit per client address",
-            vec![
+            [
                 "Off",
                 "On — 5 req/s, burst 10",
                 "On — 10 req/s, burst 20",
                 "On — 30 req/s, burst 60",
-            ],
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         ),
     }
 }
@@ -374,9 +383,9 @@ impl SiteSettings {
             .enumerate()
             .map(|(i, label)| {
                 let line = if i == popup.selected {
-                    Line::from(*label).reversed()
+                    Line::from(label.clone()).reversed()
                 } else {
-                    Line::from(*label)
+                    Line::from(label.clone())
                 };
                 ListItem::new(line)
             })
@@ -683,10 +692,10 @@ impl SiteSettings {
             return;
         };
         let selected = match setting {
-            NginxSetting::Response => match self.block_response {
-                BlockResponse::Forbidden => 0,
-                BlockResponse::Close => 1,
-            },
+            NginxSetting::Response => BlockResponse::ALL
+                .iter()
+                .position(|r| *r == self.block_response)
+                .unwrap_or(0),
             NginxSetting::RobotsTxt => usize::from(self.serve_robots_txt),
             NginxSetting::RateLimit => {
                 if !self.rate_limit_enabled {
@@ -725,11 +734,10 @@ impl SiteSettings {
     ) -> Result<()> {
         match popup.setting {
             NginxSetting::Response => {
-                let response = if popup.selected == 1 {
-                    BlockResponse::Close
-                } else {
-                    BlockResponse::Forbidden
-                };
+                let response = BlockResponse::ALL
+                    .get(popup.selected)
+                    .copied()
+                    .unwrap_or_default();
                 if response == self.block_response {
                     return Ok(());
                 }
@@ -952,6 +960,29 @@ mod tests {
     use crate::testing::blocked_bot;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// Moves the open setting popup's selection to `response`, by
+    /// searching rather than counting keypresses — the option list is
+    /// `BlockResponse::ALL`, so adding an option would otherwise silently
+    /// move these tests onto a different one and keep passing.
+    fn select_response(screen: &mut SiteSettings, db: &Db, response: BlockResponse) {
+        let target = BlockResponse::ALL
+            .iter()
+            .position(|r| *r == response)
+            .expect("response should be offered");
+        let mut message = None;
+        while screen.setting_popup.as_ref().unwrap().selected != target {
+            let current = screen.setting_popup.as_ref().unwrap().selected;
+            let key = if current < target {
+                KeyCode::Down
+            } else {
+                KeyCode::Up
+            };
+            screen
+                .handle_key(KeyEvent::from(key), db, &mut message)
+                .unwrap();
+        }
+    }
 
     fn test_screen() -> SiteSettings {
         SiteSettings::new(PathBuf::from("tests/fixtures/nginx"))
@@ -1535,9 +1566,7 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
-            .unwrap();
+        select_response(&mut screen, &db, BlockResponse::Close);
         let outcome = screen
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
@@ -1565,7 +1594,13 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
-        assert_eq!(screen.setting_popup.as_ref().unwrap().selected, 1);
+        assert_eq!(
+            screen.setting_popup.as_ref().unwrap().selected,
+            BlockResponse::ALL
+                .iter()
+                .position(|r| *r == BlockResponse::Close)
+                .unwrap()
+        );
 
         screen
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
@@ -1731,11 +1766,18 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
             .unwrap();
-        assert_eq!(screen.setting_popup.as_ref().unwrap().selected, 1);
+        let opened_on = screen.setting_popup.as_ref().unwrap().selected;
+        assert!(
+            opened_on > 0,
+            "should open on the stored value, not the first"
+        );
         screen
             .handle_key(KeyEvent::from(KeyCode::Up), &db, &mut message)
             .unwrap();
-        assert_eq!(screen.setting_popup.as_ref().unwrap().selected, 0);
+        assert_eq!(
+            screen.setting_popup.as_ref().unwrap().selected,
+            opened_on - 1
+        );
     }
 
     #[test]
@@ -1752,9 +1794,7 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Char(' ')), &db, &mut message)
             .unwrap();
         assert!(screen.setting_popup.is_some(), "Space should open it");
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
-            .unwrap();
+        select_response(&mut screen, &db, BlockResponse::Close);
         screen
             .handle_key(KeyEvent::from(KeyCode::Char(' ')), &db, &mut message)
             .unwrap();
