@@ -142,6 +142,7 @@ pub fn render(rules: &[FirewallRule]) -> String {
 mod tests {
     use super::*;
     use crate::db::NewFirewallRule;
+    use crate::testing::{allow, block, block_port, disabled};
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -173,11 +174,14 @@ mod tests {
     #[test]
     fn render_never_touches_other_chains_or_policies() {
         let rendered = render(&[]);
-        assert!(!rendered.contains("INPUT DROP"));
-        assert!(!rendered.contains("FORWARD"));
-        assert!(!rendered.contains("OUTPUT"));
-        assert!(!rendered.contains("*filter"));
-        assert!(!rendered.contains("COMMIT"));
+        assert!(
+            !rendered.contains("INPUT DROP"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(!rendered.contains("FORWARD"), "rendered was:\n{rendered}");
+        assert!(!rendered.contains("OUTPUT"), "rendered was:\n{rendered}");
+        assert!(!rendered.contains("*filter"), "rendered was:\n{rendered}");
+        assert!(!rendered.contains("COMMIT"), "rendered was:\n{rendered}");
         assert!(!rendered.to_lowercase().contains("flush ruleset"));
     }
 
@@ -187,10 +191,19 @@ mod tests {
         assert!(rendered.contains(&format!("iptables -N {CHAIN}")));
         assert!(rendered.contains(&format!("iptables -F {CHAIN}")));
         assert!(rendered.contains(&format!("iptables -I INPUT -j {CHAIN}")));
-        assert!(!rendered.contains("-A STOP-BOTS -s"));
+        assert!(
+            !rendered.contains("-A STOP-BOTS -s"),
+            "rendered was:\n{rendered}"
+        );
         // Even with no user rules, we still have safety rules for established/related and loopback
-        assert!(rendered.contains("state --state ESTABLISHED,RELATED"));
-        assert!(rendered.contains("-i lo -j ACCEPT"));
+        assert!(
+            rendered.contains("state --state ESTABLISHED,RELATED"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-i lo -j ACCEPT"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     #[test]
@@ -199,8 +212,14 @@ mod tests {
         // Chain creation and the INPUT jump are both guarded so re-running
         // the script never duplicates the jump rule or errors on an
         // already-existing chain.
-        assert!(rendered.contains("if ! iptables -L STOP-BOTS -n"));
-        assert!(rendered.contains("if ! iptables -C INPUT -j STOP-BOTS"));
+        assert!(
+            rendered.contains("if ! iptables -L STOP-BOTS -n"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("if ! iptables -C INPUT -j STOP-BOTS"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     #[test]
@@ -211,17 +230,32 @@ mod tests {
         // These lines come straight from tests/fixtures/iptables/rules.json,
         // rendered the same way tests/fixtures/iptables/basic_rules.txt shows
         // hand-written stop-bots rules being expressed.
-        assert!(rendered.contains("-A STOP-BOTS -s 1.2.3.4 -j DROP"));
+        assert!(
+            rendered.contains("-A STOP-BOTS -s 1.2.3.4 -j DROP"),
+            "rendered was:\n{rendered}"
+        );
         assert!(BASIC_RULES.contains("-A STOP-BOTS -s 1.2.3.4 -j DROP"));
 
-        assert!(rendered.contains("-A STOP-BOTS -s 5.6.7.0/24 -j DROP"));
+        assert!(
+            rendered.contains("-A STOP-BOTS -s 5.6.7.0/24 -j DROP"),
+            "rendered was:\n{rendered}"
+        );
         assert!(BASIC_RULES.contains("-A STOP-BOTS -s 5.6.7.0/24 -j DROP"));
 
-        assert!(rendered.contains("-A STOP-BOTS -s 8.9.10.11 -p tcp --dport 80 -j DROP"));
+        assert!(
+            rendered.contains("-A STOP-BOTS -s 8.9.10.11 -p tcp --dport 80 -j DROP"),
+            "rendered was:\n{rendered}"
+        );
         assert!(BASIC_RULES.contains("-A STOP-BOTS -s 8.9.10.11 -p tcp --dport 80 -j DROP"));
 
-        assert!(rendered.contains("-A STOP-BOTS -s 12.13.14.15 -j REJECT"));
-        assert!(rendered.contains("-A STOP-BOTS -s 66.249.64.0/19 -j ACCEPT"));
+        assert!(
+            rendered.contains("-A STOP-BOTS -s 12.13.14.15 -j REJECT"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-A STOP-BOTS -s 66.249.64.0/19 -j ACCEPT"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     #[test]
@@ -229,7 +263,10 @@ mod tests {
         let rules = rules_from_fixture(RULES_JSON);
         let rendered = render(&rules);
         // rule-6 in the fixture (192.168.1.100) is disabled.
-        assert!(!rendered.contains("192.168.1.100"));
+        assert!(
+            !rendered.contains("192.168.1.100"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     #[test]
@@ -238,17 +275,16 @@ mod tests {
         // apply time ("host/network ... not found"), and with `set -e` that
         // aborts the whole script partway through. So IPv6 rules must never
         // appear as an `iptables -A ...` line — they're left as a comment.
-        let rules = vec![FirewallRule {
-            id: 1,
-            address: "2001:db8::1".to_string(),
-            port: None,
-            action: FirewallAction::Block,
-            enabled: true,
-            expires_at: None,
-        }];
+        let rules = vec![block("2001:db8::1")];
         let rendered = render(&rules);
-        assert!(!rendered.contains("iptables -A STOP-BOTS -s 2001:db8::1"));
-        assert!(rendered.contains("2001:db8::1"));
+        assert!(
+            !rendered.contains("iptables -A STOP-BOTS -s 2001:db8::1"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("2001:db8::1"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     #[test]
@@ -263,7 +299,10 @@ mod tests {
 
         let rules = db.list_firewall_rules().unwrap();
         let rendered = render(&rules);
-        assert!(rendered.contains("-A STOP-BOTS -s 203.0.113.7 -p tcp --dport 443 -j DROP"));
+        assert!(
+            rendered.contains("-A STOP-BOTS -s 203.0.113.7 -p tcp --dport 443 -j DROP"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     /// The same rule set as `nftables`' golden, rendered for iptables —
@@ -273,46 +312,11 @@ mod tests {
     #[test]
     fn rendered_script_matches_the_golden() {
         let rules = vec![
-            FirewallRule {
-                id: 1,
-                address: "203.0.113.7".to_string(),
-                port: None,
-                action: FirewallAction::Allow,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 2,
-                address: "198.51.100.0/24".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 3,
-                address: "192.0.2.9".to_string(),
-                port: Some(22),
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 4,
-                address: "2001:db8::/32".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 5,
-                address: "10.0.0.1".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: false,
-                expires_at: None,
-            },
+            allow("203.0.113.7"),
+            block("198.51.100.0/24"),
+            block_port("192.0.2.9", 22),
+            block("2001:db8::/32"),
+            disabled("10.0.0.1"),
         ];
         crate::golden::assert_golden("firewall.iptables.sh", &render(&rules));
     }

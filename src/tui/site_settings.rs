@@ -949,6 +949,7 @@ fn is_permission_denied(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::blocked_bot;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -996,7 +997,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("scan-sites"));
+        assert!(content.contains("scan-sites"), "content was:\n{content}");
     }
 
     #[test]
@@ -1021,7 +1022,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("example.com"));
+        assert!(content.contains("example.com"), "content was:\n{content}");
     }
 
     #[test]
@@ -1209,30 +1210,10 @@ mod tests {
 
     #[test]
     fn confirming_apply_now_writes_the_rule_and_the_status_tag_updates() {
-        use crate::db::{BotStatus, NewBot, Source};
         use std::fs;
 
         let db = Db::open_in_memory().unwrap();
-        db.upsert_source(&Source {
-            id: "test".to_string(),
-            name: "Test".to_string(),
-            url: "https://example.invalid".to_string(),
-            last_fetched_at: None,
-            bot_count: 0,
-        })
-        .unwrap();
-        db.upsert_bot(&NewBot {
-            slug: "badbot".to_string(),
-            name: "badbot".to_string(),
-            is_ai: false,
-            is_search_engine: false,
-            is_scanner: false,
-            user_agent_pattern: "BadBot-UA".to_string(),
-            source_id: "test".to_string(),
-        })
-        .unwrap();
-        db.set_bot_status("badbot", BotStatus::Blocked).unwrap();
-
+        blocked_bot(&db, "badbot", "BadBot-UA");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("example.com");
         fs::write(&path, "server {\n    server_name example.com;\n}\n").unwrap();
@@ -1257,7 +1238,7 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::ReloadNginx);
         assert!(message.unwrap().contains("Applied"));
         let written = fs::read_to_string(&path).unwrap();
-        assert!(written.contains("BadBot-UA"));
+        assert!(written.contains("BadBot-UA"), "written was:\n{written}");
 
         screen.refresh(&db).unwrap();
         assert_eq!(screen.statuses, vec![SiteApplyStatus::UpToDate]);
@@ -1285,7 +1266,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("NOT FOUND"));
+        assert!(content.contains("NOT FOUND"), "content was:\n{content}");
     }
 
     #[test]
@@ -1316,8 +1297,14 @@ mod tests {
             .unwrap();
 
         let alert = screen.alert.as_ref().unwrap();
-        assert!(alert.contains("Failed to apply rules to example.com"));
-        assert!(!alert.contains("Try running as root"));
+        assert!(
+            alert.contains("Failed to apply rules to example.com"),
+            "alert was:\n{alert}"
+        );
+        assert!(
+            !alert.contains("Try running as root"),
+            "alert was:\n{alert}"
+        );
     }
 
     #[test]
@@ -1333,27 +1320,7 @@ mod tests {
         }
 
         let db = Db::open_in_memory().unwrap();
-        db.upsert_source(&crate::db::Source {
-            id: "test".to_string(),
-            name: "Test".to_string(),
-            url: "https://example.invalid".to_string(),
-            last_fetched_at: None,
-            bot_count: 0,
-        })
-        .unwrap();
-        db.upsert_bot(&crate::db::NewBot {
-            slug: "badbot".to_string(),
-            name: "badbot".to_string(),
-            is_ai: false,
-            is_search_engine: false,
-            is_scanner: false,
-            user_agent_pattern: "BadBot-UA".to_string(),
-            source_id: "test".to_string(),
-        })
-        .unwrap();
-        db.set_bot_status("badbot", crate::db::BotStatus::Blocked)
-            .unwrap();
-
+        blocked_bot(&db, "badbot", "BadBot-UA");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("readonly.conf");
         // A non-empty rule is expected (the bot above is globally blocked),
@@ -1383,7 +1350,7 @@ mod tests {
             .unwrap();
 
         let alert = screen.alert.as_ref().unwrap();
-        assert!(alert.contains("Try running as root"));
+        assert!(alert.contains("Try running as root"), "alert was:\n{alert}");
     }
 
     #[test]
@@ -1445,30 +1412,10 @@ mod tests {
 
     #[test]
     fn confirming_apply_all_applies_every_site_and_updates_their_status_tags() {
-        use crate::db::{BotStatus, NewBot, Source};
         use std::fs;
 
         let db = Db::open_in_memory().unwrap();
-        db.upsert_source(&Source {
-            id: "test".to_string(),
-            name: "Test".to_string(),
-            url: "https://example.invalid".to_string(),
-            last_fetched_at: None,
-            bot_count: 0,
-        })
-        .unwrap();
-        db.upsert_bot(&NewBot {
-            slug: "badbot".to_string(),
-            name: "badbot".to_string(),
-            is_ai: false,
-            is_search_engine: false,
-            is_scanner: false,
-            user_agent_pattern: "BadBot-UA".to_string(),
-            source_id: "test".to_string(),
-        })
-        .unwrap();
-        db.set_bot_status("badbot", BotStatus::Blocked).unwrap();
-
+        blocked_bot(&db, "badbot", "BadBot-UA");
         let dir = tempfile::tempdir().unwrap();
         let path_a = dir.path().join("a.example");
         let path_b = dir.path().join("b.example");
@@ -1511,7 +1458,6 @@ mod tests {
 
     #[test]
     fn apply_all_reports_partial_failures_and_still_applies_the_rest() {
-        use crate::db::{BotStatus, NewBot, Source};
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
@@ -1521,26 +1467,7 @@ mod tests {
         }
 
         let db = Db::open_in_memory().unwrap();
-        db.upsert_source(&Source {
-            id: "test".to_string(),
-            name: "Test".to_string(),
-            url: "https://example.invalid".to_string(),
-            last_fetched_at: None,
-            bot_count: 0,
-        })
-        .unwrap();
-        db.upsert_bot(&NewBot {
-            slug: "badbot".to_string(),
-            name: "badbot".to_string(),
-            is_ai: false,
-            is_search_engine: false,
-            is_scanner: false,
-            user_agent_pattern: "BadBot-UA".to_string(),
-            source_id: "test".to_string(),
-        })
-        .unwrap();
-        db.set_bot_status("badbot", BotStatus::Blocked).unwrap();
-
+        blocked_bot(&db, "badbot", "BadBot-UA");
         let dir = tempfile::tempdir().unwrap();
         let path_a = dir.path().join("a.example");
         let path_b = dir.path().join("b.example");
@@ -1572,8 +1499,8 @@ mod tests {
         assert!(fs::read_to_string(&path_a).unwrap().contains("BadBot-UA"));
         assert!(message.unwrap().contains("1 failed"));
         let alert = screen.alert.as_ref().unwrap();
-        assert!(alert.contains("b.example"));
-        assert!(alert.contains("Try running as root"));
+        assert!(alert.contains("b.example"), "alert was:\n{alert}");
+        assert!(alert.contains("Try running as root"), "alert was:\n{alert}");
     }
 
     // ---- NGINX settings panel (Tab-focused, host-wide) ----
@@ -1729,9 +1656,15 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("NGINX settings"));
-        assert!(content.contains("Block response"));
-        assert!(content.contains("444"));
+        assert!(
+            content.contains("NGINX settings"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("Block response"),
+            "content was:\n{content}"
+        );
+        assert!(content.contains("444"), "content was:\n{content}");
     }
 
     // ---- popup key coverage ----

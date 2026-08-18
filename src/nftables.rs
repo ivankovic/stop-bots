@@ -113,6 +113,7 @@ pub fn render(rules: &[FirewallRule]) -> String {
 mod tests {
     use super::*;
     use crate::db::NewFirewallRule;
+    use crate::testing::{allow, block, block_port, disabled};
     use serde::Deserialize;
 
     #[derive(Deserialize)]
@@ -151,7 +152,10 @@ mod tests {
             .collect();
         assert!(!statements.iter().any(|line| line.trim() == "flush ruleset"));
         assert!(!statements.iter().any(|line| line.contains("policy drop")));
-        assert!(rendered.contains("policy accept"));
+        assert!(
+            rendered.contains("policy accept"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     #[test]
@@ -160,9 +164,15 @@ mod tests {
         assert!(rendered.contains(&format!("add table {TABLE}")));
         assert!(rendered.contains(&format!("delete table {TABLE}")));
         assert!(rendered.contains(&format!("add chain {TABLE} {CHAIN}")));
-        assert!(rendered.contains("ct state established,related accept"));
-        assert!(rendered.contains("iif lo accept"));
-        assert!(!rendered.contains("saddr"));
+        assert!(
+            rendered.contains("ct state established,related accept"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("iif lo accept"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(!rendered.contains("saddr"), "rendered was:\n{rendered}");
     }
 
     #[test]
@@ -182,21 +192,30 @@ mod tests {
 
     #[test]
     fn render_matches_fixture_rule_lines_from_json_input() {
-        let rules = rules_from_fixture(RULES_JSON);
-        let rendered = render(&rules);
+        let rendered = render(&rules_from_fixture(RULES_JSON));
 
-        assert!(rendered.contains("add rule inet stop_bots bot_block ip saddr 1.2.3.4 drop"));
-        assert!(rendered.contains("add rule inet stop_bots bot_block ip saddr 5.6.7.0/24 drop"));
-        assert!(rendered
-            .contains("add rule inet stop_bots bot_block ip saddr 8.9.10.11 tcp dport 80 drop"));
-        assert!(rendered.contains("add rule inet stop_bots bot_block ip saddr 12.13.14.15 reject"));
-        assert!(
-            rendered.contains("add rule inet stop_bots bot_block ip saddr 66.249.64.0/19 accept")
-        );
-        // nft-rule-6: an IPv6 address with a port.
-        assert!(rendered.contains(
-            "add rule inet stop_bots bot_block ip6 saddr 2001:db8::1 tcp dport 443 drop"
-        ));
+        // A table, so the cases read as a list of "this input shape
+        // produces this line" rather than as six near-identical asserts —
+        // and so a failure names which shape broke and prints the script,
+        // instead of pointing at a line number and a bare `false`.
+        let expected = [
+            ("a bare IPv4 address", "ip saddr 1.2.3.4 drop"),
+            ("an IPv4 CIDR", "ip saddr 5.6.7.0/24 drop"),
+            ("IPv4 with a port", "ip saddr 8.9.10.11 tcp dport 80 drop"),
+            ("the Reject action", "ip saddr 12.13.14.15 reject"),
+            ("the Allow action", "ip saddr 66.249.64.0/19 accept"),
+            (
+                "IPv6 with a port",
+                "ip6 saddr 2001:db8::1 tcp dport 443 drop",
+            ),
+        ];
+        for (shape, line) in expected {
+            let full = format!("add rule inet stop_bots bot_block {line}");
+            assert!(
+                rendered.contains(&full),
+                "{shape} should render as {full:?}, but the script was:\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -209,27 +228,16 @@ mod tests {
 
     #[test]
     fn render_uses_ip6_saddr_for_ipv6_and_ip_saddr_for_ipv4() {
-        let rules = vec![
-            FirewallRule {
-                id: 1,
-                address: "2001:db8:85a3::8a2e:370:7334/64".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 2,
-                address: "10.0.0.1".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-        ];
+        let rules = vec![block("2001:db8:85a3::8a2e:370:7334/64"), block("10.0.0.1")];
         let rendered = render(&rules);
-        assert!(rendered.contains("ip6 saddr 2001:db8:85a3::8a2e:370:7334/64 drop"));
-        assert!(rendered.contains("ip saddr 10.0.0.1 drop"));
+        assert!(
+            rendered.contains("ip6 saddr 2001:db8:85a3::8a2e:370:7334/64 drop"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ip saddr 10.0.0.1 drop"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     #[test]
@@ -244,7 +252,10 @@ mod tests {
 
         let rules = db.list_firewall_rules().unwrap();
         let rendered = render(&rules);
-        assert!(rendered.contains("ip saddr 203.0.113.7 tcp dport 443 drop"));
+        assert!(
+            rendered.contains("ip saddr 203.0.113.7 tcp dport 443 drop"),
+            "rendered was:\n{rendered}"
+        );
     }
 
     /// A representative rule set, locked byte-for-byte. The golden file is
@@ -253,47 +264,12 @@ mod tests {
     #[test]
     fn rendered_script_matches_the_golden() {
         let rules = vec![
-            FirewallRule {
-                id: 1,
-                address: "203.0.113.7".to_string(),
-                port: None,
-                action: FirewallAction::Allow,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 2,
-                address: "198.51.100.0/24".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 3,
-                address: "192.0.2.9".to_string(),
-                port: Some(22),
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 4,
-                address: "2001:db8::/32".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
+            allow("203.0.113.7"),
+            block("198.51.100.0/24"),
+            block_port("192.0.2.9", 22),
+            block("2001:db8::/32"),
             // Disabled: must leave no trace in the script.
-            FirewallRule {
-                id: 5,
-                address: "10.0.0.1".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: false,
-                expires_at: None,
-            },
+            disabled("10.0.0.1"),
         ];
         crate::golden::assert_golden("firewall.nft", &render(&rules));
     }
@@ -302,32 +278,7 @@ mod tests {
     /// v6 catch-alls, strictly last.
     #[test]
     fn rendered_allowlist_script_matches_the_golden() {
-        let rules = vec![
-            FirewallRule {
-                id: 1,
-                address: "203.0.113.0/24".to_string(),
-                port: None,
-                action: FirewallAction::Allow,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 0,
-                address: "0.0.0.0/0".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-            FirewallRule {
-                id: 0,
-                address: "::/0".to_string(),
-                port: None,
-                action: FirewallAction::Block,
-                enabled: true,
-                expires_at: None,
-            },
-        ];
+        let rules = vec![allow("203.0.113.0/24"), block("0.0.0.0/0"), block("::/0")];
         crate::golden::assert_golden("firewall-allowlist.nft", &render(&rules));
     }
 }

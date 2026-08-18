@@ -33,4 +33,6 @@ pub mod nginx;
 pub mod protection;
 pub mod scanblock;
 pub mod sshlog;
+#[cfg(test)]
+mod testing;
 pub mod tui;
