@@ -675,10 +675,16 @@ fn site_settings_apply_writes_the_selected_sites_rule_to_its_own_file() {
     // was never applied.
     let example_com_conf =
         std::fs::read_to_string(nginx_root.join("sites-enabled/example.com")).unwrap();
-    assert!(example_com_conf.contains("AISearchBot"));
+    assert!(
+        example_com_conf.contains("AISearchBot"),
+        "example_com_conf was:\n{example_com_conf}"
+    );
 
     let localhost_conf = std::fs::read_to_string(nginx_root.join("conf.d/server.conf")).unwrap();
-    assert!(!localhost_conf.contains("AISearchBot"));
+    assert!(
+        !localhost_conf.contains("AISearchBot"),
+        "localhost_conf was:\n{localhost_conf}"
+    );
 }
 
 #[test]
@@ -739,9 +745,15 @@ fn site_settings_apply_all_writes_the_rule_to_every_sites_own_file() {
     // Both files, not just one, got the rule this time.
     let example_com_conf =
         std::fs::read_to_string(nginx_root.join("sites-enabled/example.com")).unwrap();
-    assert!(example_com_conf.contains("AISearchBot"));
+    assert!(
+        example_com_conf.contains("AISearchBot"),
+        "example_com_conf was:\n{example_com_conf}"
+    );
     let localhost_conf = std::fs::read_to_string(nginx_root.join("conf.d/server.conf")).unwrap();
-    assert!(localhost_conf.contains("AISearchBot"));
+    assert!(
+        localhost_conf.contains("AISearchBot"),
+        "localhost_conf was:\n{localhost_conf}"
+    );
 }
 
 #[test]
@@ -825,12 +837,17 @@ fn site_settings_apply_failure_shows_a_dismissible_alert_with_a_root_suggestion(
     // Belt-and-suspenders: the file must be completely untouched by the
     // failed write attempt, not partially modified.
     let example_com_conf = std::fs::read_to_string(&example_com_path).unwrap();
-    assert!(!example_com_conf.contains("AISearchBot"));
+    assert!(
+        !example_com_conf.contains("AISearchBot"),
+        "example_com_conf was:\n{example_com_conf}"
+    );
 }
 
-#[test]
-fn site_detail_search_and_override_a_site_from_the_tui() {
-    let tmp = tempfile::tempdir().unwrap();
+/// Seeds four bots (jyxo-crawler among them, tagged "unknown" — no
+/// category flags at all) and both fixture sites via the CLI, then opens
+/// `example.com`'s detail view in the TUI. The two tests below start from
+/// here; the view itself is driven entirely through the TUI.
+fn open_site_detail(tmp: &tempfile::TempDir) -> PtySession {
     let db_path = tmp.path().join("db.sqlite3");
 
     // Seed 4 bots (jyxo-crawler among them, tagged "unknown" — no category
@@ -868,30 +885,44 @@ fn site_detail_search_and_override_a_site_from_the_tui() {
     session.exp_string("example.com").unwrap();
 
     // Enter drills into the selected site's detail view rather than
-    // opening the rescan popup (that's `r` now — see the test above).
+    // opening the rescan popup (that's `r`).
     send_key(&mut session, "\r");
     session.exp_string("categories").unwrap();
+    session
+}
 
-    // Move to the Search Bots row (index 1) and override it to Blocked —
-    // Search defaults to Allowed globally, so this is a visible flip, and
-    // unrelated to the bot override exercised below.
+/// A site's *category* override, on its own. Search defaults to Allowed
+/// globally, so flipping it to Blocked here is a visible change that could
+/// only have come from the per-site override.
+#[test]
+fn site_detail_overrides_a_category_for_one_site() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = open_site_detail(&tmp);
+
+    // Move to the Search Bots row (index 1) and open its popup.
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\r");
     session.exp_string("Use system default").unwrap();
     session.exp_string("Allowed").unwrap();
     session.exp_string("Blocked").unwrap();
+
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B"); // Use system default -> Allowed -> Blocked
     send_key(&mut session, "\r");
     // Checked as "override)" alone, not the literal "(site override)": the
-    // row previously read "(system)", which shares its leading "(s" with
-    // "(site override)" — the terminal-output-diffing gotcha documented
-    // above means only the differing tail actually retransmits.
+    // row previously read "(system)", which shares its leading "(s", and
+    // the diffed terminal only retransmits the differing tail.
     session.exp_string("override)").unwrap();
+}
 
-    // Search for a bot with no category flags at all: overriding it
-    // specifically (independent of the category override above) proves
-    // the per-bot path works on its own.
+/// A site's *per-bot* override, on its own — reached through the search
+/// box, and deliberately on a bot with no category flags at all, so it
+/// can't be confused with the category path above.
+#[test]
+fn site_detail_searches_for_a_bot_and_overrides_it_for_one_site() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = open_site_detail(&tmp);
+
     send_key(&mut session, "/");
     send_key(&mut session, "jyxo");
     session.exp_string("Jyxo Crawler").unwrap();
@@ -901,50 +932,18 @@ fn site_detail_search_and_override_a_site_from_the_tui() {
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B"); // -> Blocked
     send_key(&mut session, "\r");
-    // Checked as "override)" alone, not the literal "(site override)": the
-    // row previously read "(system)", which shares its leading "(s" with
-    // "(site override)" — the terminal-output-diffing gotcha documented
-    // above means only the differing tail actually retransmits.
     session.exp_string("override)").unwrap();
 
-    // Leave the search box, then back all the way out of the detail view.
+    // Leaving the search box and then the detail view returns to the site
+    // list, rather than backing all the way out to the Dashboard. There's
+    // no new text to anchor on for the first transition (only a border
+    // colour changes), so it's proved indirectly: if focus hadn't returned
+    // to the categories panel, the `q` below would be swallowed as literal
+    // search-query text and the final expectation would time out.
     send_escape(&mut session);
     send_escape(&mut session);
-
     send_key(&mut session, "q");
     session.exp_string("wide").unwrap();
-    send_key(&mut session, "q");
-    session
-        .exp_eof()
-        .expect("process should exit after q on the Dashboard");
-
-    // Belt-and-suspenders: confirm both writes actually landed in the db,
-    // not just that the right text was rendered.
-    let db = stop_bots::db::Db::open(&db_path).unwrap();
-    let example_com = db
-        .list_sites()
-        .unwrap()
-        .into_iter()
-        .find(|s| s.server_name == "example.com")
-        .unwrap();
-    assert_eq!(
-        db.get_site_category_override(example_com.id, stop_bots::db::Category::Search)
-            .unwrap(),
-        Some(stop_bots::db::Policy::Blocked)
-    );
-    let jyxo_bot = db
-        .list_bots()
-        .unwrap()
-        .into_iter()
-        .find(|b| b.slug == "jyxo-crawler")
-        .unwrap();
-    let jyxo_override = db
-        .site_bot_overrides(example_com.id)
-        .unwrap()
-        .into_iter()
-        .find(|o| o.bot_id == jyxo_bot.id)
-        .map(|o| o.policy);
-    assert_eq!(jyxo_override, Some(stop_bots::db::Policy::Blocked));
 }
 
 #[test]
