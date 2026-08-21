@@ -28,7 +28,18 @@ categories = [
 # GitHub. `exclude` rather than `include` deliberately — with `include`, the
 # day someone adds a fixture directory and forgets to list it, the published
 # crate silently fails to build.
-exclude = [".serena/", "AGENTS.md", "SPECS.md", "TODO.md", "REVIEW.md", "Makefile"]
+exclude = [
+    ".serena/",
+    "AGENTS.md",
+    "SPECS.md",
+    "TODO.md",
+    "REVIEW.md",
+    "Makefile",
+    # Needs Docker to run, and ships a Dockerfile plus a staged binary
+    # nobody downloading the crate can use.
+    "tests/container",
+    "tests/container.rs",
+]
 
 [dependencies]
 # For TUI

@@ -61,6 +61,19 @@ jobs:
 
       - run: cargo check --all-targets
 
+  # The only job where generated NGINX and nftables output meets the real
+  # parsers, and where a firewall rule is checked by sending actual
+  # packets at it. Separate from `test` because it needs Docker and
+  # NET_ADMIN, which the unit suite must never require.
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: End-to-end against real nginx and nftables
+        run: STOP_BOTS_CONTAINER_TESTS=1 cargo test --test container
+
   # Catches the class of mistake that only surfaces at publish time: a bad
   # category slug, a missing required field, or a crate that packages fine but
   # does not build from its own tarball.
