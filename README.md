@@ -350,7 +350,7 @@ that keeps passing when the text is wrong.
 It needs Docker and `NET_ADMIN` and takes ~20s, so it is off by default:
 
 ```
-make container-test
+make test-containers
 ```
 
 CI runs it as its own job. Run it before a release, and before trusting any change to

@@ -3076,7 +3076,7 @@ covering:
   again after `nft delete table inet stop_bots`, which is the recovery
   path an admin needs.
 
-Off by default (`STOP_BOTS_CONTAINER_TESTS=1`, or `make container-test`),
+Off by default (`STOP_BOTS_CONTAINER_TESTS=1`, or `make test-containers`),
 since it needs Docker and `NET_ADMIN`. Its own CI job.
 
 **Three things the harness taught us that no unit test could:**
