@@ -669,10 +669,32 @@ impl App {
     ) {
         let result = (|| -> anyhow::Result<String> {
             let built = crate::firewall::build_script(&self.db, backend)?;
-            if let crate::firewall::LockoutStatus::Risks(risks) =
-                crate::firewall::assess_lockout_risk(&built.rules, None)
-            {
-                if !risks.is_empty() && !force {
+            // Both outcomes have to be handled, and the second one is why
+            // this is a `match` rather than an `if let`.
+            //
+            // `LogUnavailable` used to fall straight through: on any host
+            // where the SSH log isn't readable — not running as root, or a
+            // journald-only system where `journalctl` returns nothing —
+            // the guard silently did nothing and the script was written
+            // *and applied* with no warning at all. That is the one path
+            // in this project that can take a server off the network, and
+            // it was the path with no check on it.
+            //
+            // The CLI has always printed a note and continued, which is
+            // defensible there: a human is watching the terminal. Here the
+            // same key press can apply the script immediately, so it
+            // refuses instead. `--force`, or the CLI, remains the way
+            // through for someone who knows the log is missing and means
+            // it anyway.
+            match crate::firewall::assess_lockout_risk(&built.rules, self.ssh_log.as_deref()) {
+                crate::firewall::LockoutStatus::LogUnavailable if !force => {
+                    anyhow::bail!(
+                        "refusing to write: no SSH log could be read, so the lockout safety \
+                         check could not run. Start the TUI with --ssh-log <path>, or run \
+                         `stop-bots render-firewall` as root, which reports this and continues."
+                    );
+                }
+                crate::firewall::LockoutStatus::Risks(risks) if !risks.is_empty() && !force => {
                     let ips = risks
                         .iter()
                         .map(|(ip, cidr)| format!("{ip} (blocked by {cidr})"))
@@ -684,6 +706,7 @@ impl App {
                         risks.len()
                     );
                 }
+                _ => {}
             }
             crate::firewall::write_script(std::path::Path::new(&out_path), &built.script)?;
             self.db
@@ -863,12 +886,17 @@ mod tests {
             Db::open_in_memory().unwrap(),
             std::path::PathBuf::from("/etc/nginx"),
             false,
-            // A nonexistent path rather than `None`: auto-detection would
-            // read whatever SSH log the machine running the tests happens
-            // to have, or shell out to `journalctl` — nondeterministic and,
+            // A fixture log rather than `None`: auto-detection would read
+            // whatever SSH log the machine running the tests happens to
+            // have, or shell out to `journalctl` — nondeterministic and,
             // on some hosts, slow enough to blow the unit-test budget on
             // its own.
-            Some(std::path::PathBuf::from("/nonexistent/test-auth.log")),
+            //
+            // A *readable* one rather than a nonexistent path, because
+            // `render_firewall` now refuses when the lockout check can't
+            // run at all. Its single Accepted line is for 192.0.2.10,
+            // which nothing in these tests blocks.
+            Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
         )
         .unwrap()
     }
@@ -1212,4 +1240,99 @@ mod tests {
     // whatever latency `reqwest::get` happens to have on the test
     // machine, neither of which is worth it for a one-line early return.
     // Covered by inspection instead.
+
+    // ---- the lockout guard on the apply path ----
+
+    /// The bug that took a real server off the network.
+    ///
+    /// `LogUnavailable` used to fall through the check silently, so on any
+    /// host where the SSH log isn't readable the script was written — and,
+    /// with the render popup's "apply after writing" toggle, *applied* —
+    /// with no lockout check and no warning.
+    #[tokio::test]
+    async fn render_firewall_refuses_when_the_lockout_check_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("firewall.nft");
+        let mut app = App::new(
+            Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/etc/nginx"),
+            false,
+            Some(std::path::PathBuf::from("/nonexistent/auth.log")),
+        )
+        .unwrap();
+
+        app.render_firewall(
+            crate::firewall::FirewallBackend::Nftables,
+            out.to_str().unwrap().to_string(),
+            false,
+            false,
+        );
+
+        assert!(
+            !out.exists(),
+            "no script may be written when the guard couldn't run"
+        );
+        let message = app.message.clone().unwrap();
+        assert!(message.contains("lockout"), "message was: {message}");
+        assert!(message.contains("--ssh-log"), "message was: {message}");
+    }
+
+    /// `--force` is still the way through for someone who knows the log is
+    /// missing and means it.
+    #[tokio::test]
+    async fn force_still_writes_when_the_lockout_check_cannot_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("firewall.nft");
+        let mut app = App::new(
+            Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/etc/nginx"),
+            false,
+            Some(std::path::PathBuf::from("/nonexistent/auth.log")),
+        )
+        .unwrap();
+
+        app.render_firewall(
+            crate::firewall::FirewallBackend::Nftables,
+            out.to_str().unwrap().to_string(),
+            true,
+            false,
+        );
+
+        assert!(out.exists(), "message was: {:?}", app.message);
+    }
+
+    /// The check has to actually use the configured log — it was passing
+    /// `None` and auto-detecting, so the `--ssh-log` override never
+    /// reached it.
+    #[tokio::test]
+    async fn render_firewall_refuses_to_block_the_connected_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("firewall.nft");
+        let db = Db::open_in_memory().unwrap();
+        // The fixture log's Accepted line is for 192.0.2.10.
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "192.0.2.0/24".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+        let mut app = App::new(
+            db,
+            std::path::PathBuf::from("/etc/nginx"),
+            false,
+            Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
+        )
+        .unwrap();
+
+        app.render_firewall(
+            crate::firewall::FirewallBackend::Nftables,
+            out.to_str().unwrap().to_string(),
+            false,
+            false,
+        );
+
+        assert!(!out.exists(), "message was: {:?}", app.message);
+        let message = app.message.clone().unwrap();
+        assert!(message.contains("192.0.2.10"), "message was: {message}");
+    }
 }
