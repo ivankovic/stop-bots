@@ -338,6 +338,24 @@ Ideally, the real implementation is used. Where it can't be, in order of prefere
 The pty harness that drives the TUI end to end lives in tests/tui.rs itself (on raw `libc`);
 see the comment there for why it isn't a crate.
 
+### Container tests
+
+`tests/container.rs` runs the generated output through a **real NGINX and a real nftables**,
+in Docker, and checks the result by sending actual requests — including from a second
+container with its own address, so a firewall rule is verified by packets that genuinely
+don't arrive. It is the only place the two parsers this project writes for are exercised at
+all; everything else asserts the text we hoped would satisfy them, which is exactly the check
+that keeps passing when the text is wrong.
+
+It needs Docker and `NET_ADMIN` and takes ~20s, so it is off by default:
+
+```
+make container-test
+```
+
+CI runs it as its own job. Run it before a release, and before trusting any change to
+generated config.
+
 ## Code structure
 
 Rust's project structure must be followed.

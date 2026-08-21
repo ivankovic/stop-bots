@@ -462,6 +462,34 @@ enum Command {
         #[arg(long)]
         burst: Option<i64>,
     },
+    /// Switches one request-shape rule on or off for a site (see
+    /// SetBlockResponse's siblings in Site settings). Rules:
+    /// http-1x, no-accept, no-accept-language, no-user-agent,
+    /// ip-literal-host, old-tls.
+    SetSiteRule {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// The site's server_name, as `scan-sites` discovered it
+        #[arg(long)]
+        site: String,
+        #[arg(long)]
+        rule: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
+    /// Adds a request-path prefix that a site's blocking rules don't apply
+    /// to. Must start with `/`.
+    ExemptPath {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long)]
+        site: String,
+        #[arg(long)]
+        path: String,
+        /// Remove the exemption instead of adding it
+        #[arg(long)]
+        remove: bool,
+    },
     /// Turns generation of a `robots.txt` on or off. When on, ApplyBlocks
     /// writes one to /etc/stop-bots/nginx/robots.txt and adds a
     /// `location = /robots.txt` block to each site that serves it: one
@@ -692,6 +720,18 @@ async fn main() -> Result<()> {
             rps,
             burst,
         }) => set_rate_limit(db, enabled, rps, burst),
+        Some(Command::SetSiteRule {
+            db,
+            site,
+            rule,
+            enabled,
+        }) => set_site_rule(db, site, rule, enabled),
+        Some(Command::ExemptPath {
+            db,
+            site,
+            path,
+            remove,
+        }) => exempt_path(db, site, path, remove),
         Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
         Some(Command::ShowRobotsTxt { db }) => show_robots_txt(db),
     }
@@ -1092,6 +1132,80 @@ fn set_rate_limit(
         println!("Rate limiting off.");
     }
     println!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    Ok(())
+}
+
+/// Resolves a `server_name` to its `sites` row, failing with the known
+/// names rather than a bare "not found" — a typo here is the likeliest
+/// mistake, and the fix is usually visible in the list.
+fn find_site(db: &stop_bots::db::Db, server_name: &str) -> Result<stop_bots::db::Site> {
+    let sites = db.list_sites()?;
+    sites
+        .iter()
+        .find(|s| s.server_name == server_name)
+        .cloned()
+        .ok_or_else(|| {
+            let known: Vec<&str> = sites.iter().map(|s| s.server_name.as_str()).collect();
+            if known.is_empty() {
+                anyhow::anyhow!("no sites discovered yet — run `stop-bots scan-sites` first")
+            } else {
+                anyhow::anyhow!("unknown site: {server_name} (known: {})", known.join(", "))
+            }
+        })
+}
+
+fn set_site_rule(
+    db_path: Option<PathBuf>,
+    site: String,
+    rule: String,
+    enabled: bool,
+) -> Result<()> {
+    use stop_bots::nginx::RequestRule;
+
+    let db = open_db(db_path)?;
+    let site = find_site(&db, &site)?;
+    // Accept the dashed form the CLI advertises as well as the stored
+    // underscore form, so `--rule no-user-agent` works.
+    let id = rule.replace('-', "_");
+    let Some(rule) = RequestRule::from_id(&id) else {
+        let known: Vec<String> = RequestRule::ALL
+            .iter()
+            .map(|r| r.id().replace('_', "-"))
+            .collect();
+        anyhow::bail!("unknown rule: {rule} (known: {})", known.join(", "));
+    };
+    db.set_site_request_rule(site.id, rule.id(), enabled)?;
+    println!(
+        "{}: {} is now {}",
+        site.server_name,
+        rule.label(),
+        if enabled { "blocked" } else { "allowed" }
+    );
+    if enabled {
+        println!("Note: {}.", rule.caveat());
+    }
+    println!("Run `stop-bots apply-blocks` to write it into the site config.");
+    Ok(())
+}
+
+fn exempt_path(db_path: Option<PathBuf>, site: String, path: String, remove: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    let site = find_site(&db, &site)?;
+    let trimmed = path.trim();
+    // Matching is anchored at the start of the request path, so a value
+    // without a leading slash could never fire — refused rather than
+    // stored and silently ignored, same as the TUI does.
+    if !remove && !trimmed.starts_with('/') {
+        anyhow::bail!("an exempt path must start with '/' (got {trimmed:?})");
+    }
+    if remove {
+        db.remove_site_path_exemption(site.id, trimmed)?;
+        println!("{}: {trimmed} is no longer exempt", site.server_name);
+    } else {
+        db.add_site_path_exemption(site.id, trimmed)?;
+        println!("{}: {trimmed} is exempt from blocking", site.server_name);
+    }
+    println!("Run `stop-bots apply-blocks` to write it into the site config.");
     Ok(())
 }
 

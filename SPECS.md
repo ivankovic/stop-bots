@@ -3004,3 +3004,90 @@ which cuts both ways.
 `return`, in both block shapes, with a test asserting exactly that and
 that it appears once. `set $limit_rate` at server level would throttle
 every visitor on the site.
+
+## Container tests, and the two bugs they were built to find
+
+A real server reported that applying a firewall script from the TUI left
+SSH unreachable. Two defects came out of it, plus a third the new harness
+found on its own.
+
+### 1. The lockout guard was inert exactly where it mattered most
+
+`App::render_firewall` matched only `LockoutStatus::Risks`:
+
+```rust
+if let LockoutStatus::Risks(risks) = assess_lockout_risk(&built.rules, None) { ... }
+```
+
+`LogUnavailable` fell straight through. On any host where the SSH log
+isn't readable — not running as root, or a journald-only system where
+`journalctl` returns nothing — the guard did nothing, silently, and the
+script was written *and applied* (the render popup's "apply after
+writing" toggle) with no warning at all.
+
+The CLI has always printed a note and continued. That is defensible
+there: a human is reading the terminal. It is not defensible on a
+keypress that applies immediately, so the TUI now refuses unless
+`--force`. This is the one code path in the project that can take a
+machine off the network, and it was the one with no check on it.
+
+The same call passed `None`, so the `tui --ssh-log` override added
+earlier never reached the check either.
+
+### 2. The generated robots.txt named nobody
+
+`robots_txt_body` filtered bots on `is_robots_token(&bot.name)`. For the
+well-known-bots source, `name` is humanised from the slug —
+`ai-search-bot` becomes `Ai Search Bot` — and a name with spaces is not a
+usable robots token, so **every bot from that source was silently
+dropped**. The file was still generated and served: it forbade nobody
+while looking like a working feature.
+
+The token now comes from `user_agent_pattern`, which is the substring the
+bot actually sends, correctly cased. Backslash escapes are undone
+(patterns are NGINX regex fragments) and a trailing `/` trimmed.
+
+This was found by asserting on a real HTTP response rather than on
+generated text, which is the entire argument for the harness.
+
+### What the harness is
+
+`tests/container.rs` plus `tests/container/Dockerfile`: Ubuntu 24.04 with
+NGINX, nftables and curl, and the host-built binary copied in (matching
+glibc, so a container run is seconds rather than a rebuild). Ten tests
+covering:
+
+- every generated directive form through a real `nginx -t`;
+- a blocked user agent actually receiving 403 while an ordinary one gets
+  200;
+- every block-response option as the status code a client observes,
+  including `444` arriving as "connection closed, no status";
+- exempt paths and `/.well-known/` staying reachable for a client the
+  rules otherwise catch;
+- the generated robots.txt being served, and being readable by a crawler
+  it blocks;
+- generated firewall scripts through `nft -c -f` and then loaded for
+  real, including that re-applying doesn't duplicate rules — the
+  idempotency idiom TODO.md had flagged as reasoned-through but
+  unverified;
+- the lockout guard refusing, and naming the admin it would cut off;
+- **packets from a second container**, on a user-defined Docker network
+  with its own address, failing to arrive once blocked — and arriving
+  again after `nft delete table inet stop_bots`, which is the recovery
+  path an admin needs.
+
+Off by default (`STOP_BOTS_CONTAINER_TESTS=1`, or `make container-test`),
+since it needs Docker and `NET_ADMIN`. Its own CI job.
+
+**Three things the harness taught us that no unit test could:**
+
+- Blocking `127.0.0.1` does *not* stop loopback traffic, because the
+  generated chain accepts `iif lo` before any drop rule. That is a
+  deliberate safety property and now has a test asserting it, rather than
+  being an assumption.
+- `curl` exits non-zero against a `444`, so the harness's own status
+  helper had to stop treating a failed curl as a failed test — the `000`
+  is the observation.
+- Tests calling `docker build` in parallel raced on the staged binary,
+  producing four unrelated-looking failures that each passed in
+  isolation. Guarded with a `Once`.

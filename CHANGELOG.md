@@ -33,6 +33,17 @@ need.
 
 ### Fixed
 
+- **The TUI's firewall render no longer applies a script when the lockout safety check
+  couldn't run.** If no SSH log was readable — not running as root, or a journald-only host —
+  the check was silently skipped and the script written and applied anyway. This could take a
+  server off the network, and did. It now refuses unless forced; the CLI's behaviour (warn and
+  continue) is unchanged, since a human is watching there.
+- The TUI's lockout check now honours `tui --ssh-log` instead of always auto-detecting.
+- The generated `robots.txt` listed no bots at all when they came from the well-known-bots
+  source: their names are humanised from slugs (`ai-search-bot` → `Ai Search Bot`) and a name
+  with spaces is unusable as a robots token, so every one was silently dropped. The token now
+  comes from the user-agent pattern, which is both correctly cased and a real token.
+
 - IPv6 detections now block the `/64` rather than the single `/128`. A `/64` is the smallest
   allocation anyone gets — one LAN, the same thing a single IPv4 address represents — so
   blocking one address stopped nothing while costing a firewall rule per request.
