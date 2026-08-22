@@ -208,6 +208,22 @@ pub enum KeyOutcome {
     ReloadNginx,
 }
 
+/// Braille "dots" spinner frames, in rotation order.
+pub const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// The spinner frame to draw right now, picked from wall-clock time rather
+/// than from a counter each screen would have to own and advance. The draw
+/// loop redraws on every `Event::Tick` (30fps), so reading the clock at
+/// render time is all the animation any of them needs — and every spinner
+/// on screen turns in step, which a per-widget counter would not guarantee.
+pub fn spinner_frame() -> char {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    SPINNER_FRAMES[(millis / 80) as usize % SPINNER_FRAMES.len()]
+}
+
 /// Returns a `Rect` of exactly `width` x `height` cells, centered within
 /// `area` (clamped so it never exceeds `area`'s bounds). Used to place
 /// popups, which need a specific size in rows/columns rather than a
@@ -233,13 +249,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     render_header(app, frame, header);
 
     match app.screen {
-        Screen::Dashboard => app.dashboard.render(
-            frame,
-            body,
-            app.theme,
-            &app.message,
-            &app.cron_jobs_in_flight,
-        ),
+        Screen::Dashboard => {
+            app.dashboard
+                .render(frame, body, app.theme, &app.message, &app.jobs_in_flight)
+        }
         Screen::BotSettings => app.bot_settings.render(frame, body, app.theme),
         Screen::SiteSettings => app.site_settings.render(frame, body, app.theme),
         Screen::DynamicProtection => app.dynamic_protection.render(frame, body, app.theme),

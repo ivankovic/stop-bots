@@ -43,6 +43,22 @@ use ratatui::DefaultTerminal;
 /// detection latency ever isn't fast enough.
 const CRON_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Everything that can be running in the background, and the key
+/// [`App::jobs_in_flight`] is keyed by.
+///
+/// One set covers the internal cron's jobs and the actions an admin
+/// triggers, because both want the same two things from it: a spinner
+/// while the work is out, and a guard against starting the same work
+/// twice. `due_jobs` can't provide the second on its own (a job's
+/// `last_run` doesn't move until it finishes), and neither can a key
+/// handler — holding Enter on "apply" would otherwise stack up one
+/// `systemctl reload nginx` per repeat.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Job {
+    /// A scheduled job from [`crate::cron`].
+    Cron(CronJob),
+}
+
 pub struct App {
     pub running: bool,
     pub events: EventHandler,
@@ -60,14 +76,10 @@ pub struct App {
     /// check against `Event::Tick`'s 30fps rate (see
     /// [`CRON_CHECK_INTERVAL`]).
     last_cron_check: std::time::Instant,
-    /// Which cron jobs currently have background work in flight — guards
-    /// against starting a second one for the same job before the first
-    /// (a network round-trip for `UpdateIpRanges`, a log read/`journalctl`
-    /// subprocess for the other four) has finished, which `due_jobs` alone
-    /// can't prevent since `last_run` only updates once the job actually
-    /// completes. Also drives the Dashboard's "Running now" spinner (read
-    /// by `tui::render`'s dispatch to `Dashboard::render`).
-    pub cron_jobs_in_flight: std::collections::HashSet<CronJob>,
+    /// Which background work is currently out — see [`Job`] for what goes
+    /// in here and why one set serves both purposes. Also what every
+    /// spinner on screen is drawn from.
+    pub jobs_in_flight: std::collections::HashSet<Job>,
     /// Whether `KeyOutcome::ReloadNginx` actually calls `nginx::reload()`.
     /// Always `true` for real usage; `false` only for the end-to-end TUI
     /// tests in `tests/tui.rs`, which drive a real Site settings "apply"
@@ -137,7 +149,7 @@ impl App {
             last_cron_check: std::time::Instant::now()
                 .checked_sub(CRON_CHECK_INTERVAL)
                 .unwrap_or_else(std::time::Instant::now),
-            cron_jobs_in_flight: std::collections::HashSet::new(),
+            jobs_in_flight: std::collections::HashSet::new(),
             reload_nginx,
             apply_firewall: reload_nginx,
             ssh_log,
@@ -420,7 +432,7 @@ impl App {
     /// Starts the `UpdateIpRanges` job's background fetch (Googlebot,
     /// Bingbot, GPTBot — the same three `ipranges::IpRangeSourceKind::ALL`
     /// sources `update-ip-ranges` fetches). Guarded by
-    /// `cron_jobs_in_flight` so a slow round-trip to all three hosts can't
+    /// `jobs_in_flight` so a slow round-trip to all three hosts can't
     /// overlap with itself if `check_cron` finds the job still "due" (its
     /// `last_run` doesn't update until it actually finishes) on a later
     /// tick. Only fetches and parses in the background, same
@@ -428,7 +440,10 @@ impl App {
     /// `start_country_select`: storing happens back on the main thread in
     /// `finish_cron_update_ip_ranges`.
     fn start_cron_update_ip_ranges(&mut self) {
-        if !self.cron_jobs_in_flight.insert(CronJob::UpdateIpRanges) {
+        if !self
+            .jobs_in_flight
+            .insert(Job::Cron(CronJob::UpdateIpRanges))
+        {
             return;
         }
         let sender = self.events.sender();
@@ -456,7 +471,8 @@ impl App {
         &mut self,
         results: Vec<(ipranges::IpRangeSourceKind, Result<Vec<String>, String>)>,
     ) -> Result<()> {
-        self.cron_jobs_in_flight.remove(&CronJob::UpdateIpRanges);
+        self.jobs_in_flight
+            .remove(&Job::Cron(CronJob::UpdateIpRanges));
 
         let mut updated = 0;
         let mut failed = 0;
@@ -490,7 +506,7 @@ impl App {
     /// runs this on Tokio's separate blocking-thread pool rather than a
     /// worker thread the event loop needs, unlike `start_cron_update_ip_ranges`
     /// (real async I/O, so a plain `tokio::spawn` task is enough there).
-    /// Guarded by `cron_jobs_in_flight`, same reasoning as `UpdateIpRanges`.
+    /// Guarded by `jobs_in_flight`, same reasoning as `UpdateIpRanges`.
     /// Only the log *read* moves off-thread: the parsing/counting/`Db`
     /// writes that follow stay on the main thread in `finish_cron_log_job`,
     /// same `Db`-isn't-`Sync` pattern as every other background task here —
@@ -498,7 +514,7 @@ impl App {
     /// them and a second `Db` connection would fight that pattern for no
     /// reason.
     fn start_cron_log_job(&mut self, job: CronJob) {
-        if !self.cron_jobs_in_flight.insert(job) {
+        if !self.jobs_in_flight.insert(Job::Cron(job)) {
             return;
         }
         let sender = self.events.sender();
@@ -534,7 +550,7 @@ impl App {
     /// records the job's outcome and refreshes every screen — mirroring
     /// `finish_cron_update_ip_ranges`.
     fn finish_cron_log_job(&mut self, job: CronJob, log_text: Option<String>) -> Result<()> {
-        self.cron_jobs_in_flight.remove(&job);
+        self.jobs_in_flight.remove(&Job::Cron(job));
 
         let summary = match job {
             // Every detector runs through one arm. What differs between
@@ -960,7 +976,7 @@ mod tests {
     /// running inline, so tests that trigger them via `check_cron` must
     /// drive the resulting `CronLogFetched` events through the same
     /// `handle_event` dispatch `App::run` uses before asserting on `Db`
-    /// state. Drains until `cron_jobs_in_flight` (populated synchronously
+    /// state. Drains until `jobs_in_flight` (populated synchronously
     /// by `check_cron` before this is called) is empty again, rather than a
     /// fixed event count: `EventHandler`'s background `EventTask` also
     /// pushes `Event::Tick` into the same channel at 30fps, so a tick can
@@ -969,7 +985,7 @@ mod tests {
     /// event short. Ticks dispatch through `handle_event` as harmless
     /// no-ops here (`check_cron` throttles itself right back out).
     async fn drain_cron_events(app: &mut App) {
-        while !app.cron_jobs_in_flight.is_empty() {
+        while !app.jobs_in_flight.is_empty() {
             let event = app.events.next().await.unwrap();
             app.handle_event(event).unwrap();
         }

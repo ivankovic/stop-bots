@@ -296,7 +296,7 @@ impl Dashboard {
         area: Rect,
         theme: Theme,
         message: &Option<String>,
-        running_jobs: &std::collections::HashSet<crate::cron::CronJob>,
+        running_jobs: &std::collections::HashSet<crate::app::Job>,
     ) {
         // Panel heights, and which panel absorbs a short terminal. Every
         // detector added grows Scheduled tasks by a row, so a layout of
@@ -435,12 +435,15 @@ impl Dashboard {
         &self,
         frame: &mut Frame,
         area: Rect,
-        running_jobs: &std::collections::HashSet<crate::cron::CronJob>,
+        running_jobs: &std::collections::HashSet<crate::app::Job>,
     ) {
         let lines: Vec<Line> = self
             .cron_status
             .iter()
-            .map(|status| cron_status_line(status, running_jobs.contains(&status.job)))
+            .map(|status| {
+                let running = running_jobs.contains(&crate::app::Job::Cron(status.job));
+                cron_status_line(status, running)
+            })
             .collect();
         let panel = Paragraph::new(lines).block(
             Block::bordered()
@@ -1258,22 +1261,6 @@ fn policy_tag(policy: Policy) -> Span<'static> {
     }
 }
 
-/// Braille "dots" spinner frames for the "Running now" indicator.
-const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-
-/// Picks the current spinner frame from wall-clock time rather than a
-/// counter `Dashboard` would need to own and advance itself — since
-/// `render` is called on every redraw of the TUI's draw loop, this alone
-/// is enough to animate smoothly.
-fn spinner_frame() -> char {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    let frame = (millis / 80) % SPINNER_FRAMES.len() as u128;
-    SPINNER_FRAMES[frame as usize]
-}
-
 /// Renders one line of the "Scheduled tasks" panel: the job's label, when
 /// it last ran (or "never"), and its last outcome — or, if it's currently
 /// running in the background (`running`) or due but not yet started, that
@@ -1285,7 +1272,7 @@ fn cron_status_line(status: &crate::cron::JobStatus, running: bool) -> Line<'sta
         None => "never".to_string(),
     };
     let outcome = if running {
-        format!("{} Running now", spinner_frame())
+        format!("{} Running now", crate::tui::spinner_frame())
     } else if status.due {
         "due now".to_string()
     } else {
@@ -1511,8 +1498,9 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let running_jobs =
-            std::collections::HashSet::from([crate::cron::CronJob::Detect(Detector::SshScanners)]);
+        let running_jobs = std::collections::HashSet::from([crate::app::Job::Cron(
+            crate::cron::CronJob::Detect(Detector::SshScanners),
+        )]);
         let backend = TestBackend::new(60, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
