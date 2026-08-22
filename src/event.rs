@@ -110,6 +110,15 @@ pub enum AppEvent {
     /// Site settings apply has finished (see `App::reload_nginx`). `Err`
     /// carries the stringified failure, `anyhow::Error` not being `Clone`.
     NginxReloaded { result: Result<(), String> },
+    /// A background firewall render has finished (see
+    /// `App::render_firewall`). `signature` is the rendered rule set's
+    /// signature, for the main thread to persist — the `Db` write can't
+    /// happen on the worker. `Err` carries the stringified failure, which
+    /// includes the lockout guard refusing.
+    FirewallRendered {
+        signature: String,
+        outcome: Result<crate::app::RenderOutcome, String>,
+    },
 }
 
 /// Terminal event handler: spawns a background task that emits tick events

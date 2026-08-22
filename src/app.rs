@@ -63,6 +63,9 @@ pub enum Job {
     /// `nginx -t` followed by `systemctl reload nginx`, after Site
     /// settings has written a config file. See [`App::reload_nginx`].
     ReloadNginx,
+    /// Writing the firewall script and, if asked, applying it. See
+    /// [`App::render_firewall`].
+    RenderFirewall,
 }
 
 impl Job {
@@ -74,6 +77,7 @@ impl Job {
             Job::Cron(job) => format!("{} (scheduled)", job.label()),
             Job::ReadSshLog => "reading the SSH log".to_string(),
             Job::ReloadNginx => "reloading NGINX".to_string(),
+            Job::RenderFirewall => "writing the firewall script".to_string(),
         }
     }
 }
@@ -152,6 +156,107 @@ pub struct App {
     /// both exist for exactly the same "don't really execute system-
     /// changing commands under test" reason.
     apply_firewall: bool,
+}
+
+/// What [`App::render_firewall`] hands to the background thread. A struct
+/// rather than five positional parameters, three of which are flags.
+struct RenderRequest {
+    backend: crate::firewall::FirewallBackend,
+    out_path: String,
+    force: bool,
+    apply: bool,
+    ssh_log: Option<std::path::PathBuf>,
+}
+
+/// A successful background render, for the main thread to record.
+#[derive(Clone, Debug)]
+pub struct RenderOutcome {
+    /// What to show the admin. Carries whether the script was also
+    /// applied, and how to apply it by hand when it wasn't.
+    pub message: String,
+}
+
+/// The blocking half of a firewall render: the lockout check, the write,
+/// and — if asked — `nft -f`/`sh`.
+///
+/// Runs on the blocking pool, so it touches no `Db`. The lockout check
+/// reads the SSH log *live*, every time, and must keep doing so: it is the
+/// one guard standing between a keypress and a server that can no longer
+/// be reached. `App::ssh_log_text`, the cached copy Dynamic Protection
+/// draws from, must never reach this.
+fn render_firewall_off_thread(
+    request: RenderRequest,
+    built: &crate::firewall::BuiltFirewall,
+) -> Result<RenderOutcome, String> {
+    let RenderRequest {
+        backend,
+        out_path,
+        force,
+        apply,
+        ssh_log,
+    } = request;
+
+    // Both outcomes have to be handled, and the second one is why this is
+    // a `match` rather than an `if let`.
+    //
+    // `LogUnavailable` used to fall straight through: on any host where
+    // the SSH log isn't readable — not running as root, or a journald-only
+    // system where `journalctl` returns nothing — the guard silently did
+    // nothing and the script was written *and applied* with no warning at
+    // all. That is the one path in this project that can take a server off
+    // the network, and it was the path with no check on it.
+    //
+    // The CLI has always printed a note and continued, which is defensible
+    // there: a human is watching the terminal. Here the same key press can
+    // apply the script immediately, so it refuses instead. `--force`, or
+    // the CLI, remains the way through for someone who knows the log is
+    // missing and means it anyway.
+    match crate::firewall::assess_lockout_risk(&built.rules, ssh_log.as_deref()) {
+        crate::firewall::LockoutStatus::LogUnavailable if !force => {
+            return Err(
+                "refusing to write: no SSH log could be read, so the lockout safety \
+                        check could not run. Start the TUI with --ssh-log <path>, or run \
+                        `stop-bots render-firewall` as root, which reports this and continues."
+                    .to_string(),
+            );
+        }
+        crate::firewall::LockoutStatus::Risks(risks) if !risks.is_empty() && !force => {
+            let ips = risks
+                .iter()
+                .map(|(ip, cidr)| format!("{ip} (blocked by {cidr})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "refusing to write: would block {} currently-connected SSH client \
+                 IP address(es): {ips}",
+                risks.len()
+            ));
+        }
+        _ => {}
+    }
+
+    crate::firewall::write_script(std::path::Path::new(&out_path), &built.script)
+        .map_err(|err| err.to_string())?;
+
+    let message = if apply {
+        match crate::firewall::apply_script(backend, std::path::Path::new(&out_path)) {
+            Ok(()) => format!(
+                "Firewall rules written to {out_path} and applied ({} rule(s)).",
+                built.written
+            ),
+            Err(err) => format!(
+                "Firewall rules written to {out_path}, but applying failed: {err}. \
+                 Apply manually with: {} {out_path}",
+                backend.apply_command()
+            ),
+        }
+    } else {
+        format!(
+            "Firewall rules written to {out_path}. Review it, then apply with: {} {out_path}",
+            backend.apply_command()
+        )
+    };
+    Ok(RenderOutcome { message })
 }
 
 impl App {
@@ -321,6 +426,9 @@ impl App {
             }
             Event::App(AppEvent::SshLogRead { text }) => self.finish_ssh_log_read(text)?,
             Event::App(AppEvent::NginxReloaded { result }) => self.finish_nginx_reload(result),
+            Event::App(AppEvent::FirewallRendered { signature, outcome }) => {
+                self.finish_render_firewall(signature, outcome)?
+            }
         }
         Ok(())
     }
@@ -885,76 +993,71 @@ impl App {
         force: bool,
         apply: bool,
     ) {
-        let result = (|| -> anyhow::Result<String> {
-            let built = crate::firewall::build_script(&self.db, backend)?;
-            // Both outcomes have to be handled, and the second one is why
-            // this is a `match` rather than an `if let`.
-            //
-            // `LogUnavailable` used to fall straight through: on any host
-            // where the SSH log isn't readable — not running as root, or a
-            // journald-only system where `journalctl` returns nothing —
-            // the guard silently did nothing and the script was written
-            // *and applied* with no warning at all. That is the one path
-            // in this project that can take a server off the network, and
-            // it was the path with no check on it.
-            //
-            // The CLI has always printed a note and continued, which is
-            // defensible there: a human is watching the terminal. Here the
-            // same key press can apply the script immediately, so it
-            // refuses instead. `--force`, or the CLI, remains the way
-            // through for someone who knows the log is missing and means
-            // it anyway.
-            match crate::firewall::assess_lockout_risk(&built.rules, self.ssh_log.as_deref()) {
-                crate::firewall::LockoutStatus::LogUnavailable if !force => {
-                    anyhow::bail!(
-                        "refusing to write: no SSH log could be read, so the lockout safety \
-                         check could not run. Start the TUI with --ssh-log <path>, or run \
-                         `stop-bots render-firewall` as root, which reports this and continues."
-                    );
-                }
-                crate::firewall::LockoutStatus::Risks(risks) if !risks.is_empty() && !force => {
-                    let ips = risks
-                        .iter()
-                        .map(|(ip, cidr)| format!("{ip} (blocked by {cidr})"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    anyhow::bail!(
-                        "refusing to write: would block {} currently-connected SSH client \
-                         IP address(es): {ips}",
-                        risks.len()
-                    );
-                }
-                _ => {}
-            }
-            crate::firewall::write_script(std::path::Path::new(&out_path), &built.script)?;
-            self.db
-                .set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
+        if self.jobs_in_flight.contains(&Job::RenderFirewall) {
+            // Said rather than silently dropped, and not coalesced: this
+            // one is only reachable by confirming a popup, so there is
+            // always someone watching who can press it again. Coalescing
+            // would also mean deciding which of two `out_path`s wins.
+            self.message = Some("A firewall render is already running.".to_string());
+            return;
+        }
 
-            if apply && self.apply_firewall {
-                return Ok(
-                    match crate::firewall::apply_script(backend, std::path::Path::new(&out_path)) {
-                        Ok(()) => format!(
-                            "Firewall rules written to {out_path} and applied ({} rule(s)).",
-                            built.written
-                        ),
-                        Err(err) => format!(
-                            "Firewall rules written to {out_path}, but applying failed: {err}. \
-                             Apply manually with: {} {out_path}",
-                            backend.apply_command()
-                        ),
-                    },
-                );
+        // Built here, on the main thread, because it reads the whole rule
+        // set out of `Db` — which isn't `Sync`. What goes to the
+        // background is everything after: the lockout check (a live SSH
+        // log read, which is the slow part), the write, and `nft -f`.
+        let built = match crate::firewall::build_script(&self.db, backend) {
+            Ok(built) => built,
+            Err(err) => {
+                self.message = Some(format!("Failed to render firewall rules: {err}"));
+                return;
             }
-            Ok(format!(
-                "Firewall rules written to {out_path}. Review it, then apply with: {} {out_path}",
-                backend.apply_command()
-            ))
-        })();
+        };
 
-        self.message = Some(match result {
-            Ok(message) => message,
-            Err(err) => format!("Failed to render firewall rules: {err}"),
+        self.jobs_in_flight.insert(Job::RenderFirewall);
+        let signature = crate::firewall::rules_signature(&built.rules);
+        let apply = apply && self.apply_firewall;
+        let ssh_log = self.ssh_log.clone();
+        let sender = self.events.sender();
+        tokio::task::spawn_blocking(move || {
+            let outcome = render_firewall_off_thread(
+                RenderRequest {
+                    backend,
+                    out_path,
+                    force,
+                    apply,
+                    ssh_log,
+                },
+                &built,
+            );
+            let _ = sender.send(Event::App(AppEvent::FirewallRendered {
+                signature,
+                outcome,
+            }));
         });
+    }
+
+    /// Applies a finished background render: the message either way, and
+    /// the rendered-rules signature when a script really was written. The
+    /// signature is what the Dashboard's "needs updating" row compares
+    /// against, and it is a `Db` write, so it waits for the main thread
+    /// like every other one.
+    fn finish_render_firewall(
+        &mut self,
+        signature: String,
+        outcome: Result<RenderOutcome, String>,
+    ) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::RenderFirewall);
+        match outcome {
+            Ok(outcome) => {
+                self.db.set_firewall_rendered_signature(&signature)?;
+                self.message = Some(outcome.message);
+            }
+            Err(err) => self.message = Some(format!("Failed to render firewall rules: {err}")),
+        }
+        // The signature the Dashboard's "needs updating" row compares
+        // against has just moved, so that row is stale wherever it is.
+        self.refresh()
     }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
@@ -1018,13 +1121,10 @@ impl App {
                 force,
                 apply,
             } => {
+                // The refresh that used to follow this line now happens
+                // in `finish_render_firewall`, once the signature the
+                // Dashboard compares against has actually been written.
                 self.render_firewall(backend, out_path, force, apply);
-                // A successful render persists a new rendered-rules
-                // signature (see `render_firewall`), which the Dashboard's
-                // "needs updating" row compares against — without this,
-                // that row would keep showing stale until some unrelated
-                // event (e.g. a cron job) happens to call `refresh` next.
-                self.refresh()?;
                 return Ok(());
             }
             KeyOutcome::ReloadNginx => {
@@ -1181,19 +1281,13 @@ mod tests {
     /// to a `journalctl` subprocess) — a fixed count would then stop one
     /// event short. Ticks dispatch through `handle_event` as harmless
     /// no-ops here (`check_cron` throttles itself right back out).
-    async fn drain_cron_events(app: &mut App) {
+    async fn drain_background_work(app: &mut App) {
         while !app.jobs_in_flight.is_empty() {
             let event = app.events.next().await.unwrap();
             app.handle_event(event).unwrap();
         }
     }
 
-    /// The direct `stop_bots::firewall` call this method now makes (instead
-    /// of shelling out to a `stop-bots` binary that might not be on `$PATH`
-    /// — see the doc comment on `render_firewall`) must still actually
-    /// write the script and report success.
-    // `App::new` spawns a background task via `EventHandler::new`, so
-    // constructing one needs an actual Tokio runtime, not just `#[test]`.
     /// A mutation still reaches every screen — just at the moment each
     /// one is next drawn, rather than in the keypress that caused it. The
     /// user-visible contract is unchanged; what changed is that a keypress
@@ -1232,6 +1326,12 @@ mod tests {
         );
     }
 
+    /// The direct `stop_bots::firewall` call this method now makes (instead
+    /// of shelling out to a `stop-bots` binary that might not be on `$PATH`
+    /// — see the doc comment on `render_firewall`) must still actually
+    /// write the script and report success.
+    // `App::new` spawns a background task via `EventHandler::new`, so
+    // constructing one needs an actual Tokio runtime, not just `#[test]`.
     #[tokio::test]
     async fn render_firewall_writes_the_script_and_sets_a_success_message() {
         let mut app = test_app();
@@ -1239,6 +1339,7 @@ mod tests {
         let out_path = dir.path().join("fw.nft").to_str().unwrap().to_string();
 
         app.render_firewall(FirewallBackend::Nftables, out_path.clone(), false, false);
+        drain_background_work(&mut app).await;
 
         assert!(std::path::Path::new(&out_path).exists());
         let message = app.message.as_deref().unwrap_or_default();
@@ -1261,6 +1362,7 @@ mod tests {
         let out_path = dir.path().join("fw.nft").to_str().unwrap().to_string();
 
         app.render_firewall(FirewallBackend::Nftables, out_path.clone(), false, true);
+        drain_background_work(&mut app).await;
 
         assert!(std::path::Path::new(&out_path).exists());
         let message = app.message.as_deref().unwrap_or_default();
@@ -1280,6 +1382,7 @@ mod tests {
 
         assert_eq!(app.db.get_firewall_rendered_signature().unwrap(), None);
         app.render_firewall(FirewallBackend::Nftables, out_path, false, false);
+        drain_background_work(&mut app).await;
         assert!(app.db.get_firewall_rendered_signature().unwrap().is_some());
     }
 
@@ -1314,6 +1417,7 @@ mod tests {
         }
         app.handle_key_event(KeyEvent::from(KeyCode::Enter))
             .unwrap();
+        drain_background_work(&mut app).await;
 
         assert!(
             out_path.exists(),
@@ -1334,6 +1438,7 @@ mod tests {
         let out_path = dir.path().join("fw.sh").to_str().unwrap().to_string();
 
         app.render_firewall(FirewallBackend::Iptables, out_path.clone(), false, false);
+        drain_background_work(&mut app).await;
 
         assert!(!std::path::Path::new(&out_path).exists());
         let message = app.message.as_deref().unwrap_or_default();
@@ -1397,7 +1502,7 @@ mod tests {
             .unwrap();
 
         app.check_cron().unwrap();
-        drain_cron_events(&mut app).await;
+        drain_background_work(&mut app).await;
 
         assert!(app
             .db
@@ -1428,7 +1533,7 @@ mod tests {
             std::time::Instant::now() - CRON_CHECK_INTERVAL - std::time::Duration::from_secs(1);
 
         app.check_cron().unwrap();
-        drain_cron_events(&mut app).await;
+        drain_background_work(&mut app).await;
 
         assert!(app
             .db
@@ -1465,7 +1570,7 @@ mod tests {
             std::time::Instant::now() - CRON_CHECK_INTERVAL - std::time::Duration::from_secs(1);
 
         app.check_cron().unwrap();
-        drain_cron_events(&mut app).await;
+        drain_background_work(&mut app).await;
         let first = app
             .db
             .get_cron_last_run(CronJob::Detect(Detector::SshScanners).id())
@@ -1518,6 +1623,7 @@ mod tests {
             false,
             false,
         );
+        drain_background_work(&mut app).await;
 
         assert!(
             !out.exists(),
@@ -1548,6 +1654,7 @@ mod tests {
             true,
             false,
         );
+        drain_background_work(&mut app).await;
 
         assert!(out.exists(), "message was: {:?}", app.message);
     }
@@ -1581,6 +1688,7 @@ mod tests {
             false,
             false,
         );
+        drain_background_work(&mut app).await;
 
         assert!(!out.exists(), "message was: {:?}", app.message);
         let message = app.message.clone().unwrap();
