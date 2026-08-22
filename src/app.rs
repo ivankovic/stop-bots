@@ -70,6 +70,9 @@ pub enum Job {
     ScanSites,
     /// Rewriting site config files. See [`App::start_site_action`].
     ApplySites,
+    /// Reading each site's config file to work out whether its block is
+    /// current. See [`App::check_site_statuses`].
+    CheckSiteStatuses,
 }
 
 impl Job {
@@ -84,6 +87,7 @@ impl Job {
             Job::RenderFirewall => "writing the firewall script".to_string(),
             Job::ScanSites => "scanning the NGINX config".to_string(),
             Job::ApplySites => "writing site config".to_string(),
+            Job::CheckSiteStatuses => "checking site config".to_string(),
         }
     }
 }
@@ -130,6 +134,11 @@ pub struct App {
     /// running, so [`App::finish_nginx_reload`] knows to start one more.
     /// See [`App::reload_nginx`] for why dropping it instead is wrong.
     reload_nginx_pending: bool,
+    /// Set when the site list or its settings changed while a status check
+    /// was already out. Coalesced rather than dropped for the same reason
+    /// a reload is: nothing else would ever catch up, so the tags would
+    /// keep describing the settings from before the change.
+    site_statuses_pending: bool,
     /// Screens whose cached state something has invalidated since they
     /// were last drawn — see [`Self::refresh`].
     stale: std::collections::HashSet<Screen>,
@@ -310,6 +319,7 @@ impl App {
             ssh_log_text: None,
             ssh_log_read_at: None,
             reload_nginx_pending: false,
+            site_statuses_pending: false,
             stale: std::collections::HashSet::new(),
             jobs_in_flight: std::collections::HashSet::new(),
             reload_nginx_for_real: reload_nginx,
@@ -363,7 +373,13 @@ impl App {
         match screen {
             Screen::Dashboard => self.dashboard.refresh(&self.db),
             Screen::BotSettings => self.bot_settings.refresh(&self.db),
-            Screen::SiteSettings => self.site_settings.refresh(&self.db),
+            Screen::SiteSettings => {
+                self.site_settings.refresh(&self.db)?;
+                // Same shape as the SSH log read above: `refresh` no
+                // longer reads every site's config file itself, so kick
+                // off the check that does.
+                self.check_site_statuses()
+            }
             Screen::DynamicProtection => {
                 // Kicked off here rather than on entering the screen: this
                 // is the one place every route to a visible SSH panel goes
@@ -436,6 +452,9 @@ impl App {
                 self.finish_render_firewall(signature, outcome)?
             }
             Event::App(AppEvent::SitesScanned { sites }) => self.finish_site_scan(sites)?,
+            Event::App(AppEvent::SiteStatusesChecked { statuses }) => {
+                self.finish_site_status_check(statuses)?
+            }
             Event::App(AppEvent::SitesApplied { outcome }) => {
                 // `Arc::try_unwrap` rather than a clone: `Event` has to be
                 // `Clone`, but only one handler ever sees a given one, so
@@ -770,6 +789,48 @@ impl App {
             };
             let _ = sender.send(Event::App(AppEvent::CronLogFetched { job, log_text }));
         });
+    }
+
+    /// Works out each site's UP TO DATE / STALE tag in the background.
+    ///
+    /// One config file read and one block re-render per site, which used
+    /// to happen inside `SiteSettings::refresh` — so every change to
+    /// anything on that screen paid for all of them before redrawing. The
+    /// `Db` half (each site's resolved `BlockConfig`) stays here.
+    fn check_site_statuses(&mut self) -> Result<()> {
+        if self.jobs_in_flight.contains(&Job::CheckSiteStatuses) {
+            self.site_statuses_pending = true;
+            return Ok(());
+        }
+        let plan = self.site_settings.plan_status_check(&self.db)?;
+        if plan.is_empty() {
+            // No sites, so nothing to read and nothing to wait for. Said
+            // explicitly because an empty check would otherwise leave the
+            // tags reading "checking" forever.
+            self.site_settings.finish_status_check(Vec::new());
+            return Ok(());
+        }
+        self.jobs_in_flight.insert(Job::CheckSiteStatuses);
+        let sender = self.events.sender();
+        tokio::task::spawn_blocking(move || {
+            let statuses = crate::tui::site_settings::run_status_check(&plan);
+            let _ = sender.send(Event::App(AppEvent::SiteStatusesChecked { statuses }));
+        });
+        Ok(())
+    }
+
+    /// Adopts a finished background status check, and starts another if
+    /// something changed while it was out.
+    fn finish_site_status_check(
+        &mut self,
+        statuses: Vec<crate::nginx::SiteApplyStatus>,
+    ) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::CheckSiteStatuses);
+        self.site_settings.finish_status_check(statuses);
+        if std::mem::take(&mut self.site_statuses_pending) {
+            self.check_site_statuses()?;
+        }
+        Ok(())
     }
 
     /// Starts one of Site settings' filesystem actions in the background.

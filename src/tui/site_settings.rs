@@ -200,6 +200,13 @@ pub struct SiteSettings {
     /// Parallel to `sites`: whether each site's on-disk config currently
     /// matches its computed rule. Recomputed in full on every `refresh`.
     statuses: Vec<SiteApplyStatus>,
+    /// Whether [`Self::statuses`] still describes what is on disk.
+    ///
+    /// Cleared by every [`Self::refresh`] and set again only when a
+    /// background check comes back. Without it, the tags would keep
+    /// showing the previous answer through the moment that matters most —
+    /// right after an apply, which is exactly when they change.
+    statuses_current: bool,
     list_state: ListState,
     popup: Option<Popup>,
     detail: Option<SiteDetail>,
@@ -223,6 +230,7 @@ impl SiteSettings {
             root,
             sites: Vec::new(),
             statuses: Vec::new(),
+            statuses_current: false,
             list_state: ListState::default(),
             popup: None,
             detail: None,
@@ -245,18 +253,13 @@ impl SiteSettings {
         self.rate_limit_rps = db.get_rate_limit_rps()?;
         self.rate_limit_burst = db.get_rate_limit_burst()?;
         self.sites = db.list_sites()?;
-        self.statuses = self
-            .sites
-            .iter()
-            .map(|site| {
-                let config = nginx::block_config_for_site(db, site.id)?;
-                Ok(nginx::site_apply_status(
-                    Path::new(&site.config_path),
-                    &site.server_name,
-                    &config,
-                ))
-            })
-            .collect::<Result<_>>()?;
+        // The status tags are *not* recomputed here: each one reads that
+        // site's config file off disk and re-renders its block to compare,
+        // which on a host with many sites is a visible pause every time
+        // anything on this screen changes. `App` runs the check in the
+        // background (`App::check_site_statuses`) and calls
+        // `finish_status_check`; until then the tags say so.
+        self.statuses_current = false;
         if !self.sites.is_empty() && self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
@@ -293,13 +296,17 @@ impl SiteSettings {
             let items: Vec<ListItem> = self
                 .sites
                 .iter()
-                .zip(&self.statuses)
-                .map(|(site, status)| {
+                .enumerate()
+                .map(|(index, site)| {
+                    let status = self
+                        .statuses_current
+                        .then(|| self.statuses.get(index))
+                        .flatten();
                     ListItem::new(Line::from(vec![
                         site.server_name.clone().bold(),
                         format!("  ({})", site.config_path).dim(),
                         Span::from("  "),
-                        status_tag(*status),
+                        status_tag(status),
                     ]))
                 })
                 .collect();
@@ -933,6 +940,48 @@ impl SiteSettings {
     }
 }
 
+/// Resolves what a status check needs out of `Db`, so the per-site file
+/// reads can happen off the main thread. Reuses [`PlannedSite`]: a status
+/// check and an apply need exactly the same three things about a site.
+impl SiteSettings {
+    pub fn plan_status_check(&self, db: &Db) -> Result<Vec<PlannedSite>> {
+        self.sites
+            .iter()
+            .map(|site| {
+                Ok(PlannedSite {
+                    server_name: site.server_name.clone(),
+                    config_path: PathBuf::from(&site.config_path),
+                    config: nginx::block_config_for_site(db, site.id)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Adopts a finished background status check.
+    ///
+    /// A check that no longer matches the site list is discarded: the list
+    /// changed while it was out (a scan finished, say), and the check
+    /// already running against the old one would put the wrong tag on the
+    /// wrong row. Another check is always started with the new list.
+    pub fn finish_status_check(&mut self, statuses: Vec<SiteApplyStatus>) {
+        if statuses.len() != self.sites.len() {
+            return;
+        }
+        self.statuses = statuses;
+        self.statuses_current = true;
+    }
+}
+
+/// Reads each planned site's config file and compares it against the block
+/// that site's settings currently render to. Runs on a background thread
+/// and touches no `Db`.
+pub fn run_status_check(sites: &[PlannedSite]) -> Vec<SiteApplyStatus> {
+    sites
+        .iter()
+        .map(|site| nginx::site_apply_status(&site.config_path, &site.server_name, &site.config))
+        .collect()
+}
+
 /// Which filesystem action Site settings has asked `App` to carry out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteAction {
@@ -1033,11 +1082,14 @@ fn clone_error(err: &anyhow::Error) -> (bool, String) {
     (is_permission_denied(err), err.to_string())
 }
 
-fn status_tag(status: SiteApplyStatus) -> Span<'static> {
+/// `None` means the check hasn't come back yet — the spinner rather than a
+/// guess, since the previous answer is exactly what an apply just changed.
+fn status_tag(status: Option<&SiteApplyStatus>) -> Span<'static> {
     match status {
-        SiteApplyStatus::UpToDate => " [ UP TO DATE ] ".green(),
-        SiteApplyStatus::Stale => " [ STALE ] ".yellow(),
-        SiteApplyStatus::NotFound => " [ NOT FOUND ] ".dim(),
+        Some(SiteApplyStatus::UpToDate) => " [ UP TO DATE ] ".green(),
+        Some(SiteApplyStatus::Stale) => " [ STALE ] ".yellow(),
+        Some(SiteApplyStatus::NotFound) => " [ NOT FOUND ] ".dim(),
+        None => format!(" [ {} CHECKING ] ", crate::tui::spinner_frame()).dim(),
     }
 }
 
@@ -1076,6 +1128,15 @@ mod tests {
                 screen.finish_apply(run_apply(plan))
             }
         }
+    }
+
+    /// Reloads the screen *and* works out the status tags, the way `App`
+    /// does across two turns of the event loop. `refresh` alone no longer
+    /// reads the config files — see `SiteSettings::refresh`.
+    fn refresh_with_statuses(screen: &mut SiteSettings, db: &Db) {
+        screen.refresh(db).unwrap();
+        let plan = screen.plan_status_check(db).unwrap();
+        screen.finish_status_check(run_status_check(&plan));
     }
 
     /// Presses Enter on an open confirm popup and carries out whatever it
@@ -1381,7 +1442,7 @@ mod tests {
             .unwrap();
 
         let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
+        refresh_with_statuses(&mut screen, &db);
         assert_eq!(screen.statuses, vec![SiteApplyStatus::Stale]);
 
         let mut message = None;
@@ -1397,7 +1458,7 @@ mod tests {
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("BadBot-UA"), "written was:\n{written}");
 
-        screen.refresh(&db).unwrap();
+        refresh_with_statuses(&mut screen, &db);
         assert_eq!(screen.statuses, vec![SiteApplyStatus::UpToDate]);
     }
 
@@ -1408,7 +1469,7 @@ mod tests {
             .unwrap();
 
         let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
+        refresh_with_statuses(&mut screen, &db);
 
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1580,7 +1641,7 @@ mod tests {
             .unwrap();
 
         let mut screen = test_screen();
-        screen.refresh(&db).unwrap();
+        refresh_with_statuses(&mut screen, &db);
         assert_eq!(
             screen.statuses,
             vec![SiteApplyStatus::Stale, SiteApplyStatus::Stale]
@@ -1602,7 +1663,7 @@ mod tests {
         assert!(fs::read_to_string(&path_a).unwrap().contains("BadBot-UA"));
         assert!(fs::read_to_string(&path_b).unwrap().contains("BadBot-UA"));
 
-        screen.refresh(&db).unwrap();
+        refresh_with_statuses(&mut screen, &db);
         assert_eq!(
             screen.statuses,
             vec![SiteApplyStatus::UpToDate, SiteApplyStatus::UpToDate]
@@ -1781,11 +1842,11 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
         confirm_popup(&mut screen, &db);
-        screen.refresh(&db).unwrap();
+        refresh_with_statuses(&mut screen, &db);
         assert_eq!(screen.statuses[0], SiteApplyStatus::UpToDate);
 
         db.set_block_response(BlockResponse::Close).unwrap();
-        screen.refresh(&db).unwrap();
+        refresh_with_statuses(&mut screen, &db);
         assert_eq!(screen.statuses[0], SiteApplyStatus::Stale);
     }
 

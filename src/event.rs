@@ -133,6 +133,12 @@ pub enum AppEvent {
     SitesApplied {
         outcome: std::sync::Arc<crate::tui::site_settings::ApplyOutcome>,
     },
+    /// A background pass over every site's config file, working out which
+    /// of them still match what their settings render to (see
+    /// `App::check_site_statuses`). In the site list's order.
+    SiteStatusesChecked {
+        statuses: Vec<crate::nginx::SiteApplyStatus>,
+    },
 }
 
 /// Terminal event handler: spawns a background task that emits tick events
