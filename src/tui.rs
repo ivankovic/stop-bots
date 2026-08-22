@@ -99,7 +99,7 @@ impl Theme {
 /// `crate::tui::dynamic_protection`), so it consumes those two keys rather
 /// than cycling screens while it's active; Left/Right/`h`/`l`/`d`/`b`/`s`/
 /// `p`/Esc still work as the way out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Screen {
     #[default]
     Dashboard,

@@ -76,6 +76,9 @@ pub struct App {
     /// check against `Event::Tick`'s 30fps rate (see
     /// [`CRON_CHECK_INTERVAL`]).
     last_cron_check: std::time::Instant,
+    /// Screens whose cached state something has invalidated since they
+    /// were last drawn — see [`Self::refresh`].
+    stale: std::collections::HashSet<Screen>,
     /// Which background work is currently out — see [`Job`] for what goes
     /// in here and why one set serves both purposes. Also what every
     /// spinner on screen is drawn from.
@@ -149,6 +152,7 @@ impl App {
             last_cron_check: std::time::Instant::now()
                 .checked_sub(CRON_CHECK_INTERVAL)
                 .unwrap_or_else(std::time::Instant::now),
+            stale: std::collections::HashSet::new(),
             jobs_in_flight: std::collections::HashSet::new(),
             reload_nginx,
             apply_firewall: reload_nginx,
@@ -161,23 +165,69 @@ impl App {
         // repeat every startup — registration never touches an existing
         // row's `enabled` flag.
         crate::ipranges::reputation::register_all_reputation_sources(&app.db)?;
-        app.refresh()?;
+        app.refresh_all()?;
         Ok(app)
     }
 
-    /// Reloads every screen's state from the database.
+    /// Reloads the screen on display and marks the rest stale, to be
+    /// reloaded when they next come into view.
+    ///
+    /// This used to reload all four eagerly, on every single mutation, and
+    /// most of that work was then thrown away unlooked at: toggling one
+    /// category default on the Dashboard also made Dynamic Protection
+    /// re-read the SSH log (a `journalctl` subprocess, on hosts without a
+    /// readable `auth.log`) and Bot settings re-list every one of ~700
+    /// bots. On a small server that was most of the pause after a
+    /// keypress. Deferring is not a heuristic here — a screen's cached
+    /// state cannot be observed until it is drawn.
     fn refresh(&mut self) -> Result<()> {
-        self.dashboard.refresh(&self.db)?;
-        self.bot_settings.refresh(&self.db)?;
-        self.site_settings.refresh(&self.db)?;
-        self.dynamic_protection
-            .refresh(&self.db, self.ssh_log.as_deref())?;
+        self.stale = Screen::TABS
+            .into_iter()
+            .filter(|&screen| screen != self.screen)
+            .collect();
+        self.refresh_screen(self.screen)
+    }
+
+    /// Reloads the screen about to be drawn if anything invalidated it
+    /// while it was off display. Driven from the draw loop rather than
+    /// from each place that assigns `self.screen`, so it covers every
+    /// route into a screen — the Tab keys, the `d`/`b`/`s`/`p` jumps,
+    /// backing out of a detail view — without any of them remembering to.
+    fn refresh_if_stale(&mut self) -> Result<()> {
+        if self.stale.remove(&self.screen) {
+            self.refresh_screen(self.screen)?;
+        }
+        Ok(())
+    }
+
+    /// Reloads one screen's state from the database. `Help` has none.
+    fn refresh_screen(&mut self, screen: Screen) -> Result<()> {
+        match screen {
+            Screen::Dashboard => self.dashboard.refresh(&self.db),
+            Screen::BotSettings => self.bot_settings.refresh(&self.db),
+            Screen::SiteSettings => self.site_settings.refresh(&self.db),
+            Screen::DynamicProtection => self
+                .dynamic_protection
+                .refresh(&self.db, self.ssh_log.as_deref()),
+            Screen::Help => Ok(()),
+        }
+    }
+
+    /// Reloads every screen, for startup — where there is no "currently
+    /// displayed" screen to privilege, and nothing on screen yet for the
+    /// wait to interrupt.
+    fn refresh_all(&mut self) -> Result<()> {
+        self.stale.clear();
+        for screen in Screen::TABS {
+            self.refresh_screen(screen)?;
+        }
         Ok(())
     }
 
     /// Runs the application's main loop.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         while self.running {
+            self.refresh_if_stale()?;
             terminal.draw(|frame| tui::render(&mut self, frame))?;
             let event = self.events.next().await?;
             self.handle_event(event)?;
@@ -997,6 +1047,44 @@ mod tests {
     /// write the script and report success.
     // `App::new` spawns a background task via `EventHandler::new`, so
     // constructing one needs an actual Tokio runtime, not just `#[test]`.
+    /// A mutation still reaches every screen — just at the moment each
+    /// one is next drawn, rather than in the keypress that caused it. The
+    /// user-visible contract is unchanged; what changed is that a keypress
+    /// no longer pays for three screens nobody is looking at.
+    #[tokio::test]
+    async fn a_mutation_defers_the_other_screens_reload_until_each_is_next_drawn() {
+        let mut app = test_app();
+        assert!(
+            app.stale.is_empty(),
+            "startup loads all four, so nothing starts out stale"
+        );
+
+        app.screen = Screen::Dashboard;
+        app.refresh().unwrap();
+
+        assert_eq!(
+            app.stale,
+            std::collections::HashSet::from([
+                Screen::BotSettings,
+                Screen::SiteSettings,
+                Screen::DynamicProtection,
+            ]),
+            "every screen except the one being looked at"
+        );
+
+        app.screen = Screen::BotSettings;
+        app.refresh_if_stale().unwrap();
+
+        assert!(
+            !app.stale.contains(&Screen::BotSettings),
+            "coming into view reloads it"
+        );
+        assert!(
+            app.stale.contains(&Screen::SiteSettings),
+            "and leaves the ones still off screen alone"
+        );
+    }
+
     #[tokio::test]
     async fn render_firewall_writes_the_script_and_sets_a_success_message() {
         let mut app = test_app();
