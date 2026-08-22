@@ -1237,12 +1237,20 @@ fn test_config() -> Result<()> {
 /// rather than send the admin to `systemctl status`/`journalctl`.
 pub fn reload() -> Result<()> {
     test_config()?;
-    let status = std::process::Command::new("systemctl")
+    // `output`, not `status`: `status` inherits stdout and stderr, so
+    // anything systemctl says lands directly on the TUI's alternate screen
+    // and corrupts it. Non-root that includes a polkit agent, which takes
+    // over the terminal outright to ask for a password.
+    let output = std::process::Command::new("systemctl")
         .args(["reload", "nginx"])
-        .status()
+        .output()
         .context("failed to run `systemctl reload nginx`")?;
-    if !status.success() {
-        anyhow::bail!("systemctl reload nginx exited with {status}");
+    if !output.status.success() {
+        anyhow::bail!(
+            "systemctl reload nginx exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }
