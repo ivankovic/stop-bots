@@ -33,6 +33,14 @@ need.
 
 ### Fixed
 
+- The TUI now clears the screen before its first frame. On a terminal that ignores the
+  alternate-screen request the shell's scrollback stayed put, and because ratatui never
+  transmits the blank cells of a first frame, the old text showed through every gap — the
+  UI was unreadable.
+- `systemctl reload nginx` no longer writes onto the TUI's screen: its output was
+  inherited rather than captured, so anything it said corrupted the display, and non-root
+  a polkit agent could take over the terminal outright. Its stderr now appears in the
+  error message instead.
 - **The TUI's firewall render no longer applies a script when the lockout safety check
   couldn't run.** If no SSH log was readable — not running as root, or a journald-only host —
   the check was silently skipped and the script written and applied anyway. This could take a

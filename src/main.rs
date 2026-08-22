@@ -816,6 +816,29 @@ fn resolve_user_db_path(
     Ok(data_home.join("stop-bots").join("db.sqlite3"))
 }
 
+/// Blanks the screen before the TUI's first frame.
+///
+/// `ratatui::init` enters the alternate screen, which normally comes up
+/// blank — but a terminal that ignores the request (a `TERM` without
+/// `smcup`, tmux with `alternate-screen off`) leaves the shell's scrollback
+/// where it is. That would be cosmetic if the first frame painted over it,
+/// and it doesn't: ratatui diffs each frame against the previous one, and
+/// the first is diffed against a buffer that is already blank, so none of
+/// the frame's blank cells are transmitted and the old text shows through
+/// every gap.
+///
+/// Deliberately not `Terminal::clear`, which snapshots the cursor position
+/// first — a `\x1b[6n` query that blocks until the terminal answers, and
+/// errors out after a timeout on any terminal that doesn't. There is no
+/// cursor position worth preserving here.
+fn clear_screen() -> Result<()> {
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+    )
+    .context("failed to clear the terminal")
+}
+
 async fn run_tui(
     db_path: Option<PathBuf>,
     root: PathBuf,
@@ -825,7 +848,12 @@ async fn run_tui(
     let db = open_db(db_path)?;
     let app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
     let terminal = ratatui::init();
-    let result = app.run(terminal).await;
+    // Not `?`: bailing here would skip the `restore` below and leave the
+    // terminal in raw mode.
+    let result = match clear_screen() {
+        Ok(()) => app.run(terminal).await,
+        Err(err) => Err(err),
+    };
     ratatui::restore();
     result
 }

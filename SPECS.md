@@ -3091,3 +3091,46 @@ since it needs Docker and `NET_ADMIN`. Its own CI job.
 - Tests calling `docker build` in parallel raced on the staged binary,
   producing four unrelated-looking failures that each passed in
   isolation. Guarded with a `Once`.
+
+## Two ways the TUI corrupted its own screen (`main.rs::clear_screen`, `nginx::reload`)
+
+Reported from a real server: the TUI came up unreadable, the shell's
+scrollback still visible through it.
+
+**`ratatui::init` does enter the alternate screen** — `try_init` runs
+`execute!(stdout(), EnterAlternateScreen)`, so the first suspicion was
+wrong. The bug is what happens when a terminal *ignores* that request (a
+`TERM` without `smcup`, tmux with `alternate-screen off`, some SSH
+clients): the old content stays on screen, and ratatui never paints over
+it. Each frame is diffed against the previous one, and the very first is
+diffed against a buffer whose cells are already blank — so every blank
+cell of the first frame is skipped, and the scrollback shows through the
+gaps. Nothing about this is visible in the *rendered* text; the widgets
+are all correct.
+
+So `run_tui` now emits an unconditional `Clear(All)` after `init`, which
+is right whether or not `?1049h` was honoured.
+
+**Not `Terminal::clear`**, which was the obvious call and is wrong here:
+`ratatui-core` snapshots the cursor with `get_cursor_position()` first,
+a blocking `\x1b[6n` DSR query. There is no cursor position worth
+preserving before a full repaint, and on a terminal that doesn't answer
+the query it fails outright — as it did immediately, in the pty test
+written to cover this, with *"The cursor position could not be read
+within a normal duration"*. Straight `crossterm::terminal::Clear` asks
+nothing of the terminal.
+
+**The second leak, found while looking:** `nginx::reload` ran `systemctl
+reload nginx` with `.status()`, which inherits stdout and stderr. Every
+other subprocess in the codebase already used `.output()`. Anything
+systemctl printed went straight onto the alternate screen; worse,
+non-root, polkit can spawn a `pkttyagent` that takes the terminal over
+completely to ask for a password. Now captured, with stderr folded into
+the error message — where it is actually readable.
+
+**Testing it:** the assertion is on raw escape bytes in the pty stream
+(`\x1b[?1049h`, then `\x1b[2J`, then the first rendered text), because
+`exp_string` only scans forward — finding them in sequence is the
+ordering assertion. This is one of the few places where asserting on
+bytes rather than on rendered text is the point: the rendered text was
+never wrong.

@@ -333,6 +333,37 @@ fn expect_status_after(session: &mut PtySession, anchor: &str) -> &'static str {
     }
 }
 
+/// Asserts on raw escape bytes rather than on rendered text, because the
+/// bug this covers is invisible in the rendered text: ratatui diffs each
+/// frame against the previous one, and the very first frame is diffed
+/// against a buffer that is already blank, so none of the frame's blank
+/// cells are ever transmitted. On a terminal that honours the
+/// alternate-screen request that is harmless. On one that ignores it, the
+/// shell's scrollback stays put and shows through every gap in the first
+/// frame — the report that prompted this test. `run_tui` clears explicitly
+/// to force a full first repaint; these two sequences, in this order, are
+/// what that looks like on the wire.
+#[test]
+fn startup_enters_the_alternate_screen_and_clears_it_before_drawing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+
+    session
+        .exp_string("\x1b[?1049h")
+        .expect("the TUI should enter the alternate screen");
+    // `exp_string` only scans forward, so finding this after the sequence
+    // above is also an assertion that the clear comes second.
+    session
+        .exp_string("\x1b[2J")
+        .expect("the TUI should clear the screen before its first frame");
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
 #[test]
 fn navigate_change_a_setting_and_quit() {
     let tmp = tempfile::tempdir().unwrap();
