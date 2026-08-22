@@ -3134,3 +3134,107 @@ the error message — where it is actually readable.
 ordering assertion. This is one of the few places where asserting on
 bytes rather than on rendered text is the point: the rendered text was
 never wrong.
+
+## Taking every blocking action off the TUI's event loop
+
+Reported from the same server as the garbled screen: on a small machine
+many actions froze the interface outright.
+
+The loop is `draw` → `await event` → `handle_event`, so anything slow in
+a handler is a frozen screen for exactly as long as it takes. Nothing was
+async except four network fetches that already had the pattern.
+
+**The rule that shaped all of it.** `Db` holds a `rusqlite::Connection`,
+which is `Send` but not `Sync`, and the codebase had already settled on
+"all database access on the main thread" — `AppEvent::CronLogFetched`
+even documents it: *only the reading of the log is blocking enough to
+move off the main thread; the parsing and the `Db` writes stay*.
+Extending that beat the alternative (`Arc<Mutex<Db>>`), which would have
+let a background job hold the lock across a subprocess — a freeze by
+another route, and an easy invariant to violate. Every split below is the
+same: resolve from `Db` on the main thread, do the slow half on the
+blocking pool, fold the result back on the main thread.
+
+**What was actually slow, in the order it was fixed:**
+
+- `sshlog::find_default_source()` inside `DynamicProtection::refresh` —
+  a `journalctl` subprocess on any host without a readable `auth.log`,
+  half a second or more, and it ran on *every* reload of the screen.
+  The worst of them by a wide margin.
+- `nginx -t` + `systemctl reload nginx`, after an apply.
+- The firewall render: a live SSH-log read for the lockout check, the
+  script write, then `nft -f`.
+- `nginx::discover_sites` (a walk of the whole config root) and the
+  per-site config rewrites — both inside `SiteSettings::handle_key`.
+- `nginx::site_apply_status` in `SiteSettings::refresh`: one config file
+  read and one block re-render per site, per change to that screen.
+
+**Cheaper than async, and done first:** `refresh()` reloaded all four
+screens on every mutation and threw three of them away unlooked at.
+Toggling a category default on the Dashboard re-read the SSH log and
+re-listed ~700 bots. The other three are marked stale and reload when
+each next comes into view, driven from the draw loop so every route into
+a screen is covered. Deferring is safe by construction rather than by
+judgement: a screen's cached state cannot be observed before it is drawn.
+
+**Widening the `KeyOutcome` boundary.** Everything above except the last
+two was work `App` already owned. The scan and the applies were not:
+`SiteSettings::handle_key` performed them itself and returned
+`ReloadNginx` afterwards. So the screen now returns
+`KeyOutcome::SiteAction` as *data*, and `App` plans it against `Db`,
+performs it on the blocking pool, and hands the outcome back through
+`finish_apply`/`finish_scan`. `nginx::write_managed_files` and
+`remove_unused_managed_files` grew resolve/perform pairs for the same
+reason; both still exist unchanged for the CLI, which wants them in one
+go.
+
+**Dedupe versus coalesce, which is not a style choice.** One in-flight
+set (`App::jobs_in_flight`) both animates the spinners and stops the same
+work starting twice. Dropping a duplicate is right for a *read* — a
+skipped SSH-log re-read only means slightly stale display, and the 30s
+timer catches it. It is wrong for anything shaped write-then-act, where
+the act has to happen at least once after the last write:
+
+> Apply site A. Its reload starts. Apply site B while it is still out —
+> the file is written, the reload is dropped, and NGINX never picks B up.
+
+That is a silent wrong answer, and worse than the pause being fixed. The
+reload holds a pending flag instead, which the finishing reload consumes.
+The site status check needed the same treatment for the same reason:
+nothing else would ever catch up, so the tags would keep describing the
+settings from before the change. The firewall render is the exception —
+it is only reachable by confirming a popup, so a second request is
+*reported* rather than coalesced (and coalescing would mean deciding
+which of two output paths wins).
+
+**The safety property that must not be optimised.** `render_firewall`'s
+lockout check reads the SSH log live, every time. `App::ssh_log_text` —
+the cached copy Dynamic Protection draws from — must never reach it. The
+free function that runs on the worker only ever receives the *path*, so
+there is no way to pass it the cache by accident.
+
+**Saying so on screen.** The footer is the only line drawn on every
+screen, and `App::message` only ever appeared on the Dashboard — so an
+admin applying from Site settings had nothing telling them the TUI was
+waiting rather than idle. It now names the running job with a braille
+spinner, sorted so which of several gets named doesn't flicker.
+`spinner_frame()` reads wall-clock rather than a per-widget counter,
+which both costs no plumbing and keeps every spinner on screen turning in
+step. The site status tags show `CHECKING` rather than the previous
+answer, because the moment they are most read is right after an apply —
+exactly when the old answer is wrong.
+
+**Testing non-blocking, without timing.** The pty harness gets a fake
+`systemctl` that parks until the test deletes a gate file. The TUI then
+has to switch screens and draw *while it is parked*; a synchronous reload
+cannot, because the keypress would sit in the queue until `systemctl`
+returned. Ordering, not timing — no sleeps, nothing that degrades on a
+loaded machine. The same harness proves the coalescing: two applies with
+the gate held across both must produce two `systemctl` calls. Both tests
+were checked by reverting their fix and watching them fail.
+
+One thing this exercise re-taught: a long literal needle is a bad pty
+assertion across a screen switch. Ratatui skips any cell that already
+holds the right character, so `"Top IPs attempting SSH"` arrives split
+around whatever the two screens have in common at the same column, while
+`"Top IPs"` does not.

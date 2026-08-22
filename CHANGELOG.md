@@ -31,6 +31,28 @@ need.
   `/var/log/auth.log` paid a `journalctl` invocation (0.5s or more) on every
   refresh of the Dynamic Protection screen.
 
+### Changed
+
+- **The TUI no longer blocks on anything it does.** Every action that touches the
+  filesystem, a subprocess or the network now runs on a background thread while the
+  interface stays live: reloading NGINX, rendering and applying the firewall script,
+  scanning the NGINX config root, applying site configs, working out each site's
+  UP TO DATE / STALE tag, and reading the SSH log that Dynamic Protection's SSH panel is
+  built from. On a small server several of these were multi-second pauses with a frozen
+  screen. Database access still happens on the main thread, where it is fast and where
+  SQLite's connection can go.
+
+  The footer names whatever is running, with a braille spinner, on every screen; the SSH
+  panel and the site status tags carry their own. Two safety properties are unchanged and
+  covered by tests: the firewall's lockout guard still reads the SSH log *live* rather
+  than from the display cache, and a reload requested while one is running is held rather
+  than dropped, so applying a second site can't leave NGINX serving its old config.
+
+- A keypress reloads only the screen being looked at. All four used to reload on every
+  mutation, so toggling one category default on the Dashboard also made Dynamic
+  Protection re-read the SSH log and Bot settings re-list every bot. The other three
+  reload when each next comes into view.
+
 ### Fixed
 
 - The TUI now clears the screen before its first frame. On a terminal that ignores the
