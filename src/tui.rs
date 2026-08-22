@@ -32,6 +32,7 @@ use crate::app::App;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
+    text::{Line, Span},
     widgets::{Block, Paragraph, Tabs},
     Frame,
 };
@@ -283,7 +284,36 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             app.theme.label()
         ),
     };
-    frame.render_widget(Paragraph::new(hint).dim(), area);
+    match busy_label(&app.jobs_in_flight) {
+        // Not dimmed, unlike the hint: this is the one line that says the
+        // TUI is waiting on something rather than idle, and it has to read
+        // as foreground text next to a key hint nobody rereads.
+        Some(busy) => frame.render_widget(
+            Line::from(vec![
+                Span::raw(format!("{} {busy}   ", spinner_frame())),
+                Span::raw(hint).dim(),
+            ]),
+            area,
+        ),
+        None => frame.render_widget(Paragraph::new(hint).dim(), area),
+    }
+}
+
+/// What the footer says is happening, or `None` when nothing is.
+///
+/// Only one job is named even when several are out, because the footer is
+/// one line and the count is what matters past the first — an admin
+/// waiting on an NGINX reload does not need the scheduled log read
+/// itemised. Sorted so which one gets named doesn't flicker between
+/// redraws of the same set, `HashSet` iteration order being arbitrary.
+fn busy_label(jobs: &std::collections::HashSet<crate::app::Job>) -> Option<String> {
+    let mut labels: Vec<String> = jobs.iter().map(crate::app::Job::label).collect();
+    labels.sort();
+    let first = labels.first()?;
+    Some(match labels.len() {
+        1 => first.clone(),
+        n => format!("{first} (+{} more)", n - 1),
+    })
 }
 
 #[cfg(test)]

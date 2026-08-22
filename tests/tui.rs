@@ -274,9 +274,22 @@ fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
 /// tools at all; this is the opposite: run them, and control what they
 /// resolve to.
 fn spawn_tui_with_fake_tools(db_path: &Path, fakebin: &Path) -> PtySession {
+    spawn_tui_with_fake_tools_and_args(db_path, fakebin, &[])
+}
+
+/// [`spawn_tui_with_fake_tools`] plus extra arguments — for the one test
+/// that needs both a fake `nginx`/`systemctl` on PATH *and* a `--root`
+/// pointing at a writable fixture tree, so it can drive a real Site
+/// settings apply all the way through to the reload it triggers.
+fn spawn_tui_with_fake_tools_and_args(
+    db_path: &Path,
+    fakebin: &Path,
+    extra_args: &[&str],
+) -> PtySession {
     seed_cron_state(db_path);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
     cmd.args(["tui", "--db", db_path.to_str().unwrap()]);
+    cmd.args(extra_args);
     cmd.args(["--ssh-log", "tests/fixtures/logs/auth.log"]);
     cmd.env("TERM", "xterm-256color");
     cmd.env(
@@ -666,6 +679,132 @@ fn copy_dir_all(src: &Path, dst: &Path) {
             std::fs::copy(entry.path(), &target).unwrap();
         }
     }
+}
+
+/// The reload NGINX needs after an apply runs in the background now, so
+/// the TUI stays live through it.
+///
+/// The non-blocking half is asserted by *ordering*, not by timing: the
+/// fake `systemctl` parks until this test deletes a gate file, and the TUI
+/// has to have switched screens and drawn the Dashboard while it is still
+/// parked. A synchronous reload cannot do that — the keypress would sit in
+/// the queue until `systemctl` returned, so the Dashboard would arrive
+/// after the call was logged, not before. No sleeps, and nothing that gets
+/// slower on a loaded machine.
+///
+/// Fake `nginx`/`systemctl` on PATH, so this asserts on real process
+/// execution without reloading whatever NGINX the test machine is running.
+#[test]
+fn applying_a_site_reloads_nginx_in_the_background() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
+
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "update-bot-lists",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ])
+        .assert()
+        .success();
+    AssertCommand::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "scan-sites",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let fakebin = tmp.path().join("bin");
+    fs::create_dir_all(&fakebin).unwrap();
+    let calls = tmp.path().join("calls.log");
+    // `systemctl` parks on this until the test removes it; `nginx -t`
+    // stays instant, since `reload` runs it first and gives up if it
+    // fails.
+    let gate = tmp.path().join("gate");
+    fs::write(&gate, "").unwrap();
+    let scripts = [
+        ("nginx", String::new()),
+        (
+            "systemctl",
+            format!("while [ -e \"{}\" ]; do sleep 0.02; done\n", gate.display()),
+        ),
+    ];
+    for (tool, wait) in scripts {
+        let path = fakebin.join(tool);
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n{wait}echo \"{tool} $@\" >> \"{}\"\nexit 0\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let mut session = spawn_tui_with_fake_tools_and_args(
+        &db_path,
+        &fakebin,
+        &["--root", nginx_root.to_str().unwrap()],
+    );
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+    send_key(&mut session, "a");
+    session.exp_string("Cancel").unwrap();
+    send_key(&mut session, "\x1b[B"); // Cancel -> Apply now
+    send_key(&mut session, "\r");
+
+    // The apply's own result lands immediately, with the reload still out.
+    session.exp_string("UP").unwrap();
+    // And the TUI keeps taking input while it is: jump to the Dashboard
+    // and watch it draw, with `systemctl` still parked on the gate.
+    send_key(&mut session, "d");
+    session.exp_string("wide").unwrap();
+
+    let so_far = fs::read_to_string(&calls).unwrap_or_default();
+    assert!(
+        !so_far.contains("systemctl"),
+        "the reload should still be running -- the TUI answered a keypress \
+         while it was, which is the point. calls.log held: {so_far:?}"
+    );
+
+    fs::remove_file(&gate).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms());
+    let log = loop {
+        let log = fs::read_to_string(&calls).unwrap_or_default();
+        if log.contains("systemctl reload nginx") {
+            break log;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "systemctl was never invoked; calls.log held: {log:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        log.contains("nginx -t"),
+        "the config must be validated before the reload; calls.log was: {log:?}"
+    );
+
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
 }
 
 #[test]

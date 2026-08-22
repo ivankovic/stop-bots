@@ -106,6 +106,10 @@ pub enum AppEvent {
     /// happens on the main thread, same as `CronLogFetched` above and for
     /// the same reason.
     SshLogRead { text: Option<String> },
+    /// The background `nginx -t` + `systemctl reload nginx` that follows a
+    /// Site settings apply has finished (see `App::reload_nginx`). `Err`
+    /// carries the stringified failure, `anyhow::Error` not being `Clone`.
+    NginxReloaded { result: Result<(), String> },
 }
 
 /// Terminal event handler: spawns a background task that emits tick events

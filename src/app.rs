@@ -60,6 +60,22 @@ pub enum Job {
     /// Reading the SSH log that Dynamic Protection's SSH panel is built
     /// from. See [`App::read_ssh_log`].
     ReadSshLog,
+    /// `nginx -t` followed by `systemctl reload nginx`, after Site
+    /// settings has written a config file. See [`App::reload_nginx`].
+    ReloadNginx,
+}
+
+impl Job {
+    /// What the footer calls this while it is running. Phrased as what is
+    /// happening, not as the name of a function, since this is the only
+    /// thing on screen explaining why the admin is waiting.
+    pub fn label(&self) -> String {
+        match self {
+            Job::Cron(job) => format!("{} (scheduled)", job.label()),
+            Job::ReadSshLog => "reading the SSH log".to_string(),
+            Job::ReloadNginx => "reloading NGINX".to_string(),
+        }
+    }
 }
 
 /// How long a read of the SSH log stays good enough to rebuild Dynamic
@@ -114,7 +130,7 @@ pub struct App {
     /// to the real `nginx -t`/`systemctl reload nginx` on whatever machine
     /// runs the test suite (see `main.rs`'s `tui --no-reload` flag, the
     /// same escape hatch `apply-blocks --no-reload` uses).
-    reload_nginx: bool,
+    reload_nginx_for_real: bool,
     /// SSH log override (`tui --ssh-log`). `None` auto-detects, which can
     /// mean shelling out to `journalctl` — on some hosts more than half a
     /// second per call, and this is consulted on every refresh of the
@@ -125,7 +141,7 @@ pub struct App {
     ssh_log: Option<std::path::PathBuf>,
     /// Whether a render popup confirmed with "apply after writing" actually
     /// calls `firewall::apply_script()`. Same shape and same reason as
-    /// `reload_nginx`: always `true` for real usage, `false` only for tests
+    /// `reload_nginx_for_real`: always `true` for real usage, `false` only for tests
     /// — without this, a test requesting `apply: true` would shell out to
     /// the real `nft -f`/`sh` against whatever host runs the suite. Shares
     /// `main.rs`'s `--no-reload` flag rather than getting its own, since
@@ -137,7 +153,7 @@ pub struct App {
 impl App {
     /// Constructs a new [`App`], loading initial state from `db`. `root` is
     /// the NGINX config root Site settings scans when the user triggers a
-    /// rescan from the TUI. `reload_nginx` gates whether a successful Site
+    /// rescan from the TUI. `reload_nginx_for_real` gates whether a successful Site
     /// settings apply actually reloads NGINX, and whether a firewall render
     /// popup confirmed with "apply after writing" actually applies it (see
     /// both fields' doc comments) — one flag for both, since they exist for
@@ -180,7 +196,7 @@ impl App {
             ssh_log_read_at: None,
             stale: std::collections::HashSet::new(),
             jobs_in_flight: std::collections::HashSet::new(),
-            reload_nginx,
+            reload_nginx_for_real: reload_nginx,
             apply_firewall: reload_nginx,
             ssh_log,
         };
@@ -299,6 +315,7 @@ impl App {
                 self.finish_cron_log_job(job, log_text)?;
             }
             Event::App(AppEvent::SshLogRead { text }) => self.finish_ssh_log_read(text)?,
+            Event::App(AppEvent::NginxReloaded { result }) => self.finish_nginx_reload(result),
         }
         Ok(())
     }
@@ -625,6 +642,40 @@ impl App {
             };
             let _ = sender.send(Event::App(AppEvent::CronLogFetched { job, log_text }));
         });
+    }
+
+    /// Reloads NGINX in the background, after Site settings has written a
+    /// config file.
+    ///
+    /// `nginx -t` parses every file in the install and `systemctl reload
+    /// nginx` waits on the master process; together they are seconds on a
+    /// small server, and they used to run inside the keypress that asked
+    /// for them. No `Db` is involved, so the whole thing moves.
+    ///
+    /// The in-flight guard is doing real work here: holding Enter on
+    /// "apply" would otherwise start one reload per repeat, all of them
+    /// racing on the same NGINX master.
+    fn reload_nginx(&mut self) {
+        if !self.reload_nginx_for_real || !self.jobs_in_flight.insert(Job::ReloadNginx) {
+            return;
+        }
+        let sender = self.events.sender();
+        tokio::task::spawn_blocking(move || {
+            let result = nginx::reload().map_err(|err| err.to_string());
+            let _ = sender.send(Event::App(AppEvent::NginxReloaded { result }));
+        });
+    }
+
+    /// Reports how the background NGINX reload went. A failure is appended
+    /// to whatever the apply itself said rather than replacing it: the
+    /// files really were written, and that is worth knowing alongside the
+    /// news that NGINX is still serving the old ones.
+    fn finish_nginx_reload(&mut self, result: Result<(), String>) {
+        self.jobs_in_flight.remove(&Job::ReloadNginx);
+        if let Err(err) = result {
+            let applied = self.message.take().unwrap_or_default();
+            self.message = Some(format!("{applied} — failed to reload NGINX: {err}"));
+        }
     }
 
     /// Reads the SSH log into [`App::ssh_log_text`], in the background, if
@@ -961,12 +1012,7 @@ impl App {
             }
             KeyOutcome::ReloadNginx => {
                 self.refresh()?;
-                if self.reload_nginx {
-                    if let Err(err) = nginx::reload() {
-                        let applied = self.message.take().unwrap_or_default();
-                        self.message = Some(format!("{applied} — failed to reload NGINX: {err}"));
-                    }
-                }
+                self.reload_nginx();
                 return Ok(());
             }
             KeyOutcome::Ignored => {}
