@@ -207,6 +207,13 @@ pub enum KeyOutcome {
     /// free of real process execution so its tests stay fast and
     /// deterministic (see `crate::nginx::reload`).
     ReloadNginx,
+    /// Site settings confirmed one of its filesystem actions: a scan of
+    /// the NGINX config root, or an apply to one site or to all of them.
+    /// All three walk or rewrite files under `/etc/nginx`, so — same
+    /// reasoning as [`Self::ReloadNginx`] and [`Self::RenderFirewall`] —
+    /// `App` performs them, off the event loop, rather than the screen's
+    /// key handler doing it inline.
+    SiteAction(crate::tui::site_settings::SiteAction),
 }
 
 /// Braille "dots" spinner frames, in rotation order.

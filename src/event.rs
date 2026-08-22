@@ -119,6 +119,20 @@ pub enum AppEvent {
         signature: String,
         outcome: Result<crate::app::RenderOutcome, String>,
     },
+    /// A background walk of the NGINX config root has finished. The
+    /// `upsert_site` calls it implies happen on the main thread, `Db` not
+    /// being `Sync`.
+    SitesScanned {
+        sites: Result<Vec<crate::nginx::DiscoveredSite>, String>,
+    },
+    /// A background apply of one or every site's config has finished.
+    ///
+    /// Behind an `Arc` only because `Event` must be `Clone` and
+    /// `ApplyOutcome` isn't worth making so — it is unwrapped, not cloned,
+    /// on the one delivery it gets.
+    SitesApplied {
+        outcome: std::sync::Arc<crate::tui::site_settings::ApplyOutcome>,
+    },
 }
 
 /// Terminal event handler: spawns a background task that emits tick events

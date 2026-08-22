@@ -661,14 +661,35 @@ pub fn rate_limit_conf_body(rate_per_second: i64, zone_megabytes: i64) -> String
 /// Deliberately does not delete anything — see
 /// [`remove_unused_managed_files`] for why the two halves are separate.
 pub fn write_managed_files(db: &crate::db::Db) -> Result<()> {
+    write_planned_managed_files(&planned_managed_files(db)?)
+}
+
+/// The managed files the current settings call for, as `(path, body)`
+/// pairs.
+///
+/// Split out of [`write_managed_files`] so that the `Db` reads and the
+/// disk writes can happen in different places: the TUI resolves this on
+/// the main thread (`Db` isn't `Sync`) and writes it on a background
+/// thread, so an apply doesn't stall the event loop. The CLI still calls
+/// [`write_managed_files`], which does both in one go.
+pub fn planned_managed_files(db: &crate::db::Db) -> Result<Vec<(PathBuf, String)>> {
+    let mut files = Vec::new();
     if db.get_serve_robots_txt()? {
-        write_managed(&robots_txt_path(), &robots_txt_body(db)?)?;
+        files.push((robots_txt_path(), robots_txt_body(db)?));
     }
     if db.get_rate_limit_enabled()? {
-        write_managed(
-            &rate_limit_conf_path(),
-            &rate_limit_conf_body(db.get_rate_limit_rps()?, db.get_rate_limit_zone_mb()?),
-        )?;
+        files.push((
+            rate_limit_conf_path(),
+            rate_limit_conf_body(db.get_rate_limit_rps()?, db.get_rate_limit_zone_mb()?),
+        ));
+    }
+    Ok(files)
+}
+
+/// Writes what [`planned_managed_files`] resolved. Touches no `Db`.
+pub fn write_planned_managed_files(files: &[(PathBuf, String)]) -> Result<()> {
+    for (path, body) in files {
+        write_managed(path, body)?;
     }
     Ok(())
 }
@@ -688,11 +709,27 @@ pub fn write_managed_files(db: &crate::db::Db) -> Result<()> {
 ///
 /// A missing file is success, not an error.
 pub fn remove_unused_managed_files(db: &crate::db::Db) -> Result<()> {
+    remove_planned_managed_files(&unused_managed_files(db)?)
+}
+
+/// The managed files the current settings no longer reference. Split from
+/// the removal for the same reason [`planned_managed_files`] is split from
+/// the write.
+pub fn unused_managed_files(db: &crate::db::Db) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
     if !db.get_serve_robots_txt()? {
-        remove_managed(&robots_txt_path())?;
+        paths.push(robots_txt_path());
     }
     if !db.get_rate_limit_enabled()? {
-        remove_managed(&rate_limit_conf_path())?;
+        paths.push(rate_limit_conf_path());
+    }
+    Ok(paths)
+}
+
+/// Deletes what [`unused_managed_files`] resolved. Touches no `Db`.
+pub fn remove_planned_managed_files(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        remove_managed(path)?;
     }
     Ok(())
 }

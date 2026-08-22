@@ -66,6 +66,10 @@ pub enum Job {
     /// Writing the firewall script and, if asked, applying it. See
     /// [`App::render_firewall`].
     RenderFirewall,
+    /// Walking the NGINX config root. See [`App::start_site_action`].
+    ScanSites,
+    /// Rewriting site config files. See [`App::start_site_action`].
+    ApplySites,
 }
 
 impl Job {
@@ -78,6 +82,8 @@ impl Job {
             Job::ReadSshLog => "reading the SSH log".to_string(),
             Job::ReloadNginx => "reloading NGINX".to_string(),
             Job::RenderFirewall => "writing the firewall script".to_string(),
+            Job::ScanSites => "scanning the NGINX config".to_string(),
+            Job::ApplySites => "writing site config".to_string(),
         }
     }
 }
@@ -429,6 +435,15 @@ impl App {
             Event::App(AppEvent::FirewallRendered { signature, outcome }) => {
                 self.finish_render_firewall(signature, outcome)?
             }
+            Event::App(AppEvent::SitesScanned { sites }) => self.finish_site_scan(sites)?,
+            Event::App(AppEvent::SitesApplied { outcome }) => {
+                // `Arc::try_unwrap` rather than a clone: `Event` has to be
+                // `Clone`, but only one handler ever sees a given one, so
+                // the `Arc` is unshared by the time it lands here.
+                let outcome = std::sync::Arc::try_unwrap(outcome)
+                    .unwrap_or_else(|_| unreachable!("an event is delivered once"));
+                self.finish_site_apply(outcome)?;
+            }
         }
         Ok(())
     }
@@ -755,6 +770,90 @@ impl App {
             };
             let _ = sender.send(Event::App(AppEvent::CronLogFetched { job, log_text }));
         });
+    }
+
+    /// Starts one of Site settings' filesystem actions in the background.
+    ///
+    /// The `Db` half happens here — a scan needs the root, an apply needs
+    /// every affected site's resolved `BlockConfig` — and the filesystem
+    /// half goes to the blocking pool. A scan walks the whole config root;
+    /// an apply reads and rewrites one config file per site, plus the
+    /// generated `robots.txt` and rate-limit zone. Neither is fast on a
+    /// small server, and both used to run inside the keypress.
+    ///
+    /// A second request while one is out is reported rather than dropped:
+    /// like a firewall render, these are only reachable by confirming a
+    /// popup, so someone is watching and can press it again.
+    fn start_site_action(&mut self, action: crate::tui::site_settings::SiteAction) -> Result<()> {
+        use crate::tui::site_settings::SiteAction;
+
+        let job = match action {
+            SiteAction::Scan => Job::ScanSites,
+            SiteAction::Apply(_) | SiteAction::ApplyAll => Job::ApplySites,
+        };
+        if self.jobs_in_flight.contains(&job) {
+            self.message = Some(format!("Already {}.", job.label()));
+            return Ok(());
+        }
+
+        let sender = self.events.sender();
+        match action {
+            SiteAction::Scan => {
+                self.jobs_in_flight.insert(job);
+                let root = self.site_settings.root().to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    let sites = nginx::discover_sites(&root).map_err(|err| err.to_string());
+                    let _ = sender.send(Event::App(AppEvent::SitesScanned { sites }));
+                });
+            }
+            SiteAction::Apply(_) | SiteAction::ApplyAll => {
+                let plan = match self.site_settings.plan_apply(&self.db, action) {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        self.message = Some(format!("Apply failed: {err}"));
+                        return Ok(());
+                    }
+                };
+                self.jobs_in_flight.insert(job);
+                tokio::task::spawn_blocking(move || {
+                    let outcome = crate::tui::site_settings::run_apply(plan);
+                    let _ = sender.send(Event::App(AppEvent::SitesApplied {
+                        outcome: std::sync::Arc::new(outcome),
+                    }));
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Records a finished background scan: the `Db` writes it implies, and
+    /// the count to report.
+    fn finish_site_scan(
+        &mut self,
+        sites: Result<Vec<nginx::DiscoveredSite>, String>,
+    ) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::ScanSites);
+        self.message = Some(self.site_settings.finish_scan(&self.db, sites));
+        self.refresh()
+    }
+
+    /// Records a finished background apply, and reloads NGINX if any file
+    /// actually changed — the same condition the inline version used, just
+    /// evaluated here rather than in the key handler.
+    fn finish_site_apply(
+        &mut self,
+        outcome: crate::tui::site_settings::ApplyOutcome,
+    ) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::ApplySites);
+        let (message, changed_a_file) = self.site_settings.finish_apply(outcome);
+        self.message = Some(message);
+        // Before the reload, so the status tags reflect the files that
+        // were just written rather than waiting on `systemctl`.
+        self.refresh()?;
+        if changed_a_file {
+            self.reload_nginx();
+        }
+        Ok(())
     }
 
     /// Reloads NGINX in the background, after Site settings has written a
@@ -1130,6 +1229,10 @@ impl App {
             KeyOutcome::ReloadNginx => {
                 self.refresh()?;
                 self.reload_nginx();
+                return Ok(());
+            }
+            KeyOutcome::SiteAction(action) => {
+                self.start_site_action(action)?;
                 return Ok(());
             }
             KeyOutcome::Ignored => {}

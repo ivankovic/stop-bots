@@ -485,7 +485,7 @@ impl SiteSettings {
         }
 
         if self.popup.is_some() {
-            return self.handle_confirm_popup_key(key, db, message);
+            return self.handle_confirm_popup_key(key);
         }
 
         if self.setting_popup.is_some() {
@@ -516,12 +516,7 @@ impl SiteSettings {
 
     /// The Cancel/confirm popup shared by scan, apply-one and apply-all.
     /// Option 1 is always the affirmative one; anything else cancels.
-    fn handle_confirm_popup_key(
-        &mut self,
-        key: KeyEvent,
-        db: &Db,
-        message: &mut Option<String>,
-    ) -> Result<KeyOutcome> {
+    fn handle_confirm_popup_key(&mut self, key: KeyEvent) -> Result<KeyOutcome> {
         let Some(popup) = &mut self.popup else {
             unreachable!("dispatched on this popup")
         };
@@ -543,25 +538,18 @@ impl SiteSettings {
                 if popup.selected != 1 {
                     return Ok(KeyOutcome::Consumed);
                 }
-                let (result_message, wrote_nginx_config) = match popup.action {
-                    PopupAction::Scan => (self.scan(db), false),
-                    PopupAction::Apply(index) => self.apply_site(db, index),
-                    PopupAction::ApplyAll => self.apply_all(db),
-                };
-                *message = Some(result_message);
-                // Neither of these necessarily writes to the db
-                // (applying only touches nginx files), but `Mutated` is
-                // also how every screen's state gets refreshed —
-                // needed here so the status tags reflect the files we
-                // just wrote. An apply that actually changed a file
-                // asks `App` to reload NGINX on top of that (see
-                // `KeyOutcome::ReloadNginx`'s doc comment for why that
-                // happens there and not inline here).
-                Ok(if wrote_nginx_config {
-                    KeyOutcome::ReloadNginx
-                } else {
-                    KeyOutcome::Mutated
-                })
+                // Handed to `App` as a request rather than run here.
+                // All three walk or rewrite files under /etc/nginx, and
+                // doing that inline would block the event loop for as
+                // long as it took — the same reason a reload was already
+                // `App`'s job. `App` resolves what these need from `Db`,
+                // performs the filesystem half on a background thread,
+                // and hands the outcome back to `finish_site_action`.
+                Ok(KeyOutcome::SiteAction(match popup.action {
+                    PopupAction::Scan => SiteAction::Scan,
+                    PopupAction::Apply(index) => SiteAction::Apply(index),
+                    PopupAction::ApplyAll => SiteAction::ApplyAll,
+                }))
             }
             _ => Ok(KeyOutcome::Consumed),
         }
@@ -807,131 +795,242 @@ impl SiteSettings {
         Ok(())
     }
 
-    /// Discovers sites under `self.root` and stores them in `db`, returning
-    /// a status message either way. Errors (an unreadable/missing root, a
-    /// malformed config) are caught here rather than propagated: this runs
-    /// synchronously inside `handle_key`, whose `Result` bubbles all the way
-    /// up through `App::run` — letting a bad scan through would tear down
-    /// the whole TUI instead of just reporting the failure.
-    fn scan(&self, db: &Db) -> String {
-        match self.run_scan(db) {
-            Ok(count) => format!("Discovered {count} site(s) under {}", self.root.display()),
-            Err(err) => format!("Site scan failed: {err}"),
-        }
+    /// The root this screen scans, for `App` to hand to a background
+    /// `nginx::discover_sites`.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
-    fn run_scan(&self, db: &Db) -> Result<usize> {
-        let sites = nginx::discover_sites(&self.root)?;
-        for site in &sites {
-            db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
-        }
-        Ok(sites.len())
+    /// Resolves everything an apply needs out of `Db`, so the filesystem
+    /// half can run where `Db` cannot go.
+    ///
+    /// `Apply(index)` plans one site, `ApplyAll` plans every one. Only
+    /// `ApplyAll` plans removals: applying a *single* site must never
+    /// delete a generated file, even when the feature that produced it is
+    /// now off, because the other sites on this host still carry the
+    /// directive that references it — and deleting a rate-limit zone out
+    /// from under them makes NGINX refuse to load at all. Only a run that
+    /// brings every site into line can safely clean up.
+    pub fn plan_apply(&self, db: &Db, action: SiteAction) -> Result<ApplyPlan> {
+        let indices: Vec<usize> = match action {
+            SiteAction::Apply(index) => vec![index],
+            SiteAction::ApplyAll => (0..self.sites.len()).collect(),
+            SiteAction::Scan => Vec::new(),
+        };
+        let sites = indices
+            .into_iter()
+            .map(|index| {
+                let site = &self.sites[index];
+                Ok(PlannedSite {
+                    server_name: site.server_name.clone(),
+                    config_path: PathBuf::from(&site.config_path),
+                    config: nginx::block_config_for_site(db, site.id)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(ApplyPlan {
+            managed_writes: nginx::planned_managed_files(db)?,
+            managed_removals: match action {
+                SiteAction::ApplyAll => nginx::unused_managed_files(db)?,
+                _ => Vec::new(),
+            },
+            sites,
+            every_site: action == SiteAction::ApplyAll,
+        })
     }
 
-    /// Applies just `self.sites[index]`'s currently computed rule to its
-    /// own config file, returning a status message either way (consumed by
-    /// the caller for `App`'s shared `message` field — see the module doc
-    /// comment for why that's not enough on its own) alongside whether the
-    /// file actually changed, so the caller knows whether to ask `App` to
-    /// reload NGINX. On failure, also sets `self.alert` so the error is
-    /// actually visible on this screen; a permission-denied write gets an
-    /// extra, actionable suggestion.
-    /// Applying *one* site never removes a generated file, even when the
-    /// feature that produced it is now off: the other sites on this host
-    /// still carry the directive that references it, and deleting a
-    /// rate-limit zone out from under them makes NGINX refuse to load at
-    /// all. Only `apply_all`, which brings every site into line, can
-    /// safely clean up.
-    fn apply_site(&mut self, db: &Db, index: usize) -> (String, bool) {
-        let server_name = self.sites[index].server_name.clone();
-        match self.run_apply_site(db, index) {
-            Ok(true) => (format!("Applied blocking rules to {server_name}"), true),
-            Ok(false) => (format!("{server_name} was already up to date"), false),
-            Err(err) => {
-                let mut alert = format!("Failed to apply rules to {server_name}:\n{err}");
-                if is_permission_denied(&err) {
-                    alert.push_str("\n\nTry running as root.");
-                }
-                self.alert = Some(alert);
-                (format!("Apply failed for {server_name}"), false)
-            }
-        }
-    }
-
-    fn run_apply_site(&self, db: &Db, index: usize) -> Result<bool> {
-        let site = &self.sites[index];
-        // Same ordering as the CLI's apply: the managed file has to exist
-        // before a config that aliases it is reloaded.
-        nginx::write_managed_files(db)?;
-        let config = nginx::block_config_for_site(db, site.id)?;
-        nginx::apply_block_for_site(Path::new(&site.config_path), &site.server_name, &config)
-    }
-
-    /// Applies every known site's own rule to its own config file — the
-    /// same per-site `apply_block_for_site` call as `apply_site`, just
-    /// looped over every site rather than a single bulk nginx-file
-    /// rewrite. A site's failure doesn't stop the others from being tried;
-    /// any failures are collected into one alert afterwards (with the same
-    /// "Try running as root" suggestion if any of them was a permission
-    /// error — the common case, since a single process either has root or
-    /// doesn't, so one failure usually means they all will). The returned
-    /// bool is whether *any* site's file actually changed, same meaning as
-    /// `apply_site`'s.
-    fn apply_all(&mut self, db: &Db) -> (String, bool) {
-        let total = self.sites.len();
-        // Deliberately not removing unused managed files here: `apply_all`
-        // can partially fail, and deleting a rate-limit zone while some
-        // site still references it makes NGINX refuse to load entirely.
-        // The cleanup happens once every site succeeded, below.
+    /// Turns a finished background apply into the status message `App`
+    /// shows and, when something went wrong, the alert this screen shows
+    /// on top of it — a message on the Dashboard is no use to someone
+    /// looking at Site settings.
+    ///
+    /// The returned bool is whether any file actually changed, which is
+    /// what tells `App` whether NGINX needs reloading at all.
+    pub fn finish_apply(&mut self, outcome: ApplyOutcome) -> (String, bool) {
+        let ApplyOutcome {
+            results,
+            cleanup_error,
+            every_site,
+        } = outcome;
+        let total = results.len();
         let mut applied = 0;
         let mut unchanged = 0;
         let mut failures = Vec::new();
         let mut any_permission_denied = false;
-
-        for index in 0..total {
-            match self.run_apply_site(db, index) {
+        for result in &results {
+            match &result.changed {
                 Ok(true) => applied += 1,
                 Ok(false) => unchanged += 1,
                 Err(err) => {
-                    any_permission_denied |= is_permission_denied(&err);
-                    failures.push(format!("{}: {err}", self.sites[index].server_name));
+                    any_permission_denied |= result.permission_denied;
+                    failures.push(format!("{}: {err}", result.server_name));
                 }
             }
         }
 
-        if failures.is_empty() {
-            // Every site is now in line with the current settings, so a
-            // file none of them references any more is safe to delete.
-            // A failure here is reported but doesn't undo the apply: the
-            // config on disk is valid either way, just with a stale file
-            // left behind.
-            if let Err(err) = nginx::remove_unused_managed_files(db) {
-                self.alert = Some(format!(
-                    "Applied, but cleaning up generated files failed:\n{err}"
-                ));
-            }
-        }
-
         if !failures.is_empty() {
-            let mut alert = format!(
-                "Failed to apply rules to {} of {total} site(s):\n{}",
-                failures.len(),
-                failures.join("\n")
-            );
+            let mut alert = if every_site {
+                format!(
+                    "Failed to apply rules to {} of {total} site(s):\n{}",
+                    failures.len(),
+                    failures.join("\n")
+                )
+            } else {
+                format!("Failed to apply rules to {}", failures.join("\n"))
+            };
             if any_permission_denied {
                 alert.push_str("\n\nTry running as root.");
             }
             self.alert = Some(alert);
+        } else if let Some(err) = cleanup_error {
+            // Reported but not treated as undoing the apply: the config on
+            // disk is valid either way, just with a stale file left behind.
+            self.alert = Some(format!(
+                "Applied, but cleaning up generated files failed:\n{err}"
+            ));
         }
 
-        (
+        let message = if every_site {
             format!(
                 "Applied blocking rules to {applied} site(s), {unchanged} already up to date, {} failed",
                 failures.len()
-            ),
-            applied > 0,
-        )
+            )
+        } else {
+            let name = results
+                .first()
+                .map(|r| r.server_name.as_str())
+                .unwrap_or("the site");
+            match (applied, unchanged) {
+                (1, _) => format!("Applied blocking rules to {name}"),
+                (_, 1) => format!("{name} was already up to date"),
+                _ => format!("Apply failed for {name}"),
+            }
+        };
+        (message, applied > 0)
     }
+
+    /// Stores freshly discovered sites and reports how many. Errors are
+    /// returned as the message rather than propagated: a bad scan should
+    /// report itself, not tear down the TUI on its way up through
+    /// `App::run`.
+    pub fn finish_scan(
+        &self,
+        db: &Db,
+        sites: Result<Vec<nginx::DiscoveredSite>, String>,
+    ) -> String {
+        let root = self.root.display();
+        let stored = sites.and_then(|sites| {
+            for site in &sites {
+                db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(sites.len())
+        });
+        match stored {
+            Ok(count) => format!("Discovered {count} site(s) under {root}"),
+            Err(err) => format!("Site scan failed: {err}"),
+        }
+    }
+}
+
+/// Which filesystem action Site settings has asked `App` to carry out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteAction {
+    /// Walk the NGINX config root and record what's there.
+    Scan,
+    /// Apply one site's rule to its own config file, by index into the
+    /// screen's list.
+    Apply(usize),
+    /// Apply every site's.
+    ApplyAll,
+}
+
+/// One site's share of an [`ApplyPlan`] — resolved from `Db`, so the write
+/// itself needs nothing but this.
+pub struct PlannedSite {
+    pub server_name: String,
+    pub config_path: PathBuf,
+    pub config: nginx::BlockConfig,
+}
+
+/// Everything a background apply needs, with every `Db` read already done.
+pub struct ApplyPlan {
+    pub managed_writes: Vec<(PathBuf, String)>,
+    /// Empty except for `ApplyAll`, and applied only if every site
+    /// succeeded — see [`nginx::remove_unused_managed_files`] for why the
+    /// ordering is load-bearing rather than tidy.
+    pub managed_removals: Vec<PathBuf>,
+    pub sites: Vec<PlannedSite>,
+    pub every_site: bool,
+}
+
+/// What one site's write did.
+#[derive(Debug)]
+pub struct SiteResult {
+    pub server_name: String,
+    pub changed: Result<bool, String>,
+    /// Kept separately because the error has been stringified by the time
+    /// it crosses back, and "try running as root" is worth saying only for
+    /// this one kind of failure.
+    pub permission_denied: bool,
+}
+
+/// A finished background apply.
+#[derive(Debug)]
+pub struct ApplyOutcome {
+    pub results: Vec<SiteResult>,
+    pub cleanup_error: Option<String>,
+    pub every_site: bool,
+}
+
+/// Performs a planned apply. Runs on a background thread and touches no
+/// `Db`: everything it needs was resolved by
+/// [`SiteSettings::plan_apply`].
+///
+/// A site's failure doesn't stop the others from being tried — a single
+/// process either has root or doesn't, so one permission failure usually
+/// means they all will, and reporting them together is more use than
+/// stopping at the first.
+pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
+    // Same ordering as the CLI's apply: a managed file has to exist before
+    // a config that aliases it is reloaded.
+    let managed = nginx::write_planned_managed_files(&plan.managed_writes);
+    let results: Vec<SiteResult> = plan
+        .sites
+        .iter()
+        .map(|site| {
+            let outcome = managed.as_ref().map_err(clone_error).and_then(|()| {
+                nginx::apply_block_for_site(&site.config_path, &site.server_name, &site.config)
+                    .map_err(|err| (is_permission_denied(&err), err.to_string()))
+            });
+            SiteResult {
+                server_name: site.server_name.clone(),
+                changed: outcome
+                    .as_ref()
+                    .map(|changed| *changed)
+                    .map_err(|(_, err)| err.clone()),
+                permission_denied: outcome.err().is_some_and(|(denied, _)| denied),
+            }
+        })
+        .collect();
+
+    let all_ok = results.iter().all(|r| r.changed.is_ok());
+    let cleanup_error = (all_ok && !plan.managed_removals.is_empty())
+        .then(|| nginx::remove_planned_managed_files(&plan.managed_removals).err())
+        .flatten()
+        .map(|err| err.to_string());
+
+    ApplyOutcome {
+        results,
+        cleanup_error,
+        every_site: plan.every_site,
+    }
+}
+
+/// `anyhow::Error` isn't `Clone`, and the managed-file write is shared by
+/// every site in a plan, so its failure has to be reproducible per site.
+fn clone_error(err: &anyhow::Error) -> (bool, String) {
+    (is_permission_denied(err), err.to_string())
 }
 
 fn status_tag(status: SiteApplyStatus) -> Span<'static> {
@@ -958,6 +1057,39 @@ fn is_permission_denied(err: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use crate::testing::blocked_bot;
+
+    /// Carries out a [`SiteAction`] the way `App` does: plan against the
+    /// database here, perform the filesystem half, then fold the outcome
+    /// back into the screen. The popup used to do all of that inline, so
+    /// tests below could press Enter and then look at the files; this
+    /// keeps them able to, without pretending the split isn't there.
+    fn perform(screen: &mut SiteSettings, db: &Db, action: SiteAction) -> (String, bool) {
+        match action {
+            SiteAction::Scan => {
+                let sites = nginx::discover_sites(screen.root()).map_err(|err| err.to_string());
+                (screen.finish_scan(db, sites), false)
+            }
+            _ => {
+                let plan = screen
+                    .plan_apply(db, action)
+                    .expect("planning reads only Db");
+                screen.finish_apply(run_apply(plan))
+            }
+        }
+    }
+
+    /// Presses Enter on an open confirm popup and carries out whatever it
+    /// asked for, returning the status message.
+    fn confirm_popup(screen: &mut SiteSettings, db: &Db) -> String {
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), db, &mut None)
+            .unwrap();
+        let KeyOutcome::SiteAction(action) = outcome else {
+            panic!("confirming should request a site action, got {outcome:?}");
+        };
+        perform(screen, db, action).0
+    }
+
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -1115,14 +1247,11 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap(); // Cancel -> Scan now
-        let outcome = screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
+        let message = confirm_popup(&mut screen, &db);
 
-        assert_eq!(outcome, KeyOutcome::Mutated);
         assert!(screen.popup.is_none());
         assert!(!db.list_sites().unwrap().is_empty());
-        assert!(message.unwrap().contains("Discovered"));
+        assert!(message.contains("Discovered"), "message was: {message}");
     }
 
     #[test]
@@ -1143,12 +1272,12 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
-        let outcome = screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
+        let message = confirm_popup(&mut screen, &db);
 
-        assert_eq!(outcome, KeyOutcome::Mutated);
-        assert!(message.unwrap().contains("Discovered 0 site(s)"));
+        assert!(
+            message.contains("Discovered 0 site(s)"),
+            "message was: {message}"
+        );
         assert!(db.list_sites().unwrap().is_empty());
     }
 
@@ -1262,12 +1391,9 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap(); // Cancel -> Apply now
-        let outcome = screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
+        let message = confirm_popup(&mut screen, &db);
 
-        assert_eq!(outcome, KeyOutcome::ReloadNginx);
-        assert!(message.unwrap().contains("Applied"));
+        assert!(message.contains("Applied"), "message was: {message}");
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("BadBot-UA"), "written was:\n{written}");
 
@@ -1323,9 +1449,7 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
+        confirm_popup(&mut screen, &db);
 
         let alert = screen.alert.as_ref().unwrap();
         assert!(
@@ -1376,9 +1500,7 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
+        confirm_popup(&mut screen, &db);
 
         let alert = screen.alert.as_ref().unwrap();
         assert!(alert.contains("Try running as root"), "alert was:\n{alert}");
@@ -1471,12 +1593,12 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap(); // Cancel -> Apply now
-        let outcome = screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
+        let message = confirm_popup(&mut screen, &db);
 
-        assert_eq!(outcome, KeyOutcome::ReloadNginx);
-        assert!(message.unwrap().contains("Applied blocking rules to 2"));
+        assert!(
+            message.contains("Applied blocking rules to 2"),
+            "message was: {message}"
+        );
         assert!(fs::read_to_string(&path_a).unwrap().contains("BadBot-UA"));
         assert!(fs::read_to_string(&path_b).unwrap().contains("BadBot-UA"));
 
@@ -1522,13 +1644,11 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
+        let message = confirm_popup(&mut screen, &db);
 
         // a.example still got applied even though b.example failed.
         assert!(fs::read_to_string(&path_a).unwrap().contains("BadBot-UA"));
-        assert!(message.unwrap().contains("1 failed"));
+        assert!(message.contains("1 failed"), "message was: {message}");
         let alert = screen.alert.as_ref().unwrap();
         assert!(alert.contains("b.example"), "alert was:\n{alert}");
         assert!(alert.contains("Try running as root"), "alert was:\n{alert}");
@@ -1660,9 +1780,7 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
-            .unwrap();
+        confirm_popup(&mut screen, &db);
         screen.refresh(&db).unwrap();
         assert_eq!(screen.statuses[0], SiteApplyStatus::UpToDate);
 
@@ -1741,7 +1859,7 @@ mod tests {
         screen
             .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
             .unwrap();
-        screen
+        let outcome = screen
             .handle_key(KeyEvent::from(KeyCode::Char(' ')), &db, &mut message)
             .unwrap();
 
@@ -1749,7 +1867,11 @@ mod tests {
             screen.popup.is_none(),
             "Space should confirm, not be ignored"
         );
-        assert!(message.unwrap().contains("site(s)"));
+        let KeyOutcome::SiteAction(action) = outcome else {
+            panic!("Space should request a scan, got {outcome:?}");
+        };
+        let message = perform(&mut screen, &db, action).0;
+        assert!(message.contains("site(s)"), "message was: {message}");
     }
 
     #[test]
