@@ -116,6 +116,10 @@ pub struct App {
     /// the admin" and finding out afterwards.
     ssh_log_text: Option<String>,
     ssh_log_read_at: Option<std::time::Instant>,
+    /// Set when an apply asked for an NGINX reload while one was already
+    /// running, so [`App::finish_nginx_reload`] knows to start one more.
+    /// See [`App::reload_nginx`] for why dropping it instead is wrong.
+    reload_nginx_pending: bool,
     /// Screens whose cached state something has invalidated since they
     /// were last drawn — see [`Self::refresh`].
     stale: std::collections::HashSet<Screen>,
@@ -194,6 +198,7 @@ impl App {
                 .unwrap_or_else(std::time::Instant::now),
             ssh_log_text: None,
             ssh_log_read_at: None,
+            reload_nginx_pending: false,
             stale: std::collections::HashSet::new(),
             jobs_in_flight: std::collections::HashSet::new(),
             reload_nginx_for_real: reload_nginx,
@@ -652,11 +657,20 @@ impl App {
     /// small server, and they used to run inside the keypress that asked
     /// for them. No `Db` is involved, so the whole thing moves.
     ///
-    /// The in-flight guard is doing real work here: holding Enter on
-    /// "apply" would otherwise start one reload per repeat, all of them
-    /// racing on the same NGINX master.
+    /// Only one reload runs at a time — holding Enter on "apply" would
+    /// otherwise start one per repeat, all racing on the same NGINX
+    /// master. A request that arrives while one is out is *coalesced*, not
+    /// dropped: this is a write-then-act pair, and the act has to happen
+    /// at least once after the last write. Dropping it would mean applying
+    /// a second site while the first site's reload was still running and
+    /// having NGINX never pick the second one up — "I applied it and
+    /// nothing happened", which is worse than the pause this replaced.
     fn reload_nginx(&mut self) {
-        if !self.reload_nginx_for_real || !self.jobs_in_flight.insert(Job::ReloadNginx) {
+        if !self.reload_nginx_for_real {
+            return;
+        }
+        if !self.jobs_in_flight.insert(Job::ReloadNginx) {
+            self.reload_nginx_pending = true;
             return;
         }
         let sender = self.events.sender();
@@ -675,6 +689,9 @@ impl App {
         if let Err(err) = result {
             let applied = self.message.take().unwrap_or_default();
             self.message = Some(format!("{applied} — failed to reload NGINX: {err}"));
+        }
+        if std::mem::take(&mut self.reload_nginx_pending) {
+            self.reload_nginx();
         }
     }
 

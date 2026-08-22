@@ -9,7 +9,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -681,21 +681,19 @@ fn copy_dir_all(src: &Path, dst: &Path) {
     }
 }
 
-/// The reload NGINX needs after an apply runs in the background now, so
-/// the TUI stays live through it.
+/// Sets up a TUI over a writable copy of the NGINX fixture tree, with a
+/// fake `nginx` and a fake `systemctl` on PATH — the two tools a Site
+/// settings apply really executes.
 ///
-/// The non-blocking half is asserted by *ordering*, not by timing: the
-/// fake `systemctl` parks until this test deletes a gate file, and the TUI
-/// has to have switched screens and drawn the Dashboard while it is still
-/// parked. A synchronous reload cannot do that — the keypress would sit in
-/// the queue until `systemctl` returned, so the Dashboard would arrive
-/// after the call was logged, not before. No sleeps, and nothing that gets
-/// slower on a loaded machine.
+/// The fake `systemctl` parks until the returned gate file is deleted,
+/// which is what lets the two tests below assert on *ordering* instead of
+/// on timing: they can hold a reload open for as long as they need and
+/// still finish in milliseconds. `nginx -t` stays instant, since `reload`
+/// runs it first and gives up if it fails.
 ///
-/// Fake `nginx`/`systemctl` on PATH, so this asserts on real process
-/// execution without reloading whatever NGINX the test machine is running.
-#[test]
-fn applying_a_site_reloads_nginx_in_the_background() {
+/// Returns the temp dir (which must outlive the session), the session, the
+/// log every fake appends its argv to, and the gate.
+fn site_tui_with_a_holdable_reload() -> (tempfile::TempDir, PtySession, PathBuf, PathBuf) {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -730,9 +728,6 @@ fn applying_a_site_reloads_nginx_in_the_background() {
     let fakebin = tmp.path().join("bin");
     fs::create_dir_all(&fakebin).unwrap();
     let calls = tmp.path().join("calls.log");
-    // `systemctl` parks on this until the test removes it; `nginx -t`
-    // stays instant, since `reload` runs it first and gives up if it
-    // fails.
     let gate = tmp.path().join("gate");
     fs::write(&gate, "").unwrap();
     let scripts = [
@@ -755,19 +750,60 @@ fn applying_a_site_reloads_nginx_in_the_background() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let mut session = spawn_tui_with_fake_tools_and_args(
+    let session = spawn_tui_with_fake_tools_and_args(
         &db_path,
         &fakebin,
         &["--root", nginx_root.to_str().unwrap()],
     );
+    (tmp, session, calls, gate)
+}
+
+/// Waits for `calls.log` to hold at least `want` lines mentioning
+/// `systemctl`, and returns it. Polling rather than sleeping: the wait is
+/// on a background task, on a machine whose load the test does not
+/// control.
+fn wait_for_systemctl_calls(calls: &Path, want: usize) -> String {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms());
+    loop {
+        let log = std::fs::read_to_string(calls).unwrap_or_default();
+        if log.matches("systemctl reload nginx").count() >= want {
+            return log;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {want} systemctl call(s); calls.log held: {log:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Selects the site named `name` in Site settings' list and applies it.
+/// The list is sorted by server name, and the selection starts at the top.
+fn apply_site(session: &mut PtySession, name: &str) {
+    send_key(session, "a");
+    session.exp_string("Cancel").unwrap();
+    send_key(session, "\x1b[B"); // Cancel -> Apply now
+    send_key(session, "\r");
+    let _ = name;
+}
+
+/// The reload NGINX needs after an apply runs in the background now, so
+/// the TUI stays live through it.
+///
+/// Asserted by *ordering*, not by timing: the fake `systemctl` parks on a
+/// gate file, and the TUI has to switch screens and draw while it is still
+/// parked. A synchronous reload cannot do that — the keypress would sit in
+/// the queue until `systemctl` returned, so the Dashboard would arrive
+/// after the call was logged, not before. No sleeps, and nothing that gets
+/// slower on a loaded machine.
+#[test]
+fn applying_a_site_reloads_nginx_without_blocking_the_tui() {
+    let (_tmp, mut session, calls, gate) = site_tui_with_a_holdable_reload();
     session.exp_string("Dashboard").unwrap();
 
     send_key(&mut session, "s");
     session.exp_string("Sites").unwrap();
-    send_key(&mut session, "a");
-    session.exp_string("Cancel").unwrap();
-    send_key(&mut session, "\x1b[B"); // Cancel -> Apply now
-    send_key(&mut session, "\r");
+    apply_site(&mut session, "example.com");
 
     // The apply's own result lands immediately, with the reload still out.
     session.exp_string("UP").unwrap();
@@ -776,31 +812,56 @@ fn applying_a_site_reloads_nginx_in_the_background() {
     send_key(&mut session, "d");
     session.exp_string("wide").unwrap();
 
-    let so_far = fs::read_to_string(&calls).unwrap_or_default();
+    let so_far = std::fs::read_to_string(&calls).unwrap_or_default();
     assert!(
         !so_far.contains("systemctl"),
         "the reload should still be running -- the TUI answered a keypress \
          while it was, which is the point. calls.log held: {so_far:?}"
     );
 
-    fs::remove_file(&gate).unwrap();
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms());
-    let log = loop {
-        let log = fs::read_to_string(&calls).unwrap_or_default();
-        if log.contains("systemctl reload nginx") {
-            break log;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "systemctl was never invoked; calls.log held: {log:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    std::fs::remove_file(&gate).unwrap();
+    let log = wait_for_systemctl_calls(&calls, 1);
     assert!(
         log.contains("nginx -t"),
         "the config must be validated before the reload; calls.log was: {log:?}"
     );
 
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
+/// Applying a second site while the first site's reload is still running
+/// must not lose the second reload.
+///
+/// Only one reload runs at a time, and the obvious way to enforce that —
+/// drop the request if one is already out — is wrong here: this is a
+/// write-then-act pair, so the act has to happen at least once after the
+/// last write. Dropping it leaves NGINX serving the old config for the
+/// second site with nothing on screen saying so. The bug is silent, which
+/// is what makes it worth its own test.
+#[test]
+fn a_second_apply_during_a_reload_still_gets_its_own_reload() {
+    let (_tmp, mut session, calls, gate) = site_tui_with_a_holdable_reload();
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+
+    // Both applies happen while the gate holds the first reload open, so
+    // the second one is necessarily requested mid-flight.
+    apply_site(&mut session, "example.com");
+    session.exp_string("UP").unwrap();
+    send_key(&mut session, "\x1b[B"); // next site in the list
+    apply_site(&mut session, "localhost");
+    session.exp_string("UP").unwrap();
+
+    std::fs::remove_file(&gate).unwrap();
+    wait_for_systemctl_calls(&calls, 2);
+
+    send_key(&mut session, "q");
+    session.exp_string("wide").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
