@@ -57,7 +57,20 @@ const CRON_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 pub enum Job {
     /// A scheduled job from [`crate::cron`].
     Cron(CronJob),
+    /// Reading the SSH log that Dynamic Protection's SSH panel is built
+    /// from. See [`App::read_ssh_log`].
+    ReadSshLog,
 }
+
+/// How long a read of the SSH log stays good enough to rebuild Dynamic
+/// Protection's SSH panel from.
+///
+/// The log is append-only and this screen is a live view of it, so the
+/// only cost of a stale cache is that an attempt from the last few seconds
+/// is missing from the counts — while the cost of no cache at all was a
+/// `journalctl` subprocess, upwards of half a second, on every reload of
+/// the screen.
+const SSH_LOG_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub struct App {
     pub running: bool,
@@ -76,6 +89,17 @@ pub struct App {
     /// check against `Event::Tick`'s 30fps rate (see
     /// [`CRON_CHECK_INTERVAL`]).
     last_cron_check: std::time::Instant,
+    /// The SSH log as last read, and when. Dynamic Protection's SSH panel
+    /// is rebuilt from this rather than from a fresh read — see
+    /// [`SSH_LOG_MAX_AGE`] and [`App::read_ssh_log`]. `None` means no read
+    /// has come back yet.
+    ///
+    /// Deliberately *not* what the lockout guard in
+    /// [`App::render_firewall`] consults: that one reads live, every time.
+    /// A cached answer there is the difference between "this would cut off
+    /// the admin" and finding out afterwards.
+    ssh_log_text: Option<String>,
+    ssh_log_read_at: Option<std::time::Instant>,
     /// Screens whose cached state something has invalidated since they
     /// were last drawn — see [`Self::refresh`].
     stale: std::collections::HashSet<Screen>,
@@ -152,6 +176,8 @@ impl App {
             last_cron_check: std::time::Instant::now()
                 .checked_sub(CRON_CHECK_INTERVAL)
                 .unwrap_or_else(std::time::Instant::now),
+            ssh_log_text: None,
+            ssh_log_read_at: None,
             stale: std::collections::HashSet::new(),
             jobs_in_flight: std::collections::HashSet::new(),
             reload_nginx,
@@ -206,9 +232,15 @@ impl App {
             Screen::Dashboard => self.dashboard.refresh(&self.db),
             Screen::BotSettings => self.bot_settings.refresh(&self.db),
             Screen::SiteSettings => self.site_settings.refresh(&self.db),
-            Screen::DynamicProtection => self
-                .dynamic_protection
-                .refresh(&self.db, self.ssh_log.as_deref()),
+            Screen::DynamicProtection => {
+                // Kicked off here rather than on entering the screen: this
+                // is the one place every route to a visible SSH panel goes
+                // through, and the freshness check makes repeating it
+                // harmless.
+                self.read_ssh_log();
+                self.dynamic_protection
+                    .refresh(&self.db, self.ssh_log_text.as_deref())
+            }
             Screen::Help => Ok(()),
         }
     }
@@ -266,6 +298,7 @@ impl App {
             Event::App(AppEvent::CronLogFetched { job, log_text }) => {
                 self.finish_cron_log_job(job, log_text)?;
             }
+            Event::App(AppEvent::SshLogRead { text }) => self.finish_ssh_log_read(text)?,
         }
         Ok(())
     }
@@ -592,6 +625,57 @@ impl App {
             };
             let _ = sender.send(Event::App(AppEvent::CronLogFetched { job, log_text }));
         });
+    }
+
+    /// Reads the SSH log into [`App::ssh_log_text`], in the background, if
+    /// the copy on hand has gone stale ([`SSH_LOG_MAX_AGE`]) and no read is
+    /// already out.
+    ///
+    /// The read itself is what has to move off the event loop: with no
+    /// `--ssh-log` override and no readable `auth.log`, resolving the log
+    /// means a `journalctl` subprocess. Doing that inline, on every reload
+    /// of Dynamic Protection, is what made this screen the slowest in the
+    /// TUI. Parsing the text into rows stays on the main thread with every
+    /// other `Db` access (`Db` isn't `Sync`) — it is an in-memory line
+    /// scan, and moving it would buy nothing.
+    fn read_ssh_log(&mut self) {
+        let fresh_enough = self
+            .ssh_log_read_at
+            .is_some_and(|at| at.elapsed() < SSH_LOG_MAX_AGE);
+        if fresh_enough || !self.jobs_in_flight.insert(Job::ReadSshLog) {
+            return;
+        }
+        let sender = self.events.sender();
+        let ssh_log = self.ssh_log.clone();
+        tokio::task::spawn_blocking(move || {
+            let source = match ssh_log.as_deref() {
+                Some(path) => crate::sshlog::read_log_file(path),
+                None => crate::sshlog::find_default_source(),
+            };
+            let text = match source {
+                crate::sshlog::LogSource::Found(text) => Some(text),
+                crate::sshlog::LogSource::Unavailable => None,
+            };
+            let _ = sender.send(Event::App(AppEvent::SshLogRead { text }));
+        });
+    }
+
+    /// Stores a background SSH-log read and rebuilds the SSH panel from it.
+    ///
+    /// Marks the read as done even when the log was unavailable, so a host
+    /// with no readable log retries once every [`SSH_LOG_MAX_AGE`] rather
+    /// than starting a fresh subprocess on every reload of the screen.
+    fn finish_ssh_log_read(&mut self, text: Option<String>) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::ReadSshLog);
+        self.ssh_log_text = text;
+        self.ssh_log_read_at = Some(std::time::Instant::now());
+        if self.screen == Screen::DynamicProtection {
+            self.dynamic_protection
+                .refresh(&self.db, self.ssh_log_text.as_deref())?;
+        } else {
+            self.stale.insert(Screen::DynamicProtection);
+        }
+        Ok(())
     }
 
     /// Applies a log cron job's background-resolved log text (`None` if

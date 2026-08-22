@@ -34,7 +34,8 @@
 //!
 //! Unlike the Dashboard's `cron_status`/`user_agent_stats` (both read
 //! straight from `Db`), the SSH panel is populated by re-parsing the live
-//! SSH log on every `refresh` — there's no persisted "SSH attempt stats"
+//! SSH log, which `App` reads in the background and hands to `refresh`
+//! as text — there's no persisted "SSH attempt stats"
 //! table, deliberately: this screen is a real-time view of the current
 //! log, not a lifetime tally (that's what `sshlog::scanning_ips`/
 //! `block-scanners` already handle, on their own cron cadence). The
@@ -53,9 +54,7 @@
 //! manually-blocked user agent is always permanent, since
 //! [`crate::db::Db::block_user_agent`] has no TTL concept.
 //!
-//! `refresh` itself (which resolves the live SSH log — the `tui --ssh-log`
-//! override if one was given, else the same fixed-paths-or-journalctl
-//! lookup the cron jobs use) is deliberately thin: all the actual row-building logic lives
+//! `refresh` itself is deliberately thin: all the actual row-building logic lives
 //! in [`build_ssh_rows`]/[`build_ua_rows`], pure functions tested directly
 //! against synthetic counts below rather than through a real or faked log
 //! file.
@@ -187,13 +186,17 @@ pub struct DynamicProtection {
 }
 
 impl DynamicProtection {
-    /// Reloads both panels. See the module doc comment for the SSH panel's
-    /// live-log-read caveat and why the actual row-building logic lives in
-    /// [`build_ssh_rows`]/[`build_ua_rows`] instead of here.
-    /// `ssh_log` overrides SSH-log auto-detection (see `App`'s field of the
-    /// same name) — auto-detection can shell out to `journalctl`, and this
-    /// runs on every refresh.
-    pub fn refresh(&mut self, db: &Db, ssh_log: Option<&std::path::Path>) -> Result<()> {
+    /// Reloads both panels. See the module doc comment for why the actual
+    /// row-building logic lives in [`build_ssh_rows`]/[`build_ua_rows`]
+    /// instead of here.
+    ///
+    /// `ssh_log_text` is the log itself, already read — this screen used to
+    /// resolve and read it here, which meant a `journalctl` subprocess on
+    /// every reload on any host without a readable `auth.log`. `App` owns
+    /// that read now and does it in the background (`App::read_ssh_log`);
+    /// `None` means it hasn't arrived yet, and renders as an empty SSH
+    /// panel rather than as a wait.
+    pub fn refresh(&mut self, db: &Db, ssh_log_text: Option<&str>) -> Result<()> {
         let firewall_blocks: HashMap<String, Option<i64>> = db
             .list_firewall_rules()?
             .into_iter()
@@ -201,13 +204,9 @@ impl DynamicProtection {
             .map(|rule| (rule.address, rule.expires_at))
             .collect();
         let blocked_ip_ranges = db.blocked_ip_ranges()?;
-        let source = match ssh_log {
-            Some(path) => sshlog::read_log_file(path),
-            None => sshlog::find_default_source(),
-        };
-        let ssh_counts = match source {
-            sshlog::LogSource::Found(log_text) => sshlog::failed_attempt_counts(&log_text),
-            sshlog::LogSource::Unavailable => HashMap::new(),
+        let ssh_counts = match ssh_log_text {
+            Some(text) => sshlog::failed_attempt_counts(text),
+            None => HashMap::new(),
         };
         self.ssh_rows = build_ssh_rows(ssh_counts, &firewall_blocks, &blocked_ip_ranges);
 
@@ -369,7 +368,17 @@ impl DynamicProtection {
         }
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+    /// `jobs` is `App`'s in-flight set, so the SSH panel can say when its
+    /// contents are still on the way — the log read happens in the
+    /// background now, and an empty panel with no explanation reads as
+    /// "nothing to show" rather than "not here yet".
+    pub fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: Theme,
+        jobs: &std::collections::HashSet<crate::app::Job>,
+    ) {
         let [ssh_area, ua_area] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
 
@@ -385,8 +394,13 @@ impl DynamicProtection {
             .block(
                 Block::bordered()
                     .title(format!(
-                        "Top IPs attempting SSH connection — Enter block/unblock, f filter ({})",
-                        self.filter.label()
+                        "Top IPs attempting SSH connection — Enter block/unblock, f filter ({}){}",
+                        self.filter.label(),
+                        if jobs.contains(&crate::app::Job::ReadSshLog) {
+                            format!("  {} reading log", crate::tui::spinner_frame())
+                        } else {
+                            String::new()
+                        }
                     ))
                     .fg(theme.accent()),
             )
@@ -722,12 +736,7 @@ mod tests {
         db.block_user_agent("Mozilla/5.0").unwrap();
 
         let mut screen = DynamicProtection::default();
-        screen
-            .refresh(
-                &db,
-                Some(std::path::Path::new("/nonexistent/test-auth.log")),
-            )
-            .unwrap();
+        screen.refresh(&db, None).unwrap();
 
         assert_eq!(screen.ua_rows.len(), 1);
         assert_eq!(screen.ua_rows[0].user_agent, "Mozilla/5.0");
@@ -915,7 +924,7 @@ mod tests {
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
+            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark, &HashSet::new()))
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -960,7 +969,7 @@ mod tests {
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
+            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark, &HashSet::new()))
             .unwrap();
 
         let content = terminal
@@ -1042,7 +1051,7 @@ mod tests {
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark))
+            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark, &HashSet::new()))
             .unwrap();
 
         let content = terminal

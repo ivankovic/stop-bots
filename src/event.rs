@@ -100,6 +100,12 @@ pub enum AppEvent {
         job: crate::cron::CronJob,
         log_text: Option<String>,
     },
+    /// A background read of the SSH log, for Dynamic Protection's SSH
+    /// panel, has come back (see `App::read_ssh_log`). `None` means no log
+    /// was readable. Only the read is backgrounded; parsing it into rows
+    /// happens on the main thread, same as `CronLogFetched` above and for
+    /// the same reason.
+    SshLogRead { text: Option<String> },
 }
 
 /// Terminal event handler: spawns a background task that emits tick events

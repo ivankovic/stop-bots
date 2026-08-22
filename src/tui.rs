@@ -255,7 +255,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         }
         Screen::BotSettings => app.bot_settings.render(frame, body, app.theme),
         Screen::SiteSettings => app.site_settings.render(frame, body, app.theme),
-        Screen::DynamicProtection => app.dynamic_protection.render(frame, body, app.theme),
+        Screen::DynamicProtection => {
+            app.dynamic_protection
+                .render(frame, body, app.theme, &app.jobs_in_flight)
+        }
         Screen::Help => help::render(frame, body),
     }
 

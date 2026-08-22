@@ -364,6 +364,35 @@ fn startup_enters_the_alternate_screen_and_clears_it_before_drawing() {
         .expect("process should exit after q on the Dashboard");
 }
 
+/// The SSH panel is filled from a background read now, so it arrives a
+/// moment after the screen does. Nothing else in the suite watches that
+/// panel through a real terminal, which makes this the one place a broken
+/// hand-off would show up: the screen would simply stay empty, and every
+/// unit test would still pass.
+#[test]
+fn the_ssh_panel_fills_in_from_the_background_log_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "p");
+    // Short needles on purpose. Switching screens redraws over the
+    // Dashboard, and ratatui skips any cell that already holds the right
+    // character — so a long literal arrives split around whatever the two
+    // screens happen to have in common at the same column.
+    session.exp_string("Top IPs").unwrap();
+    // The fixture log that `spawn_tui` passes via --ssh-log has two failed
+    // attempts from this address, and an accepted login from another that
+    // must not appear: this panel ranks failures.
+    session.exp_string("203.0.113.50").unwrap();
+
+    send_key(&mut session, "q");
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
 #[test]
 fn navigate_change_a_setting_and_quit() {
     let tmp = tempfile::tempdir().unwrap();
