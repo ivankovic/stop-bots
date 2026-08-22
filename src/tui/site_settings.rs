@@ -1014,7 +1014,7 @@ pub struct ApplyPlan {
 }
 
 /// What one site's write did.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SiteResult {
     pub server_name: String,
     pub changed: Result<bool, String>,
@@ -1025,7 +1025,7 @@ pub struct SiteResult {
 }
 
 /// A finished background apply.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ApplyOutcome {
     pub results: Vec<SiteResult>,
     pub cleanup_error: Option<String>,

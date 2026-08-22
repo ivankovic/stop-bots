@@ -456,11 +456,14 @@ impl App {
                 self.finish_site_status_check(statuses)?
             }
             Event::App(AppEvent::SitesApplied { outcome }) => {
-                // `Arc::try_unwrap` rather than a clone: `Event` has to be
-                // `Clone`, but only one handler ever sees a given one, so
-                // the `Arc` is unshared by the time it lands here.
-                let outcome = std::sync::Arc::try_unwrap(outcome)
-                    .unwrap_or_else(|_| unreachable!("an event is delivered once"));
+                // Unwrapped rather than cloned, since only one handler
+                // ever sees a given event and the `Arc` is unshared by the
+                // time it lands here. Falling back to a clone rather than
+                // asserting that: `AppEvent` is `Clone`, so the day
+                // someone copies an event for a log line, a panic here
+                // would take down a TUI on a live server.
+                let outcome =
+                    std::sync::Arc::try_unwrap(outcome).unwrap_or_else(|shared| (*shared).clone());
                 self.finish_site_apply(outcome)?;
             }
         }

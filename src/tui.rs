@@ -291,19 +291,25 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             app.theme.label()
         ),
     };
-    match busy_label(&app.jobs_in_flight) {
-        // Not dimmed, unlike the hint: this is the one line that says the
-        // TUI is waiting on something rather than idle, and it has to read
-        // as foreground text next to a key hint nobody rereads.
-        Some(busy) => frame.render_widget(
-            Line::from(vec![
-                Span::raw(format!("{} {busy}   ", spinner_frame())),
-                Span::raw(hint).dim(),
-            ]),
-            area,
-        ),
-        None => frame.render_widget(Paragraph::new(hint).dim(), area),
-    }
+    let Some(busy) = busy_label(&app.jobs_in_flight) else {
+        frame.render_widget(Paragraph::new(hint).dim(), area);
+        return;
+    };
+    // Not dimmed, unlike the hint: this is the one line that says the TUI
+    // is waiting on something rather than idle, and it has to read as
+    // foreground text beside a key hint nobody rereads.
+    let activity = Span::raw(format!("{} {busy}", spinner_frame()));
+    // The footer is one line, and at 80 columns the hint alone nearly
+    // fills it. Dropping the hint rather than letting it clip: a
+    // half-printed key hint is worse than none, and the hint is the half
+    // that can be read again later.
+    let both = activity.content.len() + hint.len() + 3;
+    let line = if both <= area.width as usize {
+        Line::from(vec![activity, Span::raw(format!("   {hint}")).dim()])
+    } else {
+        Line::from(activity)
+    };
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// What the footer says is happening, or `None` when nothing is.
@@ -326,6 +332,34 @@ fn busy_label(jobs: &std::collections::HashSet<crate::app::Job>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which job gets named when several are out has to be stable across
+    /// redraws — `HashSet` iteration order is arbitrary, so without the
+    /// sort the footer would flicker between two labels 30 times a second
+    /// while nothing had actually changed.
+    #[test]
+    fn the_footer_names_one_job_stably_and_counts_the_rest() {
+        use crate::app::Job;
+        use crate::cron::CronJob;
+
+        assert_eq!(busy_label(&std::collections::HashSet::new()), None);
+
+        let one = std::collections::HashSet::from([Job::ReloadNginx]);
+        assert_eq!(busy_label(&one).as_deref(), Some("reloading NGINX"));
+
+        let several = std::collections::HashSet::from([
+            Job::ReloadNginx,
+            Job::ReadSshLog,
+            Job::Cron(CronJob::UpdateIpRanges),
+        ]);
+        // Sorted, so this is the answer every time and not just this time.
+        for _ in 0..10 {
+            assert_eq!(
+                busy_label(&several).as_deref(),
+                Some("Update crawler IP ranges (scheduled) (+2 more)")
+            );
+        }
+    }
 
     #[test]
     fn theme_toggle_round_trips() {

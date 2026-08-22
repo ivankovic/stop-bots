@@ -282,6 +282,22 @@ The TUI must follow the [Ratatui event driven async template](https://github.com
 
 Each component encapsulates its own state, event handlers, and rendering logic.
 
+**Nothing blocks the event loop.** The loop is `draw` → `await event` →
+`handle_event`, so anything slow in a handler freezes the interface for exactly as long
+as it takes. Every action that touches the filesystem, a subprocess or the network is
+split the same way:
+
+- resolve what it needs from `Db` on the main thread — `rusqlite::Connection` is `Send`
+  but not `Sync`, and all database access lives here;
+- do the slow half on `tokio::task::spawn_blocking`, where no `Db` can reach;
+- fold the result back on the main thread, through an `AppEvent`.
+
+A screen whose key handler wants to do such work returns it to `App` as data (see
+`KeyOutcome`) rather than doing it inline. `App::jobs_in_flight` both animates the
+spinners and stops the same work starting twice — but dropping a duplicate is only safe
+for a *read*. Anything shaped write-then-act must coalesce instead, because the act has
+to happen at least once after the last write.
+
 ## Code quality
 
 Code must always be formatted using the automated standard Rust formatter.
