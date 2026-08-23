@@ -61,7 +61,9 @@ On the two screens that have more than one list side by side — Site settings a
 Protection — Tab switches between *those* instead, and you cycle screens with Left/Right or
 the direct jumps.
 
-The Dashboard assumes a terminal of at least 80x30. Below that its panels start to truncate.
+The Dashboard assumes a terminal of at least 80x30, and shows the whole "Automatic
+blocking" list without scrolling from about 100 columns up (it deals its rows into as many
+columns as the width allows). Below 80x30 its panels start to truncate.
 
 The Dashboard owns everything that ends up in the **firewall script**; Site settings owns
 everything that ends up in **NGINX config**. That split decides where any given setting lives.

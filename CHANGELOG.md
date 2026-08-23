@@ -33,6 +33,13 @@ need.
 
 ### Changed
 
+- The Dashboard's "Automatic blocking" panel is a full-width panel of its own, and shows
+  all fourteen options at once instead of five at a time behind a scroll. It deals its
+  rows into as many columns as the terminal is wide enough for (two from about 100
+  columns), and "System-wide settings" and "Geo-blocking" now share the row above it —
+  between them they were using a quarter of the width.
+
+
 - **The TUI no longer blocks on anything it does.** Every action that touches the
   filesystem, a subprocess or the network now runs on a background thread while the
   interface stays live: reloading NGINX, rendering and applying the firewall script,

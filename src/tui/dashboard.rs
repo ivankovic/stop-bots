@@ -27,6 +27,22 @@
 //! also lets an admin act on it (permanently block one), not just look at
 //! it.
 //!
+//! ## Layout
+//!
+//! "System-wide settings" and "Geo-blocking" share the top row — one is
+//! three fixed rows and the other a list of country codes, so between them
+//! they were using a quarter of the width. "Automatic blocking" gets the
+//! full width below them, and deals its rows into as many columns as that
+//! width allows so that all of them are visible at once. It used to share
+//! a row with Geo-blocking and show five of its fourteen.
+//!
+//! Focus still flows *linearly* through the three lists (Categories ->
+//! Countries -> Protection) via Up/Down, and only the focused one draws a
+//! highlight, so there's never ambiguity about which list the arrows move.
+//! Within Automatic blocking the rows fill one column before starting the
+//! next, so a single selection index still walks them in reading order:
+//! Down at the foot of one column arrives at the head of the next.
+//!
 //! ## Geo-blocking
 //!
 //! A second, independently-focused list (`countries_state`, switched to via
@@ -307,9 +323,22 @@ impl Dashboard {
         // which is the right thing to lose (it's a status list, and the
         // same information is in `stop-bots`' CLI output). Everything
         // above it, including Messages, always renders.
-        let [settings_area, middle_area, stats_area, cron_area, message_area] = Layout::vertical([
-            Constraint::Length(5),
+        // Automatic blocking gets its own full-width row and asks for the
+        // height that shows every one of its rows at once — 14 of them
+        // today, and it used to share half the width with Geo-blocking and
+        // show five. It lays them out in columns rather than one long list
+        // (see `render_protection`), so "all of them" costs seven rows
+        // rather than fourteen.
+        //
+        // `Max`, not `Length`: on a terminal too short for everything,
+        // this is the panel that gives, falling back to the scrolling it
+        // used to do. Scheduled tasks holding `Min(3)` is what makes that
+        // happen — without it, the panel that vanished on a 30-row
+        // terminal would be the one reporting what the detectors just did.
+        let protection_height = self.protection_panel_height(area.width);
+        let [top_area, protection_area, stats_area, cron_area, message_area] = Layout::vertical([
             Constraint::Length(7),
+            Constraint::Max(protection_height),
             Constraint::Length(5),
             // 2 border lines + one line per known job, when there's room.
             Constraint::Min(3),
@@ -317,19 +346,16 @@ impl Dashboard {
         ])
         .areas(area);
 
-        // Geo-blocking and Automatic blocking sit side by side rather than
-        // stacked. Stacking a fourth full-width panel would push the total
-        // past this project's documented 30-row minimum terminal size (the
-        // Scheduled-tasks panel also grows by a row per detector added),
-        // and both of these are scrollable `List`s of the same shape, so
-        // splitting the width costs nothing either can't absorb. Focus
-        // still flows *linearly* through them (Categories -> Countries ->
-        // Protection) via Up/Down, matching how focus already flowed
-        // between the first two — only the focused panel draws a highlight,
-        // so there's never ambiguity about which list the arrows move.
-        let [geo_area, protection_area] =
+        // System-wide settings and Geo-blocking share a row instead, and
+        // they are the right pair for it: one is three fixed rows and the
+        // other a list of country codes, so between them they were using a
+        // quarter of the width and five vertical rows that Automatic
+        // blocking now needs. Focus still flows linearly through all three
+        // (Categories -> Countries -> Protection) via Up/Down, and only
+        // the focused panel draws a highlight.
+        let [settings_area, geo_area] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(middle_area);
+                .areas(top_area);
 
         self.render_categories(frame, settings_area, theme);
         self.render_geo(frame, geo_area, theme);
@@ -397,20 +423,86 @@ impl Dashboard {
         frame.render_stateful_widget(list, area, &mut self.countries_state);
     }
 
+    /// How wide one column of Automatic blocking rows has to be, and how
+    /// many of them fit in `width`.
+    ///
+    /// Measured from the rows actually on screen rather than fixed, so a
+    /// detector with a longer label than any of today's widens its column
+    /// instead of being cut off. At least one column, so a terminal too
+    /// narrow for even that scrolls rather than dividing by zero.
+    fn protection_columns(&self, width: u16) -> (u16, u16) {
+        let rows = self.protection_rows();
+        let widest = |f: fn(&Self, ProtectionRow) -> String| {
+            rows.iter()
+                .map(|row| f(self, *row).chars().count() as u16)
+                .max()
+                .unwrap_or(0)
+        };
+        let label_width = widest(Self::protection_label);
+        let column_width = label_width + PROTECTION_TAG_WIDTH + widest(Self::protection_detail);
+        let columns =
+            (width.saturating_sub(2) / column_width.max(1)).clamp(1, rows.len().max(1) as u16);
+        (label_width, columns)
+    }
+
+    /// How tall the Automatic blocking panel wants to be at this width:
+    /// two border lines plus however many rows survive being dealt into
+    /// columns. Asked before the layout is solved, so it takes the whole
+    /// screen's width — which is the panel's, now that it has its own row.
+    fn protection_panel_height(&self, width: u16) -> u16 {
+        let (_, columns) = self.protection_columns(width);
+        (self.protection_rows().len() as u16).div_ceil(columns) + 2
+    }
+
+    /// Draws the rows in as many columns as the width allows, so all of
+    /// them are visible at once instead of five of fourteen.
+    ///
+    /// One `List` per column, filled top to bottom and then left to right,
+    /// so the single selection index the key handler moves still walks
+    /// them in reading order: Down at the foot of one column arrives at the
+    /// head of the next. Only the column holding the selection draws a
+    /// highlight, and it draws it at the row's index *within that column*.
     fn render_protection(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let items: Vec<ListItem> = self
-            .protection_rows()
-            .into_iter()
-            .map(|row| ListItem::new(self.protection_row_line(row)))
-            .collect();
-        let list = List::new(items)
-            .block(
-                Block::bordered()
-                    .title("Automatic blocking — Enter")
-                    .fg(theme.accent()),
-            )
-            .highlight_style(self.highlight_for(Focus::Protection));
-        frame.render_stateful_widget(list, area, &mut self.protection_state);
+        let rows = self.protection_rows();
+        let (label_width, columns) = self.protection_columns(area.width);
+        let per_column = (rows.len() as u16).div_ceil(columns) as usize;
+
+        // The block is drawn once, around the lot; the columns are laid
+        // out inside it. Rendering a bordered block per column would put a
+        // line between every pair of them.
+        let block = Block::bordered()
+            .title("Automatic blocking — Enter")
+            .fg(theme.accent());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        let column_areas = Layout::horizontal(
+            std::iter::repeat_n(Constraint::Ratio(1, u32::from(columns)), columns as usize)
+                .collect::<Vec<_>>(),
+        )
+        .split(inner);
+
+        let selected = self.protection_state.selected();
+        for (column, column_area) in column_areas.iter().enumerate() {
+            let first = column * per_column;
+            let Some(chunk) = rows.get(first..(first + per_column).min(rows.len())) else {
+                continue;
+            };
+            let items: Vec<ListItem> = chunk
+                .iter()
+                .map(|row| ListItem::new(self.protection_row_line(*row, label_width as usize)))
+                .collect();
+            // `Some(index)` only for the column the selection is in;
+            // `None` everywhere else, so exactly one row is highlighted.
+            let mut state = ListState::default();
+            state.select(
+                selected
+                    .filter(|i| (first..first + chunk.len()).contains(i))
+                    .map(|i| i - first),
+            );
+            let list = List::new(items).highlight_style(self.highlight_for(Focus::Protection));
+            frame.render_stateful_widget(list, *column_area, &mut state);
+        }
     }
 
     fn render_summary(&self, frame: &mut Frame, area: Rect) {
@@ -533,7 +625,24 @@ impl Dashboard {
         }
     }
 
-    fn protection_row_line(&self, row: ProtectionRow) -> Line<'static> {
+    /// What follows a row's tag: a feed's range count (or that it has none
+    /// yet), or an enabled detector's TTL. Its own method so
+    /// [`Self::protection_columns`] can measure it.
+    fn protection_detail(&self, row: ProtectionRow) -> String {
+        match row {
+            ProtectionRow::Feed(i) => match self.reputation.get(i) {
+                // "not fetched" is the important state to surface: an
+                // enabled feed with no ranges is silently doing nothing.
+                Some(s) if s.last_fetched_at.is_none() => " not fetched".to_string(),
+                Some(s) => format!(" {}", s.range_count),
+                None => String::new(),
+            },
+            _ if self.protection_enabled(row) => format!(" {}d", self.protection_ttl_days(row)),
+            _ => String::new(),
+        }
+    }
+
+    fn protection_row_line(&self, row: ProtectionRow, label_width: usize) -> Line<'static> {
         let enabled = self.protection_enabled(row);
         // A dedicated ON/OFF tag rather than reusing `policy_tag`: that one
         // means "traffic is allowed/blocked", and rendering an *enabled*
@@ -546,21 +655,14 @@ impl Dashboard {
         } else {
             Span::from("[ OFF ]").dim()
         };
-        let detail = match row {
-            ProtectionRow::Feed(i) => match self.reputation.get(i) {
-                // "not fetched" is the important state to surface: an
-                // enabled feed with no ranges is silently doing nothing.
-                Some(s) if s.last_fetched_at.is_none() => " not fetched".to_string(),
-                Some(s) => format!(" {}", s.range_count),
-                None => String::new(),
-            },
-            _ if enabled => format!(" {}d", self.protection_ttl_days(row)),
-            _ => String::new(),
-        };
         Line::from(vec![
-            Span::from(format!("{:<19}", self.protection_label(row))),
+            Span::from(format!(
+                "{:<label_width$} ",
+                self.protection_label(row),
+                label_width = label_width
+            )),
             tag,
-            Span::from(detail),
+            Span::from(self.protection_detail(row)),
         ])
     }
 
@@ -1266,6 +1368,9 @@ fn policy_tag(policy: Policy) -> Span<'static> {
 /// running in the background (`running`) or due but not yet started, that
 /// instead (the outcome shown would otherwise be stale the moment a job
 /// becomes due again, misleadingly implying nothing's changed since).
+/// The `[ ON  ]`/`[ OFF ]` tag, plus the gutter either side of it.
+const PROTECTION_TAG_WIDTH: u16 = 9;
+
 fn cron_status_line(status: &crate::cron::JobStatus, running: bool) -> Line<'static> {
     let last_run = match status.last_run {
         Some(t) => format_relative_time(t),
@@ -1366,6 +1471,16 @@ mod tests {
         assert!(is_stale(Some(now - STALE_AFTER_SECS - 1)));
     }
 
+    /// The size every render test in this file draws at.
+    ///
+    /// Comfortably above the 80x30 the README documents as the minimum.
+    /// Several of these used to draw at 60x28 — below what the product
+    /// claims to support — and only said so the day a panel grew tall
+    /// enough to push another one off a screen no user has.
+    fn test_terminal() -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(100, 32)).unwrap()
+    }
+
     fn now_secs() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1445,8 +1560,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| {
                 dashboard.render(
@@ -1501,8 +1615,7 @@ mod tests {
         let running_jobs = std::collections::HashSet::from([crate::app::Job::Cron(
             crate::cron::CronJob::Detect(Detector::SshScanners),
         )]);
-        let backend = TestBackend::new(60, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| dashboard.render(frame, frame.area(), Theme::Dark, &None, &running_jobs))
             .unwrap();
@@ -1530,8 +1643,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| {
                 dashboard.render(
@@ -1625,8 +1737,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| {
                 dashboard.render(
@@ -2008,11 +2119,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = // 80 columns, not 60: the Dashboard's middle row now holds
-        // Geo-blocking and Automatic blocking side by side, and 80 is the
-        // universal terminal minimum this layout targets (see SPECS.md).
-        TestBackend::new(80, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| {
                 dashboard.render(
@@ -2296,8 +2403,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| {
                 dashboard.render(
@@ -2337,8 +2443,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(60, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| {
                 dashboard.render(
@@ -2673,6 +2778,64 @@ mod tests {
     }
 
     /// The provider feeds block real visitors; enabling one must say so.
+    /// The selection follows the eye across the columns: with the rows
+    /// dealt down one column and then the next, the highlight has to land
+    /// in the right column at the right row — and in exactly one place.
+    ///
+    /// Nothing else would notice getting this wrong. Each column is its
+    /// own `List` with its own state, so a selection off the end of the
+    /// first column simply highlights nothing, and every other test here
+    /// asserts on text rather than on style.
+    #[test]
+    fn the_highlight_lands_in_the_column_holding_the_selected_row() {
+        let db = Db::open_in_memory().unwrap();
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.focus = Focus::Protection;
+        // Row 9 of 14: with seven to a column, the third row of the second
+        // column — a spot only reachable if the split is right.
+        dashboard.protection_state.select(Some(9));
+
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let highlighted: Vec<String> = (0..buffer.area.height)
+            .filter(|&y| {
+                (0..buffer.area.width).any(|x| {
+                    buffer[(x, y)]
+                        .style()
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::REVERSED)
+                })
+            })
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+
+        assert_eq!(highlighted.len(), 1, "exactly one row is highlighted");
+        let label = dashboard.protection_label(dashboard.protection_rows()[9]);
+        assert!(
+            highlighted[0].contains(&label),
+            "expected {label:?} highlighted, got: {:?}",
+            highlighted[0]
+        );
+    }
+
     #[test]
     fn enabling_a_provider_feed_warns_about_blocking_real_visitors() {
         let db = Db::open_in_memory().unwrap();
@@ -2700,6 +2863,47 @@ mod tests {
         assert!(message.contains("not just bots"), "message was: {message}");
     }
 
+    /// Every automatic-blocking option is on screen at once. There are
+    /// fourteen of them and the panel is nine rows tall, which only works
+    /// because they are dealt into columns — so this is really a test that
+    /// the column layout is still doing its job. It used to show five of
+    /// the fourteen, in half the width, and the other nine were a scroll
+    /// away with nothing saying they existed.
+    #[test]
+    fn every_automatic_blocking_option_is_visible_without_scrolling() {
+        let db = Db::open_in_memory().unwrap();
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        let rows = dashboard.protection_rows();
+        assert_eq!(rows.len(), 14, "if this changes, so does the panel height");
+        for row in rows {
+            let label = dashboard.protection_label(row);
+            assert!(content.contains(&label), "{label:?} is not on screen");
+        }
+    }
+
     #[test]
     fn render_shows_the_automatic_blocking_panel() {
         let db = Db::open_in_memory().unwrap();
@@ -2707,8 +2911,7 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let backend = TestBackend::new(80, 28);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| {
                 dashboard.render(
@@ -2753,8 +2956,7 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Char('f')), &db, &mut message)
             .unwrap();
 
-        let backend = TestBackend::new(100, 32);
-        let mut terminal = Terminal::new(backend).unwrap();
+        let mut terminal = test_terminal();
         terminal
             .draw(|frame| {
                 dashboard.render(
