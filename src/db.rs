@@ -1499,17 +1499,19 @@ impl Db {
         counts: &HashMap<String, u64>,
         seen_at: i64,
     ) -> Result<()> {
-        for (user_agent, count) in counts {
-            self.conn.execute(
-                "INSERT INTO user_agent_stats (user_agent, hit_count, last_seen_at)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(user_agent) DO UPDATE SET
-                    hit_count = hit_count + excluded.hit_count,
-                    last_seen_at = excluded.last_seen_at",
-                params![user_agent, *count as i64, seen_at],
-            )?;
-        }
-        Ok(())
+        self.batch(|| {
+            for (user_agent, count) in counts {
+                self.conn.execute(
+                    "INSERT INTO user_agent_stats (user_agent, hit_count, last_seen_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(user_agent) DO UPDATE SET
+                        hit_count = hit_count + excluded.hit_count,
+                        last_seen_at = excluded.last_seen_at",
+                    params![user_agent, *count as i64, seen_at],
+                )?;
+            }
+            Ok(())
+        })
     }
 
     /// Every recorded user agent's accumulated hit count, most-seen first —
@@ -1959,16 +1961,19 @@ impl Db {
     /// [`Self::clear_source_bot_entries`], so a CIDR dropped from the
     /// upstream list on a later fetch doesn't linger here forever.
     pub fn replace_ip_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
-        self.conn.execute(
-            "DELETE FROM ip_ranges WHERE source_id = ?1",
-            params![source_id],
-        )?;
-        for cidr in cidrs {
+        self.batch(|| {
             self.conn.execute(
-                "INSERT OR IGNORE INTO ip_ranges (source_id, cidr) VALUES (?1, ?2)",
-                params![source_id, cidr],
+                "DELETE FROM ip_ranges WHERE source_id = ?1",
+                params![source_id],
             )?;
-        }
+            for cidr in cidrs {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO ip_ranges (source_id, cidr) VALUES (?1, ?2)",
+                    params![source_id, cidr],
+                )?;
+            }
+            Ok(())
+        })?;
         // The real distinct count, not `cidrs.len()`: `INSERT OR IGNORE`
         // above means a source whose fetched list has internal duplicate
         // CIDRs would otherwise overstate its own count here — the same
@@ -2022,18 +2027,21 @@ impl Db {
     /// [`Self::replace_ip_ranges`] — a CIDR IPdeny drops from a country's
     /// zone file on a later fetch stops being attributed to it.
     pub fn replace_country_ranges(&self, country_code: &str, cidrs: &[String]) -> Result<usize> {
-        self.conn.execute(
-            "DELETE FROM country_ip_ranges WHERE country_code = ?1",
-            params![country_code],
-        )?;
         let fetched_at = now();
-        for cidr in cidrs {
+        self.batch(|| {
             self.conn.execute(
-                "INSERT OR IGNORE INTO country_ip_ranges (country_code, cidr, fetched_at)
-                 VALUES (?1, ?2, ?3)",
-                params![country_code, cidr, fetched_at],
+                "DELETE FROM country_ip_ranges WHERE country_code = ?1",
+                params![country_code],
             )?;
-        }
+            for cidr in cidrs {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO country_ip_ranges (country_code, cidr, fetched_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![country_code, cidr, fetched_at],
+                )?;
+            }
+            Ok(())
+        })?;
         Ok(cidrs.len())
     }
 
@@ -2211,16 +2219,19 @@ impl Db {
     /// idiom as [`Self::replace_ip_ranges`]: an address a feed drops on a
     /// later fetch stops being blocked, rather than accumulating forever.
     pub fn replace_reputation_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
-        self.conn.execute(
-            "DELETE FROM reputation_ranges WHERE source_id = ?1",
-            params![source_id],
-        )?;
-        for cidr in cidrs {
+        self.batch(|| {
             self.conn.execute(
-                "INSERT OR IGNORE INTO reputation_ranges (source_id, cidr) VALUES (?1, ?2)",
-                params![source_id, cidr],
+                "DELETE FROM reputation_ranges WHERE source_id = ?1",
+                params![source_id],
             )?;
-        }
+            for cidr in cidrs {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO reputation_ranges (source_id, cidr) VALUES (?1, ?2)",
+                    params![source_id, cidr],
+                )?;
+            }
+            Ok(())
+        })?;
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM reputation_ranges WHERE source_id = ?1",
             params![source_id],
@@ -2375,6 +2386,40 @@ pub(crate) fn escape_for_nginx_regex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Storing a real-sized feed must not autocommit per row.
+    ///
+    /// AWS publishes around seven thousand ranges. At one autocommit — and
+    /// so one fsync — each, storing them took **98 seconds** on a
+    /// developer laptop, on the main thread, which is what "switching AWS
+    /// ranges on froze the TUI" actually was. One transaction makes the
+    /// same work about a tenth of a second.
+    ///
+    /// On disk rather than in memory, deliberately: an in-memory database
+    /// never fsyncs, so it cannot tell the two apart. Six hundred rows
+    /// rather than seven thousand, because that is already ~8s of fsyncs
+    /// unbatched and a few milliseconds batched — the point is the gap,
+    /// and a faithful row count would just make the failing case slower.
+    ///
+    /// No wall-clock assertion, because there doesn't need to be one:
+    /// tests in `src/` are budgeted at 300ms by `.config/nextest.toml` and
+    /// killed at ten times that, so the per-row version fails this by
+    /// timing out rather than by asserting.
+    #[test]
+    fn storing_a_feeds_worth_of_ranges_takes_one_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("ranges.sqlite3")).unwrap();
+        // `reputation_ranges.source_id` is a foreign key, so the source
+        // has to exist before its ranges can.
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+        let cidrs: Vec<String> = (0..600)
+            .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
+            .collect();
+
+        let stored = db.replace_reputation_ranges("aws", &cidrs).unwrap();
+
+        assert_eq!(stored, cidrs.len());
+    }
 
     fn sample_bot(slug: &str) -> NewBot {
         NewBot {

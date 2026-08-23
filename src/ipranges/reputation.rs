@@ -271,10 +271,15 @@ fn parse_csv_first_column(raw: &str) -> Vec<String> {
 /// touching an existing row — so this can run on every startup without
 /// resetting an admin's enabled flags.
 pub fn register_all_reputation_sources(db: &Db) -> Result<()> {
-    for kind in ReputationSourceKind::ALL {
-        db.register_reputation_source(&kind.as_source())?;
-    }
-    Ok(())
+    // One transaction, not six: this runs on every single TUI startup, and
+    // an autocommit per source is an fsync per source for writes that are
+    // almost always no-ops.
+    db.batch(|| {
+        for kind in ReputationSourceKind::ALL {
+            db.register_reputation_source(&kind.as_source())?;
+        }
+        Ok(())
+    })
 }
 
 /// Stores `cidrs` under `kind`, registering the source first if needed.

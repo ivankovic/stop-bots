@@ -62,6 +62,18 @@ need.
 
 ### Fixed
 
+- **Switching on a large blocklist feed no longer freezes the TUI for a minute or more.**
+  Storing the fetched ranges inserted one row per autocommit — one `fsync` each — so AWS's
+  ~7,000 ranges took **98 seconds** on the main thread. One transaction makes the same work
+  about a tenth of a second. The same per-row pattern was in the crawler IP ranges, the
+  per-country geo ranges and the user-agent hit counts, and is fixed in all four; it was
+  fixed for bot lists in an earlier change and these were missed.
+- Registering the known bot-list and reputation sources is one transaction rather than nine,
+  which is startup cost on every launch.
+- The parse of a downloaded feed runs on a worker thread rather than on the async runtime.
+  The download always yielded properly, but the parse that follows it is plain CPU work —
+  and on a one-core server there is a single runtime thread, shared with the draw loop.
+
 - The TUI now clears the screen before its first frame. On a terminal that ignores the
   alternate-screen request the shell's scrollback stayed put, and because ratatui never
   transmits the blank cells of a first frame, the old text showed through every gap — the

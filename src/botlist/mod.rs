@@ -134,10 +134,16 @@ pub(crate) fn slugify(name: &str) -> String {
 /// show up (as "never updated") on TUI/CLI startup even before a first
 /// fetch. Doesn't touch a source that's already been fetched.
 pub fn register_all_sources(db: &Db) -> Result<()> {
-    for kind in SourceKind::ALL {
-        db.register_source(&kind.as_source())?;
-    }
-    Ok(())
+    // One transaction, for the same reason as
+    // `reputation::register_all_reputation_sources`: this is startup cost
+    // on every launch, paid in fsyncs for writes that rarely change
+    // anything.
+    db.batch(|| {
+        for kind in SourceKind::ALL {
+            db.register_source(&kind.as_source())?;
+        }
+        Ok(())
+    })
 }
 
 /// Stores `bots` in `db` under `kind`'s source row, registering/refreshing

@@ -173,6 +173,24 @@ pub struct App {
     apply_firewall: bool,
 }
 
+/// Runs a downloaded body's parser on the blocking pool.
+///
+/// The download itself yields at every `await`, so it never held the event
+/// loop up — but the parse that follows is plain CPU work with no await in
+/// it, and `tokio::spawn` puts it on a runtime worker. On a one-core
+/// server there is exactly one of those, shared with the draw loop, so a
+/// megabyte of AWS `ip-ranges.json` was a megabyte of frozen interface.
+///
+/// A parse can't fail in a way worth distinguishing from a panic, so a
+/// `JoinError` is reported as one.
+async fn parse_off_thread<T: Send + 'static>(
+    parse: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(parse)
+        .await
+        .context("the parser thread panicked")?
+}
+
 /// What [`App::render_firewall`] hands to the background thread. A struct
 /// rather than five positional parameters, three of which are flags.
 struct RenderRequest {
@@ -484,7 +502,7 @@ impl App {
                 let kind = botlist::SourceKind::from_id(&source_id)
                     .with_context(|| format!("unknown bot-list source: {source_id}"))?;
                 let raw = kind.fetch().await?;
-                kind.parse(&raw)
+                parse_off_thread(move || kind.parse(&raw)).await
             }
             .await
             .map_err(|err| err.to_string());
@@ -563,7 +581,7 @@ impl App {
                 let kind = ReputationSourceKind::from_id(&source_id)
                     .with_context(|| format!("unknown reputation source: {source_id}"))?;
                 let raw = kind.fetch().await?;
-                kind.parse(&raw)
+                parse_off_thread(move || kind.parse(&raw)).await
             }
             .await
             .map_err(|err: anyhow::Error| err.to_string());
@@ -702,7 +720,7 @@ impl App {
             for kind in ipranges::IpRangeSourceKind::ALL {
                 let result = async {
                     let raw = kind.fetch().await?;
-                    kind.parse(&raw)
+                    parse_off_thread(move || kind.parse(&raw)).await
                 }
                 .await
                 .map_err(|err: anyhow::Error| err.to_string());
