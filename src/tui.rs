@@ -189,7 +189,7 @@ pub enum KeyOutcome {
     FetchReputationSource(String),
     /// The Dashboard's firewall render action was triggered. Carries the
     /// selected backend and output path for `App` to call the render
-    /// function (see `App::render_firewall`). `apply` is the render popup's
+    /// function (see `App::start_firewall_render`). `apply` is the render popup's
     /// "apply after writing" toggle (Space, see `Popup::RenderFirewall`) —
     /// when set, `App` also runs `firewall::apply_script` once the write
     /// succeeds, not just writes the script for the admin to apply by hand.

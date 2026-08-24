@@ -257,7 +257,7 @@ impl SiteSettings {
         // site's config file off disk and re-renders its block to compare,
         // which on a host with many sites is a visible pause every time
         // anything on this screen changes. `App` runs the check in the
-        // background (`App::check_site_statuses`) and calls
+        // background (`App::start_site_status_check`) and calls
         // `finish_status_check`; until then the tags say so.
         self.statuses_current = false;
         if !self.sites.is_empty() && self.list_state.selected().is_none() {
@@ -325,7 +325,8 @@ impl SiteSettings {
             self.render_popup(frame, area, popup);
         }
         if let Some(popup) = &self.setting_popup {
-            self.render_setting_popup(frame, area, popup);
+            let (title, options) = setting_options(popup.setting);
+            crate::tui::dashboard::render_option_list(frame, area, title, &options, popup.selected);
         }
         if let Some(alert) = &self.alert {
             self.render_alert(frame, area, alert);
@@ -374,11 +375,6 @@ impl SiteSettings {
             list = list.highlight_style(ratatui::style::Style::new().reversed());
         }
         frame.render_stateful_widget(list, area, &mut self.settings_state);
-    }
-
-    fn render_setting_popup(&self, frame: &mut Frame, area: Rect, popup: &SettingPopup) {
-        let (title, options) = setting_options(popup.setting);
-        crate::tui::dashboard::render_option_list(frame, area, title, &options, popup.selected);
     }
 
     fn render_alert(&self, frame: &mut Frame, area: Rect, alert: &str) {
@@ -917,12 +913,10 @@ impl SiteSettings {
             Err(err) => format!("Site scan failed: {err}"),
         }
     }
-}
 
-/// Resolves what a status check needs out of `Db`, so the per-site file
-/// reads can happen off the main thread. Reuses [`PlannedSite`]: a status
-/// check and an apply need exactly the same three things about a site.
-impl SiteSettings {
+    /// Resolves what a status check needs out of `Db`, so the per-site file
+    /// reads can happen off the main thread. Reuses [`PlannedSite`]: a status
+    /// check and an apply need exactly the same three things about a site.
     pub fn plan_status_check(&self, db: &Db) -> Result<Vec<PlannedSite>> {
         self.sites
             .iter()

@@ -242,7 +242,7 @@ pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
 /// [`FirewallBackend::apply_command`]) against it. This is the one place in
 /// the whole project that executes a generated firewall script rather than
 /// only ever writing it — the Dashboard's render popup's "apply after
-/// writing" toggle (`App::render_firewall`), gated by the same
+/// writing" toggle (`App::start_firewall_render`), gated by the same
 /// `apply_firewall`/explicit-confirmation guard `nginx::reload` uses for
 /// NGINX reloads. Never called from anywhere unattended (no cron job calls
 /// this): keeping `README.md`'s "generated, never applied *automatically*"

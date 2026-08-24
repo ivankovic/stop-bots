@@ -101,17 +101,17 @@ pub enum AppEvent {
         log_text: Option<String>,
     },
     /// A background read of the SSH log, for Dynamic Protection's SSH
-    /// panel, has come back (see `App::read_ssh_log`). `None` means no log
+    /// panel, has come back (see `App::start_ssh_log_read`). `None` means no log
     /// was readable. Only the read is backgrounded; parsing it into rows
     /// happens on the main thread, same as `CronLogFetched` above and for
     /// the same reason.
     SshLogRead { text: Option<String> },
     /// The background `nginx -t` + `systemctl reload nginx` that follows a
-    /// Site settings apply has finished (see `App::reload_nginx`). `Err`
+    /// Site settings apply has finished (see `App::start_nginx_reload`). `Err`
     /// carries the stringified failure, `anyhow::Error` not being `Clone`.
     NginxReloaded { result: Result<(), String> },
     /// A background firewall render has finished (see
-    /// `App::render_firewall`). `signature` is the rendered rule set's
+    /// `App::start_firewall_render`). `signature` is the rendered rule set's
     /// signature, for the main thread to persist — the `Db` write can't
     /// happen on the worker. `Err` carries the stringified failure, which
     /// includes the lockout guard refusing.
@@ -135,7 +135,7 @@ pub enum AppEvent {
     },
     /// A background pass over every site's config file, working out which
     /// of them still match what their settings render to (see
-    /// `App::check_site_statuses`). In the site list's order.
+    /// `App::start_site_status_check`). In the site list's order.
     SiteStatusesChecked {
         statuses: Vec<crate::nginx::SiteApplyStatus>,
     },

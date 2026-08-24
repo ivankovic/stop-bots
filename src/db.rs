@@ -1453,7 +1453,7 @@ impl Db {
     }
 
     /// The rule-set signature (see `firewall::rules_signature`) as of the
-    /// last successful firewall render (`App::render_firewall`/
+    /// last successful firewall render (`App::start_firewall_render`/
     /// `render_firewall_for_cron`), or `None` if it's never rendered —
     /// compared against what `firewall::all_rules` would produce right now
     /// to tell the Dashboard's Summary panel whether the on-disk script is

@@ -24,6 +24,33 @@ that directory.
 - Avoid churn: don’t refactor between equivalent forms (Span::styled ↔ set_style, Line::from ↔ .into()) without a clear readability or functional gain; follow file‑local conventions and do not introduce type annotations solely to satisfy .into().
 - Compactness: prefer the form that stays on one line after rustfmt; if only one of Line::from(vec![…]) or vec![…].into() avoids wrapping, choose that. If both wrap, pick the one with fewer wrapped lines.
 
+## Clippy beyond `-D warnings`
+
+`cargo clippy --all-targets -- -D warnings` is the bar and it is clean. If you
+run `-W clippy::pedantic` as well, three of its lints are **wrong for this
+codebase** and have been considered and rejected — don't "fix" them:
+
+- `unnecessary_wraps` on the `handle_*_key` methods and on `App`'s
+  `start_*` family. They return `Result` to match their siblings, and a
+  uniform signature across a family of dispatch methods is worth more than
+  removing a `?` from three of them.
+- `unused_self` on `render_message`, `apply_popup` and friends, for the same
+  reason: they sit among sibling methods that do use `self`, and breaking a
+  `render_*` family into methods and free functions helps nobody reading it.
+- `missing_errors_doc` / `must_use` (169 and 83 hits). Those earn their keep
+  on a published library API. `src/lib.rs` exists so the integration tests can
+  reach the binary's internals; it is not a designed API surface, and
+  `Cargo.toml` says so.
+
+## Background work in `App`
+
+Every long-running action is a `start_x` / `finish_x` pair, eleven times over:
+`start_` does the `Db` reads on the main thread, spawns the slow half, and
+returns immediately; `finish_` applies the result back on the main thread,
+where `Db` can be touched again. Adding a twelfth follows the same shape, and
+the pair is named for the work, not the verb — `start_nginx_reload`, not
+`reload_nginx`, because it doesn't reload anything, it starts a reload.
+
 ## Tests
 
 Beyond the policy in README.md (no mocks; in-memory fakes, injected inputs,

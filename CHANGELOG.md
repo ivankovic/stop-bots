@@ -47,6 +47,12 @@ need.
 
 ### Changed
 
+- `App`'s background work is a `start_x` / `finish_x` pair throughout. Several of the
+  `start` halves were named `reload_nginx`, `read_ssh_log`, `check_site_statuses` — right
+  about the subject and wrong about the tense, since none of them does the thing, they all
+  only start it. Internal naming only; no behaviour change.
+
+
 - The Dashboard's "Automatic blocking" panel is a full-width panel of its own, and shows
   all fourteen options at once instead of five at a time behind a scroll. It deals its
   rows into as many columns as the terminal is wide enough for (two from about 100

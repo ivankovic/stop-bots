@@ -3398,3 +3398,58 @@ left alone.
 **Test fallout is expected here, not a regression.** Changing what a
 screen says breaks tests that assert on what it said — and two of those
 had pinned wording this pass exists to change.
+
+## Code health pass before launch
+
+Measured first, because "readability" invites rewriting whatever the reader
+last touched. What the numbers said: no dead code, `-D warnings` clean, and
+the longest real functions are 100–140 lines of inherently-dispatchy `match`.
+So the debt was not function length, and the pass did not chase it.
+
+**The `db.rs` split was considered and rejected — again, and this time
+written down properly.** It is the obvious lever (2,400 lines of code across
+fourteen concerns) and the wrong one. `Db` is one struct wrapping one
+connection, so the mechanical version spreads `impl Db` blocks across files:
+2,400 lines moved, none of them easier to read, and the `// ---- section ----`
+banners already give exactly the navigation a split would. The version that
+would genuinely help — per-concern types — is a design exercise, not a
+tidy-up. A no-behaviour-change diff of that size is an expensive way to make a
+launch riskier.
+
+**The biggest actual finding was `TODO.md`.** It carried open items, a
+history of everything shipped, and design reasoning all at once, and the
+history had outgrown the todos — so real open work was buried inside the
+"Done" section as parenthetical asides: `App::message` only ever rendering on
+the Dashboard, no CLI verb for category defaults, `set_firewall_rule_enabled`
+tested but unwired. For a repo about to be public, a todo list you can't find
+the todos in is worse than a long source file. Now open work only; the history
+is in the changelog and the git log, the reasoning in this file. Every
+remaining claim was re-checked against the code — one had been fixed this
+session and was removed.
+
+**Then the code written this session, which was the only code that hadn't had
+a readability pass.** Two things came out of it:
+
+- **The `start_`/`finish_` family had drifted.** The `finish_` half had
+  converged on one name shape; the `start_` half was `start_`, `check_`,
+  `read_`, `reload_` and `render_` for the identical pattern — so the app's
+  central mechanism, and the reason the TUI never blocks, was invisible to
+  anyone reading down the file. All eleven are pairs now, named for the work
+  rather than the verb: `start_nginx_reload`, not `reload_nginx`, because it
+  does not reload anything, it starts a reload and returns. The tense was the
+  actual bug in those names — each promised to do the thing.
+- **`site_settings.rs` had grown a second `impl SiteSettings`**, an artifact
+  of how the plan/run/finish methods were added rather than a distinction
+  worth keeping. Folded back in.
+
+**Three pedantic lints are wrong here and are now recorded as rejected** in
+`AGENTS.md`, so the next reader doesn't "fix" them: `unnecessary_wraps` and
+`unused_self` both fire on members of deliberately uniform families
+(`handle_*_key`, `render_*`, `start_*`), where breaking three out of a family
+of eight costs more than the `?` it saves; and `missing_errors_doc`/`must_use`
+earn their keep on a published library API, which `src/lib.rs` explicitly is
+not.
+
+One caution worth keeping: `clippy -W clippy::pedantic` prints a *summary*
+rather than one warning per site, so grepping its output for `clippy::` finds
+nothing and looks like a clean run. It isn't; check before trusting silence.

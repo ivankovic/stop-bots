@@ -58,20 +58,20 @@ pub enum Job {
     /// A scheduled job from [`crate::cron`].
     Cron(CronJob),
     /// Reading the SSH log that Dynamic Protection's SSH panel is built
-    /// from. See [`App::read_ssh_log`].
+    /// from. See [`App::start_ssh_log_read`].
     ReadSshLog,
     /// `nginx -t` followed by `systemctl reload nginx`, after Site
-    /// settings has written a config file. See [`App::reload_nginx`].
+    /// settings has written a config file. See [`App::start_nginx_reload`].
     ReloadNginx,
     /// Writing the firewall script and, if asked, applying it. See
-    /// [`App::render_firewall`].
+    /// [`App::start_firewall_render`].
     RenderFirewall,
     /// Walking the NGINX config root. See [`App::start_site_action`].
     ScanSites,
     /// Rewriting site config files. See [`App::start_site_action`].
     ApplySites,
     /// Reading each site's config file to work out whether its block is
-    /// current. See [`App::check_site_statuses`].
+    /// current. See [`App::start_site_status_check`].
     CheckSiteStatuses,
 }
 
@@ -121,18 +121,18 @@ pub struct App {
     last_cron_check: std::time::Instant,
     /// The SSH log as last read, and when. Dynamic Protection's SSH panel
     /// is rebuilt from this rather than from a fresh read — see
-    /// [`SSH_LOG_MAX_AGE`] and [`App::read_ssh_log`]. `None` means no read
+    /// [`SSH_LOG_MAX_AGE`] and [`App::start_ssh_log_read`]. `None` means no read
     /// has come back yet.
     ///
     /// Deliberately *not* what the lockout guard in
-    /// [`App::render_firewall`] consults: that one reads live, every time.
+    /// [`App::start_firewall_render`] consults: that one reads live, every time.
     /// A cached answer there is the difference between "this would cut off
     /// the admin" and finding out afterwards.
     ssh_log_text: Option<String>,
     ssh_log_read_at: Option<std::time::Instant>,
     /// Set when an apply asked for an NGINX reload while one was already
     /// running, so [`App::finish_nginx_reload`] knows to start one more.
-    /// See [`App::reload_nginx`] for why dropping it instead is wrong.
+    /// See [`App::start_nginx_reload`] for why dropping it instead is wrong.
     reload_nginx_pending: bool,
     /// Set when the site list or its settings changed while a status check
     /// was already out. Coalesced rather than dropped for the same reason
@@ -191,7 +191,7 @@ async fn parse_off_thread<T: Send + 'static>(
         .context("the parser thread panicked")?
 }
 
-/// What [`App::render_firewall`] hands to the background thread. A struct
+/// What [`App::start_firewall_render`] hands to the background thread. A struct
 /// rather than five positional parameters, three of which are flags.
 struct RenderRequest {
     backend: crate::firewall::FirewallBackend,
@@ -396,14 +396,14 @@ impl App {
                 // Same shape as the SSH log read above: `refresh` no
                 // longer reads every site's config file itself, so kick
                 // off the check that does.
-                self.check_site_statuses()
+                self.start_site_status_check()
             }
             Screen::DynamicProtection => {
                 // Kicked off here rather than on entering the screen: this
                 // is the one place every route to a visible SSH panel goes
                 // through, and the freshness check makes repeating it
                 // harmless.
-                self.read_ssh_log();
+                self.start_ssh_log_read();
                 self.dynamic_protection
                     .refresh(&self.db, self.ssh_log_text.as_deref())
             }
@@ -467,7 +467,7 @@ impl App {
             Event::App(AppEvent::SshLogRead { text }) => self.finish_ssh_log_read(text)?,
             Event::App(AppEvent::NginxReloaded { result }) => self.finish_nginx_reload(result),
             Event::App(AppEvent::FirewallRendered { signature, outcome }) => {
-                self.finish_render_firewall(signature, outcome)?
+                self.finish_firewall_render(signature, outcome)?
             }
             Event::App(AppEvent::SitesScanned { sites }) => self.finish_site_scan(sites)?,
             Event::App(AppEvent::SiteStatusesChecked { statuses }) => {
@@ -487,6 +487,21 @@ impl App {
         }
         Ok(())
     }
+    // ---- background work: every `start_` has a `finish_` ----
+    //
+    // The shape is the same eleven times over, and it is the reason the
+    // TUI never blocks. A `start_` method does the `Db` reads on the main
+    // thread, puts the slow half on a runtime or blocking-pool task, and
+    // returns immediately; the task sends an `AppEvent`; the matching
+    // `finish_` method applies the result back on the main thread, where
+    // `Db` can be touched again (`rusqlite::Connection` is `Send` but not
+    // `Sync`).
+    //
+    // They are named as pairs on purpose. Several of these used to read
+    // `reload_nginx`, `read_ssh_log`, `check_site_statuses` — accurate
+    // about the subject and wrong about the tense, since none of them does
+    // the thing, they all only start it. `start_` says "this returns
+    // before the work does", which is the invariant a reader needs.
 
     /// Starts a background fetch+parse of the bot-list source identified by
     /// `source_id` (resolved to a `botlist::SourceKind`, which knows how to
@@ -818,7 +833,7 @@ impl App {
     /// to happen inside `SiteSettings::refresh` — so every change to
     /// anything on that screen paid for all of them before redrawing. The
     /// `Db` half (each site's resolved `BlockConfig`) stays here.
-    fn check_site_statuses(&mut self) -> Result<()> {
+    fn start_site_status_check(&mut self) -> Result<()> {
         if self.jobs_in_flight.contains(&Job::CheckSiteStatuses) {
             self.site_statuses_pending = true;
             return Ok(());
@@ -849,7 +864,7 @@ impl App {
         self.jobs_in_flight.remove(&Job::CheckSiteStatuses);
         self.site_settings.finish_status_check(statuses);
         if std::mem::take(&mut self.site_statuses_pending) {
-            self.check_site_statuses()?;
+            self.start_site_status_check()?;
         }
         Ok(())
     }
@@ -933,7 +948,7 @@ impl App {
         // were just written rather than waiting on `systemctl`.
         self.refresh()?;
         if changed_a_file {
-            self.reload_nginx();
+            self.start_nginx_reload();
         }
         Ok(())
     }
@@ -954,7 +969,7 @@ impl App {
     /// a second site while the first site's reload was still running and
     /// having NGINX never pick the second one up — "I applied it and
     /// nothing happened", which is worse than the pause this replaced.
-    fn reload_nginx(&mut self) {
+    fn start_nginx_reload(&mut self) {
         if !self.reload_nginx_for_real {
             return;
         }
@@ -980,7 +995,7 @@ impl App {
             self.message = Some(format!("{applied} — failed to reload NGINX: {err}"));
         }
         if std::mem::take(&mut self.reload_nginx_pending) {
-            self.reload_nginx();
+            self.start_nginx_reload();
         }
     }
 
@@ -995,7 +1010,7 @@ impl App {
     /// TUI. Parsing the text into rows stays on the main thread with every
     /// other `Db` access (`Db` isn't `Sync`) — it is an in-memory line
     /// scan, and moving it would buy nothing.
-    fn read_ssh_log(&mut self) {
+    fn start_ssh_log_read(&mut self) {
         let fresh_enough = self
             .ssh_log_read_at
             .is_some_and(|at| at.elapsed() < SSH_LOG_MAX_AGE);
@@ -1107,7 +1122,7 @@ impl App {
     /// allowlist geo mode, unlike iptables — see `firewall::build_script`),
     /// skipping the write (recorded as the job's summary, not an error) if
     /// doing so would risk locking out a currently-connected SSH client —
-    /// same safety check `App::render_firewall`'s manual path runs, except
+    /// same safety check `App::start_firewall_render`'s manual path runs, except
     /// `ssh_log_text` is already resolved by `start_cron_log_job` rather
     /// than being re-resolved here via `assess_lockout_risk`, so this
     /// applies `sshlog::parse_accepted_ips`/`firewall::lockout_risks`
@@ -1155,7 +1170,7 @@ impl App {
     /// `self.apply_firewall` is set (see that field's doc comment); when
     /// it isn't (tests), this behaves exactly like `apply: false` rather
     /// than silently claiming success for a subprocess it never ran.
-    fn render_firewall(
+    fn start_firewall_render(
         &mut self,
         backend: crate::firewall::FirewallBackend,
         out_path: String,
@@ -1211,7 +1226,7 @@ impl App {
     /// signature is what the Dashboard's "needs updating" row compares
     /// against, and it is a `Db` write, so it waits for the main thread
     /// like every other one.
-    fn finish_render_firewall(
+    fn finish_firewall_render(
         &mut self,
         signature: String,
         outcome: Result<RenderOutcome, String>,
@@ -1291,14 +1306,14 @@ impl App {
                 apply,
             } => {
                 // The refresh that used to follow this line now happens
-                // in `finish_render_firewall`, once the signature the
+                // in `finish_firewall_render`, once the signature the
                 // Dashboard compares against has actually been written.
-                self.render_firewall(backend, out_path, force, apply);
+                self.start_firewall_render(backend, out_path, force, apply);
                 return Ok(());
             }
             KeyOutcome::ReloadNginx => {
                 self.refresh()?;
-                self.reload_nginx();
+                self.start_nginx_reload();
                 return Ok(());
             }
             KeyOutcome::SiteAction(action) => {
@@ -1379,7 +1394,7 @@ mod tests {
             // its own.
             //
             // A *readable* one rather than a nonexistent path, because
-            // `render_firewall` now refuses when the lockout check can't
+            // `start_firewall_render` now refuses when the lockout check can't
             // run at all. Its single Accepted line is for 192.0.2.10,
             // which nothing in these tests blocks.
             Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
@@ -1501,7 +1516,7 @@ mod tests {
 
     /// The direct `stop_bots::firewall` call this method now makes (instead
     /// of shelling out to a `stop-bots` binary that might not be on `$PATH`
-    /// — see the doc comment on `render_firewall`) must still actually
+    /// — see the doc comment on `start_firewall_render`) must still actually
     /// write the script and report success.
     // `App::new` spawns a background task via `EventHandler::new`, so
     // constructing one needs an actual Tokio runtime, not just `#[test]`.
@@ -1511,7 +1526,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("fw.nft").to_str().unwrap().to_string();
 
-        app.render_firewall(FirewallBackend::Nftables, out_path.clone(), false, false);
+        app.start_firewall_render(FirewallBackend::Nftables, out_path.clone(), false, false);
         drain_background_work(&mut app).await;
 
         assert!(std::path::Path::new(&out_path).exists());
@@ -1534,7 +1549,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("fw.nft").to_str().unwrap().to_string();
 
-        app.render_firewall(FirewallBackend::Nftables, out_path.clone(), false, true);
+        app.start_firewall_render(FirewallBackend::Nftables, out_path.clone(), false, true);
         drain_background_work(&mut app).await;
 
         assert!(std::path::Path::new(&out_path).exists());
@@ -1554,16 +1569,16 @@ mod tests {
         let out_path = dir.path().join("fw.nft").to_str().unwrap().to_string();
 
         assert_eq!(app.db.get_firewall_rendered_signature().unwrap(), None);
-        app.render_firewall(FirewallBackend::Nftables, out_path, false, false);
+        app.start_firewall_render(FirewallBackend::Nftables, out_path, false, false);
         drain_background_work(&mut app).await;
         assert!(app.db.get_firewall_rendered_signature().unwrap().is_some());
     }
 
-    /// Regression test: `render_firewall` alone only updates `Db`; the
+    /// Regression test: `start_firewall_render` alone only updates `Db`; the
     /// Dashboard's "needs updating" row is a value cached on `Dashboard`
     /// itself, only recomputed by `Dashboard::refresh`. Confirming the
     /// render popup drives through `KeyOutcome::RenderFirewall`, not
-    /// `render_firewall` directly, so this exercises `App::handle_key_event`
+    /// `start_firewall_render` directly, so this exercises `App::handle_key_event`
     /// end to end (via the real 'f' keypress, backspacing the default path
     /// out and typing a writable temp one, then Enter) to prove that arm
     /// actually calls `self.refresh()` afterward — without it, the Summary
@@ -1610,7 +1625,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("fw.sh").to_str().unwrap().to_string();
 
-        app.render_firewall(FirewallBackend::Iptables, out_path.clone(), false, false);
+        app.start_firewall_render(FirewallBackend::Iptables, out_path.clone(), false, false);
         drain_background_work(&mut app).await;
 
         assert!(!std::path::Path::new(&out_path).exists());
@@ -1621,7 +1636,7 @@ mod tests {
     // The lockout-risk branch itself (skip if `LockoutStatus::Risks` is
     // non-empty and not forced) is exercised thoroughly against
     // `firewall::assess_lockout_risk`/`lockout_risks` directly in
-    // `firewall.rs`'s tests. It isn't re-tested here: `render_firewall`
+    // `firewall.rs`'s tests. It isn't re-tested here: `start_firewall_render`
     // always checks the auto-detected SSH log (`assess_lockout_risk(_,
     // None)`, matching the CLI's no-`--ssh-log` default), which isn't
     // something a unit test can point at a fixture without either reading
@@ -1790,7 +1805,7 @@ mod tests {
         )
         .unwrap();
 
-        app.render_firewall(
+        app.start_firewall_render(
             crate::firewall::FirewallBackend::Nftables,
             out.to_str().unwrap().to_string(),
             false,
@@ -1821,7 +1836,7 @@ mod tests {
         )
         .unwrap();
 
-        app.render_firewall(
+        app.start_firewall_render(
             crate::firewall::FirewallBackend::Nftables,
             out.to_str().unwrap().to_string(),
             true,
@@ -1855,7 +1870,7 @@ mod tests {
         )
         .unwrap();
 
-        app.render_firewall(
+        app.start_firewall_render(
             crate::firewall::FirewallBackend::Nftables,
             out.to_str().unwrap().to_string(),
             false,

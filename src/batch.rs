@@ -48,6 +48,10 @@
 //! **switched on or selected** — fetching AWS's published address space
 //! for a feed nobody enabled is megabytes for nothing.
 //!
+//! `--no-fetch` skips all four. Bot lists change weekly and an access log
+//! changes every second, so a nightly full run plus a frequent
+//! `--no-fetch --apply` is the pair the README recommends.
+//!
 //! ## Two independent planes
 //!
 //! NGINX config and the firewall script are separate mechanisms, and one
@@ -63,6 +67,11 @@
 //! running both gets one detection pass rather than two, and the
 //! Dashboard's "Scheduled tasks" panel shows what the *real* cron did
 //! rather than claiming everything is overdue.
+//!
+//! The access-log read offset is shared the same way, and is the easier
+//! half to get wrong: it is keyed by the log's path, so a key of batch's
+//! own would re-tally the whole log on the first run and double-count
+//! every line thereafter. See [`scan_logs`].
 
 use crate::cron::CronJob;
 use crate::db::Db;
