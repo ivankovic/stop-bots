@@ -29,7 +29,14 @@ const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
 const DB_HELP: &str = "Database path (defaults to /var/lib/stop-bots/db.sqlite3, falling back to a per-user location if that's not writable)";
 
 #[derive(Parser)]
-#[command(name = "stop-bots", about = "Configure your server to stop bad bots")]
+// `version` is not decoration: this ships as a tagged GitHub release
+// binary, so "is the thing on the server the thing I built?" is a
+// question someone will actually have to answer.
+#[command(
+    name = "stop-bots",
+    version,
+    about = "Configure your server to stop bad bots"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -98,6 +105,8 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Write the firewall rules to a script for you to review and apply.
+    ///
     /// Render the stored firewall rules into an iptables or nftables script.
     /// The script is written to disk only — it is never executed by this
     /// tool. Review it, then apply it yourself. Also includes derived rules
@@ -135,6 +144,8 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Block IPs with a pile of failed SSH logins.
+    ///
     /// Scans the SSH log for IP addresses with a pile of failed
     /// authentication attempts — the signature of an automated
     /// scanner/brute-force bot, not a human — and adds a temporary Block
@@ -171,6 +182,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Block IPs that probed a pile of nonexistent URLs.
+    ///
     /// Scans the NGINX access log for IP addresses that requested a pile of
     /// distinct nonexistent URLs (404s) — the signature of an automated
     /// vulnerability/URL scanner, not a human clicking a dead link — and
@@ -206,6 +219,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Block IPs faking a Googlebot/Bingbot/GPTBot user agent.
+    ///
     /// Scans the NGINX access log for IP addresses that claimed, via their
     /// User-Agent, to be Googlebot, Bingbot or GPTBot while connecting from
     /// an address that crawler's own operator does not publish — the
@@ -243,6 +258,10 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Block IPs that asked for /.env, /.git/config and friends.
+    ///
+    /// Block IPs that asked for /.env, /.git/config and friends.
+    ///
     /// Scans the NGINX access log for IP addresses that requested a path
     /// nothing legitimate ever asks for — `/.env`, `/.git/config`,
     /// `/wp-config.php`, `/vendor/phpunit/...` and friends — and adds a
@@ -271,6 +290,8 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Set the extra probe paths, on top of the built-in list.
+    ///
     /// Replaces the extra probe paths checked by BlockProbePaths, on top of
     /// the built-in list (which is never removable — turn the detector off
     /// instead). One path per line; blank lines and `#` comments are
@@ -288,6 +309,8 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Block anything that fetched the honeypot trap path.
+    ///
     /// Scans the NGINX access log for anything that fetched the honeypot
     /// trap path and adds a temporary Block rule (expiring after
     /// --ttl-days) for each.
@@ -316,7 +339,9 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Sets the honeypot trap path. Must start with `/`. Pick something
+    /// Set the honeypot trap path.
+    ///
+    /// Must start with `/`. Pick something
     /// that does *not* sound valuable: a path like `/admin` or `/backup`
     /// would also be guessed by scanners that never read robots.txt, which
     /// turns a precise "ignored robots.txt" signal into just another probe
@@ -327,6 +352,8 @@ enum Command {
         #[arg(long)]
         path: String,
     },
+    /// Tally which user agents are getting through successfully.
+    ///
     /// Reads the NGINX access log and tallies which user agents made a
     /// successful (non-4xx/5xx) request, adding the counts onto the
     /// `user_agent_stats` table (see stop_bots::accessstats::
@@ -348,6 +375,8 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Download one crawler's published IP ranges.
+    ///
     /// Download and store the current CIDR list for one published crawler
     /// IP-range source (Googlebot, Bingbot or GPTBot)
     UpdateIpRanges {
@@ -357,6 +386,8 @@ enum Command {
         #[arg(long)]
         source_id: String,
     },
+    /// Download one third-party CIDR feed (does not switch it on).
+    ///
     /// Download and store one third-party CIDR feed: an abuse/reputation
     /// list (firehol-level1, tor-exits, blocklist-de) or a cloud
     /// provider's published address space (aws, google-cloud,
@@ -369,7 +400,9 @@ enum Command {
         #[arg(long)]
         source_id: String,
     },
-    /// Switches a third-party CIDR feed on or off. While on, every CIDR it
+    /// Switch a third-party CIDR feed on or off.
+    ///
+    /// While on, every CIDR it
     /// holds becomes a derived Block rule at render-firewall time (nothing
     /// is written to firewall_rules, same as crawler and country ranges).
     ///
@@ -389,12 +422,16 @@ enum Command {
         #[arg(long, action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// List the third-party CIDR feeds.
+    ///
     /// Lists every third-party CIDR feed with its on/off state and how many
     /// ranges it currently holds
     ListReputationSources {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Download one country's IP ranges (does not select it).
+    ///
     /// Download and store IPdeny's current aggregated CIDR list for one
     /// country (does not select it — see AddCountry)
     UpdateCountryRanges {
@@ -404,7 +441,9 @@ enum Command {
         #[arg(long)]
         country: String,
     },
-    /// Sets the host-wide geo mode: "blocklist" (selected countries are
+    /// Set the geo mode: blocklist or allowlist.
+    ///
+    /// "blocklist" (selected countries are
     /// blocked, everything else allowed — the default) or "allowlist"
     /// (selected countries are the only ones allowed, everything else
     /// blocked). Switching modes doesn't touch the selected-country list
@@ -415,6 +454,8 @@ enum Command {
         #[arg(long)]
         mode: GeoModeArg,
     },
+    /// Add a country to the geo selection.
+    ///
     /// Add a country to the host-wide geo selection (fetch its ranges first
     /// with UpdateCountryRanges). What this means depends on the current
     /// geo mode — see SetGeoMode.
@@ -462,7 +503,9 @@ enum Command {
         #[arg(long)]
         burst: Option<i64>,
     },
-    /// Switches one request-shape rule on or off for a site (see
+    /// Switch one request-shape rule on or off for a site.
+    ///
+    /// See the rule list below (see
     /// SetBlockResponse's siblings in Site settings). Rules:
     /// http-1x, no-accept, no-accept-language, no-user-agent,
     /// ip-literal-host, old-tls.
@@ -477,6 +520,8 @@ enum Command {
         #[arg(long, action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Exempt a path prefix from a site's blocking rules.
+    ///
     /// Adds a request-path prefix that a site's blocking rules don't apply
     /// to. Must start with `/`.
     ExemptPath {
@@ -490,7 +535,9 @@ enum Command {
         #[arg(long)]
         remove: bool,
     },
-    /// Turns generation of a `robots.txt` on or off. When on, ApplyBlocks
+    /// Turn generation of a robots.txt on or off.
+    ///
+    /// When on, ApplyBlocks
     /// writes one to /etc/stop-bots/nginx/robots.txt and adds a
     /// `location = /robots.txt` block to each site that serves it: one
     /// `User-agent:` line per currently-blocked bot under a shared
@@ -514,7 +561,8 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
-    /// Sets what NGINX does with a request the blocking rules caught.
+    /// Set what NGINX sends a blocked request.
+    ///
     ///
     /// These are not interchangeable status codes; each says something
     /// different, and the difference matters most for clients caught by
@@ -540,9 +588,11 @@ enum Command {
         #[arg(long)]
         response: BlockResponseArg,
     },
-    /// One unattended pass over everything, for a real cron entry:
-    /// refresh every list, scan the logs, write the NGINX blocking rules
-    /// and the firewall script — and, with --apply, put both into effect.
+    /// One unattended pass over everything, for a real cron entry.
+    ///
+    /// Refreshes every list, scans the logs, writes the NGINX blocking
+    /// rules and the firewall script — and, with --apply, puts both into
+    /// effect.
     ///
     /// Without --apply nothing is enforced: the config and the script are
     /// written and left alone, which is inert (config does nothing until a

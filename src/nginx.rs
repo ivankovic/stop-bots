@@ -1064,7 +1064,17 @@ fn apply_block(content: &str, block: &ServerBlock, config: &BlockConfig) -> Stri
 /// `server { ... }` blocks, returning one [`DiscoveredSite`] per block (named
 /// after its first `server_name`). Files with no server block, or that
 /// aren't valid UTF-8 text, are silently skipped.
+///
+/// A `root` that does not exist *is* an error, unlike anything unreadable
+/// inside one. The difference matters: a mistyped `--root` used to walk
+/// nothing and report "0 site(s)", which reads exactly like a correct run
+/// against a server that has no sites — so the mistake looked like an
+/// answer. A file that can't be read inside a real root is a different
+/// thing, and still skipped.
 pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
+    if !root.exists() {
+        anyhow::bail!("{} does not exist", root.display());
+    }
     let mut sites = Vec::new();
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         if !entry.file_type().is_file() {
