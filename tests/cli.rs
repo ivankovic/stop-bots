@@ -2165,3 +2165,58 @@ fn batch_records_its_run_against_the_internal_crons_schedule() {
         );
     }
 }
+
+/// Batch must share the access-log read offset with everything else that
+/// reads the same log, not keep one of its own.
+///
+/// That offset is how `Db` remembers what has already been tallied. With a
+/// key of its own, batch would re-count the whole log on its first run and
+/// then double-count every line for as long as anything else read it too —
+/// and the number it inflates is the hit count Dynamic Protection shows an
+/// admin deciding whether to block a user agent.
+#[test]
+fn batch_shares_the_access_log_offset_with_record_access_stats() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+    let log = fixture.nginx_root.join("access.log");
+    fs::write(&log, access_line("203.0.113.5", "/", 200, "Mozilla/5.0")).unwrap();
+
+    fixture.run(&["record-access-stats", "--access-log", log.to_str().unwrap()]);
+    let after_cli = hit_count(&fixture, "Mozilla/5.0");
+    assert_eq!(after_cli, 1, "one line, counted once");
+
+    // Same log, nothing appended: batch has nothing new to count.
+    let out = fixture.firewall_script();
+    fixture
+        .cmd(&[
+            "batch",
+            "--no-fetch",
+            "--root",
+            fixture.nginx_root.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--ssh-log",
+            "tests/fixtures/logs/auth.log",
+            "--access-log",
+            log.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        hit_count(&fixture, "Mozilla/5.0"),
+        after_cli,
+        "batch re-counted a log line that had already been tallied"
+    );
+}
+
+fn hit_count(fixture: &Fixture, user_agent: &str) -> i64 {
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    db.list_user_agent_stats()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.user_agent == user_agent)
+        .map(|s| s.hit_count)
+        .unwrap_or(0)
+}

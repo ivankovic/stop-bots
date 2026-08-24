@@ -3314,6 +3314,16 @@ config file, and the write-generated-files-before / delete-unreferenced-
 after ordering that is load-bearing because deleting a rate-limit zone
 another site still references makes NGINX refuse to load at all.
 
+**One defect found in review, worth recording.** The access-log tally
+was keyed by the literal string `"batch"` rather than by the log's path.
+That key is where `Db` remembers how far into the log has already been
+counted, so batch would have re-tallied the whole log on its first run
+and then double-counted every line for as long as anything else read the
+same log — and the number it inflates is the hit count Dynamic
+Protection shows an admin deciding whether to block a user agent. It now
+uses the same `access_log.unwrap_or(DEFAULT_LOG_PATH)` key every other
+caller does, with a test that fails on the old behaviour.
+
 **Testing.** The refusals are asserted in `tests/cli.rs`, offline via
 `--no-fetch`, including that nothing was *written* — and the
 log-unavailable one was checked by disabling the guard and watching it

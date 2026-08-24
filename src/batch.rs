@@ -268,8 +268,19 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
         },
     );
 
+    // Keyed by the log's real path, not by anything batch invents. That
+    // key is where `Db` remembers how far into the log has already been
+    // counted, so a key of its own would mean re-tallying the whole log on
+    // the first run and then double-counting every line for as long as
+    // anything else (the TUI, `record-access-stats`) also ran. The number
+    // being inflated is the one Dynamic Protection shows an admin when
+    // they decide whether to block a user agent.
+    let log_path = options
+        .access_log
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(crate::accesslog::DEFAULT_LOG_PATH));
     let stats = match &access_log {
-        Some(text) => accessstats::record_access_stats(db, "batch", text)
+        Some(text) => accessstats::record_access_stats(db, &log_path.to_string_lossy(), text)
             .map(|outcome| format!("{} user agent(s)", outcome.distinct_user_agents)),
         None => Ok("skipped: no NGINX access log".to_string()),
     };

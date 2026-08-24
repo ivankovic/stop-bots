@@ -572,9 +572,11 @@ enum Command {
         /// only writing both
         #[arg(long)]
         apply: bool,
-        /// Path to write the generated firewall script to
-        #[arg(long, default_value = stop_bots::firewall::DEFAULT_OUTPUT_PATH)]
-        out: PathBuf,
+        /// Path to write the generated firewall script to. Defaults to
+        /// /etc/stop-bots/firewall.nft, or firewall.sh with --backend
+        /// iptables — which generates a shell script, not an nftables one
+        #[arg(long)]
+        out: Option<PathBuf>,
         #[arg(long, default_value = "nftables")]
         backend: FirewallBackend,
         /// Read this SSH log file instead of auto-detecting one. Worth
@@ -708,7 +710,7 @@ async fn main() -> Result<()> {
                 db,
                 stop_bots::batch::BatchOptions {
                     root,
-                    out,
+                    out: out.unwrap_or_else(|| default_firewall_out(backend)),
                     backend: backend.into(),
                     apply,
                     ssh_log,
@@ -955,6 +957,21 @@ async fn run_tui(
 ///
 /// Failures go to stderr and set a non-zero exit status, so they are
 /// visible whichever way the job is wired up.
+/// Where `batch` writes its firewall script when not told otherwise.
+///
+/// Backend-dependent, because the iptables backend emits a shell script:
+/// a plain default would hand someone a `.nft` file full of `iptables`
+/// commands. `render-firewall` sidesteps this by requiring `--out`, which
+/// a cron entry shouldn't have to.
+fn default_firewall_out(backend: FirewallBackend) -> PathBuf {
+    match backend {
+        FirewallBackend::Nftables => PathBuf::from(stop_bots::firewall::DEFAULT_OUTPUT_PATH),
+        FirewallBackend::Iptables => {
+            PathBuf::from(stop_bots::firewall::DEFAULT_OUTPUT_PATH).with_extension("sh")
+        }
+    }
+}
+
 async fn run_batch(
     db_path: Option<PathBuf>,
     options: stop_bots::batch::BatchOptions,
