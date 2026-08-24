@@ -1082,8 +1082,6 @@ impl App {
     /// entirely would leave the job looking permanently overdue in the
     /// panel rather than saying why nothing happened.
     fn run_detector(&self, detector: Detector, log_text: Option<&str>) -> Result<String> {
-        use crate::protection::Detector as D;
-
         if !detector.is_enabled(&self.db)? {
             return Ok("disabled".to_string());
         }
@@ -1095,17 +1093,7 @@ impl App {
             });
         };
         let ttl = detector.ttl_days(&self.db)?;
-        let db = &self.db;
-        let outcome = match detector {
-            D::SshScanners => crate::scanblock::block_ssh_scanners(db, 20, ttl, text, false),
-            D::WebScanners => crate::scanblock::block_web_scanners(db, 7, ttl, text, false),
-            D::SpoofedCrawlers => crate::scanblock::block_spoofed_crawlers(db, ttl, text, false),
-            D::ProbePaths => crate::scanblock::block_probe_paths(db, ttl, text, false),
-            D::Honeypot => crate::scanblock::block_honeypot(db, ttl, text, false),
-            D::AssetRatio => crate::scanblock::block_asset_ratio(db, ttl, text, false),
-            D::RotatingUserAgent => crate::scanblock::block_rotating_ua(db, ttl, text, false),
-            D::RefererlessCrawl => crate::scanblock::block_refererless(db, ttl, text, false),
-        };
+        let outcome = crate::scanblock::run_detector(&self.db, detector, ttl, text, false);
         Ok(match outcome {
             Ok(outcome) => outcome.summary(),
             Err(err) => format!("error: {err}"),

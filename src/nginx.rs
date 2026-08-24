@@ -1247,6 +1247,74 @@ pub fn apply_block_for_site(
     Ok(true)
 }
 
+/// What [`apply_all_sites`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplyAllOutcome {
+    pub sites: usize,
+    pub files: usize,
+    /// How many files were actually rewritten. Zero means NGINX has
+    /// nothing new to read, so there is no point reloading it.
+    pub changed: usize,
+}
+
+/// Applies the current blocking policy to every site discovered under
+/// `root`, writing the generated files it needs and cleaning up the ones it
+/// no longer does. Does **not** reload NGINX — the caller decides that,
+/// since it is the step with a side effect outside this project's files.
+///
+/// Lives here rather than in `main.rs` because both the `apply-blocks`
+/// subcommand and `crate::batch` need it, and the ordering below is
+/// load-bearing enough that a second copy would be a bug waiting to
+/// happen: generated files are written *before* any config that aliases
+/// them, and unreferenced ones are deleted only *after* every config has
+/// been rewritten (see [`remove_unused_managed_files`]).
+pub fn apply_all_sites(db: &crate::db::Db, root: &Path) -> Result<ApplyAllOutcome> {
+    write_managed_files(db)?;
+    let default_config = default_block_config(db)?;
+    // Sites already known to the db (i.e. previously scanned) — the only
+    // ones that can carry a per-site override at all.
+    let known_sites = db.list_sites()?;
+    let sites = discover_sites(root)?;
+
+    // A single config file commonly holds multiple `server` blocks for the
+    // same site (e.g. an HTTP redirect block plus the HTTPS one), so dedupe
+    // by file and apply once per file rather than once per discovered site.
+    let mut config_paths: Vec<_> = sites.iter().map(|s| s.config_path.clone()).collect();
+    config_paths.sort();
+    config_paths.dedup();
+
+    let mut changed = 0;
+    for path in &config_paths {
+        // Built fresh per file, filtered to sites that actually live in
+        // *this* file: `server_name` alone isn't unique across the whole
+        // `sites` table (two different files can share one, e.g. a stale
+        // config left behind after a rename), so a single map built once
+        // for the whole run could leak one site's override onto another's
+        // same-named block in a different file. Note this join is a
+        // textual `config_path` match, only valid when `root` here matches
+        // whatever root was used at scan time — a mismatch just falls
+        // through to `default_config`, not an error.
+        let site_configs: Vec<(String, BlockConfig)> = known_sites
+            .iter()
+            .filter(|s| Path::new(&s.config_path) == path.as_path())
+            .map(|s| Ok((s.server_name.clone(), block_config_for_site(db, s.id)?)))
+            .collect::<Result<_>>()?;
+        if apply_blocks_to_file(path, &site_configs, &default_config)? {
+            changed += 1;
+        }
+    }
+
+    // Only now that every config has been rewritten is it safe to delete a
+    // generated file the new config no longer references.
+    remove_unused_managed_files(db)?;
+
+    Ok(ApplyAllOutcome {
+        sites: sites.len(),
+        files: config_paths.len(),
+        changed,
+    })
+}
+
 /// Validates the currently-installed NGINX config with `nginx -t`. Run
 /// before every [`reload`] so a malformed config — ours or an unrelated
 /// hand edit elsewhere in the same install — is reported as a clear error

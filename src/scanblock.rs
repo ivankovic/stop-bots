@@ -115,6 +115,42 @@ impl ScanBlockOutcome {
     }
 }
 
+/// The failed-SSH-attempt count above which an address is a scanner, and
+/// the distinct-404 count above which one is a web scanner. Defaults for
+/// every caller that doesn't have a reason to pick its own — the CLI's
+/// `--min-attempts`/`--min-paths` flags do.
+pub const DEFAULT_SSH_ATTEMPTS: usize = 20;
+pub const DEFAULT_WEB_PATHS: usize = 7;
+
+/// Runs whichever detector `detector` names against `log_text`.
+///
+/// The one place that maps a [`Detector`](crate::protection::Detector) onto
+/// the function that implements it. Both schedulers go through here — the
+/// TUI's internal cron and `crate::batch` — so a detector added to
+/// `Detector::ALL` and forgotten here fails to compile rather than
+/// silently never running from one of them.
+pub fn run_detector(
+    db: &Db,
+    detector: crate::protection::Detector,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    use crate::protection::Detector as D;
+    match detector {
+        D::SshScanners => {
+            block_ssh_scanners(db, DEFAULT_SSH_ATTEMPTS, ttl_days, log_text, dry_run)
+        }
+        D::WebScanners => block_web_scanners(db, DEFAULT_WEB_PATHS, ttl_days, log_text, dry_run),
+        D::SpoofedCrawlers => block_spoofed_crawlers(db, ttl_days, log_text, dry_run),
+        D::ProbePaths => block_probe_paths(db, ttl_days, log_text, dry_run),
+        D::Honeypot => block_honeypot(db, ttl_days, log_text, dry_run),
+        D::AssetRatio => block_asset_ratio(db, ttl_days, log_text, dry_run),
+        D::RotatingUserAgent => block_rotating_ua(db, ttl_days, log_text, dry_run),
+        D::RefererlessCrawl => block_refererless(db, ttl_days, log_text, dry_run),
+    }
+}
+
 /// Finds scanning IPs in `log_text` (an SSH log's contents — see
 /// [`crate::sshlog::scanning_ips`] for exactly what counts) and adds a
 /// Block rule, expiring after `ttl_days`, for each one not already covered

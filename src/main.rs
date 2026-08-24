@@ -894,63 +894,15 @@ async fn update_bot_lists(
 
 fn apply_blocks(root: &Path, db_path: Option<PathBuf>, no_reload: bool) -> Result<()> {
     let db = open_db(db_path)?;
-    // Written before any config is touched, so the file the generated
-    // `alias` points at already exists by the time NGINX reloads.
-    nginx::write_managed_files(&db)?;
-    let default_config = nginx::default_block_config(&db)?;
-    // Sites already known to the db (i.e. previously scanned) — the only
-    // ones that can carry a per-site override at all.
-    let known_sites = db.list_sites()?;
-    let sites = nginx::discover_sites(root)?;
-
-    // A single config file commonly holds multiple `server` blocks for the
-    // same site (e.g. an HTTP redirect block plus the HTTPS one), so dedupe
-    // by file and apply once per file rather than once per discovered site.
-    let mut config_paths: Vec<_> = sites.iter().map(|s| s.config_path.clone()).collect();
-    config_paths.sort();
-    config_paths.dedup();
-
-    let mut changed = 0;
-    for path in &config_paths {
-        // Built fresh per file, filtered to sites that actually live in
-        // *this* file: `server_name` alone isn't unique across the whole
-        // `sites` table (two different files can share one, e.g. a stale
-        // config left behind after a rename), so a single map built once
-        // for the whole run could leak one site's override onto another's
-        // same-named block in a different file. Note this join is a
-        // textual `config_path` match, only valid when `--root` here
-        // matches whatever `--root` was used at scan time — a mismatch
-        // just falls through to `default_config` below, not an error.
-        let site_configs: Vec<(String, nginx::BlockConfig)> = known_sites
-            .iter()
-            .filter(|s| Path::new(&s.config_path) == path.as_path())
-            .map(|s| {
-                Ok((
-                    s.server_name.clone(),
-                    nginx::block_config_for_site(&db, s.id)?,
-                ))
-            })
-            .collect::<Result<_>>()?;
-        if nginx::apply_blocks_to_file(path, &site_configs, &default_config)? {
-            changed += 1;
-        }
-    }
+    let outcome = nginx::apply_all_sites(&db, root)?;
     println!(
         "Applied blocking rules to {} site(s) across {} file(s), {} file(s) changed",
-        sites.len(),
-        config_paths.len(),
-        changed
+        outcome.sites, outcome.files, outcome.changed
     );
-
-    // Only now that every config has been rewritten is it safe to delete a
-    // generated file the new config no longer references — see
-    // `nginx::remove_unused_managed_files` for why the order is
-    // load-bearing rather than tidy.
-    nginx::remove_unused_managed_files(&db)?;
 
     // Writing the sentinel block does nothing until NGINX re-reads it — no
     // point reloading when nothing actually changed on disk.
-    if changed > 0 && !no_reload {
+    if outcome.changed > 0 && !no_reload {
         nginx::reload().context("nginx config was applied, but reload failed")?;
         println!("Reloaded NGINX");
     }
