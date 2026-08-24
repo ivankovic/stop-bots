@@ -146,10 +146,19 @@ impl BotSettings {
     }
 
     fn render_sources(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        // Measured, not a fixed 28: "Nginx Ultimate Bad Bot Blocker" is 30
+        // and overflowed its column, so the counts beside it didn't line up
+        // with the other two rows'.
+        let name_width = self
+            .sources
+            .iter()
+            .map(|source| source.name.chars().count())
+            .max()
+            .unwrap_or(0);
         let items: Vec<ListItem> = self
             .sources
             .iter()
-            .map(|source| ListItem::new(source_line(source)))
+            .map(|source| ListItem::new(source_line(source, name_width)))
             .collect();
 
         let mut block = Block::bordered().title("Bot list sources — Enter to update");
@@ -393,9 +402,9 @@ impl BotSettings {
     }
 }
 
-fn source_line(source: &Source) -> Line<'static> {
+fn source_line(source: &Source, name_width: usize) -> Line<'static> {
     Line::from(vec![
-        Span::from(format!("{:<28}", source.name)).bold(),
+        Span::from(format!("{:<name_width$}  ", source.name)).bold(),
         Span::from(format!("{:>5} bots  ", source.bot_count)).dim(),
         Span::from(humanize_age(source.last_fetched_at)).dim(),
     ])

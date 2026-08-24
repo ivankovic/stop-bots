@@ -378,28 +378,7 @@ impl SiteSettings {
 
     fn render_setting_popup(&self, frame: &mut Frame, area: Rect, popup: &SettingPopup) {
         let (title, options) = setting_options(popup.setting);
-        let content_width = options
-            .iter()
-            .map(|o| o.len())
-            .max()
-            .unwrap_or(0)
-            .max(title.len());
-        let popup_area = centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
-        let items: Vec<ListItem> = options
-            .iter()
-            .enumerate()
-            .map(|(i, label)| {
-                let line = if i == popup.selected {
-                    Line::from(label.clone()).reversed()
-                } else {
-                    Line::from(label.clone())
-                };
-                ListItem::new(line)
-            })
-            .collect();
-        let list = List::new(items).block(Block::bordered().title(title));
-        frame.render_widget(Clear, popup_area);
-        frame.render_widget(list, popup_area);
+        crate::tui::dashboard::render_option_list(frame, area, title, &options, popup.selected);
     }
 
     fn render_alert(&self, frame: &mut Frame, area: Rect, alert: &str) {
@@ -1315,14 +1294,16 @@ mod tests {
         assert!(message.contains("Discovered"), "message was: {message}");
     }
 
+    /// A mistyped `--root` must say so, not report zero sites.
+    ///
+    /// It used to walk nothing and report "Discovered 0 site(s)", which
+    /// reads exactly like a correct run against a server that has none —
+    /// so the mistake looked like an answer. What has not changed, and is
+    /// the other half of this test, is that the failure arrives as a
+    /// message: propagating it would tear down the whole TUI on the way
+    /// up through `App::run`.
     #[test]
-    fn scanning_a_missing_root_finds_nothing_without_crashing() {
-        // `nginx::discover_sites` silently skips walk errors (see its own
-        // doc comment), so a missing root isn't actually an error path
-        // today — but `handle_key`'s `Result` still must not propagate one
-        // if that ever changes, hence `scan` catching errors at all. What's
-        // observable today: this never panics or errors, and just reports
-        // zero sites found.
+    fn scanning_a_missing_root_reports_the_failure_rather_than_zero_sites() {
         let db = Db::open_in_memory().unwrap();
         let mut screen = SiteSettings::new(PathBuf::from("/nonexistent/does-not-exist"));
         let mut message = None;
@@ -1336,8 +1317,12 @@ mod tests {
         let message = confirm_popup(&mut screen, &db);
 
         assert!(
-            message.contains("Discovered 0 site(s)"),
+            message.contains("Site scan failed"),
             "message was: {message}"
+        );
+        assert!(
+            !message.contains("Discovered 0"),
+            "a bad root must not look like an empty server: {message}"
         );
         assert!(db.list_sites().unwrap().is_empty());
     }

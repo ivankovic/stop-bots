@@ -76,6 +76,29 @@ need.
 
 ### Fixed
 
+- `--version` now exists. It also shows in the TUI's header, which is where someone is
+  standing when they decide to report something.
+- `stop-bots --help` is scannable: twenty subcommands printed their entire description —
+  one ran to 931 characters — as their one-line summary. Each now has a real one-liner,
+  with the full text still under `<subcommand> --help`.
+- A mistyped `--root` is an error rather than "Discovered 0 site(s)", which read exactly
+  like a correct run against a server with no sites. Something unreadable *inside* a real
+  root is still skipped, as before.
+- The Dashboard's Summary no longer tells a fresh install to press `f`, which would have
+  rendered an empty script. With no rules it says so, and points at the panel above.
+- Dynamic Protection's two panels say what an empty one means. A blank bordered box reads
+  as "broken", and here it is usually the good case: nothing is attacking you.
+- Bot list source names no longer overflow their column and knock the counts out of line.
+- Popups are sized to their contents. The firewall render popup was two columns short of
+  its own key hint and cut "Esc cancel" in half; a longer output path would have gone the
+  same way.
+- Dynamic Protection's panel titles fit at 80 columns, the documented minimum, instead of
+  being cut mid-word.
+- Choice popups say `Enter choose  Esc cancel`. The one popup shape with no text besides
+  its options was also the only one that never mentioned the way out.
+- The "Automatic blocking" panel says what its `5d` column means.
+
+
 - **Switching on a large blocklist feed no longer freezes the TUI for a minute or more.**
   Storing the fetched ranges inserted one row per autocommit — one `fsync` each — so AWS's
   ~7,000 ranges took **98 seconds** on the main thread. One transaction makes the same work

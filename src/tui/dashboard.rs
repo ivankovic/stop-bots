@@ -225,6 +225,9 @@ pub struct Dashboard {
     /// e.g. a scanner blocked since the last daily `RenderFirewall` cron
     /// tick is actually reflected in the on-disk script yet.
     firewall_needs_update: bool,
+    /// How many rules a render would write, for the Summary panel — see
+    /// its three-state line, which reads differently at zero.
+    rule_count: usize,
 }
 
 impl Dashboard {
@@ -245,6 +248,7 @@ impl Dashboard {
         self.reputation = db.list_reputation_sources()?;
         self.cron_status = crate::cron::status(db)?;
         self.firewall_needs_update = firewall_needs_update(db)?;
+        self.rule_count = crate::firewall::all_rules(db)?.len();
         if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
         }
@@ -471,7 +475,9 @@ impl Dashboard {
         // out inside it. Rendering a bordered block per column would put a
         // line between every pair of them.
         let block = Block::bordered()
-            .title("Automatic blocking — Enter")
+            // The trailing "5d" on an enabled detector is how long its
+            // blocks last, which nothing else on screen says.
+            .title("Automatic blocking — Enter to change, days = how long a block lasts")
             .fg(theme.accent());
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -513,10 +519,15 @@ impl Dashboard {
                 self.up_to_date_count(),
                 self.needs_update_count()
             )),
-            Line::from(if self.firewall_needs_update {
-                "Firewall rules: needs updating (press f to update)".to_string()
-            } else {
-                "Firewall rules: up to date".to_string()
+            // Three states, not two. A fresh install has no rules at all,
+            // and telling someone to press `f` there sends them to render
+            // an empty script — which looks like the tool doing nothing.
+            Line::from(match (self.rule_count, self.firewall_needs_update) {
+                (0, _) => {
+                    "Firewall rules: none yet — switch on some automatic blocking above".to_string()
+                }
+                (n, true) => format!("Firewall rules: {n} to write (press f)"),
+                (n, false) => format!("Firewall rules: {n}, script up to date"),
             }),
         ])
         .block(Block::bordered().title("Summary"));
@@ -698,14 +709,19 @@ impl Dashboard {
             ),
             Popup::AddCountry { input, error } => {
                 let title = "Add a country (2-letter code)";
-                let width = 40u16;
-                let height = if error.is_some() { 5 } else { 4 };
-                let popup_area = centered_rect(width, height, area);
                 let mut lines = vec![Line::from(format!("{input}\u{2588}"))];
                 if let Some(err) = &error {
                     lines.push(Line::from(err.as_str()).red());
                 }
                 lines.push(Line::from("Enter confirm  Esc cancel").dim());
+                // Same content-sized rule as the render popup below: a
+                // long enough validation message would otherwise be cut
+                // off exactly when it most needs reading.
+                let popup_area = centered_rect(
+                    widest_line(&lines).max(title.chars().count() as u16) + 4,
+                    lines.len() as u16 + 2,
+                    area,
+                );
                 let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(paragraph, popup_area);
@@ -717,9 +733,6 @@ impl Dashboard {
                 error,
             } => {
                 let title = "Render firewall rules";
-                let width = 56u16;
-                let height = if error.is_some() { 10 } else { 9 };
-                let popup_area = centered_rect(width, height, area);
 
                 let mut lines = vec![
                     Line::from("Backend:").bold(),
@@ -748,6 +761,12 @@ impl Dashboard {
                     Line::from("↑/↓ backend  Space apply toggle  Enter confirm  Esc cancel").dim(),
                 );
 
+                // Sized to its own content rather than to a fixed 56,
+                // which was two columns short of its own key hint and cut
+                // "Esc cancel" in half — and would have clipped any output
+                // path longer than the default.
+                let popup_area =
+                    centered_rect(widest_line(&lines) + 4, lines.len() as u16 + 2, area);
                 let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(paragraph, popup_area);
@@ -1298,7 +1317,11 @@ impl Dashboard {
 /// deliberately keep their own rendering, since neither is a list and
 /// forcing them through here would mean parameters that only one caller
 /// ever uses.
-fn render_option_list(
+/// A popup that is a list of choices, one of them selected.
+///
+/// Shared with Site settings rather than copied: there were two of these,
+/// and only one of them grew the "Esc cancel" hint.
+pub(crate) fn render_option_list(
     frame: &mut Frame,
     area: Rect,
     title: &str,
@@ -1311,7 +1334,15 @@ fn render_option_list(
         .max()
         .unwrap_or(0)
         .max(title.len());
-    let popup_area = centered_rect(content_width as u16 + 4, options.len() as u16 + 2, area);
+    // The way out, in the frame. Every *form* popup already says this;
+    // the option lists did not, so the one popup shape with no text
+    // besides its choices was also the one that never mentioned Esc.
+    const HINT: &str = "Enter choose  Esc cancel";
+    let popup_area = centered_rect(
+        (content_width.max(HINT.len()) as u16) + 4,
+        options.len() as u16 + 3,
+        area,
+    );
     let items: Vec<ListItem> = options
         .iter()
         .enumerate()
@@ -1319,6 +1350,7 @@ fn render_option_list(
             let line = Line::from(label.clone());
             ListItem::new(if i == selected { line.reversed() } else { line })
         })
+        .chain(std::iter::once(ListItem::new(Line::from(HINT).dim())))
         .collect();
     let list = List::new(items).block(Block::bordered().title(title.to_string()));
     frame.render_widget(Clear, popup_area);
@@ -1368,6 +1400,20 @@ fn policy_tag(policy: Policy) -> Span<'static> {
 /// running in the background (`running`) or due but not yet started, that
 /// instead (the outcome shown would otherwise be stale the moment a job
 /// becomes due again, misleadingly implying nothing's changed since).
+/// The width of the longest of `lines`, for sizing a popup to hold them.
+///
+/// Popups used to carry hardcoded widths, which is fine right up until
+/// someone edits the text inside one — and then the thing that gets cut
+/// off is a key hint or a validation message, i.e. the part that was
+/// there to be read.
+fn widest_line(lines: &[Line<'_>]) -> u16 {
+    lines
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(0)
+}
+
 /// The `[ ON  ]`/`[ OFF ]` tag, plus the gutter either side of it.
 const PROTECTION_TAG_WIDTH: u16 = 9;
 
@@ -2397,8 +2443,12 @@ mod tests {
         assert!(firewall_needs_update(&db).unwrap());
     }
 
+    /// With no rules at all — a fresh install — the panel must not say
+    /// "needs updating (press f)". Pressing `f` there renders an empty
+    /// script, which looks like the tool doing nothing, and it is the
+    /// first screen a new user sees.
     #[test]
-    fn render_shows_the_firewall_summary_row() {
+    fn the_firewall_summary_row_does_not_send_a_fresh_install_to_render_nothing() {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
@@ -2424,18 +2474,62 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(
-            content.contains("Firewall rules: needs updating"),
+            content.contains("Firewall rules: none yet"),
             "content was:\n{content}"
         );
+        assert!(!content.contains("press f"), "content was:\n{content}");
+    }
+
+    #[test]
+    fn render_shows_the_firewall_summary_row() {
+        let db = Db::open_in_memory().unwrap();
+        // A rule to write. Without one the panel says something else
+        // entirely, and deliberately — see the test below.
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "203.0.113.9".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &None,
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
         assert!(
-            content.contains("press f to update"),
+            content.contains("Firewall rules: 1 to write"),
             "content was:\n{content}"
         );
+        assert!(content.contains("press f"), "content was:\n{content}");
     }
 
     #[test]
     fn render_shows_the_firewall_summary_row_as_up_to_date_after_a_render() {
         let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "203.0.113.9".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
         let rules = crate::firewall::all_rules(&db).unwrap();
         db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&rules))
             .unwrap();
@@ -2464,7 +2558,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(
-            content.contains("Firewall rules: up to date"),
+            content.contains("script up to date"),
             "content was:\n{content}"
         );
         assert!(

@@ -3333,3 +3333,68 @@ reloaded. That needed a `systemctl` shim in the image, since a container
 has no init system — the same substitution the harness already made by
 calling `nginx -s reload` by hand, now available to the code under test
 so `--apply` can be exercised as the single command an admin runs.
+
+## Usability pass before launch
+
+Done by *looking*: every screen rendered to a `TestBackend` at 100x32 and
+80x30 and read as a first-time user would, plus the CLI's help and error
+paths run by hand. Reading the source would not have found most of what
+follows — several items are only visible as pixels.
+
+**What a fresh install actually looked like.** Four panels of zeros and,
+in the Summary, "Firewall rules: needs updating (press f to update)".
+Pressing `f` on a database with no rules renders an empty script, which
+looks like the tool doing nothing — so the one piece of guidance a new
+user got pointed the wrong way. That row now has three states, and at
+zero it points at the Automatic blocking panel instead. Dynamic
+Protection was two empty bordered boxes with no text at all; an empty box
+reads as "broken", and on that screen empty is usually the *good* case.
+Site settings already had the right pattern — *"No sites discovered yet.
+Press r to scan /etc/nginx"* — so the fix was to copy it, not to build an
+onboarding wizard.
+
+**Two clipping bugs, both from hardcoded widths.** The firewall render
+popup was `width = 56` against a 57-character key hint, so it printed
+"Esc ca" and stopped; a longer output path would have gone the same way.
+Dynamic Protection's panel titles ran past the border at 80 columns, the
+width the README documents as the minimum. Both now size to their
+content, and the titles drop their key hints rather than truncate — the
+panel's name and the active filter are what has to survive, and the hints
+are in `?` anyway.
+
+**`--help` was the front door and it was a wall.** Clap uses the first
+paragraph of a doc comment as the short help, and twenty subcommands had
+no paragraph break — `block-scanners` presented **931 characters** as its
+one-line summary. Adding a blank line was not enough, because several
+first *sentences* were already 200+ characters; each needed a real
+one-line opener written above the existing text. The long form is
+unchanged under `<subcommand> --help`.
+
+**A mistyped `--root` reported success.** `discover_sites` deliberately
+swallows walk errors, which is right for an unreadable file inside a real
+tree and wrong for a root that does not exist: the second reported
+"Discovered 0 site(s)", indistinguishable from a correct run against a
+server with no sites. Now separated. This is also the rare case where the
+existing test asserted the *bug* — `scanning_a_missing_root_finds_nothing_
+without_crashing` pinned the old message — so it was rewritten rather
+than deleted, keeping its real point (the failure must arrive as a
+message, never propagate and tear down the TUI).
+
+**`--version` did not exist**, on a project that ships tagged release
+binaries. It is also in the TUI header now: the TUI is where someone is
+standing when they decide to report something, and "which build is this?"
+is the first question back.
+
+**One duplication found by looking rather than grepping.** Choice popups
+had two implementations, one in `dashboard.rs` and one in
+`site_settings.rs`, and only the first grew an `Esc cancel` hint. Now one
+shared `render_option_list`.
+
+**Deliberately not done.** No wizard, no first-run tour: the empty states
+plus the existing per-screen hints are the onboarding, and a tour is a
+thing to maintain. The Geo-blocking panel's blank rows are cosmetic and
+left alone.
+
+**Test fallout is expected here, not a regression.** Changing what a
+screen says breaks tests that assert on what it said — and two of those
+had pinned wording this pass exists to change.

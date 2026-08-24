@@ -384,23 +384,28 @@ impl DynamicProtection {
 
         let reversed = Style::new().reversed();
 
-        let ssh_items: Vec<ListItem> = self
-            .visible_ssh_rows()
-            .into_iter()
-            .map(ssh_row_line)
-            .map(ListItem::new)
-            .collect();
+        let reading = jobs.contains(&crate::app::Job::ReadSshLog);
+        let ssh_items: Vec<ListItem> = empty_or(
+            self.visible_ssh_rows()
+                .into_iter()
+                .map(ssh_row_line)
+                .map(ListItem::new)
+                .collect(),
+            if reading {
+                "Reading the SSH log…"
+            } else if self.ssh_rows.is_empty() {
+                "No failed SSH logins in the current log. Nothing to block — this is the good case."
+            } else {
+                "Nothing matches this filter. Press f to change it."
+            },
+        );
         let ssh_list = List::new(ssh_items)
             .block(
                 Block::bordered()
-                    .title(format!(
-                        "Top IPs attempting SSH connection — Enter block/unblock, f filter ({}){}",
+                    .title(panel_title(
+                        "Failed SSH logins",
                         self.filter.label(),
-                        if jobs.contains(&crate::app::Job::ReadSshLog) {
-                            format!("  {} reading log", crate::tui::spinner_frame())
-                        } else {
-                            String::new()
-                        }
+                        ssh_area.width,
                     ))
                     .fg(theme.accent()),
             )
@@ -411,18 +416,25 @@ impl DynamicProtection {
             });
         frame.render_stateful_widget(ssh_list, ssh_area, &mut self.ssh_state);
 
-        let ua_items: Vec<ListItem> = self
-            .visible_ua_rows()
-            .into_iter()
-            .map(ua_row_line)
-            .map(ListItem::new)
-            .collect();
+        let ua_items: Vec<ListItem> = empty_or(
+            self.visible_ua_rows()
+                .into_iter()
+                .map(ua_row_line)
+                .map(ListItem::new)
+                .collect(),
+            if self.ua_rows.is_empty() {
+                "No successful requests tallied yet. This fills in as traffic arrives,                  or run `stop-bots record-access-stats`."
+            } else {
+                "Nothing matches this filter. Press f to change it."
+            },
+        );
         let ua_list = List::new(ua_items)
             .block(
                 Block::bordered()
-                    .title(format!(
-                        "Top User Agents — Enter block/unblock, f filter ({})",
-                        self.filter.label()
+                    .title(panel_title(
+                        "Top user agents",
+                        self.filter.label(),
+                        ua_area.width,
                     ))
                     .fg(theme.accent()),
             )
@@ -485,6 +497,37 @@ fn ip_in_blocked_range(ip_str: &str, blocked_ranges: &[String]) -> bool {
         }
     }
     false
+}
+
+/// A panel title, with its key hints dropped when the terminal is too
+/// narrow to hold them.
+///
+/// At 80 columns — the width this project documents as its minimum — the
+/// old titles ran past the border and were cut mid-word, so the last
+/// thing on screen was half a hint. What has to survive is the name of
+/// the panel and which filter is on; the hints are in `?` too.
+fn panel_title(name: &str, filter: &str, width: u16) -> String {
+    let short = format!("{name} ({filter})");
+    let full = format!("{short} — Enter block/unblock, f filter");
+    if full.chars().count() + 2 <= width as usize {
+        full
+    } else {
+        short
+    }
+}
+
+/// A list's items, or a single dimmed line saying why there are none.
+///
+/// An empty bordered box reads as "this is broken", not as "nothing to
+/// show" — and on this screen the second is the *good* outcome, so it is
+/// worth saying out loud. Site settings already does this for its own
+/// empty list; this is the same idea.
+fn empty_or(items: Vec<ListItem<'static>>, message: &str) -> Vec<ListItem<'static>> {
+    if items.is_empty() {
+        vec![ListItem::new(Line::from(message.to_string()).dim())]
+    } else {
+        items
+    }
 }
 
 /// Turns raw failed-attempt `counts` (see [`sshlog::failed_attempt_counts`])
@@ -1062,13 +1105,13 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(
-            content.contains("Top IPs attempting SSH connection"),
+            content.contains("Failed SSH logins"),
             "content was:\n{content}"
         );
         assert!(content.contains("198.51.100.9"), "content was:\n{content}");
         assert!(content.contains("NOT BLOCKED"), "content was:\n{content}");
         assert!(
-            content.contains("Top User Agents"),
+            content.contains("Top user agents"),
             "content was:\n{content}"
         );
         assert!(content.contains("curl/8.0"), "content was:\n{content}");

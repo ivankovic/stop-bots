@@ -392,8 +392,10 @@ fn the_ssh_panel_fills_in_from_the_background_log_read() {
     // Short needles on purpose. Switching screens redraws over the
     // Dashboard, and ratatui skips any cell that already holds the right
     // character — so a long literal arrives split around whatever the two
-    // screens happen to have in common at the same column.
-    session.exp_string("Top IPs").unwrap();
+    // screens happen to have in common at the same column. "Failed SSH"
+    // is exactly that: its "e" lands on the "e" of "System-wide" and the
+    // run is cut in two.
+    session.exp_string("logins").unwrap();
     // The fixture log that `spawn_tui` passes via --ssh-log has two failed
     // attempts from this address, and an accepted login from another that
     // must not appear: this panel ranks failures.

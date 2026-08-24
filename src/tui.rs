@@ -279,7 +279,13 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     let tabs = Tabs::new(titles)
         .select(selected)
         .highlight_style(Style::new().fg(app.theme.accent()).bold())
-        .block(Block::new().title("stop-bots".bold()));
+        // Version in the header, not just behind `--version`: the TUI is
+        // where someone is standing when they decide to report something,
+        // and "which build is this?" is the first thing to ask them.
+        .block(Block::new().title(vec![
+            "stop-bots".bold(),
+            format!(" {}", env!("CARGO_PKG_VERSION")).dim(),
+        ]));
     frame.render_widget(tabs, area);
 }
 
