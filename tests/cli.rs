@@ -1934,3 +1934,234 @@ fn list_firewall_rules_shows_expiry_only_for_temporary_rules() {
         "temporary_line was:\n{temporary_line}"
     );
 }
+
+// ---- batch mode ----
+
+impl Fixture {
+    /// One batch pass over this fixture, offline. `--no-fetch` throughout:
+    /// every test in this suite must run without a network, and the
+    /// download steps are the only part of batch that needs one.
+    ///
+    /// A fixture SSH log rather than auto-detection, for the usual reason
+    /// — and because the lockout guard reads it, so leaving it to
+    /// auto-detection would make these tests depend on whatever log the
+    /// machine running them happens to have.
+    fn batch(&self, extra: &[&str]) -> Command {
+        let out = self.firewall_script();
+        let mut args = vec![
+            "batch",
+            "--no-fetch",
+            "--root",
+            self.nginx_root.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--ssh-log",
+            "tests/fixtures/logs/auth.log",
+            "--access-log",
+            "/dev/null",
+        ];
+        args.extend_from_slice(extra);
+        self.cmd(&args)
+    }
+
+    fn firewall_script(&self) -> std::path::PathBuf {
+        self.managed.join("firewall.nft")
+    }
+}
+
+/// The whole point of batch mode: one command does the lot. It has to
+/// discover the site, write the NGINX block, and write the firewall
+/// script, from a database that starts empty.
+#[test]
+fn batch_scans_applies_and_renders_in_one_pass() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    let site = fixture.write_site("example.com");
+
+    fixture.batch(&[]).assert().success();
+
+    let config = fs::read_to_string(&site).unwrap();
+    assert!(
+        config.contains("stop-bots"),
+        "the site config should carry the generated block:\n{config}"
+    );
+    assert!(
+        fixture.firewall_script().exists(),
+        "the firewall script should have been written"
+    );
+}
+
+/// Quiet on success, because `cron` mails the owner anything a job
+/// prints and a nightly run that says nothing is one nobody has to read.
+#[test]
+fn a_successful_batch_run_says_nothing() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+
+    fixture
+        .batch(&[])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::is_empty());
+}
+
+/// `--verbose` is what a first run by hand wants: every step, named.
+#[test]
+fn verbose_batch_reports_every_step() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+
+    fixture
+        .batch(&["--verbose"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("scan sites"))
+        .stdout(predicate::str::contains("nginx blocks"))
+        .stdout(predicate::str::contains("firewall"));
+}
+
+/// **The safety property this whole feature turns on.** Under `--apply`,
+/// a lockout guard that could not run at all counts as a refusal.
+///
+/// Interactive `render-firewall` prints a note and carries on here,
+/// which is defensible when a human is watching the terminal. From
+/// crontab nobody is — and this project has already taken a server off
+/// the network once by letting exactly this case fall through.
+#[test]
+fn batch_apply_refuses_when_the_lockout_check_cannot_run() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+
+    fixture
+        .cmd(&[
+            "batch",
+            "--no-fetch",
+            "--apply",
+            "--root",
+            fixture.nginx_root.to_str().unwrap(),
+            "--out",
+            fixture.firewall_script().to_str().unwrap(),
+            "--ssh-log",
+            "/nonexistent/auth.log",
+            "--access-log",
+            "/dev/null",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refusing to apply"))
+        .stderr(predicate::str::contains("--ssh-log"));
+
+    assert!(
+        !fixture.firewall_script().exists(),
+        "refusing must mean nothing was written, not just nothing applied"
+    );
+}
+
+/// The other half of the guard: rules that really would cut off the
+/// admin who is connected right now. The fixture log's Accepted line is
+/// for 192.0.2.10, which the rule below covers.
+#[test]
+fn batch_apply_refuses_to_block_the_connected_admin() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+    fixture.run(&[
+        "add-firewall-rule",
+        "--address",
+        "192.0.2.0/24",
+        "--action",
+        "block",
+    ]);
+
+    fixture
+        .batch(&["--apply"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("192.0.2.10"));
+
+    assert!(!fixture.firewall_script().exists());
+}
+
+/// Nothing is enforced without `--apply`, so the same rule set that is
+/// refused above is written without complaint — the admin still gets to
+/// read the script before running it, which is this project's default
+/// everywhere else.
+#[test]
+fn batch_without_apply_writes_rules_the_guard_would_refuse_to_apply() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+    fixture.run(&[
+        "add-firewall-rule",
+        "--address",
+        "192.0.2.0/24",
+        "--action",
+        "block",
+    ]);
+
+    fixture.batch(&[]).assert().success();
+
+    assert!(fixture.firewall_script().exists());
+}
+
+/// One step failing must not stop the others, and must still be visible:
+/// `cron` only tells anyone about a job that exits non-zero.
+#[test]
+fn a_failed_step_is_reported_and_sets_a_failing_exit_status() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    let site = fixture.write_site("example.com");
+
+    // An unwritable output path fails the firewall step and nothing else.
+    fixture
+        .cmd(&[
+            "batch",
+            "--no-fetch",
+            "--root",
+            fixture.nginx_root.to_str().unwrap(),
+            "--out",
+            "/nonexistent/directory/firewall.nft",
+            "--ssh-log",
+            "tests/fixtures/logs/auth.log",
+            "--access-log",
+            "/dev/null",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("FAIL"))
+        .stderr(predicate::str::contains("firewall"));
+
+    // The NGINX plane is independent and ran anyway.
+    let config = fs::read_to_string(&site).unwrap();
+    assert!(config.contains("stop-bots"), "config was:\n{config}");
+}
+
+/// Batch records each step under the same key the TUI's internal cron
+/// uses, so the two schedulers agree about what has already run rather
+/// than each doing the work again — and the Dashboard's "Scheduled
+/// tasks" panel shows what the real cron did.
+#[test]
+fn batch_records_its_run_against_the_internal_crons_schedule() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+
+    fixture.batch(&[]).assert().success();
+
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    for job in [
+        stop_bots::cron::CronJob::RecordAccessStats,
+        stop_bots::cron::CronJob::RenderFirewall,
+        stop_bots::cron::CronJob::Detect(stop_bots::protection::Detector::SshScanners),
+    ] {
+        assert!(
+            db.get_cron_last_run(job.id()).unwrap().is_some(),
+            "{} should have been stamped",
+            job.label()
+        );
+    }
+}

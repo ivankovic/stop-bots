@@ -9,6 +9,20 @@ need.
 
 ### Added
 
+- **`stop-bots batch` — one unattended pass, for a real crontab.** Refreshes every list,
+  scans the logs, writes the NGINX blocking rules and the firewall script, and with
+  `--apply` puts both into effect. Quiet when everything worked (so a healthy nightly run
+  doesn't mail you), non-zero exit and a report on stderr when something didn't; `--verbose`
+  prints a line per step. `--no-fetch` skips the downloads, for a host with no outbound
+  access or a second, more frequent entry that only wants the log scan and the apply.
+
+  Under `--apply` the SSH lockout guard refuses — and refusing means nothing is written or
+  applied — both when the rules would block a currently-connected client and when no SSH log
+  could be read at all, because then the check could not run. The interactive
+  `render-firewall` only warns in that second case, which is defensible with a human at the
+  terminal and is not from cron. Pass `--ssh-log` explicitly; `--force` overrides.
+
+
 - Seven choices for what a blocked request gets back, rather than two: `403`, `404`, `410`
   (asks crawlers to drop the URL permanently), `429`, `418` (RFC 2324's teapot), `444`
   (close without replying), or a tarpit that answers 403 with the body throttled to a byte

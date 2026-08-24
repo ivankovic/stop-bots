@@ -167,10 +167,9 @@ each adds a temporary firewall block that expires on its own and is re-added if 
 continues.
 
 They run on an internal timer that re-reads your SSH and NGINX access logs every minute —
-**but only while the TUI is open.** Nothing is detected when the process isn't running. The
-equivalent CLI subcommands (`block-scanners`, `block-web-scanners`,
-`block-spoofed-crawlers`, `block-probe-paths`, `block-honeypot`) are safe to run unattended
-from a real cron if you want that, since none of them applies anything by itself.
+**but only while the TUI is open.** Nothing is detected when the process isn't running. For
+a server you aren't sitting in front of, see [Unattended, from cron](#unattended-from-cron)
+below.
 
 - **SSH and web scanners**: IPs with a pile of failed SSH logins, or many distinct 404'd
   paths. Never an IP with a recent successful SSH login, or one inside a known crawler's
@@ -231,7 +230,8 @@ Every firewall decision above is *generated*, never applied automatically: `rend
 yourself, and refuses to write one that would lock out a currently-connected SSH session. The
 Dashboard's render popup can also apply it for you immediately, but only when you explicitly
 ask it to (the "apply after writing" toggle) — never as a side effect of anything automatic
-like the internal cron.
+like the internal cron. The one way to have it applied unattended is `batch --apply`, which
+you have to put in a crontab yourself; see [Unattended, from cron](#unattended-from-cron).
 
 The same applies on the NGINX side: changing a setting only changes what *would* be written.
 Site settings shows each site as `STALE` until you apply.
@@ -243,6 +243,44 @@ Dynamic Protection screen or `remove-firewall-rule`.
 There's also a plain access-log tally, independent of blocking: `record-access-stats` /
 `list-access-stats` count how often each user agent shows up in successful (non-error)
 requests, so you can see who's actually visiting on top of who's being blocked.
+
+## Unattended, from cron
+
+`stop-bots batch` is one pass over everything the TUI does by hand: refresh every list,
+scan the logs, write the NGINX blocking rules and the firewall script.
+
+```
+# One full pass a night. Refreshes the lists, scans the logs, applies both.
+0 4 * * * root /usr/local/bin/stop-bots batch --apply --ssh-log /var/log/auth.log
+
+# And detection every ten minutes, without re-downloading lists that change weekly.
+*/10 * * * * root /usr/local/bin/stop-bots batch --apply --no-fetch --ssh-log /var/log/auth.log
+```
+
+It says nothing when everything worked, so a healthy nightly run doesn't mail you. A failed
+step prints to stderr and sets a non-zero exit status, which is what makes cron tell you
+about it. Run it once by hand with `--verbose` first — that prints a line per step, and is
+the easiest way to see what it is actually doing.
+
+**`--apply` is what makes it enforce anything.** Without it, `batch` writes the NGINX config
+and the firewall script and stops: config does nothing until a reload, a script does nothing
+until it is run. That is this project's default everywhere, and it stays the default here.
+
+**With `--apply`, the SSH lockout guard can refuse — and refusing means nothing is applied.**
+It refuses if the rules would block a client that is connected right now, *and* if no SSH log
+could be read at all, because then the check could not run. The interactive
+`render-firewall` only prints a note in that second case, on the reasoning that a human is
+watching the terminal; from cron nobody is. **Pass `--ssh-log` explicitly**: cron runs as
+root so `/var/log/auth.log` usually reads fine, but on a journald-only host `journalctl`
+under cron can come back empty, which is exactly the case it refuses on. `--force` overrides
+the guard if you mean it.
+
+One step failing never stops the others, and the NGINX and firewall halves are independent —
+a failed NGINX reload still leaves the firewall applied, and the other way round.
+
+`batch` records each step against the same schedule the TUI's internal cron uses, so the two
+agree about what has already run instead of both doing it, and the Dashboard's "Scheduled
+tasks" panel shows what your real cron did.
 
 # Contact
 
@@ -396,7 +434,9 @@ Some directories don't exist yet but should be created if the need arises.
         |- scanblock.rs   <- Shared CLI+cron logic for every detector's detect-and-block pass
         |- protection.rs  <- The detectors' on/off switches, their defaults, and why
         |- ipranges/      <- Crawler, country and third-party IP-range fetching/storage
-        |- cron.rs        <- The internal cron: which background jobs run how often
+        |- batch.rs       <- Batch mode: one unattended pass, for a real crontab
+|- batch.rs       <- Batch mode: one unattended pass, for a real crontab
+|- cron.rs        <- The internal cron: which background jobs run how often
         |- firewall.rs    <- Shared firewall-rendering logic (lockout safety, script writing)
         |- iptables.rs    <- iptables script generation
         |- nftables.rs    <- nftables script generation

@@ -138,9 +138,7 @@ pub fn run_detector(
 ) -> Result<ScanBlockOutcome> {
     use crate::protection::Detector as D;
     match detector {
-        D::SshScanners => {
-            block_ssh_scanners(db, DEFAULT_SSH_ATTEMPTS, ttl_days, log_text, dry_run)
-        }
+        D::SshScanners => block_ssh_scanners(db, DEFAULT_SSH_ATTEMPTS, ttl_days, log_text, dry_run),
         D::WebScanners => block_web_scanners(db, DEFAULT_WEB_PATHS, ttl_days, log_text, dry_run),
         D::SpoofedCrawlers => block_spoofed_crawlers(db, ttl_days, log_text, dry_run),
         D::ProbePaths => block_probe_paths(db, ttl_days, log_text, dry_run),

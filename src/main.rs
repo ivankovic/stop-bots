@@ -540,6 +540,65 @@ enum Command {
         #[arg(long)]
         response: BlockResponseArg,
     },
+    /// One unattended pass over everything, for a real cron entry:
+    /// refresh every list, scan the logs, write the NGINX blocking rules
+    /// and the firewall script — and, with --apply, put both into effect.
+    ///
+    /// Without --apply nothing is enforced: the config and the script are
+    /// written and left alone, which is inert (config does nothing until a
+    /// reload, a script does nothing until it is run). That is this
+    /// project's default everywhere else and stays the default here.
+    ///
+    /// With --apply, the SSH lockout guard refuses — and refusing means
+    /// nothing is applied — if the rules would block a currently-connected
+    /// client, *or* if no SSH log could be read at all so the check could
+    /// not run. Interactive RenderFirewall only prints a note in that
+    /// second case, because a human is watching; from crontab nobody is.
+    /// Pass --ssh-log if the log isn't where this expects, or --force if
+    /// you know what you're doing.
+    ///
+    /// Refreshes bot lists and crawler IP ranges in full, and reputation
+    /// feeds and country ranges only where they are switched on or
+    /// selected. One step's failure never stops the others; the exit
+    /// status is non-zero if any of them failed, which is what makes cron
+    /// mail you.
+    Batch {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Root directory to scan for NGINX config files
+        #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
+        root: PathBuf,
+        /// Reload NGINX and run the generated firewall script, rather than
+        /// only writing both
+        #[arg(long)]
+        apply: bool,
+        /// Path to write the generated firewall script to
+        #[arg(long, default_value = stop_bots::firewall::DEFAULT_OUTPUT_PATH)]
+        out: PathBuf,
+        #[arg(long, default_value = "nftables")]
+        backend: FirewallBackend,
+        /// Read this SSH log file instead of auto-detecting one. Worth
+        /// setting explicitly under cron: on a journald-only host,
+        /// `journalctl` can come back empty, which is the case --apply
+        /// refuses on
+        #[arg(long)]
+        ssh_log: Option<PathBuf>,
+        /// Read this NGINX access log instead of auto-detecting one
+        #[arg(long)]
+        access_log: Option<PathBuf>,
+        /// Apply even if the lockout guard objects, or could not run
+        #[arg(long)]
+        force: bool,
+        /// Skip every step that downloads something — for a host with no
+        /// outbound access, or a second, more frequent cron entry that
+        /// only wants the log scan and the apply (bot lists change weekly;
+        /// an access log changes every second)
+        #[arg(long)]
+        no_fetch: bool,
+        /// Print a line per step, not just the failures
+        #[arg(long, short)]
+        verbose: bool,
+    },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
         #[arg(long, help = DB_HELP)]
@@ -633,6 +692,34 @@ async fn main() -> Result<()> {
             no_reload,
             ssh_log,
         }) => run_tui(db, root, no_reload, ssh_log).await,
+        Some(Command::Batch {
+            db,
+            root,
+            apply,
+            out,
+            backend,
+            ssh_log,
+            access_log,
+            force,
+            no_fetch,
+            verbose,
+        }) => {
+            run_batch(
+                db,
+                stop_bots::batch::BatchOptions {
+                    root,
+                    out,
+                    backend: backend.into(),
+                    apply,
+                    ssh_log,
+                    access_log,
+                    force,
+                    no_fetch,
+                },
+                verbose,
+            )
+            .await
+        }
         Some(Command::ScanSites { root, db }) => scan_sites(&root, db),
         Some(Command::UpdateBotLists {
             db,
@@ -856,6 +943,37 @@ async fn run_tui(
     };
     ratatui::restore();
     result
+}
+
+/// Runs one batch pass and turns its report into output and an exit
+/// status.
+///
+/// Quiet on success on purpose: this is built to sit in a crontab, and
+/// `cron` mails the owner anything a job prints. A nightly run that says
+/// nothing is a nightly run nobody has to read. `--verbose` prints every
+/// step, which is what a first run by hand wants.
+///
+/// Failures go to stderr and set a non-zero exit status, so they are
+/// visible whichever way the job is wired up.
+async fn run_batch(
+    db_path: Option<PathBuf>,
+    options: stop_bots::batch::BatchOptions,
+    verbose: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    let report = stop_bots::batch::run(&db, &options).await;
+
+    if verbose {
+        println!("{}", report.full());
+    } else if report.failures() > 0 {
+        eprintln!("{}", report.failures_only());
+    }
+
+    let failures = report.failures();
+    if failures > 0 {
+        anyhow::bail!("{failures} of {} step(s) failed", report.steps.len());
+    }
+    Ok(())
 }
 
 fn scan_sites(root: &Path, db_path: Option<PathBuf>) -> Result<()> {

@@ -19,6 +19,7 @@
 pub mod accesslog;
 pub mod accessstats;
 pub mod app;
+pub mod batch;
 pub mod botlist;
 pub mod cron;
 pub mod db;

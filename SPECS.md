@@ -3238,3 +3238,88 @@ assertion across a screen switch. Ratatui skips any cell that already
 holds the right character, so `"Top IPs attempting SSH"` arrives split
 around whatever the two screens have in common at the same column, while
 `"Top IPs"` does not.
+
+## Batch mode (`src/batch.rs`, `stop-bots batch`)
+
+"A batch mode that can run from crontab that simply updates all lists,
+scans the logs, creates the updated blocks and applies them."
+
+The last four words are the whole design problem. Everything else in
+this project is *generate-only* on purpose — `src/iptables.rs` and
+`src/nftables.rs` both say so in their module docs, `cron.rs` says an
+internal cron that silently executed firewall changes "would be a very
+different, much riskier feature", and the README promises "generated,
+never applied automatically". This is the one thing that breaks that,
+so it breaks it on purpose and only when asked.
+
+**`--apply` is a flag, and the default is unchanged.** Without it,
+`batch` writes NGINX config and a firewall script and stops. Both are
+inert: config does nothing until a reload, a script does nothing until
+it is run. Anyone who wants the old guarantee just doesn't pass the
+flag, and the tests assert that shape rather than assuming it.
+
+**The lockout guard refuses on "could not run", not only on "no".**
+`render-firewall` prints a note and continues when no SSH log is
+readable, which is defensible with a human at the terminal — and is the
+exact hole that, in the TUI, wrote *and applied* a script that took a
+server off the network. From crontab there is no human, so
+`LockoutStatus::LogUnavailable` under `--apply` is a refusal: non-zero
+exit, and **nothing written**, not merely nothing applied. This is why
+batch does not reuse `main.rs`'s `check_lockout_risk`, which encodes the
+interactive policy.
+
+`--ssh-log` matters more here than anywhere else and the CLI help says
+so: cron runs as root, so `/var/log/auth.log` usually reads fine, but on
+a journald-only host `journalctl` under cron can come back empty — which
+is precisely the refuse case, so the run would fail nightly for a reason
+that looks like nothing.
+
+**Two independent planes.** NGINX config and the firewall script are
+separate mechanisms. A failed NGINX reload must not stop the firewall
+half and vice versa, so they are the last two steps and neither is
+conditional on the other. Same rule one level down: one step's failure
+never aborts the run, every step reports its own outcome, and the exit
+status is non-zero if any failed — which is the only thing that makes
+`cron` mail anyone.
+
+**Quiet on success.** `cron` mails the owner whatever a job prints, so a
+nightly run that says nothing is a nightly run nobody has to read.
+`--verbose` prints a line per step, which is what a first run by hand
+wants; the README says to start there.
+
+**Scope of "all lists".** Bot lists and crawler IP ranges refresh in
+full — three of each, all small, and everything depends on them.
+Reputation feeds and country ranges refresh only where switched on or
+selected: fetching AWS's published address space for a feed nobody
+enabled is megabytes for nothing.
+
+**`--no-fetch` is not just test scaffolding.** Bot lists change weekly;
+an access log changes every second. A nightly full run plus a
+ten-minute `--no-fetch --apply` is the pattern the README shows, and it
+happens to be what makes the module testable offline.
+
+**Shared schedule state.** Each step stamps `Db::set_cron_last_run`
+under the same key the TUI's internal cron uses. Deliberate, and it
+could have gone either way: it means an admin running both gets one
+detection pass rather than two, and the Dashboard's "Scheduled tasks"
+panel reports what the *real* cron did instead of claiming everything is
+overdue.
+
+**Two lifts, so nothing forked.** `scanblock::run_detector` is now the
+one place a `Detector` maps to its implementation, so a detector added
+to `Detector::ALL` and forgotten fails to compile rather than silently
+never running from one of the two schedulers. `nginx::apply_all_sites`
+moved out of `main.rs`, which had real logic in it — the dedupe by
+config file, and the write-generated-files-before / delete-unreferenced-
+after ordering that is load-bearing because deleting a rate-limit zone
+another site still references makes NGINX refuse to load at all.
+
+**Testing.** The refusals are asserted in `tests/cli.rs`, offline via
+`--no-fetch`, including that nothing was *written* — and the
+log-unavailable one was checked by disabling the guard and watching it
+fail. `--apply` itself can only be proven in `tests/container.rs`: real
+`nft`, and a real HTTP request to an NGINX that has genuinely been
+reloaded. That needed a `systemctl` shim in the image, since a container
+has no init system — the same substitution the harness already made by
+calling `nginx -s reload` by hand, now available to the code under test
+so `--apply` can be exercised as the single command an admin runs.

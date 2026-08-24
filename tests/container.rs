@@ -607,6 +607,88 @@ fn a_blocked_client_container_cannot_reach_the_server() {
     );
 }
 
+// ---- batch mode: does one command really do the lot? ----
+
+/// `batch --apply` is the only thing in this project that enforces
+/// anything unattended, and it enforces on two planes at once. Both are
+/// checked the only way that means anything: a real `nft` ruleset, and a
+/// real HTTP request to a real NGINX that has genuinely been reloaded.
+///
+/// `--force` because a container has no SSH log, so the lockout guard
+/// cannot run — which is exactly the case `--apply` refuses on, and the
+/// documented way through. `--no-fetch` to keep the run offline and
+/// deterministic.
+#[test]
+fn batch_apply_enforces_on_both_planes_at_once() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-batch");
+    server.seed_bot("badbot", "BadBot");
+    server.stop_bots("add-firewall-rule --address 203.0.113.9 --action block");
+
+    // Everything is still inert at this point: no table, and the server
+    // serves the bot happily.
+    assert_eq!(server.status("/", "-H 'User-Agent: BadBot/1.0'"), "200");
+
+    let output = server.stop_bots(
+        "batch --apply --force --no-fetch --verbose \
+         --root /etc/nginx/sites-enabled --out /tmp/fw.nft --access-log /dev/null",
+    );
+
+    // The firewall plane: the script was written *and* loaded.
+    let ruleset = server.sh("nft list table inet stop_bots");
+    assert!(
+        ruleset.contains("ip saddr 203.0.113.9 drop"),
+        "batch --apply should have loaded the rules; batch said:\n{output}\nruleset:\n{ruleset}"
+    );
+
+    // The NGINX plane: the config was written *and* reloaded, which only
+    // a request can show.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(
+        server.status("/", "-H 'User-Agent: BadBot/1.0'"),
+        "403",
+        "batch --apply should have reloaded NGINX; batch said:\n{output}"
+    );
+    assert_eq!(
+        server.status("/", "-H 'User-Agent: Mozilla/5.0'"),
+        "200",
+        "and everyone else must still be served"
+    );
+}
+
+/// Without `--apply`, the same run writes both and enforces neither. This
+/// is the project's default and the reason `--apply` is a flag rather
+/// than the behaviour: a script on disk and a config NGINX has not
+/// re-read are both inert.
+#[test]
+fn batch_without_apply_writes_both_and_enforces_neither() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-batch-dry");
+    server.seed_bot("badbot", "BadBot");
+    server.stop_bots("add-firewall-rule --address 203.0.113.9 --action block");
+
+    server.stop_bots(
+        "batch --no-fetch --root /etc/nginx/sites-enabled \
+         --out /tmp/fw.nft --access-log /dev/null",
+    );
+
+    assert!(
+        server.run("test -s /tmp/fw.nft").0,
+        "the script should have been written"
+    );
+    let (loaded, _, _) = server.run("nft list table inet stop_bots");
+    assert!(!loaded, "but nothing should have been loaded into nftables");
+    assert_eq!(
+        server.status("/", "-H 'User-Agent: BadBot/1.0'"),
+        "200",
+        "and NGINX should still be serving its old config"
+    );
+}
+
 // ---- the lockout guard, against a real ruleset ----
 
 /// The guard that failed in production. With a log naming a connected
