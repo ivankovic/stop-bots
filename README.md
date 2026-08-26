@@ -367,6 +367,20 @@ The budgets are enforced, not aspirational: `cargo nextest run` (what CI uses) f
 that exceeds them as SLOW, per `.config/nextest.toml`. Plain `cargo test` works identically,
 it just doesn't report per-test time.
 
+### Coverage
+
+93% of lines, measured with `cargo llvm-cov --summary-only --workspace`. That figure
+*understates* it: the container suite (`make test-containers`) runs a binary inside Docker,
+so its coverage never comes back.
+
+**No test touches the network**, which is where the remaining gap is and why it is there.
+Every downloader takes a `--source <file>` override that parses the same format the server
+would have sent — a real feature for a host with no outbound access, and what makes the
+parse-and-store half of a download testable. What is left uncovered is the spawn itself:
+four `App::start_*` methods and `batch`'s `update_lists`, whose entire job is to start an
+HTTP request. Covering those would mean an injectable base URL and a local HTTP server, and
+would test reqwest rather than this project.
+
 ### How should tests handle dependencies?
 
 *No mocks*. Mocks prevent testing through the interface and are brittle — they test the mock

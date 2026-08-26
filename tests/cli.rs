@@ -2220,3 +2220,167 @@ fn hit_count(fixture: &Fixture, user_agent: &str) -> i64 {
         .map(|s| s.hit_count)
         .unwrap_or(0)
 }
+
+// ---- `--source`: every download has a local-file path through it ----
+//
+// Every fetch in this project now takes a `--source <file>` override that
+// parses the same format the server would have sent. It is a real feature
+// for a host with no outbound access — and it is what lets these tests
+// cover the parse-and-store half of a download without a network, which
+// was the single largest gap in this suite's coverage.
+
+/// Crawler ranges, from Google's published `prefixes` JSON. Both families
+/// come out of one file, and both have to reach the database.
+#[test]
+fn update_ip_ranges_reads_a_local_file_instead_of_downloading() {
+    let fixture = Fixture::new();
+
+    fixture
+        .run(&[
+            "update-ip-ranges",
+            "--source-id",
+            "googlebot",
+            "--source",
+            "tests/fixtures/ipranges/googlebot-sample.json",
+        ])
+        .stdout(predicate::str::contains("Stored 3 CIDR range(s)"));
+
+    // Visible where it matters: a rendered firewall script, not just a row.
+    let out = fixture.managed.join("fw.nft");
+    fixture.run(&[
+        "render-firewall",
+        "--backend",
+        "nftables",
+        "--out",
+        out.to_str().unwrap(),
+        "--force",
+    ]);
+    let script = fs::read_to_string(&out).unwrap();
+    // Googlebot is a Search bot, allowed by default, so its ranges are
+    // fetched but inert — which is the point of storing them: they are
+    // what the spoofed-crawler detector checks *against*.
+    assert!(!script.contains("192.178.4.0/27"), "script was:\n{script}");
+}
+
+/// A country's IPdeny zone file, which is bare CIDRs with blank lines.
+#[test]
+fn update_country_ranges_reads_a_local_file_instead_of_downloading() {
+    let fixture = Fixture::new();
+
+    fixture
+        .run(&[
+            "update-country-ranges",
+            "--country",
+            "nl",
+            "--source",
+            "tests/fixtures/ipranges/country-sample.zone",
+        ])
+        .stdout(predicate::str::contains("Stored 3 CIDR range(s)"));
+
+    fixture.run(&["add-country", "--country", "nl"]);
+    let out = fixture.managed.join("fw.nft");
+    fixture.run(&[
+        "render-firewall",
+        "--backend",
+        "nftables",
+        "--out",
+        out.to_str().unwrap(),
+        "--force",
+    ]);
+    let script = fs::read_to_string(&out).unwrap();
+    assert!(script.contains("86.48.240.0/20"), "script was:\n{script}");
+}
+
+/// The two shapes a reputation feed arrives in: a plain `.netset` list and
+/// a provider's JSON. Both go through `--source`, so both parsers are
+/// exercised offline.
+#[test]
+fn update_reputation_source_reads_a_local_file_in_either_format() {
+    for (source_id, path, expected) in [
+        (
+            "firehol-level1",
+            "tests/fixtures/ipranges/firehol-sample.netset",
+            "198.51.100.0/24",
+        ),
+        (
+            "aws",
+            "tests/fixtures/ipranges/aws-sample.json",
+            "13.34.37.64/27",
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture
+            .run(&[
+                "update-reputation-source",
+                "--source-id",
+                source_id,
+                "--source",
+                path,
+            ])
+            .stdout(predicate::str::contains("Stored 2 range(s)"));
+        // Fetching does not switch a feed on, so the output says so —
+        // otherwise a fetch that changes nothing reads as a bug.
+        fixture.run(&[
+            "set-reputation-source",
+            "--source-id",
+            source_id,
+            "--enabled",
+            "true",
+        ]);
+
+        let out = fixture.managed.join("fw.nft");
+        fixture.run(&[
+            "render-firewall",
+            "--backend",
+            "nftables",
+            "--out",
+            out.to_str().unwrap(),
+            "--force",
+        ]);
+        let script = fs::read_to_string(&out).unwrap();
+        assert!(
+            script.contains(expected),
+            "{source_id}: script was:\n{script}"
+        );
+    }
+}
+
+/// The comments and blank lines a real `.netset` carries must not become
+/// CIDRs. The fixture has one of each, and "Stored 2" above is only
+/// meaningful because of it.
+#[test]
+fn a_feeds_comments_and_blank_lines_are_not_stored_as_ranges() {
+    let fixture = Fixture::new();
+
+    fixture.run(&[
+        "update-reputation-source",
+        "--source-id",
+        "firehol-level1",
+        "--source",
+        "tests/fixtures/ipranges/firehol-sample.netset",
+    ]);
+
+    fixture
+        .run(&["list-reputation-sources"])
+        .stdout(predicate::str::contains("2 range"));
+}
+
+/// A `--source` that isn't there says which file, rather than leaving a
+/// bare "No such file or directory" to be matched against the three paths
+/// a command line can carry.
+#[test]
+fn a_missing_source_file_names_the_file() {
+    let fixture = Fixture::new();
+
+    fixture
+        .cmd(&[
+            "update-ip-ranges",
+            "--source-id",
+            "googlebot",
+            "--source",
+            "/nonexistent/ranges.json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/nonexistent/ranges.json"));
+}

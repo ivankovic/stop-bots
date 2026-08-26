@@ -101,6 +101,24 @@ pub(crate) fn seed_source(db: &Db, id: &str) {
     .expect("failed to seed a bot-list source");
 }
 
+/// A minimal [`NewBot`], for tests that only need *a* bot to exist.
+///
+/// Separate from [`blocked_bot`]: that one seeds a source and pins the
+/// bot's status, which is what a test about applying NGINX config wants.
+/// This is the plain value, for callers that hand it to something which
+/// does the storing itself.
+pub(crate) fn new_bot(slug: &str, source_id: &str) -> NewBot {
+    NewBot {
+        slug: slug.to_string(),
+        name: slug.to_string(),
+        is_ai: false,
+        is_search_engine: false,
+        is_scanner: false,
+        user_agent_pattern: format!("{slug}-ua"),
+        source_id: source_id.to_string(),
+    }
+}
+
 /// A bot pinned to Blocked, matching `pattern` — the "there is something
 /// to block" setup, previously ~20 lines of `upsert_source` +
 /// `upsert_bot` + `set_bot_status` in eleven places.

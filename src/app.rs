@@ -1437,10 +1437,199 @@ mod tests {
         assert_eq!(app.screen, Screen::DynamicProtection);
     }
 
+    // ---- the `finish_` half of every network fetch ----
+    //
+    // These are the only part of a download this suite can reach: the
+    // `start_` halves make a real HTTP request, and no test here touches
+    // the network. That split is worth knowing, because the `finish_`
+    // half is where the interesting decisions are — what gets stored, what
+    // the admin is told, and what happens on failure — while the `start_`
+    // half is a spawn.
+    //
+    // Each takes the same `Result<T, String>` its background task would
+    // have sent, so a synthetic payload exercises it exactly as the real
+    // event does.
+
     /// `h`/`l` must not steal a keystroke that a screen's own search/text
     /// focus wants — Bot settings' search box (`/`) accepts any character,
     /// including 'h'/'l', as literal query text, e.g. typing "arclejot" to
     /// filter by name must not jump screens partway through.
+    /// A finished bot-list download stores the bots and says how many.
+    #[tokio::test]
+    async fn a_finished_bot_list_download_is_stored_and_counted() {
+        let mut app = test_app();
+
+        let source_id = botlist::SourceKind::WellKnownBots.id();
+        app.finish_source_update(
+            source_id.to_string(),
+            Ok(vec![crate::testing::new_bot("badbot", source_id)]),
+        )
+        .unwrap();
+
+        assert_eq!(app.db.list_bots().unwrap().len(), 1);
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("Stored 1 bot"), "message was: {message}");
+    }
+
+    /// A failed one says so and changes nothing. The distinction matters:
+    /// a transient network error must not look like "this source is empty".
+    #[tokio::test]
+    async fn a_failed_bot_list_download_reports_it_and_stores_nothing() {
+        let mut app = test_app();
+
+        app.finish_source_update(
+            botlist::SourceKind::WellKnownBots.id().to_string(),
+            Err("connection refused".to_string()),
+        )
+        .unwrap();
+
+        assert!(app.db.list_bots().unwrap().is_empty());
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("Failed to update"),
+            "message was: {message}"
+        );
+        assert!(
+            message.contains("connection refused"),
+            "message was: {message}"
+        );
+    }
+
+    /// Fetching a country's ranges is only half of what the admin asked
+    /// for — they picked a country to *act on*, so a successful fetch also
+    /// adds it to the geo selection.
+    #[tokio::test]
+    async fn a_finished_country_fetch_also_selects_the_country() {
+        let mut app = test_app();
+
+        app.finish_country_select("nl".to_string(), Ok(vec!["1.2.3.0/24".to_string()]))
+            .unwrap();
+
+        assert_eq!(app.db.list_selected_countries().unwrap(), vec!["nl"]);
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("Blocked NL"), "message was: {message}");
+    }
+
+    /// And the message follows the current geo mode rather than assuming
+    /// one: in Allowlist mode, selecting a country *permits* it, and
+    /// saying "Blocked" there would be exactly backwards.
+    #[tokio::test]
+    async fn a_finished_country_fetch_says_allowed_in_allowlist_mode() {
+        let mut app = test_app();
+        app.db.set_geo_mode(crate::db::GeoMode::Allowlist).unwrap();
+
+        app.finish_country_select("nl".to_string(), Ok(vec!["1.2.3.0/24".to_string()]))
+            .unwrap();
+
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("Allowed NL"), "message was: {message}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_country_fetch_leaves_the_country_unselected() {
+        let mut app = test_app();
+
+        app.finish_country_select("nl".to_string(), Err("404".to_string()))
+            .unwrap();
+
+        assert!(app.db.list_selected_countries().unwrap().is_empty());
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("Failed to fetch"),
+            "message was: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_reputation_fetch_stores_its_ranges() {
+        let mut app = test_app();
+        let source_id = crate::ipranges::reputation::ReputationSourceKind::Aws.id();
+
+        app.finish_reputation_fetch(source_id.to_string(), Ok(vec!["1.2.3.0/24".to_string()]))
+            .unwrap();
+
+        let stored = app
+            .db
+            .list_reputation_sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == source_id)
+            .unwrap();
+        assert_eq!(stored.range_count, 1);
+    }
+
+    /// An empty parse is refused rather than stored. It almost always
+    /// means the upstream format moved or an error page was served, and
+    /// storing it would silently un-block everything the feed covered.
+    #[tokio::test]
+    async fn a_reputation_fetch_that_parsed_to_nothing_is_not_stored() {
+        let mut app = test_app();
+        let source_id = crate::ipranges::reputation::ReputationSourceKind::Aws.id();
+
+        app.finish_reputation_fetch(source_id.to_string(), Ok(Vec::new()))
+            .unwrap();
+
+        let stored = app
+            .db
+            .list_reputation_sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == source_id)
+            .unwrap();
+        assert_eq!(stored.range_count, 0);
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(
+            message.contains("no usable addresses"),
+            "message was: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_reputation_fetch_reports_it() {
+        let mut app = test_app();
+
+        app.finish_reputation_fetch(
+            crate::ipranges::reputation::ReputationSourceKind::Aws
+                .id()
+                .to_string(),
+            Err("timed out".to_string()),
+        )
+        .unwrap();
+
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("timed out"), "message was: {message}");
+    }
+
+    /// One crawler source failing must not discard what the other two
+    /// fetched — the job stores whatever worked and summarises the rest.
+    #[tokio::test]
+    async fn a_partly_failed_crawler_range_update_keeps_what_worked() {
+        use crate::ipranges::IpRangeSourceKind;
+        let mut app = test_app();
+        app.jobs_in_flight
+            .insert(Job::Cron(CronJob::UpdateIpRanges));
+
+        app.finish_cron_update_ip_ranges(vec![
+            (
+                IpRangeSourceKind::GoogleBot,
+                Ok(vec!["8.8.8.0/24".to_string()]),
+            ),
+            (IpRangeSourceKind::BingBot, Err("timed out".to_string())),
+        ])
+        .unwrap();
+
+        assert!(!app
+            .jobs_in_flight
+            .contains(&Job::Cron(CronJob::UpdateIpRanges)));
+        let summary = app
+            .db
+            .get_cron_last_summary(CronJob::UpdateIpRanges.id())
+            .unwrap()
+            .unwrap_or_default();
+        assert!(summary.contains("updated 1"), "summary was: {summary}");
+        assert!(summary.contains("1 failed"), "summary was: {summary}");
+    }
+
     #[tokio::test]
     async fn h_and_l_are_literal_query_text_while_bot_settings_search_is_focused() {
         let mut app = test_app();

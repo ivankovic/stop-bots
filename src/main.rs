@@ -385,6 +385,11 @@ enum Command {
         /// Which source to update: googlebot, bingbot or gptbot
         #[arg(long)]
         source_id: String,
+        /// Read the list from a local file instead of downloading it
+        /// (parsed as this source's format). For a host with no outbound
+        /// access — and what makes this path testable offline
+        #[arg(long)]
+        source: Option<PathBuf>,
     },
     /// Download one third-party CIDR feed (does not switch it on).
     ///
@@ -399,6 +404,11 @@ enum Command {
         db: Option<PathBuf>,
         #[arg(long)]
         source_id: String,
+        /// Read the list from a local file instead of downloading it
+        /// (parsed as this source's format). For a host with no outbound
+        /// access — and what makes this path testable offline
+        #[arg(long)]
+        source: Option<PathBuf>,
     },
     /// Switch a third-party CIDR feed on or off.
     ///
@@ -440,6 +450,11 @@ enum Command {
         /// Two-letter country code, e.g. "us" or "nl"
         #[arg(long)]
         country: String,
+        /// Read the list from a local file instead of downloading it
+        /// (parsed as this source's format). For a host with no outbound
+        /// access — and what makes this path testable offline
+        #[arg(long)]
+        source: Option<PathBuf>,
     },
     /// Set the geo mode: blocklist or allowlist.
     ///
@@ -835,19 +850,27 @@ async fn main() -> Result<()> {
         Some(Command::SetHoneypotPath { db, path }) => set_honeypot_path(db, path),
         Some(Command::RecordAccessStats { db, access_log }) => record_access_stats(db, access_log),
         Some(Command::ListAccessStats { db }) => list_access_stats(db),
-        Some(Command::UpdateIpRanges { db, source_id }) => update_ip_ranges(db, source_id).await,
-        Some(Command::UpdateReputationSource { db, source_id }) => {
-            update_reputation_source(db, source_id).await
-        }
+        Some(Command::UpdateIpRanges {
+            db,
+            source_id,
+            source,
+        }) => update_ip_ranges(db, source_id, source).await,
+        Some(Command::UpdateReputationSource {
+            db,
+            source_id,
+            source,
+        }) => update_reputation_source(db, source_id, source).await,
         Some(Command::SetReputationSource {
             db,
             source_id,
             enabled,
         }) => set_reputation_source(db, source_id, enabled),
         Some(Command::ListReputationSources { db }) => list_reputation_sources(db),
-        Some(Command::UpdateCountryRanges { db, country }) => {
-            update_country_ranges(db, country).await
-        }
+        Some(Command::UpdateCountryRanges {
+            db,
+            country,
+            source,
+        }) => update_country_ranges(db, country, source).await,
         Some(Command::SetGeoMode { db, mode }) => set_geo_mode(db, mode),
         Some(Command::AddCountry { db, country }) => set_country_selected(db, country, true),
         Some(Command::RemoveCountry { db, country }) => set_country_selected(db, country, false),
@@ -1163,20 +1186,41 @@ fn remove_firewall_rule(db_path: Option<PathBuf>, id: i64) -> Result<()> {
     Ok(())
 }
 
-async fn update_ip_ranges(db_path: Option<PathBuf>, source_id: String) -> Result<()> {
+async fn update_ip_ranges(
+    db_path: Option<PathBuf>,
+    source_id: String,
+    source: Option<PathBuf>,
+) -> Result<()> {
     let db = open_db(db_path)?;
     let kind = ipranges::IpRangeSourceKind::from_id(&source_id)
         .with_context(|| format!("unknown ip-range source id: {source_id}"))?;
-    let count = ipranges::update(&db, kind).await?;
+    let count = match source {
+        Some(path) => ipranges::store(&db, kind, &kind.parse(&read_source_file(&path)?)?)?,
+        None => ipranges::update(&db, kind).await?,
+    };
     println!("Stored {count} CIDR range(s) from {}", kind.name());
     Ok(())
 }
 
-async fn update_country_ranges(db_path: Option<PathBuf>, country: String) -> Result<()> {
+async fn update_country_ranges(
+    db_path: Option<PathBuf>,
+    country: String,
+    source: Option<PathBuf>,
+) -> Result<()> {
     let db = open_db(db_path)?;
-    let count = ipranges::update_country(&db, &country).await?;
+    let count = match source {
+        Some(path) => ipranges::store_country(&db, &country, &read_source_file(&path)?)?,
+        None => ipranges::update_country(&db, &country).await?,
+    };
     println!("Stored {count} CIDR range(s) for country {country}");
     Ok(())
+}
+
+/// Reads a `--source` override, saying which file failed rather than
+/// leaving a bare "No such file or directory" to be matched against three
+/// possible paths on the command line.
+fn read_source_file(path: &Path) -> Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
 }
 
 fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
@@ -1187,7 +1231,11 @@ fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
     Ok(())
 }
 
-async fn update_reputation_source(db_path: Option<PathBuf>, source_id: String) -> Result<()> {
+async fn update_reputation_source(
+    db_path: Option<PathBuf>,
+    source_id: String,
+    source: Option<PathBuf>,
+) -> Result<()> {
     use stop_bots::ipranges::reputation::{self, ReputationSourceKind};
 
     let db = open_db(db_path)?;
@@ -1195,7 +1243,10 @@ async fn update_reputation_source(db_path: Option<PathBuf>, source_id: String) -
         let known: Vec<&str> = ReputationSourceKind::ALL.iter().map(|k| k.id()).collect();
         anyhow::bail!("unknown source: {source_id} (known: {})", known.join(", "));
     };
-    let count = reputation::update(&db, kind).await?;
+    let count = match source {
+        Some(path) => reputation::store(&db, kind, &kind.parse(&read_source_file(&path)?)?)?,
+        None => reputation::update(&db, kind).await?,
+    };
     println!("Stored {count} range(s) for {}", kind.name());
     // Fetching and enabling are separate on purpose; say so, or a fetch
     // that appears to succeed but changes nothing reads as a bug.

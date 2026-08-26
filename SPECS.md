@@ -3453,3 +3453,43 @@ not.
 One caution worth keeping: `clippy -W clippy::pedantic` prints a *summary*
 rather than one warning per site, so grepping its output for `clippy::` finds
 nothing and looks like a clean run. It isn't; check before trusting silence.
+
+## Test coverage, measured
+
+93% of lines (`cargo llvm-cov --summary-only --workspace`), and an
+understatement: the container suite runs a binary inside Docker, so its
+coverage never comes back.
+
+Worth recording *how* the gap was found, because the percentage alone
+would have sent the work to the wrong place. Pulling the uncovered line
+ranges rather than the per-file percentages showed the misses were not
+spread thinly — they clustered almost entirely into one cause: **every
+code path that makes an HTTP request**, because no test here touches the
+network. `app.rs` sat at 74% not because it was under-tested but because
+six of its methods were downloaders.
+
+Two things closed most of it.
+
+**The `finish_` half of every fetch is testable as-is.** Each takes the
+same `Result<T, String>` its background task would have sent, so a
+synthetic payload exercises it exactly as the real event does — and it is
+the half where the decisions live: what gets stored, what the admin is
+told, what happens on failure. Nine tests took `app.rs` from 74% to 85%.
+The `start_` halves are a spawn and a message; there is not much there to
+get wrong.
+
+**`--source <file>` on the three downloaders that lacked it.** The
+pattern already existed on `update-bot-lists`, where it is a real feature
+(a host with no outbound access) that happens to make the parser
+testable. Extending it to crawler ranges, country ranges and reputation
+feeds needed one genuine split — `ipranges::store_country`, separating
+parse-and-store from fetch, exactly as `store` was already separated from
+`update` — and covered both feed formats (a plain `.netset` and a
+provider's JSON) offline.
+
+**Where the line is drawn, deliberately.** What remains uncovered is the
+spawn itself: four `App::start_*` methods, `parse_off_thread`, and
+`batch`'s `update_lists`. Covering those means an injectable base URL and
+a local HTTP server, which tests `reqwest` rather than this project. The
+`--source` overrides are the better answer to the same question, and they
+ship as a feature rather than as scaffolding.

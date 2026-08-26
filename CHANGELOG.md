@@ -9,6 +9,12 @@ need.
 
 ### Added
 
+- `update-ip-ranges`, `update-country-ranges` and `update-reputation-source` take a
+  `--source <file>` override, parsing the same format the server would have sent —
+  matching what `update-bot-lists` already had. For a host with no outbound access, and
+  what makes the parse-and-store half of every download testable offline.
+
+
 - **`stop-bots batch` — one unattended pass, for a real crontab.** Refreshes every list,
   scans the logs, writes the NGINX blocking rules and the firewall script, and with
   `--apply` puts both into effect. Quiet when everything worked (so a healthy nightly run

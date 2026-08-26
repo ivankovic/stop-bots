@@ -293,10 +293,18 @@ pub fn is_local_or_private(ip: &std::net::IpAddr) -> bool {
 /// Fetches, parses and stores `country_code`'s current CIDR list. Returns
 /// the count now stored.
 pub async fn update_country(db: &Db, country_code: &str) -> Result<usize> {
+    let raw = fetch_country(&validate_country_code(country_code)?).await?;
+    store_country(db, country_code, &raw)
+}
+
+/// Parses an already-obtained zone file and stores it under `country_code`.
+///
+/// Split from [`update_country`] the same way [`store`] is split from
+/// [`update`]: it is the half that needs no network, which is what makes a
+/// `--source` override — and the tests that use one — possible.
+pub fn store_country(db: &Db, country_code: &str, raw: &str) -> Result<usize> {
     let cc = validate_country_code(country_code)?;
-    let raw = fetch_country(&cc).await?;
-    let cidrs = parse_zone_file(&raw);
-    db.replace_country_ranges(&cc, &cidrs)
+    db.replace_country_ranges(&cc, &parse_zone_file(raw))
 }
 
 #[cfg(test)]
