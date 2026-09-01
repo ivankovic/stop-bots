@@ -1,22 +1,19 @@
 # Stop Bots
 
-A TUI (and CLI) that helps you configure your server to stop bad bots and still allow good bots.
+A TUI (and CLI) that helps you configure your server to stop bad bots without hiding behind a CDN.
 
 It works alongside NGINX and your existing firewall (iptables or nftables), on two separate
 planes:
 
-- **NGINX config.** It classifies known bots by category (scanners, search engines, AI
-  crawlers) and blocks or allows them by injecting a rule into your site configs. The same
-  injected block can also rate-limit requests, serve a generated `robots.txt`, and exempt
-  paths you don't want any of it applied to.
-- **A firewall script.** It watches your SSH and NGINX access logs to flag IPs that are
-  scanning, probing for exposed secrets, forging a crawler's identity, or walking into a
-  honeypot — and turns those, plus geo-blocking, third-party blocklists and your own ad-hoc
-  rules, into an iptables or nftables script.
+- **NGINX config.** - It classifies known bots by category (scanners, search engines, AI
+  crawlers) and blocks or allows them by injecting a rule into your site configs. It scans the NGINX
+  log to detect bots dynamically and block them even if no ruleset tracks them yet.
+- **A firewall script.** - Block entire countries, datacenter IP ranges, known bot IP ranges or any
+  IP address that repeatedly tries to log into your server unsuccessfully.
 
-Nothing is enforced behind your back. Every blocking decision is stored in a database first;
-NGINX config is written only when you apply it, and the firewall script is *generated* for
-you to review and run yourself.
+The app tries its best to not lock you out of the server, but you use it on your own risk. And note
+that it is licensed under AGPL, so if you are using it commercially, make sure you obey the letter
+of the license.
 
 # Installation
 
@@ -32,8 +29,9 @@ Or build from a checkout:
 cargo install --path .
 ```
 
-A prebuilt `x86_64` Linux binary is attached to each
-[release](https://github.com/ivankovic/stop-bots/releases).
+A prebuilt `x86_64` Linux binary is available on GitHub [releases](https://github.com/ivankovic/stop-bots/releases).
+
+## Dependencies
 
 Requires Rust 1.88 or newer to build. Linux only in practice: it shells out to
 `systemctl`, `nginx -t` and `nft`/`iptables`, so while it compiles elsewhere it won't be
@@ -42,8 +40,8 @@ much use there.
 # Usage
 
 Run the binary with no arguments to launch the TUI, or see `stop-bots --help` for the full
-list of CLI subcommands (the TUI and CLI share the same SQLite database and drive the exact
-same underlying logic — everything you can do interactively you can also automate).
+list of CLI subcommands. The TUI and CLI can be used together. Configure everything in the TUI and
+then use the CLI in a crontab to keep the rules updated.
 
 You can exit the app, or back out of a popup/submenu, with 'q' or Escape.
 
@@ -60,10 +58,6 @@ Tab / Shift+Tab (or Left/Right, or their vim `h`/`l` aliases) cycle through the 
 On the two screens that have more than one list side by side — Site settings and Dynamic
 Protection — Tab switches between *those* instead, and you cycle screens with Left/Right or
 the direct jumps.
-
-The Dashboard assumes a terminal of at least 80x30, and shows the whole "Automatic
-blocking" list without scrolling from about 100 columns up (it deals its rows into as many
-columns as the width allows). Below 80x30 its panels start to truncate.
 
 The Dashboard owns everything that ends up in the **firewall script**; Site settings owns
 everything that ends up in **NGINX config**. That split decides where any given setting lives.
@@ -98,7 +92,7 @@ everything that ends up in **NGINX config**. That split decides where any given 
 
 ## What it actually protects against
 
-### In your NGINX config
+### Using the NGINX config
 
 - **Known bots**, by category (scanner / search engine / AI crawler), sourced from
   [ArcJet's Well-Known Bots](https://github.com/arcjet/well-known-bots),
@@ -300,9 +294,7 @@ full text of the License.
 
 ## Can't use AGPL software?
 
-Alternative licensing is available, for individually negotiated compensation.
-
-[Contact me](mailto:marko@ivankovic.me) for options.
+Alternative licensing is **NOT** available.
 
 # For Developers, human or otherwise
 
