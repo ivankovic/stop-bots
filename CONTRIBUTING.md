@@ -142,6 +142,11 @@ Read a whole screen's view in **one** `with_db` call. Each call is a
 them can show two halves of two different states. Anything slow that is not a
 database read — a bot-list download, say — happens *outside* the lock.
 
+**Anything an unauthenticated caller can reach has to be cheap, or throttled.**
+`/login` is the one such endpoint that does real work — an Argon2 verification —
+and `LoginThrottle` rejects before hashing rather than after. A new
+unauthenticated route that costs more than a map lookup needs the same treatment.
+
 **Every mutating form needs `layout::csrf_field`.** The server rejects a post
 without it either way; the helper is what makes the correct path the short one.
 Several screens have a test asserting that the number of POST forms on the page

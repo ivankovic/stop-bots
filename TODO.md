@@ -26,9 +26,6 @@ list — which meant the open items below were unfindable inside it.
   one, because both front-ends now read this from `crate::dynamic`.
 * **Recommend only the backend that is installed.** Nothing checks whether
   `nft` or `iptables` exists before offering both.
-* **The web UI has no rate limit on failed logins.** Argon2 makes a guess
-  expensive, which is most of the defence, but nothing sleeps or locks out after
-  a run of failures. Worth having before anyone runs it exposed for real.
 * **No CLI verb for the web UI's own settings.** `web:secure_cookie` and
   `web:trust_forwarded_for` have to be set by hand, unlike `web:bind` and
   `web:allowed_hosts`, which `stop-bots web --save` writes. A

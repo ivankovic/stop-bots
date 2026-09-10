@@ -1551,3 +1551,176 @@ async fn an_unauthenticated_request_under_a_prefix_is_sent_to_the_prefixed_login
         "redirecting to /login would send the browser outside the location block"
     );
 }
+
+// ---- login throttling ----
+
+/// A run of wrong passwords eventually gets a 429 rather than another
+/// Argon2 verification.
+///
+/// The production burst is 20, so this posts past it. That is the point:
+/// before this existed, anyone who could reach `/login` could make the
+/// server run unbounded Argon2 — ~50ms of CPU and 19MB each — as fast as
+/// they could post, against the very host this tool protects.
+#[tokio::test]
+async fn a_flood_of_login_attempts_is_refused_before_it_costs_a_hash() {
+    let (app, _password, _tmp, _db) = app_with_db();
+
+    let mut refused = None;
+    for attempt in 0..40 {
+        let response = app
+            .clone()
+            .oneshot(post("/login", "password=wrong"))
+            .await
+            .unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            refused = Some((attempt, response));
+            break;
+        }
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "attempt {attempt} should be a plain refusal until the limiter trips"
+        );
+    }
+
+    let (attempt, response) = refused.expect("the limiter must trip within 40 attempts");
+    assert!(
+        attempt >= 5,
+        "tripping after {attempt} attempts would punish an ordinary typo"
+    );
+    assert!(
+        response.headers().contains_key(header::RETRY_AFTER),
+        "a 429 without Retry-After tells the caller nothing about when to come back"
+    );
+
+    let retry: u64 = response.headers()[header::RETRY_AFTER]
+        .to_str()
+        .unwrap()
+        .parse()
+        .expect("Retry-After is a number of seconds");
+    assert!(retry >= 1, "Retry-After was {retry}");
+}
+
+/// The throttle must not stand between the operator and a console they
+/// have the password for.
+#[tokio::test]
+async fn a_correct_password_still_works_after_a_few_typos() {
+    let (app, password, _tmp, _db) = app_with_db();
+
+    for _ in 0..3 {
+        let response = app
+            .clone()
+            .oneshot(post("/login", "password=wrong"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let response = app
+        .oneshot(post("/login", &format!("password={password}")))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a handful of typos must not lock the operator out"
+    );
+}
+
+/// And a success clears the history, so the next typo starts from zero
+/// rather than from wherever the previous run left off.
+#[tokio::test]
+async fn logging_in_successfully_resets_the_throttle() {
+    let (app, password, _tmp, _db) = app_with_db();
+
+    for _ in 0..4 {
+        app.clone()
+            .oneshot(post("/login", "password=wrong"))
+            .await
+            .unwrap();
+    }
+    app.clone()
+        .oneshot(post("/login", &format!("password={password}")))
+        .await
+        .unwrap();
+
+    // Back to a plain 401 rather than a 429 carried over from before.
+    let response = app.oneshot(post("/login", "password=wrong")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The 429 page is still the login page, so the operator sees why and can
+/// try again from it.
+#[tokio::test]
+async fn a_throttled_login_still_renders_the_login_form() {
+    let (app, _password, _tmp, _db) = app_with_db();
+
+    let mut throttled = None;
+    for _ in 0..40 {
+        let response = app
+            .clone()
+            .oneshot(post("/login", "password=wrong"))
+            .await
+            .unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            throttled = Some(response);
+            break;
+        }
+    }
+
+    let html = body_string(throttled.expect("the limiter must trip")).await;
+    assert!(html.contains("Too many login attempts"), "was: {html}");
+    assert!(
+        html.contains(r#"name="password""#),
+        "the operator should be able to try again from this page"
+    );
+}
+
+/// The mitigation for the shared-bucket problem, and the reason
+/// `web:trust_forwarded_for` earns its keep beyond the anti-lockout guard.
+///
+/// Behind a proxy every request arrives from 127.0.0.1, so a flood shares
+/// the operator's bucket and delays their login too. Once the console is
+/// told it may believe the forwarded header, the attacker gets their own
+/// bucket and the operator is unaffected — which is what this asserts.
+#[tokio::test]
+async fn a_trusted_forwarded_address_keeps_one_clients_flood_off_another() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    Db::open(&db_path)
+        .unwrap()
+        .set_bool_setting(stop_bots::web::TRUST_FORWARDED_KEY, true)
+        .unwrap();
+
+    let attempt = |app: Router, forwarded: &'static str, body: String| async move {
+        let mut request = post("/login", &body);
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", forwarded.parse().unwrap());
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:5000".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+        app.oneshot(request).await.unwrap().status()
+    };
+
+    // An attacker, from one address, until it is refused.
+    let mut throttled = false;
+    for i in 0..20 {
+        let status = attempt(app.clone(), "203.0.113.9", format!("password=wrong{i}")).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            throttled = true;
+            break;
+        }
+    }
+    assert!(
+        throttled,
+        "the attacker's address should have been throttled"
+    );
+
+    // The operator, from another, with the right password.
+    let status = attempt(app, "198.51.100.4", format!("password={password}")).await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "one address's flood must not stand between the operator and their own console"
+    );
+}

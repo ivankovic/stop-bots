@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 use crate::db::Db;
-use crate::web::auth::Sessions;
+use crate::web::auth::{LoginThrottle, Sessions};
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -44,6 +44,9 @@ pub struct AppState {
     pub ssh_log: Option<PathBuf>,
     /// Live sessions.
     pub sessions: Arc<Sessions>,
+    /// Failed-login throttling. Shared across requests, so it has to
+    /// outlive any one of them.
+    pub login_throttle: Arc<LoginThrottle>,
     /// The path prefix this console is served under. Read once at
     /// startup: it is part of how the server is deployed, not something a
     /// request can change.
@@ -83,6 +86,7 @@ impl AppState {
             nginx_root,
             ssh_log,
             sessions: Arc::new(Sessions::default()),
+            login_throttle: Arc::new(LoginThrottle::default()),
             base,
             apply_for_real,
         }

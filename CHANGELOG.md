@@ -32,6 +32,11 @@ need.
   server matches the full path and generates links that include it. A subdomain needs
   none of this and is the simpler deployment.
 
+  Login attempts are throttled — before the password is hashed, not after. The point is
+  not that a generated 144-bit password is guessable; it is that verifying one runs
+  Argon2id (~50ms of CPU, 19MB), and an unauthenticated caller could otherwise drive that
+  as fast as they could post.
+
   Behind TLS, set `web:secure_cookie` — without it a browser will also send the
   session to an `http://` URL for the same host. It is off by default because the
   default deployment is plain HTTP on loopback, where a `Secure` cookie is never

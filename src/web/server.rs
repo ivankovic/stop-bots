@@ -327,7 +327,34 @@ async fn login_form(State(state): State<AppState>) -> Markup {
     layout::login_page(&state.base, None)
 }
 
-async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+async fn login_submit(
+    State(state): State<AppState>,
+    Extension(client): Extension<ClientAddr>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    // Before the hash, not after. Verifying a password is ~50ms of CPU
+    // and 19MB of Argon2 working memory; letting an unauthenticated
+    // caller drive that as fast as they can post is a denial of service
+    // against the host this tool exists to protect. A refusal here costs
+    // a map lookup.
+    //
+    // Keyed by client address where there is one. Behind a proxy without
+    // `web:trust_forwarded_for` there is not, and everyone shares the
+    // "unknown" bucket — which is exactly why the global token bucket
+    // inside the throttle exists as well.
+    let key = client.0.clone().unwrap_or_else(|| "unknown".to_string());
+    if let Err(throttled) = state.login_throttle.check(&key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(
+                header::RETRY_AFTER,
+                throttled.retry_after.as_secs().max(1).to_string(),
+            )],
+            Html(layout::login_page(&state.base, Some(throttled.message)).into_string()),
+        )
+            .into_response();
+    }
+
     let password = form.password;
     let verified = state
         .with_db(move |db| auth::verify_password(db, &password))
@@ -349,14 +376,17 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
         },
         // One message for a wrong password and for no password having been
         // set: neither is worth confirming to whoever is guessing.
-        Ok(false) => (
-            StatusCode::UNAUTHORIZED,
-            Html(
-                layout::login_page(&state.base, Some("That password was not accepted."))
-                    .into_string(),
-            ),
-        )
-            .into_response(),
+        Ok(false) => {
+            state.login_throttle.record_failure(&key);
+            (
+                StatusCode::UNAUTHORIZED,
+                Html(
+                    layout::login_page(&state.base, Some("That password was not accepted."))
+                        .into_string(),
+                ),
+            )
+                .into_response()
+        }
         Err(err) => internal_error(&err.to_string()),
     }
 }

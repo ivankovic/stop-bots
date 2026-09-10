@@ -164,6 +164,260 @@ impl Sessions {
     }
 }
 
+/// How long a client is made to wait, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Throttled {
+    pub retry_after: Duration,
+    /// What to tell the operator. Deliberately the same wording whether
+    /// the global cap or this client's own backoff is what refused: which
+    /// one it was tells a guesser how close they are to the limit.
+    pub message: &'static str,
+}
+
+/// Tunables, so tests can exercise the backoff without sleeping for real
+/// seconds. Production uses [`ThrottleConfig::default`].
+#[derive(Debug, Clone)]
+pub struct ThrottleConfig {
+    /// Failures allowed before any delay is imposed. A fat-fingered
+    /// paste should not cost the operator a wait.
+    pub free_attempts: u32,
+    /// The delay after the first attempt past `free_attempts`; it doubles
+    /// with each further failure.
+    pub base_delay: Duration,
+    /// Ceiling on that doubling. Without one, an attacker could push the
+    /// legitimate operator's next attempt hours out.
+    pub max_delay: Duration,
+    /// Verifications the server will do in a burst.
+    pub burst: f64,
+    /// Sustained verifications per second once the burst is spent.
+    pub refill_per_second: f64,
+    /// A client with no failures for this long is forgotten.
+    pub client_ttl: Duration,
+    /// Cap on tracked clients, so cycling source addresses cannot grow
+    /// this map without bound.
+    pub max_clients: usize,
+}
+
+impl Default for ThrottleConfig {
+    fn default() -> Self {
+        Self {
+            // Generous, because the cost of being wrong here lands on the
+            // operator and the benefit is small: the password is always
+            // generated and 144 bits wide, so nothing in this range makes
+            // guessing more or less hopeless than it already is.
+            free_attempts: 10,
+            base_delay: Duration::from_secs(1),
+            // Thirty seconds, not minutes. The ceiling exists for the
+            // operator's sake, not the attacker's — see the note on
+            // `LoginThrottle` about sharing a bucket behind a proxy.
+            max_delay: Duration::from_secs(30),
+            // ~2 verifications a second sustained is ~10% of one core
+            // spent on Argon2, which is the number that actually matters:
+            // it is the cap on what an unauthenticated caller can make
+            // this host do.
+            burst: 20.0,
+            refill_per_second: 2.0,
+            client_ttl: Duration::from_secs(60 * 60),
+            max_clients: 1024,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Failures {
+    consecutive: u32,
+    next_allowed: Instant,
+    last_seen: Instant,
+}
+
+/// Throttling for the login endpoint.
+///
+/// **What this is actually defending.** The password is always generated
+/// — `--set-password` offers no way to choose a weak one — so 144 bits of
+/// entropy makes online guessing hopeless on its own. The exposure worth
+/// closing is different: verifying a password runs Argon2id at OWASP
+/// defaults, ~50ms of CPU and 19MB of memory, and until now anyone who
+/// could reach `/login` could make the server do that as fast as they
+/// could post. That is an amplification DoS against the host this tool is
+/// supposed to be protecting.
+///
+/// So the order matters: **a refusal here happens before any hashing**,
+/// and costs a map lookup.
+///
+/// Two limits, because they answer different attacks:
+///
+/// - **A global token bucket** caps the CPU an unauthenticated caller can
+///   provoke. It is global on purpose — a per-client limit is bypassed by
+///   rotating source addresses, and this server frequently cannot tell
+///   clients apart anyway (behind a proxy every request arrives from
+///   127.0.0.1 unless `X-Forwarded-For` is trusted).
+/// - **Per-client exponential backoff** punishes a persistent guesser
+///   that *can* be identified, and is what produces the "too many
+///   attempts" the operator sees.
+///
+/// **The honest cost, and what to do about it.** Any limiter on an
+/// unauthenticated endpoint lets a flood deny the legitimate user; that is
+/// inherent, not a flaw in this one. Where clients cannot be told apart
+/// they share a bucket, so a sustained attack delays the operator's own
+/// login by up to `max_delay` too.
+///
+/// Three things bound that. The ceiling is thirty seconds rather than
+/// hours. The TUI and the CLI on the host are untouched by any of this,
+/// so the operator is never actually shut out of their own server. And —
+/// the one worth acting on — **behind a proxy, `web:trust_forwarded_for`
+/// is what lets this tell clients apart at all**: without it every request
+/// arrives from 127.0.0.1 and the attacker shares the operator's bucket;
+/// with it the attacker gets their own and the operator is unaffected.
+pub struct LoginThrottle {
+    config: ThrottleConfig,
+    state: Mutex<ThrottleState>,
+}
+
+#[derive(Debug)]
+struct ThrottleState {
+    clients: HashMap<String, Failures>,
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl Default for LoginThrottle {
+    fn default() -> Self {
+        Self::new(ThrottleConfig::default())
+    }
+}
+
+impl LoginThrottle {
+    pub fn new(config: ThrottleConfig) -> Self {
+        Self {
+            state: Mutex::new(ThrottleState {
+                clients: HashMap::new(),
+                tokens: config.burst,
+                last_refill: Instant::now(),
+            }),
+            config,
+        }
+    }
+
+    /// Whether to attempt a verification for `key` at all.
+    ///
+    /// `Ok(())` consumes a token — an accepted attempt costs one whether
+    /// or not the password turns out to be right, because the cost being
+    /// rationed is the hash, not the failure.
+    pub fn check(&self, key: &str) -> Result<(), Throttled> {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .expect("the throttle map is never held across a panic");
+
+        let elapsed = now.saturating_duration_since(state.last_refill);
+        state.tokens = (state.tokens + elapsed.as_secs_f64() * self.config.refill_per_second)
+            .min(self.config.burst);
+        state.last_refill = now;
+
+        state
+            .clients
+            .retain(|_, f| now.saturating_duration_since(f.last_seen) < self.config.client_ttl);
+
+        if let Some(failures) = state.clients.get(key) {
+            if failures.next_allowed > now {
+                return Err(Throttled {
+                    retry_after: failures.next_allowed.saturating_duration_since(now),
+                    message: TOO_MANY,
+                });
+            }
+        }
+
+        if state.tokens < 1.0 {
+            // How long until one token is back.
+            let deficit = 1.0 - state.tokens;
+            return Err(Throttled {
+                retry_after: Duration::from_secs_f64(
+                    (deficit / self.config.refill_per_second).max(0.001),
+                ),
+                message: TOO_MANY,
+            });
+        }
+
+        state.tokens -= 1.0;
+        Ok(())
+    }
+
+    /// Records that `key` got the password wrong, and pushes its next
+    /// permitted attempt out.
+    pub fn record_failure(&self, key: &str) {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .expect("the throttle map is never held across a panic");
+
+        // Evict the least recently seen rather than let an address-cycling
+        // attacker grow this map without bound. Cheap because the cap is
+        // small and this only runs when it is reached.
+        if state.clients.len() >= self.config.max_clients && !state.clients.contains_key(key) {
+            if let Some(oldest) = state
+                .clients
+                .iter()
+                .min_by_key(|(_, f)| f.last_seen)
+                .map(|(k, _)| k.clone())
+            {
+                state.clients.remove(&oldest);
+            }
+        }
+
+        let free = self.config.free_attempts;
+        let base = self.config.base_delay;
+        let max = self.config.max_delay;
+        let entry = state.clients.entry(key.to_string()).or_insert(Failures {
+            consecutive: 0,
+            next_allowed: now,
+            last_seen: now,
+        });
+        entry.consecutive = entry.consecutive.saturating_add(1);
+        entry.last_seen = now;
+        entry.next_allowed = now + backoff(entry.consecutive, free, base, max);
+    }
+
+    /// Clears `key`'s history. The right password ends the punishment.
+    pub fn record_success(&self, key: &str) {
+        self.state
+            .lock()
+            .expect("the throttle map is never held across a panic")
+            .clients
+            .remove(key);
+    }
+
+    /// How many clients are being tracked. For tests.
+    pub fn tracked(&self) -> usize {
+        self.state
+            .lock()
+            .expect("the throttle map is never held across a panic")
+            .clients
+            .len()
+    }
+}
+
+/// One message for every refusal: which limit tripped would tell a guesser
+/// how close they are to it.
+const TOO_MANY: &str = "Too many login attempts. Wait a moment and try again.";
+
+/// The delay after `consecutive` failures.
+///
+/// Doubling from `base` once the free attempts are spent, capped at `max`.
+/// Saturating rather than shifting: at 40 consecutive failures a naive
+/// `1 << n` overflows, and the answer there is "the cap", not a panic.
+fn backoff(consecutive: u32, free: u32, base: Duration, max: Duration) -> Duration {
+    if consecutive <= free {
+        return Duration::ZERO;
+    }
+    let steps = consecutive - free - 1;
+    let multiplier = 1u64.checked_shl(steps.min(32)).unwrap_or(u64::MAX);
+    base.checked_mul(multiplier.min(u32::MAX as u64) as u32)
+        .unwrap_or(max)
+        .min(max)
+}
+
 /// Compares a submitted CSRF token against the session's, in constant
 /// time.
 ///
@@ -262,6 +516,212 @@ fn base64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Short delays so the backoff can be exercised for real rather than
+    /// simulated. These are the production semantics on a compressed
+    /// clock — the same trick the project uses elsewhere (an in-memory
+    /// SQLite is still SQLite).
+    fn fast_throttle() -> LoginThrottle {
+        LoginThrottle::new(ThrottleConfig {
+            free_attempts: 2,
+            base_delay: Duration::from_millis(20),
+            max_delay: Duration::from_millis(80),
+            burst: 4.0,
+            refill_per_second: 1000.0,
+            client_ttl: Duration::from_millis(50),
+            max_clients: 4,
+        })
+    }
+
+    #[test]
+    fn the_first_few_attempts_are_not_delayed() {
+        let throttle = fast_throttle();
+        for attempt in 0..2 {
+            assert!(
+                throttle.check("a").is_ok(),
+                "attempt {attempt} should not be throttled: a typo must not cost a wait"
+            );
+            throttle.record_failure("a");
+        }
+    }
+
+    #[test]
+    fn failures_past_the_free_ones_impose_a_growing_delay() {
+        let throttle = fast_throttle();
+        for _ in 0..3 {
+            let _ = throttle.check("a");
+            throttle.record_failure("a");
+        }
+
+        let first = throttle.check("a").unwrap_err();
+        std::thread::sleep(first.retry_after + Duration::from_millis(5));
+
+        assert!(throttle.check("a").is_ok(), "the wait should have expired");
+        throttle.record_failure("a");
+        let second = throttle.check("a").unwrap_err();
+
+        assert!(
+            second.retry_after > first.retry_after,
+            "the delay should grow: {:?} then {:?}",
+            first.retry_after,
+            second.retry_after
+        );
+    }
+
+    #[test]
+    fn the_delay_is_capped() {
+        let config = ThrottleConfig {
+            free_attempts: 1,
+            base_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(60),
+            ..ThrottleConfig::default()
+        };
+        // Far past the point where a naive `1 << n` would overflow.
+        for consecutive in [10, 40, 1_000, u32::MAX] {
+            let delay = backoff(
+                consecutive,
+                config.free_attempts,
+                config.base_delay,
+                config.max_delay,
+            );
+            assert_eq!(
+                delay, config.max_delay,
+                "{consecutive} failures must give the ceiling, not an overflow"
+            );
+        }
+    }
+
+    #[test]
+    fn the_right_password_clears_the_backoff() {
+        let throttle = fast_throttle();
+        for _ in 0..4 {
+            let _ = throttle.check("a");
+            throttle.record_failure("a");
+        }
+        assert!(throttle.check("a").is_err());
+
+        throttle.record_success("a");
+        assert!(
+            throttle.check("a").is_ok(),
+            "a burst of typos must not keep costing the operator once they get it right"
+        );
+    }
+
+    #[test]
+    fn one_clients_failures_do_not_delay_another() {
+        let throttle = fast_throttle();
+        for _ in 0..4 {
+            let _ = throttle.check("noisy");
+            throttle.record_failure("noisy");
+        }
+        assert!(throttle.check("noisy").is_err());
+        assert!(
+            throttle.check("quiet").is_ok(),
+            "an identifiable attacker must not lock out everyone else"
+        );
+    }
+
+    #[test]
+    fn the_global_bucket_caps_work_no_client_key_can_dodge() {
+        // The property a per-client limit cannot give: rotating the source
+        // address does not buy more hashing.
+        let throttle = LoginThrottle::new(ThrottleConfig {
+            burst: 3.0,
+            refill_per_second: 0.0001,
+            ..fast_config()
+        });
+
+        for i in 0..3 {
+            assert!(throttle.check(&format!("client-{i}")).is_ok(), "burst {i}");
+        }
+        assert!(
+            throttle.check("client-99").is_err(),
+            "a fresh address must not refill the global bucket"
+        );
+    }
+
+    #[test]
+    fn a_throttled_caller_is_told_how_long_to_wait() {
+        let throttle = LoginThrottle::new(ThrottleConfig {
+            burst: 1.0,
+            refill_per_second: 1.0,
+            ..fast_config()
+        });
+        assert!(throttle.check("a").is_ok());
+
+        let throttled = throttle.check("a").unwrap_err();
+        assert!(
+            throttled.retry_after > Duration::ZERO,
+            "a Retry-After of zero tells the caller nothing"
+        );
+    }
+
+    #[test]
+    fn every_refusal_reads_the_same() {
+        // Which limit tripped would tell a guesser how close they are to
+        // it, so both say the same thing.
+        let throttle = LoginThrottle::new(ThrottleConfig {
+            burst: 1.0,
+            refill_per_second: 0.0001,
+            ..fast_config()
+        });
+        let _ = throttle.check("a");
+        let global = throttle.check("b").unwrap_err();
+
+        let backoff_throttle = fast_throttle();
+        for _ in 0..4 {
+            let _ = backoff_throttle.check("a");
+            backoff_throttle.record_failure("a");
+        }
+        let per_client = backoff_throttle.check("a").unwrap_err();
+
+        assert_eq!(global.message, per_client.message);
+    }
+
+    #[test]
+    fn stale_clients_are_forgotten() {
+        let throttle = fast_throttle();
+        throttle.record_failure("a");
+        assert_eq!(throttle.tracked(), 1);
+
+        std::thread::sleep(Duration::from_millis(60));
+        // `check` is what sweeps; it does not itself record anything, so
+        // afterwards the map should hold nothing at all.
+        let _ = throttle.check("b");
+
+        assert_eq!(
+            throttle.tracked(),
+            0,
+            "an entry idle past the TTL should have been swept"
+        );
+    }
+
+    #[test]
+    fn the_client_map_cannot_be_grown_without_bound() {
+        // An attacker cycling source addresses would otherwise turn this
+        // into a memory leak with a network interface in front of it.
+        let throttle = fast_throttle();
+        for i in 0..50 {
+            throttle.record_failure(&format!("client-{i}"));
+        }
+        assert!(
+            throttle.tracked() <= 4,
+            "tracked {} clients, cap is 4",
+            throttle.tracked()
+        );
+    }
+
+    fn fast_config() -> ThrottleConfig {
+        ThrottleConfig {
+            free_attempts: 2,
+            base_delay: Duration::from_millis(20),
+            max_delay: Duration::from_millis(80),
+            burst: 4.0,
+            refill_per_second: 1000.0,
+            client_ttl: Duration::from_millis(50),
+            max_clients: 4,
+        }
+    }
 
     #[test]
     fn a_password_verifies_against_its_own_hash() {

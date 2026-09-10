@@ -340,6 +340,12 @@ stop-bots web --bind 127.0.0.1:8787   # and set web:trust_forwarded_for
 Behind TLS, also set `web:secure_cookie`. Without it a browser will send the session
 cookie to an `http://` URL for the same host as well.
 
+`web:trust_forwarded_for` matters more than it looks. Without it every request behind a
+proxy arrives from `127.0.0.1`, so the console cannot tell one client from another — which
+means a flood of login attempts shares the same throttle bucket as you, and the guard that
+stops you blocking your own address has nothing to compare against. With it, both work
+per-client.
+
 ## Behind NGINX: a subdomain, or a path prefix
 
 **A subdomain is the simpler deployment**, and the one to take if you can:
@@ -398,6 +404,13 @@ Three things are missing on purpose, and the Help screen says so with the reason
 
 It also refuses to block the address you are connected from, which would take away the
 console you'd use to undo it.
+
+Login attempts are throttled. Not because the password is guessable — it is generated,
+144 bits — but because verifying one runs Argon2id, and letting an unauthenticated caller
+drive that as fast as they can post is a denial of service against the host this tool is
+supposed to be protecting. Ten wrong attempts are free; past that a client backs off
+exponentially, and a global cap bounds the CPU regardless of how many addresses the
+attempts come from.
 
 ## Running NGINX in a container
 

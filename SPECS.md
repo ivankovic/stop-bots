@@ -3735,3 +3735,51 @@ strip it" a loud failure rather than a page that half-works.
 A subdomain needs none of this and stays the recommended deployment. The prefix
 support exists because an NGINX `location` block is what many people already
 have.
+
+### Login throttling (`web::auth::LoginThrottle`)
+
+**What this defends is not what it looks like.** `--set-password` only ever
+generates, and a generated password is 24 base64url characters — 144 bits.
+Online guessing was never a threat. The exposure was that verifying a password
+runs Argon2id at OWASP defaults, ~50ms of CPU and 19MB of working memory, and
+anyone who could reach `/login` could make the server do that as fast as they
+could post. That is an amplification denial of service against the host this
+tool exists to protect.
+
+So the ordering is the whole design: **a refusal happens before any hashing**,
+and costs a map lookup.
+
+Two limits, answering different attacks:
+
+- **A global token bucket** (burst 20, refill 2/s) caps the CPU an
+  unauthenticated caller can provoke — about 10% of one core spent on Argon2,
+  whatever they do. Global on purpose: a per-client limit is bypassed by
+  rotating source addresses, and behind a proxy this server frequently cannot
+  tell clients apart at all.
+- **Per-client exponential backoff** (10 free attempts, then 1s doubling to a
+  30s ceiling) slows a guesser that *can* be identified, and produces the
+  message the operator sees.
+
+The client map is bounded and swept: an attacker cycling source addresses would
+otherwise turn it into a memory leak with a network interface in front of it.
+Both refusals carry the same wording, because which limit tripped would tell a
+guesser how close they are to it.
+
+**The shared-bucket problem, found by testing against a real server rather than
+only in the suite.** The unit tests all passed while the live behaviour was
+worse than intended: after a flood, the *correct* password also got a 429.
+Behind NGINX every request's peer is `127.0.0.1`, so the attacker and the
+operator share one bucket.
+
+Some of that is inherent — any limiter on an unauthenticated endpoint lets a
+flood deny the legitimate user — and three things bound it. The ceiling is
+thirty seconds rather than hours. The free allowance is ten, so ordinary use
+never meets it. The TUI and the CLI on the host are untouched, so the operator
+is never actually shut out of their own server.
+
+The part that is *not* inherent is the one worth acting on:
+`web:trust_forwarded_for` is what lets the console tell clients apart behind a
+proxy. Verified end to end — with it on, an attacker at one address is
+throttled while the operator at another logs in normally, and there is a test
+asserting exactly that. It already mattered for the anti-lockout guard; this
+gives it a second reason to be set, and the README now says so.
