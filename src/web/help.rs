@@ -25,10 +25,9 @@
 
 use axum::extract::{Query, State};
 use axum::response::Response;
-use axum::Router;
 use maud::{html, Markup};
 
-use crate::web::layout::{self, PillKind, Tab};
+use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{internal_error, render, Auth, FlashQuery};
 use crate::web::state::AppState;
 
@@ -75,7 +74,8 @@ pub async fn page(
         Err(err) => return internal_error(&err.to_string()),
     };
 
-    render(Tab::Help, &auth.csrf, flash.into_flash(), body(&view))
+    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    render(Tab::Help, &ctx, flash.into_flash(), body(&view))
 }
 
 fn body(view: &View) -> Markup {
@@ -267,10 +267,6 @@ fn row(title: &str, detail: Markup) -> Markup {
             td { (detail) }
         }
     }
-}
-
-pub fn actions() -> Router<AppState> {
-    Router::new()
 }
 
 #[cfg(test)]

@@ -44,6 +44,10 @@ pub struct AppState {
     pub ssh_log: Option<PathBuf>,
     /// Live sessions.
     pub sessions: Arc<Sessions>,
+    /// The path prefix this console is served under. Read once at
+    /// startup: it is part of how the server is deployed, not something a
+    /// request can change.
+    pub base: crate::web::BasePath,
     /// Whether writes may actually touch the system, or only the database.
     /// Mirrors the TUI's `--no-reload`, and the integration tests run with
     /// it off so that a test never reloads the developer's NGINX.
@@ -57,11 +61,29 @@ impl AppState {
         ssh_log: Option<PathBuf>,
         apply_for_real: bool,
     ) -> Self {
+        Self::with_base(
+            db,
+            nginx_root,
+            ssh_log,
+            apply_for_real,
+            crate::web::BasePath::default(),
+        )
+    }
+
+    /// The same, served under a path prefix.
+    pub fn with_base(
+        db: Db,
+        nginx_root: PathBuf,
+        ssh_log: Option<PathBuf>,
+        apply_for_real: bool,
+        base: crate::web::BasePath,
+    ) -> Self {
         Self {
             db: Arc::new(Mutex::new(db)),
             nginx_root,
             ssh_log,
             sessions: Arc::new(Sessions::default()),
+            base,
             apply_for_real,
         }
     }

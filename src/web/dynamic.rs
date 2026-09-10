@@ -30,7 +30,7 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::dynamic::{Filter, Live, RowStatus, SshRow, UaRow};
-use crate::web::layout::{self, PillKind, Tab};
+use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, ClientAddr, FlashQuery};
 use crate::web::state::AppState;
 
@@ -90,16 +90,16 @@ pub async fn page(
         Err(err) => return internal_error(&err.to_string()),
     };
 
-    let csrf = auth.csrf.clone();
+    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
     render(
         Tab::Dynamic,
-        &csrf,
+        &ctx,
         params.flash.into_flash(),
-        body(&live, filter, &csrf),
+        body(&live, filter, &ctx),
     )
 }
 
-fn body(live: &Live, filter: Filter, csrf: &str) -> Markup {
+fn body(live: &Live, filter: Filter, ctx: &Ctx) -> Markup {
     let ssh: Vec<&SshRow> = live
         .ssh
         .iter()
@@ -112,7 +112,7 @@ fn body(live: &Live, filter: Filter, csrf: &str) -> Markup {
         .collect();
 
     html! {
-        (filter_bar(filter))
+        (filter_bar(filter, ctx))
 
         (layout::panel(
             "Failed SSH logins",
@@ -138,7 +138,7 @@ fn body(live: &Live, filter: Filter, csrf: &str) -> Markup {
                                     td .num { (row.count) }
                                     td { (status_pill(row.status)) }
                                     td .mono { (row.address) }
-                                    td .right { (address_action(row, csrf)) }
+                                    td .right { (address_action(row, ctx)) }
                                 }
                             }
                         }
@@ -171,7 +171,7 @@ fn body(live: &Live, filter: Filter, csrf: &str) -> Markup {
                                     td .num { (row.count) }
                                     td { (status_pill(row.status)) }
                                     td .wrap .mono { (row.user_agent) }
-                                    td .right { (ua_action(row, csrf)) }
+                                    td .right { (ua_action(row, ctx)) }
                                 }
                             }
                         }
@@ -182,7 +182,7 @@ fn body(live: &Live, filter: Filter, csrf: &str) -> Markup {
     }
 }
 
-fn filter_bar(current: Filter) -> Markup {
+fn filter_bar(current: Filter, ctx: &Ctx) -> Markup {
     html! {
         .row style="margin-bottom:16px" {
             span .hint { "Show:" }
@@ -192,10 +192,10 @@ fn filter_bar(current: Filter) -> Markup {
                 (Filter::BlockedOnly, "Blocked"),
             ] {
                 @if filter == current {
-                    a .button href={ "/dynamic?filter=" (filter_name(filter)) }
+                    a .button href=(ctx.url(&format!("/dynamic?filter={}", filter_name(filter))))
                         style="border-color:var(--accent);color:var(--accent);font-weight:600" { (label) }
                 } @else {
-                    a .button href={ "/dynamic?filter=" (filter_name(filter)) } { (label) }
+                    a .button href=(ctx.url(&format!("/dynamic?filter={}", filter_name(filter)))) { (label) }
                 }
             }
         }
@@ -219,19 +219,19 @@ fn status_pill(status: RowStatus) -> Markup {
 /// A `BLOCKLIST` row gets none: the block came from a downloaded list, and
 /// offering an "unblock" that the next list refresh silently undoes would
 /// be a lie about what the button does.
-fn address_action(row: &SshRow, csrf: &str) -> Markup {
+fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
     match row.status {
         RowStatus::Blocklist => html! { span .hint { "from a blocklist" } },
         RowStatus::Blocked { .. } => html! {
-            form .inline method="post" action="/dynamic/unblock-address" {
-                (layout::csrf_field(csrf))
+            form .inline method="post" action=(ctx.url("/dynamic/unblock-address")) {
+                (layout::csrf_field(ctx))
                 input type="hidden" name="address" value=(row.address);
                 button type="submit" { "Unblock" }
             }
         },
         RowStatus::Pending => html! {
-            form .inline method="post" action="/dynamic/block-address" {
-                (layout::csrf_field(csrf))
+            form .inline method="post" action=(ctx.url("/dynamic/block-address")) {
+                (layout::csrf_field(ctx))
                 input type="hidden" name="address" value=(row.address);
                 button .danger type="submit" { "Block" }
             }
@@ -239,19 +239,19 @@ fn address_action(row: &SshRow, csrf: &str) -> Markup {
     }
 }
 
-fn ua_action(row: &UaRow, csrf: &str) -> Markup {
+fn ua_action(row: &UaRow, ctx: &Ctx) -> Markup {
     match row.status {
         RowStatus::Blocklist => html! { span .hint { "from a bot list" } },
         RowStatus::Blocked { .. } => html! {
-            form .inline method="post" action="/dynamic/unblock-ua" {
-                (layout::csrf_field(csrf))
+            form .inline method="post" action=(ctx.url("/dynamic/unblock-ua")) {
+                (layout::csrf_field(ctx))
                 input type="hidden" name="user_agent" value=(row.user_agent);
                 button type="submit" { "Unblock" }
             }
         },
         RowStatus::Pending => html! {
-            form .inline method="post" action="/dynamic/block-ua" {
-                (layout::csrf_field(csrf))
+            form .inline method="post" action=(ctx.url("/dynamic/block-ua")) {
+                (layout::csrf_field(ctx))
                 input type="hidden" name="user_agent" value=(row.user_agent);
                 button .danger type="submit" { "Block" }
             }
@@ -261,12 +261,12 @@ fn ua_action(row: &UaRow, csrf: &str) -> Markup {
 
 // ---- actions ----
 
-pub fn actions() -> Router<AppState> {
+pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
     Router::new()
-        .route("/dynamic/block-address", post(block_address))
-        .route("/dynamic/unblock-address", post(unblock_address))
-        .route("/dynamic/block-ua", post(block_ua))
-        .route("/dynamic/unblock-ua", post(unblock_ua))
+        .route(&base.url("/dynamic/block-address"), post(block_address))
+        .route(&base.url("/dynamic/unblock-address"), post(unblock_address))
+        .route(&base.url("/dynamic/block-ua"), post(block_ua))
+        .route(&base.url("/dynamic/unblock-ua"), post(unblock_ua))
 }
 
 #[derive(Deserialize)]
@@ -295,7 +295,7 @@ async fn block_address(
     let address = form.address;
 
     if let Some(reason) = would_lock_out(&client, &address) {
-        return back_with("/dynamic", &reason, false);
+        return back_with(&state.base, "/dynamic", &reason, false);
     }
 
     let stored = address.clone();
@@ -303,8 +303,14 @@ async fn block_address(
         .with_db(move |db| db.block_address_permanently(&stored))
         .await
     {
-        Ok(()) => back_with("/dynamic", &format!("Blocked {address}."), true),
+        Ok(()) => back_with(
+            &state.base,
+            "/dynamic",
+            &format!("Blocked {address}."),
+            true,
+        ),
         Err(err) => back_with(
+            &state.base,
             "/dynamic",
             &format!("Could not block {address}: {err}"),
             false,
@@ -342,8 +348,14 @@ async fn unblock_address(
     let address = form.address;
     let stored = address.clone();
     match state.with_db(move |db| db.unblock_address(&stored)).await {
-        Ok(()) => back_with("/dynamic", &format!("Unblocked {address}."), true),
+        Ok(()) => back_with(
+            &state.base,
+            "/dynamic",
+            &format!("Unblocked {address}."),
+            true,
+        ),
         Err(err) => back_with(
+            &state.base,
             "/dynamic",
             &format!("Could not unblock {address}: {err}"),
             false,
@@ -359,8 +371,9 @@ async fn block_ua(
     let ua = form.user_agent;
     let stored = ua.clone();
     match state.with_db(move |db| db.block_user_agent(&stored)).await {
-        Ok(()) => back_with("/dynamic", "Blocked that user agent.", true),
+        Ok(()) => back_with(&state.base, "/dynamic", "Blocked that user agent.", true),
         Err(err) => back_with(
+            &state.base,
             "/dynamic",
             &format!("Could not block that user agent: {err}"),
             false,
@@ -379,8 +392,9 @@ async fn unblock_ua(
         .with_db(move |db| db.unblock_user_agent(&stored))
         .await
     {
-        Ok(()) => back_with("/dynamic", "Unblocked that user agent.", true),
+        Ok(()) => back_with(&state.base, "/dynamic", "Unblocked that user agent.", true),
         Err(err) => back_with(
+            &state.base,
             "/dynamic",
             &format!("Could not unblock that user agent: {err}"),
             false,
@@ -419,7 +433,7 @@ mod tests {
             count: 3,
             status: RowStatus::Blocklist,
         };
-        let rendered = address_action(&row, "token").into_string();
+        let rendered = address_action(&row, &Ctx::for_tests()).into_string();
 
         assert!(
             !rendered.contains("<form"),
@@ -440,10 +454,10 @@ mod tests {
             ..pending.clone()
         };
 
-        assert!(address_action(&pending, "t")
+        assert!(address_action(&pending, &Ctx::for_tests())
             .into_string()
             .contains("/dynamic/block-address"));
-        assert!(address_action(&blocked, "t")
+        assert!(address_action(&blocked, &Ctx::for_tests())
             .into_string()
             .contains("/dynamic/unblock-address"));
     }
@@ -462,8 +476,8 @@ mod tests {
         };
 
         for rendered in [
-            address_action(&row, "the-token").into_string(),
-            ua_action(&ua, "the-token").into_string(),
+            address_action(&row, &Ctx::new("the-token", Default::default())).into_string(),
+            ua_action(&ua, &Ctx::new("the-token", Default::default())).into_string(),
         ] {
             assert!(
                 rendered.contains(r#"name="csrf" value="the-token""#),
@@ -481,7 +495,7 @@ mod tests {
             count: 1,
             status: RowStatus::Pending,
         };
-        let rendered = ua_action(&ua, "t").into_string();
+        let rendered = ua_action(&ua, &Ctx::for_tests()).into_string();
 
         assert!(
             !rendered.contains("onfocus=\"alert(1)"),

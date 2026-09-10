@@ -3674,3 +3674,64 @@ opt-level = 3` (and blake2), not by weakening the parameters — the cost
 parameters are what the tests should be exercising, and a test that hashes with
 settings the product never uses is a test of nothing. 4.8s to 1.1s, and no
 nextest overrides needed.
+
+### Serving under a path prefix (`web::BasePath`, `--base-path`)
+
+The first version generated root-absolute URLs everywhere — about seventy of
+them across `href`, `src`, `action`, every `Location` header and the session
+cookie's `Path`. That works for a subdomain and cannot work for
+`https://example.com/stop-bots/`, in either proxy configuration:
+
+- `proxy_pass http://127.0.0.1:8787;` (prefix preserved) — every request 404s,
+  because the router had no `/stop-bots/*` routes.
+- `proxy_pass http://127.0.0.1:8787/;` (prefix stripped) — the first request
+  works and nothing after it does. The page comes back referring to
+  `/assets/style.css`, `/bots`, `/category`; the browser resolves those against
+  the domain root, outside the `location` block, and they 404. The
+  post-login redirect to `/` walks the browser out of the console entirely.
+
+**The prefix must survive the proxy.** That is the decision everything else
+follows from: this server matches the full path *including* the prefix and
+generates links that do too, so `proxy_pass` must have no trailing slash. The
+other arrangement — proxy strips, server serves from the root — is not
+implementable from the server side at all, because what breaks it is the
+browser's resolution of paths in the returned HTML.
+
+`BasePath` normalises `stop-bots`, `/stop-bots` and `/stop-bots/` to
+`/stop-bots`, and rejects `..` and URL punctuation. That validation is not
+theatre: the value is concatenated into every URL and every `Location` header
+the site emits, and a prefix able to climb out of itself is not a thing to
+discover later.
+
+**`Ctx` rather than a second parameter.** Screens already threaded
+`csrf: &str` through every render function. Widening that one parameter into
+`Ctx { csrf, base }` was less churn than adding a second, and it is better
+grouped: the two always travel together, and a screen with one but not the
+other cannot render a working form. `ctx.url("/bots")` is now the only way to
+write a link, and a literal `"/bots"` in an `href` is the mistake the test
+below catches.
+
+**Explicit route paths, not `Router::nest`.** `nest` was the obvious tool and
+has a sharp edge: it maps `/stop-bots` onto the inner `/` but leaves
+`/stop-bots/` — the canonical URL, the one `BasePath::url("/")` produces and the
+one an NGINX `location /stop-bots/` block sends — falling through to the
+fallback as a 404. Registering each route at its full path costs one closure
+and puts the trailing slash under the router's own control. `/stop-bots` with
+no slash gets a 308 to `/stop-bots/`, so the console has one canonical URL and
+the cookie's `Path` is unambiguous.
+
+The cookie is scoped to the prefix rather than to `/`, which is a bonus of
+having a prefix at all: on a shared domain the session stops being sent to
+every other application on it.
+
+**The test is exhaustive rather than a spot check.** A single absolute URL left
+in a template is a broken link that only appears in a proxied deployment.
+`no_url_on_any_page_escapes_the_prefix` seeds every table so no panel renders
+its empty state, walks all seven pages, extracts every `href`/`src`/`action`,
+and asserts each root-relative one starts with the prefix. There is also a test
+that unprefixed paths are *not* served, which is what makes "the proxy must not
+strip it" a loud failure rather than a page that half-works.
+
+A subdomain needs none of this and stays the recommended deployment. The prefix
+support exists because an NGINX `location` block is what many people already
+have.

@@ -26,6 +26,12 @@ need.
   The Help screen lists each omission with its reason, alongside how this console is
   actually exposed.
 
+  Serve it under a path prefix with `--base-path /stop-bots` when NGINX puts it in a
+  `location` block rather than on its own subdomain. The proxy must not strip the
+  prefix — `proxy_pass http://127.0.0.1:8787;` with no trailing slash — because this
+  server matches the full path and generates links that include it. A subdomain needs
+  none of this and is the simpler deployment.
+
   Behind TLS, set `web:secure_cookie` — without it a browser will also send the
   session to an `http://` URL for the same host. It is off by default because the
   default deployment is plain HTTP on loopback, where a `Secure` cookie is never

@@ -46,8 +46,9 @@ use maud::Markup;
 use serde::Deserialize;
 
 use crate::web::auth::{self, Authenticated, SESSION_COOKIE};
-use crate::web::layout::{self, Flash, Tab};
+use crate::web::layout::{self, Ctx, Flash, Tab};
 use crate::web::state::AppState;
+use crate::web::BasePath;
 
 /// Builds the router.
 ///
@@ -55,29 +56,54 @@ use crate::web::state::AppState;
 /// `tower::ServiceExt::oneshot` without binding a port — the whole
 /// middleware stack runs, which is the part worth testing.
 pub fn router(state: AppState) -> Router {
+    // Routes are registered at their *full* paths, prefix included, rather
+    // than through `Router::nest`.
+    //
+    // `nest` looked like the obvious tool and has a sharp edge here: it
+    // maps `/stop-bots` onto the inner `/` but leaves `/stop-bots/` — the
+    // canonical URL, the one `BasePath::url("/")` generates and the one an
+    // NGINX `location /stop-bots/` block sends — falling through to the
+    // fallback as a 404. Building the paths explicitly costs one closure
+    // and puts the trailing slash under this function's control.
+    let path = |p: &str| state.base.url(p);
+
     let protected = Router::new()
-        .route("/", get(crate::web::dashboard::page))
-        .route("/bots", get(crate::web::bots::page))
-        .route("/sites", get(crate::web::sites::page))
-        .route("/dynamic", get(crate::web::dynamic::page))
-        .route("/help", get(crate::web::help::page))
-        .merge(crate::web::dashboard::actions())
-        .merge(crate::web::bots::actions())
-        .merge(crate::web::sites::actions())
-        .merge(crate::web::dynamic::actions())
+        .route(&path("/"), get(crate::web::dashboard::page))
+        .route(&path("/bots"), get(crate::web::bots::page))
+        .route(&path("/sites"), get(crate::web::sites::page))
+        .route(&path("/dynamic"), get(crate::web::dynamic::page))
+        .route(&path("/help"), get(crate::web::help::page))
+        .merge(crate::web::dashboard::actions(&state.base))
+        .merge(crate::web::bots::actions(&state.base))
+        .merge(crate::web::sites::actions(&state.base))
+        .merge(crate::web::dynamic::actions(&state.base))
         .layer(middleware::from_fn_with_state(state.clone(), csrf_guard))
         .layer(middleware::from_fn_with_state(state.clone(), require_login));
 
     let public = Router::new()
-        .route("/login", get(login_form).post(login_submit))
-        .route("/logout", post(logout))
-        .route("/assets/style.css", get(stylesheet))
-        .route("/assets/htmx.min.js", get(htmx));
+        .route(&path("/login"), get(login_form).post(login_submit))
+        .route(&path("/logout"), post(logout))
+        .route(&path("/assets/style.css"), get(stylesheet))
+        .route(&path("/assets/htmx.min.js"), get(htmx));
 
-    Router::new()
-        .merge(protected)
-        .merge(public)
-        .fallback(not_found)
+    let mut app = Router::new().merge(protected).merge(public);
+
+    // Under a prefix, `/stop-bots` with no trailing slash is what someone
+    // types. Redirect rather than serve it: one canonical URL for the
+    // console keeps the session cookie's `Path` and every relative
+    // reference unambiguous.
+    if !state.base.is_root() {
+        let canonical = state.base.url("/");
+        app = app.route(
+            state.base.as_str(),
+            get(move || {
+                let canonical = canonical.clone();
+                async move { Redirect::permanent(&canonical) }
+            }),
+        );
+    }
+
+    app.fallback(not_found)
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -231,7 +257,7 @@ async fn require_login(
     let Some(authenticated) = session_id.and_then(|id| state.sessions.validate(&id)) else {
         // A 303 for a form post and a 303 for a page load alike: the
         // browser should end up looking at the login page either way.
-        return Redirect::to("/login").into_response();
+        return Redirect::to(&state.base.url("/login")).into_response();
     };
 
     request.extensions_mut().insert(authenticated);
@@ -245,7 +271,7 @@ async fn require_login(
 /// leaves the handler nothing to parse. The bodies here are small form
 /// posts, so buffering one is not the memory hazard it would be on an
 /// upload endpoint — and there is no upload endpoint.
-async fn csrf_guard(State(_state): State<AppState>, request: Request, next: Next) -> Response {
+async fn csrf_guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
     use axum::http::Method;
 
     if matches!(
@@ -259,7 +285,7 @@ async fn csrf_guard(State(_state): State<AppState>, request: Request, next: Next
         // `require_login` runs first, so this is unreachable in the
         // assembled router. Failing closed anyway costs nothing and means
         // a future rewiring cannot quietly turn CSRF off.
-        return Redirect::to("/login").into_response();
+        return Redirect::to(&state.base.url("/login")).into_response();
     };
 
     let (parts, body) = request.into_parts();
@@ -297,8 +323,8 @@ struct LoginForm {
     password: String,
 }
 
-async fn login_form() -> Markup {
-    layout::login_page(None)
+async fn login_form(State(state): State<AppState>) -> Markup {
+    layout::login_page(&state.base, None)
 }
 
 async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
@@ -315,8 +341,8 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
     match verified {
         Ok(true) => match state.sessions.create() {
             Ok((id, _csrf)) => (
-                [(header::SET_COOKIE, session_cookie(&id, secure))],
-                Redirect::to("/"),
+                [(header::SET_COOKIE, session_cookie(&id, secure, &state.base))],
+                Redirect::to(&state.base.url("/")),
             )
                 .into_response(),
             Err(err) => internal_error(&err.to_string()),
@@ -325,7 +351,10 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
         // set: neither is worth confirming to whoever is guessing.
         Ok(false) => (
             StatusCode::UNAUTHORIZED,
-            Html(layout::login_page(Some("That password was not accepted.")).into_string()),
+            Html(
+                layout::login_page(&state.base, Some("That password was not accepted."))
+                    .into_string(),
+            ),
         )
             .into_response(),
         Err(err) => internal_error(&err.to_string()),
@@ -347,7 +376,7 @@ async fn logout(State(state): State<AppState>, request: Request) -> Response {
         state.sessions.remove(&id);
     }
     (
-        [(header::SET_COOKIE, expired_cookie())],
+        [(header::SET_COOKIE, expired_cookie(&state.base))],
         Redirect::to("/login"),
     )
         .into_response()
@@ -365,16 +394,22 @@ async fn logout(State(state): State<AppState>, request: Request) -> Response {
 /// password and bounce straight back to the login page. Behind TLS it
 /// should be on — `web:secure_cookie` — or a browser will send the session
 /// to an `http://` URL for the same host.
-fn session_cookie(id: &str, secure: bool) -> String {
-    let mut cookie = format!("{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/");
+fn session_cookie(id: &str, secure: bool, base: &BasePath) -> String {
+    let mut cookie = format!(
+        "{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path={}",
+        base.cookie_path()
+    );
     if secure {
         cookie.push_str("; Secure");
     }
     cookie
 }
 
-fn expired_cookie() -> String {
-    format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
+fn expired_cookie(base: &BasePath) -> String {
+    format!(
+        "{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path={}; Max-Age=0",
+        base.cookie_path()
+    )
 }
 
 /// Pulls one cookie's value out of a `Cookie` header.
@@ -464,7 +499,7 @@ pub fn internal_error(message: &str) -> Response {
         Html(
             layout::page(
                 Tab::Dashboard,
-                "",
+                &Ctx::for_tests(),
                 Some(Flash::err(message)),
                 maud::html! { p { "The request could not be completed." } },
             )
@@ -476,8 +511,8 @@ pub fn internal_error(message: &str) -> Response {
 
 /// Renders `content` as a full page, with the session's CSRF token
 /// available to the caller.
-pub fn render(tab: Tab, csrf: &str, flash: Option<Flash>, content: Markup) -> Response {
-    Html(layout::page(tab, csrf, flash, content).into_string()).into_response()
+pub fn render(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Response {
+    Html(layout::page(tab, ctx, flash, content).into_string()).into_response()
 }
 
 /// The `Authenticated` an inner handler is guaranteed to have.
@@ -490,10 +525,11 @@ pub type Auth = Extension<Authenticated>;
 /// clear-on-read dance, it lands on every subsequent request until it is
 /// cleared, and the message is not secret — it is what the operator just
 /// did, and they are about to read it on screen.
-pub fn back_with(path: &str, message: &str, ok: bool) -> Response {
+pub fn back_with(base: &BasePath, path: &str, message: &str, ok: bool) -> Response {
     let kind = if ok { "ok" } else { "err" };
     Redirect::to(&format!(
-        "{path}?flash={}&kind={kind}",
+        "{}?flash={}&kind={kind}",
+        base.url(path),
         percent_encode(message)
     ))
     .into_response()
@@ -555,7 +591,7 @@ mod tests {
 
     #[test]
     fn the_session_cookie_carries_the_flags_that_make_it_safe() {
-        let cookie = session_cookie("a-session-id", false);
+        let cookie = session_cookie("a-session-id", false, &BasePath::default());
         for flag in ["HttpOnly", "SameSite=Strict", "Path=/"] {
             assert!(cookie.contains(flag), "missing {flag} in: {cookie}");
         }
@@ -564,15 +600,15 @@ mod tests {
     #[test]
     fn secure_is_opt_in_because_the_default_deployment_is_plain_http() {
         assert!(
-            !session_cookie("id", false).contains("Secure"),
+            !session_cookie("id", false, &BasePath::default()).contains("Secure"),
             "a Secure cookie is never stored over plain HTTP, so the default must not set it"
         );
-        assert!(session_cookie("id", true).contains("; Secure"));
+        assert!(session_cookie("id", true, &BasePath::default()).contains("; Secure"));
     }
 
     #[test]
     fn logging_out_sends_a_cookie_that_expires_immediately() {
-        assert!(expired_cookie().contains("Max-Age=0"));
+        assert!(expired_cookie(&BasePath::default()).contains("Max-Age=0"));
     }
 
     #[test]

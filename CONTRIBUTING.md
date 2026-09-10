@@ -69,7 +69,7 @@ it just doesn't report per-test time.
 
 ### Coverage
 
-93.1% of lines, measured with `cargo llvm-cov --summary-only --workspace`. That figure
+92.8% of lines, measured with `cargo llvm-cov --summary-only --workspace`. That figure
 *understates* it: the container suite (`make test-containers`) runs a binary inside Docker,
 so its coverage never comes back.
 
@@ -77,7 +77,7 @@ It is a check, not a boast — but the check and the achieved figure are deliber
 different numbers. CI runs the same command with `--fail-under-lines 90`, and the badge
 at the top of the README claims that **floor**, not this snapshot.
 
-A floor set at today's figure would be a trap rather than a check. 93.1% of ~19,000 lines
+A floor set at today's figure would be a trap rather than a check. 92.8% of ~19,000 lines
 leaves only a few hundred uncovered lines of headroom — one ordinary function landing slightly
 under-tested turns CI red on an unrelated pull request, and the quickest fix at that point
 is to edit the floor down, which is exactly the rot the floor exists to prevent. 90% is

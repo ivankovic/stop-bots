@@ -28,7 +28,7 @@ use serde::Deserialize;
 
 use crate::botlist::{self, SourceKind};
 use crate::db::{Bot, BotStatus, Category, Db, Policy, Source};
-use crate::web::layout::{self, PillKind, Tab};
+use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
 use crate::web::state::AppState;
 
@@ -103,23 +103,23 @@ pub async fn page(
         Ok(view) => view,
         Err(err) => return internal_error(&err.to_string()),
     };
-    let csrf = auth.csrf.clone();
+    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
     render(
         Tab::Bots,
-        &csrf,
+        &ctx,
         params.flash.into_flash(),
-        body(&view, &csrf),
+        body(&view, &ctx),
     )
 }
 
-fn body(view: &View, csrf: &str) -> Markup {
+fn body(view: &View, ctx: &Ctx) -> Markup {
     html! {
-        (sources_panel(view, csrf))
-        (bots_panel(view, csrf))
+        (sources_panel(view, ctx))
+        (bots_panel(view, ctx))
     }
 }
 
-fn sources_panel(view: &View, csrf: &str) -> Markup {
+fn sources_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
         "Bot list sources",
         Some("Where the known-bot list comes from"),
@@ -146,8 +146,8 @@ fn sources_panel(view: &View, csrf: &str) -> Markup {
                                     }
                                 }
                                 td .right {
-                                    form .inline method="post" action="/bots/update-source" {
-                                        (layout::csrf_field(csrf))
+                                    form .inline method="post" action=(ctx.url("/bots/update-source")) {
+                                        (layout::csrf_field(ctx))
                                         input type="hidden" name="source" value=(source.id);
                                         button type="submit" { "Update" }
                                     }
@@ -169,19 +169,19 @@ fn sources_panel(view: &View, csrf: &str) -> Markup {
     )
 }
 
-fn bots_panel(view: &View, csrf: &str) -> Markup {
+fn bots_panel(view: &View, ctx: &Ctx) -> Markup {
     let hint = format!("{} known bots", view.total);
     layout::panel(
         "Bots",
         Some(&hint),
         html! {
             .panel-body {
-                form .row method="get" action="/bots" {
+                form .row method="get" action=(ctx.url("/bots")) {
                     input type="text" name="q" value=(view.query)
                         placeholder="Search by name or user-agent pattern" size="34";
                     button type="submit" { "Search" }
                     @if !view.query.is_empty() {
-                        a .button href="/bots" { "Clear" }
+                        a .button href=(ctx.url("/bots")) { "Clear" }
                     }
                 }
             }
@@ -207,7 +207,7 @@ fn bots_panel(view: &View, csrf: &str) -> Markup {
                                 td {
                                     (effective_pill(bot, view.scanner, view.search, view.ai))
                                 }
-                                td .right { (override_form(bot, csrf)) }
+                                td .right { (override_form(bot, ctx)) }
                             }
                         }
                     }
@@ -263,10 +263,10 @@ fn effective_pill(bot: &Bot, scanner: Policy, search: Policy, ai: Policy) -> Mar
     }
 }
 
-fn override_form(bot: &Bot, csrf: &str) -> Markup {
+fn override_form(bot: &Bot, ctx: &Ctx) -> Markup {
     html! {
-        form .inline method="post" action="/bots/status" {
-            (layout::csrf_field(csrf))
+        form .inline method="post" action=(ctx.url("/bots/status")) {
+            (layout::csrf_field(ctx))
             input type="hidden" name="slug" value=(bot.slug);
             select name="status" data-autosubmit {
                 @for (value, label) in [
@@ -309,10 +309,10 @@ fn status_from(id: &str) -> Option<BotStatus> {
 
 // ---- actions ----
 
-pub fn actions() -> Router<AppState> {
+pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
     Router::new()
-        .route("/bots/status", post(set_status))
-        .route("/bots/update-source", post(update_source))
+        .route(&base.url("/bots/status"), post(set_status))
+        .route(&base.url("/bots/update-source"), post(update_source))
 }
 
 #[derive(Deserialize)]
@@ -327,7 +327,7 @@ async fn set_status(
     Form(form): Form<StatusForm>,
 ) -> Response {
     let Some(status) = status_from(&form.status) else {
-        return back_with("/bots", "Unknown bot status.", false);
+        return back_with(&state.base, "/bots", "Unknown bot status.", false);
     };
     let slug = form.slug;
     let stored = slug.clone();
@@ -336,6 +336,7 @@ async fn set_status(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             "/bots",
             &format!(
                 "{slug} now: {}. Apply on Site settings to write it out.",
@@ -343,7 +344,12 @@ async fn set_status(
             ),
             true,
         ),
-        Err(err) => back_with("/bots", &format!("Could not change {slug}: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/bots",
+            &format!("Could not change {slug}: {err}"),
+            false,
+        ),
     }
 }
 
@@ -365,13 +371,19 @@ async fn update_source(
     Form(form): Form<SourceForm>,
 ) -> Response {
     let Some(kind) = SourceKind::from_id(&form.source) else {
-        return back_with("/bots", &format!("Unknown source: {}", form.source), false);
+        return back_with(
+            &state.base,
+            "/bots",
+            &format!("Unknown source: {}", form.source),
+            false,
+        );
     };
 
     let raw = match kind.fetch().await {
         Ok(raw) => raw,
         Err(err) => {
             return back_with(
+                &state.base,
                 "/bots",
                 &format!("Could not download {}: {err}", kind.name()),
                 false,
@@ -387,8 +399,14 @@ async fn update_source(
         .await;
 
     match stored {
-        Ok(count) => back_with("/bots", &format!("{}: {count} bot(s).", kind.name()), true),
+        Ok(count) => back_with(
+            &state.base,
+            "/bots",
+            &format!("{}: {count} bot(s).", kind.name()),
+            true,
+        ),
         Err(err) => back_with(
+            &state.base,
             "/bots",
             &format!("Could not store {}: {err}", kind.name()),
             false,
@@ -518,7 +536,7 @@ mod tests {
     fn every_form_carries_the_csrf_token() {
         let db = seeded();
         let view = load(&db, "").unwrap();
-        let rendered = body(&view, "the-token").into_string();
+        let rendered = body(&view, &Ctx::new("the-token", Default::default())).into_string();
 
         // The search form is a GET and needs no token; every POST does.
         let posts = rendered.matches(r#"method="post""#).count();
@@ -542,7 +560,7 @@ mod tests {
         .unwrap();
 
         let view = load(&db, "").unwrap();
-        let rendered = body(&view, "t").into_string();
+        let rendered = body(&view, &Ctx::for_tests()).into_string();
         assert!(
             !rendered.contains("<img src=x"),
             "bot names come from a third-party download and must be escaped: {rendered}"

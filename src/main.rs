@@ -627,6 +627,23 @@ enum Command {
         /// Address to bind, as `address:port`.
         #[arg(long)]
         bind: Option<String>,
+        /// Serve under a path prefix, for an NGINX location block like
+        /// `https://example.com/stop-bots/`.
+        ///
+        /// The proxy must NOT strip the prefix — this server matches the
+        /// full path including it, and generates links that do too:
+        ///
+        ///   location /stop-bots/ {
+        ///       proxy_pass http://127.0.0.1:8787;   # no trailing slash
+        ///       proxy_set_header Host $host;
+        ///   }
+        ///
+        /// A `proxy_pass` *with* a trailing slash strips the prefix, and
+        /// then every link this server generates points outside the
+        /// location block. A subdomain needs none of this and is the
+        /// simpler deployment if you can take it.
+        #[arg(long)]
+        base_path: Option<String>,
         /// Permit a bind that is not loopback. Without this, a
         /// non-loopback address is refused rather than silently exposing
         /// the console to the network.
@@ -969,6 +986,7 @@ async fn main() -> Result<()> {
             root,
             ssh_log,
             bind,
+            base_path,
             expose,
             allowed_hosts,
             save,
@@ -980,6 +998,7 @@ async fn main() -> Result<()> {
                 root,
                 ssh_log,
                 bind,
+                base_path,
                 expose,
                 allowed_hosts,
                 save,
@@ -1576,6 +1595,7 @@ async fn run_web(
     root: PathBuf,
     ssh_log: Option<PathBuf>,
     bind: Option<String>,
+    base_path: Option<String>,
     expose: bool,
     allowed_hosts: Option<String>,
     save: bool,
@@ -1593,6 +1613,10 @@ async fn run_web(
     // every interface having never passed it.
     let addr = web::resolve_bind(&db, bind.as_deref())?;
     let exposed = expose || db.get_bool_setting(web::EXPOSE_KEY, false)?;
+    let base = match &base_path {
+        Some(raw) => web::BasePath::parse(raw)?,
+        None => web::BasePath::from_db(&db)?,
+    };
 
     if !web::is_loopback(&addr) && !exposed {
         anyhow::bail!(
@@ -1614,6 +1638,7 @@ async fn run_web(
 
     if save {
         db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
+        db.set_text_setting(web::BASE_PATH_KEY, base.as_str())?;
         if expose {
             db.set_bool_setting(web::EXPOSE_KEY, true)?;
         }
@@ -1656,7 +1681,14 @@ async fn run_web(
         );
     }
 
-    println!("stop-bots web UI on http://{addr}/");
+    println!("stop-bots web UI on http://{addr}{}", base.url("/"));
+    if !base.is_root() {
+        println!(
+            "Served under {}. The proxy in front must not strip it:",
+            base.as_str()
+        );
+        println!("    proxy_pass http://{addr};   # no trailing slash");
+    }
     if web::is_loopback(&addr) {
         println!("Loopback only — reachable from this machine.");
     } else {
@@ -1673,7 +1705,7 @@ async fn run_web(
         }
     }
 
-    let state = AppState::new(db, root, ssh_log, !no_apply);
+    let state = AppState::with_base(db, root, ssh_log, !no_apply, base);
     server::serve(state, addr).await
 }
 

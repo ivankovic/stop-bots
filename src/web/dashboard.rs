@@ -31,7 +31,7 @@ use serde::Deserialize;
 
 use crate::db::{Category, Db, GeoMode, Policy};
 use crate::protection::Detector;
-use crate::web::layout::{self, PillKind, Tab};
+use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
 use crate::web::state::AppState;
 
@@ -113,31 +113,26 @@ pub async fn page(
         Ok(view) => view,
         Err(err) => return internal_error(&err.to_string()),
     };
-    let csrf = auth.csrf.clone();
-    render(
-        Tab::Dashboard,
-        &csrf,
-        flash.into_flash(),
-        body(&view, &csrf),
-    )
+    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    render(Tab::Dashboard, &ctx, flash.into_flash(), body(&view, &ctx))
 }
 
-fn body(view: &View, csrf: &str) -> Markup {
+fn body(view: &View, ctx: &Ctx) -> Markup {
     html! {
         .grid-2 {
-            (categories_panel(view, csrf))
-            (geo_panel(view, csrf))
+            (categories_panel(view, ctx))
+            (geo_panel(view, ctx))
         }
-        (detectors_panel(view, csrf))
-        (feeds_panel(view, csrf))
-        (summary_panel(view, csrf))
+        (detectors_panel(view, ctx))
+        (feeds_panel(view, ctx))
+        (summary_panel(view, ctx))
         (jobs_panel(view))
     }
 }
 
 // ---- system-wide category defaults ----
 
-fn categories_panel(view: &View, csrf: &str) -> Markup {
+fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
     let rows = [
         (Category::Scanner, view.scanner),
         (Category::Search, view.search),
@@ -154,8 +149,8 @@ fn categories_panel(view: &View, csrf: &str) -> Markup {
                             td { (category_label(category)) }
                             td { (policy_pill(policy)) }
                             td .right {
-                                form .inline method="post" action="/category" {
-                                    (layout::csrf_field(csrf))
+                                form .inline method="post" action=(ctx.url("/category")) {
+                                    (layout::csrf_field(ctx))
                                     input type="hidden" name="category" value=(category_id(category));
                                     input type="hidden" name="policy" value=(policy_id(flip(policy)));
                                     button type="submit" {
@@ -231,7 +226,7 @@ fn policy_from(id: &str) -> Option<Policy> {
 
 // ---- geo ----
 
-fn geo_panel(view: &View, csrf: &str) -> Markup {
+fn geo_panel(view: &View, ctx: &Ctx) -> Markup {
     let mode_label = match view.geo_mode {
         GeoMode::Blocklist => "Blocklist — the countries below are blocked",
         GeoMode::Allowlist => "Allowlist — only the countries below are allowed",
@@ -248,8 +243,8 @@ fn geo_panel(view: &View, csrf: &str) -> Markup {
         html! {
             .panel-body {
                 .row {
-                    form .inline method="post" action="/geo-mode" {
-                        (layout::csrf_field(csrf))
+                    form .inline method="post" action=(ctx.url("/geo-mode")) {
+                        (layout::csrf_field(ctx))
                         input type="hidden" name="mode" value=(match view.geo_mode {
                             GeoMode::Blocklist => "allowlist",
                             GeoMode::Allowlist => "blocklist",
@@ -283,8 +278,8 @@ fn geo_panel(view: &View, csrf: &str) -> Markup {
                                     }
                                 }
                                 td .right {
-                                    form .inline method="post" action="/geo-remove" {
-                                        (layout::csrf_field(csrf))
+                                    form .inline method="post" action=(ctx.url("/geo-remove")) {
+                                        (layout::csrf_field(ctx))
                                         input type="hidden" name="country" value=(code);
                                         button type="submit" { "Remove" }
                                     }
@@ -295,8 +290,8 @@ fn geo_panel(view: &View, csrf: &str) -> Markup {
                 }
             }
             .panel-body {
-                form .row method="post" action="/geo-add" {
-                    (layout::csrf_field(csrf))
+                form .row method="post" action=(ctx.url("/geo-add")) {
+                    (layout::csrf_field(ctx))
                     input type="text" name="country" placeholder="Country code, e.g. CN"
                         maxlength="2" size="4" required;
                     button .primary type="submit" { "Add" }
@@ -313,7 +308,7 @@ fn geo_panel(view: &View, csrf: &str) -> Markup {
 
 // ---- detectors ----
 
-fn detectors_panel(view: &View, csrf: &str) -> Markup {
+fn detectors_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
         "Automatic blocking",
         Some("Detectors that write firewall rules from your logs"),
@@ -344,8 +339,8 @@ fn detectors_panel(view: &View, csrf: &str) -> Markup {
                             }
                             td .num { (ttl_days) "d" }
                             td {
-                                form .row method="post" action="/detector-ttl" style="gap:6px" {
-                                    (layout::csrf_field(csrf))
+                                form .row method="post" action=(ctx.url("/detector-ttl")) style="gap:6px" {
+                                    (layout::csrf_field(ctx))
                                     input type="hidden" name="detector" value=(detector.id());
                                     input type="number" name="days" min="1" max="3650"
                                         value=(ttl_days) size="4" style="width:5.5em";
@@ -353,8 +348,8 @@ fn detectors_panel(view: &View, csrf: &str) -> Markup {
                                 }
                             }
                             td .right {
-                                form .inline method="post" action="/detector" {
-                                    (layout::csrf_field(csrf))
+                                form .inline method="post" action=(ctx.url("/detector")) {
+                                    (layout::csrf_field(ctx))
                                     input type="hidden" name="detector" value=(detector.id());
                                     input type="hidden" name="enabled" value=(if *enabled { "0" } else { "1" });
                                     button type="submit" {
@@ -372,7 +367,7 @@ fn detectors_panel(view: &View, csrf: &str) -> Markup {
 
 // ---- third-party feeds ----
 
-fn feeds_panel(view: &View, csrf: &str) -> Markup {
+fn feeds_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
         "Third-party IP feeds",
         Some("Published CIDR lists. Switching one on does not download it"),
@@ -406,8 +401,8 @@ fn feeds_panel(view: &View, csrf: &str) -> Markup {
                                     }
                                 }
                                 td .right {
-                                    form .inline method="post" action="/feed" {
-                                        (layout::csrf_field(csrf))
+                                    form .inline method="post" action=(ctx.url("/feed")) {
+                                        (layout::csrf_field(ctx))
                                         input type="hidden" name="feed" value=(feed.id);
                                         input type="hidden" name="enabled" value=(if feed.enabled { "0" } else { "1" });
                                         button type="submit" {
@@ -426,7 +421,7 @@ fn feeds_panel(view: &View, csrf: &str) -> Markup {
 
 // ---- summary ----
 
-fn summary_panel(view: &View, csrf: &str) -> Markup {
+fn summary_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
         "Summary",
         None,
@@ -467,8 +462,8 @@ fn summary_panel(view: &View, csrf: &str) -> Markup {
                 }
             }
             .panel-body {
-                form .row method="post" action="/render-firewall" {
-                    (layout::csrf_field(csrf))
+                form .row method="post" action=(ctx.url("/render-firewall")) {
+                    (layout::csrf_field(ctx))
                     label .field {
                         "Write the firewall script to"
                         input type="text" name="out" value="/etc/stop-bots/firewall.sh" size="34";
@@ -548,16 +543,16 @@ pub(crate) fn relative(at: i64) -> String {
 
 // ---- actions ----
 
-pub fn actions() -> Router<AppState> {
+pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
     Router::new()
-        .route("/category", post(set_category))
-        .route("/geo-mode", post(set_geo_mode))
-        .route("/geo-add", post(add_country))
-        .route("/geo-remove", post(remove_country))
-        .route("/detector", post(set_detector))
-        .route("/detector-ttl", post(set_detector_ttl))
-        .route("/feed", post(set_feed))
-        .route("/render-firewall", post(render_firewall))
+        .route(&base.url("/category"), post(set_category))
+        .route(&base.url("/geo-mode"), post(set_geo_mode))
+        .route(&base.url("/geo-add"), post(add_country))
+        .route(&base.url("/geo-remove"), post(remove_country))
+        .route(&base.url("/detector"), post(set_detector))
+        .route(&base.url("/detector-ttl"), post(set_detector_ttl))
+        .route(&base.url("/feed"), post(set_feed))
+        .route(&base.url("/render-firewall"), post(render_firewall))
 }
 
 #[derive(Deserialize)]
@@ -573,7 +568,12 @@ async fn set_category(
 ) -> Response {
     let (Some(category), Some(policy)) = (category_from(&form.category), policy_from(&form.policy))
     else {
-        return back_with("/", "That is not a category this tool knows.", false);
+        return back_with(
+            &state.base,
+            "/",
+            "That is not a category this tool knows.",
+            false,
+        );
     };
 
     match state
@@ -581,6 +581,7 @@ async fn set_category(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             "/",
             &format!(
                 "{} are now {}. Apply on Site settings to write it into the site configs.",
@@ -589,7 +590,12 @@ async fn set_category(
             ),
             true,
         ),
-        Err(err) => back_with("/", &format!("Could not save that: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("Could not save that: {err}"),
+            false,
+        ),
     }
 }
 
@@ -606,11 +612,16 @@ async fn set_geo_mode(
     let mode = match form.mode.as_str() {
         "allowlist" => GeoMode::Allowlist,
         "blocklist" => GeoMode::Blocklist,
-        _ => return back_with("/", "Unknown geo mode.", false),
+        _ => return back_with(&state.base, "/", "Unknown geo mode.", false),
     };
     match state.with_db(move |db| db.set_geo_mode(mode)).await {
-        Ok(()) => back_with("/", "Geo mode changed.", true),
-        Err(err) => back_with("/", &format!("Could not change the geo mode: {err}"), false),
+        Ok(()) => back_with(&state.base, "/", "Geo mode changed.", true),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("Could not change the geo mode: {err}"),
+            false,
+        ),
     }
 }
 
@@ -627,6 +638,7 @@ async fn add_country(
     let code = form.country.trim().to_uppercase();
     if code.len() != 2 || !code.chars().all(|c| c.is_ascii_alphabetic()) {
         return back_with(
+            &state.base,
             "/",
             "A country is a two-letter ISO code, like CN or RU.",
             false,
@@ -637,12 +649,11 @@ async fn add_country(
         .with_db(move |db| db.set_country_selected(&stored, true))
         .await
     {
-        Ok(()) => back_with(
-            "/",
+        Ok(()) => back_with(&state.base, "/",
             &format!("Selected {code}. Its ranges still need downloading with `stop-bots update-country-ranges --country {code}`."),
             true,
         ),
-        Err(err) => back_with("/", &format!("Could not select {code}: {err}"), false),
+        Err(err) => back_with(&state.base, "/", &format!("Could not select {code}: {err}"), false),
     }
 }
 
@@ -657,8 +668,13 @@ async fn remove_country(
         .with_db(move |db| db.set_country_selected(&stored, false))
         .await
     {
-        Ok(()) => back_with("/", &format!("Removed {code}."), true),
-        Err(err) => back_with("/", &format!("Could not remove {code}: {err}"), false),
+        Ok(()) => back_with(&state.base, "/", &format!("Removed {code}."), true),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("Could not remove {code}: {err}"),
+            false,
+        ),
     }
 }
 
@@ -674,7 +690,7 @@ async fn set_detector(
     Form(form): Form<DetectorForm>,
 ) -> Response {
     let Some(detector) = Detector::from_id(&form.detector) else {
-        return back_with("/", "Unknown detector.", false);
+        return back_with(&state.base, "/", "Unknown detector.", false);
     };
     let enabled = form.enabled == "1";
     match state
@@ -682,6 +698,7 @@ async fn set_detector(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             "/",
             &format!(
                 "{} is now {}.",
@@ -690,7 +707,12 @@ async fn set_detector(
             ),
             true,
         ),
-        Err(err) => back_with("/", &format!("Could not change that: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("Could not change that: {err}"),
+            false,
+        ),
     }
 }
 
@@ -706,10 +728,15 @@ async fn set_detector_ttl(
     Form(form): Form<TtlForm>,
 ) -> Response {
     let Some(detector) = Detector::from_id(&form.detector) else {
-        return back_with("/", "Unknown detector.", false);
+        return back_with(&state.base, "/", "Unknown detector.", false);
     };
     if form.days < 1 {
-        return back_with("/", "A block has to last at least a day.", false);
+        return back_with(
+            &state.base,
+            "/",
+            "A block has to last at least a day.",
+            false,
+        );
     }
     let days = form.days;
     match state
@@ -717,11 +744,17 @@ async fn set_detector_ttl(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             "/",
             &format!("{} now blocks for {days} day(s).", detector.spec().label),
             true,
         ),
-        Err(err) => back_with("/", &format!("Could not change that: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("Could not change that: {err}"),
+            false,
+        ),
     }
 }
 
@@ -744,11 +777,17 @@ async fn set_feed(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             "/",
             &format!("{id} is now {}.", if enabled { "on" } else { "off" }),
             true,
         ),
-        Err(err) => back_with("/", &format!("Could not change {id}: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("Could not change {id}: {err}"),
+            false,
+        ),
     }
 }
 
@@ -779,7 +818,12 @@ async fn render_firewall(
     };
     let out = std::path::PathBuf::from(form.out.trim());
     if out.as_os_str().is_empty() {
-        return back_with("/", "Give the script a path to be written to.", false);
+        return back_with(
+            &state.base,
+            "/",
+            "Give the script a path to be written to.",
+            false,
+        );
     }
 
     let ssh_log = state.ssh_log.clone();
@@ -814,6 +858,7 @@ async fn render_firewall(
 
     match written {
         Ok((path, count)) => back_with(
+            &state.base,
             "/",
             &format!(
                 "Wrote {count} rule(s) to {}. Run it to apply.",
@@ -821,7 +866,7 @@ async fn render_firewall(
             ),
             true,
         ),
-        Err(err) => back_with("/", &format!("{err}"), false),
+        Err(err) => back_with(&state.base, "/", &format!("{err}"), false),
     }
 }
 
@@ -867,7 +912,7 @@ mod tests {
         crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
 
         let view = load(&db).unwrap();
-        let rendered = body(&view, "token").into_string();
+        let rendered = body(&view, &Ctx::for_tests()).into_string();
 
         assert!(rendered.contains("Sites discovered"));
         assert!(
@@ -886,7 +931,7 @@ mod tests {
         crate::botlist::register_all_sources(&db).unwrap();
         crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
         let view = load(&db).unwrap();
-        let rendered = body(&view, "the-token").into_string();
+        let rendered = body(&view, &Ctx::new("the-token", Default::default())).into_string();
 
         let forms = rendered.matches("<form").count();
         let tokens = rendered.matches(r#"name="csrf" value="the-token""#).count();
@@ -907,7 +952,7 @@ mod tests {
         .unwrap();
 
         let view = load(&db).unwrap();
-        let rendered = body(&view, "t").into_string();
+        let rendered = body(&view, &Ctx::for_tests()).into_string();
         assert!(
             rendered.contains("SCRIPT IS STALE"),
             "a rule added since the last render makes the on-disk script stale"

@@ -38,7 +38,7 @@ use serde::Deserialize;
 
 use crate::db::{BlockResponse, Category, Db, Policy, Site};
 use crate::nginx::{self, RequestRule, SiteApplyStatus};
-use crate::web::layout::{self, PillKind, Tab};
+use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
 use crate::web::state::AppState;
 
@@ -85,14 +85,14 @@ pub async fn page(
         Ok(view) => view,
         Err(err) => return internal_error(&err.to_string()),
     };
-    let csrf = auth.csrf.clone();
-    render(Tab::Sites, &csrf, flash.into_flash(), body(&view, &csrf))
+    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    render(Tab::Sites, &ctx, flash.into_flash(), body(&view, &ctx))
 }
 
-fn body(view: &View, csrf: &str) -> Markup {
+fn body(view: &View, ctx: &Ctx) -> Markup {
     html! {
-        (nginx_settings_panel(view, csrf))
-        (sites_panel(view, csrf))
+        (nginx_settings_panel(view, ctx))
+        (sites_panel(view, ctx))
     }
 }
 
@@ -122,7 +122,7 @@ const RESPONSES: [(BlockResponse, &str); 7] = [
     ),
 ];
 
-fn nginx_settings_panel(view: &View, csrf: &str) -> Markup {
+fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
         "NGINX settings",
         Some("Host-wide, and applied to every site on the next Apply"),
@@ -132,8 +132,8 @@ fn nginx_settings_panel(view: &View, csrf: &str) -> Markup {
                     tr {
                         td { "Blocked requests get" }
                         td {
-                            form .row method="post" action="/sites/block-response" style="gap:8px" {
-                                (layout::csrf_field(csrf))
+                            form .row method="post" action=(ctx.url("/sites/block-response")) style="gap:8px" {
+                                (layout::csrf_field(ctx))
                                 select name="response" {
                                     @for (response, label) in RESPONSES {
                                         @if response == view.block_response {
@@ -160,8 +160,8 @@ fn nginx_settings_panel(view: &View, csrf: &str) -> Markup {
                                 } @else {
                                     (layout::pill("OFF", PillKind::Neutral))
                                 }
-                                form .inline method="post" action="/sites/robots" {
-                                    (layout::csrf_field(csrf))
+                                form .inline method="post" action=(ctx.url("/sites/robots")) {
+                                    (layout::csrf_field(ctx))
                                     input type="hidden" name="enabled" value=(if view.serve_robots { "0" } else { "1" });
                                     button type="submit" {
                                         @if view.serve_robots { "Turn off" } @else { "Turn on" }
@@ -177,8 +177,8 @@ fn nginx_settings_panel(view: &View, csrf: &str) -> Markup {
                             span .hint { "Enforced by NGINX at request time, unlike everything else here" }
                         }
                         td {
-                            form .row method="post" action="/sites/rate-limit" style="gap:8px" {
-                                (layout::csrf_field(csrf))
+                            form .row method="post" action=(ctx.url("/sites/rate-limit")) style="gap:8px" {
+                                (layout::csrf_field(ctx))
                                 @if view.rate_limit {
                                     (layout::pill("ON", PillKind::Allowed))
                                 } @else {
@@ -214,19 +214,19 @@ fn nginx_settings_panel(view: &View, csrf: &str) -> Markup {
     )
 }
 
-fn sites_panel(view: &View, csrf: &str) -> Markup {
+fn sites_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
         "Sites",
         Some("Discovered under the configured NGINX root"),
         html! {
             .panel-body {
                 .row {
-                    form .inline method="post" action="/sites/scan" {
-                        (layout::csrf_field(csrf))
+                    form .inline method="post" action=(ctx.url("/sites/scan")) {
+                        (layout::csrf_field(ctx))
                         button type="submit" { "Rescan " (view.root.display()) }
                     }
-                    form .inline method="post" action="/sites/apply-all" {
-                        (layout::csrf_field(csrf))
+                    form .inline method="post" action=(ctx.url("/sites/apply-all")) {
+                        (layout::csrf_field(ctx))
                         button .primary type="submit" { "Apply to every site" }
                     }
                 }
@@ -244,14 +244,14 @@ fn sites_panel(view: &View, csrf: &str) -> Markup {
                         @for (site, status) in &view.sites {
                             tr {
                                 td {
-                                    a href={ "/sites/" (site.id) } { (site.server_name) }
+                                    a href=(ctx.url(&format!("/sites/{}", site.id))) { (site.server_name) }
                                     br;
                                     span .hint .mono { (site.config_path) }
                                 }
                                 td { (status_pill(*status)) }
                                 td .right {
-                                    form .inline method="post" action="/sites/apply" {
-                                        (layout::csrf_field(csrf))
+                                    form .inline method="post" action=(ctx.url("/sites/apply")) {
+                                        (layout::csrf_field(ctx))
                                         input type="hidden" name="id" value=(site.id);
                                         button type="submit" { "Apply" }
                                     }
@@ -320,19 +320,19 @@ pub async fn detail(
         Ok(detail) => detail,
         Err(err) => return internal_error(&err.to_string()),
     };
-    let csrf = auth.csrf.clone();
+    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
     render(
         Tab::Sites,
-        &csrf,
+        &ctx,
         flash.into_flash(),
-        detail_body(&detail, &csrf),
+        detail_body(&detail, &ctx),
     )
 }
 
-fn detail_body(detail: &Detail, csrf: &str) -> Markup {
+fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
     let id = detail.site.id;
     html! {
-        p { a href="/sites" { "← All sites" } }
+        p { a href=(ctx.url("/sites")) { "← All sites" } }
 
         (layout::panel(
             &detail.site.server_name,
@@ -341,8 +341,8 @@ fn detail_body(detail: &Detail, csrf: &str) -> Markup {
                 .panel-body {
                     .row {
                         (status_pill(detail.status))
-                        form .inline method="post" action="/sites/apply" {
-                            (layout::csrf_field(csrf))
+                        form .inline method="post" action=(ctx.url("/sites/apply")) {
+                            (layout::csrf_field(ctx))
                             input type="hidden" name="id" value=(id);
                             button .primary type="submit" { "Apply to this site" }
                         }
@@ -371,8 +371,8 @@ fn detail_body(detail: &Detail, csrf: &str) -> Markup {
                                 }
                             }
                             td .right {
-                                form .inline method="post" action={ "/sites/" (id) "/category" } {
-                                    (layout::csrf_field(csrf))
+                                form .inline method="post" action=(ctx.url(&format!("/sites/{id}/category"))) {
+                                    (layout::csrf_field(ctx))
                                     input type="hidden" name="category" value=(category_id(category));
                                     select name="policy" data-autosubmit {
                                         @for (value, text) in [
@@ -420,8 +420,8 @@ fn detail_body(detail: &Detail, csrf: &str) -> Markup {
                                     }
                                 }
                                 td .right {
-                                    form .inline method="post" action={ "/sites/" (id) "/rule" } {
-                                        (layout::csrf_field(csrf))
+                                    form .inline method="post" action=(ctx.url(&format!("/sites/{id}/rule"))) {
+                                        (layout::csrf_field(ctx))
                                         input type="hidden" name="rule" value=(rule.id());
                                         input type="hidden" name="enabled" value=(if *enabled { "0" } else { "1" });
                                         button type="submit" {
@@ -448,8 +448,8 @@ fn detail_body(detail: &Detail, csrf: &str) -> Markup {
                             tr {
                                 td .mono { (path) }
                                 td .right {
-                                    form .inline method="post" action={ "/sites/" (id) "/exempt-remove" } {
-                                        (layout::csrf_field(csrf))
+                                    form .inline method="post" action=(ctx.url(&format!("/sites/{id}/exempt-remove"))) {
+                                        (layout::csrf_field(ctx))
                                         input type="hidden" name="path" value=(path);
                                         button type="submit" { "Remove" }
                                     }
@@ -459,8 +459,8 @@ fn detail_body(detail: &Detail, csrf: &str) -> Markup {
                     } }
                 }
                 .panel-body {
-                    form .row method="post" action={ "/sites/" (id) "/exempt-add" } {
-                        (layout::csrf_field(csrf))
+                    form .row method="post" action=(ctx.url(&format!("/sites/{id}/exempt-add"))) {
+                        (layout::csrf_field(ctx))
                         input type="text" name="path" placeholder="/blog" size="24" required;
                         button .primary type="submit" { "Add" }
                     }
@@ -506,19 +506,22 @@ fn override_from(id: &str) -> Option<Option<Policy>> {
 
 // ---- actions ----
 
-pub fn actions() -> Router<AppState> {
+pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
     Router::new()
-        .route("/sites/{id}", axum::routing::get(detail))
-        .route("/sites/block-response", post(set_block_response))
-        .route("/sites/robots", post(set_robots))
-        .route("/sites/rate-limit", post(set_rate_limit))
-        .route("/sites/scan", post(scan))
-        .route("/sites/apply", post(apply_one))
-        .route("/sites/apply-all", post(apply_all))
-        .route("/sites/{id}/category", post(set_site_category))
-        .route("/sites/{id}/rule", post(set_site_rule))
-        .route("/sites/{id}/exempt-add", post(add_exemption))
-        .route("/sites/{id}/exempt-remove", post(remove_exemption))
+        .route(&base.url("/sites/{id}"), axum::routing::get(detail))
+        .route(&base.url("/sites/block-response"), post(set_block_response))
+        .route(&base.url("/sites/robots"), post(set_robots))
+        .route(&base.url("/sites/rate-limit"), post(set_rate_limit))
+        .route(&base.url("/sites/scan"), post(scan))
+        .route(&base.url("/sites/apply"), post(apply_one))
+        .route(&base.url("/sites/apply-all"), post(apply_all))
+        .route(&base.url("/sites/{id}/category"), post(set_site_category))
+        .route(&base.url("/sites/{id}/rule"), post(set_site_rule))
+        .route(&base.url("/sites/{id}/exempt-add"), post(add_exemption))
+        .route(
+            &base.url("/sites/{id}/exempt-remove"),
+            post(remove_exemption),
+        )
 }
 
 #[derive(Deserialize)]
@@ -537,6 +540,7 @@ async fn set_block_response(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             "/sites",
             &format!(
                 "Blocked requests now get {}. Apply to write it out.",
@@ -544,7 +548,12 @@ async fn set_block_response(
             ),
             true,
         ),
-        Err(err) => back_with("/sites", &format!("Could not save that: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/sites",
+            &format!("Could not save that: {err}"),
+            false,
+        ),
     }
 }
 
@@ -561,6 +570,7 @@ async fn set_robots(
     let on = form.enabled == "1";
     match state.with_db(move |db| db.set_serve_robots_txt(on)).await {
         Ok(()) => back_with(
+            &state.base,
             "/sites",
             if on {
                 "robots.txt will be generated. Apply to write it out."
@@ -569,7 +579,12 @@ async fn set_robots(
             },
             true,
         ),
-        Err(err) => back_with("/sites", &format!("Could not save that: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/sites",
+            &format!("Could not save that: {err}"),
+            false,
+        ),
     }
 }
 
@@ -587,6 +602,7 @@ async fn set_rate_limit(
 ) -> Response {
     if form.rps < 1 || form.burst < 1 {
         return back_with(
+            &state.base,
             "/sites",
             "Rate and burst both have to be at least 1.",
             false,
@@ -603,6 +619,7 @@ async fn set_rate_limit(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             "/sites",
             &format!(
                 "Rate limiting {} at {rps}/s with a burst of {burst}. Apply to write it out.",
@@ -610,7 +627,12 @@ async fn set_rate_limit(
             ),
             true,
         ),
-        Err(err) => back_with("/sites", &format!("Could not save that: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/sites",
+            &format!("Could not save that: {err}"),
+            false,
+        ),
     }
 }
 
@@ -627,8 +649,13 @@ async fn scan(State(state): State<AppState>, _auth: Auth) -> Response {
         .await;
 
     match found {
-        Ok(count) => back_with("/sites", &format!("Found {count} site(s)."), true),
-        Err(err) => back_with("/sites", &format!("Scan failed: {err}"), false),
+        Ok(count) => back_with(
+            &state.base,
+            "/sites",
+            &format!("Found {count} site(s)."),
+            true,
+        ),
+        Err(err) => back_with(&state.base, "/sites", &format!("Scan failed: {err}"), false),
     }
 }
 
@@ -670,7 +697,12 @@ async fn apply_one(
             };
             reload_then(&state, "/sites", message).await
         }
-        Err(err) => back_with("/sites", &format!("Apply failed: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/sites",
+            &format!("Apply failed: {err}"),
+            false,
+        ),
     }
 }
 
@@ -689,7 +721,12 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
             )
             .await
         }
-        Err(err) => back_with("/sites", &format!("Apply failed: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/sites",
+            &format!("Apply failed: {err}"),
+            false,
+        ),
     }
 }
 
@@ -703,6 +740,7 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
 async fn reload_then(state: &AppState, back: &str, message: String) -> Response {
     if !state.apply_for_real {
         return back_with(
+            &state.base,
             back,
             &format!("{message} (NGINX not reloaded: --no-apply)"),
             true,
@@ -717,8 +755,18 @@ async fn reload_then(state: &AppState, back: &str, message: String) -> Response 
         .await;
 
     match reloaded {
-        Ok(()) => back_with(back, &format!("{message} NGINX reloaded."), true),
-        Err(err) => back_with(back, &format!("{message} Reload failed: {err}"), false),
+        Ok(()) => back_with(
+            &state.base,
+            back,
+            &format!("{message} NGINX reloaded."),
+            true,
+        ),
+        Err(err) => back_with(
+            &state.base,
+            back,
+            &format!("{message} Reload failed: {err}"),
+            false,
+        ),
     }
 }
 
@@ -738,15 +786,25 @@ async fn set_site_category(
     let (Some(category), Some(policy)) =
         (category_from(&form.category), override_from(&form.policy))
     else {
-        return back_with(&back, "Unknown category or policy.", false);
+        return back_with(&state.base, &back, "Unknown category or policy.", false);
     };
 
     match state
         .with_db(move |db| db.set_site_category_override(id, category, policy))
         .await
     {
-        Ok(()) => back_with(&back, "Override saved. Apply to write it out.", true),
-        Err(err) => back_with(&back, &format!("Could not save that: {err}"), false),
+        Ok(()) => back_with(
+            &state.base,
+            &back,
+            "Override saved. Apply to write it out.",
+            true,
+        ),
+        Err(err) => back_with(
+            &state.base,
+            &back,
+            &format!("Could not save that: {err}"),
+            false,
+        ),
     }
 }
 
@@ -764,7 +822,7 @@ async fn set_site_rule(
 ) -> Response {
     let back = format!("/sites/{id}");
     let Some(rule) = RequestRule::from_id(&form.rule) else {
-        return back_with(&back, "Unknown request rule.", false);
+        return back_with(&state.base, &back, "Unknown request rule.", false);
     };
     let on = form.enabled == "1";
     let rule_id = rule.id().to_string();
@@ -774,6 +832,7 @@ async fn set_site_rule(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             &back,
             &format!(
                 "{} is now {}. Apply to write it out.",
@@ -782,7 +841,12 @@ async fn set_site_rule(
             ),
             true,
         ),
-        Err(err) => back_with(&back, &format!("Could not save that: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            &back,
+            &format!("Could not save that: {err}"),
+            false,
+        ),
     }
 }
 
@@ -800,7 +864,12 @@ async fn add_exemption(
     let back = format!("/sites/{id}");
     let path = form.path.trim().to_string();
     if !path.starts_with('/') {
-        return back_with(&back, "A path exemption has to start with `/`.", false);
+        return back_with(
+            &state.base,
+            &back,
+            "A path exemption has to start with `/`.",
+            false,
+        );
     }
     let stored = path.clone();
     match state
@@ -808,11 +877,17 @@ async fn add_exemption(
         .await
     {
         Ok(()) => back_with(
+            &state.base,
             &back,
             &format!("{path} is now exempt. Apply to write it out."),
             true,
         ),
-        Err(err) => back_with(&back, &format!("Could not add {path}: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            &back,
+            &format!("Could not add {path}: {err}"),
+            false,
+        ),
     }
 }
 
@@ -829,8 +904,18 @@ async fn remove_exemption(
         .with_db(move |db| db.remove_site_path_exemption(id, &stored))
         .await
     {
-        Ok(()) => back_with(&back, &format!("{path} is no longer exempt."), true),
-        Err(err) => back_with(&back, &format!("Could not remove {path}: {err}"), false),
+        Ok(()) => back_with(
+            &state.base,
+            &back,
+            &format!("{path} is no longer exempt."),
+            true,
+        ),
+        Err(err) => back_with(
+            &state.base,
+            &back,
+            &format!("Could not remove {path}: {err}"),
+            false,
+        ),
     }
 }
 
@@ -895,7 +980,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = Db::open_in_memory().unwrap();
         let view = load(&db, tmp.path()).unwrap();
-        let rendered = body(&view, "t").into_string();
+        let rendered = body(&view, &Ctx::for_tests()).into_string();
 
         assert!(rendered.contains("No sites yet"), "was: {rendered}");
         assert!(rendered.contains("Rescan"));
@@ -914,7 +999,7 @@ mod tests {
             "every request rule is off until switched on"
         );
 
-        let rendered = detail_body(&detail, "t").into_string();
+        let rendered = detail_body(&detail, &Ctx::for_tests()).into_string();
         for (rule, _) in &detail.rules {
             assert!(
                 rendered.contains(rule.label()),
@@ -938,7 +1023,7 @@ mod tests {
         assert_eq!(detail.ai, Some(Policy::Blocked));
         assert_eq!(detail.exemptions, ["/blog"]);
 
-        let rendered = detail_body(&detail, "t").into_string();
+        let rendered = detail_body(&detail, &Ctx::for_tests()).into_string();
         assert!(rendered.contains("/blog"));
     }
 
@@ -955,8 +1040,16 @@ mod tests {
         let id = db.list_sites().unwrap()[0].id;
 
         for rendered in [
-            body(&load(&db, tmp.path()).unwrap(), "the-token").into_string(),
-            detail_body(&load_detail(&db, id).unwrap(), "the-token").into_string(),
+            body(
+                &load(&db, tmp.path()).unwrap(),
+                &Ctx::new("the-token", Default::default()),
+            )
+            .into_string(),
+            detail_body(
+                &load_detail(&db, id).unwrap(),
+                &Ctx::new("the-token", Default::default()),
+            )
+            .into_string(),
         ] {
             let posts = rendered.matches(r#"method="post""#).count();
             let tokens = rendered.matches(r#"name="csrf" value="the-token""#).count();
@@ -971,7 +1064,7 @@ mod tests {
         db.upsert_site("<script>alert(1)</script>", "/etc/nginx/x")
             .unwrap();
 
-        let rendered = body(&load(&db, tmp.path()).unwrap(), "t").into_string();
+        let rendered = body(&load(&db, tmp.path()).unwrap(), &Ctx::for_tests()).into_string();
         assert!(
             !rendered.contains("<script>alert(1)"),
             "server names come off disk and must be escaped: {rendered}"

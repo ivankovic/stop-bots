@@ -24,6 +24,43 @@
 
 use maud::{html, Markup, DOCTYPE};
 
+use crate::web::BasePath;
+
+/// What every rendered page needs in order to build a link or a form.
+///
+/// One value rather than two parameters, because these two always travel
+/// together and always come from the same place: the session supplies the
+/// token, the server's configuration supplies the prefix, and a screen
+/// that has one without the other cannot render a working form.
+#[derive(Debug, Clone)]
+pub struct Ctx {
+    /// The session's CSRF token.
+    pub csrf: String,
+    /// The path prefix this console is served under.
+    pub base: BasePath,
+}
+
+impl Ctx {
+    pub fn new(csrf: impl Into<String>, base: BasePath) -> Self {
+        Self {
+            csrf: csrf.into(),
+            base,
+        }
+    }
+
+    /// A URL a browser can follow. **Every** link, form action and
+    /// redirect goes through here; a literal `"/bots"` in an `href` is a
+    /// link that breaks the moment the console is served under a prefix.
+    pub fn url(&self, path: &str) -> String {
+        self.base.url(path)
+    }
+
+    /// For tests and for the few places that render without a session.
+    pub fn for_tests() -> Self {
+        Self::new("test-csrf", BasePath::default())
+    }
+}
+
 /// Which tab is current. The same five the TUI has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -93,7 +130,7 @@ impl Flash {
 /// itself, and it means every authenticated page carries the token whether
 /// or not it happens to render a form — which is also what lets a test
 /// find it without seeding rows first.
-pub fn page(tab: Tab, csrf: &str, flash: Option<Flash>, content: Markup) -> Markup {
+pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -104,16 +141,16 @@ pub fn page(tab: Tab, csrf: &str, flash: Option<Flash>, content: Markup) -> Mark
                 // name the sites and addresses being administered.
                 meta name="referrer" content="no-referrer";
                 title { (tab.label()) " — stop-bots" }
-                meta name="csrf-token" content=(csrf);
-                link rel="stylesheet" href="/assets/style.css";
-                script src="/assets/htmx.min.js" defer {}
+                meta name="csrf-token" content=(ctx.csrf);
+                link rel="stylesheet" href=(ctx.url("/assets/style.css"));
+                script src=(ctx.url("/assets/htmx.min.js")) defer {}
                 // Applied before first paint, so a dark-theme user does
                 // not get a white flash on every navigation.
                 script {
                     (maud::PreEscaped(THEME_BOOTSTRAP))
                 }
             }
-            body hx-headers=(format!(r#"{{"x-csrf-token": "{csrf}"}}"#)) {
+            body hx-headers=(format!(r#"{{"x-csrf-token": "{}"}}"#, ctx.csrf)) {
                 header .top {
                     .brand {
                         strong { "stop-bots" }
@@ -126,17 +163,17 @@ pub fn page(tab: Tab, csrf: &str, flash: Option<Flash>, content: Markup) -> Mark
                         button #theme-toggle type="button" title="Switch between the light and dark theme" {
                             "Theme"
                         }
-                        form .inline method="post" action="/logout" {
-                            (csrf_field(csrf))
+                        form .inline method="post" action=(ctx.url("/logout")) {
+                            (csrf_field(ctx))
                             button type="submit" { "Log out" }
                         }
                     }
                     nav .tabs {
                         @for candidate in Tab::ALL {
                             @if candidate == tab {
-                                a href=(candidate.path()) aria-current="page" { (candidate.label()) }
+                                a href=(ctx.url(candidate.path())) aria-current="page" { (candidate.label()) }
                             } @else {
-                                a href=(candidate.path()) { (candidate.label()) }
+                                a href=(ctx.url(candidate.path())) { (candidate.label()) }
                             }
                         }
                     }
@@ -155,7 +192,7 @@ pub fn page(tab: Tab, csrf: &str, flash: Option<Flash>, content: Markup) -> Mark
 
 /// The login page, which has no chrome — no tabs to a UI you cannot reach
 /// yet, and no logout button.
-pub fn login_page(error: Option<&str>) -> Markup {
+pub fn login_page(base: &BasePath, error: Option<&str>) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
@@ -164,7 +201,7 @@ pub fn login_page(error: Option<&str>) -> Markup {
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 meta name="referrer" content="no-referrer";
                 title { "Log in — stop-bots" }
-                link rel="stylesheet" href="/assets/style.css";
+                link rel="stylesheet" href=(base.url("/assets/style.css"));
                 script { (maud::PreEscaped(THEME_BOOTSTRAP)) }
             }
             body {
@@ -175,7 +212,7 @@ pub fn login_page(error: Option<&str>) -> Markup {
                             @if let Some(error) = error {
                                 .flash.err { (error) }
                             }
-                            form method="post" action="/login" {
+                            form method="post" action=(base.url("/login")) {
                                 label .field {
                                     "Password"
                                     // `autofocus` so the only thing on the
@@ -238,8 +275,8 @@ pub enum PillKind {
 /// forgetting the token is a thing you have to do on purpose. The server
 /// rejects a post without it either way — this is what makes the correct
 /// path the short one.
-pub fn csrf_field(token: &str) -> Markup {
-    html! { input type="hidden" name="csrf" value=(token); }
+pub fn csrf_field(ctx: &Ctx) -> Markup {
+    html! { input type="hidden" name="csrf" value=(ctx.csrf); }
 }
 
 /// Placeholder row for an empty table.
@@ -335,7 +372,7 @@ mod tests {
 
     #[test]
     fn the_current_tab_is_the_only_one_marked_current() {
-        let rendered = page(Tab::Bots, "t", None, html! {}).into_string();
+        let rendered = page(Tab::Bots, &Ctx::for_tests(), None, html! {}).into_string();
         assert_eq!(
             rendered.matches("aria-current=\"page\"").count(),
             1,
@@ -350,7 +387,7 @@ mod tests {
         // because every bot name and user agent on these screens is
         // attacker-controlled text.
         let content = html! { p { "<script>alert(1)</script>" } };
-        let rendered = page(Tab::Dashboard, "t", None, content).into_string();
+        let rendered = page(Tab::Dashboard, &Ctx::for_tests(), None, content).into_string();
 
         assert!(
             !rendered.contains("<script>alert(1)</script>"),
@@ -361,16 +398,28 @@ mod tests {
 
     #[test]
     fn a_flash_renders_with_the_class_that_colours_it() {
-        let ok = page(Tab::Dashboard, "t", Some(Flash::ok("saved")), html! {}).into_string();
+        let ok = page(
+            Tab::Dashboard,
+            &Ctx::for_tests(),
+            Some(Flash::ok("saved")),
+            html! {},
+        )
+        .into_string();
         assert!(ok.contains(r#"class="flash ok""#), "was: {ok}");
 
-        let err = page(Tab::Dashboard, "t", Some(Flash::err("nope")), html! {}).into_string();
+        let err = page(
+            Tab::Dashboard,
+            &Ctx::for_tests(),
+            Some(Flash::err("nope")),
+            html! {},
+        )
+        .into_string();
         assert!(err.contains(r#"class="flash err""#));
     }
 
     #[test]
     fn the_login_page_offers_no_way_into_the_app() {
-        let rendered = login_page(None).into_string();
+        let rendered = login_page(&BasePath::default(), None).into_string();
         for path in ["/bots", "/sites", "/dynamic", "/logout"] {
             assert!(
                 !rendered.contains(path),

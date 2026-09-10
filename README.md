@@ -337,6 +337,54 @@ tell which address a request really came from:
 stop-bots web --bind 127.0.0.1:8787   # and set web:trust_forwarded_for
 ```
 
+Behind TLS, also set `web:secure_cookie`. Without it a browser will send the session
+cookie to an `http://` URL for the same host as well.
+
+## Behind NGINX: a subdomain, or a path prefix
+
+**A subdomain is the simpler deployment**, and the one to take if you can:
+
+```nginx
+server {
+    server_name stopbots.example.com;
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_set_header Host $host;
+    }
+}
+```
+
+```
+stop-bots web --allowed-hosts stopbots.example.com --save
+```
+
+**A path prefix works too**, but the console has to be told about it — it needs to
+generate every link, form action, redirect and cookie path with the prefix already in
+them, and it cannot guess:
+
+```
+stop-bots web --base-path /stop-bots --allowed-hosts example.com --save
+```
+
+```nginx
+location /stop-bots/ {
+    proxy_pass http://127.0.0.1:8787;   # NO trailing slash
+    proxy_set_header Host $host;
+}
+```
+
+**The trailing slash on `proxy_pass` matters, and its absence is the whole trick.**
+Without it, NGINX passes the full path through and `stop-bots` sees
+`/stop-bots/whatever`, which is what it now serves and generates. *With* a trailing
+slash, NGINX strips the prefix — and then the browser resolves the links in the page
+against the domain root, lands outside the `location` block, and everything 404s. No
+amount of care on the server's side can fix that, so the prefix has to survive the
+proxy.
+
+Nothing enforces this from outside, but the failure is loud rather than subtle: with the
+prefix configured, an unprefixed request is a plain 404 rather than a page that
+half-works.
+
 ## What it will not do
 
 Three things are missing on purpose, and the Help screen says so with the reasons:

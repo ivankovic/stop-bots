@@ -67,6 +67,95 @@ pub const BIND_KEY: &str = "web:bind";
 /// runs. Not 8080.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
+/// `settings` key for the path prefix this console is served under.
+pub const BASE_PATH_KEY: &str = "web:base_path";
+
+/// The path prefix this console is served under, normalised.
+///
+/// Empty for the ordinary case — the console owns the root of whatever
+/// host reaches it. Set it when NGINX puts it somewhere else, as in
+/// `https://example.com/stop-bots/`.
+///
+/// **The proxy must not strip the prefix.** This server matches the full
+/// path including it, so `proxy_pass http://127.0.0.1:8787;` (no trailing
+/// slash) is the correct form. A `proxy_pass` *with* a trailing slash
+/// strips the prefix, and then the paths this server generates would point
+/// somewhere the proxy does not route.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BasePath(String);
+
+impl BasePath {
+    /// Parses and normalises a prefix: `stop-bots`, `/stop-bots` and
+    /// `/stop-bots/` all become `/stop-bots`, and anything empty becomes
+    /// the root.
+    ///
+    /// Rejects a prefix containing `..` or a query/fragment marker. Those
+    /// cannot arrive from anywhere but a hand-edited setting, but this
+    /// value is concatenated into every URL and every `Location` header on
+    /// the site, and a prefix that can climb out of itself is not
+    /// something to discover later.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim().trim_matches('/');
+        if trimmed.is_empty() {
+            return Ok(Self::default());
+        }
+        if trimmed.split('/').any(|segment| segment == "..") {
+            anyhow::bail!("a base path may not contain `..`: {raw}");
+        }
+        if trimmed.contains(['?', '#', ' ']) {
+            anyhow::bail!("a base path may not contain `?`, `#` or a space: {raw}");
+        }
+        Ok(Self(format!("/{trimmed}")))
+    }
+
+    /// Reads it from `db`, falling back to the root.
+    pub fn from_db(db: &crate::db::Db) -> Result<Self> {
+        match db.get_text_setting(BASE_PATH_KEY)? {
+            Some(raw) => Self::parse(&raw),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Whether this console is served from the root.
+    pub fn is_root(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The prefix itself: `""` or `"/stop-bots"`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Turns an internal path into one a browser can follow.
+    ///
+    /// Every link, form action and redirect in the UI goes through here.
+    /// `url("/")` is the one case worth naming: it must not become
+    /// `/stop-bots` with no trailing slash, because a relative resolution
+    /// against that would drop the last segment.
+    pub fn url(&self, path: &str) -> String {
+        if self.0.is_empty() {
+            return path.to_string();
+        }
+        if path == "/" {
+            return format!("{}/", self.0);
+        }
+        format!("{}{path}", self.0)
+    }
+
+    /// What the session cookie's `Path` should be.
+    ///
+    /// Scoping the cookie to the prefix rather than to `/` is a bonus of
+    /// having one at all: on a shared domain, the session stops being sent
+    /// to every other application on it.
+    pub fn cookie_path(&self) -> String {
+        if self.0.is_empty() {
+            "/".to_string()
+        } else {
+            format!("{}/", self.0)
+        }
+    }
+}
+
 /// `settings` key for whether the session cookie carries `Secure`.
 ///
 /// Off by default because the default deployment is plain HTTP on
@@ -164,6 +253,94 @@ pub fn configured_hosts(db: &crate::db::Db) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_base_path_is_normalised_however_it_is_written() {
+        for raw in ["stop-bots", "/stop-bots", "/stop-bots/", "  /stop-bots/  "] {
+            assert_eq!(
+                BasePath::parse(raw).unwrap().as_str(),
+                "/stop-bots",
+                "input was {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_base_path_is_the_root() {
+        for raw in ["", "/", "   ", "//"] {
+            let base = BasePath::parse(raw).unwrap();
+            assert!(base.is_root(), "input was {raw:?}");
+            assert_eq!(base.as_str(), "");
+        }
+    }
+
+    #[test]
+    fn a_nested_base_path_keeps_its_inner_slashes() {
+        assert_eq!(
+            BasePath::parse("/admin/stop-bots").unwrap().as_str(),
+            "/admin/stop-bots"
+        );
+    }
+
+    #[test]
+    fn a_base_path_that_could_climb_out_of_itself_is_refused() {
+        for raw in ["/../etc", "/stop-bots/../..", "/a/../b"] {
+            assert!(
+                BasePath::parse(raw).is_err(),
+                "{raw} must not parse: it is concatenated into every URL on the site"
+            );
+        }
+    }
+
+    #[test]
+    fn a_base_path_with_url_punctuation_is_refused() {
+        for raw in ["/stop bots", "/stop-bots?x=1", "/stop-bots#top"] {
+            assert!(BasePath::parse(raw).is_err(), "{raw} must not parse");
+        }
+    }
+
+    #[test]
+    fn urls_at_the_root_are_left_alone() {
+        let base = BasePath::default();
+        for path in ["/", "/bots", "/assets/style.css", "/sites/7/rule"] {
+            assert_eq!(base.url(path), path);
+        }
+    }
+
+    #[test]
+    fn urls_under_a_prefix_all_carry_it() {
+        let base = BasePath::parse("/stop-bots").unwrap();
+        assert_eq!(base.url("/bots"), "/stop-bots/bots");
+        assert_eq!(base.url("/assets/style.css"), "/stop-bots/assets/style.css");
+        assert_eq!(base.url("/sites/7/rule"), "/stop-bots/sites/7/rule");
+    }
+
+    #[test]
+    fn the_root_url_keeps_its_trailing_slash_under_a_prefix() {
+        // `/stop-bots` without the slash would make a browser resolve
+        // relative references against `/`, dropping the prefix.
+        let base = BasePath::parse("/stop-bots").unwrap();
+        assert_eq!(base.url("/"), "/stop-bots/");
+    }
+
+    #[test]
+    fn the_cookie_is_scoped_to_the_prefix() {
+        assert_eq!(BasePath::default().cookie_path(), "/");
+        assert_eq!(
+            BasePath::parse("/stop-bots").unwrap().cookie_path(),
+            "/stop-bots/",
+            "scoping the session to the prefix keeps it off every other app on the domain"
+        );
+    }
+
+    #[test]
+    fn a_stored_base_path_is_read_back_normalised() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(BasePath::from_db(&db).unwrap().is_root());
+
+        db.set_text_setting(BASE_PATH_KEY, "stop-bots/").unwrap();
+        assert_eq!(BasePath::from_db(&db).unwrap().as_str(), "/stop-bots");
+    }
 
     #[test]
     fn loopback_is_recognised_in_both_families() {

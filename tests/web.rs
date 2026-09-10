@@ -32,6 +32,11 @@ fn app() -> (Router, String, tempfile::TempDir) {
 /// through the real database is what makes these tests assertions about
 /// behaviour rather than about status codes.
 fn app_with_db() -> (Router, String, tempfile::TempDir, std::path::PathBuf) {
+    app_under("")
+}
+
+/// The same, served under a path prefix.
+fn app_under(base: &str) -> (Router, String, tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
     let db = Db::open(&db_path).unwrap();
@@ -46,7 +51,13 @@ fn app_with_db() -> (Router, String, tempfile::TempDir, std::path::PathBuf) {
 
     // `apply_for_real: false` throughout — a test must never reload the
     // developer's NGINX or run a firewall script at them.
-    let state = AppState::new(Db::open(&db_path).unwrap(), nginx_root, None, false);
+    let state = AppState::with_base(
+        Db::open(&db_path).unwrap(),
+        nginx_root,
+        None,
+        false,
+        stop_bots::web::BasePath::parse(base).unwrap(),
+    );
     (server::router(state), password, tmp, db_path)
 }
 
@@ -1293,4 +1304,250 @@ async fn a_forwarded_address_is_only_believed_when_configured() {
         .list_firewall_rules()
         .unwrap()
         .is_empty());
+}
+
+// ---- served under a path prefix ----
+//
+// The whole point of `--base-path` is that *nothing* the browser is told
+// to fetch escapes the prefix. A single absolute `/bots` left in a
+// template is a broken link that only shows up in a proxied deployment,
+// so the check here is exhaustive over the emitted markup rather than a
+// spot check on a few known URLs.
+
+const PREFIX: &str = "/stop-bots";
+
+fn get_under(path: &str) -> Request<Body> {
+    get(&format!("{PREFIX}{path}"))
+}
+
+/// Every URL the page emits, from `href`, `src` and `action` attributes.
+fn emitted_urls(html: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for attribute in ["href=\"", "src=\"", "action=\""] {
+        for (_, rest) in html
+            .match_indices(attribute)
+            .map(|(i, _)| (i, &html[i + attribute.len()..]))
+        {
+            if let Some(url) = rest.split('"').next() {
+                urls.push(url.to_string());
+            }
+        }
+    }
+    urls
+}
+
+#[tokio::test]
+async fn under_a_prefix_the_screens_are_reachable_at_the_prefixed_paths() {
+    let (app, password, _tmp, _db) = app_under(PREFIX);
+
+    // Login first, at the prefixed path.
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("{PREFIX}/login"),
+            &format!("password={password}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION],
+        "/stop-bots/",
+        "the post-login redirect must land inside the prefix, with its trailing slash"
+    );
+    let cookie = session_cookie_from(&response);
+
+    for path in ["/", "/bots", "/sites", "/dynamic", "/help"] {
+        let response = app
+            .clone()
+            .oneshot(with_cookie(get_under(path), &cookie))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{PREFIX}{path} should render"
+        );
+    }
+}
+
+#[tokio::test]
+async fn under_a_prefix_the_unprefixed_paths_are_not_served() {
+    let (app, _password, _tmp, _db) = app_under(PREFIX);
+
+    // This is what makes the "proxy must not strip the prefix" rule
+    // enforceable rather than advice: a stripped request does not
+    // accidentally half-work.
+    for path in ["/login", "/", "/assets/style.css"] {
+        let response = app.clone().oneshot(get(path)).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} must not be served when a prefix is configured"
+        );
+    }
+}
+
+#[tokio::test]
+async fn no_url_on_any_page_escapes_the_prefix() {
+    let (app, password, tmp, db_path) = app_under(PREFIX);
+
+    // Seed enough that every table renders rows, so their action URLs are
+    // in the markup being checked rather than behind an empty state.
+    let db = Db::open(&db_path).unwrap();
+    db.upsert_bot(&stop_bots::db::NewBot {
+        slug: "gptbot".into(),
+        name: "GPTBot".into(),
+        is_ai: true,
+        is_search_engine: false,
+        is_scanner: false,
+        user_agent_pattern: "GPTBot".into(),
+        source_id: "well-known-bots".into(),
+    })
+    .unwrap();
+    db.block_address_permanently("192.0.2.9").unwrap();
+    db.set_country_selected("CN", true).unwrap();
+    drop(db);
+    write_site(&tmp, "example.com");
+
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("{PREFIX}/login"),
+            &format!("password={password}"),
+        ))
+        .await
+        .unwrap();
+    let cookie = session_cookie_from(&response);
+
+    let csrf_page = app
+        .clone()
+        .oneshot(with_cookie(get_under("/sites"), &cookie))
+        .await
+        .unwrap();
+    let csrf = body_string(csrf_page)
+        .await
+        .split(r#"<meta name="csrf-token" content=""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap()
+        .to_string();
+
+    let scan = format!("{PREFIX}/sites/scan");
+    app.clone()
+        .oneshot(with_cookie(post(&scan, &format!("csrf={csrf}")), &cookie))
+        .await
+        .unwrap();
+    let site_id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+
+    let pages = [
+        "/".to_string(),
+        "/bots".to_string(),
+        "/bots?q=gpt".to_string(),
+        "/sites".to_string(),
+        format!("/sites/{site_id}"),
+        "/dynamic".to_string(),
+        "/help".to_string(),
+    ];
+
+    for path in pages {
+        let response = app
+            .clone()
+            .oneshot(with_cookie(get_under(&path), &cookie))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let html = body_string(response).await;
+
+        let urls = emitted_urls(&html);
+        assert!(!urls.is_empty(), "{path} emitted no URLs at all to check");
+
+        for url in urls {
+            // Off-site links (the README's, say) and fragments are none of
+            // this check's business; a root-relative one is.
+            if !url.starts_with('/') {
+                continue;
+            }
+            assert!(
+                url.starts_with("/stop-bots/"),
+                "{path} emits {url}, which points outside the prefix and would 404 behind the proxy"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn under_a_prefix_the_session_cookie_is_scoped_to_it() {
+    let (app, password, _tmp, _db) = app_under(PREFIX);
+
+    let response = app
+        .oneshot(post(
+            &format!("{PREFIX}/login"),
+            &format!("password={password}"),
+        ))
+        .await
+        .unwrap();
+    let set = response.headers()[header::SET_COOKIE].to_str().unwrap();
+
+    assert!(
+        set.contains("Path=/stop-bots/"),
+        "a session for this console has no business being sent to every other app on the \
+         domain; was: {set}"
+    );
+}
+
+#[tokio::test]
+async fn under_a_prefix_a_redirect_after_an_action_stays_inside_it() {
+    let (app, password, _tmp, _db) = app_under(PREFIX);
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("{PREFIX}/login"),
+            &format!("password={password}"),
+        ))
+        .await
+        .unwrap();
+    let cookie = session_cookie_from(&response);
+
+    let page = app
+        .clone()
+        .oneshot(with_cookie(get_under("/"), &cookie))
+        .await
+        .unwrap();
+    let csrf = body_string(page)
+        .await
+        .split(r#"<meta name="csrf-token" content=""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap()
+        .to_string();
+
+    let response = app
+        .oneshot(with_cookie(
+            post(
+                &format!("{PREFIX}/category"),
+                &format!("csrf={csrf}&category=ai&policy=allowed"),
+            ),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(
+        location.starts_with("/stop-bots/?flash="),
+        "an action's redirect must come back inside the prefix; was: {location}"
+    );
+}
+
+#[tokio::test]
+async fn an_unauthenticated_request_under_a_prefix_is_sent_to_the_prefixed_login() {
+    let (app, _password, _tmp, _db) = app_under(PREFIX);
+
+    let response = app.oneshot(get_under("/bots")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION],
+        "/stop-bots/login",
+        "redirecting to /login would send the browser outside the location block"
+    );
 }
