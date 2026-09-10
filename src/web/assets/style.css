@@ -1,0 +1,278 @@
+/* stop-bots web UI.
+ *
+ * One stylesheet, no framework, no build step. The design follows the TUI
+ * it mirrors: dense rows of label/state/action, colour used only to carry
+ * meaning (blocked is red, allowed is green), and nothing that moves
+ * unless the operator asked it to.
+ *
+ * Both themes are defined as custom properties on :root. The default
+ * follows the operating system; the toggle in the header stamps
+ * data-theme on <html> and wins over it, which is the same escape hatch
+ * the TUI's `c` key provides for terminals that misreport.
+ */
+
+:root {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --border: #d8dde4;
+  --fg: #1b2027;
+  --fg-dim: #5c6672;
+  --accent: #0b6bcb;
+  --accent-fg: #ffffff;
+  --blocked: #b4232c;
+  --blocked-bg: #fdeaea;
+  --allowed: #1c7a3e;
+  --allowed-bg: #e8f6ed;
+  --warn: #8a5a00;
+  --warn-bg: #fdf3e0;
+  --shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12161c;
+    --panel: #1a1f27;
+    --border: #2b323d;
+    --fg: #c8d0da;
+    --fg-dim: #8892a0;
+    --accent: #4aa5f0;
+    --accent-fg: #0b1015;
+    --blocked: #ff6b74;
+    --blocked-bg: #2c1a1d;
+    --allowed: #7bd396;
+    --allowed-bg: #16261c;
+    --warn: #e0a54a;
+    --warn-bg: #2a2214;
+    --shadow: none;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #12161c;
+  --panel: #1a1f27;
+  --border: #2b323d;
+  --fg: #c8d0da;
+  --fg-dim: #8892a0;
+  --accent: #4aa5f0;
+  --accent-fg: #0b1015;
+  --blocked: #ff6b74;
+  --blocked-bg: #2c1a1d;
+  --allowed: #7bd396;
+  --allowed-bg: #16261c;
+  --warn: #e0a54a;
+  --warn-bg: #2a2214;
+  --shadow: none;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+code, .mono, td.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  font-size: 0.92em;
+}
+
+/* ---- header and navigation ---- */
+
+header.top {
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  padding: 0 16px;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 12px 0 8px;
+}
+
+.brand strong { font-size: 17px; letter-spacing: -0.01em; }
+.brand .version { color: var(--fg-dim); font-size: 13px; }
+.brand .spacer { flex: 1; }
+
+nav.tabs { display: flex; gap: 2px; flex-wrap: wrap; }
+
+nav.tabs a {
+  padding: 8px 14px;
+  color: var(--fg-dim);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+}
+
+nav.tabs a:hover { color: var(--fg); }
+
+nav.tabs a[aria-current="page"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+main { padding: 20px 16px 64px; max-width: 1180px; margin: 0 auto; }
+
+/* ---- panels ---- */
+
+section.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin-bottom: 20px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+section.panel > h2 {
+  margin: 0;
+  padding: 12px 16px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border-bottom: 1px solid var(--border);
+}
+
+section.panel > h2 .hint {
+  font-weight: 400;
+  color: var(--fg-dim);
+  margin-left: 8px;
+}
+
+.panel-body { padding: 4px 16px 14px; }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+@media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }
+
+/* ---- tables ---- */
+
+table { width: 100%; border-collapse: collapse; }
+
+th {
+  text-align: left;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+  font-weight: 600;
+  padding: 10px 16px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+td { padding: 9px 16px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover { background: color-mix(in srgb, var(--fg) 4%, transparent); }
+
+td.right, th.right { text-align: right; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.wrap { word-break: break-all; }
+
+/* ---- state pills ---- */
+
+.pill {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.pill.blocked { color: var(--blocked); background: var(--blocked-bg); }
+.pill.allowed { color: var(--allowed); background: var(--allowed-bg); }
+.pill.warn { color: var(--warn); background: var(--warn-bg); }
+.pill.neutral { color: var(--fg-dim); background: color-mix(in srgb, var(--fg) 8%, transparent); }
+
+/* ---- forms and buttons ---- */
+
+button, .button {
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button:hover, .button:hover { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+button.primary:hover { color: var(--accent-fg); filter: brightness(1.08); }
+
+button.danger:hover { border-color: var(--blocked); color: var(--blocked); }
+
+input[type="text"], input[type="password"], input[type="number"], select {
+  font: inherit;
+  font-size: 14px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--fg);
+  min-width: 0;
+}
+
+input:focus, select:focus, button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+form.inline { display: inline; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+label.field { display: flex; flex-direction: column; gap: 5px; font-size: 13px; color: var(--fg-dim); }
+
+/* ---- messages ---- */
+
+.flash {
+  padding: 10px 14px;
+  border-radius: 8px;
+  margin-bottom: 16px;
+  border: 1px solid var(--border);
+}
+
+.flash.ok { color: var(--allowed); background: var(--allowed-bg); border-color: transparent; }
+.flash.err { color: var(--blocked); background: var(--blocked-bg); border-color: transparent; }
+
+.empty { color: var(--fg-dim); padding: 14px 16px; font-style: italic; }
+
+.hint { color: var(--fg-dim); font-size: 13px; }
+
+/* ---- login ---- */
+
+.login-wrap { max-width: 380px; margin: 12vh auto; }
+.login-wrap section.panel { margin: 0; }
+.login-wrap .panel-body { padding: 18px 16px; }
+.login-wrap label.field { margin-bottom: 14px; }
+.login-wrap input { width: 100%; }
+.login-wrap button { width: 100%; }
+
+/* htmx swaps a row in place; a brief tint makes it obvious which one. */
+.htmx-settling td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+td { transition: background 240ms ease-out; }
+
+@media (prefers-reduced-motion: reduce) {
+  td { transition: none; }
+}

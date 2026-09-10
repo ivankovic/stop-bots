@@ -8,5 +8,6 @@
 slow-timeout = { period = "300ms", terminate-after = 10 }
 
 [[profile.default.overrides]]
-filter = "binary(cli) | binary(tui)"
+filter = "binary(cli) | binary(tui) | binary(web)"
 slow-timeout = { period = "1s", terminate-after = 15 }
+

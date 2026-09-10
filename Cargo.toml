@@ -78,6 +78,34 @@ futures = "0.3"
 
 # For CLI argument parsing
 clap = { version = "4.4", features = ["derive"] }
+# For the web UI. `axum` is close to free here: `reqwest` already brings
+# `hyper`, `http` and `tower`, so this adds the router and little else.
+# Default features off — `axum`'s defaults pull in multipart, ws and
+# tracing, none of which this serves.
+axum = { version = "0.8", default-features = false, features = [
+    "http1",
+    "tokio",
+    "query",
+    "form",
+] }
+
+# HTML as a compile-time macro rather than runtime templates: a typo in a
+# tag name is a build error, escaping is on by default, and there are no
+# template files to ship alongside the binary.
+maud = { version = "0.27", features = ["axum"] }
+
+# For hashing the web UI's password. Argon2id is the current default
+# recommendation for a password that guards root-equivalent access.
+argon2 = "0.5"
+
+# Session ids and CSRF tokens. `rand` was already in the tree; this makes
+# the dependency direct because the security of those tokens depends on it.
+rand = "0.9"
+
+# Constant-time comparison for session and CSRF tokens, so neither can be
+# recovered a byte at a time from response timing.
+subtle = { version = "2", default-features = false }
+sha2 = "0.11.0"
 
 [dev-dependencies]
 # For testing
@@ -89,6 +117,25 @@ tempfile = "3"
 # itself is in tests/tui.rs, on raw libc, see the comment there for why
 # it isn't a crate.
 libc = "0.2"
+# `ServiceExt::oneshot`, to drive the web router in tests without binding
+# a port. The whole middleware stack runs, which is the part worth
+# testing; a real listener would only add a port to collide on.
+tower = { version = "0.5.3", features = ["util"] }
+
+# Argon2 is deliberately expensive, and an unoptimised build multiplies
+# that by roughly twenty: the same hash that costs ~50ms in the shipped
+# binary cost nearly two seconds under `cargo test`, which made every
+# web-UI test blow its budget and starved the rest of the suite of CPU.
+#
+# Optimising these two packages *only* fixes it without touching the cost
+# parameters, which are the OWASP-recommended defaults and are what the
+# tests should be exercising. Everything else stays unoptimised and
+# debuggable.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 opt-level = 2

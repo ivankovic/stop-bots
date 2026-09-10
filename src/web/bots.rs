@@ -16,26 +16,29 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-pub mod accesslog;
-pub mod accessstats;
-pub mod app;
-pub mod batch;
-pub mod botlist;
-pub mod cron;
-pub mod db;
-pub mod dynamic;
-pub mod event;
-pub mod firewall;
-#[cfg(test)]
-mod golden;
-pub mod ipranges;
-pub mod iptables;
-pub mod nftables;
-pub mod nginx;
-pub mod protection;
-pub mod scanblock;
-pub mod sshlog;
-#[cfg(test)]
-mod testing;
-pub mod tui;
-pub mod web;
+//! Placeholder for the bots screen.
+
+use axum::extract::{Query, State};
+use axum::response::Response;
+use axum::Router;
+
+use crate::web::layout::Tab;
+use crate::web::server::{render, Auth, FlashQuery};
+use crate::web::state::AppState;
+
+pub async fn page(
+    State(_state): State<AppState>,
+    auth: Auth,
+    Query(flash): Query<FlashQuery>,
+) -> Response {
+    render(
+        Tab::Bots,
+        &auth.csrf,
+        flash.into_flash(),
+        maud::html! { p { "Not built yet." } },
+    )
+}
+
+pub fn actions() -> Router<AppState> {
+    Router::new()
+}

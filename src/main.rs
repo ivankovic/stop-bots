@@ -597,6 +597,60 @@ enum Command {
     /// Host-wide, and only changes what *would* be written: run ApplyBlocks
     /// afterwards to get the new response code into the site configs. Until
     /// then Site settings shows every applied site as STALE.
+    /// Start the web UI.
+    ///
+    /// Binds 127.0.0.1:8787 by default, which is reachable only from this
+    /// machine. That default is the safe one and staying on it is the
+    /// recommendation: the console can rewrite your firewall and your
+    /// NGINX config, so it is worth reaching over an SSH tunnel
+    /// (`ssh -L 8787:127.0.0.1:8787 you@host`) rather than exposing.
+    ///
+    /// Binding anywhere else needs --expose as well, on purpose. The
+    /// intended deployment for that is behind the same NGINX this tool is
+    /// protecting, with TLS and the Host allowlist set:
+    ///
+    ///   stop-bots web --bind 0.0.0.0:8787 --expose \
+    ///     --allowed-hosts admin.example.com --save
+    ///
+    /// A password is generated and printed the first time this runs.
+    /// It is shown once and stored only as an Argon2 hash, so keep it;
+    /// --set-password issues a new one.
+    Web {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// NGINX config root to scan for sites.
+        #[arg(long, default_value = "/etc/nginx")]
+        root: PathBuf,
+        /// SSH log to read for the Dynamic Protection screen.
+        #[arg(long)]
+        ssh_log: Option<PathBuf>,
+        /// Address to bind, as `address:port`.
+        #[arg(long)]
+        bind: Option<String>,
+        /// Permit a bind that is not loopback. Without this, a
+        /// non-loopback address is refused rather than silently exposing
+        /// the console to the network.
+        #[arg(long)]
+        expose: bool,
+        /// Comma-separated host names this server will answer to, beyond
+        /// localhost and 127.0.0.1. Required when reaching it by name:
+        /// a request carrying an unlisted Host is refused, which is what
+        /// makes DNS rebinding against the console fail.
+        #[arg(long)]
+        allowed_hosts: Option<String>,
+        /// Persist --bind, --expose and --allowed-hosts, so a later plain
+        /// `stop-bots web` starts the same way.
+        #[arg(long)]
+        save: bool,
+        /// Generate a new password, print it, and exit without serving.
+        #[arg(long)]
+        set_password: bool,
+        /// Never touch the system: applying writes the database and the
+        /// config files but does not reload NGINX or run the firewall
+        /// script. The same escape hatch the TUI's --no-reload is.
+        #[arg(long)]
+        no_apply: bool,
+    },
     /// Set the commands used to test and reload NGINX.
     ///
     /// Defaults are `nginx -t` and `systemctl reload nginx`, which is what
@@ -905,6 +959,30 @@ async fn main() -> Result<()> {
         Some(Command::AddCountry { db, country }) => set_country_selected(db, country, true),
         Some(Command::RemoveCountry { db, country }) => set_country_selected(db, country, false),
         Some(Command::ListSelectedCountries { db }) => list_selected_countries(db),
+        Some(Command::Web {
+            db,
+            root,
+            ssh_log,
+            bind,
+            expose,
+            allowed_hosts,
+            save,
+            set_password,
+            no_apply,
+        }) => {
+            run_web(
+                db,
+                root,
+                ssh_log,
+                bind,
+                expose,
+                allowed_hosts,
+                save,
+                set_password,
+                no_apply,
+            )
+            .await
+        }
         Some(Command::SetNginxCommands {
             db,
             test,
@@ -1483,6 +1561,102 @@ fn show_robots_txt(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     print!("{}", nginx::robots_txt_body(&db)?);
     Ok(())
+}
+
+/// Starts the web UI, after the checks that decide whether it may bind
+/// where it was asked to.
+#[allow(clippy::too_many_arguments)]
+async fn run_web(
+    db_path: Option<PathBuf>,
+    root: PathBuf,
+    ssh_log: Option<PathBuf>,
+    bind: Option<String>,
+    expose: bool,
+    allowed_hosts: Option<String>,
+    save: bool,
+    set_password: bool,
+    no_apply: bool,
+) -> Result<()> {
+    use stop_bots::web::{self, auth, server, state::AppState};
+
+    let db = open_db(db_path)?;
+
+    if save {
+        if let Some(bind) = &bind {
+            db.set_text_setting(web::BIND_KEY, bind)?;
+        }
+        if let Some(hosts) = &allowed_hosts {
+            db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
+        }
+        if expose {
+            db.set_bool_setting(web::EXPOSE_KEY, true)?;
+        }
+    } else if let Some(hosts) = &allowed_hosts {
+        // Not saved, but it has to reach the running server somehow, and
+        // the allowlist is read from the database on every request.
+        db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
+    }
+
+    if set_password {
+        let password = auth::generate_password()?;
+        auth::set_password(&db, &password)?;
+        println!("New password: {password}");
+        println!();
+        println!("Shown once. Only an Argon2 hash of it is stored.");
+        return Ok(());
+    }
+
+    let addr = web::resolve_bind(&db, bind.as_deref())?;
+    let exposed = expose || db.get_bool_setting(web::EXPOSE_KEY, false)?;
+
+    if !web::is_loopback(&addr) && !exposed {
+        anyhow::bail!(
+            "refusing to bind {addr}, which is reachable from the network.\n\n\
+             The web UI can rewrite this host's firewall and NGINX config, so exposing it \n\
+             is a deliberate act rather than a default. If that is what you want:\n\n    \
+             stop-bots web --bind {addr} --expose --allowed-hosts <your-hostname>\n\n\
+             Otherwise reach it over an SSH tunnel and leave it on loopback:\n\n    \
+             ssh -L 8787:127.0.0.1:8787 <this-host>"
+        );
+    }
+
+    // Only once the server is actually going to start. Printing a
+    // password and then refusing to bind reads as though the password is
+    // the problem, and burns one for nothing.
+    if !auth::password_is_set(&db)? {
+        let password = auth::generate_password()?;
+        auth::set_password(&db, &password)?;
+        println!("A password has been generated for the web UI:");
+        println!();
+        println!("    {password}");
+        println!();
+        println!("Shown once. Only an Argon2 hash of it is stored — write it down now.");
+        println!("`stop-bots web --set-password` issues a new one.");
+        println!();
+    }
+
+    let hosts = web::configured_hosts(&db)?;
+    if !web::is_loopback(&addr) && hosts.is_empty() {
+        // Not fatal: an exposed console reached by bare IP is a real, if
+        // unusual, deployment. Loud, because the usual reason to get here
+        // is putting it behind NGINX on a hostname and then finding every
+        // request refused.
+        eprintln!(
+            "Warning: bound to {addr} with no --allowed-hosts set. Requests carrying a \n\
+             host name rather than an address will be refused. This is the DNS-rebinding \n\
+             guard doing its job; list the name you will use."
+        );
+    }
+
+    println!("stop-bots web UI on http://{addr}/");
+    if web::is_loopback(&addr) {
+        println!("Loopback only — reachable from this machine.");
+    } else {
+        println!("Exposed on {addr}. Put TLS and this tool's own protection in front of it.");
+    }
+
+    let state = AppState::new(db, root, ssh_log, !no_apply);
+    server::serve(state, addr).await
 }
 
 fn set_nginx_commands(
