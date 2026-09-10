@@ -404,3 +404,38 @@ async fn the_session_cookie_is_not_readable_from_script() {
         "SameSite is the second lock on CSRF; was: {set}"
     );
 }
+
+/// The CSP allows inline script only by hash, and a hash does not cover an
+/// inline event handler — that needs `unsafe-hashes`, which is the hole
+/// hashing was meant to avoid. So a page with an `onclick` is a page with
+/// a control that silently does nothing in any browser that enforces CSP.
+#[tokio::test]
+async fn no_page_uses_an_inline_event_handler() {
+    let (app, password, _tmp) = app();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    for path in ["/", "/bots", "/sites", "/dynamic", "/help"] {
+        let response = app
+            .clone()
+            .oneshot(with_cookie(get(path), &cookie))
+            .await
+            .unwrap();
+        let html = body_string(response).await;
+
+        for handler in ["onclick=", "onchange=", "onsubmit=", "onload=", "onerror="] {
+            assert!(
+                !html.contains(handler),
+                "{path} carries {handler}, which this server's own CSP blocks"
+            );
+        }
+    }
+}
+
+/// The login page too — it is the one page an operator sees before
+/// anything else works.
+#[tokio::test]
+async fn the_login_page_uses_no_inline_event_handler() {
+    let (app, _password, _tmp) = app();
+    let html = body_string(app.oneshot(get("/login")).await.unwrap()).await;
+    assert!(!html.contains("onclick="), "was: {html}");
+}

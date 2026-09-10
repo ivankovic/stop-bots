@@ -119,7 +119,11 @@ pub fn page(tab: Tab, csrf: &str, flash: Option<Flash>, content: Markup) -> Mark
                         strong { "stop-bots" }
                         span .version { (env!("CARGO_PKG_VERSION")) }
                         span .spacer {}
-                        button type="button" onclick="stopBotsToggleTheme()" title="Switch between the light and dark theme" {
+                        // No `onclick`: an inline event handler needs
+                        // `unsafe-hashes` in the CSP, which is exactly the
+                        // hole hashing the script was meant to avoid. The
+                        // handler is attached from the hashed script below.
+                        button #theme-toggle type="button" title="Switch between the light and dark theme" {
                             "Theme"
                         }
                         form .inline method="post" action="/logout" {
@@ -251,21 +255,38 @@ pub fn empty(message: &str) -> Markup {
 /// allowing inline script generally.
 const THEME_BOOTSTRAP: &str = r#"
 (function () {
-  try {
-    var t = localStorage.getItem('stop-bots-theme');
-    if (t) document.documentElement.setAttribute('data-theme', t);
-  } catch (e) {}
-})();
-function stopBotsToggleTheme() {
-  var el = document.documentElement;
-  var current = el.getAttribute('data-theme');
-  if (!current) {
-    current = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  function stored() {
+    try { return localStorage.getItem('stop-bots-theme'); } catch (e) { return null; }
   }
-  var next = current === 'dark' ? 'light' : 'dark';
-  el.setAttribute('data-theme', next);
-  try { localStorage.setItem('stop-bots-theme', next); } catch (e) {}
-}
+  var t = stored();
+  if (t) document.documentElement.setAttribute('data-theme', t);
+
+  function toggle() {
+    var el = document.documentElement;
+    var current = el.getAttribute('data-theme');
+    if (!current) {
+      current = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    var next = current === 'dark' ? 'light' : 'dark';
+    el.setAttribute('data-theme', next);
+    try { localStorage.setItem('stop-bots-theme', next); } catch (e) {}
+  }
+
+  document.addEventListener('DOMContentLoaded', function () {
+    var button = document.getElementById('theme-toggle');
+    if (button) button.addEventListener('click', toggle);
+  });
+
+  // Delegated, so a select rendered anywhere submits its form on change
+  // without needing an inline handler of its own. Progressive
+  // enhancement: without script the visible submit button still works.
+  document.addEventListener('change', function (event) {
+    var el = event.target;
+    if (el && el.matches && el.matches('select[data-autosubmit]') && el.form) {
+      el.form.submit();
+    }
+  });
+})();
 "#;
 
 /// SHA-256 of [`THEME_BOOTSTRAP`], for the Content-Security-Policy.
