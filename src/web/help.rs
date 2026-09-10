@@ -37,6 +37,7 @@ struct View {
     loopback: bool,
     allowed_hosts: Vec<String>,
     trusts_forwarded: bool,
+    secure_cookie: bool,
     nginx_test: String,
     nginx_reload: String,
     apply_for_real: bool,
@@ -60,6 +61,7 @@ pub async fn page(
                 bind: bind.to_string(),
                 allowed_hosts: crate::web::configured_hosts(db)?,
                 trusts_forwarded: db.get_bool_setting(crate::web::TRUST_FORWARDED_KEY, false)?,
+                secure_cookie: db.get_bool_setting(crate::web::SECURE_COOKIE_KEY, false)?,
                 nginx_test: commands.test.join(" "),
                 nginx_reload: commands.reload.join(" "),
                 apply_for_real,
@@ -100,6 +102,17 @@ fn body(view: &View) -> Markup {
                             "localhost, 127.0.0.1, ::1"
                             @for host in &view.allowed_hosts {
                                 ", " span .mono { (host) }
+                            }
+                        }
+                    }
+                    tr {
+                        td { "Session cookie is Secure" }
+                        td colspan="2" {
+                            @if view.secure_cookie {
+                                (layout::pill("YES", PillKind::Allowed))
+                            } @else {
+                                (layout::pill("NO", PillKind::Neutral))
+                                span .hint { " Behind TLS this should be on, or a browser will send the session to an http:// URL too." }
                             }
                         }
                     }
@@ -275,6 +288,7 @@ mod tests {
             loopback,
             allowed_hosts: vec![],
             trusts_forwarded: false,
+            secure_cookie: false,
             nginx_test: "nginx -t".into(),
             nginx_reload: "systemctl reload nginx".into(),
             apply_for_real: true,

@@ -2543,3 +2543,139 @@ fn a_missing_source_file_names_the_file() {
         .failure()
         .stderr(predicate::str::contains("/nonexistent/ranges.json"));
 }
+
+// ---- `stop-bots web` startup checks ----
+
+/// Exposing the console is opt-in, and the refusal has to be a refusal:
+/// nothing may be persisted, or a later plain `stop-bots web` comes up on
+/// every interface having never passed this check.
+#[test]
+fn web_refuses_a_non_loopback_bind_without_expose_and_saves_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "web",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--bind",
+            "0.0.0.0:8787",
+            "--save",
+            "--set-password",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("refusing to bind"))
+        .stderr(predicate::str::contains("ssh -L"));
+
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    assert_eq!(
+        db.get_text_setting(stop_bots::web::BIND_KEY).unwrap(),
+        None,
+        "a refused bind must not be persisted"
+    );
+    assert!(
+        !db.get_bool_setting(stop_bots::web::EXPOSE_KEY, false)
+            .unwrap(),
+        "nor may the exposure flag be"
+    );
+}
+
+/// The deliberate path does persist, so a later plain run starts the same
+/// way.
+#[test]
+fn web_with_expose_and_save_persists_the_bind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    stop_bots_cmd(&[
+        "web",
+        "--db",
+        db_path.to_str().unwrap(),
+        "--bind",
+        "0.0.0.0:8788",
+        "--expose",
+        "--allowed-hosts",
+        "admin.example.com",
+        "--save",
+        "--set-password",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("New password:"));
+
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    assert_eq!(
+        db.get_text_setting(stop_bots::web::BIND_KEY)
+            .unwrap()
+            .as_deref(),
+        Some("0.0.0.0:8788")
+    );
+    assert!(db
+        .get_bool_setting(stop_bots::web::EXPOSE_KEY, false)
+        .unwrap());
+    assert_eq!(
+        db.get_text_setting(stop_bots::web::ALLOWED_HOSTS_KEY)
+            .unwrap()
+            .as_deref(),
+        Some("admin.example.com")
+    );
+}
+
+/// `--set-password` stores a hash and prints the password once. The
+/// password itself must not survive anywhere this program can read it
+/// back.
+#[test]
+fn web_set_password_stores_only_a_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    let output = stop_bots_cmd(&["web", "--db", db_path.to_str().unwrap(), "--set-password"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let password = stdout
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches("New password: ")
+        .to_string();
+    assert!(!password.is_empty(), "stdout was:\n{stdout}");
+
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    let stored = db
+        .get_text_setting(stop_bots::web::auth::PASSWORD_HASH_KEY)
+        .unwrap()
+        .unwrap();
+    assert!(stored.starts_with("$argon2id$"), "was: {stored}");
+    assert!(!stored.contains(&password));
+    assert!(stop_bots::web::auth::verify_password(&db, &password).unwrap());
+}
+
+/// An unparsable bind address is rejected by name rather than defaulted.
+#[test]
+fn web_rejects_a_bind_that_is_not_an_address_and_port() {
+    let tmp = tempfile::tempdir().unwrap();
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "web",
+            "--db",
+            tmp.path().join("db.sqlite3").to_str().unwrap(),
+            "--bind",
+            "8787",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("8787"));
+}
+
+/// A plain `Command`, for the tests above that need one without the
+/// `Fixture`'s NGINX environment.
+fn stop_bots_cmd(args: &[&str]) -> Command {
+    let mut cmd = Command::cargo_bin("stop-bots").unwrap();
+    cmd.args(args);
+    cmd
+}

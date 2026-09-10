@@ -67,6 +67,16 @@ pub const BIND_KEY: &str = "web:bind";
 /// runs. Not 8080.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
+/// `settings` key for whether the session cookie carries `Secure`.
+///
+/// Off by default because the default deployment is plain HTTP on
+/// loopback, where a `Secure` cookie is simply never stored and the
+/// console would appear to reject a correct password. Turn it on for the
+/// deployment the README describes — behind NGINX with TLS — where without
+/// it a browser will happily send the session to an `http://` URL for the
+/// same host.
+pub const SECURE_COOKIE_KEY: &str = "web:secure_cookie";
+
 /// `settings` key for whether `X-Forwarded-For` may be believed.
 ///
 /// Off by default, and that default matters. A forwarded header is

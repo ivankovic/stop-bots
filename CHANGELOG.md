@@ -23,7 +23,13 @@ need.
 
   It refuses to block the address you are connected from, writes the firewall script
   but never runs it, and does not offer to unblock something a downloaded list blocked.
-  The Help screen lists each omission with its reason.
+  The Help screen lists each omission with its reason, alongside how this console is
+  actually exposed.
+
+  Behind TLS, set `web:secure_cookie` — without it a browser will also send the
+  session to an `http://` URL for the same host. It is off by default because the
+  default deployment is plain HTTP on loopback, where a `Secure` cookie is never
+  stored at all.
 
 - **Configurable NGINX test and reload commands** — `stop-bots set-nginx-commands`.
   For NGINX in a container, where the config is on a bind mount this tool can write but

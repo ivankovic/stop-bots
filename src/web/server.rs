@@ -35,8 +35,6 @@
 //! nobody can load makes the login page unreadable, and a login form
 //! cannot present a session token it does not have yet.
 
-use std::sync::Arc;
-
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -309,10 +307,15 @@ async fn login_submit(State(state): State<AppState>, Form(form): Form<LoginForm>
         .with_db(move |db| auth::verify_password(db, &password))
         .await;
 
+    let secure = state
+        .with_db(|db| db.get_bool_setting(crate::web::SECURE_COOKIE_KEY, false))
+        .await
+        .unwrap_or(false);
+
     match verified {
         Ok(true) => match state.sessions.create() {
             Ok((id, _csrf)) => (
-                [(header::SET_COOKIE, session_cookie(&id))],
+                [(header::SET_COOKIE, session_cookie(&id, secure))],
                 Redirect::to("/"),
             )
                 .into_response(),
@@ -354,12 +357,20 @@ async fn logout(State(state): State<AppState>, request: Request) -> Response {
 ///
 /// `HttpOnly` so script cannot read it, `SameSite=Strict` so the browser
 /// will not attach it to a request another site started — belt to the CSRF
-/// token's braces — and `Path=/` because every route needs it. Deliberately
-/// no `Secure`: this is served over plain HTTP on loopback in the default
-/// deployment, and a `Secure` cookie would simply never be stored there.
-/// Behind TLS, NGINX is what upgrades it.
-fn session_cookie(id: &str) -> String {
-    format!("{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/")
+/// token's braces — and `Path=/` because every route needs it.
+///
+/// `Secure` is opt-in rather than always on, and the default is off,
+/// because the default deployment is plain HTTP on loopback: a `Secure`
+/// cookie is never stored there, so the console would take a correct
+/// password and bounce straight back to the login page. Behind TLS it
+/// should be on — `web:secure_cookie` — or a browser will send the session
+/// to an `http://` URL for the same host.
+fn session_cookie(id: &str, secure: bool) -> String {
+    let mut cookie = format!("{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
 }
 
 fn expired_cookie() -> String {
@@ -472,12 +483,6 @@ pub fn render(tab: Tab, csrf: &str, flash: Option<Flash>, content: Markup) -> Re
 /// The `Authenticated` an inner handler is guaranteed to have.
 pub type Auth = Extension<Authenticated>;
 
-/// Sends the browser back to `path`, the POST-redirect-GET half of every
-/// action so a reload does not repeat it.
-pub fn back_to(path: &str) -> Response {
-    Redirect::to(path).into_response()
-}
-
 /// Shared by the action handlers: a flash message survives one redirect by
 /// riding in the query string.
 ///
@@ -525,19 +530,6 @@ impl FlashQuery {
     }
 }
 
-/// A `post` route, spelled once so every action route reads the same.
-pub fn action<H, T>(handler: H) -> axum::routing::MethodRouter<AppState>
-where
-    H: axum::handler::Handler<T, AppState>,
-    T: 'static,
-{
-    post(handler)
-}
-
-/// Wraps the state in an `Arc` for the few places that need to share it
-/// beyond a handler's lifetime.
-pub type Shared = Arc<AppState>;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,10 +555,19 @@ mod tests {
 
     #[test]
     fn the_session_cookie_carries_the_flags_that_make_it_safe() {
-        let cookie = session_cookie("a-session-id");
+        let cookie = session_cookie("a-session-id", false);
         for flag in ["HttpOnly", "SameSite=Strict", "Path=/"] {
             assert!(cookie.contains(flag), "missing {flag} in: {cookie}");
         }
+    }
+
+    #[test]
+    fn secure_is_opt_in_because_the_default_deployment_is_plain_http() {
+        assert!(
+            !session_cookie("id", false).contains("Secure"),
+            "a Secure cookie is never stored over plain HTTP, so the default must not set it"
+        );
+        assert!(session_cookie("id", true).contains("; Secure"));
     }
 
     #[test]

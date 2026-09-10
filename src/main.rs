@@ -636,10 +636,15 @@ enum Command {
         /// localhost and 127.0.0.1. Required when reaching it by name:
         /// a request carrying an unlisted Host is refused, which is what
         /// makes DNS rebinding against the console fail.
+        ///
+        /// Always persisted, with or without --save: the running server
+        /// reads it from the database on every request, so there is
+        /// nowhere else for it to live.
         #[arg(long)]
         allowed_hosts: Option<String>,
-        /// Persist --bind, --expose and --allowed-hosts, so a later plain
-        /// `stop-bots web` starts the same way.
+        /// Persist --bind and --expose, so a later plain `stop-bots web`
+        /// starts the same way. Nothing is saved unless the address passes
+        /// the exposure check first.
         #[arg(long)]
         save: bool,
         /// Generate a new password, print it, and exit without serving.
@@ -1581,31 +1586,11 @@ async fn run_web(
 
     let db = open_db(db_path)?;
 
-    if save {
-        if let Some(bind) = &bind {
-            db.set_text_setting(web::BIND_KEY, bind)?;
-        }
-        if let Some(hosts) = &allowed_hosts {
-            db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
-        }
-        if expose {
-            db.set_bool_setting(web::EXPOSE_KEY, true)?;
-        }
-    } else if let Some(hosts) = &allowed_hosts {
-        // Not saved, but it has to reach the running server somehow, and
-        // the allowlist is read from the database on every request.
-        db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
-    }
-
-    if set_password {
-        let password = auth::generate_password()?;
-        auth::set_password(&db, &password)?;
-        println!("New password: {password}");
-        println!();
-        println!("Shown once. Only an Argon2 hash of it is stored.");
-        return Ok(());
-    }
-
+    // Resolve and *check* before anything is written. `--save` used to run
+    // first, which meant `--bind 0.0.0.0:8787 --expose --save
+    // --set-password` persisted an exposed bind and exited before the
+    // guard below ever ran — and the next plain `stop-bots web` came up on
+    // every interface having never passed it.
     let addr = web::resolve_bind(&db, bind.as_deref())?;
     let exposed = expose || db.get_bool_setting(web::EXPOSE_KEY, false)?;
 
@@ -1618,6 +1603,29 @@ async fn run_web(
              Otherwise reach it over an SSH tunnel and leave it on loopback:\n\n    \
              ssh -L 8787:127.0.0.1:8787 <this-host>"
         );
+    }
+
+    // The host allowlist is read from the database on every request, so it
+    // is stored whether or not --save was given — there is nowhere else for
+    // it to live. The flag's help says so.
+    if let Some(hosts) = &allowed_hosts {
+        db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
+    }
+
+    if save {
+        db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
+        if expose {
+            db.set_bool_setting(web::EXPOSE_KEY, true)?;
+        }
+    }
+
+    if set_password {
+        let password = auth::generate_password()?;
+        auth::set_password(&db, &password)?;
+        println!("New password: {password}");
+        println!();
+        println!("Shown once. Only an Argon2 hash of it is stored.");
+        return Ok(());
     }
 
     // Only once the server is actually going to start. Printing a
@@ -1653,6 +1661,16 @@ async fn run_web(
         println!("Loopback only — reachable from this machine.");
     } else {
         println!("Exposed on {addr}. Put TLS and this tool's own protection in front of it.");
+        if !db.get_bool_setting(web::SECURE_COOKIE_KEY, false)? {
+            // Not fatal: this process cannot tell whether there is TLS in
+            // front of it, and refusing would break the plaintext-behind-a-
+            // proxy case that is otherwise fine.
+            eprintln!(
+                "Note: the session cookie is not marked Secure, so a browser will also send \n\
+                 it to an http:// URL for this host. Behind TLS, set `{}` to true.",
+                web::SECURE_COOKIE_KEY
+            );
+        }
     }
 
     let state = AppState::new(db, root, ssh_log, !no_apply);
