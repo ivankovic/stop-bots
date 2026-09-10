@@ -61,7 +61,7 @@ walkdir = "2"
 anyhow = "1"
 
 # For SQLite database
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # For HTTP requests to fetch bot data
 reqwest = { version = "0.12", features = ["json"] }
