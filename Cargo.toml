@@ -96,7 +96,7 @@ maud = { version = "0.27", features = ["axum"] }
 
 # For hashing the web UI's password. Argon2id is the current default
 # recommendation for a password that guards root-equivalent access.
-argon2 = "0.5"
+argon2 = "0.6"
 
 # Session ids and CSRF tokens. `rand` was already in the tree; this makes
 # the dependency direct because the security of those tokens depends on it.
