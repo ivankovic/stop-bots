@@ -352,7 +352,8 @@ fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
         // Writing the sentinel block does nothing until NGINX re-reads it,
         // so there is nothing to reload when nothing changed on disk.
         if applied.changed > 0 && options.apply {
-            nginx::reload().context("config was written, but the reload failed")?;
+            let commands = nginx::NginxCommands::from_db(db)?;
+            nginx::reload_with(&commands).context("config was written, but the reload failed")?;
             summary.push_str(", reloaded");
         }
         Ok(summary)

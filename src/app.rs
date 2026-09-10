@@ -977,9 +977,21 @@ impl App {
             self.reload_nginx_pending = true;
             return;
         }
+        // Resolved here, on the main thread, because the spawned half
+        // cannot reach a `Db` — the same split every other `start_*` makes.
+        // A malformed stored command surfaces as the reload failing, which
+        // is where the admin is already looking.
+        let commands = match nginx::NginxCommands::from_db(&self.db) {
+            Ok(commands) => commands,
+            Err(err) => {
+                self.jobs_in_flight.remove(&Job::ReloadNginx);
+                self.message = Some(format!("failed to reload NGINX: {err}"));
+                return;
+            }
+        };
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
-            let result = nginx::reload().map_err(|err| err.to_string());
+            let result = nginx::reload_with(&commands).map_err(|err| err.to_string());
             let _ = sender.send(Event::App(AppEvent::NginxReloaded { result }));
         });
     }

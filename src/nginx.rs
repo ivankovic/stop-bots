@@ -1325,44 +1325,133 @@ pub fn apply_all_sites(db: &crate::db::Db, root: &Path) -> Result<ApplyAllOutcom
     })
 }
 
-/// Validates the currently-installed NGINX config with `nginx -t`. Run
-/// before every [`reload`] so a malformed config — ours or an unrelated
-/// hand edit elsewhere in the same install — is reported as a clear error
-/// here rather than left for the admin to dig out of `systemctl status`.
-fn test_config() -> Result<()> {
-    let output = std::process::Command::new("nginx")
-        .arg("-t")
-        .output()
-        .context("failed to run `nginx -t`")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "nginx -t failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
+/// How to test and reload NGINX.
+///
+/// Two commands rather than two hardcoded invocations, because NGINX is
+/// not always a service on this host. The case that forced it: NGINX in a
+/// container, with its config on a bind mount this tool writes to. The
+/// files are ours to edit, but `systemctl reload nginx` reloads nothing —
+/// there is no such unit — and `nginx -t` either isn't installed or tests
+/// a different config than the one the container will read. Both become
+/// `docker exec <name> nginx ...` there.
+///
+/// Resolved from `Db` on the main thread and passed to the blocking half,
+/// which by the rule in `app.rs` cannot reach a `Db` at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NginxCommands {
+    /// Argv for the config check. Must exit non-zero on a bad config.
+    pub test: Vec<String>,
+    /// Argv for the reload.
+    pub reload: Vec<String>,
 }
 
-/// Reloads NGINX via `systemctl reload nginx` so a just-written blocking
-/// rule (from [`apply_blocks_to_file`] or [`apply_block_for_site`]) actually
-/// takes effect — writing the sentinel block to a site's config file alone
-/// does nothing until NGINX re-reads it. Always preceded by [`test_config`]:
-/// `systemctl reload` refuses a config that fails validation on its own too,
-/// but checking explicitly here gets a message callers can show directly
-/// rather than send the admin to `systemctl status`/`journalctl`.
-pub fn reload() -> Result<()> {
-    test_config()?;
-    // `output`, not `status`: `status` inherits stdout and stderr, so
-    // anything systemctl says lands directly on the TUI's alternate screen
-    // and corrupts it. Non-root that includes a polkit agent, which takes
-    // over the terminal outright to ask for a password.
-    let output = std::process::Command::new("systemctl")
-        .args(["reload", "nginx"])
+impl NginxCommands {
+    /// What a normal host install needs, and what every caller got before
+    /// these were configurable.
+    pub const DEFAULT_TEST: &'static str = "nginx -t";
+    pub const DEFAULT_RELOAD: &'static str = "systemctl reload nginx";
+
+    /// `settings` keys, alongside the rest of the `nginx:` family.
+    pub const TEST_KEY: &'static str = "nginx:test_command";
+    pub const RELOAD_KEY: &'static str = "nginx:reload_command";
+
+    /// Reads both from `db`, falling back to the defaults for either one
+    /// that was never set. A stored command that no longer parses is an
+    /// error rather than a silent fallback: silently reloading the host's
+    /// NGINX because the container command had an unbalanced quote is
+    /// exactly the surprise this type exists to prevent.
+    pub fn from_db(db: &crate::db::Db) -> Result<Self> {
+        let stored = |key: &str, fallback: &str| -> Result<Vec<String>> {
+            let raw = db.get_text_setting(key)?;
+            let raw = raw.as_deref().unwrap_or(fallback);
+            split_command(raw)
+                .with_context(|| format!("the setting `{key}` is not a valid command"))
+        };
+        Ok(Self {
+            test: stored(Self::TEST_KEY, Self::DEFAULT_TEST)?,
+            reload: stored(Self::RELOAD_KEY, Self::DEFAULT_RELOAD)?,
+        })
+    }
+}
+
+impl Default for NginxCommands {
+    fn default() -> Self {
+        Self {
+            test: split_command(Self::DEFAULT_TEST).expect("the default test command parses"),
+            reload: split_command(Self::DEFAULT_RELOAD).expect("the default reload command parses"),
+        }
+    }
+}
+
+/// Splits a configured command into argv.
+///
+/// Deliberately *not* a shell: the string is never handed to `sh -c`, so
+/// there is no expansion, no globbing, no `;` and no pipelines. What a
+/// reload command needs is words, and words with spaces in them — a path
+/// under `/Applications/...`, a container named with a space — which is
+/// exactly single and double quotes and nothing else.
+///
+/// Keeping the shell out of it is the security-relevant half. This command
+/// runs as root; `sh -c` would turn a settings row into arbitrary code, and
+/// the settings table is reachable from the web UI.
+pub fn split_command(input: &str) -> Result<Vec<String>> {
+    let mut argv = Vec::new();
+    let mut current = String::new();
+    let mut has_word = false;
+    let mut quote: Option<char> = None;
+
+    for c in input.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None if c == '\'' || c == '"' => {
+                // An empty quoted string is still an argument, so the
+                // word has to be marked as started here and not only by
+                // pushing a character.
+                quote = Some(c);
+                has_word = true;
+            }
+            None if c.is_whitespace() => {
+                if has_word {
+                    argv.push(std::mem::take(&mut current));
+                    has_word = false;
+                }
+            }
+            None => {
+                current.push(c);
+                has_word = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        anyhow::bail!("unbalanced quote in `{input}`");
+    }
+    if has_word {
+        argv.push(current);
+    }
+    if argv.is_empty() {
+        anyhow::bail!("`{input}` is empty");
+    }
+    Ok(argv)
+}
+
+/// Runs `argv`, returning its stderr on a non-zero exit.
+///
+/// `output`, not `status`: `status` inherits stdout and stderr, so anything
+/// the command says lands directly on the TUI's alternate screen and
+/// corrupts it. Run non-root, `systemctl` additionally pulls in a polkit
+/// agent, which takes over the terminal outright to ask for a password.
+fn run(argv: &[String], what: &str) -> Result<()> {
+    let (program, args) = argv.split_first().expect("argv is never empty");
+    let output = std::process::Command::new(program)
+        .args(args)
         .output()
-        .context("failed to run `systemctl reload nginx`")?;
+        .with_context(|| format!("failed to run `{}`", argv.join(" ")))?;
     if !output.status.success() {
         anyhow::bail!(
-            "systemctl reload nginx exited with {}: {}",
+            "{what} (`{}`) exited with {}: {}",
+            argv.join(" "),
             output.status,
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -1370,9 +1459,141 @@ pub fn reload() -> Result<()> {
     Ok(())
 }
 
+/// Validates the currently-installed NGINX config. Run before every
+/// [`reload_with`] so a malformed config — ours or an unrelated hand edit
+/// elsewhere in the same install — is reported as a clear error here rather
+/// than left for the admin to dig out of `systemctl status`.
+fn test_config(commands: &NginxCommands) -> Result<()> {
+    run(&commands.test, "the NGINX config test")
+}
+
+/// Reloads NGINX so a just-written blocking rule (from
+/// [`apply_blocks_to_file`] or [`apply_block_for_site`]) actually takes
+/// effect — writing the sentinel block to a site's config file alone does
+/// nothing until NGINX re-reads it. Always preceded by [`test_config`]:
+/// `systemctl reload` refuses a config that fails validation on its own too,
+/// but checking explicitly here gets a message callers can show directly
+/// rather than send the admin to `systemctl status`/`journalctl`.
+pub fn reload_with(commands: &NginxCommands) -> Result<()> {
+    test_config(commands)?;
+    run(&commands.reload, "the NGINX reload")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- configured test/reload commands ----
+
+    #[test]
+    fn split_command_splits_on_whitespace() {
+        assert_eq!(
+            split_command("docker exec nginx nginx -s reload").unwrap(),
+            ["docker", "exec", "nginx", "nginx", "-s", "reload"]
+        );
+    }
+
+    #[test]
+    fn split_command_collapses_runs_of_whitespace() {
+        assert_eq!(
+            split_command("  nginx\t\t-t  ").unwrap(),
+            ["nginx", "-t"],
+            "leading, trailing and repeated whitespace must not produce empty argv entries"
+        );
+    }
+
+    #[test]
+    fn split_command_keeps_quoted_spaces_in_one_argument() {
+        for (input, expected) in [
+            (r#"docker exec "my nginx" nginx -t"#, "my nginx"),
+            (r#"docker exec 'my nginx' nginx -t"#, "my nginx"),
+        ] {
+            let argv = split_command(input).unwrap();
+            assert_eq!(argv[2], expected, "input was: {input}");
+            assert_eq!(argv.len(), 5, "input was: {input}");
+        }
+    }
+
+    #[test]
+    fn split_command_treats_an_empty_quoted_string_as_an_argument() {
+        assert_eq!(
+            split_command(r#"nginx "" -t"#).unwrap(),
+            ["nginx", "", "-t"],
+            "an empty argument is still an argument, and dropping it shifts every flag after it"
+        );
+    }
+
+    #[test]
+    fn split_command_rejects_an_unbalanced_quote() {
+        let err = split_command(r#"docker exec "my nginx nginx -t"#).unwrap_err();
+        assert!(
+            err.to_string().contains("unbalanced quote"),
+            "error was: {err}"
+        );
+    }
+
+    #[test]
+    fn split_command_rejects_a_command_with_no_words() {
+        for input in ["", "   "] {
+            assert!(
+                split_command(input).is_err(),
+                "{input:?} has no program to run, so it must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn split_command_does_not_interpret_shell_metacharacters() {
+        // The command is never handed to `sh -c`, so these are ordinary
+        // characters in an argument. This test is the guard on that: if
+        // anyone ever routes it through a shell, it starts failing.
+        assert_eq!(
+            split_command("nginx -t; rm -rf /").unwrap(),
+            ["nginx", "-t;", "rm", "-rf", "/"],
+            "`;` must be part of a word, not a command separator"
+        );
+    }
+
+    #[test]
+    fn nginx_commands_default_to_the_host_install() {
+        let commands = NginxCommands::default();
+        assert_eq!(commands.test, ["nginx", "-t"]);
+        assert_eq!(commands.reload, ["systemctl", "reload", "nginx"]);
+    }
+
+    #[test]
+    fn nginx_commands_fall_back_per_setting() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_text_setting(NginxCommands::RELOAD_KEY, "docker exec web nginx -s reload")
+            .unwrap();
+
+        let commands = NginxCommands::from_db(&db).unwrap();
+        assert_eq!(
+            commands.reload,
+            ["docker", "exec", "web", "nginx", "-s", "reload"]
+        );
+        assert_eq!(
+            commands.test,
+            ["nginx", "-t"],
+            "setting only the reload command must leave the test command at its default"
+        );
+    }
+
+    #[test]
+    fn nginx_commands_reject_a_stored_command_that_does_not_parse() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_text_setting(NginxCommands::TEST_KEY, r#"docker exec "web nginx -t"#)
+            .unwrap();
+
+        // Not a silent fallback: reloading the host's NGINX because the
+        // container command had an unbalanced quote is the exact surprise
+        // worth failing loudly over.
+        let err = NginxCommands::from_db(&db).unwrap_err();
+        assert!(
+            err.to_string().contains(NginxCommands::TEST_KEY),
+            "the error must name the setting at fault; it was: {err}"
+        );
+    }
     use std::fs;
 
     const FIXTURES_ROOT: &str = "tests/fixtures/nginx";

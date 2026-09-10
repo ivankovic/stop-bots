@@ -189,7 +189,7 @@ fn fake_tools(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     let bin = dir.join("fakebin");
     fs::create_dir_all(&bin).unwrap();
     let log = dir.join("calls.log");
-    for tool in ["nginx", "systemctl", "nft"] {
+    for tool in ["nginx", "systemctl", "nft", "docker"] {
         let path = bin.join(tool);
         fs::write(
             &path,
@@ -986,6 +986,165 @@ fn a_failing_nginx_config_check_stops_the_reload() {
         !log.contains("systemctl"),
         "an invalid config must never be reloaded; log was: {log}"
     );
+}
+
+/// The containerised case, end to end: with the test and reload commands
+/// pointed at `docker exec`, an apply must drive *those* and must never
+/// fall back to the host's `nginx` or `systemctl` — a host with NGINX in a
+/// container generally has neither, and silently reloading the wrong one
+/// is worse than failing.
+#[test]
+fn a_configured_reload_command_replaces_systemctl_entirely() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    fs::create_dir_all(&nginx_root).unwrap();
+    write_site(&nginx_root, "a.example");
+    let (bin, calls) = fake_tools(tmp.path());
+
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
+
+    stop_bots(&[
+        "set-nginx-commands",
+        "--db",
+        db_path.to_str().unwrap(),
+        "--test",
+        "docker exec web nginx -t",
+        "--reload",
+        "docker exec web nginx -s reload",
+    ]);
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .env("PATH", path_with(&bin))
+        .args([
+            "apply-blocks",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let log = fs::read_to_string(&calls).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "docker exec web nginx -t",
+            "docker exec web nginx -s reload"
+        ],
+        "validate first, then reload, both through docker; log was: {log}"
+    );
+}
+
+/// A configured test command that fails still stops the reload. The guard
+/// is the property, not the binary it happens to run.
+#[test]
+fn a_configured_test_command_that_fails_stops_the_reload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let nginx_root = tmp.path().join("nginx");
+    fs::create_dir_all(&nginx_root).unwrap();
+    write_site(&nginx_root, "a.example");
+    let (bin, calls) = fake_tools(tmp.path());
+    fs::write(
+        tmp.path().join("fail-docker"),
+        "nginx: [emerg] unknown directive\n",
+    )
+    .unwrap();
+
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
+
+    stop_bots(&[
+        "set-nginx-commands",
+        "--db",
+        db_path.to_str().unwrap(),
+        "--test",
+        "docker exec web nginx -t",
+        "--reload",
+        "docker exec web nginx -s reload",
+    ]);
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .env("PATH", path_with(&bin))
+        .args([
+            "apply-blocks",
+            "--root",
+            nginx_root.to_str().unwrap(),
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown directive"));
+
+    let log = fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        log.lines().count(),
+        1,
+        "the reload must not run after a failed check; log was: {log}"
+    );
+}
+
+/// Setting only one of the two leaves the other at its default, and the
+/// command is echoed back so `set-nginx-commands` with no flags is a way
+/// to ask what is in effect.
+#[test]
+fn set_nginx_commands_reports_both_and_defaults_the_unset_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    stop_bots(&[
+        "set-nginx-commands",
+        "--db",
+        db_path.to_str().unwrap(),
+        "--reload",
+        "docker exec web nginx -s reload",
+    ])
+    .stdout(predicate::str::contains("Test command:   nginx -t"))
+    .stdout(predicate::str::contains(
+        "Reload command: docker exec web nginx -s reload",
+    ));
+
+    stop_bots(&["set-nginx-commands", "--db", db_path.to_str().unwrap()]).stdout(
+        predicate::str::contains("Reload command: docker exec web nginx -s reload"),
+    );
+
+    stop_bots(&[
+        "set-nginx-commands",
+        "--db",
+        db_path.to_str().unwrap(),
+        "--reset",
+    ])
+    .stdout(predicate::str::contains(
+        "Reload command: systemctl reload nginx",
+    ));
+}
+
+/// An unusable command is rejected when it is stored, not at the next
+/// reload — which could be a cron run hours later with nobody watching.
+#[test]
+fn set_nginx_commands_rejects_an_unparsable_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "set-nginx-commands",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--reload",
+            "docker exec \"web nginx -s reload",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unbalanced quote"));
 }
 
 /// Per-site HTTP/1.x rejection end to end, including the guard that keeps

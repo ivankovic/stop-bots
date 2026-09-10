@@ -597,6 +597,36 @@ enum Command {
     /// Host-wide, and only changes what *would* be written: run ApplyBlocks
     /// afterwards to get the new response code into the site configs. Until
     /// then Site settings shows every applied site as STALE.
+    /// Set the commands used to test and reload NGINX.
+    ///
+    /// Defaults are `nginx -t` and `systemctl reload nginx`, which is what
+    /// a normal host install needs. Change them when NGINX is not a
+    /// service on this host — the case that motivated this is NGINX in a
+    /// container with its config on a bind mount, where the files are ours
+    /// to edit but there is no unit to reload:
+    ///
+    ///   --test "docker exec web nginx -t"
+    ///   --reload "docker exec web nginx -s reload"
+    ///
+    /// The command is split into words and run directly. It is never
+    /// handed to a shell, so `;`, `|`, `&&`, globs and `$VAR` are ordinary
+    /// characters in an argument rather than syntax. Quote an argument
+    /// that genuinely contains a space.
+    ///
+    /// Pass neither flag to print the commands currently in effect.
+    SetNginxCommands {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// The config check. Must exit non-zero on a bad config.
+        #[arg(long)]
+        test: Option<String>,
+        /// The reload.
+        #[arg(long)]
+        reload: Option<String>,
+        /// Restore both to their defaults.
+        #[arg(long, conflicts_with_all = ["test", "reload"])]
+        reset: bool,
+    },
     SetBlockResponse {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
@@ -875,6 +905,12 @@ async fn main() -> Result<()> {
         Some(Command::AddCountry { db, country }) => set_country_selected(db, country, true),
         Some(Command::RemoveCountry { db, country }) => set_country_selected(db, country, false),
         Some(Command::ListSelectedCountries { db }) => list_selected_countries(db),
+        Some(Command::SetNginxCommands {
+            db,
+            test,
+            reload,
+            reset,
+        }) => set_nginx_commands(db, test, reload, reset),
         Some(Command::SetBlockResponse { db, response }) => set_block_response(db, response),
         Some(Command::SetRateLimit {
             db,
@@ -1111,7 +1147,8 @@ fn apply_blocks(root: &Path, db_path: Option<PathBuf>, no_reload: bool) -> Resul
     // Writing the sentinel block does nothing until NGINX re-reads it — no
     // point reloading when nothing actually changed on disk.
     if outcome.changed > 0 && !no_reload {
-        nginx::reload().context("nginx config was applied, but reload failed")?;
+        let commands = nginx::NginxCommands::from_db(&db)?;
+        nginx::reload_with(&commands).context("nginx config was applied, but reload failed")?;
         println!("Reloaded NGINX");
     }
     Ok(())
@@ -1445,6 +1482,39 @@ fn set_robots_txt(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
 fn show_robots_txt(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     print!("{}", nginx::robots_txt_body(&db)?);
+    Ok(())
+}
+
+fn set_nginx_commands(
+    db_path: Option<PathBuf>,
+    test: Option<String>,
+    reload: Option<String>,
+    reset: bool,
+) -> Result<()> {
+    use stop_bots::nginx::NginxCommands;
+
+    let db = open_db(db_path)?;
+
+    if reset {
+        db.set_text_setting(NginxCommands::TEST_KEY, NginxCommands::DEFAULT_TEST)?;
+        db.set_text_setting(NginxCommands::RELOAD_KEY, NginxCommands::DEFAULT_RELOAD)?;
+    }
+    for (key, value) in [
+        (NginxCommands::TEST_KEY, &test),
+        (NginxCommands::RELOAD_KEY, &reload),
+    ] {
+        let Some(value) = value else { continue };
+        // Parsed before it is stored, so an unbalanced quote is rejected
+        // here rather than at the next reload — which could be a cron run
+        // hours later with nobody watching.
+        stop_bots::nginx::split_command(value)
+            .with_context(|| format!("refusing to store an unusable command for `{key}`"))?;
+        db.set_text_setting(key, value)?;
+    }
+
+    let commands = NginxCommands::from_db(&db)?;
+    println!("Test command:   {}", commands.test.join(" "));
+    println!("Reload command: {}", commands.reload.join(" "));
     Ok(())
 }
 
