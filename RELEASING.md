@@ -43,7 +43,7 @@ step 3.
    cargo fmt --check
    cargo clippy --all-targets -- -D warnings
    cargo test
-   cargo llvm-cov --workspace --fail-under-lines 93 --summary-only
+   cargo llvm-cov --workspace --fail-under-lines 90 --summary-only
    cargo publish --dry-run
    ```
 

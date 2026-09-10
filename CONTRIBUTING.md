@@ -73,11 +73,19 @@ it just doesn't report per-test time.
 *understates* it: the container suite (`make test-containers`) runs a binary inside Docker,
 so its coverage never comes back.
 
-It is a check, not a boast. CI runs the same command with `--fail-under-lines 93`, so a
-drop below the advertised figure is a red build rather than a number that quietly rots —
-and the badge at the top of the README claims the floor, not a snapshot. Lowering the
-floor is allowed; the badge and this paragraph have to move in the same commit, which is
-the point.
+It is a check, not a boast — but the check and the achieved figure are deliberately two
+different numbers. CI runs the same command with `--fail-under-lines 90`, and the badge
+at the top of the README claims that **floor**, not this snapshot.
+
+A floor set at today's figure would be a trap rather than a check. 93.29% of 16,012 lines
+leaves 47 uncovered lines of headroom — one ordinary function landing slightly
+under-tested turns CI red on an unrelated pull request, and the quickest fix at that point
+is to edit the floor down, which is exactly the rot the floor exists to prevent. 90% is
+low enough to survive normal development and high enough that a real collapse is a red
+build.
+
+Raising the floor as the achieved figure rises is welcome. It just has to move together
+with the badge in `README.md` and this paragraph.
 
 **No test touches the network**, which is where the remaining gap is and why it is there.
 Every downloader takes a `--source <file>` override that parses the same format the server
@@ -136,7 +144,15 @@ as a diff in review rather than as a picture nobody thought to re-take.
 
 Re-run it after any change to a screen's layout, and commit the result. The README
 references the files by absolute `raw.githubusercontent.com` URL, because relative
-image paths do not resolve on crates.io.
+image paths do not resolve on crates.io (which is also why `Cargo.toml` excludes
+`docs/` from the package).
+
+The generator reaches into things that move — `Dashboard::refresh`,
+`SiteSettings::finish_status_check`, the `Screen` enum, and the string ids of five
+cron jobs and three bot-list sources. It does not silently rot when one of those is
+renamed: CI's `cargo clippy --all-targets -- -D warnings` compiles examples, so the
+break is a red build rather than a surprise the next time somebody runs
+`make screenshots`.
 
 ### Container tests
 

@@ -42,6 +42,11 @@ exclude = [
     # Distribution packaging: PKGBUILDs and an ebuild that consume the
     # published artefacts. Of no use to anyone who already has the crate.
     "packaging/",
+    # The README's screenshots. Excluded rather than shipped because the
+    # README references them by absolute raw.githubusercontent.com URL —
+    # relative image paths don't resolve on crates.io — so a packaged copy
+    # is bytes nothing ever reads.
+    "docs/",
 ]
 
 [dependencies]

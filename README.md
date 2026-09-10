@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/ivankovic/stop-bots/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ivankovic/stop-bots/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/stop-bots.svg)](https://crates.io/crates/stop-bots)
-[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A593%25-brightgreen)](https://github.com/ivankovic/stop-bots/blob/main/CONTRIBUTING.md#coverage)
+[![Coverage](https://img.shields.io/badge/coverage-%E2%89%A590%25-brightgreen)](https://github.com/ivankovic/stop-bots/blob/main/CONTRIBUTING.md#coverage)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](https://github.com/ivankovic/stop-bots/blob/main/Cargo.toml)
 [![License: AGPL v3+](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](https://github.com/ivankovic/stop-bots/blob/main/LICENSE)
 

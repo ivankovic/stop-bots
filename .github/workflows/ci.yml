@@ -74,16 +74,19 @@ jobs:
       - name: End-to-end against real nginx and nftables
         run: STOP_BOTS_CONTAINER_TESTS=1 cargo test --test container
 
-  # The README and the badge both claim 93% line coverage. This job is what
-  # makes that a check rather than a boast: `--fail-under-lines` turns a drop
-  # below the advertised figure into a red build, so the number cannot rot
-  # quietly between releases.
+  # The badge claims a *floor* of 90%, and this is what enforces it. The
+  # figure actually achieved is higher — 93.29% at the time of writing, and
+  # CONTRIBUTING.md quotes that separately — but a floor set at today's
+  # number is a trap rather than a check: 16,012 lines at 93.29% means 47
+  # net uncovered lines turns CI red, which is one ordinary function landing
+  # slightly under-tested. The first time that happens on an unrelated PR,
+  # the quickest fix is to edit the floor down, and then the badge is
+  # decoration again — the exact failure this job exists to prevent.
   #
-  # The floor is the advertised figure, not a comfortable margin below it.
-  # That is deliberate and it does bite: adding a chunk of untested code
-  # fails CI. Lowering the floor is allowed — but the badge in README.md and
-  # the figure in CONTRIBUTING.md must move in the same commit, which is the
-  # whole point.
+  # So: a floor low enough to survive normal development and high enough
+  # that a real collapse in coverage is a red build. Raising it as the
+  # achieved figure rises is welcome; it just has to move together with the
+  # badge in README.md and the paragraph in CONTRIBUTING.md.
   #
   # The container suite is excluded here, as it is from the local figure:
   # it runs the binary inside Docker, so its coverage never comes back.
@@ -105,7 +108,7 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Coverage
-        run: cargo llvm-cov --workspace --fail-under-lines 93 --summary-only
+        run: cargo llvm-cov --workspace --fail-under-lines 90 --summary-only
 
   # Catches the class of mistake that only surfaces at publish time: a bad
   # category slug, a missing required field, or a crate that packages fine but
