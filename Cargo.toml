@@ -100,7 +100,7 @@ argon2 = "0.5"
 
 # Session ids and CSRF tokens. `rand` was already in the tree; this makes
 # the dependency direct because the security of those tokens depends on it.
-rand = "0.9"
+rand = "0.10"
 
 # Constant-time comparison for session and CSRF tokens, so neither can be
 # recovered a byte at a time from response timing.
