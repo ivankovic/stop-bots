@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 931 492" width="931" height="492" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="14">
+<rect width="100%" height="100%" rx="8" fill="#12161c"/>
+<rect x="20.4" y="66.0" width="890.4" height="18.0" fill="#e05561"/>
+<rect x="20.4" y="282.0" width="890.4" height="18.0" fill="#a1a8b3"/>
+<rect x="20.4" y="300.0" width="890.4" height="18.0" fill="#a1a8b3"/>
+<rect x="20.4" y="390.0" width="890.4" height="18.0" fill="#a1a8b3"/>
+<text x="12.0" y="25.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">stop-bots</text>
+<text x="87.6" y="25.5" fill="#c8d0da" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> 0.0.1</text>
+<text x="12.0" y="43.5" fill="#c8d0da" textLength="369.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Dashboard │ Bot settings │ Site settings │ </text>
+<text x="381.6" y="43.5" fill="#42b3c2" textLength="151.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Dynamic Protection</text>
+<text x="12.0" y="61.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌Failed SSH logins (all) — Enter block/unblock, f filter───────────────────────────────────────────────────┐</text>
+<text x="12.0" y="79.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="79.5" fill="#c8d0da" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">       3  BLOCKED                   192.0.2.44                                                            </text>
+<text x="910.8" y="79.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="97.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="97.5" fill="#e05561" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">       3  BLOCKED                   203.0.113.9                                                           </text>
+<text x="910.8" y="97.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="115.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="115.5" fill="#e05561" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">       2  BLOCKED                   198.51.100.17                                                         </text>
+<text x="910.8" y="115.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="133.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="133.5" fill="#e05561" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">       1  BLOCKED                   192.0.2.201                                                           </text>
+<text x="910.8" y="133.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="151.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│       1  NOT BLOCKED               203.0.113.77                                                          │</text>
+<text x="12.0" y="169.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                                                          │</text>
+<text x="12.0" y="187.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                                                          │</text>
+<text x="12.0" y="205.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                                                          │</text>
+<text x="12.0" y="223.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                                                          │</text>
+<text x="12.0" y="241.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                                                          │</text>
+<text x="12.0" y="259.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="277.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌Top user agents (all) — Enter block/unblock, f filter─────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="295.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="295.5" fill="#e05561" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    4812  BLOCKLIST                 Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)      </text>
+<text x="910.8" y="295.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="313.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="313.5" fill="#e05561" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    3004  BLOCKLIST                 Mozilla/5.0 (compatible; ClaudeBot/1.0)                               </text>
+<text x="910.8" y="313.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="331.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="331.5" fill="#e05561" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    2671  BLOCKED                   Mozilla/5.0 (compatible; Bytespider; spider-feedback@bytedance.com)   </text>
+<text x="910.8" y="331.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="349.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│    1988  NOT BLOCKED               Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0 Safari│</text>
+<text x="12.0" y="367.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│    1204  NOT BLOCKED               Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.htm│</text>
+<text x="12.0" y="385.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│     906  NOT BLOCKED               python-requests/2.31.0                                                │</text>
+<text x="12.0" y="403.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="403.5" fill="#e05561" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">     742  BLOCKLIST                 Mozilla/5.0 (compatible; CCBot/2.0; +https://commoncrawl.org/faq/)    </text>
+<text x="910.8" y="403.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="421.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│     318  NOT BLOCKED               curl/8.5.0                                                            │</text>
+<text x="12.0" y="439.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                                                          │</text>
+<text x="12.0" y="457.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="475.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">q quit  Tab/Shift+Tab/←→ switch  d/b/s/p jump  ? help  c theme (dark)                                       </text>
+</svg>

@@ -1,0 +1,50 @@
+# Maintainer: Marko Ivankovic <marko@ivankovic.me>
+pkgname=stop-bots
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="A TUI that helps you configure your server to stop bad bots and still allow good bots"
+arch=('x86_64')
+url="https://github.com/ivankovic/stop-bots"
+license=('AGPL-3.0-or-later')
+depends=('gcc-libs')
+makedepends=('cargo')
+# Not depends: the tool shells out to these only when you ask it to, and a
+# server running nftables should not be made to install iptables to try it.
+optdepends=('nginx: to apply the generated site blocking rules'
+            'nftables: to apply the generated firewall script'
+            'iptables: alternative firewall backend')
+# From crates.io rather than from a GitHub tag: it is the artefact `cargo
+# publish` produced, so what is built here is byte-for-byte what
+# `cargo install stop-bots` builds.
+source=("$pkgname-$pkgver.tar.gz::https://static.crates.io/crates/$pkgname/$pkgname-$pkgver.crate")
+sha256sums=('SKIP')  # replace before submitting: see packaging/README.md
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  # Vendors the exact tree Cargo.lock pins, so the build is offline and
+  # reproducible — which is what `--frozen` below then enforces.
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release --all-features
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  # The container suite is not run here: it needs Docker and NET_ADMIN,
+  # which a package build has neither of and should not ask for.
+  cargo test --frozen --release
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

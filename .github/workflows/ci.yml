@@ -74,6 +74,39 @@ jobs:
       - name: End-to-end against real nginx and nftables
         run: STOP_BOTS_CONTAINER_TESTS=1 cargo test --test container
 
+  # The README and the badge both claim 93% line coverage. This job is what
+  # makes that a check rather than a boast: `--fail-under-lines` turns a drop
+  # below the advertised figure into a red build, so the number cannot rot
+  # quietly between releases.
+  #
+  # The floor is the advertised figure, not a comfortable margin below it.
+  # That is deliberate and it does bite: adding a chunk of untested code
+  # fails CI. Lowering the floor is allowed — but the badge in README.md and
+  # the figure in CONTRIBUTING.md must move in the same commit, which is the
+  # whole point.
+  #
+  # The container suite is excluded here, as it is from the local figure:
+  # it runs the binary inside Docker, so its coverage never comes back.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Coverage
+        run: cargo llvm-cov --workspace --fail-under-lines 93 --summary-only
+
   # Catches the class of mistake that only surfaces at publish time: a bad
   # category slug, a missing required field, or a crate that packages fine but
   # does not build from its own tarball.

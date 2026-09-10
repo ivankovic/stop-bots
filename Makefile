@@ -7,6 +7,12 @@ test:
 test-containers:
 	STOP_BOTS_CONTAINER_TESTS=1 cargo test --test container -- --nocapture
 
+# Regenerates docs/screenshots/. Seeded fiction, never the host's own logs
+# — see the module comment in examples/screenshots.rs. Run it after any
+# change to a screen's layout, and commit the diff.
+screenshots:
+	cargo run --example screenshots
+
 build: test
 	cargo build --release
 

@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 931 708" width="931" height="708" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="14">
+<rect width="100%" height="100%" rx="8" fill="#12161c"/>
+<rect x="20.4" y="66.0" width="117.6" height="18.0" fill="#42b3c2"/>
+<rect x="138.0" y="66.0" width="109.2" height="18.0" fill="#e05561"/>
+<rect x="247.2" y="66.0" width="210.0" height="18.0" fill="#42b3c2"/>
+<text x="12.0" y="25.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">stop-bots</text>
+<text x="87.6" y="25.5" fill="#c8d0da" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> 0.0.1</text>
+<text x="20.4" y="43.5" fill="#42b3c2" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Dashboard</text>
+<text x="96.0" y="43.5" fill="#c8d0da" textLength="823.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> │ Bot settings │ Site settings │ Dynamic Protection                                              </text>
+<text x="12.0" y="61.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌System-wide settings────────────────────────────────┐┌Geo-blocking (Blocklist) — m for mode───────────────┐</text>
+<text x="12.0" y="79.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="79.5" fill="#c8d0da" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Scanners      </text>
+<text x="138.0" y="79.5" fill="#c8d0da" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="457.2" y="79.5" fill="#42b3c2" textLength="462.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">││+ Add a country                                     │</text>
+<text x="12.0" y="97.5" fill="#42b3c2" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Search Bots   </text>
+<text x="138.0" y="97.5" fill="#8cc265" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ ALLOWED ] </text>
+<text x="247.2" y="97.5" fill="#42b3c2" textLength="294.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                         ││CN      </text>
+<text x="541.2" y="97.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="650.4" y="97.5" fill="#42b3c2" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 4312 range(s)                 │</text>
+<text x="12.0" y="115.5" fill="#42b3c2" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│AI Bots       </text>
+<text x="138.0" y="115.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="247.2" y="115.5" fill="#42b3c2" textLength="294.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                         ││RU      </text>
+<text x="541.2" y="115.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="650.4" y="115.5" fill="#42b3c2" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 2190 range(s)                 │</text>
+<text x="12.0" y="133.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                    ││                                                    │</text>
+<text x="12.0" y="151.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                    ││                                                    │</text>
+<text x="12.0" y="169.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="187.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌Automatic blocking — Enter to change, days = how long a block lasts───────────────────────────────────────┐</text>
+<text x="12.0" y="205.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│SSH scanners           </text>
+<text x="213.6" y="205.5" fill="#8cc265" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ ON  ]</text>
+<text x="272.4" y="205.5" fill="#42b3c2" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 5d                    Crawls with no referer </text>
+<text x="658.8" y="205.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="717.6" y="205.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                       │</text>
+<text x="12.0" y="223.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Web scanners           </text>
+<text x="213.6" y="223.5" fill="#8cc265" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ ON  ]</text>
+<text x="272.4" y="223.5" fill="#42b3c2" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 1d                    AWS ranges             </text>
+<text x="658.8" y="223.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="717.6" y="223.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> not fetched           │</text>
+<text x="12.0" y="241.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Forged crawler UAs     </text>
+<text x="213.6" y="241.5" fill="#8cc265" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ ON  ]</text>
+<text x="272.4" y="241.5" fill="#42b3c2" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 1d                    blocklist.de           </text>
+<text x="658.8" y="241.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="717.6" y="241.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> not fetched           │</text>
+<text x="12.0" y="259.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Probe paths            </text>
+<text x="213.6" y="259.5" fill="#8cc265" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ ON  ]</text>
+<text x="272.4" y="259.5" fill="#42b3c2" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 5d                    DigitalOcean ranges    </text>
+<text x="658.8" y="259.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="717.6" y="259.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> not fetched           │</text>
+<text x="12.0" y="277.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Honeypot path          </text>
+<text x="213.6" y="277.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="272.4" y="277.5" fill="#42b3c2" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                       FireHOL level 1        </text>
+<text x="658.8" y="277.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="717.6" y="277.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> not fetched           │</text>
+<text x="12.0" y="295.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Fetches no assets      </text>
+<text x="213.6" y="295.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="272.4" y="295.5" fill="#42b3c2" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                       Google Cloud ranges    </text>
+<text x="658.8" y="295.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="717.6" y="295.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> not fetched           │</text>
+<text x="12.0" y="313.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Rotating user agent    </text>
+<text x="213.6" y="313.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="272.4" y="313.5" fill="#42b3c2" textLength="386.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                       Tor exit nodes         </text>
+<text x="658.8" y="313.5" fill="#42b3c2" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">[ OFF ]</text>
+<text x="717.6" y="313.5" fill="#42b3c2" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> not fetched           │</text>
+<text x="12.0" y="331.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="349.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌Summary───────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="367.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Sites discovered: 2                                                                                       │</text>
+<text x="12.0" y="385.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Bot list sources: 3 up to date, 0 need updating                                                           │</text>
+<text x="12.0" y="403.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Firewall rules: 6506 to write (press f)                                                                   │</text>
+<text x="12.0" y="421.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="439.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌Scheduled tasks (internal cron — runs only while this TUI is open)────────────────────────────────────────┐</text>
+<text x="12.0" y="457.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Update crawler IP ranges: last ran 44m ago, 4 sources, 21,904 ranges                                      │</text>
+<text x="12.0" y="475.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Block SSH scanners: last ran 3m ago, due now                                                              │</text>
+<text x="12.0" y="493.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Block web scanners: last ran 3m ago, due now                                                              │</text>
+<text x="12.0" y="511.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Block forged crawler UAs: last ran 3m ago, due now                                                        │</text>
+<text x="12.0" y="529.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Block probe paths: last ran 3m ago, due now                                                               │</text>
+<text x="12.0" y="547.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Block honeypot hits: last ran never, due now                                                              │</text>
+<text x="12.0" y="565.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Block asset-less clients: last ran never, due now                                                         │</text>
+<text x="12.0" y="583.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Block rotating user agents: last ran never, due now                                                       │</text>
+<text x="12.0" y="601.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│Block referer-less crawling: last ran never, due now                                                      │</text>
+<text x="12.0" y="619.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="637.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌Messages──────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="655.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│No recent actions.                                                                                        │</text>
+<text x="12.0" y="673.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="691.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">q quit  Tab/Shift+Tab/←→ switch  d/b/s/p jump  ? help  c theme (dark)                                       </text>
+</svg>

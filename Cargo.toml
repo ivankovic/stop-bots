@@ -39,6 +39,9 @@ exclude = [
     # nobody downloading the crate can use.
     "tests/container",
     "tests/container.rs",
+    # Distribution packaging: PKGBUILDs and an ebuild that consume the
+    # published artefacts. Of no use to anyone who already has the crate.
+    "packaging/",
 ]
 
 [dependencies]

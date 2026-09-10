@@ -1,0 +1,26 @@
+# Kept deliberately quiet: this is a one-maintainer project, and a PR per patch
+# release of a transitive crate is how a security tool ends up with a stale
+# dependency tree that nobody reads any more.
+#
+# Weekly, grouped, and only the two ecosystems that actually ship here.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for everything routine. A major bump still comes on its own,
+      # because that is the one that needs reading.
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # The workflows pin action majors (`@v4`, `@v2`); this is what moves them.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

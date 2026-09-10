@@ -1,0 +1,27 @@
+# Maintainer: Marko Ivankovic <marko@ivankovic.me>
+pkgname=stop-bots-bin
+_pkgname=stop-bots
+pkgver=0.0.1
+pkgrel=1
+pkgdesc="A TUI that helps you configure your server to stop bad bots and still allow good bots (prebuilt binary)"
+arch=('x86_64')
+url="https://github.com/ivankovic/stop-bots"
+license=('AGPL-3.0-or-later')
+depends=('gcc-libs')
+provides=("$_pkgname=$pkgver")
+conflicts=("$_pkgname")
+optdepends=('nginx: to apply the generated site blocking rules'
+            'nftables: to apply the generated firewall script'
+            'iptables: alternative firewall backend')
+_tarball="$_pkgname-$pkgver-x86_64-unknown-linux-gnu"
+source=("$_tarball.tar.gz::$url/releases/download/v$pkgver/$_tarball.tar.gz")
+# The release workflow publishes a .sha256 next to the tarball; paste its
+# digest here rather than trusting a fresh download.
+sha256sums=('SKIP')  # replace before submitting: see packaging/README.md
+
+package() {
+  cd "$_tarball"
+  install -Dm0755 "$_pkgname" "$pkgdir/usr/bin/$_pkgname"
+  install -Dm0644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+  install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE"
+}

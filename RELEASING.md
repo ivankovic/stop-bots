@@ -43,7 +43,15 @@ step 3.
    cargo fmt --check
    cargo clippy --all-targets -- -D warnings
    cargo test
+   cargo llvm-cov --workspace --fail-under-lines 93 --summary-only
    cargo publish --dry-run
+   ```
+
+   And, if any screen's layout changed, regenerate the README's screenshots and
+   commit the diff — CI does not do this for you:
+
+   ```
+   make screenshots
    ```
 
    `--dry-run` matters: it builds the crate *from the packaged tarball*, which is the only
@@ -82,6 +90,11 @@ step 3.
    cargo publish
    ```
 
+7. **Update the distribution packages.** They consume artefacts that only exist once
+   steps 5 and 6 are done — the GitHub release tarball and the crates.io `.crate` —
+   so they are genuinely last, not merely listed last. `packaging/README.md` has the
+   checksum commands and the submission steps for each.
+
 If something is wrong before step 6, delete the tag and the release, fix it, and start
 again:
 
@@ -110,3 +123,16 @@ deliberately is a prerequisite for `1.0.0`.
 
 The MSRV in `Cargo.toml` (`rust-version`) is enforced by a dedicated CI job. Raising it is
 a breaking change; a dependency raising *its* MSRV shows up as that job going red.
+
+## The README's claims
+
+Three things in `README.md` are only true after a release, and all three are checked
+by something rather than by memory:
+
+- **`cargo install stop-bots`** works only once `cargo publish` has run. Until then
+  the crates.io badge renders as an error, which is the visible reminder.
+- **The releases link** is empty until the first tag is pushed.
+- **The coverage badge** claims a floor that the `coverage` CI job enforces with
+  `--fail-under-lines`.
+
+The first two are why the announcement goes out after step 6, not before it.
