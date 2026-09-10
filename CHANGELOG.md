@@ -9,6 +9,33 @@ need.
 
 ### Added
 
+- **A web UI — `stop-bots web`.** The same five screens as the TUI, in a browser.
+
+  It binds `127.0.0.1:8787` and generates a password on first run, printed once.
+  Reach it over an SSH tunnel (`ssh -L 8787:127.0.0.1:8787 host`); binding anything
+  else needs `--expose` as well, because the console can rewrite the firewall and the
+  NGINX config of the host it runs on.
+
+  There is a password, a CSRF token and a `Host` allowlist even on loopback, because
+  loopback is reachable by every local user on the box and by any page in the admin's
+  own browser — a form post needs no readable response, and DNS rebinding defeats
+  same-origin. The `Host` allowlist is what makes rebinding fail.
+
+  It refuses to block the address you are connected from, writes the firewall script
+  but never runs it, and does not offer to unblock something a downloaded list blocked.
+  The Help screen lists each omission with its reason.
+
+- **Configurable NGINX test and reload commands** — `stop-bots set-nginx-commands`.
+  For NGINX in a container, where the config is on a bind mount this tool can write but
+  `systemctl reload nginx` reloads nothing:
+
+  ```
+  stop-bots set-nginx-commands --test "docker exec web nginx -t" \
+                               --reload "docker exec web nginx -s reload"
+  ```
+
+  The command is split into words and run directly, never through a shell.
+
 - `update-ip-ranges`, `update-country-ranges` and `update-reputation-source` take a
   `--source <file>` override, parsing the same format the server would have sent —
   matching what `update-bot-lists` already had. For a host with no outbound access, and

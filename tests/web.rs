@@ -22,15 +22,103 @@ use tower::ServiceExt;
 
 /// A router over a fresh database, plus the password that opens it.
 fn app() -> (Router, String, tempfile::TempDir) {
+    let (router, password, tmp, _) = app_with_db();
+    (router, password, tmp)
+}
+
+/// The same, keeping the database path so a test can open a second
+/// connection and check what a handler actually wrote. SQLite is perfectly
+/// happy with two connections to one file, and reading the result back
+/// through the real database is what makes these tests assertions about
+/// behaviour rather than about status codes.
+fn app_with_db() -> (Router, String, tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
-    let db = Db::open(tmp.path().join("db.sqlite3")).unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db = Db::open(&db_path).unwrap();
     let password = stop_bots::web::auth::generate_password().unwrap();
     stop_bots::web::auth::set_password(&db, &password).unwrap();
+    stop_bots::botlist::register_all_sources(&db).unwrap();
+    stop_bots::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+    drop(db);
+
+    let nginx_root = tmp.path().join("nginx");
+    std::fs::create_dir_all(nginx_root.join("sites-enabled")).unwrap();
 
     // `apply_for_real: false` throughout — a test must never reload the
     // developer's NGINX or run a firewall script at them.
-    let state = AppState::new(db, tmp.path().join("nginx"), None, false);
-    (server::router(state), password, tmp)
+    let state = AppState::new(Db::open(&db_path).unwrap(), nginx_root, None, false);
+    (server::router(state), password, tmp, db_path)
+}
+
+/// Posts a form with the session's CSRF token, and returns the flash
+/// message the redirect carries.
+///
+/// The message is the handler's own account of what it did, so asserting
+/// on it is asserting on the outcome the operator is shown — not on a
+/// status code that a refusal and a success would share.
+async fn act(
+    app: &Router,
+    cookie: &str,
+    csrf: &str,
+    path: &str,
+    body: &str,
+) -> (StatusCode, String) {
+    let full = if body.is_empty() {
+        format!("csrf={csrf}")
+    } else {
+        format!("csrf={csrf}&{body}")
+    };
+    let response = app
+        .clone()
+        .oneshot(with_cookie(post(path, &full), cookie))
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+
+    // The flash rides in the query string; decode enough of it to read.
+    let flash = location
+        .split_once("flash=")
+        .map(|(_, rest)| rest.split('&').next().unwrap_or_default().to_string())
+        .map(|raw| percent_decode(&raw))
+        .unwrap_or_default();
+    (status, flash)
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                match u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap(), 16) {
+                    Ok(byte) => {
+                        out.push(byte);
+                        i += 3;
+                    }
+                    Err(_) => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn get(path: &str) -> Request<Body> {
@@ -438,4 +526,771 @@ async fn the_login_page_uses_no_inline_event_handler() {
     let (app, _password, _tmp) = app();
     let html = body_string(app.oneshot(get("/login")).await.unwrap()).await;
     assert!(!html.contains("onclick="), "was: {html}");
+}
+
+// ---- actions: what the handlers actually write ----
+//
+// Every one of these reads the result back out of the database through a
+// second connection, rather than trusting a 303. A refusal and a success
+// are both redirects; the difference is what changed and what the operator
+// is told.
+
+use stop_bots::db::{BotStatus, Category, GeoMode, Policy};
+
+#[tokio::test]
+async fn setting_a_category_default_is_stored_and_reported() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (status, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/category",
+        "category=ai&policy=allowed",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(
+        flash.contains("AI bots"),
+        "the message names the category: {flash}"
+    );
+
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(
+        db.get_category_default(Category::Ai).unwrap(),
+        Policy::Allowed
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_category_changes_nothing() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let before = Db::open(&db_path)
+        .unwrap()
+        .get_category_default(Category::Ai)
+        .unwrap();
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/category",
+        "category=wat&policy=allowed",
+    )
+    .await;
+    assert!(flash.contains("not a category"), "was: {flash}");
+
+    assert_eq!(
+        Db::open(&db_path)
+            .unwrap()
+            .get_category_default(Category::Ai)
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn the_geo_mode_and_country_selection_round_trip() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    act(&app, &cookie, &csrf, "/geo-mode", "mode=allowlist").await;
+    act(&app, &cookie, &csrf, "/geo-add", "country=cn").await;
+
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Allowlist);
+    assert_eq!(
+        db.list_selected_countries().unwrap(),
+        ["CN"],
+        "a lowercase code is normalised, not rejected"
+    );
+    drop(db);
+
+    act(&app, &cookie, &csrf, "/geo-remove", "country=CN").await;
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .list_selected_countries()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_country_that_is_not_a_two_letter_code_is_refused() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    for bad in ["england", "c", "1"] {
+        let (_, flash) = act(&app, &cookie, &csrf, "/geo-add", &format!("country={bad}")).await;
+        assert!(flash.contains("two-letter"), "{bad} gave: {flash}");
+    }
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .list_selected_countries()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_detector_can_be_switched_on_and_given_a_ttl() {
+    use stop_bots::protection::Detector;
+
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let detector = Detector::ALL[0];
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/detector",
+        &format!("detector={}&enabled=1", detector.id()),
+    )
+    .await;
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/detector-ttl",
+        &format!("detector={}&days=9", detector.id()),
+    )
+    .await;
+
+    let db = Db::open(&db_path).unwrap();
+    assert!(detector.is_enabled(&db).unwrap());
+    assert_eq!(detector.ttl_days(&db).unwrap(), 9);
+}
+
+#[tokio::test]
+async fn a_zero_day_ttl_is_refused() {
+    use stop_bots::protection::Detector;
+
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let detector = Detector::ALL[0];
+    let before = detector.ttl_days(&Db::open(&db_path).unwrap()).unwrap();
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/detector-ttl",
+        &format!("detector={}&days=0", detector.id()),
+    )
+    .await;
+    assert!(flash.contains("at least a day"), "was: {flash}");
+    assert_eq!(
+        detector.ttl_days(&Db::open(&db_path).unwrap()).unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
+async fn a_reputation_feed_can_be_switched_on() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let id = Db::open(&db_path)
+        .unwrap()
+        .list_reputation_sources()
+        .unwrap()[0]
+        .id
+        .clone();
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/feed",
+        &format!("feed={id}&enabled=1"),
+    )
+    .await;
+
+    let enabled = Db::open(&db_path)
+        .unwrap()
+        .list_reputation_sources()
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap()
+        .enabled;
+    assert!(enabled);
+}
+
+#[tokio::test]
+async fn writing_the_firewall_script_produces_a_file_and_records_the_signature() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    Db::open(&db_path)
+        .unwrap()
+        .block_address_permanently("192.0.2.10")
+        .unwrap();
+
+    let out = tmp.path().join("firewall.sh");
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/render-firewall",
+        &format!("out={}&backend=nftables", out.display()),
+    )
+    .await;
+
+    assert!(flash.contains("Wrote"), "was: {flash}");
+    let script = std::fs::read_to_string(&out).expect("the script must exist on disk");
+    assert!(script.contains("192.0.2.10"), "script was:\n{script}");
+    assert!(
+        Db::open(&db_path)
+            .unwrap()
+            .get_firewall_rendered_signature()
+            .unwrap()
+            .is_some(),
+        "recording the signature is what stops the Dashboard calling it stale straight away"
+    );
+}
+
+#[tokio::test]
+async fn writing_the_firewall_script_needs_somewhere_to_write_it() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/render-firewall",
+        "out=&backend=nftables",
+    )
+    .await;
+    assert!(flash.contains("path"), "was: {flash}");
+}
+
+#[tokio::test]
+async fn a_bot_override_is_stored() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let db = Db::open(&db_path).unwrap();
+    db.upsert_bot(&stop_bots::db::NewBot {
+        slug: "gptbot".into(),
+        name: "GPTBot".into(),
+        is_ai: true,
+        is_search_engine: false,
+        is_scanner: false,
+        user_agent_pattern: "gptbot".into(),
+        source_id: "well-known-bots".into(),
+    })
+    .unwrap();
+    drop(db);
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/bots/status",
+        "slug=gptbot&status=blocked",
+    )
+    .await;
+
+    let status = Db::open(&db_path)
+        .unwrap()
+        .list_bots()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.slug == "gptbot")
+        .unwrap()
+        .status;
+    assert_eq!(status, BotStatus::Blocked);
+}
+
+// ---- sites ----
+
+/// Writes a site config under the router's NGINX root and returns its path.
+fn write_site(tmp: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    let path = tmp.path().join("nginx/sites-enabled").join(name);
+    std::fs::write(
+        &path,
+        format!("server {{\n    listen 80;\n    server_name {name};\n}}\n"),
+    )
+    .unwrap();
+    path
+}
+
+#[tokio::test]
+async fn scanning_finds_the_sites_on_disk() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    write_site(&tmp, "shop.example.com");
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    assert!(flash.contains("2 site"), "was: {flash}");
+
+    let names: Vec<String> = Db::open(&db_path)
+        .unwrap()
+        .list_sites()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.server_name)
+        .collect();
+    assert!(names.contains(&"example.com".to_string()), "got: {names:?}");
+}
+
+#[tokio::test]
+async fn the_nginx_settings_round_trip() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/sites/block-response",
+        "response=444",
+    )
+    .await;
+    act(&app, &cookie, &csrf, "/sites/robots", "enabled=1").await;
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/sites/rate-limit",
+        "enabled=1&rps=7&burst=21",
+    )
+    .await;
+
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(db.get_block_response().unwrap().stored(), "444");
+    assert!(db.get_serve_robots_txt().unwrap());
+    assert!(db.get_rate_limit_enabled().unwrap());
+    assert_eq!(db.get_rate_limit_rps().unwrap(), 7);
+    assert_eq!(db.get_rate_limit_burst().unwrap(), 21);
+}
+
+#[tokio::test]
+async fn a_rate_limit_of_zero_is_refused() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/sites/rate-limit",
+        "enabled=1&rps=0&burst=5",
+    )
+    .await;
+    assert!(flash.contains("at least 1"), "was: {flash}");
+    assert!(
+        !Db::open(&db_path)
+            .unwrap()
+            .get_rate_limit_enabled()
+            .unwrap(),
+        "a refused save must not switch it on"
+    );
+}
+
+#[tokio::test]
+async fn applying_writes_the_rule_into_the_site_config() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let path = write_site(&tmp, "example.com");
+
+    // Something to block, or an apply writes nothing.
+    let db = Db::open(&db_path).unwrap();
+    db.upsert_bot(&stop_bots::db::NewBot {
+        slug: "gptbot".into(),
+        name: "GPTBot".into(),
+        is_ai: true,
+        is_search_engine: false,
+        is_scanner: false,
+        user_agent_pattern: "GPTBot".into(),
+        source_id: "well-known-bots".into(),
+    })
+    .unwrap();
+    db.set_bot_status("gptbot", BotStatus::Blocked).unwrap();
+    drop(db);
+
+    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+    let (_, flash) = act(&app, &cookie, &csrf, "/sites/apply", &format!("id={id}")).await;
+
+    assert!(flash.contains("Applied"), "was: {flash}");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        written.contains("GPTBot"),
+        "the blocking rule should be in the config now:\n{written}"
+    );
+    assert!(
+        flash.contains("--no-apply"),
+        "the message must say NGINX was not reloaded: {flash}"
+    );
+}
+
+#[tokio::test]
+async fn applying_to_every_site_touches_all_of_them() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let first = write_site(&tmp, "a.example");
+    let second = write_site(&tmp, "b.example");
+
+    let db = Db::open(&db_path).unwrap();
+    db.upsert_bot(&stop_bots::db::NewBot {
+        slug: "gptbot".into(),
+        name: "GPTBot".into(),
+        is_ai: true,
+        is_search_engine: false,
+        is_scanner: false,
+        user_agent_pattern: "GPTBot".into(),
+        source_id: "well-known-bots".into(),
+    })
+    .unwrap();
+    db.set_bot_status("gptbot", BotStatus::Blocked).unwrap();
+    drop(db);
+
+    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    act(&app, &cookie, &csrf, "/sites/apply-all", "").await;
+
+    for path in [first, second] {
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("GPTBot"),
+            "{} was:\n{written}",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_site_detail_page_renders_and_its_overrides_stick() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+
+    let page = app
+        .clone()
+        .oneshot(with_cookie(get(&format!("/sites/{id}")), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(body_string(page).await.contains("example.com"));
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/sites/{id}/category"),
+        "category=ai&policy=blocked",
+    )
+    .await;
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/sites/{id}/exempt-add"),
+        "path=/blog",
+    )
+    .await;
+
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(
+        db.get_site_category_override(id, Category::Ai).unwrap(),
+        Some(Policy::Blocked)
+    );
+    assert_eq!(db.site_path_exemptions(id).unwrap(), ["/blog"]);
+    drop(db);
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/sites/{id}/exempt-remove"),
+        "path=/blog",
+    )
+    .await;
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .site_path_exemptions(id)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn an_exemption_that_is_not_a_path_is_refused() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/sites/{id}/exempt-add"),
+        "path=blog",
+    )
+    .await;
+    assert!(flash.contains("start with"), "was: {flash}");
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .site_path_exemptions(id)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_request_shape_rule_can_be_switched_on_for_one_site() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+
+    let rule = stop_bots::nginx::RequestRule::ALL[1];
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/sites/{id}/rule"),
+        &format!("rule={}&enabled=1", rule.id()),
+    )
+    .await;
+
+    assert_eq!(
+        Db::open(&db_path).unwrap().site_request_rules(id).unwrap(),
+        [rule.id()]
+    );
+}
+
+// ---- dynamic protection ----
+
+#[tokio::test]
+async fn blocking_and_unblocking_an_address_round_trips() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/dynamic/block-address",
+        "address=192.0.2.55",
+    )
+    .await;
+    assert!(
+        Db::open(&db_path)
+            .unwrap()
+            .list_firewall_rules()
+            .unwrap()
+            .iter()
+            .any(|r| r.address == "192.0.2.55"),
+        "the rule should be stored"
+    );
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/dynamic/unblock-address",
+        "address=192.0.2.55",
+    )
+    .await;
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .list_firewall_rules()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn blocking_and_unblocking_a_user_agent_round_trips() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/dynamic/block-ua",
+        "user_agent=curl%2F8.5.0",
+    )
+    .await;
+    assert_eq!(
+        Db::open(&db_path)
+            .unwrap()
+            .list_blocked_user_agents()
+            .unwrap(),
+        ["curl/8.5.0"]
+    );
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/dynamic/unblock-ua",
+        "user_agent=curl%2F8.5.0",
+    )
+    .await;
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .list_blocked_user_agents()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn the_dynamic_screen_filters_are_all_reachable() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    for filter in ["all", "pending", "blocked", "nonsense"] {
+        let response = app
+            .clone()
+            .oneshot(with_cookie(
+                get(&format!("/dynamic?filter={filter}")),
+                &cookie,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "filter={filter}");
+    }
+}
+
+#[tokio::test]
+async fn searching_the_bot_list_is_reachable_from_the_url() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let response = app
+        .oneshot(with_cookie(get("/bots?q=gpt"), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// The anti-lockout guard, through the router.
+///
+/// `ConnectInfo` is normally supplied by the listener, which these tests do
+/// not use — so it is inserted into the request's extensions directly,
+/// which is exactly where the middleware reads it from. That keeps the
+/// guard under test rather than the plumbing that feeds it.
+fn from_peer(mut request: Request<Body>, peer: &str) -> Request<Body> {
+    let addr: std::net::SocketAddr = peer.parse().unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(addr));
+    request
+}
+
+#[tokio::test]
+async fn blocking_the_address_you_are_connected_from_is_refused() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let request = from_peer(
+        with_cookie(
+            post(
+                "/dynamic/block-address",
+                &format!("csrf={csrf}&address=203.0.113.5"),
+            ),
+            &cookie,
+        ),
+        "203.0.113.5:44321",
+    );
+    let response = app.clone().oneshot(request).await.unwrap();
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+
+    assert!(
+        percent_decode(location).contains("lock you out"),
+        "location was: {location}"
+    );
+    assert!(
+        Db::open(&db_path)
+            .unwrap()
+            .list_firewall_rules()
+            .unwrap()
+            .is_empty(),
+        "the refusal has to actually prevent the write, not just word it differently"
+    );
+}
+
+#[tokio::test]
+async fn blocking_a_different_address_from_the_same_peer_still_works() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let request = from_peer(
+        with_cookie(
+            post(
+                "/dynamic/block-address",
+                &format!("csrf={csrf}&address=198.51.100.9"),
+            ),
+            &cookie,
+        ),
+        "203.0.113.5:44321",
+    );
+    app.clone().oneshot(request).await.unwrap();
+
+    assert_eq!(
+        Db::open(&db_path)
+            .unwrap()
+            .list_firewall_rules()
+            .unwrap()
+            .len(),
+        1,
+        "the guard must only refuse the caller's own address"
+    );
+}
+
+/// With a proxy in front, the peer is the proxy. The guard follows
+/// `X-Forwarded-For` — but only once the operator has said a proxy exists,
+/// because otherwise the header is just text anyone can send.
+#[tokio::test]
+async fn a_forwarded_address_is_only_believed_when_configured() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let attempt = |app: Router, cookie: String, csrf: String| async move {
+        let mut request = from_peer(
+            with_cookie(
+                post(
+                    "/dynamic/block-address",
+                    &format!("csrf={csrf}&address=203.0.113.77"),
+                ),
+                &cookie,
+            ),
+            "127.0.0.1:5000",
+        );
+        request
+            .headers_mut()
+            .insert("x-forwarded-for", "203.0.113.77".parse().unwrap());
+        let response = app.oneshot(request).await.unwrap();
+        percent_decode(response.headers()[header::LOCATION].to_str().unwrap())
+    };
+
+    // Untrusted: the header is ignored, so the block goes through.
+    let flash = attempt(app.clone(), cookie.clone(), csrf.clone()).await;
+    assert!(
+        flash.contains("Blocked"),
+        "an untrusted forwarded header must not be able to veto a block: {flash}"
+    );
+
+    let db = Db::open(&db_path).unwrap();
+    db.unblock_address("203.0.113.77").unwrap();
+    db.set_bool_setting(stop_bots::web::TRUST_FORWARDED_KEY, true)
+        .unwrap();
+    drop(db);
+
+    // Trusted: now it names the client, and the guard fires.
+    let flash = attempt(app, cookie, csrf).await;
+    assert!(flash.contains("lock you out"), "was: {flash}");
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .list_firewall_rules()
+        .unwrap()
+        .is_empty());
 }

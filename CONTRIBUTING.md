@@ -69,7 +69,7 @@ it just doesn't report per-test time.
 
 ### Coverage
 
-93% of lines, measured with `cargo llvm-cov --summary-only --workspace`. That figure
+92.8% of lines, measured with `cargo llvm-cov --summary-only --workspace`. That figure
 *understates* it: the container suite (`make test-containers`) runs a binary inside Docker,
 so its coverage never comes back.
 
@@ -77,8 +77,8 @@ It is a check, not a boast — but the check and the achieved figure are deliber
 different numbers. CI runs the same command with `--fail-under-lines 90`, and the badge
 at the top of the README claims that **floor**, not this snapshot.
 
-A floor set at today's figure would be a trap rather than a check. 93.29% of 16,012 lines
-leaves 47 uncovered lines of headroom — one ordinary function landing slightly
+A floor set at today's figure would be a trap rather than a check. 92.8% of ~19,000 lines
+leaves only a few hundred uncovered lines of headroom — one ordinary function landing slightly
 under-tested turns CI red on an unrelated pull request, and the quickest fix at that point
 is to edit the floor down, which is exactly the rot the floor exists to prevent. 90% is
 low enough to survive normal development and high enough that a real collapse is a red
@@ -121,6 +121,46 @@ Ideally, the real implementation is used. Where it can't be, in order of prefere
 
 The pty harness that drives the TUI end to end lives in tests/tui.rs itself (on raw `libc`);
 see the comment there for why it isn't a crate.
+
+### The web UI
+
+`src/web/` is a third front-end over the same core as the CLI and the TUI. Nothing
+in it knows how to block a bot — `nginx`, `firewall`, `dynamic`, `protection` and
+`cron` already carry those decisions, because the other two front-ends needed them.
+A behaviour that belongs to the product goes in one of those, not in a handler.
+
+**All database work goes through `AppState::with_db`.** `Db` wraps a
+`rusqlite::Connection`, which is `Send` but not `Sync`, so it cannot be shared
+across concurrent handlers as it stands. `with_db` runs the closure inside
+`spawn_blocking` and takes and drops the guard entirely within it — the same rule
+`app.rs` follows for the TUI's event loop. It uses a `std::sync::Mutex` rather than
+a tokio one on purpose: the std guard is not `Send`, so holding one across an
+`.await` is a compile error rather than a stalled runtime.
+
+Read a whole screen's view in **one** `with_db` call. Each call is a
+`spawn_blocking` hop and a lock acquisition, and a page assembled from a dozen of
+them can show two halves of two different states. Anything slow that is not a
+database read — a bot-list download, say — happens *outside* the lock.
+
+**Every mutating form needs `layout::csrf_field`.** The server rejects a post
+without it either way; the helper is what makes the correct path the short one.
+Several screens have a test asserting that the number of POST forms on the page
+equals the number of tokens, which is the cheapest way to catch a new form that
+forgot.
+
+**No inline event handlers.** The Content-Security-Policy allows the one inline
+script by hash, and a hash does not cover an `onclick` — that needs
+`unsafe-hashes`, which is the hole hashing avoids. Attach handlers from the hashed
+script in `layout.rs`; `tests/web.rs` fails the build if a page carries one.
+
+Run it against a throwaway database while working on it:
+
+```
+cargo run -- web --db /tmp/stop-bots-dev.db --root ./tests/fixtures/nginx --no-apply
+```
+
+`--no-apply` is the important half: without it, applying a site reloads the NGINX
+on your development machine.
 
 ### Screenshots
 
@@ -197,6 +237,9 @@ Some directories don't exist yet but should be created if the need arises.
         |- ipranges/      <- Crawler, country and third-party IP-range fetching/storage
         |- batch.rs       <- Batch mode: one unattended pass, for a real crontab
         |- cron.rs        <- The internal cron: which background jobs run how often
+        |- dynamic.rs     <- What is hitting the server now, shared by the TUI and web screens
+        |- web.rs         <- Web UI: bind address, exposure policy, Host allowlist
+        |- web/           <- One file per web screen, plus auth, state, layout and the router
         |- firewall.rs    <- Shared firewall-rendering logic (lockout safety, script writing)
         |- iptables.rs    <- iptables script generation
         |- nftables.rs    <- nftables script generation

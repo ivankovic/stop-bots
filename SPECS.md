@@ -3493,3 +3493,184 @@ spawn itself: four `App::start_*` methods, `parse_off_thread`, and
 a local HTTP server, which tests `reqwest` rather than this project. The
 `--source` overrides are the better answer to the same question, and they
 ship as a feature rather than as scaffolding.
+
+## Configurable NGINX test and reload commands (`nginx::NginxCommands`, `set-nginx-commands`)
+
+`test_config` ran `nginx -t` and `reload` ran `systemctl reload nginx`, both
+hardcoded. That is right for a host install and wrong for the deployment that
+prompted this: NGINX in a container, with its config on a bind mount this tool
+writes to. The files are ours to edit, but there is no unit to reload, and the
+host's `nginx -t` — if it exists at all — validates a different config than the
+one the container will read.
+
+Two settings, `nginx:test_command` and `nginx:reload_command`, defaulting to
+exactly what every caller got before. `NginxCommands::from_db` resolves them on
+the main thread; the blocking half receives the resolved argv, because by the
+rule in `app.rs` that half cannot reach a `Db`.
+
+**The command is never handed to a shell**, and that is the security-relevant
+decision rather than a stylistic one. `split_command` handles whitespace and
+quoted arguments and nothing else; `;`, `|`, `&&`, globs and `$VAR` stay
+ordinary characters inside a word, with a test asserting it. This program runs
+as root, and the settings table became reachable from a web UI in the same
+release — `sh -c` here would have turned a settings row into arbitrary code
+execution.
+
+**A stored command that no longer parses is an error, not a fallback.** Quietly
+reloading the host's NGINX because the container command had an unbalanced
+quote is the precise surprise worth failing over. `set-nginx-commands` parses
+before it stores, so the rejection lands while a human is watching rather than
+at the next cron run.
+
+Tested through the existing fake-executables harness, with `docker` added to
+it. The assertion is on the whole call log, so a fallback to the host's `nginx`
+or `systemctl` fails the test rather than passing unnoticed.
+
+## Web UI (`src/web/`, `stop-bots web`)
+
+A third front-end over the same core as the CLI and the TUI. Nothing under
+`src/web/` knows how to block a bot: `nginx`, `firewall`, `dynamic`,
+`protection` and `cron` already carry every decision this project makes,
+because the CLI and the TUI both needed them.
+
+### Why a password on a loopback-only server
+
+The bind default is `127.0.0.1:8787`, and "bound to loopback" is not the same
+as "only reachable by the admin". Two ways in that need no network access:
+
+- **Every local user on the box** can open it — a shared host, a CI runner,
+  anything else running there.
+- **The admin's own browser.** A page on any origin can POST to loopback; a
+  form post needs no readable response, so same-origin policy does not stop it.
+  DNS rebinding removes even that limit, by making a hostile name resolve to
+  127.0.0.1 — at which point the attacker's page *is* same-origin.
+
+So four guards, in this order: a `Host` allowlist, security headers, the
+session, then CSRF. The allowlist is specifically the rebinding defence — an
+attacker's page cannot change the `Host` header the browser sends, so a request
+arriving as `evil.example` is one that got here by having that name point at
+us, and is refused before any handler runs. Loopback names are allowed without
+configuration; anything else has to be listed, which is the price of putting
+the console on a hostname.
+
+Argon2id for the password, generated on first run and shown once. Generated
+rather than prompted: nobody picks a good password for a service they are about
+to leave running. Sessions live in memory, so a restart logs everyone out —
+for a process that rewrites firewall rules, that is the safer default and the
+cost is one login.
+
+### Exposure is opt-in twice
+
+A non-loopback bind needs `--expose` (or the `web:expose` setting) on top of
+`--bind`. The refusal names the SSH tunnel as the alternative, because that is
+the recommendation: `ssh -L 8787:127.0.0.1:8787 host` gets a remote admin to
+the console without putting it on the network at all.
+
+### Threading
+
+`Db` wraps a `rusqlite::Connection`, which is `Send` but not `Sync`.
+`AppState::with_db` is the only door to it, and enforces the same rule `app.rs`
+follows for the TUI's event loop: the work happens inside `spawn_blocking`, and
+the mutex guard never crosses an `.await`.
+
+A `std::sync::Mutex` rather than a `tokio::sync::Mutex`, deliberately. A tokio
+mutex exists to be held across `.await`, which is exactly what must never
+happen here — `rusqlite` blocks its thread, so a guard held across a suspension
+point would stall the runtime. The std guard is not `Send`, so the mistake is a
+compile error at the point someone tries to make it.
+
+A connection pool was the other answer and is the wrong one: SQLite serialises
+writes anyway, and a second connection buys contention handling for a workload
+that is one operator clicking buttons.
+
+Each screen reads its whole view in **one** `with_db` call. Every call is a
+`spawn_blocking` hop and a lock acquisition, and a page assembled from a dozen
+of them can show two halves of two different states. The exception is a bot-list
+update, which fetches *outside* the lock and takes it only to store — a network
+request under the single lock would stall every other request in the console for
+as long as the publisher takes to answer.
+
+### The anti-lockout guard
+
+`firewall::assess_lockout_risk` protects SSH. The web UI needs the same guard
+for a sharper reason: blocking the address your own browser is connected from
+takes away the console you would use to undo it, and unlike SSH there is no
+second way in that this tool is not also managing.
+
+The address compared against is the socket peer, or the leftmost
+`X-Forwarded-For` entry when the peer is loopback **and** the operator has set
+`web:trust_forwarded_for`. Both conditions, not either: a forwarded header is
+client-supplied text, and believing it unconditionally would let anyone switch
+the guard off from outside by claiming to be the address they are about to
+block. A `None` client address means the block goes ahead — refusing every
+block because the address is unknown would make the tool useless in exactly the
+deployment where it is most wanted.
+
+### What the UI will not do, and why
+
+- **Apply the firewall script.** It writes it; running it stays manual. A
+  written script is inert, and putting the one operation that can take the host
+  off the network a single click away in a browser is not a trade worth making.
+  The lockout guard still runs at write time, because the script is written to
+  be run later, by which point nobody is watching.
+- **Unblock a row a downloaded list blocked.** The next refresh of that list
+  would silently undo it, so the button is not offered — the honest place to
+  change it is the bot's own setting.
+- **Change the password.** A console whose password can be changed by whoever
+  is already looking at it gains nothing from the change.
+
+### Choice of stack
+
+axum, maud, and vendored htmx; no build step and no JavaScript toolchain.
+`reqwest` already brings `hyper`, `http` and `tower`, so axum costs about four
+net crates. maud checks the HTML at compile time and escapes by default, which
+matters on screens where every bot name and user agent is attacker-supplied
+text.
+
+htmx is checked in with its digest recorded rather than linked from a CDN. An
+administration console for a server under attack should not let a third-party
+origin execute code in the page that rewrites the firewall, and it has to keep
+working on a host with no outbound access — the same constraint `--source`
+answers everywhere else.
+
+### CSP and inline handlers
+
+The Content-Security-Policy is `default-src 'none'` with `frame-ancestors
+'none'`, and allows the one inline script by SHA-256 hash, computed at startup
+from the script itself rather than pasted in — a hash written down by hand goes
+stale the first time someone edits the script, and the symptom is the theme
+toggle silently doing nothing in browsers that enforce CSP.
+
+That hash does **not** cover inline event handlers: `onclick` and `onchange`
+need `unsafe-hashes`, which is the hole hashing was meant to avoid. The first
+draft used both and would have shipped a theme toggle and a set of dropdowns
+that did nothing in any enforcing browser. Handlers are now attached from the
+hashed script, the selects use one delegated `change` listener, and their
+submit buttons are always rendered rather than hidden inside `<noscript>` — the
+auto-submit is an enhancement, and a control that silently does nothing without
+script is worse than one extra button. `tests/web.rs` asserts that no page
+carries an inline handler.
+
+### `crate::dynamic`
+
+Lifted out of `tui/dynamic_protection.rs` when the web UI needed the same
+answers, for the reason `scanblock` and `accessstats` were lifted out before
+it: whether an address counts as blocked is product behaviour, not
+presentation, and two front-ends computing it separately is two front-ends that
+will eventually disagree. What stayed behind is lists, selection and key
+handling. Its tests moved with it.
+
+### Testing
+
+`tests/web.rs` drives the assembled router with `tower::ServiceExt::oneshot` —
+the whole middleware stack runs, without binding a port. There are no mocks:
+the database is real SQLite on a tempdir and the password is really hashed and
+verified.
+
+Argon2 at OWASP-default cost takes ~2s in a debug build, which blew every web
+test's budget and starved the rest of the suite of CPU badly enough that
+unrelated tests were killed. Fixed with `[profile.dev.package.argon2]
+opt-level = 3` (and blake2), not by weakening the parameters — the cost
+parameters are what the tests should be exercising, and a test that hashes with
+settings the product never uses is a test of nothing. 4.8s to 1.1s, and no
+nextest overrides needed.

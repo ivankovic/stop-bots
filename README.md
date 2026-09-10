@@ -6,7 +6,8 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](https://github.com/ivankovic/stop-bots/blob/main/Cargo.toml)
 [![License: AGPL v3+](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](https://github.com/ivankovic/stop-bots/blob/main/LICENSE)
 
-A TUI (and CLI) that helps you configure your server to stop bad bots without hiding behind a CDN.
+A TUI, a web UI and a CLI that help you configure your server to stop bad bots without hiding
+behind a CDN.
 
 It works alongside NGINX and your existing firewall (iptables or nftables), on two separate
 planes:
@@ -47,8 +48,9 @@ much use there.
 
 # Usage
 
-Run the binary with no arguments to launch the TUI, or see `stop-bots --help` for the full
-list of CLI subcommands. The TUI and CLI can be used together. Configure everything in the TUI and
+Run the binary with no arguments to launch the TUI, `stop-bots web` for the same screens in
+a browser (see [The web UI](#the-web-ui)), or see `stop-bots --help` for the full list of
+CLI subcommands. The TUI and CLI can be used together. Configure everything in the TUI and
 then use the CLI in a crontab to keep the rules updated.
 
 You can exit the app, or back out of a popup/submenu, with 'q' or Escape.
@@ -296,6 +298,74 @@ a failed NGINX reload still leaves the firewall applied, and the other way round
 `batch` records each step against the same schedule the TUI's internal cron uses, so the two
 agree about what has already run instead of both doing it, and the Dashboard's "Scheduled
 tasks" panel shows what your real cron did.
+
+# The web UI
+
+`stop-bots web` serves the same five screens in a browser.
+
+```
+stop-bots web
+```
+
+It binds **127.0.0.1:8787** — reachable only from that machine — and prints a generated
+password once, on first run. Reach it from your laptop over an SSH tunnel:
+
+```
+ssh -L 8787:127.0.0.1:8787 your-server
+```
+
+then open <http://127.0.0.1:8787/>.
+
+## Exposing it
+
+Binding anything but loopback takes a second, deliberate flag, because this console can
+rewrite the firewall and the NGINX config of the host it runs on:
+
+```
+stop-bots web --bind 0.0.0.0:8787 --expose --allowed-hosts admin.example.com --save
+```
+
+`--allowed-hosts` is not optional in practice: a request carrying a host name that isn't
+listed is refused. That is what makes DNS rebinding against the console fail, and it is
+why an exposed server reached by name needs the name spelled out.
+
+Put it behind NGINX with TLS — the same NGINX this tool is protecting. If you do, and the
+proxy sets `X-Forwarded-For`, tell the console it may believe that header, or it cannot
+tell which address a request really came from:
+
+```
+stop-bots web --bind 127.0.0.1:8787   # and set web:trust_forwarded_for
+```
+
+## What it will not do
+
+Three things are missing on purpose, and the Help screen says so with the reasons:
+
+- **It writes the firewall script but never runs it.** A written script is inert; running
+  it is the one operation that can take the host off the network, and that is not going
+  behind a button in a browser.
+- **It will not unblock something a downloaded list blocked** — the next refresh of that
+  list would silently undo it.
+- **It will not change its own password.** Use `stop-bots web --set-password` on the host.
+
+It also refuses to block the address you are connected from, which would take away the
+console you'd use to undo it.
+
+## Running NGINX in a container
+
+If NGINX is in Docker and its config is on a bind mount, `systemctl reload nginx` reloads
+nothing. Point the two commands at the container instead — this applies to the CLI and the
+TUI as well:
+
+```
+stop-bots set-nginx-commands \
+  --test   "docker exec web nginx -t" \
+  --reload "docker exec web nginx -s reload"
+```
+
+The command is split into words and run directly. It never goes through a shell, so `;`,
+`|` and `$VAR` are ordinary characters rather than syntax.
+
 
 # Contributing
 
