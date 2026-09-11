@@ -58,6 +58,17 @@ need.
   `fetch_ip_ranges`, `store_ip_ranges`) so the two front-ends run the same code rather
   than two copies that drift. Behaviour in the TUI is unchanged.
 
+- **The web UI puts panels side by side on a wide window**, rather than stacking
+  everything down one 1180px column. Every screen is a grid that collapses back to
+  one column below 1040px, so a narrow window and a phone are unchanged.
+
+  The Dynamic Protection tables — failed SSH logins and top user agents — are
+  capped at twenty rows and scroll inside their panel, with the column headers
+  stuck to the top. On a server that is actually being scanned those tables ran to
+  hundreds of rows and buried everything after them. A user agent too long for its
+  column is now truncated rather than wrapped, so that rows are a uniform height;
+  the whole string is still there as the cell's `title`.
+
 - **Configurable NGINX test and reload commands** — `stop-bots set-nginx-commands`.
   For NGINX in a container, where the config is on a bind mount this tool can write but
   `systemctl reload nginx` reloads nothing:

@@ -91,8 +91,10 @@ pub async fn page(
 
 fn body(view: &View, ctx: &Ctx) -> Markup {
     html! {
-        (nginx_settings_panel(view, ctx))
-        (sites_panel(view, ctx))
+        .cols {
+            (nginx_settings_panel(view, ctx))
+            (sites_panel(view, ctx))
+        }
     }
 }
 
@@ -334,6 +336,8 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
     html! {
         p { a href=(ctx.url("/sites")) { "← All sites" } }
 
+        .cols {
+
         (layout::panel(
             &detail.site.server_name,
             Some(&detail.site.config_path),
@@ -467,6 +471,8 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
                 }
             },
         ))
+
+        }
     }
 }
 

@@ -122,7 +122,10 @@ nav.tabs a[aria-current="page"] {
   font-weight: 600;
 }
 
-main { padding: 20px 16px 64px; max-width: 1180px; margin: 0 auto; }
+/* Wide enough for two comfortable panel columns (see `.cols`) on a
+   laptop, and still narrow enough that a single panel isn't a 2000px
+   line of text on a desktop monitor. */
+main { padding: 20px 16px 64px; max-width: 1440px; margin: 0 auto; }
 
 /* ---- panels ---- */
 
@@ -152,8 +155,23 @@ section.panel > h2 .hint {
 
 .panel-body { padding: 4px 16px 14px; }
 
-.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-@media (max-width: 860px) { .grid-2 { grid-template-columns: 1fr; } }
+/* Panels sit side by side when the window can take two columns, and
+   stack when it can't — one column is the default rather than the
+   exception, so a narrow window and a phone need no special case.
+
+   `align-items: start` is what stops a two-row panel being stretched to
+   the height of the table beside it; without it a grid row is as tall as
+   its tallest cell and every short panel grows a dead area. */
+.cols {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 20px;
+  align-items: start;
+}
+@media (min-width: 1040px) { .cols { grid-template-columns: 1fr 1fr; } }
+/* The grid's `gap` already spaces these; the panel's own margin would
+   make every gap 40px between rows and 20px between columns. */
+.cols > section.panel { margin-bottom: 0; }
 
 /* ---- tables ---- */
 
@@ -177,6 +195,60 @@ tbody tr:hover { background: color-mix(in srgb, var(--fg) 4%, transparent); }
 td.right, th.right { text-align: right; }
 td.num { text-align: right; font-variant-numeric: tabular-nums; }
 td.wrap { word-break: break-all; }
+
+/* ---- tables that scroll rather than run off the page ---- */
+
+/* The SSH and user-agent tables are as long as the logs make them —
+   hundreds of rows on a server that is actually being scanned. Capping
+   them at twenty rows and scrolling inside the panel keeps whatever
+   comes after them reachable, and keeps the two side by side rather than
+   one being a mile below the other.
+
+   The two heights are derived from the padding above, not guessed: a
+   body row is a 13px/1.5 button (19px line box + 12px padding + 2px
+   border) inside a cell with 9px padding either side, plus the 1px rule
+   under it; a header row is a 12px/1.5 label with 10px above and 6px
+   below, plus its rule. If `td`, `th` or `button` padding changes, these
+   have to change with it — the alternative was measuring in JavaScript,
+   which is not worth a second script tag and a second CSP hash. */
+:root {
+  --table-row-h: 52px;
+  --table-head-h: 35px;
+  --table-rows-visible: 20;
+}
+
+.table-scroll {
+  max-height: calc(var(--table-head-h) + var(--table-rows-visible) * var(--table-row-h));
+  overflow-y: auto;
+  /* Reaching the bottom of this shouldn't then start scrolling the page. */
+  overscroll-behavior: contain;
+}
+
+/* Twenty rows down, four unlabelled columns is not a table. */
+.table-scroll thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+}
+
+/* Every row exactly one line tall, which is what makes "twenty rows" a
+   height the arithmetic above can predict. A user agent too long for its
+   column is truncated rather than wrapped, and carries the whole string
+   as its `title`. */
+.table-scroll table { table-layout: fixed; }
+.table-scroll td {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Fixed layout needs its widths stated. Both scrollable tables share a
+   shape — a count, a state pill, the long value, an action — and these
+   are the widths that leave the long value all the rest. */
+.table-scroll col.w-count { width: 92px; }
+.table-scroll col.w-state { width: 122px; }
+.table-scroll col.w-action { width: 136px; }
 
 /* ---- state pills ---- */
 

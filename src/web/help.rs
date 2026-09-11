@@ -80,6 +80,8 @@ pub async fn page(
 
 fn body(view: &View) -> Markup {
     html! {
+        .cols {
+
         (layout::panel(
             "How this console is exposed",
             None,
@@ -257,6 +259,8 @@ fn body(view: &View) -> Markup {
                 }
             },
         ))
+
+        }
     }
 }
 

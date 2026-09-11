@@ -114,6 +114,8 @@ fn body(live: &Live, filter: Filter, ctx: &Ctx) -> Markup {
     html! {
         (filter_bar(filter, ctx))
 
+        .cols {
+
         (layout::panel(
             "Failed SSH logins",
             Some("Addresses that tried to log in and failed"),
@@ -125,20 +127,28 @@ fn body(live: &Live, filter: Filter, ctx: &Ctx) -> Markup {
                         "No addresses match this filter."
                     }))
                 } @else {
-                    table {
-                        thead { tr {
-                            th .right { "Attempts" }
-                            th { "State" }
-                            th { "Address" }
-                            th .right { "Action" }
-                        } }
-                        tbody {
-                            @for row in &ssh {
-                                tr {
-                                    td .num { (row.count) }
-                                    td { (status_pill(row.status)) }
-                                    td .mono { (row.address) }
-                                    td .right { (address_action(row, ctx)) }
+                    .table-scroll {
+                        table {
+                            colgroup {
+                                col .w-count;
+                                col .w-state;
+                                col;
+                                col .w-action;
+                            }
+                            thead { tr {
+                                th .right { "Attempts" }
+                                th { "State" }
+                                th { "Address" }
+                                th .right { "Action" }
+                            } }
+                            tbody {
+                                @for row in &ssh {
+                                    tr {
+                                        td .num { (row.count) }
+                                        td { (status_pill(row.status)) }
+                                        td .mono { (row.address) }
+                                        td .right { (address_action(row, ctx)) }
+                                    }
                                 }
                             }
                         }
@@ -158,20 +168,35 @@ fn body(live: &Live, filter: Filter, ctx: &Ctx) -> Markup {
                         "No user agents match this filter."
                     }))
                 } @else {
-                    table {
-                        thead { tr {
-                            th .right { "Hits" }
-                            th { "State" }
-                            th { "User agent" }
-                            th .right { "Action" }
-                        } }
-                        tbody {
-                            @for row in &uas {
-                                tr {
-                                    td .num { (row.count) }
-                                    td { (status_pill(row.status)) }
-                                    td .wrap .mono { (row.user_agent) }
-                                    td .right { (ua_action(row, ctx)) }
+                    .table-scroll {
+                        table {
+                            colgroup {
+                                col .w-count;
+                                col .w-state;
+                                col;
+                                col .w-action;
+                            }
+                            thead { tr {
+                                th .right { "Hits" }
+                                th { "State" }
+                                th { "User agent" }
+                                th .right { "Action" }
+                            } }
+                            tbody {
+                                @for row in &uas {
+                                    tr {
+                                        // One line, truncated with an
+                                        // ellipsis when it doesn't fit —
+                                        // a wrapped user agent is three
+                                        // rows tall and makes "twenty
+                                        // rows" unpredictable. `title`
+                                        // keeps the whole string a hover
+                                        // away, and in the DOM.
+                                        td .num { (row.count) }
+                                        td { (status_pill(row.status)) }
+                                        td .mono title=(row.user_agent) { (row.user_agent) }
+                                        td .right { (ua_action(row, ctx)) }
+                                    }
                                 }
                             }
                         }
@@ -179,6 +204,8 @@ fn body(live: &Live, filter: Filter, ctx: &Ctx) -> Markup {
                 }
             },
         ))
+
+        }
     }
 }
 
@@ -484,6 +511,89 @@ mod tests {
                 "a form without the token would be rejected: {rendered}"
             );
         }
+    }
+
+    fn live_with(ssh: usize, uas: usize) -> Live {
+        Live {
+            ssh: (0..ssh)
+                .map(|i| SshRow {
+                    address: format!("192.0.2.{i}"),
+                    count: i as u64,
+                    status: RowStatus::Pending,
+                })
+                .collect(),
+            user_agents: (0..uas)
+                .map(|i| UaRow {
+                    user_agent: format!("SomeCrawler/{i}.0"),
+                    count: i as u64,
+                    status: RowStatus::Pending,
+                })
+                .collect(),
+        }
+    }
+
+    /// Both long tables scroll inside their panel rather than running the
+    /// page down to whatever the logs happened to contain. The row cap
+    /// itself is CSS (`--table-rows-visible`); what has to be true of the
+    /// markup is that the wrapper and the fixed-layout column widths are
+    /// there, because without them the cap has nothing to apply to and
+    /// the truncation has no width to truncate against.
+    #[test]
+    fn both_long_tables_are_wrapped_in_a_scroll_container() {
+        let rendered = body(&live_with(40, 40), Filter::All, &Ctx::for_tests()).into_string();
+
+        assert_eq!(
+            rendered.matches(r#"class="table-scroll""#).count(),
+            2,
+            "both tables scroll, or neither does: {rendered}"
+        );
+        assert_eq!(rendered.matches(r#"<col class="w-count">"#).count(), 2);
+        assert_eq!(rendered.matches(r#"<col class="w-action">"#).count(), 2);
+    }
+
+    /// A user agent is truncated to one line so that a row's height is
+    /// predictable, which is only acceptable because the whole string
+    /// stays in the document as the cell's `title`. If that attribute
+    /// ever stops being emitted, truncation starts losing information.
+    #[test]
+    fn a_truncated_user_agent_keeps_the_whole_string_in_its_title() {
+        let long = "Mozilla/5.0 (compatible; SomeVeryLongCrawlerName/9.9; +https://example.com/a-page-about-the-crawler)";
+        let live = Live {
+            ssh: vec![],
+            user_agents: vec![UaRow {
+                user_agent: long.into(),
+                count: 7,
+                status: RowStatus::Pending,
+            }],
+        };
+
+        let rendered = body(&live, Filter::All, &Ctx::for_tests()).into_string();
+
+        assert!(
+            rendered.contains(&format!(r#"title="{long}""#)),
+            "was: {rendered}"
+        );
+    }
+
+    /// The `title` attribute is a second place attacker-controlled text
+    /// reaches markup, and it was added after the escaping test below.
+    #[test]
+    fn a_hostile_user_agent_cannot_break_out_of_the_title_attribute() {
+        let live = Live {
+            ssh: vec![],
+            user_agents: vec![UaRow {
+                user_agent: r#"" autofocus onfocus="alert(1)"#.into(),
+                count: 1,
+                status: RowStatus::Pending,
+            }],
+        };
+
+        let rendered = body(&live, Filter::All, &Ctx::for_tests()).into_string();
+
+        assert!(
+            !rendered.contains(r#"onfocus="alert(1)"#),
+            "the quote must be escaped, not closed: {rendered}"
+        );
     }
 
     #[test]

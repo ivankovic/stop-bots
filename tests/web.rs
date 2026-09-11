@@ -530,6 +530,42 @@ async fn no_page_uses_an_inline_event_handler() {
     }
 }
 
+/// Every screen lays its panels out in the responsive two-column grid, so
+/// that a wide window puts tables side by side instead of stacking them a
+/// screen apart. The breakpoint itself is CSS; what a test can hold is
+/// that no screen was left out of the container that applies it, and that
+/// no panel escaped it — one stray panel outside the grid becomes a
+/// full-width band across an otherwise two-column page.
+#[tokio::test]
+async fn every_screen_lays_its_panels_out_in_the_column_grid() {
+    let (app, password, _tmp) = app();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    for path in ["/", "/bots", "/sites", "/dynamic", "/help"] {
+        let response = app
+            .clone()
+            .oneshot(with_cookie(get(path), &cookie))
+            .await
+            .unwrap();
+        let html = body_string(response).await;
+
+        assert_eq!(
+            html.matches(r#"<div class="cols">"#).count(),
+            1,
+            "{path} has no single column grid"
+        );
+        let (before, inside) = html.split_once(r#"<div class="cols">"#).unwrap();
+        assert!(
+            !before.contains(r#"<section class="panel">"#),
+            "{path} has a panel above its grid"
+        );
+        assert!(
+            inside.contains(r#"<section class="panel">"#),
+            "{path} has a grid with no panels in it"
+        );
+    }
+}
+
 /// The login page too — it is the one page an operator sees before
 /// anything else works.
 #[tokio::test]

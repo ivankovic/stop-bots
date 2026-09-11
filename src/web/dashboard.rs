@@ -119,14 +119,14 @@ pub async fn page(
 
 fn body(view: &View, ctx: &Ctx) -> Markup {
     html! {
-        .grid-2 {
+        .cols {
             (categories_panel(view, ctx))
             (geo_panel(view, ctx))
+            (detectors_panel(view, ctx))
+            (feeds_panel(view, ctx))
+            (summary_panel(view, ctx))
+            (jobs_panel(view))
         }
-        (detectors_panel(view, ctx))
-        (feeds_panel(view, ctx))
-        (summary_panel(view, ctx))
-        (jobs_panel(view))
     }
 }
 

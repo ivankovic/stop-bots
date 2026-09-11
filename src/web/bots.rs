@@ -114,8 +114,10 @@ pub async fn page(
 
 fn body(view: &View, ctx: &Ctx) -> Markup {
     html! {
-        (sources_panel(view, ctx))
-        (bots_panel(view, ctx))
+        .cols {
+            (sources_panel(view, ctx))
+            (bots_panel(view, ctx))
+        }
     }
 }
 

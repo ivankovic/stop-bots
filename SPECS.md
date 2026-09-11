@@ -3682,6 +3682,38 @@ origin execute code in the page that rewrites the firewall, and it has to keep
 working on a host with no outbound access — the same constraint `--source`
 answers everywhere else.
 
+### Layout: two columns, and tables that scroll
+
+Every screen wraps its panels in `.cols`, a grid that is one column by
+default and two above 1040px. One column is the default rather than the
+exception, so a narrow window and a phone need no special case, and adding
+a panel needs no decision about where it goes. `align-items: start` is what
+stops a two-row panel being stretched to the height of the table beside it.
+
+`main` is 1440px wide rather than 1180px, which is what makes two columns
+worth having on a laptop without turning a single panel into a 2000px line
+of text on a desktop monitor.
+
+The two Dynamic Protection tables are as long as the logs make them —
+hundreds of rows on a server that is actually being scanned — so they are
+capped at twenty rows (`--table-rows-visible`) and scroll inside their
+panel, with the header stuck to the top. Without the cap the two tables
+could not usefully sit side by side: one would start a screen below the
+other.
+
+The cap is a `max-height` computed from `--table-row-h`/`--table-head-h`,
+which are derived from the `td`/`th`/`button` padding above them in the
+same file and have to be changed with it. Measuring the real row height
+would mean a second inline script and a second CSP hash, which is not worth
+it for a cap that is a design choice rather than a correctness property.
+
+It does mean rows have to be a predictable height, which is why a user
+agent in a scrollable table is truncated with an ellipsis rather than
+wrapped — a wrapped one is three rows tall, and twenty of them is not
+twenty rows. The whole string stays in the document as the cell's `title`,
+and there is a test for that, because truncation that loses information is
+a different feature from truncation that doesn't.
+
 ### CSP and inline handlers
 
 The Content-Security-Policy is `default-src 'none'` with `frame-ancestors
