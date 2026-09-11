@@ -49,9 +49,11 @@ use crate::web::state::AppState;
 /// hundreds of times — never starts a background task. Tests of the cron
 /// itself call [`tick`].
 ///
-/// The handle is returned so the caller can abort it; dropping it detaches
-/// the task, which is what happens when the server exits and the process
-/// with it.
+/// The handle is returned so `serve` can abort the loop on the one path
+/// where it outlives the server: `axum::serve` returning an error rather
+/// than the process being killed under it. Dropping the handle would
+/// detach the task instead, which is harmless but leaves a tick running
+/// against a database nothing is serving from.
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Checked immediately, then once per interval — not the other way

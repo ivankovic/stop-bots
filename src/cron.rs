@@ -51,7 +51,7 @@
 
 use crate::db::Db;
 use crate::protection::Detector;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One of the background jobs the internal cron schedules.
@@ -333,7 +333,14 @@ fn render_firewall(db: &Db, out_path: &std::path::Path, ssh_log_text: Option<&st
                 );
             }
         }
-        crate::firewall::write_script(out_path, &built.script)?;
+        // Named in the error, because this is the one failure here an
+        // operator has to act on outside stop-bots, and "Permission
+        // denied (os error 13)" on its own doesn't say which file to fix.
+        // The default is under `/etc`, so an unprivileged `stop-bots web`
+        // hits this on every daily run until someone grants the write or
+        // points `render-firewall` somewhere else.
+        crate::firewall::write_script(out_path, &built.script)
+            .with_context(|| format!("could not write {}", out_path.display()))?;
         db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
         Ok(format!(
             "wrote {} rule(s) to {}",
@@ -343,7 +350,10 @@ fn render_firewall(db: &Db, out_path: &std::path::Path, ssh_log_text: Option<&st
     })();
     match result {
         Ok(summary) => summary,
-        Err(err) => format!("error: {err}"),
+        // `{err:#}` rather than `{err}`: the whole chain, since the
+        // outermost message is the context and the cause is what says
+        // what actually went wrong.
+        Err(err) => format!("error: {err:#}"),
     }
 }
 
@@ -504,6 +514,29 @@ mod tests {
 
         assert!(summary.contains("wrote"), "summary was: {summary}");
         assert!(out_path.exists());
+    }
+
+    /// An unprivileged `stop-bots web` hits this once a day, forever, so
+    /// the summary the Dashboard shows has to name the file rather than
+    /// leaving the operator with a bare "Permission denied".
+    #[test]
+    fn a_firewall_script_that_cannot_be_written_says_which_path_failed() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the job wants a directory: the same "cannot write
+        // there" shape as a read-only `/etc`, without needing to drop
+        // privileges inside a test.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "").unwrap();
+        let out_path = blocker.join("fw.nft");
+
+        let summary = render_firewall(&db, &out_path, None);
+
+        assert!(summary.starts_with("error: "), "summary was: {summary}");
+        assert!(
+            summary.contains(&out_path.display().to_string()),
+            "summary named no path: {summary}"
+        );
     }
 
     /// The real default path (`/etc/stop-bots/firewall.nft`) has no parent

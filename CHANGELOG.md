@@ -49,7 +49,10 @@ need.
 
   This closes the gap that made the web UI look like a viewer: a server left running now
   keeps detection, access-log stats and the daily crawler-range refresh current on its
-  own. `RenderFirewall` still only writes the script — nothing here applies one.
+  own. `RenderFirewall` still only writes the script — nothing here applies
+  one — and if the server can't write it (an unprivileged `stop-bots web`, and a
+  default path under `/etc`) the recorded outcome names the file rather than
+  reporting a bare "Permission denied".
 
   The per-job logic moved out of `App` into `cron.rs` (`read_log_for`, `run_log_job`,
   `fetch_ip_ranges`, `store_ip_ranges`) so the two front-ends run the same code rather
