@@ -58,10 +58,19 @@ jobs:
   # that has not changed, so a job that only runs on a commit finds out
   # whenever the next commit happens to land.
   #
-  # No allow-list. Every warning cargo-audit has raised here so far turned
-  # out to have a patched version already published — an ignore entry would
-  # have hidden two of them. If one genuinely has no fix, add it here with
-  # the reason and a link, rather than dropping `--deny warnings`.
+  # `unsound` and `yanked` rather than `--deny warnings`, which is all four
+  # categories and so includes `unmaintained`. An unmaintained transitive
+  # crate is not something anyone here can act on — you cannot maintain
+  # someone else's crate, and the upstream that depends on it moves when it
+  # moves — so denying it turns this red on a Monday morning for no
+  # available action, which is how a job starts getting ignored. The two
+  # kept are the ones that earned the job: the advisories in `anyhow` and
+  # `lru` that found it were `unsound`, and both had patches published.
+  # Vulnerabilities fail regardless of `--deny`; they need no flag.
+  #
+  # No allow-list. Every advisory raised here so far had a patched version
+  # already published, and an ignore entry would have hidden two of them.
+  # If one genuinely has no fix, add it here with the reason and a link.
   audit:
     runs-on: ubuntu-latest
     steps:
@@ -72,7 +81,7 @@ jobs:
           tool: cargo-audit
 
       - name: Audit dependencies
-        run: cargo audit --deny warnings
+        run: cargo audit --deny unsound --deny yanked
 
   # A separate job so a bump in a dependency's own MSRV shows up as this job
   # going red, rather than as a confusing failure for someone on an older

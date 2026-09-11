@@ -67,9 +67,11 @@ need.
   describes every visitor there has ever been.
 
 - Dependency advisories are now a CI job (`cargo audit`), weekly as well as on
-  push, because an advisory is published against code that hasn't changed. This
-  found `RUSTSEC-2026-0258` in `h2` — reachable from the web server through hyper
-  — along with unsoundness in `anyhow` and `lru`; all three had patched versions
+  push, because an advisory is published against code that hasn't changed. It
+  fails on vulnerabilities, unsound crates and yanked ones, but not on
+  unmaintained ones — nobody here can act on those. This found
+  `RUSTSEC-2026-0258` in `h2` — reachable from the web server through hyper —
+  along with unsoundness in `anyhow` and `lru`; all three had patched versions
   already published and are updated in `Cargo.lock`.
 
 - **The web UI puts panels side by side on a wide window**, rather than stacking
