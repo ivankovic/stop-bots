@@ -58,6 +58,20 @@ need.
   `fetch_ip_ranges`, `store_ip_ranges`) so the two front-ends run the same code rather
   than two copies that drift. Behaviour in the TUI is unchanged.
 
+- **`--threshold 0` is refused.** Every detector compares `count >= threshold`, so
+  zero meant "no evidence required": `block-scanners --threshold 0` added a block
+  rule for every address in the log, whatever it had done. One is still allowed —
+  that is an aggressive policy, not a mistake. The same floor is applied to the
+  three behavioural thresholds that have no CLI verb and are set by hand in the
+  settings table, where it is 2, since one distinct page or one user agent
+  describes every visitor there has ever been.
+
+- Dependency advisories are now a CI job (`cargo audit`), weekly as well as on
+  push, because an advisory is published against code that hasn't changed. This
+  found `RUSTSEC-2026-0258` in `h2` — reachable from the web server through hyper
+  — along with unsoundness in `anyhow` and `lru`; all three had patched versions
+  already published and are updated in `Cargo.lock`.
+
 - **The web UI puts panels side by side on a wide window**, rather than stacking
   everything down one 1180px column. Every screen is a grid that collapses back to
   one column below 1040px, so a narrow window and a phone are unchanged.

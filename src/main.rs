@@ -26,6 +26,26 @@ const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
 const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
 
 /// Help text shared by every subcommand's `--db` flag.
+/// Rejects `--threshold 0` at the command line.
+///
+/// Every detector compares `count >= threshold`, so zero matches every
+/// address in the log regardless of what it did — one flag away from
+/// "block every visitor", in a tool whose whole safety story is never
+/// blocking someone by mistake. One is a defensible policy (fail2ban's
+/// `maxretry` goes that low); zero is not a policy, it is a mistake, and
+/// an error beats silently treating it as one.
+fn min_threshold(raw: &str) -> Result<usize, String> {
+    let value: usize = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not a whole number"))?;
+    if value == 0 {
+        return Err(
+            "a threshold of 0 matches every address in the log, whatever it did".to_string(),
+        );
+    }
+    Ok(value)
+}
+
 const DB_HELP: &str = "Database path (defaults to /var/lib/stop-bots/db.sqlite3, falling back to a per-user location if that's not writable)";
 
 #[derive(Parser)]
@@ -168,7 +188,10 @@ enum Command {
         /// this module doesn't parse timestamps) before an IP is
         /// considered a scanner rather than someone who mistyped a
         /// password a couple of times
-        #[arg(long, default_value_t = 20)]
+        ///
+        /// Must be at least 1. Zero would mean "no evidence required" and
+        /// block every address that appears in the log at all.
+        #[arg(long, default_value_t = 20, value_parser = min_threshold)]
         threshold: usize,
         /// How many days an added block rule lasts before it's
         /// automatically dropped (re-added on a later run if the IP is
@@ -204,7 +227,10 @@ enum Command {
         /// hits, and not a rate — this module doesn't parse timestamps)
         /// before an IP is considered a scanner rather than a client that
         /// hit one dead link
-        #[arg(long, default_value_t = 7)]
+        ///
+        /// Must be at least 1. Zero would mean "no evidence required" and
+        /// block every address that appears in the log at all.
+        #[arg(long, default_value_t = 7, value_parser = min_threshold)]
         threshold: usize,
         /// How many days an added block rule lasts before it's
         /// automatically dropped (re-added on a later run if the IP is

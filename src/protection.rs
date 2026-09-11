@@ -333,6 +333,37 @@ pub const SUBNET_ESCALATION_DEFAULT: bool = false;
 pub const SUBNET_ESCALATION_MIN: &str = "detect_subnet_escalation_min";
 pub const SUBNET_ESCALATION_MIN_DEFAULT: i64 = 3;
 
+/// The smallest threshold any detector will act on.
+///
+/// Every detector compares `count >= threshold`, so 0 and 1 both mean "no
+/// evidence required": every address in the log matches, whatever it did.
+/// That is the one failure this project cannot have — the tool exists to
+/// not block people by mistake.
+///
+/// Two rather than one because one is still every client for the
+/// behavioural detectors specifically: one distinct page, one user agent,
+/// one path without a referer describes every visitor there has ever been.
+pub const MIN_THRESHOLD: i64 = 2;
+
+/// Reads a detector threshold, floored at [`MIN_THRESHOLD`].
+///
+/// The floor is at the read rather than at the writes because there are no
+/// writes: none of these thresholds has a CLI verb, a TUI editor or a web
+/// control. They are reachable the way every other verb-less setting in
+/// this project is reachable, and the way TODO.md tells people to reach
+/// them — by hand, with `sqlite3`. So the read is the only place that sees
+/// every caller.
+///
+/// A negative value never gets this far: [`Db::get_int_setting`] screens
+/// those and returns the detector's own default instead, which is what
+/// stops `as usize` turning `-1` into `usize::MAX` and leaving a detector
+/// that reports itself enabled while never firing again. This floor is
+/// the layer above that one, and closes what it doesn't: zero, which is a
+/// perfectly valid non-negative integer.
+pub fn threshold(db: &Db, key: &str, default: i64) -> Result<usize> {
+    Ok(db.get_int_setting(key, default)?.max(MIN_THRESHOLD) as usize)
+}
+
 /// Whether IPv4 `/24` escalation is on, and its threshold.
 ///
 /// Deliberately separate from the unconditional IPv6 `/64` widening in
@@ -345,10 +376,11 @@ pub fn subnet_escalation(db: &Db) -> Result<Option<usize>> {
     if !db.get_bool_setting(SUBNET_ESCALATION, SUBNET_ESCALATION_DEFAULT)? {
         return Ok(None);
     }
-    let min = db
-        .get_int_setting(SUBNET_ESCALATION_MIN, SUBNET_ESCALATION_MIN_DEFAULT)?
-        .max(2) as usize;
-    Ok(Some(min))
+    Ok(Some(threshold(
+        db,
+        SUBNET_ESCALATION_MIN,
+        SUBNET_ESCALATION_MIN_DEFAULT,
+    )?))
 }
 
 /// Threshold for the asset-ratio detector: distinct successful page URLs
@@ -372,6 +404,64 @@ pub const REFERERLESS_MIN_PATHS_DEFAULT: i64 = 25;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The failure this floor exists to prevent: every detector compares
+    /// `count >= threshold`, so a hand-edited 0 turns "block scanners"
+    /// into "block everyone who appears in the log at all".
+    #[test]
+    fn a_threshold_that_would_match_everything_is_raised_to_the_floor() {
+        let db = Db::open_in_memory().unwrap();
+
+        for value in [0, 1] {
+            db.set_int_setting(ASSET_RATIO_MIN_PAGES, value).unwrap();
+            assert_eq!(
+                threshold(&db, ASSET_RATIO_MIN_PAGES, ASSET_RATIO_MIN_PAGES_DEFAULT).unwrap(),
+                MIN_THRESHOLD as usize,
+                "{value} was let through"
+            );
+        }
+    }
+
+    /// A negative one is screened a layer lower, by `get_int_setting`,
+    /// which is what stops `as usize` turning it into `usize::MAX` and
+    /// leaving a detector enabled but permanently silent. Asserted here
+    /// rather than only in `db.rs` because this is the caller that would
+    /// be hurt if that filter were ever dropped as redundant.
+    #[test]
+    fn a_negative_threshold_falls_back_to_the_default_rather_than_wrapping() {
+        let db = Db::open_in_memory().unwrap();
+
+        for value in [i64::MIN, -1] {
+            db.set_int_setting(ROTATING_UA_MIN, value).unwrap();
+            assert_eq!(
+                threshold(&db, ROTATING_UA_MIN, ROTATING_UA_MIN_DEFAULT).unwrap(),
+                ROTATING_UA_MIN_DEFAULT as usize,
+                "{value} did not fall back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn a_threshold_above_the_floor_is_left_alone() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_int_setting(REFERERLESS_MIN_PATHS, 40).unwrap();
+
+        assert_eq!(
+            threshold(&db, REFERERLESS_MIN_PATHS, REFERERLESS_MIN_PATHS_DEFAULT).unwrap(),
+            40
+        );
+    }
+
+    /// Unset means the default, not the floor.
+    #[test]
+    fn an_unset_threshold_is_the_detector_s_own_default() {
+        let db = Db::open_in_memory().unwrap();
+
+        assert_eq!(
+            threshold(&db, ASSET_RATIO_MIN_PAGES, ASSET_RATIO_MIN_PAGES_DEFAULT).unwrap(),
+            ASSET_RATIO_MIN_PAGES_DEFAULT as usize
+        );
+    }
 
     #[test]
     fn every_detector_has_a_distinct_stable_id() {

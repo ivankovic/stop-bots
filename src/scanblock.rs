@@ -380,10 +380,11 @@ pub fn block_asset_ratio(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
-    let min_pages = db.get_int_setting(
+    let min_pages = crate::protection::threshold(
+        db,
         crate::protection::ASSET_RATIO_MIN_PAGES,
         crate::protection::ASSET_RATIO_MIN_PAGES_DEFAULT,
-    )? as usize;
+    )?;
     let candidates = accesslog::asset_less_ips(log_text, min_pages);
     behavioural(db, candidates, ttl_days, dry_run)
 }
@@ -396,10 +397,11 @@ pub fn block_rotating_ua(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
-    let min_agents = db.get_int_setting(
+    let min_agents = crate::protection::threshold(
+        db,
         crate::protection::ROTATING_UA_MIN,
         crate::protection::ROTATING_UA_MIN_DEFAULT,
-    )? as usize;
+    )?;
     let candidates = accesslog::rotating_user_agent_ips(log_text, min_agents);
     behavioural(db, candidates, ttl_days, dry_run)
 }
@@ -412,10 +414,11 @@ pub fn block_refererless(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
-    let min_paths = db.get_int_setting(
+    let min_paths = crate::protection::threshold(
+        db,
         crate::protection::REFERERLESS_MIN_PATHS,
         crate::protection::REFERERLESS_MIN_PATHS_DEFAULT,
-    )? as usize;
+    )?;
     let candidates = accesslog::refererless_crawl_ips(log_text, min_paths);
     behavioural(db, candidates, ttl_days, dry_run)
 }

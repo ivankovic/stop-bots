@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly, because two of these jobs go red without anything here
+  # changing: `audit` when an advisory is published against a dependency,
+  # and `test` when a new `stable` lands a lint. Finding either on a
+  # schedule beats finding it in someone's unrelated pull request.
+  schedule:
+    - cron: "17 5 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -45,6 +51,28 @@ jobs:
       # stalling it.
       - name: Test
         run: cargo nextest run
+
+  # This project is security software, so learning about an advisory in its
+  # own dependency tree from someone else's bug report is not acceptable.
+  # Scheduled as well as on push: an advisory is published against code
+  # that has not changed, so a job that only runs on a commit finds out
+  # whenever the next commit happens to land.
+  #
+  # No allow-list. Every warning cargo-audit has raised here so far turned
+  # out to have a patched version already published — an ignore entry would
+  # have hidden two of them. If one genuinely has no fix, add it here with
+  # the reason and a link, rather than dropping `--deny warnings`.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
 
   # A separate job so a bump in a dependency's own MSRV shows up as this job
   # going red, rather than as a confusing failure for someone on an older

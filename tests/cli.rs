@@ -1759,6 +1759,54 @@ fn block_scanners_ignores_an_ip_below_the_threshold() {
         .stdout(predicate::str::contains("198.51.100.9").not());
 }
 
+/// `--threshold 0` used to be accepted, and every detector compares
+/// `count >= threshold`, so it blocked every address in the log whatever
+/// it had done — five single failed logins became five block rules. One
+/// flag, or one shell variable that expanded to nothing, away from mass
+/// blocking in a tool whose whole premise is not blocking people by
+/// mistake.
+///
+/// Rejected at parse time, so nothing is written and no database is even
+/// created; 1 is still allowed, because "one failed attempt is a scanner"
+/// is an aggressive policy rather than a mistake.
+#[test]
+fn block_scanners_refuses_a_threshold_of_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+
+    let log_path = tmp.path().join("auth.log");
+    fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 1)).unwrap();
+
+    for command in ["block-scanners", "block-web-scanners"] {
+        Command::cargo_bin("stop-bots")
+            .unwrap()
+            .args([command, "--db", db_path, "--threshold", "0"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("matches every address in the log"));
+    }
+
+    assert!(
+        !std::path::Path::new(db_path).exists(),
+        "a rejected threshold still created a database"
+    );
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "block-scanners",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+            "--threshold",
+            "1",
+        ])
+        .assert()
+        .success();
+}
+
 /// The safety property that matters most: an IP that eventually logs in
 /// successfully must never be auto-blocked, even with a mountain of failed
 /// attempts before it.
