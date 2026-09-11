@@ -550,7 +550,7 @@ impl Dashboard {
             .collect();
         let panel = Paragraph::new(lines).block(
             Block::bordered()
-                .title("Scheduled tasks (internal cron — runs only while this TUI is open)"),
+                .title("Scheduled tasks (internal cron — runs while the TUI or web UI is open)"),
         );
         frame.render_widget(panel, area);
     }

@@ -48,6 +48,7 @@
 
 pub mod auth;
 pub mod bots;
+pub mod cron;
 pub mod dashboard;
 pub mod dynamic;
 pub mod help;

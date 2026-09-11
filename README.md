@@ -184,9 +184,10 @@ each adds a temporary firewall block that expires on its own and is re-added if 
 continues.
 
 They run on an internal timer that re-reads your SSH and NGINX access logs every minute —
-**but only while the TUI is open.** Nothing is detected when the process isn't running. For
-a server you aren't sitting in front of, see [Unattended, from cron](#unattended-from-cron)
-below.
+**but only while the TUI or the web UI is running.** Either one keeps the same schedule, in
+the same database, so leaving the web UI up is enough; nothing is detected when neither is
+running. For a server with no stop-bots process on it at all, see
+[Unattended, from cron](#unattended-from-cron) below.
 
 - **SSH and web scanners**: IPs with a pile of failed SSH logins, or many distinct 404'd
   paths. Never an IP with a recent successful SSH login, or one inside a known crawler's
@@ -282,6 +283,14 @@ the easiest way to see what it is actually doing.
 **`--apply` is what makes it enforce anything.** Without it, `batch` writes the NGINX config
 and the firewall script and stops: config does nothing until a reload, a script does nothing
 until it is run. That is this project's default everywhere, and it stays the default here.
+
+`batch` and a long-running front-end coexist safely. The TUI, the web UI and `batch` all
+record what they did through the same keys in the same database, so whichever gets to a job
+first does it and the others find it no longer due — you don't get two detection passes, and
+the Dashboard's "Scheduled tasks" panel shows what actually happened rather than claiming
+everything is overdue. If you already leave the web UI running, the nightly `batch` entry is
+belt and braces rather than a requirement; if you don't, it is the only thing keeping
+detection current.
 
 **With `--apply`, the SSH lockout guard can refuse — and refusing means nothing is applied.**
 It refuses if the rules would block a client that is connected right now, *and* if no SSH log

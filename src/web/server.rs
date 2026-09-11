@@ -118,15 +118,21 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> anyhow::Resul
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
+    // The internal cron ticks for as long as this server runs — see
+    // `crate::web::cron`. Started here rather than in `router` so that a
+    // test driving the router directly never starts a background task.
+    let cron = crate::web::cron::spawn(state.clone());
     // `into_make_service_with_connect_info` is what puts the peer address
     // where `client_address` can find it, and so what makes the
     // anti-lockout guard able to recognise the browser that is asking.
-    axum::serve(
+    let served = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("the web server stopped: {e}"))
+    .map_err(|e| anyhow::anyhow!("the web server stopped: {e}"));
+    cron.abort();
+    served
 }
 
 // ---- middleware ----

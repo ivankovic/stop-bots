@@ -493,7 +493,7 @@ fn summary_panel(view: &View, ctx: &Ctx) -> Markup {
 fn jobs_panel(view: &View) -> Markup {
     layout::panel(
         "Scheduled tasks",
-        Some("Run by the internal cron, which only ticks while the TUI is open"),
+        Some("Run by the internal cron, which ticks while this server or the TUI is running"),
         html! {
             table {
                 thead { tr {

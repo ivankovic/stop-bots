@@ -42,6 +42,19 @@ need.
   default deployment is plain HTTP on loopback, where a `Secure` cookie is never
   stored at all.
 
+- **The internal cron now ticks while the web UI runs, not only the TUI.** The two share
+  one schedule in one database, so running both does the work once: whichever ticks first
+  records the job and the other finds it no longer due. The same is true of a crontab
+  entry running `stop-bots batch`, which already recorded through those keys.
+
+  This closes the gap that made the web UI look like a viewer: a server left running now
+  keeps detection, access-log stats and the daily crawler-range refresh current on its
+  own. `RenderFirewall` still only writes the script — nothing here applies one.
+
+  The per-job logic moved out of `App` into `cron.rs` (`read_log_for`, `run_log_job`,
+  `fetch_ip_ranges`, `store_ip_ranges`) so the two front-ends run the same code rather
+  than two copies that drift. Behaviour in the TUI is unchanged.
+
 - **Configurable NGINX test and reload commands** — `stop-bots set-nginx-commands`.
   For NGINX in a container, where the config is on a bind mount this tool can write but
   `systemctl reload nginx` reloads nothing:

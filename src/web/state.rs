@@ -55,6 +55,14 @@ pub struct AppState {
     /// Mirrors the TUI's `--no-reload`, and the integration tests run with
     /// it off so that a test never reloads the developer's NGINX.
     pub apply_for_real: bool,
+    /// Where the internal cron's `RenderFirewall` job writes its script.
+    ///
+    /// A field rather than [`crate::firewall::DEFAULT_OUTPUT_PATH`] read at
+    /// the point of use, for the same reason the TUI passes it as a
+    /// parameter: the default is a real path under `/etc`, and a test that
+    /// drives a tick must be able to point it at a temp directory instead
+    /// of writing to the developer's system.
+    pub firewall_out: PathBuf,
 }
 
 impl AppState {
@@ -89,6 +97,7 @@ impl AppState {
             login_throttle: Arc::new(LoginThrottle::default()),
             base,
             apply_for_real,
+            firewall_out: PathBuf::from(crate::firewall::DEFAULT_OUTPUT_PATH),
         }
     }
 

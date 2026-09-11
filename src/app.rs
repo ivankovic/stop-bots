@@ -25,7 +25,6 @@ use crate::db::Db;
 use crate::event::{AppEvent, Event, EventHandler};
 use crate::ipranges;
 use crate::nginx;
-use crate::protection::Detector;
 use crate::tui::{self, KeyOutcome, Screen, Theme};
 use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -41,7 +40,7 @@ use ratatui::DefaultTerminal;
 /// than once a minute. Cheap either way (a handful of `settings` table
 /// reads), so there'd be room to tighten it further if once-a-minute
 /// detection latency ever isn't fast enough.
-const CRON_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+use crate::cron::CHECK_INTERVAL as CRON_CHECK_INTERVAL;
 
 /// Everything that can be running in the background, and the key
 /// [`App::jobs_in_flight`] is keyed by.
@@ -731,16 +730,7 @@ impl App {
         }
         let sender = self.events.sender();
         tokio::spawn(async move {
-            let mut results = Vec::new();
-            for kind in ipranges::IpRangeSourceKind::ALL {
-                let result = async {
-                    let raw = kind.fetch().await?;
-                    parse_off_thread(move || kind.parse(&raw)).await
-                }
-                .await
-                .map_err(|err: anyhow::Error| err.to_string());
-                results.push((kind, result));
-            }
+            let results = crate::cron::fetch_ip_ranges().await;
             let _ = sender.send(Event::App(AppEvent::CronIpRangesFetched { results }));
         });
     }
@@ -757,24 +747,7 @@ impl App {
         self.jobs_in_flight
             .remove(&Job::Cron(CronJob::UpdateIpRanges));
 
-        let mut updated = 0;
-        let mut failed = 0;
-        for (kind, result) in results {
-            match result {
-                Ok(cidrs) => {
-                    ipranges::store(&self.db, kind, &cidrs)?;
-                    updated += 1;
-                }
-                Err(_) => failed += 1,
-            }
-        }
-        let summary = if failed == 0 {
-            format!("updated {updated} crawler source(s)")
-        } else {
-            format!("updated {updated} crawler source(s), {failed} failed")
-        };
-        self.db
-            .set_cron_last_run(CronJob::UpdateIpRanges.id(), now_secs(), &summary)?;
+        crate::cron::store_ip_ranges(&self.db, results)?;
         self.refresh()?;
         Ok(())
     }
@@ -801,28 +774,9 @@ impl App {
             return;
         }
         let sender = self.events.sender();
-        let uses_ssh_log = match job {
-            CronJob::Detect(detector) => detector.spec().uses_ssh_log,
-            CronJob::RenderFirewall => true,
-            _ => false,
-        };
         let ssh_log = self.ssh_log.clone();
         tokio::task::spawn_blocking(move || {
-            let log_text = if uses_ssh_log {
-                let source = match ssh_log.as_deref() {
-                    Some(path) => crate::sshlog::read_log_file(path),
-                    None => crate::sshlog::find_default_source(),
-                };
-                match source {
-                    crate::sshlog::LogSource::Found(text) => Some(text),
-                    crate::sshlog::LogSource::Unavailable => None,
-                }
-            } else {
-                match crate::accesslog::find_default_source() {
-                    crate::accesslog::LogSource::Found(text) => Some(text),
-                    crate::accesslog::LogSource::Unavailable => None,
-                }
-            };
+            let log_text = crate::cron::read_log_for(job, ssh_log.as_deref());
             let _ = sender.send(Event::App(AppEvent::CronLogFetched { job, log_text }));
         });
     }
@@ -1063,111 +1017,21 @@ impl App {
     }
 
     /// Applies a log cron job's background-resolved log text (`None` if
-    /// the log was unavailable) back on the main thread: the same
-    /// detection/tally/render logic each job used to run inline with, then
-    /// records the job's outcome and refreshes every screen — mirroring
-    /// `finish_cron_update_ip_ranges`.
+    /// the log was unavailable) back on the main thread, then refreshes
+    /// every screen — mirroring `finish_cron_update_ip_ranges`. The job
+    /// itself, and the recording of its outcome, is
+    /// [`crate::cron::run_log_job`]: shared with the web front-end so that
+    /// the two can't drift.
     fn finish_cron_log_job(&mut self, job: CronJob, log_text: Option<String>) -> Result<()> {
         self.jobs_in_flight.remove(&Job::Cron(job));
-
-        let summary = match job {
-            // Every detector runs through one arm. What differs between
-            // them — the log they read, the threshold, the function — is
-            // either on the spec or in `run_detector`, so a new detector
-            // adds no code here at all.
-            CronJob::Detect(detector) => self.run_detector(detector, log_text.as_deref())?,
-            CronJob::RecordAccessStats => match log_text {
-                Some(text) => match crate::accessstats::record_access_stats(
-                    &self.db,
-                    crate::accesslog::DEFAULT_LOG_PATH,
-                    &text,
-                ) {
-                    Ok(outcome) => outcome.summary(),
-                    Err(err) => format!("error: {err}"),
-                },
-                None => "NGINX access log unavailable".to_string(),
-            },
-            CronJob::RenderFirewall => self.render_firewall_for_cron(
-                crate::firewall::DEFAULT_OUTPUT_PATH,
-                log_text.as_deref(),
-            ),
-            CronJob::UpdateIpRanges => {
-                unreachable!(
-                    "UpdateIpRanges is fetched/applied via CronIpRangesFetched, not this event"
-                )
-            }
-        };
-        self.db.set_cron_last_run(job.id(), now_secs(), &summary)?;
+        crate::cron::run_log_job(
+            &self.db,
+            job,
+            log_text.as_deref(),
+            std::path::Path::new(crate::firewall::DEFAULT_OUTPUT_PATH),
+        )?;
         self.refresh()?;
         Ok(())
-    }
-
-    /// Runs one detector, if it is switched on, and turns the result into
-    /// the one-line summary the Dashboard's "Scheduled tasks" panel shows.
-    ///
-    /// **A disabled detector still records a summary.** Skipping the write
-    /// entirely would leave the job looking permanently overdue in the
-    /// panel rather than saying why nothing happened.
-    fn run_detector(&self, detector: Detector, log_text: Option<&str>) -> Result<String> {
-        if !detector.is_enabled(&self.db)? {
-            return Ok("disabled".to_string());
-        }
-        let Some(text) = log_text else {
-            return Ok(if detector.spec().uses_ssh_log {
-                "SSH log unavailable".to_string()
-            } else {
-                "NGINX access log unavailable".to_string()
-            });
-        };
-        let ttl = detector.ttl_days(&self.db)?;
-        let outcome = crate::scanblock::run_detector(&self.db, detector, ttl, text, false);
-        Ok(match outcome {
-            Ok(outcome) => outcome.summary(),
-            Err(err) => format!("error: {err}"),
-        })
-    }
-
-    /// The actual work behind the `RenderFirewall` job: writes the current
-    /// firewall rules to `out_path` (a parameter, rather than reading
-    /// `crate::firewall::DEFAULT_OUTPUT_PATH` directly, purely so tests can
-    /// point it at a temp file) using the nftables backend (handles
-    /// allowlist geo mode, unlike iptables — see `firewall::build_script`),
-    /// skipping the write (recorded as the job's summary, not an error) if
-    /// doing so would risk locking out a currently-connected SSH client —
-    /// same safety check `App::start_firewall_render`'s manual path runs, except
-    /// `ssh_log_text` is already resolved by `start_cron_log_job` rather
-    /// than being re-resolved here via `assess_lockout_risk`, so this
-    /// applies `sshlog::parse_accepted_ips`/`firewall::lockout_risks`
-    /// directly; `None` (log unavailable) skips the check entirely, same as
-    /// `assess_lockout_risk`'s `LogUnavailable` case. Never propagates an
-    /// error: any failure becomes the returned summary string instead,
-    /// since a cron job recording "what went wrong" is the whole point —
-    /// there's no interactive caller here to hand a `Result` to.
-    fn render_firewall_for_cron(&self, out_path: &str, ssh_log_text: Option<&str>) -> String {
-        let result: anyhow::Result<String> = (|| {
-            let built = crate::firewall::build_script(
-                &self.db,
-                crate::firewall::FirewallBackend::Nftables,
-            )?;
-            if let Some(text) = ssh_log_text {
-                let connected_ips = crate::sshlog::parse_accepted_ips(text);
-                let risks = crate::firewall::lockout_risks(&built.rules, &connected_ips);
-                if !risks.is_empty() {
-                    anyhow::bail!(
-                        "skipped: would block {} currently-connected SSH client IP address(es)",
-                        risks.len()
-                    );
-                }
-            }
-            crate::firewall::write_script(std::path::Path::new(out_path), &built.script)?;
-            self.db
-                .set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
-            Ok(format!("wrote {} rule(s) to {out_path}", built.written))
-        })();
-        match result {
-            Ok(summary) => summary,
-            Err(err) => format!("error: {err}"),
-        }
     }
 
     /// Renders firewall rules to a script file, calling the same
@@ -1379,17 +1243,18 @@ fn source_display_name(source_id: &str) -> String {
         .unwrap_or_else(|| source_id.to_string())
 }
 
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::firewall::FirewallBackend;
+    use crate::protection::Detector;
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
 
     fn test_app() -> App {
         // `reload_nginx: false` — no test here drives a Site settings apply
@@ -1843,35 +1708,6 @@ mod tests {
     // something a unit test can point at a fixture without either reading
     // whatever real log happens to be on the machine running the test or
     // adding an `--ssh-log`-style override this method doesn't have yet.
-
-    #[tokio::test]
-    async fn render_firewall_for_cron_writes_the_script_and_reports_success() {
-        let app = test_app();
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("fw.nft");
-
-        let summary = app.render_firewall_for_cron(out_path.to_str().unwrap(), None);
-
-        assert!(summary.contains("wrote"), "summary was: {summary}");
-        assert!(out_path.exists());
-    }
-
-    /// The real default path (`/etc/stop-bots/firewall.nft`) has no parent
-    /// directory created anywhere else in the codebase, unlike the
-    /// database's `/var/lib/stop-bots`. Since this cron job runs
-    /// unattended, it must create its own parent directory rather than
-    /// failing with "No such file or directory" forever on a fresh host.
-    #[tokio::test]
-    async fn render_firewall_for_cron_creates_missing_parent_directories() {
-        let app = test_app();
-        let dir = tempfile::tempdir().unwrap();
-        let out_path = dir.path().join("nested/does/not/exist/fw.nft");
-
-        let summary = app.render_firewall_for_cron(out_path.to_str().unwrap(), None);
-
-        assert!(summary.contains("wrote"), "summary was: {summary}");
-        assert!(out_path.exists());
-    }
 
     /// Regression test for a real bug: a freshly-constructed `App` used to
     /// set `last_cron_check` to `Instant::now()`, so the very first

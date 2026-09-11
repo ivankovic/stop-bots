@@ -1163,8 +1163,8 @@ aren't counted — undercounts rather than overcounts, and the companion
 normally already counted, so this rarely loses an IP entirely. No
 interactive TUI affordance (no popup to run this on demand or tweak its
 threshold/TTL from the Dashboard) — but it does now run automatically on a
-timer while the TUI is open, and its state is shown there; see "Internal
-cron" below.
+timer while the TUI or web UI is open, and its state is shown in both;
+see "Internal cron" below.
 
 ## Web scan detection (`src/accesslog.rs::scanning_ips`, `main.rs::block_web_scanners`)
 
@@ -1279,7 +1279,7 @@ knowing which upstream proxies are legitimate is its own can of worms, and
 better solved (if ever) as its own deliberate feature rather than bolted
 onto this one.
 
-## Internal cron (`src/cron.rs`, `App`'s tick handler in `src/app.rs`, the Dashboard's "Scheduled tasks" panel)
+## Internal cron (`src/cron.rs`, `App`'s tick handler in `src/app.rs`, `src/web/cron.rs`, the Dashboard's "Scheduled tasks" panel)
 
 Replaces relying on an external `cron`/systemd-timer entry to keep the
 scanner-detection and crawler-range commands running unattended, by having
@@ -1291,12 +1291,21 @@ logic each equivalent CLI subcommand runs, via `scanblock`/`ipranges`/
 "Scheduled tasks", listing all four with when they last ran and their last
 outcome.
 
-**Only automates while the TUI is open — this is the one limitation to
-know before treating it as a full cron replacement.** Closing the TUI
-pauses every job; there is no separate headless daemon mode. A job overdue
-when the TUI (re)starts just runs the next time it's checked (the same
-never-fetched-yet convention `ipranges` staleness already used), not a
-"catch up on however many intervals were missed" scheme.
+**Only automates while a stop-bots front-end is running — this is the one
+limitation to know before treating it as a full cron replacement.** The
+TUI (`App::check_cron`) and the web server (`crate::web::cron`, a plain
+background task, since `AppState::with_db` already solves the
+`Db`-isn't-`Sync` problem that makes the TUI's version a start/finish
+pair) both drive it; closing both pauses every job, and there is no
+separate headless daemon mode. Running both at once is safe and does not
+double the work: they record through the same `cron_last_run:{id}` keys,
+so whichever ticks first marks the job done and the other finds it no
+longer due — which is also why the per-job logic lives in `cron.rs`
+(`read_log_for`, `run_log_job`, `fetch_ip_ranges`, `store_ip_ranges`)
+rather than in either front-end. A job overdue when a front-end (re)starts
+just runs the next time it's checked (the same never-fetched-yet
+convention `ipranges` staleness already used), not a "catch up on however
+many intervals were missed" scheme.
 
 **State is persisted in the existing `settings` table, not kept
 in-memory.** Two keys per job (`cron_last_run:{id}`, `cron_last_summary:{id}`,
@@ -3589,6 +3598,46 @@ of them can show two halves of two different states. The exception is a bot-list
 update, which fetches *outside* the lock and takes it only to store — a network
 request under the single lock would stall every other request in the console for
 as long as the publisher takes to answer.
+
+### The internal cron (`src/web/cron.rs`)
+
+The web server ticks the internal cron for as long as it runs, the same as the
+TUI. See "Internal cron" above for the shared-schedule design; what is
+web-specific is here.
+
+`cron::spawn` is called from `server::serve`, **not** from `router`. The
+integration tests drive `router` directly hundreds of times, and a spawn there
+would start that many background tasks ticking against tempdir databases. Tests
+of the cron call `web::cron::tick` instead.
+
+The TUI splits every job into a start/finish pair routed through its event loop,
+because `Db` is not `Sync` and its handle lives on the drawing thread.
+`with_db` already is that door, so here a job is an `async fn` that awaits its
+halves in order — which is why this file is a fifth the size of the equivalent
+in `app.rs`.
+
+The one rule `with_db`'s signature cannot enforce, and this file keeps by hand:
+**the log read happens outside the lock.** Resolving the SSH log can shell out
+to `journalctl`; doing that inside `with_db` would hold the database against
+every in-flight request for its duration. `cron::read_log_for` takes no `Db`
+precisely so that stays possible. `UpdateIpRanges` follows the same shape for
+the same reason, with three remote round-trips in place of the log read.
+
+Jobs run sequentially. They share one database behind one mutex, so concurrency
+would buy lock contention and two detectors writing blocks at once. A failing
+job is reported to stderr and the pass continues — a cron pass that gives up on
+the first unreadable log is one that stops doing its other jobs forever.
+
+`AppState::firewall_out` exists because `firewall::DEFAULT_OUTPUT_PATH` is a
+real path under `/etc`: a test driving a tick, or a server started by hand, must
+be able to point the `RenderFirewall` job somewhere else. Same reasoning as the
+`out_path` parameter the TUI's equivalent has always taken.
+
+The first tick runs immediately rather than after a minute's sleep, matching the
+TUI's backdated `last_cron_check`. On a fresh install that means `stop-bots web`
+fetches the three crawler-range sources and writes a firewall script within a
+second of starting — deliberate, and the same thing opening the TUI has always
+done, but worth knowing before running it on a host with no outbound access.
 
 ### The anti-lockout guard
 
