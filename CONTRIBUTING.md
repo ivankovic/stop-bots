@@ -44,7 +44,39 @@ Code must always be formatted using the automated standard Rust formatter.
 
 No Rust check errors are allowed. Rust check should be run frequently.
 
+### The pre-commit hook
+
+Opt-in, one command:
+
+```
+make hooks
+```
+
+It formats what you staged and runs `cargo clippy --all-targets -- -D warnings`, the same
+invocation CI uses, so a commit that passes here passes there. A commit with no Rust in it
+skips both and costs nothing; a clean Rust commit costs about four seconds warm.
+
+It deliberately does not run the tests. The unit suite is twenty seconds, and a hook that
+costs that much gets bypassed once and then by habit.
+
+**It will refuse a commit rather than guess.** If a file is staged unformatted *and* has
+unstaged changes, formatting is judged against the staged bytes (`git show :file`) but
+`cargo fmt` rewrites your working tree — so re-staging would sweep in edits you left out on
+purpose. It formats your working tree, says which files, and stops so you can `git add -p`
+the part you meant.
+
+`git commit --no-verify` skips it once; `git config --unset core.hooksPath` turns it off.
+
 ## Testing
+
+```
+make unit-test         # everything that needs only a compiler
+make integration-test  # the container suite: Docker and NET_ADMIN
+make test              # both, unit first
+```
+
+`make unit-test` prefers `cargo nextest run` when it is installed and falls back to
+`cargo test`; they run the same tests, but only nextest enforces the per-test budgets below.
 
 Automated tests should be run frequently during coding.
 
@@ -70,7 +102,7 @@ it just doesn't report per-test time.
 ### Coverage
 
 92.8% of lines, measured with `cargo llvm-cov --summary-only --workspace`. That figure
-*understates* it: the container suite (`make test-containers`) runs a binary inside Docker,
+*understates* it: the container suite (`make integration-test`) runs a binary inside Docker,
 so its coverage never comes back.
 
 It is a check, not a boast — but the check and the achieved figure are deliberately two
@@ -211,7 +243,7 @@ that keeps passing when the text is wrong.
 It needs Docker and `NET_ADMIN` and takes ~20s, so it is off by default:
 
 ```
-make test-containers
+make integration-test
 ```
 
 CI runs it as its own job. Run it before a release, and before trusting any change to

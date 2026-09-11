@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# Formats and lints what is about to be committed. Enable with `make
+# hooks`; skip once with `git commit --no-verify`.
+#
+# Two things this deliberately does not do. It does not run the tests —
+# the unit suite is twenty seconds and a hook that costs that much gets
+# bypassed until it is bypassed by habit. And it does not format a file it
+# cannot stage safely; see the partial-staging note below.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Nothing Rust in this commit? Then there is nothing here to say. A
+# docs-only commit should not pay for a clippy run.
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR -- '*.rs')
+mapfile -t staged_cargo < <(git diff --cached --name-only --diff-filter=ACMR -- Cargo.toml Cargo.lock)
+if [ ${#staged[@]} -eq 0 ] && [ ${#staged_cargo[@]} -eq 0 ]; then
+    exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: no cargo on PATH — skipping fmt and clippy." >&2
+    exit 0
+fi
+
+# ---- formatting ----
+#
+# **Judged against the index, never the working tree.** The commit is made
+# of the index, and the two differ whenever anything is partially staged.
+# An earlier version of this hook compared working-tree hashes across a
+# `cargo fmt` run, which was wrong in a way that only showed up on the
+# second attempt: the first run formatted the working tree, so the second
+# saw nothing to do and waved the still-unformatted index straight
+# through. Asking rustfmt about the exact bytes `git show :file` returns
+# is the only check that cannot drift from what is being committed.
+#
+# `cargo fmt` then rewrites the working tree, and that result may only be
+# staged for a file whose working tree and index already agreed. For a
+# file with unstaged changes the working tree holds edits that were
+# deliberately left out, and `git add` would sweep them in — the one thing
+# a formatting hook must never do. Those are reported instead.
+if [ ${#staged[@]} -gt 0 ]; then
+    edition="$(sed -n 's/^edition *= *"\(.*\)".*/\1/p' Cargo.toml | head -1)"
+    probe="$(mktemp -d)"
+    trap 'rm -rf "$probe"' EXIT
+
+    fixable=()
+    unsafe=()
+    for file in "${staged[@]}"; do
+        git show ":$file" > "$probe/probe.rs"
+        if rustfmt --edition "${edition:-2021}" --check "$probe/probe.rs" >/dev/null 2>&1; then
+            continue  # the staged bytes are already formatted
+        fi
+        if git diff --quiet -- "$file"; then
+            fixable+=("$file")
+        else
+            unsafe+=("$file")
+        fi
+    done
+
+    if [ ${#fixable[@]} -gt 0 ] || [ ${#unsafe[@]} -gt 0 ]; then
+        cargo fmt --all
+    fi
+
+    if [ ${#fixable[@]} -gt 0 ]; then
+        git add -- "${fixable[@]}"
+        echo "pre-commit: formatted and re-staged:"
+        printf '  %s\n' "${fixable[@]}"
+    fi
+
+    if [ ${#unsafe[@]} -gt 0 ]; then
+        echo >&2
+        echo "pre-commit: these are staged unformatted and also have unstaged changes," >&2
+        echo "so staging the formatted version would commit edits you did not stage:" >&2
+        printf '  %s\n' "${unsafe[@]}" >&2
+        echo >&2
+        echo "They have been formatted in your working tree. Stage the part you mean" >&2
+        echo "(git add -p), then commit again." >&2
+        exit 1
+    fi
+fi
+
+# ---- linting ----
+#
+# The same invocation CI runs, so a commit that passes here passes there.
+# Warm, this is a few seconds; the first run after a dependency change
+# pays for a rebuild.
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo >&2
+    echo "pre-commit: clippy found something. Fix it, or commit with --no-verify" >&2
+    echo "if you are deliberately landing it." >&2
+    exit 1
+fi

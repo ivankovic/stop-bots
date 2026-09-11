@@ -58,6 +58,21 @@ need.
   `fetch_ip_ranges`, `store_ip_ranges`) so the two front-ends run the same code rather
   than two copies that drift. Behaviour in the TUI is unchanged.
 
+- **`make unit-test` / `make integration-test` / `make test`**, replacing the old
+  `test` / `test-containers` pair. `unit-test` is everything that needs only a
+  compiler; `integration-test` is the container suite; `test` is both, unit first,
+  since there is no sense building containers to find out the code doesn't compile.
+  Every target is `.PHONY` now — a directory named `build` or `test` would
+  previously have made `make` say "up to date" and run nothing.
+
+- **An opt-in pre-commit hook**, `make hooks`. Formats what you staged and runs
+  CI's exact clippy invocation. A commit with no Rust in it skips both; a clean
+  Rust commit costs about four seconds. It judges formatting against the staged
+  bytes rather than the working tree, and refuses rather than re-stage a file that
+  is staged unformatted *and* has unstaged changes — formatting rewrites the
+  working tree, so `git add` there would commit edits that were left out on
+  purpose.
+
 - **`--threshold 0` is refused.** Every detector compares `count >= threshold`, so
   zero meant "no evidence required": `block-scanners --threshold 0` added a block
   rule for every address in the log, whatever it had done. One is still allowed —
