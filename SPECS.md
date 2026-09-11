@@ -3605,6 +3605,14 @@ The unit is a golden file (`tests/golden/stop-bots-web.service`), built from a
 host gets. Golden rather than substring assertions because the failure that
 matters is a directive quietly changing meaning.
 
+`activate` — the half that actually starts a daemon — is covered by pointing
+`Layout::systemctl` at a script that records its arguments, asserting the exact
+calls and their order. Injected into the layout rather than put on `PATH`,
+because `PATH` is process-global and would race a threaded test runner; it is
+also the same shape `NginxCommands` already uses for the configurable NGINX
+commands. Without it that function had no coverage at all, since every other
+test goes through `--prefix`, which skips systemctl entirely.
+
 `systemd-analyze verify` parses the generated unit — that is what catches a
 misspelled directive name, which a golden file cannot. Running it under a real
 system manager needs root and has not been done here; the sandbox directives

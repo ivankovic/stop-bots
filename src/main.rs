@@ -1850,10 +1850,21 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         return Ok(());
     }
 
-    println!("The console is on loopback. Reach it over an SSH tunnel:\n");
-    println!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
-    println!("then open http://127.0.0.1:8787/.\n");
-    println!("To put it behind the NGINX it is protecting, see \"Behind NGINX\" in the README.");
+    if options.start {
+        println!("The console is on loopback. Reach it over an SSH tunnel:\n");
+        println!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
+        println!("then open http://127.0.0.1:8787/.\n");
+        println!(
+            "To put it behind the NGINX it is protecting, see \"Behind NGINX\" in the README."
+        );
+    } else {
+        // Telling someone to open a URL for a service that is not running
+        // is how a working install gets reported as broken.
+        println!("Enabled for the next boot but not started, as asked. Start it with:\n");
+        println!("    systemctl start {}\n", stop_bots::install::WEB_UNIT);
+        println!("then reach it over an SSH tunnel:\n");
+        println!("    ssh -L 8787:127.0.0.1:8787 <this-host>");
+    }
     println!();
     println!("One thing that changes now that this runs as root: the internal cron's");
     println!(

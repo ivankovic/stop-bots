@@ -84,6 +84,13 @@ pub struct Layout {
     pub systemd_marker: PathBuf,
     /// Exists only on Debian and its derivatives.
     pub debian_marker: PathBuf,
+    /// The `systemctl` to run. A field rather than a bare `"systemctl"` at
+    /// the point of use for the same reason every path here is one: it is
+    /// what lets a test point [`activate`] at a script that records its
+    /// arguments, instead of leaving the one function that starts a daemon
+    /// untested. Injecting it beats putting a fake on `PATH`, which is
+    /// process-global and races under a threaded test runner.
+    pub systemctl: PathBuf,
 }
 
 impl Layout {
@@ -106,6 +113,7 @@ impl Layout {
             ssh_log: prefix.join("var/log/auth.log"),
             systemd_marker: prefix.join("run/systemd/system"),
             debian_marker: prefix.join("etc/debian_version"),
+            systemctl: PathBuf::from("systemctl"),
         }
     }
 
@@ -372,9 +380,11 @@ pub fn activate(layout: &Layout, options: &Options) -> Result<Steps> {
 
     steps.push("systemctl daemon-reload".to_string());
     if !options.dry_run {
-        systemctl(&["daemon-reload"])?;
+        systemctl(layout, &["daemon-reload"])?;
     }
 
+    // `enable` without `--now` leaves the unit set to start at the next
+    // boot but not running, which is what --no-start is for.
     let action: &[&str] = if options.start {
         &["enable", "--now", WEB_UNIT]
     } else {
@@ -382,18 +392,23 @@ pub fn activate(layout: &Layout, options: &Options) -> Result<Steps> {
     };
     steps.push(format!("systemctl {}", action.join(" ")));
     if !options.dry_run {
-        systemctl(action)?;
+        systemctl(layout, action)?;
     }
 
-    let _ = layout;
     Ok(steps)
 }
 
-fn systemctl(args: &[&str]) -> Result<()> {
-    let output = std::process::Command::new("systemctl")
+fn systemctl(layout: &Layout, args: &[&str]) -> Result<()> {
+    let output = std::process::Command::new(&layout.systemctl)
         .args(args)
         .output()
-        .with_context(|| format!("failed to run `systemctl {}`", args.join(" ")))?;
+        .with_context(|| {
+            format!(
+                "failed to run `{} {}`",
+                layout.systemctl.display(),
+                args.join(" ")
+            )
+        })?;
     if !output.status.success() {
         anyhow::bail!(
             "`systemctl {}` exited with {}: {}",
@@ -578,6 +593,108 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o700, "state dir was left at {mode:04o}");
+    }
+
+    /// A `systemctl` that records its arguments and succeeds, so the one
+    /// function here that starts a daemon is covered by something other
+    /// than hope. Written into the layout rather than onto `PATH`: `PATH`
+    /// is process-global and would race a threaded test runner.
+    fn recording_systemctl(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("systemctl.log");
+        let script = dir.join("fake-systemctl");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, log)
+    }
+
+    /// The exact calls, in order. An argument-order slip or a typo in the
+    /// unit name is invisible to every other test here, because they all
+    /// go through `--prefix`, which skips systemctl entirely.
+    #[test]
+    fn activating_reloads_systemd_then_enables_and_starts_the_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        let (script, log) = recording_systemctl(dir.path());
+        layout.systemctl = script;
+
+        let steps = activate(
+            &layout,
+            &Options {
+                start: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls, "daemon-reload\nenable --now stop-bots-web.service\n",
+            "steps reported were: {steps:?}"
+        );
+    }
+
+    /// `--no-start` enables the unit for the next boot without running it
+    /// now — so no `--now`.
+    #[test]
+    fn activating_without_start_enables_but_does_not_run_the_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        let (script, log) = recording_systemctl(dir.path());
+        layout.systemctl = script;
+
+        activate(&layout, &Options::default()).unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls, "daemon-reload\nenable stop-bots-web.service\n");
+    }
+
+    /// A dry run must not reach systemd either — that is the whole promise
+    /// of the flag on the one command that starts a daemon.
+    #[test]
+    fn a_dry_run_does_not_call_systemctl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        let (script, log) = recording_systemctl(dir.path());
+        layout.systemctl = script;
+
+        let steps = activate(
+            &layout,
+            &Options {
+                dry_run: true,
+                start: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        assert!(!log.exists(), "systemctl ran during a dry run");
+        assert!(
+            steps.iter().any(|s| s.contains("enable --now")),
+            "a dry run still describes what it would do: {steps:?}"
+        );
+    }
+
+    /// A failing `systemctl` is an error, not a step that quietly reports
+    /// success — the unit is written but the service is not running, and
+    /// the operator has to know that.
+    #[test]
+    fn a_failing_systemctl_stops_the_install() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        let script = dir.path().join("failing-systemctl");
+        std::fs::write(&script, "#!/bin/sh\necho 'no such unit' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        layout.systemctl = script;
+
+        let err = activate(&layout, &Options::default()).unwrap_err();
+
+        assert!(err.to_string().contains("no such unit"), "was: {err}");
     }
 
     #[test]
