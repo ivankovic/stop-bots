@@ -2720,6 +2720,154 @@ fn web_rejects_a_bind_that_is_not_an_address_and_port() {
         .stderr(predicate::str::contains("8787"));
 }
 
+/// Stages a fake Debian-with-systemd root that `install web` will accept,
+/// and a binary for its ExecStart to point at.
+fn fake_debian_root() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::create_dir_all(tmp.path().join("run/systemd/system")).unwrap();
+    fs::create_dir_all(tmp.path().join("etc")).unwrap();
+    fs::write(tmp.path().join("etc/debian_version"), "13.1\n").unwrap();
+    let binary = tmp.path().join("stop-bots");
+    fs::write(&binary, b"#!/bin/true\n").unwrap();
+    (tmp, binary)
+}
+
+/// The whole installer, end to end, into a prefix: a unit, the two
+/// directories, a generated password, and no `systemctl` — a unit under a
+/// prefix is not a path systemd reads, and saying so beats running
+/// `daemon-reload` and implying the file took effect.
+#[test]
+fn install_web_writes_a_unit_and_a_password_under_a_prefix() {
+    let (tmp, binary) = fake_debian_root();
+
+    let output = Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "install",
+            "web",
+            "--prefix",
+            tmp.path().to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+
+    assert!(stdout.contains("Console password"), "was: {stdout}");
+    assert!(stdout.contains("skipping systemctl"), "was: {stdout}");
+
+    let unit = fs::read_to_string(tmp.path().join("etc/systemd/system/stop-bots-web.service"))
+        .expect("no unit written");
+    assert!(unit.contains(&format!("ExecStart={} web", binary.display())));
+    // Directive lines only: the unit's own comments name
+    // `ProtectSystem=full` to explain why it is not used, so a plain
+    // substring search finds it in the prose.
+    let directives: Vec<&str> = unit
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .collect();
+    assert!(
+        directives.contains(&"ProtectSystem=yes"),
+        "was: {directives:?}"
+    );
+    assert!(
+        !directives.contains(&"ProtectSystem=full"),
+        "full would make /etc read-only and break the first NGINX apply"
+    );
+    assert!(tmp.path().join("var/lib/stop-bots/db.sqlite3").exists());
+    assert!(tmp.path().join("etc/stop-bots").is_dir());
+}
+
+/// Re-running must not issue a second password: the first one was printed
+/// once and written down, and silently replacing it locks the operator out
+/// of their own console.
+#[test]
+fn install_web_run_twice_keeps_the_first_password() {
+    let (tmp, binary) = fake_debian_root();
+    let args = [
+        "install",
+        "web",
+        "--prefix",
+        tmp.path().to_str().unwrap(),
+        "--binary",
+        binary.to_str().unwrap(),
+    ];
+
+    let first = Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(args)
+        .assert()
+        .success();
+    let first = String::from_utf8(first.get_output().stdout.clone()).unwrap();
+    let second = Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args(args)
+        .assert()
+        .success();
+    let second = String::from_utf8(second.get_output().stdout.clone()).unwrap();
+
+    assert!(first.contains("Console password"));
+    assert!(
+        !second.contains("Console password"),
+        "a second password was issued: {second}"
+    );
+    assert!(second.contains("already set"), "was: {second}");
+    assert!(second.contains("already up to date"), "was: {second}");
+}
+
+/// `--dry-run` has to be trustworthy or nobody will use it on the one
+/// command in this project that starts a daemon.
+#[test]
+fn install_web_dry_run_changes_nothing() {
+    let (tmp, binary) = fake_debian_root();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "install",
+            "web",
+            "--prefix",
+            tmp.path().to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("nothing was changed"));
+
+    assert!(!tmp
+        .path()
+        .join("etc/systemd/system/stop-bots-web.service")
+        .exists());
+    assert!(!tmp.path().join("var/lib/stop-bots").exists());
+    assert!(!tmp.path().join("etc/stop-bots").exists());
+}
+
+/// A host that is not Debian is told so rather than given a unit nobody
+/// has checked.
+#[test]
+fn install_web_refuses_a_host_that_is_not_debian() {
+    let (tmp, binary) = fake_debian_root();
+    fs::remove_file(tmp.path().join("etc/debian_version")).unwrap();
+
+    Command::cargo_bin("stop-bots")
+        .unwrap()
+        .args([
+            "install",
+            "web",
+            "--prefix",
+            tmp.path().to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not look like Debian"));
+}
+
 /// A plain `Command`, for the tests above that need one without the
 /// `Fixture`'s NGINX environment.
 fn stop_bots_cmd(args: &[&str]) -> Command {

@@ -1,0 +1,58 @@
+# Written by `stop-bots install web`. Re-running that command leaves an
+# edited copy of this file alone and tells you so; `--force` replaces it.
+#
+# Settings deliberately absent from ExecStart: the bind address, the host
+# allowlist, the path prefix and whether exposure is permitted all live in
+# the `settings` table, because the running server re-reads them. Adding a
+# flag for one here gives it two sources of truth and the database wins on
+# the next restart. Change them with `stop-bots web --save ...` instead.
+[Unit]
+Description=stop-bots web console
+Documentation=https://github.com/ivankovic/stop-bots
+# Wants rather than Requires: the console is most worth looking at when
+# NGINX is down, so it must not be stopped along with it.
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/stop-bots web --db /var/lib/stop-bots/db.sqlite3 --root /etc/nginx --ssh-log /var/log/auth.log
+Restart=on-failure
+RestartSec=5s
+
+# Runs as root, and has to: it rewrites this host's NGINX config, writes
+# the firewall script, and runs `nginx -t` and `systemctl reload nginx`.
+# The directives below are the hardening that survives that. Notably
+# absent is ProtectSystem=full, which would make /etc read-only and break
+# the first apply — an hour after the unit started cleanly.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=yes
+ProtectHome=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+# AF_UNIX for the dbus socket `systemctl reload nginx` talks over,
+# AF_INET/AF_INET6 for the console itself and the crawler-range
+# downloads. Nothing here uses a raw or netlink socket: this service
+# writes the firewall script, it never applies it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# The database holds the console's password hash.
+UMask=0077
+
+# Three that `systemd-analyze security` will still flag, each on
+# purpose. User= — see above. CapabilityBoundingSet= — root's ability
+# to write a file it does not own *is* CAP_DAC_OVERRIDE, so trimming
+# the set is how you get a service that starts cleanly and cannot
+# write /etc/nginx an hour later. MemoryDenyWriteExecute= — safe for a
+# Rust binary with no JIT, but nobody has run this unit with it on,
+# and an untested sandbox directive is not hardening.
+
+[Install]
+WantedBy=multi-user.target

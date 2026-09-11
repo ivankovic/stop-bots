@@ -28,6 +28,7 @@ pub mod event;
 pub mod firewall;
 #[cfg(test)]
 mod golden;
+pub mod install;
 pub mod ipranges;
 pub mod iptables;
 pub mod nftables;

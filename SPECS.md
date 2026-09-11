@@ -3537,6 +3537,82 @@ Tested through the existing fake-executables harness, with `docker` added to
 it. The assertion is on the whole call log, so a fallback to the host's `nginx`
 or `systemctl` fails the test rather than passing unnoticed.
 
+## Installing as a service (`src/install.rs`, `stop-bots install web`)
+
+Everything else in this project writes a file and stops. This writes a unit,
+reloads systemd and starts a daemon, so it is the one module whose mistakes
+are not undone by editing a file back. Three rules follow, and they are why
+it is a module rather than forty lines in `main.rs`.
+
+**Every path is a field on `Layout`.** Nothing reads a constant at the point
+of use, which is what lets a test point the whole installer at a temp
+directory and assert the bytes it produced. `Layout::under` builds each path
+by joining a *relative* path onto the prefix, because `Path::join` with an
+absolute path discards the prefix — the mistake that would send a `--prefix`
+install to the developer's real `/etc`, and the reason there is a test
+asserting every field stays inside.
+
+**Nothing is written until every check has passed.** `preflight` runs in full
+first: systemd (`/run/systemd/system` exists — a `systemctl` binary on `PATH`
+proves only that the package is installed, which is true inside a container
+that is not running systemd), Debian, the binary is a file, and the unit
+directory is writable. Writability is checked by writing, not by comparing
+euid to 0: what matters is whether this process can write there, and
+root-in-a-container answers that differently from `id -u`. A check that fails
+after the directories exist leaves a half-install, which is worse than no
+install because it looks finished.
+
+**It refuses rather than overwrites.** A unit that exists and differs stops
+the run unless `--force`; byte-identical is a no-op, which is what makes
+re-running safe. An operator who edited `ExecStart` made a decision.
+
+`is_build_artifact` refuses a binary under `target/debug` or `target/release`.
+`sudo cargo run -- install web` would otherwise resolve `current_exe()` to a
+path that works until the next `cargo clean`, with nothing warning when it
+stops.
+
+### Why the service runs as root
+
+Because the console rewrites `/etc/nginx`, writes `/etc/stop-bots/firewall.nft`
+and runs `nginx -t` and `systemctl reload nginx`. There is no unprivileged
+split that leaves the feature set intact; dropping privilege would mean the
+web UI silently losing the ability to apply anything.
+
+The hardening in the generated unit is what survives that. `ProtectSystem=full`
+would make `/etc` read-only and break the first NGINX apply — an hour after
+the unit started cleanly — so it is `ProtectSystem=yes`, covering `/usr` and
+`/boot`. `CapabilityBoundingSet=` is deliberately not set: root's ability to
+write a file it does not own *is* `CAP_DAC_OVERRIDE`, so trimming the set is
+how you get a service that starts and then cannot write NGINX config.
+`MemoryDenyWriteExecute=` is safe in principle for a Rust binary with no JIT
+and is left off because nobody has run the unit with it on — an untested
+sandbox directive is not hardening. `systemd-analyze security` scores the
+result 5.8 (MEDIUM), up from 7.8 (EXPOSED) before the additions.
+
+### Settings do not go in the unit
+
+`ExecStart` carries `--db`, `--root` and `--ssh-log`, which are paths. The
+bind address, host allowlist, path prefix and exposure flag go to the
+`settings` table, because the running server re-reads them on every request —
+a flag in `ExecStart` would be a second source of truth that loses to the
+database on the next restart. The unit says so in a comment, so the next
+person to add a flag reads the reason first.
+
+### How it is verified
+
+The unit is a golden file (`tests/golden/stop-bots-web.service`), built from a
+`Layout` with no temp directory in it so the golden is the bytes a real Debian
+host gets. Golden rather than substring assertions because the failure that
+matters is a directive quietly changing meaning.
+
+`systemd-analyze verify` parses the generated unit — that is what catches a
+misspelled directive name, which a golden file cannot. Running it under a real
+system manager needs root and has not been done here; the sandbox directives
+were smoke-tested with `systemd-run --user`, where every one a user manager can
+apply ran the binary fine, and the three it cannot (`ProtectClock`,
+`ProtectKernelModules`, `ProtectKernelLogs`) fail identically for `/bin/true`,
+which is a user-session limitation rather than anything about this unit.
+
 ## Web UI (`src/web/`, `stop-bots web`)
 
 A third front-end over the same core as the CLI and the TUI. Nothing under

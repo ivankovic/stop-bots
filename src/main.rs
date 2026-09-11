@@ -25,7 +25,6 @@ use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
 const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
 const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
 
-/// Help text shared by every subcommand's `--db` flag.
 /// Rejects `--threshold 0` at the command line.
 ///
 /// Every detector compares `count >= threshold`, so zero matches every
@@ -46,6 +45,7 @@ fn min_threshold(raw: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+/// Help text shared by every subcommand's `--db` flag.
 const DB_HELP: &str = "Database path (defaults to /var/lib/stop-bots/db.sqlite3, falling back to a per-user location if that's not writable)";
 
 #[derive(Parser)]
@@ -798,6 +798,64 @@ enum Command {
         #[arg(long, short)]
         verbose: bool,
     },
+    /// Set stop-bots up as a system service.
+    ///
+    /// Currently Debian with systemd, which is what has been tested. The
+    /// unit it writes is very likely correct on any systemd distribution;
+    /// the SSH log path it assumes is Debian's.
+    ///
+    /// Nothing is written until every check has passed, an existing unit
+    /// file that you have edited is left alone rather than replaced, and
+    /// --dry-run prints the whole plan without touching anything. Start
+    /// there.
+    Install {
+        /// What to install. `web` writes a systemd unit for the web
+        /// console and enables it.
+        #[arg(value_enum)]
+        target: InstallTarget,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Print every step and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Replace a unit file that exists and differs from what this
+        /// would write.
+        #[arg(long)]
+        force: bool,
+        /// Enable the unit but do not start it now.
+        #[arg(long)]
+        no_start: bool,
+        /// The stop-bots binary to name in ExecStart. Defaults to the one
+        /// running this command, which is refused if it sits in a build
+        /// directory — a unit pointing into target/debug works until the
+        /// next `cargo clean`.
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// NGINX config root the service will scan.
+        #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
+        root: PathBuf,
+        /// SSH log the service will read.
+        #[arg(long, default_value = "/var/log/auth.log")]
+        ssh_log: PathBuf,
+        /// Install into this prefix instead of `/`. For inspecting the
+        /// result without root; a unit written under a prefix is not a
+        /// unit systemd will ever see, so this skips systemctl entirely.
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+        /// Address the service will bind. Persisted to the database, not
+        /// written into the unit — the server re-reads it.
+        #[arg(long)]
+        bind: Option<String>,
+        /// Serve under a path prefix, for an NGINX `location` block.
+        #[arg(long)]
+        base_path: Option<String>,
+        /// Permit a bind that is not loopback.
+        #[arg(long)]
+        expose: bool,
+        /// Comma-separated host names the console will answer to.
+        #[arg(long)]
+        allowed_hosts: Option<String>,
+    },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
         #[arg(long, help = DB_HELP)]
@@ -819,6 +877,12 @@ enum Command {
         #[arg(long)]
         ssh_log: Option<PathBuf>,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum InstallTarget {
+    /// The web console, as a systemd service.
+    Web,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -891,6 +955,36 @@ async fn main() -> Result<()> {
             no_reload,
             ssh_log,
         }) => run_tui(db, root, no_reload, ssh_log).await,
+        Some(Command::Install {
+            target,
+            db,
+            dry_run,
+            force,
+            no_start,
+            binary,
+            root,
+            ssh_log,
+            prefix,
+            bind,
+            base_path,
+            expose,
+            allowed_hosts,
+        }) => match target {
+            InstallTarget::Web => run_install_web(InstallWeb {
+                db,
+                dry_run,
+                force,
+                start: !no_start,
+                binary,
+                root,
+                ssh_log,
+                prefix,
+                bind,
+                base_path,
+                expose,
+                allowed_hosts,
+            }),
+        },
         Some(Command::Batch {
             db,
             root,
@@ -1610,6 +1704,165 @@ fn set_robots_txt(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
 fn show_robots_txt(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     print!("{}", nginx::robots_txt_body(&db)?);
+    Ok(())
+}
+
+/// Everything `install web` was given. A struct because it is a dozen
+/// fields and `run_install_web(db, true, false, true, None, ...)` is not
+/// a call anyone can read.
+struct InstallWeb {
+    db: Option<PathBuf>,
+    dry_run: bool,
+    force: bool,
+    start: bool,
+    binary: Option<PathBuf>,
+    root: PathBuf,
+    ssh_log: PathBuf,
+    prefix: Option<PathBuf>,
+    bind: Option<String>,
+    base_path: Option<String>,
+    expose: bool,
+    allowed_hosts: Option<String>,
+}
+
+fn run_install_web(options: InstallWeb) -> Result<()> {
+    use stop_bots::install::{self, Layout, Options};
+    use stop_bots::web;
+
+    let binary = match options.binary {
+        Some(path) => path,
+        None => {
+            let current = std::env::current_exe()
+                .context("could not work out which stop-bots binary is running")?;
+            // A unit naming target/debug/stop-bots works right up until the
+            // next `cargo clean`, and nothing warns when it stops.
+            if install::is_build_artifact(&current) {
+                anyhow::bail!(
+                    "{} is a build artifact, so a unit naming it would break on the \
+                     next `cargo clean`. Install the binary first, then:\n\n    \
+                     stop-bots install web --binary /usr/local/bin/stop-bots\n\n\
+                     Or pass --binary explicitly if you really do mean this path.",
+                    current.display()
+                );
+            }
+            current
+        }
+    };
+
+    let prefix = options.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
+    let mut layout = Layout::under(&prefix, binary);
+    // `--root` and `--ssh-log` have their own defaults and are absolute, so
+    // they replace what the prefix produced rather than being joined onto
+    // it. Under a prefix that means the unit names the real paths, which is
+    // right: a prefixed install is for reading the output, not running it.
+    layout.nginx_root = options.root;
+    layout.ssh_log = options.ssh_log;
+
+    let opts = Options {
+        dry_run: options.dry_run,
+        force: options.force,
+        start: options.start,
+    };
+
+    let mut steps = install::install_web(&layout, &opts)?;
+
+    // Under a prefix there is no systemd to tell: the unit is somewhere
+    // systemd will never look. Saying so beats running `daemon-reload` and
+    // implying the file took effect.
+    let prefixed = prefix != Path::new("/");
+    if prefixed {
+        steps.push(format!(
+            "skipping systemctl: {} is not a path systemd reads",
+            layout.unit_dir.display()
+        ));
+    } else {
+        steps.extend(install::activate(&layout, &opts)?);
+    }
+
+    // Settings, not unit contents. The running server re-reads these on
+    // every request, so a flag in ExecStart would be a second source of
+    // truth that loses to the database on the next restart.
+    let mut password = None;
+    if !options.dry_run {
+        let db = open_db(options.db.or(Some(layout.db_path.clone())))?;
+
+        let addr = web::resolve_bind(&db, options.bind.as_deref())?;
+        let exposed = options.expose || db.get_bool_setting(web::EXPOSE_KEY, false)?;
+        if !web::is_loopback(&addr) && !exposed {
+            anyhow::bail!(
+                "refusing to install a service bound to {addr}, which is reachable \
+                 from the network, without --expose. The console can rewrite this \
+                 host's firewall and NGINX config."
+            );
+        }
+        db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
+        if options.expose {
+            db.set_bool_setting(web::EXPOSE_KEY, true)?;
+        }
+        if let Some(raw) = &options.base_path {
+            db.set_text_setting(web::BASE_PATH_KEY, web::BasePath::parse(raw)?.as_str())?;
+        }
+        if let Some(hosts) = &options.allowed_hosts {
+            db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
+        }
+        steps.push(format!(
+            "bind {addr} recorded in {}",
+            layout.db_path.display()
+        ));
+
+        if !web::auth::password_is_set(&db)? {
+            let generated = web::auth::generate_password()?;
+            web::auth::set_password(&db, &generated)?;
+            password = Some(generated);
+            steps.push("generated a console password".to_string());
+        } else {
+            steps.push("a console password is already set, keeping it".to_string());
+        }
+    }
+
+    if options.dry_run {
+        println!("Dry run — nothing was changed. Would:");
+    } else {
+        println!("Installed:");
+    }
+    for step in &steps {
+        println!("  {step}");
+    }
+    println!();
+
+    if let Some(password) = password {
+        println!("Console password:\n");
+        println!("    {password}\n");
+        println!("Shown once. Only an Argon2 hash of it is stored — write it down now.");
+        println!("`stop-bots web --set-password` issues a new one.\n");
+    }
+
+    if options.dry_run {
+        println!("Re-run without --dry-run to do it.");
+        return Ok(());
+    }
+
+    if prefixed {
+        println!(
+            "Written under {}. Review it, then install for real.",
+            prefix.display()
+        );
+        return Ok(());
+    }
+
+    println!("The console is on loopback. Reach it over an SSH tunnel:\n");
+    println!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
+    println!("then open http://127.0.0.1:8787/.\n");
+    println!("To put it behind the NGINX it is protecting, see \"Behind NGINX\" in the README.");
+    println!();
+    println!("One thing that changes now that this runs as root: the internal cron's");
+    println!(
+        "daily RenderFirewall job can write {}/firewall.nft,",
+        layout.output_dir.display()
+    );
+    println!("which it could not before. Nothing applies that script — running it is");
+    println!("still yours to do, or `stop-bots batch --apply` from a crontab.");
+
     Ok(())
 }
 

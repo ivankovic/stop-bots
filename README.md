@@ -325,6 +325,37 @@ ssh -L 8787:127.0.0.1:8787 your-server
 
 then open <http://127.0.0.1:8787/>.
 
+## As a service (Debian)
+
+```
+sudo stop-bots install web
+```
+
+Writes `/etc/systemd/system/stop-bots-web.service`, creates `/var/lib/stop-bots` (0700 — it
+holds the console's password hash) and `/etc/stop-bots`, generates a password if there isn't
+one, and enables and starts the unit.
+
+**`--dry-run` prints the whole plan and changes nothing.** This is the one command in the
+project that starts a daemon, so start there. `--prefix <dir>` writes the same tree somewhere
+you can read it without root. If the unit already exists and you have edited it, the
+installer stops and says so rather than replacing your edit; `--force` if you meant it.
+
+The service runs as **root**, because the console rewrites `/etc/nginx`, writes the firewall
+script, and runs `nginx -t` and `systemctl reload nginx`. There is no unprivileged split that
+leaves the feature set intact. The unit carries the hardening that survives that requirement
+and a comment saying which hardening was left off and why.
+
+The bind address, host allowlist and path prefix are deliberately *not* in the unit — the
+running server re-reads them from the database, so putting them in `ExecStart` would give
+them two sources of truth. Change them with `stop-bots web --save ...` and restart.
+
+One thing changes once this runs as root: the internal cron's daily `RenderFirewall` job can
+now write `/etc/stop-bots/firewall.nft`, which it could not when you ran the console by hand
+as yourself. Nothing applies that script — running it is still yours to do.
+
+Only Debian is checked for, because that is what has been tested; the unit is very likely
+correct on any systemd distribution, but the SSH log path it assumes is Debian's.
+
 ## Exposing it
 
 Binding anything but loopback takes a second, deliberate flag, because this console can

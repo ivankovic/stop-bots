@@ -58,6 +58,20 @@ need.
   `fetch_ip_ranges`, `store_ip_ranges`) so the two front-ends run the same code rather
   than two copies that drift. Behaviour in the TUI is unchanged.
 
+- **`stop-bots install web`** sets the console up as a systemd service on Debian:
+  a unit at `/etc/systemd/system/stop-bots-web.service`, `/var/lib/stop-bots` at
+  0700 because it holds the password hash, `/etc/stop-bots` for the firewall
+  script, a generated password if there isn't one, and `systemctl enable --now`.
+
+  `--dry-run` prints the plan and changes nothing; `--prefix` writes the tree
+  somewhere readable without root; a unit you have edited is refused rather than
+  replaced unless you pass `--force`; and a binary under `target/debug` is
+  refused, because a unit naming one works until the next `cargo clean`.
+
+  The service runs as root, which it has to — the console rewrites `/etc/nginx`
+  and runs `systemctl reload nginx`. The unit carries the hardening compatible
+  with that and names the hardening that isn't, with reasons.
+
 - **`make unit-test` / `make integration-test` / `make test`**, replacing the old
   `test` / `test-containers` pair. `unit-test` is everything that needs only a
   compiler; `integration-test` is the container suite; `test` is both, unit first,
