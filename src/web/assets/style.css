@@ -237,8 +237,13 @@ td.wrap { word-break: break-all; }
    column is truncated rather than wrapped, and carries the whole string
    as its `title`. */
 .table-scroll table { table-layout: fixed; }
-.table-scroll td {
-  white-space: nowrap;
+/* Nothing in these rows wraps — a wrapped cell is a taller row, and a
+   button that wraps to a second line is the easy way to get one. */
+.table-scroll td { white-space: nowrap; }
+/* Only the two long columns can overflow theirs, and they are the only
+   ones an ellipsis says anything about: a count, a pill and a button
+   either fit or the column widths below are wrong. */
+.table-scroll td.mono {
   overflow: hidden;
   text-overflow: ellipsis;
 }

@@ -3697,7 +3697,12 @@ of text on a desktop monitor.
 The two Dynamic Protection tables are as long as the logs make them —
 hundreds of rows on a server that is actually being scanned — so they are
 capped at twenty rows (`--table-rows-visible`) and scroll inside their
-panel, with the header stuck to the top. Without the cap the two tables
+panel, with the header stuck to the top. Twenty is the cap for a row
+carrying an action button, which is the tall case; a table of rows that
+offer no button — everything a downloaded blocklist blocked — is shorter
+per row and shows a few more before it scrolls. It is a `max-height`, so
+either way it degrades into "about twenty" rather than cutting a row in
+half. Without the cap the two tables
 could not usefully sit side by side: one would start a screen below the
 other.
 
