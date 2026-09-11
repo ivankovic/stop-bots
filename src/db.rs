@@ -655,18 +655,18 @@ impl Db {
                 path TEXT NOT NULL,
                 PRIMARY KEY (site_id, path)
             );
-            -- Row presence means the site rejects HTTP/1.0 and HTTP/1.1 —
-            -- the same shape `selected_countries` uses. A per-site flag
-            -- rather than a column on `sites` because `sites` rows are
-            -- rewritten wholesale by every scan, and a setting must not be
-            -- lost because someone re-ran discovery.
-            CREATE TABLE IF NOT EXISTS site_reject_http_1x (
-                site_id INTEGER PRIMARY KEY REFERENCES sites(id)
-            );
-            -- One row per (site, enabled request-shape rule). Same
-            -- row-presence shape as the table above; a table rather than
-            -- more boolean columns so a new rule is a new `RequestRule`
-            -- variant and no schema change.
+            -- One row per (site, enabled request-shape rule). Row presence
+            -- is the flag, the shape `selected_countries` uses; a per-site
+            -- table rather than columns on `sites` because `sites` rows are
+            -- rewritten wholesale by every scan and a setting must not be
+            -- lost because someone re-ran discovery, and a table rather than
+            -- one boolean column per rule so a new rule is a new
+            -- `RequestRule` variant and no schema change.
+            --
+            -- This replaced a single-purpose `site_reject_http_1x` table,
+            -- whose `http_1x` rule became one variant among six. That table
+            -- is not created any more: nothing has read it since, and no
+            -- released version ever wrote it.
             CREATE TABLE IF NOT EXISTS site_request_rules (
                 site_id INTEGER NOT NULL REFERENCES sites(id),
                 rule TEXT NOT NULL,
@@ -1298,35 +1298,6 @@ impl Db {
         Ok(())
     }
 
-    /// Whether `site_id` rejects HTTP/1.0 and HTTP/1.1 requests.
-    pub fn site_rejects_http_1x(&self, site_id: i64) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM site_reject_http_1x WHERE site_id = ?1",
-            params![site_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
-    pub fn set_site_rejects_http_1x(&self, site_id: i64, reject: bool) -> Result<()> {
-        if reject {
-            self.conn.execute(
-                "INSERT OR IGNORE INTO site_reject_http_1x (site_id) VALUES (?1)",
-                params![site_id],
-            )?;
-        } else {
-            self.conn.execute(
-                "DELETE FROM site_reject_http_1x WHERE site_id = ?1",
-                params![site_id],
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Whether generated site configs serve this project's `robots.txt`.
-    /// Off by default: it replaces whatever the site already serves at
-    /// `/robots.txt`, which may well be hand-written and carry rules this
-    /// project knows nothing about.
     pub fn get_serve_robots_txt(&self) -> Result<bool> {
         self.get_bool_setting("serve_robots_txt", false)
     }

@@ -41,11 +41,6 @@
 use crate::db::Db;
 use anyhow::Result;
 
-/// `settings` key: whether spoofed-crawler detection runs.
-pub const SPOOFED_CRAWLERS_ENABLED: &str = "detect_spoofed_crawlers";
-/// `settings` key: TTL in days for a block that detection adds.
-pub const SPOOFED_CRAWLERS_TTL_DAYS: &str = "detect_spoofed_crawlers_ttl_days";
-
 /// Spoofed-crawler detection defaults to **on**. Unlike the threshold-based
 /// detectors this one has no false-positive tuning to get wrong: an IP is
 /// only flagged when it puts a crawler's name in its user agent *and* sits
@@ -64,10 +59,6 @@ pub const SPOOFED_CRAWLERS_ENABLED_DEFAULT: bool = true;
 /// re-flagged on its very next request anyway.
 pub const SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT: i64 = 1;
 
-/// `settings` key: whether probe-path detection runs.
-pub const PROBE_PATHS_ENABLED: &str = "detect_probe_paths";
-/// `settings` key: TTL in days for a block that detection adds.
-pub const PROBE_PATHS_TTL_DAYS: &str = "detect_probe_paths_ttl_days";
 /// `settings` key: extra probe paths, one per line, appended to
 /// [`crate::accesslog::DEFAULT_PROBE_PATHS`].
 pub const PROBE_PATHS_EXTRA: &str = "detect_probe_paths_extra";
@@ -117,10 +108,6 @@ pub fn probe_paths(db: &Db) -> Result<Vec<String>> {
     Ok(paths)
 }
 
-/// `settings` key: whether honeypot detection runs.
-pub const HONEYPOT_ENABLED: &str = "detect_honeypot";
-/// `settings` key: TTL in days for a block that detection adds.
-pub const HONEYPOT_TTL_DAYS: &str = "detect_honeypot_ttl_days";
 /// `settings` key: the trap path itself.
 pub const HONEYPOT_PATH: &str = "detect_honeypot_path";
 

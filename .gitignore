@@ -22,3 +22,9 @@ target
 #.idea/
 
 tests/container/stop-bots
+
+# Local config for the codediff viewer: a personal colour theme plus
+# absolute paths to temp files on whoever's machine it is. Untracked it
+# warns on every `cargo publish`; committed it would be someone else's
+# theme and a dead /tmp path.
+.codediff.toml

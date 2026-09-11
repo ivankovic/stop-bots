@@ -84,7 +84,7 @@ that tags any `{` immediately preceded by the word `server`, so nested
 `location {}` blocks and commented-out blocks (including ones containing
 literal `{`/`}`, as in the test fixtures) are handled correctly.
 
-## Bot list (`src/botlist.rs`)
+## Bot list (`src/botlist/`)
 
 Source: [ArcJet Well-Known Bots](https://github.com/arcjet/well-known-bots)
 (`well-known-bots.json`), chosen because it's actively maintained, already
@@ -919,7 +919,7 @@ the stable **id** (`"well-known-bots"`) instead, resolved via
 `PopupTarget::Source` changed the same way, looking the display name back
 up from `self.sources` only when rendering the popup's title.
 
-## Crawler and country IP ranges (`src/ipranges.rs`, `Db::derived_firewall_entries`)
+## Crawler and country IP ranges (`src/ipranges/`, `Db::derived_firewall_entries`)
 
 Extends the firewall layer (see "Firewall integration" above, which
 predates this and describes it as plain admin-managed with "no bot-list
@@ -932,7 +932,7 @@ publish a stable JSON URL with the *identical* shape —
 {"ipv6Prefix": "..."}]}` — verified live against all three
 (`developers.google.com/search/apis/ipranges/googlebot.json`,
 `bing.com/toolbox/bingbot.json`, `openai.com/gptbot.json`). Because the
-shape is identical, `IpRangeSourceKind` (in `src/ipranges.rs`) shares one
+shape is identical, `IpRangeSourceKind` (in `src/ipranges/mod.rs`) shares one
 parser across all three, unlike `botlist::SourceKind`'s three different
 per-source modules. Anthropic doesn't publish a range file (recommends
 reverse-DNS instead), so there's no fourth source here.
@@ -1330,7 +1330,7 @@ which jobs are due once a minute (throttled against `Event::Tick`'s 30fps
 rate — cheap either way, a handful of `settings` reads, but no reason to
 ask 30 times a second). A job's own interval can never be shorter than
 that check cadence and have it matter; tightening detection further would
-mean shortening `CRON_CHECK_INTERVAL` itself, not just the job's
+mean shortening `cron::CHECK_INTERVAL` itself, not just the job's
 `interval()`.
 
 **All five jobs now start background work rather than running any part of
@@ -1830,7 +1830,7 @@ user-agent tracking" above), so the User Agent panel just reads it
 directly. Nothing equivalent existed for SSH attempt counts, and this
 screen doesn't add one: it re-parses the live SSH log
 (`sshlog::find_default_source`, no path override, same lookup
-`run_cron_block_scanners` already uses) on every `refresh`. The
+`cron::read_log_for` already uses) on every `refresh`. The
 discriminating question that ruled out a new `ssh_attempt_stats`
 table/cron job/CLI command mirroring `accessstats.rs`: does this panel
 need data that outlives the current log? No — it's explicitly a
@@ -1901,7 +1901,7 @@ and an "apply after writing" shortcut in the render popup itself.
 same rule set `build_script` renders (`firewall::all_rules`, factored out
 of `build_script` for exactly this reuse — admin-managed rules from
 `Db::list_firewall_rules` followed by derived crawler/geo rules). Every
-successful write (`App::render_firewall`, `render_firewall_for_cron`)
+successful write (`App::render_firewall`, `cron::render_firewall`)
 persists this string via new `Db::set_firewall_rendered_signature`
 (reuses the `settings` table, one fixed key — there's only ever one
 "current" render to track). `Dashboard::refresh` recomputes the current
@@ -2782,10 +2782,12 @@ low-value churn; converge opportunistically.
 **What it does.** An optional per-site rule rejecting HTTP/1.0 and
 HTTP/1.1 requests: `if ($server_protocol ~ "^HTTP/1\.")`, folded into the
 same flag form as the other blockers so exemptions still apply. Stored as
-row presence in `site_reject_http_1x` (the `selected_countries` shape), a
+row presence in `site_request_rules` (the `selected_countries` shape), a
 per-site table rather than a column on `sites` because `sites` rows are
 rewritten by every scan and a setting must not be lost to re-running
-discovery.
+discovery. It shipped with a table of its own, `site_reject_http_1x`,
+which the `RequestRule` generalisation below superseded and which nothing
+has read since.
 
 **The premise, and its limit.** Current browsers negotiate HTTP/2, and a
 lot of scraping tooling doesn't, so this is a cheap filter. It is also the
