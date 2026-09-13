@@ -605,6 +605,23 @@ impl Db {
         Ok(db)
     }
 
+    /// Where this database lives on disk, or `None` for an in-memory one.
+    ///
+    /// Asked of the connection rather than remembered from `open`, so it
+    /// is right for every way a `Db` can come into existence and needs no
+    /// caller to carry the path alongside the handle.
+    pub fn path(&self) -> Option<std::path::PathBuf> {
+        let file: String = self
+            .conn
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                [],
+                |row| row.get(0),
+            )
+            .ok()?;
+        (!file.is_empty()).then(|| std::path::PathBuf::from(file))
+    }
+
     /// Opens an in-memory database. Intended for tests.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;

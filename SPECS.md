@@ -4518,3 +4518,67 @@ also a bare table.
 
 The test is a rule rather than two assertions: for each panel, whatever
 follows the last `</table>` must start with a `.panel-body`.
+
+## Asking the kernel, not the file
+
+`stop-bots status` exists because of a gap nobody had named. Every check in
+this project was of the form "does what we would generate match what is on
+disk" — `firewall_needs_update` compares a signature, `SiteApplyStatus`
+compares a config file, the cron panel compares timestamps. All correct,
+and all of them were green on a host that was not protected at all: 48,860
+drop rules in `/etc/stop-bots/firewall.nft`, and an `ip filter` table with
+`policy accept`. The script was right, the database was right, and the
+kernel had never been told.
+
+That is not a bug in any one place. It is a whole category of question —
+"is the thing in effect" — that the codebase could not ask, because
+`src/` contained no code that read live system state. `health` is that
+code.
+
+### The split, and why the probe is what gets stored
+
+`probe` shells out and touches no database; `assess` reads the database and
+runs no subprocesses. The same division as `refresh` and `webaccess`, for
+the same `Db`-is-not-`Sync` reason, plus one specific to this module: `nft
+list` on a real ruleset is megabytes of text, so it must not happen on a
+dashboard render.
+
+What is cached is the **probe**, not the report. The probe is the expensive
+half and the slow-moving half — a ruleset does not change between page
+loads — while the report is derived from it *and the database*, which the
+operator may have changed a second ago. Caching the report instead would
+produce a panel confidently disagreeing with the screen above it.
+
+### Not looking is not the same as fine
+
+Every field on `Probe` is an `Option`, and `None` means "could not find
+out". The checks that depend on a `None` report `Unknown`, never `Ok`. This
+is the whole reason the module is trustworthy: `nft list` needs root, and a
+status panel that says a host is protected because it could not check is
+worse than no panel, because it is believed.
+
+### Exit status conflated with the answer, twice
+
+Both bugs found by the container tests, and both the same mistake:
+
+- `nft list table inet stop_bots` exits non-zero when the table does not
+  exist. That is not "could not check" — it is *zero rules loaded*, the
+  exact critical case. Fixed by listing table *names* first, which is cheap
+  and proves `nft` is usable; our table's absence from that list then means
+  zero rather than unknown.
+- `systemctl is-enabled` exits non-zero for a unit that is merely disabled,
+  which is indistinguishable by status from a unit that does not exist. The
+  printed word tells them apart; an empty answer is the one that means
+  unknown.
+
+Both would have made the check silently useless in precisely the state it
+exists to detect, and neither was visible from a unit test — the failures
+only appear against a real `nft` and a real systemd.
+
+### Where the report is shown
+
+The console gets a panel with a row per check and the fix on the row that
+needs one. The TUI gets a single line in the Summary panel, coloured by the
+worst check, because a host that has quietly stopped being protected should
+be visible from the screen the admin already has open rather than behind a
+key they would have to know to press.

@@ -1881,7 +1881,71 @@ async fn the_dashboard_offers_update_everything_and_apply_everything() {
     }
 }
 
-/// Loose content — anything that is not the full-bleed table — has to sit
+/// The panel that answers "is this host actually protected", as opposed to
+/// the rest of the Dashboard, which answers "is what this tool would write
+/// up to date".
+#[tokio::test]
+async fn the_dashboard_reports_system_status_once_a_probe_exists() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    // Before any probe, the panel says so rather than rendering seven
+    // rows of UNKNOWN.
+    let body = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let panel = panel_html(&body, "System status");
+    assert!(
+        panel.contains("No check has run yet"),
+        "an unprobed host should say so:\n{panel}"
+    );
+
+    // The state a real host was found in: rules generated, none loaded.
+    {
+        // A second connection to the same file, which is also a small
+        // exercise of the busy timeout `Db::open` now sets.
+        let db = Db::open(&db_path).unwrap();
+        db.add_firewall_rule(&stop_bots::db::NewFirewallRule {
+            address: "198.51.100.7".to_string(),
+            port: None,
+            action: stop_bots::db::FirewallAction::Block,
+        })
+        .unwrap();
+        stop_bots::health::store_probe(
+            &db,
+            &stop_bots::health::Probe {
+                live_rules: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    let body = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let panel = panel_html(&body, "System status");
+
+    assert!(panel.contains("CRITICAL"), "was:\n{panel}");
+    assert!(
+        panel.contains("none loaded into the kernel"),
+        "the panel does not say what is wrong:\n{panel}"
+    );
+    assert!(
+        panel.contains("Apply everything"),
+        "the panel does not say what to do about it:\n{panel}"
+    );
+}
+
+/// Loose content — anything that is not the full-bleed table/// Loose content — anything that is not the full-bleed table — has to sit
 /// in a `.panel-body`, because that is the only thing carrying the side
 /// padding. Web Access shipped without it and its dropdowns sat flush
 /// against the panel edge.

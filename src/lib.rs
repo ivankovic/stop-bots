@@ -29,6 +29,7 @@ pub mod fetch;
 pub mod firewall;
 #[cfg(test)]
 mod golden;
+pub mod health;
 pub mod install;
 pub mod ipdetail;
 pub mod ipranges;

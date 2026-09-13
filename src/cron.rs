@@ -67,6 +67,10 @@ pub enum CronJob {
     RecordAccessStats,
     /// Renders the current firewall rules to disk. Does not apply them.
     RenderFirewall,
+    /// Looks at the host — the live ruleset, the units, the disk — and
+    /// records what it found for the dashboards to read. See
+    /// [`crate::health`].
+    HealthCheck,
 }
 
 impl CronJob {
@@ -74,7 +78,11 @@ impl CronJob {
     pub fn all() -> Vec<CronJob> {
         std::iter::once(CronJob::UpdateIpRanges)
             .chain(Detector::ALL.into_iter().map(CronJob::Detect))
-            .chain([CronJob::RecordAccessStats, CronJob::RenderFirewall])
+            .chain([
+                CronJob::RecordAccessStats,
+                CronJob::RenderFirewall,
+                CronJob::HealthCheck,
+            ])
             .collect()
     }
 
@@ -89,6 +97,7 @@ impl CronJob {
             CronJob::Detect(detector) => detector.id(),
             CronJob::RecordAccessStats => "record_access_stats",
             CronJob::RenderFirewall => "render_firewall",
+            CronJob::HealthCheck => "health_check",
         }
     }
 
@@ -99,6 +108,7 @@ impl CronJob {
             CronJob::Detect(detector) => detector.spec().job_label,
             CronJob::RecordAccessStats => "Record access-log stats",
             CronJob::RenderFirewall => "Render firewall script",
+            CronJob::HealthCheck => "Check system health",
         }
     }
 
@@ -113,6 +123,11 @@ impl CronJob {
     pub fn interval(self) -> Duration {
         match self {
             CronJob::UpdateIpRanges | CronJob::RenderFirewall => Duration::from_secs(24 * 60 * 60),
+            // Hourly. `nft list` on a large ruleset is megabytes of text,
+            // so this is not something to do per render — but a host that
+            // silently stopped being protected should not stay that way
+            // for a day either.
+            CronJob::HealthCheck => Duration::from_secs(60 * 60),
             CronJob::Detect(_) | CronJob::RecordAccessStats => Duration::from_secs(60),
         }
     }
@@ -205,7 +220,7 @@ pub fn uses_ssh_log(job: CronJob) -> bool {
     match job {
         CronJob::Detect(detector) => detector.spec().uses_ssh_log,
         CronJob::RenderFirewall => true,
-        CronJob::RecordAccessStats | CronJob::UpdateIpRanges => false,
+        CronJob::RecordAccessStats | CronJob::UpdateIpRanges | CronJob::HealthCheck => false,
     }
 }
 
@@ -281,9 +296,40 @@ pub fn run_log_job(
         CronJob::UpdateIpRanges => {
             unreachable!("UpdateIpRanges is run via fetch_ip_ranges/store_ip_ranges")
         }
+        CronJob::HealthCheck => {
+            unreachable!("HealthCheck is run via health_check, which needs no log")
+        }
     };
     db.set_cron_last_run(job.id(), now(), &summary)?;
     Ok(summary)
+}
+
+/// Takes a health probe and records it, for the dashboards to read.
+///
+/// Split across [`crate::health::probe`] and [`crate::health::store_probe`]
+/// rather than storing a finished report: the probe is the expensive half
+/// and the slow-moving half, and re-deriving the report at render time is
+/// what keeps the panel agreeing with the rules on the screen above it.
+pub fn health_check(db: &Db, ssh_log: Option<&std::path::Path>) -> String {
+    let backend = match crate::firewall::stored_backend(db) {
+        Ok(backend) => backend,
+        Err(err) => return format!("error: {err}"),
+    };
+    // An in-memory database has no filesystem to run out of, so the free
+    // space check is asked about the working directory instead of being
+    // skipped — it still answers "can this host write anything at all".
+    let db_path = db
+        .path()
+        .unwrap_or_else(|| std::path::PathBuf::from("./stop-bots.sqlite3"));
+
+    let probe = crate::health::probe(backend, &db_path, ssh_log);
+    if let Err(err) = crate::health::store_probe(db, &probe) {
+        return format!("error: {err}");
+    }
+    match crate::health::assess(db, &probe) {
+        Ok(report) => report.headline(),
+        Err(err) => format!("error: {err}"),
+    }
 }
 
 /// Runs one detector, if it is switched on, and turns the result into a

@@ -144,6 +144,11 @@ pub enum AppEvent {
         source: crate::refresh::Source,
         result: Result<String, String>,
     },
+    /// The internal cron's health probe has come back (see
+    /// `App::start_cron_health_check`). Carries the probe, not a report:
+    /// storing it and assessing it are both `Db` work and so wait for the
+    /// main thread, same as every other job here.
+    HealthProbed { probe: Box<crate::health::Probe> },
     /// The NGINX config change that puts this console behind a subdomain
     /// or a path prefix has been written and validated (see
     /// `App::start_web_access`). The plan comes back with it because

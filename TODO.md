@@ -31,8 +31,16 @@ list — which meant the open items below were unfindable inside it.
   by whoever is connecting, so a scanner that offers `x from y` as its username
   hides itself from detection for the cost of one string. Pinned as
   current behaviour by `a_username_containing_from_defeats_the_whole_line`.
+* **The container suite fails intermittently under parallel load.** Roughly
+  one run in five at `--test-threads 3` or higher reports a failure that does
+  not reproduce, and the three runs either side of it are clean. The failure
+  detail has not been captured yet, so the cause is unknown; the suspicion is
+  Docker resource contention during container start rather than any
+  assertion. Worth catching once with the output saved before deciding
+  whether it needs a retry, a lower default parallelism, or a fix.
 * **Recommend only the backend that is installed.** Nothing checks whether
-  `nft` or `iptables` exists before offering both.
+  `nft` or `iptables` exists before offering both. `health` now reports which
+  backend's live state it read, so the information is to hand.
 * **"Update everything" and the internal cron can fetch the same feeds at
   once.** `Job::UpdateEverything` and `Job::Cron(UpdateIpRanges)` are separate
   entries in `jobs_in_flight`, and `check_cron` keeps ticking while `u` runs —

@@ -39,6 +39,8 @@
 //! request for the duration. [`crate::cron::read_log_for`] takes no `Db`
 //! precisely so that this stays possible.
 
+use std::path::PathBuf;
+
 use crate::cron::{self, CronJob};
 use crate::web::state::AppState;
 
@@ -95,6 +97,7 @@ pub async fn tick(state: &AppState) -> usize {
             CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
                 run_log_job(state, job).await
             }
+            CronJob::HealthCheck => health_check(state).await,
         };
         match result {
             Ok(()) => ran += 1,
@@ -115,6 +118,40 @@ async fn run_log_job(state: &AppState, job: CronJob) -> anyhow::Result<()> {
     let out = state.firewall_out.clone();
     state
         .with_db(move |db| cron::run_log_job(db, job, log_text.as_deref(), out.as_deref()))
+        .await?;
+    Ok(())
+}
+
+/// Probes the host off the database lock, then records what it found.
+///
+/// The probe shells out to `nft`, `systemctl` and `df`, and `nft list` on
+/// a large ruleset is megabytes of text — none of which has any business
+/// happening while the database lock is held, or on the async runtime.
+async fn health_check(state: &AppState) -> anyhow::Result<()> {
+    let (backend, db_path) = state
+        .with_db(|db| {
+            Ok((
+                crate::firewall::stored_backend(db)?,
+                db.path()
+                    .unwrap_or_else(|| PathBuf::from("./stop-bots.sqlite3")),
+            ))
+        })
+        .await?;
+
+    let ssh_log = state.ssh_log.clone();
+    let probe = tokio::task::spawn_blocking(move || {
+        crate::health::probe(backend, &db_path, ssh_log.as_deref())
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("the health-probe thread panicked: {err}"))?;
+
+    state
+        .with_db(move |db| {
+            crate::health::store_probe(db, &probe)?;
+            let summary = crate::health::assess(db, &probe)?.headline();
+            cron::record_run(db, CronJob::HealthCheck, &summary);
+            anyhow::Ok(())
+        })
         .await?;
     Ok(())
 }

@@ -250,6 +250,41 @@ exempt verified search-engine crawlers, which would otherwise match every one of
   Protection screen to permanently block a specific IP or user agent you've spotted before it
   ever crosses an automatic threshold.
 
+### Is it actually working?
+
+Everything above is *generated*. Whether any of it is in effect is a separate
+question, and `stop-bots status` is the one that answers it:
+
+```
+stop-bots status
+```
+
+Seven checks, and the first is the one worth having: are the generated rules
+actually in the kernel, or only on disk? A real host ran for three weeks with
+48,860 drop rules in `/etc/stop-bots/firewall.nft` and an empty ruleset,
+because writing the script and loading it are two steps and nothing had ever
+looked at the second.
+
+The rest: will the ruleset survive a reboot (`nftables.service` enabled?), does
+the script still match the rules, are the NGINX blocks applied, is the console
+service running the binary it names, is there room for the database, and can
+the detectors read their logs.
+
+It exits non-zero if anything is **CRITICAL**, so it works as a monitoring
+check. `--quiet` prints only what needs attention, which is the form for cron:
+
+```
+0 * * * * /usr/local/bin/stop-bots status --quiet
+```
+
+A check that could not run — `nft list` needs root — reports **UNKNOWN**, never
+OK. A health check that says everything is fine because it could not look is
+worse than none, because it is believed.
+
+The same report is on the Dashboard in both the console and the TUI, taken
+hourly by the internal cron rather than on every render: `nft list` on a large
+ruleset is megabytes of text.
+
 ### Nothing happens without you
 
 Every firewall decision above is *generated*, never applied automatically: `render-firewall`

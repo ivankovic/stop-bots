@@ -765,6 +765,32 @@ enum Command {
     ///
     /// Refreshes bot lists and crawler IP ranges in full, and reputation
     /// feeds and country ranges only where they are switched on or
+    /// Report whether this host is actually protected.
+    ///
+    /// Every other check in this tool compares what it would generate
+    /// against what is on disk. This one looks at the kernel, the units
+    /// and the filesystem — the gap that let a host run for three weeks
+    /// with 48,860 generated rules and an empty ruleset.
+    ///
+    /// Exits 1 if anything is CRITICAL and 0 otherwise, so it is usable
+    /// from a monitoring check. `--quiet` prints only what needs
+    /// attention, which is the form to put in cron.
+    Status {
+        /// Database path (defaults to /var/lib/stop-bots/db.sqlite3,
+        /// falling back to a per-user location if that's not writable)
+        #[arg(long)]
+        db: Option<PathBuf>,
+        /// Read this SSH log instead of auto-detecting one
+        #[arg(long)]
+        ssh_log: Option<PathBuf>,
+        /// Print only checks that need attention
+        #[arg(long)]
+        quiet: bool,
+        /// Use the last probe the internal cron took instead of looking at
+        /// the host now. Cheap, and what the dashboards show.
+        #[arg(long)]
+        cached: bool,
+    },
     /// selected. One step's failure never stops the others; the exit
     /// status is non-zero if any of them failed, which is what makes cron
     /// mail you.
@@ -998,6 +1024,12 @@ async fn main() -> Result<()> {
                 allowed_hosts,
             }),
         },
+        Some(Command::Status {
+            db,
+            ssh_log,
+            quiet,
+            cached,
+        }) => run_status(db, ssh_log, quiet, cached),
         Some(Command::Batch {
             db,
             root,
@@ -1305,6 +1337,84 @@ async fn run_tui(
 /// visible whichever way the job is wired up.
 /// Where `batch` writes its firewall script when not told otherwise.
 ///
+/// Prints the health report, and exits non-zero if anything is critical.
+///
+/// The exit status is the point: this is meant to go in a monitoring check
+/// or a crontab, where nobody reads the output until something is wrong.
+fn run_status(
+    db_path: Option<PathBuf>,
+    ssh_log: Option<PathBuf>,
+    quiet: bool,
+    cached: bool,
+) -> Result<()> {
+    use stop_bots::health::{self, Level};
+
+    let db = open_db(db_path)?;
+    let (report, taken_at) = if cached {
+        match health::cached_report(&db)? {
+            Some((report, at)) => (report, Some(at)),
+            None => anyhow::bail!(
+                "no health probe has been recorded yet — run `stop-bots status` without \
+                 --cached, or leave the console running so its internal cron takes one"
+            ),
+        }
+    } else {
+        let backend = stop_bots::firewall::stored_backend(&db)?;
+        let path = db
+            .path()
+            .unwrap_or_else(|| PathBuf::from("./stop-bots.sqlite3"));
+        let probe = health::probe(backend, &path, ssh_log.as_deref());
+        health::store_probe(&db, &probe)?;
+        (health::assess(&db, &probe)?, None)
+    };
+
+    let shown: Vec<_> = if quiet {
+        report.at_least(Level::Warn)
+    } else {
+        report.checks.iter().collect()
+    };
+
+    if quiet && shown.is_empty() {
+        return Ok(());
+    }
+
+    println!("{}", report.headline());
+    if let Some(at) = taken_at {
+        println!("(from a probe taken {})", format_age(at));
+    }
+    println!();
+
+    for check in shown {
+        println!("  [{}] {}", check.level.tag(), check.title);
+        println!("      {}", check.detail);
+        if let Some(fix) = &check.fix {
+            println!("      -> {fix}");
+        }
+    }
+    println!();
+
+    if report.worst() == Level::Critical {
+        // `bail!` rather than `exit(1)`: it prints the reason, and the
+        // reason is the whole value of a non-zero status here.
+        anyhow::bail!("this host is not protected the way it is configured to be");
+    }
+    Ok(())
+}
+
+/// "3 minutes ago", for a probe's timestamp.
+fn format_age(taken_at: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let seconds = (now - taken_at).max(0);
+    match seconds {
+        0..=90 => "just now".to_string(),
+        91..=5400 => format!("{} minute(s) ago", seconds / 60),
+        _ => format!("{} hour(s) ago", seconds / 3600),
+    }
+}
+
 /// `batch`'s arguments as the command line gives them, before the two
 /// that depend on the database have been resolved.
 ///

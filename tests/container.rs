@@ -1743,6 +1743,149 @@ fn probing_for_dotenv_gets_a_real_client_blocked_end_to_end() {
     );
 }
 
+// ---- is this host actually protected? ----
+
+/// **The check the whole `health` module exists for**, against a host
+/// genuinely in the state a real server was found in: a pile of generated
+/// rules on disk and an empty ruleset in the kernel.
+///
+/// No amount of asserting on generated text finds this. The script was
+/// correct, the database was correct, and the host was open.
+#[test]
+fn status_reports_generated_rules_that_never_reached_the_kernel() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-status-unenforced");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+
+    let db = "/var/lib/stop-bots/db.sqlite3";
+    host.sh(&format!(
+        "stop-bots add-firewall-rule --address 203.0.113.60 --db {db}"
+    ));
+    host.sh(&format!(
+        "stop-bots render-firewall --backend nftables --out /etc/stop-bots/firewall.nft --db {db}"
+    ));
+
+    // Written, never applied — exactly what `render-firewall` promises and
+    // exactly the gap nothing used to look at.
+    let (ok, out, err) = host.run(&format!("stop-bots status --db {db}"));
+    let said = format!("{out}{err}");
+    assert!(
+        !ok,
+        "a host with nothing enforced should exit non-zero:\n{said}"
+    );
+    assert!(said.contains("CRITICAL"), "was:\n{said}");
+    assert!(
+        said.contains("none loaded into the kernel"),
+        "the report does not name the problem:\n{said}"
+    );
+
+    // Load them, and the same command has to change its mind.
+    host.sh("nft -f /etc/stop-bots/firewall.nft");
+    let (ok, out, err) = host.run(&format!("stop-bots status --db {db}"));
+    let said = format!("{out}{err}");
+    assert!(
+        !said.contains("none loaded into the kernel"),
+        "the report still says nothing is loaded after loading it:\n{said}"
+    );
+    assert!(
+        ok,
+        "with the rules loaded and the console running, nothing should be critical:\n{said}"
+    );
+}
+
+/// nftables rules live in kernel memory. A host that is protected now and
+/// comes back open after a reboot is worth being told about, and the
+/// answer comes from systemd rather than from anything this tool wrote.
+#[test]
+fn status_notices_that_the_ruleset_will_not_survive_a_reboot() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-status-persist");
+    host.sh("systemctl start nginx");
+    let db = "/var/lib/stop-bots/db.sqlite3";
+
+    let (_, out, err) = host.run(&format!("stop-bots status --db {db}"));
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("nftables.service is not enabled"),
+        "a host with nftables.service disabled was not told:\n{said}"
+    );
+
+    host.sh("systemctl enable nftables.service");
+    let (_, out, err) = host.run(&format!("stop-bots status --db {db}"));
+    let said = format!("{out}{err}");
+    assert!(
+        !said.contains("is not enabled"),
+        "enabling the unit did not change the answer:\n{said}"
+    );
+}
+
+/// Run without root, the probe cannot read the ruleset — and must say so
+/// rather than reporting a host it could not look at as healthy.
+#[test]
+fn status_run_without_root_says_it_could_not_look() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-status-unprivileged");
+    host.sh("systemctl start nginx");
+    host.sh("useradd --create-home --shell /bin/sh checker");
+    host.sh("install -d -o checker /home/checker/state");
+
+    let (_, out, err) =
+        host.run("su checker -c 'stop-bots status --db /home/checker/state/db.sqlite3'");
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("UNKNOWN"),
+        "an unprivileged run must report what it could not check:\n{said}"
+    );
+    assert!(
+        said.contains("needs root"),
+        "it should say why it could not check:\n{said}"
+    );
+}
+
+/// The internal cron takes the probe, and both dashboards read it back.
+/// This asserts the half that crosses a process boundary: the console
+/// records a probe, and a separate `status --cached` run sees it.
+#[test]
+fn the_console_records_a_health_probe_for_the_dashboards_to_read() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-status-cached");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+    host.wait_for_console();
+
+    let db = "/var/lib/stop-bots/db.sqlite3";
+    // The internal cron runs every due job shortly after start-up, and the
+    // health check has never run on a fresh database, so it is due.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut said = String::new();
+    while std::time::Instant::now() < deadline {
+        let (_, out, err) = host.run(&format!("stop-bots status --cached --db {db}"));
+        said = format!("{out}{err}");
+        if !said.contains("no health probe has been recorded") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    assert!(
+        said.contains("check(s)"),
+        "the console never recorded a probe:\n{said}"
+    );
+    assert!(
+        said.contains("from a probe taken"),
+        "a cached report should say when it was taken:\n{said}"
+    );
+}
+
 // ---- the firewall backends, against the real thing ----
 
 /// **The backend/path drift bug.**

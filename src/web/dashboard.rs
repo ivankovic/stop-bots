@@ -31,6 +31,7 @@ use serde::Deserialize;
 
 use crate::db::{Category, Db, GeoMode, Policy};
 use crate::firewall::{FirewallBackend, LockoutStatus};
+use crate::health;
 use crate::protection::Detector;
 use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
@@ -42,6 +43,9 @@ use crate::web::state::AppState;
 /// is a `spawn_blocking` hop and a lock acquisition, and a page assembled
 /// from twelve of them could show two halves of two different states.
 struct View {
+    /// The last health probe, re-assessed against the database as it is
+    /// now, and when that probe was taken. `None` until one has run.
+    health: Option<(health::Report, i64)>,
     scanner: Policy,
     search: Policy,
     ai: Policy,
@@ -80,6 +84,10 @@ struct View {
 const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 
 fn load(db: &Db, firewall_out: Option<&std::path::Path>) -> anyhow::Result<View> {
+    // Derived from the cron's last probe rather than probing here: the
+    // probe shells out to `nft`, and a dashboard render is the last place
+    // that should happen.
+    let health = health::cached_report(db)?;
     let sources = db.list_sources()?;
     let now = now_secs();
     let sources_stale = sources
@@ -94,6 +102,7 @@ fn load(db: &Db, firewall_out: Option<&std::path::Path>) -> anyhow::Result<View>
     let signature = crate::firewall::rules_signature(&rules);
 
     Ok(View {
+        health,
         scanner: db.get_category_default(Category::Scanner)?,
         search: db.get_category_default(Category::Search)?,
         ai: db.get_category_default(Category::Ai)?,
@@ -164,6 +173,7 @@ pub async fn page(
 fn body(view: &View, ctx: &Ctx) -> Markup {
     html! {
         .cols {
+            (health_panel(view))
             (categories_panel(view, ctx))
             (geo_panel(view, ctx))
             (detectors_panel(view, ctx))
@@ -172,6 +182,78 @@ fn body(view: &View, ctx: &Ctx) -> Markup {
             (web_access_panel(view, ctx))
             (jobs_panel(view))
         }
+    }
+}
+
+// ---- is this host actually protected? ----
+
+fn health_panel(view: &View) -> Markup {
+    let Some((report, taken_at)) = &view.health else {
+        return layout::panel(
+            "System status",
+            Some("Whether this host is actually protected"),
+            html! {
+                .panel-body {
+                    p .hint {
+                        "No check has run yet. The internal cron takes one every hour while "
+                        "this console is open, or run "
+                        code { "stop-bots status" }
+                        " to take one now."
+                    }
+                }
+            },
+        );
+    };
+
+    layout::panel(
+        "System status",
+        Some(&format!(
+            "{} \u{2014} checked {}",
+            report.headline(),
+            age(*taken_at)
+        )),
+        html! {
+            table {
+                tbody {
+                    @for check in &report.checks {
+                        tr {
+                            td { (check.title) }
+                            td { (level_pill(check.level)) }
+                            td {
+                                (check.detail)
+                                @if let Some(fix) = &check.fix {
+                                    br;
+                                    span .hint { "\u{2192} " (fix) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+fn level_pill(level: health::Level) -> Markup {
+    // `Unknown` is neutral rather than green on purpose: a check that
+    // could not run has not passed, and colouring it as if it had is how a
+    // status panel starts lying.
+    let kind = match level {
+        health::Level::Ok => PillKind::Allowed,
+        health::Level::Unknown => PillKind::Neutral,
+        health::Level::Warn => PillKind::Warn,
+        health::Level::Critical => PillKind::Blocked,
+    };
+    layout::pill(level.tag(), kind)
+}
+
+/// "12 minutes ago", for the panel's subtitle.
+fn age(taken_at: i64) -> String {
+    let seconds = (now_secs() - taken_at).max(0);
+    match seconds {
+        0..=90 => "just now".to_string(),
+        91..=5400 => format!("{} minutes ago", seconds / 60),
+        _ => format!("{} hours ago", seconds / 3600),
     }
 }
 

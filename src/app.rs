@@ -540,12 +540,15 @@ impl App {
             Event::App(AppEvent::WebAccessApplied { plan, result }) => {
                 self.finish_web_access(*plan, result)?
             }
+            Event::App(AppEvent::HealthProbed { probe }) => {
+                self.finish_cron_health_check(*probe)?
+            }
         }
         Ok(())
     }
     // ---- background work: every `start_` has a `finish_` ----
     //
-    // The shape is the same thirteen times over, and it is the reason the
+    // The shape is the same fourteen times over, and it is the reason the
     // TUI never blocks. A `start_` method does the `Db` reads on the main
     // thread, puts the slow half on a runtime or blocking-pool task, and
     // returns immediately; the task sends an `AppEvent`; the matching
@@ -802,6 +805,7 @@ impl App {
             CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
                 self.start_cron_log_job(job)
             }
+            CronJob::HealthCheck => self.start_cron_health_check(),
         }
         Ok(())
     }
@@ -1438,6 +1442,50 @@ impl App {
             }
             Err(err) => self.message = Some(format!("Web access setup failed: {err}")),
         }
+        self.refresh()
+    }
+
+    /// Probes the host for the internal cron's health check.
+    ///
+    /// The probe shells out to `nft`, `systemctl` and `df` — `nft list` on
+    /// a large ruleset is megabytes of text — so it goes to the blocking
+    /// pool. The database reads it needs (which backend, where the file
+    /// is) happen here first, on the main thread, like every other pair.
+    fn start_cron_health_check(&mut self) {
+        let job = Job::Cron(CronJob::HealthCheck);
+        if self.jobs_in_flight.contains(&job) {
+            return;
+        }
+        let backend = match crate::firewall::stored_backend(&self.db) {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.message = Some(format!("Could not read the firewall backend: {err}"));
+                return;
+            }
+        };
+        let db_path = self
+            .db
+            .path()
+            .unwrap_or_else(|| std::path::PathBuf::from("./stop-bots.sqlite3"));
+
+        self.jobs_in_flight.insert(job);
+        let ssh_log = self.ssh_log.clone();
+        let sender = self.events.sender();
+        tokio::task::spawn_blocking(move || {
+            let probe = crate::health::probe(backend, &db_path, ssh_log.as_deref());
+            let _ = sender.send(Event::App(AppEvent::HealthProbed {
+                probe: Box::new(probe),
+            }));
+        });
+    }
+
+    /// Records a finished probe and the one-line summary the Scheduled
+    /// tasks panel shows.
+    fn finish_cron_health_check(&mut self, probe: crate::health::Probe) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::Cron(CronJob::HealthCheck));
+        crate::health::store_probe(&self.db, &probe)?;
+        let summary = crate::health::assess(&self.db, &probe)?.headline();
+        crate::cron::record_run(&self.db, CronJob::HealthCheck, &summary);
         self.refresh()
     }
 

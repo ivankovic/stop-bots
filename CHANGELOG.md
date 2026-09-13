@@ -9,6 +9,29 @@ need.
 
 ### Added
 
+- **`stop-bots status`, and a System status panel on both Dashboards.** Every
+  other check in this project compares what it *would* generate against what
+  is *on disk*. None of them looked at the kernel — which is how a real host
+  ran for three weeks with 48,860 generated drop rules and an empty ruleset.
+
+  Seven checks: rules actually loaded, rules surviving a reboot, script
+  matching the rules, NGINX blocks applied, the console service running the
+  binary it names, room for the database, and readable detector logs. Each one
+  is something that went wrong on a real server.
+
+  `status` exits non-zero on anything CRITICAL, so it works from a monitoring
+  check or a crontab; `--quiet` prints only what needs attention. A check that
+  could not run reports UNKNOWN rather than OK: `nft list` needs root, and a
+  health check that says everything is fine because it could not look is worse
+  than no health check.
+
+  Split as `health::probe` (shells out, no database) and `health::assess`
+  (database, no subprocesses), the same shape as `refresh` and `webaccess`.
+  Only the probe is stored — an hourly `HealthCheck` cron job takes it — and
+  the report is re-derived at render time, so the panel agrees with rules the
+  operator changed a second ago. `nft list` on a large ruleset is megabytes of
+  text, which is why it is not done per render.
+
 - **The container suite went from 12 tests to 36, and grew a second image
   that has a real init.** Three of the four bugs that reached a live server
   were systemd *sandbox* failures, and the old container had no systemd at

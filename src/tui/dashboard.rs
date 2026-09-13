@@ -272,6 +272,9 @@ pub struct Dashboard {
     /// How many rules a render would write, for the Summary panel — see
     /// its three-state line, which reads differently at zero.
     rule_count: usize,
+    /// The last health probe, re-assessed on every refresh. `None` until
+    /// the internal cron has taken one — see [`crate::health`].
+    health: Option<(crate::health::Report, i64)>,
     /// Every scanned site's `server_name`, for the Web Access popup to
     /// offer. Names rather than rows: the popup only needs to hand one
     /// back, and `webaccess::plan` looks the rest up itself.
@@ -281,6 +284,9 @@ pub struct Dashboard {
 impl Dashboard {
     /// Reloads everything shown on the dashboard from `db`.
     pub fn refresh(&mut self, db: &Db) -> Result<()> {
+        // Cheap: the expensive half (shelling out to `nft`) is the cron's
+        // job, and this only re-derives the report from what it stored.
+        self.health = crate::health::cached_report(db)?;
         let sites = db.list_sites()?;
         self.site_count = sites.len();
         self.sites = sites.into_iter().map(|s| s.server_name).collect();
@@ -393,7 +399,9 @@ impl Dashboard {
         let [top_area, protection_area, stats_area, cron_area, message_area] = Layout::vertical([
             Constraint::Length(7),
             Constraint::Max(protection_height),
-            Constraint::Length(5),
+            // 2 border lines plus four: sites, sources, firewall rules,
+            // and the system-status line.
+            Constraint::Length(6),
             // 2 border lines + one line per known job, when there's room.
             Constraint::Min(3),
             Constraint::Length(3),
@@ -579,6 +587,10 @@ impl Dashboard {
                 (n, true) => format!("Firewall rules: {n} to write (press f)"),
                 (n, false) => format!("Firewall rules: {n}, script up to date"),
             }),
+            // The one line that answers "is this host actually protected",
+            // as opposed to "is the script this tool would write up to
+            // date" — which the three lines above are all about.
+            self.health_line(),
         ])
         // The two host-wide actions are hinted here rather than in
         // "System-wide settings"' own title, where they belong by
@@ -588,6 +600,31 @@ impl Dashboard {
         // full-width, and already the one that says "press f".
         .block(Block::bordered().title("Summary — u update everything, a apply everything"));
         frame.render_widget(summary, area);
+    }
+
+    /// The Summary panel's system-status line.
+    ///
+    /// Coloured by the worst check, because the point of putting it here
+    /// is that a host that has quietly stopped being protected should be
+    /// visible from the screen the admin already has open.
+    fn health_line(&self) -> Line<'static> {
+        use crate::health::Level;
+
+        let Some((report, _)) = &self.health else {
+            return Line::from("System status: not checked yet").dim();
+        };
+        let worst = report.worst();
+        let text = match report.at_least(Level::Warn).first() {
+            Some(check) => format!("System status: {} — {}", check.title, check.detail),
+            None => format!("System status: {}", report.headline()),
+        };
+        let line = Line::from(text);
+        match worst {
+            Level::Critical => line.red(),
+            Level::Warn => line.yellow(),
+            Level::Unknown => line.dim(),
+            Level::Ok => line.green(),
+        }
     }
 
     fn render_cron(
