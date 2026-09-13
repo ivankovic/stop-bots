@@ -111,6 +111,30 @@ need.
 
 ### Fixed
 
+- **The console returned 421 on a site's second `server_name`.** A block
+  reading `server_name www.example.com example.com;` is routine and NGINX
+  answers for both, but `scan-sites` stores a site under the first name only
+  — one row, one name — so Web Access allowlisted just that one. The console
+  then worked on `www.example.com` and refused `example.com`, the
+  DNS-rebinding guard correctly rejecting a host nobody had told it about.
+  `nginx::server_names_for` now reads every name off the block the console's
+  `location` is going into, and `Plan.host` became `Plan.hosts`. A config
+  that cannot be read still yields the stored name, so it degrades to the
+  old behaviour rather than to an empty allowlist.
+
+- **The Web Access panel showed a path prefix with a doubled slash.** It
+  rendered `"/" + base_path` where the stored value already carried its
+  leading slash, so `/stop-bots` displayed as `//stop-bots`. Only the display
+  was wrong. The panel now reads the prefix through `BasePath`, so a setting
+  written by hand without a leading slash also displays as a path.
+
+- **Recording a path prefix looked like it had done nothing.** The prefix is
+  read once, when the router is built, so a newly recorded one left the
+  console still answering on the old one: the panel showed the new prefix,
+  every link 404'd, and nothing on the page explained it. The Web Access
+  panel now carries a "Restart needed" row naming what this process is
+  actually serving and the command to pick up the change.
+
 - **`make deploy` could land a new binary and leave the console down.** The
   remote half used `systemctl try-restart`, which does nothing at all to a
   unit that is enabled but not running — which is exactly where a service

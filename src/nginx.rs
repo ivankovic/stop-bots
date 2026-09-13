@@ -1402,6 +1402,29 @@ fn current_block_text(content: &str, block: &ServerBlock) -> Option<String> {
     Some(content[start..end].to_string())
 }
 
+/// Every `server_name` on the block that declares `server_name`, that one
+/// included.
+///
+/// `scan-sites` stores a site under the *first* name on its block, because
+/// one row needs one name. NGINX answers for all of them, so anything that
+/// has to agree with NGINX about which hosts reach a site — the console's
+/// own allowlist, so far — needs the rest too.
+///
+/// Falls back to just `server_name` if the file cannot be read or no block
+/// declares it: a caller that gets one name behaves as it did before this
+/// existed, which is the right way for this to fail.
+pub fn server_names_for(config_path: &Path, server_name: &str) -> Vec<String> {
+    let Ok(content) = fs::read_to_string(config_path) else {
+        return vec![server_name.to_string()];
+    };
+    parse_server_blocks(&content)
+        .into_iter()
+        .find(|block| block.names.iter().any(|name| name == server_name))
+        .map(|block| block.names)
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| vec![server_name.to_string()])
+}
+
 /// Compares what's actually written in `config_path` for `server_name`
 /// against `config` (the currently computed blocking rule for that site)
 /// without changing anything on disk.

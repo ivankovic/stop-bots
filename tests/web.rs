@@ -1945,7 +1945,57 @@ async fn the_dashboard_reports_system_status_once_a_probe_exists() {
     );
 }
 
-/// Loose content — anything that is not the full-bleed table/// Loose content — anything that is not the full-bleed table — has to sit
+/// A prefix that has been recorded but not picked up is the state a
+/// console ends up in the moment Web Access writes one: the panel shows
+/// the new prefix, the process is still serving the old one, and every
+/// link 404s with nothing on the page to explain it.
+#[tokio::test]
+async fn a_recorded_prefix_that_needs_a_restart_says_so() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    // Nothing recorded: this console serves the root, nothing is pending.
+    let body = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !panel_html(&body, "Web Access").contains("Restart needed"),
+        "a console with no recorded prefix should not claim a restart is pending"
+    );
+
+    // Recorded after start-up, exactly as the Web Access form does it.
+    {
+        let db = Db::open(&db_path).unwrap();
+        db.set_text_setting(stop_bots::web::BASE_PATH_KEY, "/stop-bots")
+            .unwrap();
+    }
+
+    let body = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let panel = panel_html(&body, "Web Access");
+
+    assert!(panel.contains("Restart needed"), "was:\n{panel}");
+    assert!(
+        panel.contains("systemctl restart"),
+        "the notice must say how to fix it:\n{panel}"
+    );
+    // And the prefix renders as a path, not with a doubled slash.
+    assert!(
+        panel.contains("/stop-bots") && !panel.contains("//stop-bots"),
+        "the prefix is rendered with a doubled slash:\n{panel}"
+    );
+}
+
+/// Loose content — anything that is not the full-bleed table — has to sit
 /// in a `.panel-body`, because that is the only thing carrying the side
 /// padding. Web Access shipped without it and its dropdowns sat flush
 /// against the panel edge.

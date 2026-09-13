@@ -74,7 +74,14 @@ struct View {
     /// address, the path prefix and the host allowlist, all three of which
     /// this panel writes.
     bind: String,
+    /// The prefix recorded in the database, normalised — `""` for the
+    /// root, otherwise `/stop-bots`. Already carries its leading slash,
+    /// which is the thing the panel used to add a second one to.
     base_path: String,
+    /// The prefix this *process* is serving under. Read at start-up, so it
+    /// differs from `base_path` exactly when a change has been recorded
+    /// and not yet picked up — see [`web_access_panel`].
+    serving_base_path: String,
     allowed_hosts: Vec<String>,
     jobs: Vec<crate::cron::JobStatus>,
 }
@@ -83,7 +90,11 @@ struct View {
 /// TUI's Summary panel.
 const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 
-fn load(db: &Db, firewall_out: Option<&std::path::Path>) -> anyhow::Result<View> {
+fn load(
+    db: &Db,
+    firewall_out: Option<&std::path::Path>,
+    serving: &crate::web::BasePath,
+) -> anyhow::Result<View> {
     // Derived from the cron's last probe rather than probing here: the
     // probe shells out to `nft`, and a dashboard render is the last place
     // that should happen.
@@ -136,9 +147,10 @@ fn load(db: &Db, firewall_out: Option<&std::path::Path>) -> anyhow::Result<View>
         bind: crate::web::resolve_bind(db, None)
             .map(|addr| addr.to_string())
             .unwrap_or_else(|_| crate::web::DEFAULT_BIND.to_string()),
-        base_path: db
-            .get_text_setting(crate::web::BASE_PATH_KEY)?
-            .unwrap_or_default(),
+        // Through `BasePath` rather than raw, so a setting written by
+        // hand without a leading slash still displays as a path.
+        base_path: crate::web::BasePath::from_db(db)?.as_str().to_string(),
+        serving_base_path: serving.as_str().to_string(),
         allowed_hosts: crate::web::configured_hosts(db)?,
         firewall_needs_update: db.get_firewall_rendered_signature()?.as_deref()
             != Some(signature.as_str()),
@@ -159,8 +171,9 @@ pub async fn page(
     Query(flash): Query<FlashQuery>,
 ) -> Response {
     let firewall_out = state.firewall_out.clone();
+    let serving = state.base.clone();
     let view = match state
-        .with_db(move |db| load(db, firewall_out.as_deref()))
+        .with_db(move |db| load(db, firewall_out.as_deref(), &serving))
         .await
     {
         Ok(view) => view,
@@ -671,7 +684,35 @@ fn web_access_panel(view: &View, ctx: &Ctx) -> Markup {
                     tr {
                         td { "Path prefix" }
                         td .mono {
-                            @if view.base_path.is_empty() { "/" } @else { "/" (view.base_path) }
+                            @if view.base_path.is_empty() { "/" } @else { (view.base_path) }
+                        }
+                    }
+                    // The prefix is read once, when the router is built,
+                    // so recording a new one leaves this process still
+                    // answering on the old one. Without this row that is
+                    // invisible: the panel shows the new prefix, the
+                    // console serves the old one, and every link is a 404
+                    // with nothing to explain it.
+                    @if view.base_path != view.serving_base_path {
+                        tr {
+                            td { "Restart needed" }
+                            td {
+                                (layout::pill("PENDING", PillKind::Warn))
+                                " "
+                                span .hint {
+                                    "this console is still serving "
+                                    code {
+                                        @if view.serving_base_path.is_empty() {
+                                            "/"
+                                        } @else {
+                                            (view.serving_base_path) "/"
+                                        }
+                                    }
+                                    ". The prefix is read once, when the server starts. Run "
+                                    code { "systemctl restart stop-bots-web.service" }
+                                    " (or restart it however you started it) to pick up the new one."
+                                }
+                            }
                         }
                     }
                     tr {
@@ -1432,7 +1473,7 @@ mod tests {
         crate::botlist::register_all_sources(&db).unwrap();
         crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
 
-        let view = load(&db, None).unwrap();
+        let view = load(&db, None, &crate::web::BasePath::default()).unwrap();
         let rendered = body(&view, &Ctx::for_tests()).into_string();
 
         assert!(rendered.contains("Sites discovered"));
@@ -1451,7 +1492,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         crate::botlist::register_all_sources(&db).unwrap();
         crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
-        let view = load(&db, None).unwrap();
+        let view = load(&db, None, &crate::web::BasePath::default()).unwrap();
         let rendered = body(&view, &Ctx::new("the-token", Default::default())).into_string();
 
         let forms = rendered.matches("<form").count();
@@ -1472,7 +1513,7 @@ mod tests {
         })
         .unwrap();
 
-        let view = load(&db, None).unwrap();
+        let view = load(&db, None, &crate::web::BasePath::default()).unwrap();
         let rendered = body(&view, &Ctx::for_tests()).into_string();
         assert!(
             rendered.contains("SCRIPT IS STALE"),
@@ -1487,9 +1528,9 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
 
         crate::firewall::store_backend(&db, FirewallBackend::Iptables).unwrap();
-        let iptables = load(&db, None).unwrap();
+        let iptables = load(&db, None, &crate::web::BasePath::default()).unwrap();
         crate::firewall::store_backend(&db, FirewallBackend::Nftables).unwrap();
-        let nftables = load(&db, None).unwrap();
+        let nftables = load(&db, None, &crate::web::BasePath::default()).unwrap();
 
         assert!(
             iptables.firewall_out.ends_with(".sh"),
@@ -1513,7 +1554,9 @@ mod tests {
         for backend in [FirewallBackend::Iptables, FirewallBackend::Nftables] {
             crate::firewall::store_backend(&db, backend).unwrap();
             assert_eq!(
-                load(&db, Some(chosen)).unwrap().firewall_out,
+                load(&db, Some(chosen), &crate::web::BasePath::default())
+                    .unwrap()
+                    .firewall_out,
                 "/srv/rules.txt"
             );
         }

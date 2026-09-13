@@ -51,8 +51,9 @@ list — which meant the open items below were unfindable inside it.
 * **A changed path prefix needs a restart.** `BasePath` is read once when the
   router is built, so after Web Access mounts the console under `/stop-bots/`
   — from either front-end — the running console keeps generating links without
-  it until it is restarted. Both say so in the message; neither can do
-  anything about it without rebuilding the router in place.
+  it until it is restarted. The Web Access panel now says so explicitly, with
+  a "Restart needed" row naming what this process is serving; the underlying
+  fix is rebuilding the router in place, which nothing does yet.
 * **No CLI verb for the web UI's own settings.** `web:secure_cookie` and
   `web:trust_forwarded_for` have to be set by hand, unlike `web:bind` and
   `web:allowed_hosts`, which `stop-bots web --save` writes. A

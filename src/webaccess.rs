@@ -67,9 +67,17 @@ pub enum Request {
 pub struct Plan {
     /// The config change to make.
     pub access: ConsoleAccess,
-    /// The host name the console must start accepting, added to the
+    /// Every host name the console must start accepting, added to the
     /// allowlist by [`record`].
-    pub host: String,
+    ///
+    /// Plural, and that is the whole point. A `server` block routinely
+    /// carries several names — `server_name www.example.com example.com;`
+    /// — and NGINX answers for all of them, but `scan-sites` records only
+    /// the first as the site's name. Allowlisting just that one produces a
+    /// console that works on `www.example.com` and returns 421 on
+    /// `example.com`, with the host check correctly refusing a name it was
+    /// never told about.
+    pub hosts: Vec<String>,
     /// The prefix to serve under, in path mode. `None` in subdomain mode,
     /// where the console keeps the root.
     pub base_path: Option<BasePath>,
@@ -95,7 +103,7 @@ pub fn plan(db: &Db, request: &Request) -> Result<Plan> {
             }
             Ok(Plan {
                 access: ConsoleAccess::Subdomain { host: host.clone() },
-                host,
+                hosts: vec![host],
                 base_path: None,
                 upstream,
                 commands,
@@ -122,13 +130,16 @@ pub fn plan(db: &Db, request: &Request) -> Result<Plan> {
                 .with_context(|| {
                     format!("No scanned site called {server_name}. Re-scan sites first.")
                 })?;
+            // Every name on the block this location is going into, not
+            // just the one the database happens to store.
+            let hosts = nginx::server_names_for(&config_path, &server_name);
             Ok(Plan {
                 access: ConsoleAccess::Path {
                     prefix: prefix.url("/"),
                     config_path,
-                    server_name: server_name.clone(),
+                    server_name,
                 },
-                host: server_name,
+                hosts,
                 base_path: Some(prefix),
                 upstream,
                 commands,
@@ -153,8 +164,13 @@ pub fn apply(plan: &Plan, root: &Path) -> Result<PathBuf> {
 /// that only makes the console harder to reach.
 pub fn record(db: &Db, plan: &Plan) -> Result<()> {
     let mut hosts = crate::web::configured_hosts(db)?;
-    if !hosts.iter().any(|h| h == &plan.host) {
-        hosts.push(plan.host.clone());
+    let before = hosts.len();
+    for host in &plan.hosts {
+        if !hosts.iter().any(|known| known == host) {
+            hosts.push(host.clone());
+        }
+    }
+    if hosts.len() != before {
         db.set_text_setting(crate::web::ALLOWED_HOSTS_KEY, &hosts.join(","))?;
     }
     if let Some(prefix) = &plan.base_path {
@@ -213,7 +229,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.host, "console.example.com");
+        assert_eq!(plan.hosts, vec!["console.example.com".to_string()]);
         assert!(plan.base_path.is_none(), "a subdomain keeps the root");
         assert!(matches!(plan.access, ConsoleAccess::Subdomain { .. }));
     }
@@ -281,6 +297,74 @@ mod tests {
             other => panic!("expected path mode, got {other:?}"),
         }
         assert_eq!(plan.base_path.as_ref().unwrap().as_str(), "/stop-bots");
+    }
+
+    /// **The bug this found on a real host.** `server_name www.example.com
+    /// example.com;` is routine, NGINX answers for both, and `scan-sites`
+    /// records the site under the first. Allowlisting only that one gives
+    /// a console that works on `www.example.com` and returns 421 on
+    /// `example.com` — the host check correctly refusing a name nobody
+    /// told it about.
+    #[test]
+    fn every_name_on_the_block_is_allowlisted_not_just_the_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("example.conf");
+        std::fs::write(
+            &config,
+            "server {\n    server_name www.example.com example.com;\n    listen 443 ssl;\n}\n",
+        )
+        .unwrap();
+
+        let db = db();
+        db.upsert_site("www.example.com", config.to_str().unwrap())
+            .unwrap();
+
+        let plan = plan(
+            &db,
+            &Request::Path {
+                site: "www.example.com".to_string(),
+                prefix: "/stop-bots/".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.hosts,
+            vec!["www.example.com".to_string(), "example.com".to_string()],
+            "the second name on the block was dropped"
+        );
+
+        record(&db, &plan).unwrap();
+        let allowed = crate::web::configured_hosts(&db).unwrap();
+        assert!(
+            allowed.contains(&"example.com".to_string()),
+            "was: {allowed:?}"
+        );
+        assert!(
+            allowed.contains(&"www.example.com".to_string()),
+            "was: {allowed:?}"
+        );
+    }
+
+    /// A config that cannot be read still yields the name the database
+    /// has, so a missing file degrades to the old behaviour rather than to
+    /// an empty allowlist.
+    #[test]
+    fn an_unreadable_config_still_allowlists_the_stored_name() {
+        let db = db();
+        db.upsert_site("example.com", "/nonexistent/example.conf")
+            .unwrap();
+
+        let plan = plan(
+            &db,
+            &Request::Path {
+                site: "example.com".to_string(),
+                prefix: "/stop-bots/".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.hosts, vec!["example.com".to_string()]);
     }
 
     /// The console has to start answering to the name NGINX will now send
