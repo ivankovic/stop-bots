@@ -1,0 +1,44 @@
+# A real Debian host, with a real init.
+#
+# The sibling `Dockerfile` deliberately has no init system, which makes it
+# fast and makes it blind: three of the four bugs found on a live server
+# were systemd *sandbox* failures, and a container with no systemd cannot
+# see any of them. This image exists for those.
+#
+# Debian 13, not the sibling's ubuntu:24.04, because this is the image
+# that runs `install web` — which gates on /etc/debian_version — and
+# because it is what the project is actually deployed to. The binary is
+# still built on the host and copied in; an Ubuntu 24.04 build (glibc
+# 2.39) runs on trixie (2.41), forward-compatible.
+FROM debian:13
+
+# systemd checks this to decide it is containerised.
+ENV container=docker
+
+RUN apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+        systemd systemd-sysv dbus \
+        nginx nftables iptables curl ca-certificates sqlite3 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Boot to `running` in a couple of seconds instead of waiting on network
+# and getty units nothing here uses. journald stays: every assertion about
+# why a unit failed reads the journal, and a masked journald turns those
+# into "no output".
+RUN find /etc/systemd/system /lib/systemd/system -path '*.wants/*' \
+        -not -name '*journald*' \
+        -not -name '*tmpfiles*' \
+        -not -name '*sysusers*' \
+        -delete
+
+# `docker stop` should reach systemd as a shutdown request, not a TERM it
+# ignores for ten seconds.
+STOPSIGNAL SIGRTMIN+3
+
+COPY stop-bots /usr/local/bin/stop-bots
+COPY site.conf /etc/nginx/sites-enabled/test-site.conf
+RUN rm -f /etc/nginx/sites-enabled/default && \
+    mkdir -p /var/www/test /etc/stop-bots && \
+    echo '<h1>hello</h1>' > /var/www/test/index.html
+
+CMD ["/lib/systemd/systemd"]

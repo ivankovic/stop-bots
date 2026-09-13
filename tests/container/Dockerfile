@@ -10,7 +10,7 @@ FROM ubuntu:24.04
 
 RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        nginx nftables curl ca-certificates && \
+        nginx nftables iptables curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 # NGINX in the foreground, logging where the tool expects to find it.

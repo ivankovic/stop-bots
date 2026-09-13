@@ -25,15 +25,37 @@
 //! returns 403 to the wrong requests. These tests run the generated
 //! output through the actual parsers and then send actual requests at it.
 //!
-//! **They do not run by default.** They need Docker and `NET_ADMIN`, take
-//! tens of seconds, and would break `cargo test` on any machine without a
+//! **They do not run by default.** They need Docker, take tens of
+//! seconds, and would break `cargo test` on any machine without a
 //! container runtime. Set `STOP_BOTS_CONTAINER_TESTS=1` to enable them;
-//! `make container-test` does that for you. CI runs them as their own job.
+//! `make integration-test` does that for you. CI runs them as their own
+//! job.
 //!
-//! The container is deliberately *not* a faithful production host: there
-//! is no systemd, so `nginx -s reload` stands in for
-//! `systemctl reload nginx`. What it is faithful about is the two parsers
-//! this project cannot check any other way.
+//! ## Two images, because faithfulness is not free
+//!
+//! [`Server`] (`Dockerfile`, ubuntu:24.04) has **no init system**. It is
+//! fast, needs only `NET_ADMIN`, and is what the NGINX and nftables tests
+//! use — `nginx -s reload` stands in for `systemctl reload nginx`. What it
+//! is faithful about is the two parsers this project cannot check any
+//! other way.
+//!
+//! [`Host`] (`Dockerfile.host`, debian:13) runs **real systemd as PID 1**.
+//! It exists because that "no init system" line above was, for a while,
+//! the reason three separate bugs reached a live server: `install web`
+//! failing with `203/EXEC` because the unit's `ProtectHome=yes` hid the
+//! binary, the firewall apply failing because `RestrictAddressFamilies`
+//! omitted `AF_NETLINK`, and a deploy that replaced the binary without
+//! restarting anything. Every one of those is a property of the generated
+//! unit under a real service manager, and no amount of asserting on the
+//! unit's *text* finds them — the text was what everyone had already
+//! read.
+//!
+//! Tests on `Host` derive their probes from the unit `install web`
+//! actually wrote (see [`Host::oneshot_under_web_sandbox`]) rather than
+//! from a hand-written copy, and the sandbox ones each carry a negative
+//! control that removes the directive under test and asserts the failure
+//! comes back. Without that control, a container where the sandbox
+//! silently did not apply would pass every one of them.
 
 use std::process::Command;
 
@@ -46,12 +68,15 @@ fn enabled() -> bool {
     }
     eprintln!(
         "skipping: container tests are off. Set STOP_BOTS_CONTAINER_TESTS=1 \
-         (or run `make container-test`) to enable them."
+         (or run `make integration-test`) to enable them."
     );
     false
 }
 
 const IMAGE: &str = "stop-bots-test:latest";
+
+/// The image with a real init — see `Dockerfile.host` and [`Host`].
+const HOST_IMAGE: &str = "stop-bots-host:latest";
 
 /// Builds the image exactly once per test binary run.
 ///
@@ -66,16 +91,47 @@ fn build_image() {
     ONCE.call_once(build_image_now);
 }
 
-fn build_image_now() {
+/// The same, for the systemd image. A separate `Once` so a run that only
+/// touches one of the two images only builds that one.
+fn build_host_image() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let ctx = stage_binary();
+        let out = Command::new("docker")
+            .args([
+                "build",
+                "-q",
+                "-f",
+                &format!("{ctx}/Dockerfile.host"),
+                "-t",
+                HOST_IMAGE,
+                &ctx,
+            ])
+            .output()
+            .expect("failed to run docker build");
+        assert!(
+            out.status.success(),
+            "docker build (host image) failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+}
+
+/// Copies the binary under test into the build context and returns the
+/// context path.
+///
+/// `CARGO_BIN_EXE_stop-bots` is the exact binary this test run compiled —
+/// not whatever happens to be on `PATH`.
+fn stage_binary() -> String {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let ctx = format!("{manifest}/tests/container");
-
-    // The binary under test, built by cargo, staged into the build
-    // context. `CARGO_BIN_EXE_stop-bots` is the exact binary this test
-    // run compiled — not whatever happens to be on PATH.
     std::fs::copy(env!("CARGO_BIN_EXE_stop-bots"), format!("{ctx}/stop-bots"))
         .expect("failed to stage the stop-bots binary into the build context");
+    ctx
+}
 
+fn build_image_now() {
+    let ctx = stage_binary();
     let out = Command::new("docker")
         .args(["build", "-q", "-t", IMAGE, &ctx])
         .output()
@@ -98,23 +154,53 @@ struct Network {
     name: String,
 }
 
+/// The subnet every test network is given.
+///
+/// **Not Docker's default.** Docker hands out RFC1918 addresses, and every
+/// detector in this project deliberately skips those —
+/// `accesslog::is_local_or_private` is what stops a NAT gateway or a
+/// reverse proxy getting the whole office blocked. A client on
+/// `192.168.x.x` is therefore invisible to detection, and an end-to-end
+/// test built on one passes by finding nothing, for ever.
+///
+/// TEST-NET-2, reserved by RFC 5737 for documentation: it is not private,
+/// so the detectors treat it as a real remote client, and it can never
+/// route anywhere outside the container network.
+///
+/// Carved into /28s because tests run in parallel and Docker refuses two
+/// networks whose pools overlap. Sixteen is far more than the handful of
+/// networked tests here, and each gets thirteen usable addresses.
+fn test_subnet(index: usize) -> String {
+    format!("198.51.100.{}/28", (index % 16) * 16)
+}
+
 impl Network {
     fn create(name: &str) -> Network {
         let _ = Command::new("docker")
             .args(["network", "rm", name])
             .output();
-        let out = Command::new("docker")
-            .args(["network", "create", name])
-            .output()
-            .expect("failed to create a docker network");
-        assert!(
-            out.status.success(),
-            "docker network create failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        Network {
-            name: name.to_string(),
+
+        // Retry across slices rather than pick one and hope: a network
+        // left behind by an aborted run still holds its pool, and the
+        // failure ("Pool overlaps with other one on this address space")
+        // names neither which network nor which test.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut last = String::new();
+        for _ in 0..16 {
+            let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let subnet = test_subnet(index);
+            let out = Command::new("docker")
+                .args(["network", "create", "--subnet", &subnet, name])
+                .output()
+                .expect("failed to create a docker network");
+            if out.status.success() {
+                return Network {
+                    name: name.to_string(),
+                };
+            }
+            last = String::from_utf8_lossy(&out.stderr).to_string();
         }
+        panic!("docker network create failed for every subnet slice:\n{last}");
     }
 }
 
@@ -161,6 +247,23 @@ impl Client {
             ])
             .output()
             .expect("failed to inspect the client container");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Fetches `path` from `host` and returns the status code.
+    fn get_path(&self, host: &str, path: &str, extra: &str) -> String {
+        let out = Command::new("docker")
+            .args([
+                "exec",
+                &self.name,
+                "sh",
+                "-c",
+                &format!(
+                    "curl -s -o /dev/null -w '%{{http_code}}' {extra} http://{host}:8080{path}"
+                ),
+            ])
+            .output()
+            .expect("failed to run curl in the client container");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
@@ -303,6 +406,16 @@ impl Server {
         stdout.trim().to_string()
     }
 
+    /// The same, against another port — for the two-site tests, where the
+    /// second `server` block is what has to behave differently.
+    fn status_on(&self, port: u16, path: &str, extra_curl_args: &str) -> String {
+        let (_, stdout, _) = self.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' {extra_curl_args} \
+             http://127.0.0.1:{port}{path}"
+        ));
+        stdout.trim().to_string()
+    }
+
     fn body(&self, path: &str, extra_curl_args: &str) -> String {
         self.sh(&format!(
             "curl -s {extra_curl_args} http://127.0.0.1:8080{path}"
@@ -332,6 +445,1449 @@ impl Drop for Server {
             .args(["rm", "-f", &self.name])
             .output();
     }
+}
+
+// ---- a real Debian host, with a real init ----
+
+/// A container running systemd as PID 1, cleaned up on drop.
+///
+/// Separate from [`Server`] because the privileges differ and the boot
+/// cost is real: this one needs `SYS_ADMIN` and an unconfined seccomp
+/// profile, and takes a couple of seconds to reach `running`. Tests that
+/// only need NGINX and `nft` should keep using `Server`, which needs
+/// neither.
+struct Host {
+    name: String,
+}
+
+impl Host {
+    fn start(name: &str) -> Host {
+        build_host_image();
+        // Leftover from a previous aborted run.
+        let _ = Command::new("docker").args(["rm", "-f", name]).output();
+
+        let out = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                // systemd needs to mount things: every `Protect*` and
+                // `Private*` directive in the generated unit is a mount
+                // namespace, and without this they are silently not
+                // applied — which would make every assertion below pass
+                // for the wrong reason.
+                "--cap-add=SYS_ADMIN",
+                // `nft` and `iptables` manipulate the container's own
+                // netfilter tables, same as `Server`.
+                "--cap-add=NET_ADMIN",
+                // Docker's outer seccomp and AppArmor profiles block
+                // syscalls systemd needs to boot at all. Turning them off
+                // does *not* weaken what is under test: `RestrictAddress\
+                // Families` is enforced by a seccomp filter systemd
+                // installs itself, inside the unit, and it was verified to
+                // still refuse AF_NETLINK with these off.
+                "--security-opt",
+                "seccomp=unconfined",
+                "--security-opt",
+                "apparmor=unconfined",
+                "--cgroupns=host",
+                "-v",
+                "/sys/fs/cgroup:/sys/fs/cgroup:rw",
+                "--tmpfs",
+                "/run",
+                "--tmpfs",
+                "/run/lock",
+                HOST_IMAGE,
+            ])
+            .output()
+            .expect("failed to run docker run");
+        assert!(
+            out.status.success(),
+            "docker run (host) failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let host = Host {
+            name: name.to_string(),
+        };
+        host.wait_for_boot();
+        host
+    }
+
+    /// Blocks until systemd says the system is up.
+    ///
+    /// `degraded` counts: this image has units masked out of the boot
+    /// (see `Dockerfile.host`), and a masked unit is a failed job as far
+    /// as `is-system-running` is concerned. What matters is that the
+    /// manager is accepting jobs, which both states mean.
+    fn wait_for_boot(&self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut last = String::new();
+        while std::time::Instant::now() < deadline {
+            let (_, stdout, stderr) = self.run("systemctl is-system-running");
+            last = format!("{stdout}{stderr}");
+            match last.trim() {
+                "running" | "degraded" => return,
+                _ => std::thread::sleep(std::time::Duration::from_millis(200)),
+            }
+        }
+        panic!("systemd never finished booting; last state was {last:?}");
+    }
+
+    /// Runs a shell command inside the container, returning
+    /// (exit status success, stdout, stderr).
+    fn run(&self, cmd: &str) -> (bool, String, String) {
+        let out = Command::new("docker")
+            .args(["exec", &self.name, "sh", "-c", cmd])
+            .output()
+            .expect("failed to run docker exec");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    /// Runs a command and asserts it succeeded.
+    fn sh(&self, cmd: &str) -> String {
+        let (ok, stdout, stderr) = self.run(cmd);
+        assert!(
+            ok,
+            "command failed: {cmd}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        stdout
+    }
+
+    /// One property of a unit, as systemd itself reports it.
+    ///
+    /// Read through `systemctl show` rather than by parsing `systemctl
+    /// status`: the status text is for humans and changes between
+    /// versions, while these property names are stable and the values are
+    /// exactly what the manager decided.
+    fn unit(&self, unit: &str, property: &str) -> String {
+        self.sh(&format!("systemctl show -p {property} --value {unit}"))
+            .trim()
+            .to_string()
+    }
+
+    /// What the journal has for a unit — the only place a sandbox refusal
+    /// leaves its reason, and the reason is the whole point of these
+    /// tests.
+    fn journal(&self, unit: &str) -> String {
+        let (_, stdout, stderr) = self.run(&format!("journalctl -u {unit} --no-pager -o cat"));
+        format!("{stdout}{stderr}")
+    }
+
+    /// Starts a unit without asserting it worked, for the cases where
+    /// failing *is* the expected outcome.
+    fn try_start(&self, unit: &str) -> bool {
+        self.run(&format!("systemctl start {unit}")).0
+    }
+
+    /// The live nftables ruleset.
+    fn ruleset(&self) -> String {
+        self.sh("nft list ruleset")
+    }
+
+    /// Blocks until the console answers, meaning its start-up writes to
+    /// the database are done.
+    ///
+    /// Needed because `Db::open` sets no `busy_timeout`, so a second
+    /// process that wants the database *while the console is still
+    /// registering sources and running due cron jobs* gets an immediate
+    /// "database is locked" rather than waiting a moment. That is a real
+    /// rough edge — see TODO.md — and this poll keeps these tests from
+    /// racing it. It is not hiding it: nothing here would have found it,
+    /// and a flaky test would have hidden it better.
+    fn wait_for_console(&self) {
+        self.wait_for_console_at("");
+    }
+
+    /// The same, for a console serving under a path prefix.
+    ///
+    /// A prefixed console does not answer on `/login` at all — the prefix
+    /// is part of every route it matches, which is the whole reason it has
+    /// to be told about one. Polling the unprefixed path after a Web
+    /// Access change is how this helper first reported a healthy console
+    /// as dead.
+    fn wait_for_console_at(&self, base: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            let (ok, code, _) = self.run(&format!(
+                "curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:8787{base}/login"
+            ));
+            if ok && code.trim().starts_with('2') {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        panic!(
+            "the console never answered on 127.0.0.1:8787{base}/login. journal:\n{}",
+            self.journal("stop-bots-web.service")
+        );
+    }
+
+    /// Installs the console and logs into it, returning a handle that can
+    /// post actions the way a browser does.
+    ///
+    /// The password comes from the installer's own output, which is the
+    /// only place it is ever shown — so this also exercises the claim that
+    /// an operator can actually get in with what they were handed.
+    fn console(&self) -> Console {
+        let out = self.sh("stop-bots install web");
+        let password = out
+            .lines()
+            .map(str::trim)
+            .find(|line| line.len() > 20 && !line.contains(' '))
+            .unwrap_or_else(|| panic!("no password in the installer output:\n{out}"))
+            .to_string();
+        self.wait_for_console();
+
+        // A cookie jar, so the session survives across calls exactly as it
+        // would in a browser.
+        let login = self.sh(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' -c /tmp/jar              --data-urlencode 'password={password}' http://127.0.0.1:8787/login"
+        ));
+        assert!(
+            login.trim().starts_with('2') || login.trim().starts_with('3'),
+            "logging in with the installer's own password returned {login}"
+        );
+        Console {
+            name: self.name.clone(),
+        }
+    }
+
+    /// The stored console password hash, read with the tool's own
+    /// database rather than by poking at SQLite's file format.
+    fn password_hash(&self) -> String {
+        self.sh("sqlite3 /var/lib/stop-bots/db.sqlite3 \"select value from settings where key like 'web:password%'\"")
+            .trim()
+            .to_string()
+    }
+
+    /// Seeds one blocked bot through the real parser, so an apply has
+    /// something to write. Same format and same reasoning as
+    /// [`Server::seed_bot`].
+    fn seed_bot(&self, id: &str, pattern: &str, db: &str) {
+        let json = format!(
+            r#"[{{"id":"{id}","categories":["ai"],"pattern":{{"accepted":["{pattern}"],"forbidden":[]}},"url":"https://example.invalid/{id}"}}]"#
+        );
+        self.sh(&format!("cat > /tmp/bots.json <<'JSON'\n{json}\nJSON"));
+        self.sh(&format!(
+            "stop-bots update-bot-lists --source /tmp/bots.json --db {db}"
+        ));
+    }
+
+    /// Runs `command` as a oneshot unit carrying **the generated web
+    /// unit's own sandbox**, and returns whether it succeeded.
+    ///
+    /// The unit is derived from `/etc/systemd/system/stop-bots-web.service`
+    /// as `install web` wrote it — every `Protect*`, `Restrict*` and
+    /// `Private*` line is carried over verbatim, and only `ExecStart` and
+    /// `Type` are replaced. That is the whole point: a hand-written unit
+    /// listing the directives this test expects would pass forever,
+    /// including on the day the generated one stops emitting one of them.
+    ///
+    /// `mangle` edits the derived unit before it is installed, so a test
+    /// can prove its own teeth by removing a directive and watching the
+    /// command fail.
+    fn oneshot_under_web_sandbox(&self, probe: &str, command: &str, mangle: &str) -> bool {
+        self.sh(&format!(
+            "set -e\n\
+             sed -e 's|^ExecStart=.*|ExecStart={command}|' \
+                 -e 's|^Type=.*|Type=oneshot|' \
+                 -e 's|^Restart=.*||' \
+                 /etc/systemd/system/{unit} {mangle} \
+                 > /etc/systemd/system/{probe}.service\n\
+             systemctl daemon-reload",
+            unit = "stop-bots-web.service",
+        ));
+        self.try_start(&format!("{probe}.service"))
+    }
+}
+
+/// A logged-in session against the console running inside a [`Host`].
+///
+/// Drives it over real HTTP through the container's own `curl`, rather
+/// than through the router in-process the way `tests/web.rs` does. That is
+/// the point: this is the only place the console is a listening server
+/// with a session cookie, talking to a real NGINX and a real `nft`.
+struct Console {
+    name: String,
+}
+
+impl Console {
+    fn run(&self, cmd: &str) -> (bool, String, String) {
+        let out = Command::new("docker")
+            .args(["exec", &self.name, "sh", "-c", cmd])
+            .output()
+            .expect("failed to run docker exec");
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    }
+
+    /// Fetches a page as the logged-in user.
+    fn get(&self, path: &str) -> String {
+        let (ok, stdout, stderr) =
+            self.run(&format!("curl -s -b /tmp/jar http://127.0.0.1:8787{path}"));
+        assert!(ok, "GET {path} failed:\n{stderr}");
+        stdout
+    }
+
+    /// The CSRF token currently on `path`. Every form carries one, and a
+    /// post without it is refused — so reading it back out is part of
+    /// behaving like a browser, not a way around the check.
+    fn csrf(&self, path: &str) -> String {
+        let body = self.get(path);
+        let marker = r#"name="csrf" value=""#;
+        let start = body
+            .find(marker)
+            .unwrap_or_else(|| panic!("no csrf token on {path}"))
+            + marker.len();
+        body[start..]
+            .split('"')
+            .next()
+            .expect("an unterminated csrf value")
+            .to_string()
+    }
+
+    /// Posts a form the way the page's own button would, token included.
+    /// Returns the flash message the console redirected to.
+    fn post(&self, path: &str, fields: &[(&str, &str)]) -> String {
+        let csrf = self.csrf("/");
+        let mut args = format!("--data-urlencode 'csrf={csrf}'");
+        for (key, value) in fields {
+            args.push_str(&format!(" --data-urlencode '{key}={value}'"));
+        }
+        let (ok, stdout, stderr) = self.run(&format!(
+            "curl -s -L -b /tmp/jar -c /tmp/jar {args} http://127.0.0.1:8787{path}"
+        ));
+        assert!(ok, "POST {path} failed:\n{stderr}");
+        stdout
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .output();
+    }
+}
+
+// ---- `install web`: the unit, and the sandbox it puts the service in ----
+
+/// The install path an operator actually runs, on a host that has an init
+/// to talk to.
+///
+/// Every part of this was unit-tested against a fake `systemctl` before
+/// today, and all of it passed while the real thing failed on a real host
+/// — twice. The difference is that nothing was asking systemd.
+#[test]
+fn install_web_writes_a_unit_that_systemd_actually_starts() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-install");
+    host.sh("systemctl start nginx");
+
+    let out = host.sh("stop-bots install web");
+    assert!(
+        out.contains("stop-bots-web.service"),
+        "install said nothing about the unit:\n{out}"
+    );
+
+    // The installer must be the one that generated the password, because
+    // it is the only one that shows it to anybody. `install web` used to
+    // start the service *before* doing its database work, so the service
+    // could win the race, generate a password of its own, and leave the
+    // installer reporting "a console password is already set, keeping it"
+    // — an install that completes and hands the operator nothing. The
+    // other two ways that race landed were a service that crash-looped on
+    // "database is locked" and an install that failed after having already
+    // enabled the unit.
+    assert!(
+        out.contains("Console password:"),
+        "the installer did not generate and print the password:\n{out}"
+    );
+
+    assert_eq!(host.unit("stop-bots-web.service", "LoadState"), "loaded");
+    assert_eq!(
+        host.unit("stop-bots-web.service", "ActiveState"),
+        "active",
+        "the service is not running. journal:\n{}",
+        host.journal("stop-bots-web.service")
+    );
+    assert_eq!(
+        host.unit("stop-bots-web.service", "UnitFileState"),
+        "enabled",
+        "`enable --now` did not enable it, so it would not come back on boot"
+    );
+}
+
+/// **The netlink bug, reproduced and then fixed, in one test.**
+///
+/// `nft` and Debian's nft-backed `iptables` reach the kernel over a
+/// netlink socket. The generated unit used to write
+/// `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` under a comment
+/// asserting the service never applies the firewall — which stopped being
+/// true the moment applying was added. The failure on the real host was
+/// `Unable to initialize Netlink socket: Address family not supported by
+/// protocol`, which names neither systemd nor this project.
+///
+/// The negative control is not decoration. Without it this test passes
+/// whether or not the sandbox is being enforced at all, and "the sandbox
+/// silently did not apply" is the one way a container can lie about this.
+#[test]
+fn the_generated_sandbox_lets_the_firewall_reach_netlink() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-netlink");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+
+    let db = "/var/lib/stop-bots/db.sqlite3";
+    host.sh(&format!(
+        "stop-bots add-firewall-rule --address 203.0.113.9 --db {db}"
+    ));
+    // `batch --apply` rather than a bespoke verb: it is the only thing
+    // that applies the firewall unattended, and it is what a real cron
+    // entry runs — so this probes the sandbox through the same call the
+    // host does. `--force` because a container has no SSH log for the
+    // lockout guard to read, `--no-fetch` to keep the run offline.
+    let apply = format!(
+        "/usr/local/bin/stop-bots batch --apply --force --no-fetch \
+         --root /etc/nginx/sites-enabled --out /etc/stop-bots/firewall.nft --db {db}"
+    );
+
+    // First the control: strip AF_NETLINK back out, and the apply must
+    // fail the way the real host did.
+    let without = host.oneshot_under_web_sandbox(
+        "probe-without-netlink",
+        &apply,
+        "| sed -e 's/ AF_NETLINK//'",
+    );
+    assert!(
+        !without,
+        "stripping AF_NETLINK from the unit did not break the apply, so this \
+         test cannot tell whether the sandbox is enforced at all"
+    );
+    let journal = host.journal("probe-without-netlink.service");
+    assert!(
+        journal.contains("Netlink"),
+        "the failure was not the netlink one, so the control proves nothing:\n{journal}"
+    );
+
+    // Then the unit as generated: the same command, through the same
+    // sandbox, has to work.
+    let with = host.oneshot_under_web_sandbox("probe-with-netlink", &apply, "");
+    assert!(
+        with,
+        "the generated unit's sandbox blocks the firewall apply. journal:\n{}",
+        host.journal("probe-with-netlink.service")
+    );
+    assert!(
+        host.ruleset().contains("203.0.113.9"),
+        "the apply reported success but the rule is not in the live ruleset"
+    );
+}
+
+/// **The `install web` bug, reproduced from the report.**
+///
+/// A binary sitting in `/root` and a unit setting `ProtectHome=yes` is a
+/// service that dies with `status=203/EXEC` and "No such file or
+/// directory" for a file that is plainly there. The fix is a preflight
+/// refusal that names the directive; this checks both halves, because a
+/// refusal for a danger that is not real would be just as wrong.
+#[test]
+fn installing_from_a_hidden_directory_is_refused_before_systemd_can_fail() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-hidden");
+    host.sh("systemctl start nginx");
+    host.sh("cp /usr/local/bin/stop-bots /root/stop-bots");
+
+    let (ok, stdout, stderr) = host.run("/root/stop-bots install web");
+    let said = format!("{stdout}{stderr}");
+    assert!(!ok, "install from /root should have been refused:\n{said}");
+    assert!(
+        said.contains("ProtectHome=yes"),
+        "the refusal must name the directive, or it is as useless as systemd's own report:\n{said}"
+    );
+    assert!(
+        said.contains("203/EXEC"),
+        "the refusal must name the failure it is preventing:\n{said}"
+    );
+    assert!(
+        said.contains("/usr/local/bin/stop-bots"),
+        "the refusal must give a command to paste:\n{said}"
+    );
+
+    // Now prove the danger is real rather than folklore: install properly,
+    // then run the /root copy through the sandbox the generated unit
+    // actually sets. This is the failure the check above exists to stop.
+    host.sh("stop-bots install web");
+    let ran = host.oneshot_under_web_sandbox("probe-root-binary", "/root/stop-bots --version", "");
+    assert!(
+        !ran,
+        "the generated unit does not hide /root, so the preflight refusal guards nothing"
+    );
+    assert_eq!(
+        host.unit("probe-root-binary.service", "ExecMainStatus"),
+        "203",
+        "expected 203/EXEC. journal:\n{}",
+        host.journal("probe-root-binary.service")
+    );
+}
+
+/// The unit's own comment says `ProtectSystem=full` is deliberately absent
+/// because it would make `/etc` read-only and break the first apply "an
+/// hour after the unit started cleanly". That was a claim with nothing
+/// behind it. This runs a real apply through the real sandbox, and then
+/// through the stricter one, so the comment is a test result.
+#[test]
+fn the_sandbox_still_lets_the_service_rewrite_nginx_config() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-protectsystem");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+
+    let db = "/var/lib/stop-bots/db.sqlite3";
+    host.sh(&format!(
+        "stop-bots scan-sites --root /etc/nginx/sites-enabled --db {db}"
+    ));
+    host.seed_bot("badbot", "BadBot", db);
+    let apply = format!("/usr/local/bin/stop-bots apply-blocks --root /etc/nginx/sites-enabled --no-reload --db {db}");
+
+    let strict = host.oneshot_under_web_sandbox(
+        "probe-protect-full",
+        &apply,
+        "| sed -e 's/^ProtectSystem=.*/ProtectSystem=full/'",
+    );
+    assert!(
+        !strict,
+        "ProtectSystem=full did not stop the apply, so the reason the unit gives for not using it is wrong"
+    );
+
+    let asgenerated = host.oneshot_under_web_sandbox("probe-protect-yes", &apply, "");
+    assert!(
+        asgenerated,
+        "the generated sandbox blocks the apply it exists to allow. journal:\n{}",
+        host.journal("probe-protect-yes.service")
+    );
+    let applied = host.sh("cat /etc/nginx/sites-enabled/test-site.conf");
+    assert!(
+        applied.contains("BEGIN stop-bots"),
+        "the apply reported success but wrote no block into the site config:\n{applied}"
+    );
+    assert!(
+        applied.contains("BadBot"),
+        "the block is there but does not carry the seeded pattern:\n{applied}"
+    );
+}
+
+/// **The `make deploy` bug.** A new binary lands, everything reports
+/// success, and the console keeps serving the old code because nothing
+/// restarted the unit.
+///
+/// The marker is a wrapper rather than `--version`, for the reason the
+/// Makefile now says out loud: two builds of the same `0.0.x` are
+/// indistinguishable by version, so the only honest evidence is that the
+/// *new file* is what got executed.
+#[test]
+fn replacing_the_binary_and_restarting_runs_the_new_one() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-redeploy");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+
+    let before = host.unit("stop-bots-web.service", "MainPID");
+    assert_ne!(before, "0", "the service is not running to begin with");
+
+    // Stand in for `make deploy`: write beside the running binary, then
+    // rename over it.
+    //
+    // Not a `>` redirect, and that is the point — truncating a running
+    // executable fails with `Text file busy`, which is exactly why the
+    // Makefile scps to `$(DEPLOY_PATH).new` and moves it into place. A
+    // rename swaps the directory entry and leaves the running image
+    // alone, which is also why the old process keeps serving old code
+    // until something restarts it.
+    host.sh("cp /usr/local/bin/stop-bots /usr/local/bin/stop-bots.real");
+    host.sh("printf '#!/bin/sh\\ntouch /run/new-build-ran\\nexec /usr/local/bin/stop-bots.real \"$@\"\\n' > /usr/local/bin/stop-bots.new");
+    host.sh("chmod 755 /usr/local/bin/stop-bots.new");
+    host.sh("mv /usr/local/bin/stop-bots.new /usr/local/bin/stop-bots");
+    assert!(
+        !host.run("test -e /run/new-build-ran").0,
+        "the marker exists before the restart, so it proves nothing"
+    );
+
+    host.sh("systemctl try-restart stop-bots-web.service");
+
+    let after = host.unit("stop-bots-web.service", "MainPID");
+    assert_ne!(
+        before, after,
+        "try-restart left the old process running, which is the bug exactly"
+    );
+    assert_eq!(
+        host.unit("stop-bots-web.service", "ActiveState"),
+        "active",
+        "the service did not come back. journal:\n{}",
+        host.journal("stop-bots-web.service")
+    );
+    assert!(
+        host.run("test -e /run/new-build-ran").0,
+        "the service restarted but re-executed the old binary"
+    );
+}
+
+/// Re-running `install web` must not silently replace an edited unit, and
+/// must replace it with `--force`. An operator who tuned a directive and
+/// lost it to a routine re-install finds out at the next reboot.
+#[test]
+fn reinstalling_leaves_an_edited_unit_alone_unless_forced() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-reinstall");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+    host.wait_for_console();
+    host.sh("printf '\\n# operator edit\\n' >> /etc/systemd/system/stop-bots-web.service");
+
+    // A hard refusal, not a warning: re-running the installer is a
+    // routine thing to do, and quietly reverting a directive someone
+    // tuned would only be discovered at the next reboot.
+    let (ok, stdout, stderr) = host.run("stop-bots install web");
+    let said = format!("{stdout}{stderr}");
+    assert!(
+        !ok,
+        "a plain re-install over an edited unit should fail:\n{said}"
+    );
+    assert!(
+        host.sh("cat /etc/systemd/system/stop-bots-web.service")
+            .contains("# operator edit"),
+        "the re-install overwrote the edit. install said:\n{said}"
+    );
+    assert!(
+        said.contains("--force"),
+        "it left the edit but never said how to replace it:\n{said}"
+    );
+
+    host.sh("stop-bots install web --force");
+    assert!(
+        !host
+            .sh("cat /etc/systemd/system/stop-bots-web.service")
+            .contains("# operator edit"),
+        "--force did not replace the edited unit"
+    );
+    assert_eq!(
+        host.unit("stop-bots-web.service", "ActiveState"),
+        "active",
+        "the forced re-install left the service down. journal:\n{}",
+        host.journal("stop-bots-web.service")
+    );
+}
+
+/// The password is generated once and printed once. A second install must
+/// not roll it, or every re-install locks the operator out of a console
+/// they had bookmarked.
+#[test]
+fn reinstalling_keeps_the_first_password() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-password");
+    host.sh("systemctl start nginx");
+
+    let first = host.sh("stop-bots install web");
+    let hash = host.password_hash();
+    assert!(!hash.is_empty(), "no password hash was stored:\n{first}");
+
+    let second = host.sh("stop-bots install web");
+
+    // The hash is the claim that matters. A quieter second message could
+    // just as easily mean the password was rolled and not printed.
+    assert_eq!(
+        hash,
+        host.password_hash(),
+        "the stored password hash changed on re-install:\n{second}"
+    );
+}
+
+/// The database holds the console's password hash, so it must not be
+/// readable by anything else on the host.
+#[test]
+fn the_database_is_not_readable_by_other_users() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-perms");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+
+    // The property that matters is reachability, not the mode digits:
+    // `install web` chmods the *directory* to 0700 and leaves the file at
+    // whatever the umask gave it, so the file is typically 0644 inside a
+    // directory nothing else can traverse. Asserting 0600 on the file
+    // would fail today for a reason that is not a vulnerability; asserting
+    // that another account cannot read it is the real claim.
+    host.sh("useradd --create-home --shell /bin/sh snoop");
+    let (ok, stdout, stderr) = host.run("su snoop -c 'cat /var/lib/stop-bots/db.sqlite3'");
+    assert!(
+        !ok,
+        "an unprivileged local user read the database holding the console's password hash:\n{stdout}{stderr}"
+    );
+
+    let dir_mode = host.sh("stat -c %a /var/lib/stop-bots");
+    assert_eq!(
+        dir_mode.trim(),
+        "700",
+        "the state directory is the first thing keeping that file private"
+    );
+    // And the file's own mode, which is what survives a backup or a `cp`
+    // out of that directory.
+    let file_mode = host.sh("stat -c %a /var/lib/stop-bots/db.sqlite3");
+    assert_eq!(
+        file_mode.trim(),
+        "600",
+        "the database holding the password hash is readable beyond its owner"
+    );
+}
+
+/// `systemd-analyze verify` is systemd's own parser. A directive this
+/// project misspells is accepted silently by `systemctl daemon-reload`
+/// and simply does not apply — which is the quietest possible way for
+/// hardening to stop hardening.
+#[test]
+fn systemd_itself_accepts_every_directive_in_the_generated_unit() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-verify");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+
+    let (ok, stdout, stderr) =
+        host.run("systemd-analyze verify /etc/systemd/system/stop-bots-web.service");
+    let output = format!("{stdout}{stderr}");
+    assert!(
+        ok,
+        "systemd-analyze verify rejected the generated unit:\n{output}"
+    );
+    assert!(
+        !output.to_lowercase().contains("unknown"),
+        "systemd did not recognise something in the unit:\n{output}"
+    );
+}
+
+/// Debian's `iptables` is nft-backed, so it reaches the kernel over
+/// netlink exactly like `nft` does. The sandbox has to let both through,
+/// and the backend that ships on a host this project targets is the one
+/// most likely to be reached for.
+#[test]
+fn the_generated_sandbox_lets_the_iptables_backend_reach_netlink() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-iptables-sandbox");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+
+    let db = "/var/lib/stop-bots/db.sqlite3";
+    host.sh(&format!(
+        "stop-bots add-firewall-rule --address 203.0.113.11 --db {db}"
+    ));
+    let apply = format!("/usr/local/bin/stop-bots batch --apply --force --no-fetch --backend iptables --root /etc/nginx/sites-enabled --out /etc/stop-bots/firewall.sh --db {db}");
+
+    let ran = host.oneshot_under_web_sandbox("probe-iptables", &apply, "");
+    assert!(
+        ran,
+        "the generated sandbox blocks an iptables apply. journal:\n{}",
+        host.journal("probe-iptables.service")
+    );
+    assert!(
+        host.sh("iptables -S STOP-BOTS").contains("203.0.113.11"),
+        "the apply reported success but the rule is not in the live iptables chain"
+    );
+}
+
+// ---- the console, as a listening server on a real host ----
+
+/// "Apply everything" from the browser, on a host where both planes are
+/// real: NGINX genuinely reloaded, `nft` genuinely loaded.
+///
+/// This is the end-to-end version of the netlink bug. The console is
+/// running under the sandbox `install web` generated, the apply goes
+/// through a button rather than a probe unit, and the evidence is a live
+/// ruleset and a request that actually gets refused.
+#[test]
+fn apply_everything_from_the_console_enforces_on_both_planes() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-apply-all");
+    host.sh("systemctl start nginx");
+    let console = host.console();
+
+    let db = "/var/lib/stop-bots/db.sqlite3";
+    host.sh(&format!(
+        "stop-bots scan-sites --root /etc/nginx/sites-enabled --db {db}"
+    ));
+    host.seed_bot("badbot", "BadBot", db);
+    host.sh(&format!(
+        "stop-bots add-firewall-rule --address 203.0.113.40 --db {db}"
+    ));
+
+    let flash = console.post("/apply-all", &[]);
+
+    let ruleset = host.sh("nft list ruleset");
+    assert!(
+        ruleset.contains("203.0.113.40"),
+        "the firewall half did not reach the kernel. console said:\n{flash}\nruleset:\n{ruleset}"
+    );
+
+    let blocked =
+        host.sh("curl -s -o /dev/null -w '%{http_code}' -A 'BadBot/1.0' http://127.0.0.1:8080/");
+    assert_eq!(
+        blocked.trim(),
+        "403",
+        "the NGINX half did not take effect — config written but not reloaded"
+    );
+    let served =
+        host.sh("curl -s -o /dev/null -w '%{http_code}' -A 'Mozilla/5.0' http://127.0.0.1:8080/");
+    assert_eq!(served.trim(), "200", "everyone else must still be served");
+}
+
+/// The Web Access panel writes NGINX config that puts the console behind
+/// the very server it is protecting. New codegen, validated by `nginx -t`
+/// here for the first time against a config that then has to actually
+/// proxy.
+///
+/// Also pins the documented limitation: the path prefix is read when the
+/// router is built, so the console answers on it only after a restart.
+#[test]
+fn web_access_path_mode_serves_the_console_through_nginx() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-webaccess");
+    host.sh("systemctl start nginx");
+    let console = host.console();
+    host.sh(
+        "stop-bots scan-sites --root /etc/nginx/sites-enabled --db /var/lib/stop-bots/db.sqlite3",
+    );
+
+    let flash = console.post(
+        "/web-access",
+        // Every field, including the one this mode does not use: the
+        // page's own form posts all four, and the handler deserialises
+        // them as a unit.
+        &[
+            ("mode", "path"),
+            ("site", "test.example"),
+            ("prefix", "/stop-bots/"),
+            ("host", ""),
+        ],
+    );
+
+    let site = host.sh("cat /etc/nginx/sites-enabled/test-site.conf");
+    assert!(
+        site.contains("location /stop-bots/"),
+        "no console location block was written. console said:\n{flash}\nconfig:\n{site}"
+    );
+    let (ok, output, err) = host.run("nginx -t");
+    assert!(
+        ok,
+        "the generated console config does not parse:\n{output}{err}"
+    );
+
+    // The proxy reaches the console: not a 502, which is what a wrong
+    // upstream or a `proxy_pass` trailing slash would give.
+    host.sh("systemctl reload nginx");
+    let through =
+        host.sh("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/stop-bots/");
+    assert_ne!(
+        through.trim(),
+        "502",
+        "NGINX could not reach the console it was just pointed at"
+    );
+
+    // And after the restart the limitation calls for, the prefixed path
+    // really serves the console.
+    host.sh("systemctl restart stop-bots-web.service");
+    host.wait_for_console_at("/stop-bots");
+    let body = host.sh("curl -s -L http://127.0.0.1:8080/stop-bots/");
+    assert!(
+        body.contains("password"),
+        "the console is not being served under its prefix:\n{body}"
+    );
+}
+
+/// The host allowlist is the DNS-rebinding guard, and `tests/web.rs`
+/// checks it against a `Host:` header it sets itself. This checks it
+/// against one a real client sent to a real listener.
+#[test]
+fn the_console_refuses_a_host_header_it_was_not_told_about() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-hosts");
+    host.sh("systemctl start nginx");
+    host.console();
+
+    let loopback = host.sh("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/login");
+    assert!(
+        loopback.trim().starts_with('2'),
+        "loopback should need no configuration, got {loopback}"
+    );
+
+    let forged = host.sh(
+        "curl -s -o /dev/null -w '%{http_code}' -H 'Host: evil.example' http://127.0.0.1:8787/login",
+    );
+    // 421 Misdirected Request, which is what the guard returns: the
+    // request arrived at a server that does not answer for that name.
+    assert_eq!(
+        forged.trim(),
+        "421",
+        "an unlisted Host header reached the console"
+    );
+}
+
+// ---- NGINX behaviour that needed a real client ----
+
+/// TODO.md has been asking for this one: `set $limit_rate 1` throttles the
+/// response body, but how much NGINX writes before the throttle engages on
+/// a body this small had never been measured.
+///
+/// Asserted as "the client is still waiting after five seconds" rather
+/// than as a duration: the useful property is that a tarpitted client is
+/// held, and a test that pins the exact number would break on an NGINX
+/// upgrade without anything being wrong.
+#[test]
+fn a_tarpitted_client_is_held_while_everyone_else_is_served_at_once() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-tarpit");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.seed_bot("badbot", "BadBot");
+    server.stop_bots("set-block-response --response tarpit");
+    server.apply_and_reload();
+
+    let started = std::time::Instant::now();
+    let tarpitted = server.status("/", "--max-time 5 -A 'BadBot/1.0'");
+    let held = started.elapsed();
+    assert_eq!(
+        tarpitted, "000",
+        "a tarpitted client got a complete response in {held:?}; the throttle \
+         is writing the whole body before it engages"
+    );
+    assert!(
+        held >= std::time::Duration::from_secs(4),
+        "the connection closed after {held:?} instead of holding the client"
+    );
+
+    let started = std::time::Instant::now();
+    assert_eq!(
+        server.status("/", "--max-time 5 -A 'Mozilla/5.0'"),
+        "200",
+        "the tarpit is holding everyone, not just blocked clients"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "an unblocked client waited too, so the throttle is not scoped to the block"
+    );
+}
+
+/// Rate limiting is `limit_req`, which NGINX enforces at request time —
+/// the one piece of this project that is a runtime component, and the one
+/// that cannot be checked by reading generated text.
+#[test]
+fn rate_limiting_refuses_a_burst_and_then_lets_the_client_back_in() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-ratelimit");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.stop_bots("set-rate-limit --enabled true --rps 1 --burst 2");
+    server.apply_and_reload();
+
+    // Well past rps+burst, as fast as curl can send them.
+    let codes = server.sh(
+        "for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' http://127.0.0.1:8080/; done",
+    );
+    // 429, not 503: the generated config sets `limit_req_status 429;`,
+    // which is the status this project chose for "back off and retry".
+    assert!(
+        codes.contains("429"),
+        "a burst well over the configured rate was never refused: {codes}"
+    );
+    assert!(
+        codes.contains("200"),
+        "every request was refused, so the limit is not letting anyone through: {codes}"
+    );
+}
+
+/// The whole detection loop, with nothing faked at any join: a real client
+/// fetches the honeypot from a real NGINX, the detector reads the log
+/// NGINX actually wrote, the rule it adds is rendered and loaded into a
+/// real ruleset, and the client can no longer reach the server.
+///
+/// Every one of those steps is tested in isolation elsewhere. None of the
+/// joins between them was tested anywhere.
+#[test]
+fn fetching_the_honeypot_gets_a_real_client_blocked_end_to_end() {
+    if !enabled() {
+        return;
+    }
+    let net = Network::create("stop-bots-honeypot-net");
+    let server = Server::start_on_network("stop-bots-honeypot", &net);
+    let client = Client::start("stop-bots-honeypot-client", &net);
+
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.stop_bots("set-honeypot-path --path /trap-me");
+    server.apply_and_reload();
+
+    assert_eq!(
+        client.get("stop-bots-honeypot", ""),
+        "200",
+        "the client cannot reach the server to begin with"
+    );
+
+    // The bait, fetched by the real client through the real server.
+    client.get_path("stop-bots-honeypot", "/trap-me", "");
+
+    let found = server.stop_bots("block-honeypot --access-log /var/log/nginx/access.log");
+    assert!(
+        found.contains(&client.address()),
+        "the detector did not find the client in the log NGINX wrote:\n{found}"
+    );
+
+    server.stop_bots("render-firewall --backend nftables --out /etc/stop-bots/firewall.nft");
+    server.sh("nft -f /etc/stop-bots/firewall.nft");
+
+    assert_eq!(
+        client.get("stop-bots-honeypot", "--max-time 5"),
+        "000",
+        "the client was detected and blocked but can still reach the server. ruleset:\n{}",
+        server.sh("nft list ruleset")
+    );
+}
+
+/// Each request-shape rule, against a request actually shaped that way.
+///
+/// The generated `if` conditions have golden files, and a golden file
+/// cannot tell you whether `$http_accept = ""` is the variable NGINX
+/// populates for a request with no `Accept` header. Only a request with no
+/// `Accept` header can.
+///
+/// `http-1x` and `old-tls` are absent on purpose: both only ever land in a
+/// TLS `server` block, and there is no certificate here. `http-1x` would
+/// also match curl's own HTTP/1.1, so a plain-HTTP check of it could not
+/// tell "the rule works" from "everything is blocked".
+#[test]
+fn each_request_shape_rule_refuses_a_request_actually_shaped_that_way() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-shape");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+
+    // A request that satisfies every rule, so a 403 below is the rule
+    // under test and not a header curl happened not to send.
+    let ordinary = "-H 'Accept: text/html' -H 'Accept-Language: en' \
+                    -A 'Mozilla/5.0' -H 'Host: test.example'";
+
+    for (rule, offending) in [
+        (
+            "no-accept",
+            "-H 'Accept:' -H 'Accept-Language: en' -A 'Mozilla/5.0'",
+        ),
+        (
+            "no-accept-language",
+            "-H 'Accept: text/html' -H 'Accept-Language:' -A 'Mozilla/5.0'",
+        ),
+        (
+            "no-user-agent",
+            "-H 'Accept: text/html' -H 'Accept-Language: en' -A ''",
+        ),
+        (
+            "ip-literal-host",
+            "-H 'Accept: text/html' -H 'Accept-Language: en' -A 'Mozilla/5.0' -H 'Host: 127.0.0.1'",
+        ),
+    ] {
+        server.stop_bots(&format!(
+            "set-site-rule --site test.example --rule {rule} --enabled true"
+        ));
+        server.apply_and_reload();
+
+        assert_eq!(
+            server.status("/", offending),
+            "403",
+            "{rule} was on and a request matching it was served anyway"
+        );
+        assert_eq!(
+            server.status("/", ordinary),
+            "200",
+            "{rule} refused an ordinary request too"
+        );
+
+        server.stop_bots(&format!(
+            "set-site-rule --site test.example --rule {rule} --enabled false"
+        ));
+        server.apply_and_reload();
+        assert_eq!(
+            server.status("/", offending),
+            "200",
+            "{rule} kept refusing after it was switched off"
+        );
+    }
+}
+
+/// A per-site setting has to stop at that site. Two `server` blocks, one
+/// rule, and a request that is refused by one and served by the other.
+///
+/// `tests/cli.rs` already checks that the *text* lands in one file and not
+/// the other. What it cannot check is that NGINX agrees — an `if` in the
+/// wrong block, or a block written to a file NGINX does not include, looks
+/// identical on disk.
+#[test]
+fn a_per_site_rule_applies_to_that_site_and_not_its_neighbour() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-two-sites");
+    server.sh(
+        "printf 'server {\n    listen 8081;\n    server_name other.example;\n    \
+         root /var/www/test;\n    index index.html;\n    location / { try_files $uri $uri/ =404; }\n}\n' \
+         > /etc/nginx/sites-enabled/other-site.conf",
+    );
+    server.sh("nginx -s reload");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+
+    let no_ua = "-H 'Accept: text/html' -H 'Accept-Language: en' -A ''";
+    assert_eq!(
+        server.status("/", no_ua),
+        "200",
+        "site A serves before the rule"
+    );
+    assert_eq!(
+        server.status_on(8081, "/", no_ua),
+        "200",
+        "site B serves before the rule"
+    );
+
+    server.stop_bots("set-site-rule --site test.example --rule no-user-agent --enabled true");
+    server.apply_and_reload();
+
+    assert_eq!(
+        server.status("/", no_ua),
+        "403",
+        "the rule did not take effect on the site it was set for"
+    );
+    assert_eq!(
+        server.status_on(8081, "/", no_ua),
+        "200",
+        "a rule set for one site is being enforced on its neighbour"
+    );
+}
+
+/// The probe-path detector, through the same full loop as the honeypot:
+/// a real client asks a real NGINX for `/.env`, and the rule that follows
+/// really stops it.
+///
+/// Worth having alongside the honeypot test rather than instead of it —
+/// they share the loop but not the matcher, and this one runs against the
+/// built-in path list rather than a configured single path.
+#[test]
+fn probing_for_dotenv_gets_a_real_client_blocked_end_to_end() {
+    if !enabled() {
+        return;
+    }
+    let net = Network::create("stop-bots-probe-net");
+    let server = Server::start_on_network("stop-bots-probe", &net);
+    let client = Client::start("stop-bots-probe-client", &net);
+
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.apply_and_reload();
+    assert_eq!(
+        client.get("stop-bots-probe", ""),
+        "200",
+        "the client cannot reach the server to begin with"
+    );
+
+    client.get_path("stop-bots-probe", "/.env", "");
+    client.get_path("stop-bots-probe", "/.git/config", "");
+
+    let found = server.stop_bots("block-probe-paths --access-log /var/log/nginx/access.log");
+    assert!(
+        found.contains(&client.address()),
+        "the detector did not find the probing client in NGINX's own log:\n{found}"
+    );
+
+    server.stop_bots("render-firewall --backend nftables --out /etc/stop-bots/firewall.nft");
+    server.sh("nft -f /etc/stop-bots/firewall.nft");
+
+    assert_eq!(
+        client.get("stop-bots-probe", "--max-time 5"),
+        "000",
+        "the prober was detected and blocked but can still reach the server. ruleset:\n{}",
+        server.sh("nft list ruleset")
+    );
+}
+
+// ---- the firewall backends, against the real thing ----
+
+/// **The backend/path drift bug.**
+///
+/// `AppState.firewall_out` was a path fixed at start-up
+/// (`/etc/stop-bots/firewall.nft`) while the backend came from a form on
+/// every render, so a host set to iptables got `#!/bin/sh` and twelve
+/// thousand `iptables -A` lines in a file named for the other backend.
+/// Worse, the internal cron hardcoded nftables, so every tick quietly
+/// replaced the operator's iptables script with an nftables one *at the
+/// same path* — and the next apply ran `sh` over nftables syntax.
+///
+/// Driven through the console, because the console is where the backend
+/// is chosen and where the drift was.
+#[test]
+fn the_console_writes_each_backend_to_its_own_path_in_its_own_syntax() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-drift");
+    host.sh("systemctl start nginx");
+    let console = host.console();
+
+    host.sh(
+        "stop-bots add-firewall-rule --address 203.0.113.23 --db /var/lib/stop-bots/db.sqlite3",
+    );
+
+    // A decoy from "the other backend", to catch a render that writes to
+    // whichever path it happened to be started with.
+    host.sh("printf 'DECOY - must not be overwritten\n' > /etc/stop-bots/firewall.sh");
+
+    console.post("/render-firewall", &[("backend", "nftables"), ("out", "")]);
+    let nft = host.sh("cat /etc/stop-bots/firewall.nft");
+    assert!(
+        nft.contains("203.0.113.23"),
+        "the nftables render did not land in firewall.nft:\n{nft}"
+    );
+    assert!(
+        !nft.starts_with("#!/bin/sh"),
+        "firewall.nft contains a shell script:\n{nft}"
+    );
+    assert!(
+        host.sh("cat /etc/stop-bots/firewall.sh").contains("DECOY"),
+        "an nftables render overwrote the iptables script"
+    );
+
+    // Now the other way round: switching backend must move the *path*
+    // too, not just the syntax.
+    host.sh("rm -f /etc/stop-bots/firewall.sh");
+    host.sh("printf 'DECOY - must not be overwritten\n' > /etc/stop-bots/firewall.nft");
+    console.post("/render-firewall", &[("backend", "iptables"), ("out", "")]);
+
+    let sh = host.sh("cat /etc/stop-bots/firewall.sh");
+    assert!(
+        sh.starts_with("#!/bin/sh"),
+        "the iptables render is not a shell script:\n{sh}"
+    );
+    assert!(
+        sh.contains("iptables") && sh.contains("203.0.113.23"),
+        "the iptables render has no rule in it:\n{sh}"
+    );
+    assert!(
+        host.sh("cat /etc/stop-bots/firewall.nft").contains("DECOY"),
+        "an iptables render overwrote the nftables script — the bug exactly"
+    );
+}
+
+/// `batch` is what a real crontab runs, and it used to carry a `nftables`
+/// default that no host setting could override — so an operator who chose
+/// iptables in the console got an nftables script from every cron run, at
+/// the other path, and ended up with two files in two syntaxes one of
+/// which was always stale.
+///
+/// An explicit `--backend` still wins. Without one, the host's own setting
+/// decides.
+#[test]
+fn batch_follows_the_stored_backend_unless_the_flag_says_otherwise() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-batch-backend");
+    host.sh("systemctl start nginx");
+    let console = host.console();
+
+    let db = "/var/lib/stop-bots/db.sqlite3";
+    host.sh(&format!(
+        "stop-bots add-firewall-rule --address 203.0.113.50 --db {db}"
+    ));
+
+    // The console is where the backend is chosen, so choose it there.
+    console.post("/render-firewall", &[("backend", "iptables"), ("out", "")]);
+    host.sh("rm -f /etc/stop-bots/firewall.sh /etc/stop-bots/firewall.nft");
+
+    // No --backend: the stored choice has to decide both syntax and path.
+    host.sh(&format!(
+        "stop-bots batch --no-fetch --force --root /etc/nginx/sites-enabled --db {db}"
+    ));
+    assert!(
+        !host.run("test -e /etc/stop-bots/firewall.nft").0,
+        "a crontab-shaped run wrote an nftables script to a host set to iptables"
+    );
+    let written = host.sh("cat /etc/stop-bots/firewall.sh");
+    assert!(
+        written.starts_with("#!/bin/sh") && written.contains("203.0.113.50"),
+        "the stored backend did not decide what batch generated:\n{written}"
+    );
+
+    // An explicit flag still overrides it, in both syntax and path.
+    host.sh(&format!(
+        "stop-bots batch --no-fetch --force --backend nftables --root /etc/nginx/sites-enabled --db {db}"
+    ));
+    let forced = host.sh("cat /etc/stop-bots/firewall.nft");
+    assert!(
+        !forced.starts_with("#!/bin/sh") && forced.contains("203.0.113.50"),
+        "an explicit --backend did not win:\n{forced}"
+    );
+}
+
+/// The iptables backend has been rendered and golden-tested for a long
+/// time and never once executed. `iptables.rs` is at 100% line coverage,
+/// which says only that every line ran, not that the script it produces
+/// loads.
+#[test]
+fn generated_iptables_scripts_load_into_real_iptables() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-iptables-load");
+    server.stop_bots("add-firewall-rule --address 203.0.113.30");
+    server.stop_bots("add-firewall-rule --address 203.0.113.0/24");
+    server.stop_bots("render-firewall --backend iptables --out /etc/stop-bots/firewall.sh");
+
+    server.sh("sh /etc/stop-bots/firewall.sh");
+
+    let live = server.sh("iptables -S STOP-BOTS");
+    assert!(
+        live.contains("203.0.113.30"),
+        "single address missing:\n{live}"
+    );
+    assert!(
+        live.contains("203.0.113.0/24"),
+        "CIDR range missing:\n{live}"
+    );
+}
+
+/// Applying the same script twice must leave one chain with one copy of
+/// each rule. The generated script flushes `STOP-BOTS` before filling it,
+/// and "it flushes" is a claim about a shell script nobody had run twice.
+#[test]
+fn re_applying_the_iptables_script_does_not_double_the_rules() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-iptables-idempotent");
+    server.stop_bots("add-firewall-rule --address 203.0.113.31");
+    server.stop_bots("render-firewall --backend iptables --out /etc/stop-bots/firewall.sh");
+
+    server.sh("sh /etc/stop-bots/firewall.sh");
+    let once = server.sh("iptables -S STOP-BOTS");
+    server.sh("sh /etc/stop-bots/firewall.sh");
+    let twice = server.sh("iptables -S STOP-BOTS");
+
+    assert_eq!(
+        once, twice,
+        "a second run changed the chain, so it is accumulating rules"
+    );
+    assert_eq!(
+        twice.matches("203.0.113.31").count(),
+        1,
+        "the rule is in the chain more than once:\n{twice}"
+    );
+}
+
+/// Allowlist mode turns the host into default-deny once the script runs.
+/// That is the highest-stakes thing this project can generate, and it had
+/// a golden file and no execution.
+#[test]
+fn allowlist_mode_really_drops_everything_outside_the_selection() {
+    if !enabled() {
+        return;
+    }
+    let net = Network::create("stop-bots-allowlist-net");
+    let server = Server::start_on_network("stop-bots-allowlist", &net);
+    let client = Client::start("stop-bots-allowlist-client", &net);
+
+    assert_eq!(
+        client.get("stop-bots-allowlist", ""),
+        "200",
+        "the client cannot reach the server before any rules exist"
+    );
+
+    // A country whose ranges cover nothing the client is in, selected in
+    // allowlist mode: everything else must be dropped.
+    server.sh("printf '192.0.2.0/24\n' > /tmp/zone.zone");
+    server.stop_bots("update-country-ranges --country nl --source /tmp/zone.zone");
+    server.stop_bots("add-country --country nl");
+    server.stop_bots("set-geo-mode --mode allowlist");
+    server.stop_bots("render-firewall --backend nftables --out /etc/stop-bots/firewall.nft");
+    server.sh("nft -f /etc/stop-bots/firewall.nft");
+
+    assert_eq!(
+        client.get("stop-bots-allowlist", "--max-time 5"),
+        "000",
+        "allowlist mode let an address outside the selection through. ruleset:\n{}",
+        server.sh("nft list ruleset")
+    );
+    // And the host has not cut off its own loopback, which is the way
+    // default-deny goes wrong.
+    assert_eq!(
+        server.status("/", ""),
+        "200",
+        "allowlist mode blocked loopback"
+    );
+}
+
+/// `nftables`' `inet` family covers IPv4 and IPv6 in one table, which is
+/// the stated reason `iptables::render` may skip IPv6 rules. Stated, and
+/// never checked against an actual IPv6 packet.
+#[test]
+fn an_ipv6_rule_really_drops_ipv6_traffic() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-ipv6");
+    server.sh("ip -6 addr add 2001:db8::1/64 dev lo || true");
+    server.stop_bots("add-firewall-rule --address 2001:db8::/64");
+    server.stop_bots("render-firewall --backend nftables --out /etc/stop-bots/firewall.nft");
+    server.sh("nft -f /etc/stop-bots/firewall.nft");
+
+    let ruleset = server.sh("nft list ruleset");
+    assert!(
+        ruleset.contains("2001:db8::/64"),
+        "the IPv6 rule is not in the live ruleset:\n{ruleset}"
+    );
+    let (_, code, _) = server
+        .run("curl -s -o /dev/null -w '%{http_code}' --max-time 5 -g 'http://[2001:db8::1]:8080/'");
+    assert_eq!(
+        code.trim(),
+        "000",
+        "an address inside a dropped IPv6 range was still served"
+    );
 }
 
 // ---- NGINX: does the generated config actually parse and behave? ----
