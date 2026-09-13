@@ -650,6 +650,15 @@ enum Command {
         /// SSH log to read for the Dynamic Protection screen.
         #[arg(long)]
         ssh_log: Option<PathBuf>,
+        /// Where the console's "Write script" button and its internal cron
+        /// write the firewall script.
+        ///
+        /// Set here rather than in the console because the console runs as
+        /// root and the script is executable: a destination taken from a
+        /// form field would let anyone who reaches the login page create a
+        /// root-owned file anywhere on the host.
+        #[arg(long)]
+        firewall_out: Option<PathBuf>,
         /// Address to bind, as `address:port`.
         #[arg(long)]
         bind: Option<String>,
@@ -774,8 +783,12 @@ enum Command {
         /// iptables — which generates a shell script, not an nftables one
         #[arg(long)]
         out: Option<PathBuf>,
-        #[arg(long, default_value = "nftables")]
-        backend: FirewallBackend,
+        /// Which firewall to generate for. Defaults to whichever backend
+        /// this host is set to — the console records that, and a crontab
+        /// that silently disagreed with it used to leave two scripts on
+        /// disk, in two syntaxes, at two paths, one of them stale.
+        #[arg(long)]
+        backend: Option<FirewallBackend>,
         /// Read this SSH log file instead of auto-detecting one. Worth
         /// setting explicitly under cron: on a journald-only host,
         /// `journalctl` can come back empty, which is the case --apply
@@ -999,10 +1012,10 @@ async fn main() -> Result<()> {
         }) => {
             run_batch(
                 db,
-                stop_bots::batch::BatchOptions {
+                BatchRequest {
                     root,
-                    out: out.unwrap_or_else(|| default_firewall_out(backend)),
-                    backend: backend.into(),
+                    out,
+                    backend,
                     apply,
                     ssh_log,
                     access_log,
@@ -1105,6 +1118,7 @@ async fn main() -> Result<()> {
             db,
             root,
             ssh_log,
+            firewall_out,
             bind,
             base_path,
             expose,
@@ -1117,6 +1131,7 @@ async fn main() -> Result<()> {
                 db,
                 root,
                 ssh_log,
+                firewall_out,
                 bind,
                 base_path,
                 expose,
@@ -1290,25 +1305,50 @@ async fn run_tui(
 /// visible whichever way the job is wired up.
 /// Where `batch` writes its firewall script when not told otherwise.
 ///
-/// Backend-dependent, because the iptables backend emits a shell script:
-/// a plain default would hand someone a `.nft` file full of `iptables`
-/// commands. `render-firewall` sidesteps this by requiring `--out`, which
-/// a cron entry shouldn't have to.
-fn default_firewall_out(backend: FirewallBackend) -> PathBuf {
-    match backend {
-        FirewallBackend::Nftables => PathBuf::from(stop_bots::firewall::DEFAULT_OUTPUT_PATH),
-        FirewallBackend::Iptables => {
-            PathBuf::from(stop_bots::firewall::DEFAULT_OUTPUT_PATH).with_extension("sh")
-        }
-    }
+/// `batch`'s arguments as the command line gives them, before the two
+/// that depend on the database have been resolved.
+///
+/// Separate from [`stop_bots::batch::BatchOptions`] because resolving them
+/// needs an open database and parsing does not: the backend falls back to
+/// whatever this host is set to, and the output path falls out of
+/// whichever backend that turns out to be.
+struct BatchRequest {
+    root: PathBuf,
+    out: Option<PathBuf>,
+    backend: Option<FirewallBackend>,
+    apply: bool,
+    ssh_log: Option<PathBuf>,
+    access_log: Option<PathBuf>,
+    force: bool,
+    no_fetch: bool,
 }
 
-async fn run_batch(
-    db_path: Option<PathBuf>,
-    options: stop_bots::batch::BatchOptions,
-    verbose: bool,
-) -> Result<()> {
+async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: bool) -> Result<()> {
     let db = open_db(db_path)?;
+
+    // An explicit `--backend` wins; without one, the host's own setting
+    // does. It used to be neither: the flag carried a `nftables` default,
+    // so a host switched to iptables in the console got an nftables script
+    // from every cron run — at the *other* path, so both files existed and
+    // one of them was always stale. The same drift once had the internal
+    // cron overwriting an operator's iptables script with nftables syntax.
+    let backend = match request.backend {
+        Some(backend) => backend.into(),
+        None => stop_bots::firewall::stored_backend(&db)?,
+    };
+    let options = stop_bots::batch::BatchOptions {
+        root: request.root,
+        out: request
+            .out
+            .unwrap_or_else(|| stop_bots::firewall::default_output_path(backend)),
+        backend,
+        apply: request.apply,
+        ssh_log: request.ssh_log,
+        access_log: request.access_log,
+        force: request.force,
+        no_fetch: request.no_fetch,
+    };
+
     let report = stop_bots::batch::run(&db, &options).await;
 
     if verbose {
@@ -1766,22 +1806,23 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
 
     let mut steps = install::install_web(&layout, &opts)?;
 
-    // Under a prefix there is no systemd to tell: the unit is somewhere
-    // systemd will never look. Saying so beats running `daemon-reload` and
-    // implying the file took effect.
     let prefixed = prefix != Path::new("/");
-    if prefixed {
-        steps.push(format!(
-            "skipping systemctl: {} is not a path systemd reads",
-            layout.unit_dir.display()
-        ));
-    } else {
-        steps.extend(install::activate(&layout, &opts)?);
-    }
 
     // Settings, not unit contents. The running server re-reads these on
     // every request, so a flag in ExecStart would be a second source of
     // truth that loses to the database on the next restart.
+    //
+    // **Before `activate`, not after.** `activate` is `systemctl enable
+    // --now`, so everything below would otherwise be racing a service that
+    // is already starting and opening this same database. Three things
+    // went wrong when it did: the service lost the race and crash-looped
+    // on `Restart=on-failure` with "database is locked"; or this lost it
+    // and the install failed having already enabled the unit; or the
+    // service won, generated the password first, and the operator was
+    // shown "a console password is already set" instead of the password.
+    // The bind-address refusal below is the same argument in one line — it
+    // declines to install a service that, in the old order, was already
+    // running.
     let mut password = None;
     if !options.dry_run {
         let db = open_db(options.db.or(Some(layout.db_path.clone())))?;
@@ -1818,6 +1859,22 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         } else {
             steps.push("a console password is already set, keeping it".to_string());
         }
+
+        // After the writes, and while the path is still to hand.
+        install::secure_database(&layout.db_path)?;
+    }
+
+    // Only now, with the database written and closed, is it safe to start
+    // the service. Under a prefix there is no systemd to tell: the unit is
+    // somewhere systemd will never look, and saying so beats running
+    // `daemon-reload` and implying the file took effect.
+    if prefixed {
+        steps.push(format!(
+            "skipping systemctl: {} is not a path systemd reads",
+            layout.unit_dir.display()
+        ));
+    } else {
+        steps.extend(install::activate(&layout, &opts)?);
     }
 
     if options.dry_run {
@@ -1884,6 +1941,7 @@ async fn run_web(
     db_path: Option<PathBuf>,
     root: PathBuf,
     ssh_log: Option<PathBuf>,
+    firewall_out: Option<PathBuf>,
     bind: Option<String>,
     base_path: Option<String>,
     expose: bool,
@@ -1995,7 +2053,10 @@ async fn run_web(
         }
     }
 
-    let state = AppState::with_base(db, root, ssh_log, !no_apply, base);
+    let mut state = AppState::with_base(db, root, ssh_log, !no_apply, base);
+    // `None` unless the operator named a path: without one the destination
+    // follows the backend, so an iptables render lands in `.sh`.
+    state.firewall_out = firewall_out;
     server::serve(state, addr).await
 }
 

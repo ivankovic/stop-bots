@@ -63,14 +63,15 @@ use crate::db::Db;
 // The row model and the "is this already blocked?" decision live in
 // `crate::dynamic`, shared with the web UI — see that module for why.
 use crate::dynamic::{Filter, Live, RowStatus, SshRow, UaRow};
-use crate::tui::{KeyOutcome, Theme};
+use crate::ipdetail::{AddressKind, IpDetail};
+use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Style, Stylize},
     text::Line,
-    widgets::{Block, List, ListItem, ListState},
+    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -92,6 +93,10 @@ pub struct DynamicProtection {
     ua_state: ListState,
     focus: Focus,
     filter: Filter,
+    /// The open address-detail popup, if any. `Some` also means `Esc`
+    /// closes the popup rather than leaving the screen, the same
+    /// nested-back-out shape `site_detail` uses one level deeper.
+    detail: Option<IpDetail>,
 }
 
 impl DynamicProtection {
@@ -149,6 +154,20 @@ impl DynamicProtection {
         db: &Db,
         message: &mut Option<String>,
     ) -> Result<KeyOutcome> {
+        // The popup owns the keyboard while it is open. It is a read-only
+        // view, so only "close" is meaningful — but it must claim `Esc`,
+        // or the screen would back out to the Dashboard with a detail
+        // still on screen.
+        if self.detail.is_some() {
+            return Ok(match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('i') | KeyCode::Enter => {
+                    self.detail = None;
+                    KeyOutcome::Consumed
+                }
+                _ => KeyOutcome::Consumed,
+            });
+        }
+
         match key.code {
             KeyCode::Tab | KeyCode::BackTab => {
                 self.focus = match self.focus {
@@ -171,6 +190,7 @@ impl DynamicProtection {
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Enter => self.toggle_block_selected(db, message),
+            KeyCode::Char('i') => self.inspect_selected(message),
             _ => Ok(KeyOutcome::Ignored),
         }
     }
@@ -180,6 +200,56 @@ impl DynamicProtection {
             Focus::Ssh => &mut self.ssh_state,
             Focus::UserAgents => &mut self.ua_state,
         }
+    }
+
+    /// Opens the address-detail popup for the selected SSH row.
+    ///
+    /// SSH only. The User Agent panel's rows are keyed by user agent
+    /// string, not by address, so there is no address to look up — the
+    /// equivalent view for that panel is a different question ("which bot
+    /// pattern matched this") and is not this one wearing a disguise.
+    ///
+    /// Reads the database, but nothing over the network: see
+    /// [`crate::ipdetail`] for why a detail view here is deliberately not
+    /// reverse DNS.
+    fn inspect_selected(&mut self, message: &mut Option<String>) -> Result<KeyOutcome> {
+        if self.focus != Focus::Ssh {
+            *message = Some(
+                "Inspect works on a failed-SSH-login row — switch panels with Tab.".to_string(),
+            );
+            return Ok(KeyOutcome::Consumed);
+        }
+        let Some(row) = self
+            .ssh_state
+            .selected()
+            .and_then(|i| self.visible_ssh_rows().get(i).copied())
+        else {
+            return Ok(KeyOutcome::Consumed);
+        };
+
+        // `App` finishes this, for the reason `UpdateSource` and
+        // `SelectCountry` go the same way: it owns the resource the work
+        // needs — here the SSH log text it read in the background — and a
+        // screen reaching for that would mean either keeping a copy of a
+        // multi-megabyte log or reading it again at a different moment
+        // than the rows beside it.
+        Ok(KeyOutcome::InspectAddress(row.address.clone()))
+    }
+
+    /// Shows a detail `App` assembled for [`KeyOutcome::InspectAddress`].
+    pub fn show_detail(&mut self, detail: IpDetail) {
+        self.detail = Some(detail);
+    }
+
+    /// The status currently shown for `address`, so `App` can pass the
+    /// row's own verdict into the detail rather than recomputing one that
+    /// could disagree with what is on screen.
+    pub fn status_of(&self, address: &str) -> RowStatus {
+        self.ssh_rows
+            .iter()
+            .find(|row| row.address == address)
+            .map(|row| row.status)
+            .unwrap_or(RowStatus::Pending)
     }
 
     /// Toggles whichever row is selected in the currently focused panel
@@ -329,7 +399,126 @@ impl DynamicProtection {
                 Style::default()
             });
         frame.render_stateful_widget(ua_list, ua_area, &mut self.ua_state);
+
+        // Last, and over the whole screen rather than one panel: it
+        // answers a question about a row, and reading it against half the
+        // table it came from is what a popup is for.
+        if let Some(detail) = &self.detail {
+            let lines = detail_lines(detail);
+            let popup = centered_rect(
+                widest_line(&lines).max(24) + 4,
+                lines.len() as u16 + 2,
+                area,
+            );
+            let paragraph = Paragraph::new(lines).block(
+                Block::bordered()
+                    .title(format!(" {} ", detail.address))
+                    .fg(theme.accent()),
+            );
+            frame.render_widget(Clear, popup);
+            frame.render_widget(paragraph, popup);
+        }
     }
+}
+
+/// The address-detail popup's body.
+///
+/// Every line is something already in the database — see
+/// [`crate::ipdetail`] for why there is no reverse DNS here. The order is
+/// deliberate: what the host already decided about this address, then what
+/// the feeds say it *is*, then what it actually did. Someone deciding
+/// whether to block reads top-down and can stop as soon as they have
+/// enough.
+fn detail_lines(detail: &IpDetail) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        "Status  ".into(),
+        detail.status.label().bold(),
+    ])];
+
+    match detail.kind {
+        AddressKind::LocalOrPrivate => {
+            lines.push(Line::from(""));
+            lines.push("A loopback or private address.".dim().into());
+            // Said explicitly because the alternative — an empty list of
+            // feed hits — reads as "nothing known about a public address",
+            // which is a different and much more suspicious claim.
+            lines.push(
+                "No feed lists these, so there is nothing to look up."
+                    .dim()
+                    .into(),
+            );
+        }
+        AddressKind::Malformed => {
+            lines.push(Line::from(""));
+            lines.push("Not a valid IP address or range.".dim().into());
+        }
+        AddressKind::Public => {
+            lines.push(Line::from(""));
+            for hit in &detail.crawlers {
+                lines.push(Line::from(vec![
+                    "Crawler ".into(),
+                    hit.source.clone().green(),
+                    format!("  ({})", hit.range).dim(),
+                ]));
+            }
+            for hit in &detail.reputation {
+                lines.push(Line::from(vec![
+                    "Feed    ".into(),
+                    hit.source.clone().yellow(),
+                    format!("  ({})", hit.range).dim(),
+                ]));
+            }
+            match (&detail.country, detail.country_data_available) {
+                (Some(code), _) => {
+                    lines.push(Line::from(vec!["Country ".into(), code.clone().into()]));
+                }
+                // Distinguished on purpose: with no zone file fetched,
+                // "no country" is a statement about this host's data, not
+                // about the address.
+                (None, true) => lines.push("Country  not in any fetched country".dim().into()),
+                (None, false) => lines.push("Country  no country data fetched".dim().into()),
+            }
+            if detail.is_unknown() {
+                lines.push(Line::from(""));
+                lines.push("In none of the crawler or reputation feeds.".dim().into());
+            }
+        }
+    }
+
+    if !detail.usernames.is_empty() {
+        lines.push(Line::from(""));
+        lines.push("Tried to log in as".bold().into());
+        // Capped: an attacker picks these names, and a client that tried
+        // four hundred of them would otherwise own the whole screen. The
+        // count above already says how hard it tried.
+        const MAX_SHOWN: usize = 8;
+        for (user, count) in detail.usernames.iter().take(MAX_SHOWN) {
+            lines.push(Line::from(vec![
+                format!("  {user}").into(),
+                format!("  ×{count}").dim(),
+            ]));
+        }
+        if detail.usernames.len() > MAX_SHOWN {
+            lines.push(
+                format!("  … and {} more", detail.usernames.len() - MAX_SHOWN)
+                    .dim()
+                    .into(),
+            );
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push("Esc close".dim().into());
+    lines
+}
+
+/// The widest line in `lines`, for sizing a popup to its content.
+fn widest_line(lines: &[Line<'_>]) -> u16 {
+    lines
+        .iter()
+        .map(|line| line.width() as u16)
+        .max()
+        .unwrap_or(0)
 }
 
 /// A panel title, with its key hints dropped when the terminal is too
@@ -841,5 +1030,141 @@ mod tests {
         assert!(RowStatus::Blocklist.is_blocklist());
         assert!(!RowStatus::Pending.is_blocklist());
         assert!(!RowStatus::Blocked { until: None }.is_blocklist());
+    }
+    fn screen_with_one_ssh_row(status: RowStatus) -> DynamicProtection {
+        let mut screen = DynamicProtection {
+            ssh_rows: vec![SshRow {
+                address: "185.220.101.7".to_string(),
+                count: 12,
+                status,
+            }],
+            ..Default::default()
+        };
+        screen.ssh_state.select(Some(0));
+        screen
+    }
+
+    fn drawn(screen: &mut DynamicProtection) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark, &HashSet::new()))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// Opening the popup is two steps on purpose: the screen asks, and
+    /// `App` answers, because the usernames come from the SSH log text
+    /// `App` holds. This stands in for that second step.
+    fn open_detail(screen: &mut DynamicProtection, db: &Db) {
+        let mut message = None;
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Char('i')), db, &mut message)
+            .unwrap();
+        let KeyOutcome::InspectAddress(address) = outcome else {
+            panic!("expected an InspectAddress outcome, got {outcome:?}");
+        };
+        let status = screen.status_of(&address);
+        let detail = crate::ipdetail::IpDetail::load(
+            db,
+            &address,
+            status,
+            vec![("root".to_string(), 9), ("admin".to_string(), 3)],
+        )
+        .unwrap();
+        screen.show_detail(detail);
+    }
+
+    #[test]
+    fn i_asks_app_to_inspect_the_selected_address() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ssh_row(RowStatus::Pending);
+        let mut message = None;
+
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Char('i')), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            KeyOutcome::InspectAddress("185.220.101.7".to_string())
+        );
+    }
+
+    #[test]
+    fn the_detail_popup_shows_the_address_and_the_accounts_tried() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ssh_row(RowStatus::Pending);
+
+        open_detail(&mut screen, &db);
+
+        let content = drawn(&mut screen);
+        assert!(content.contains("185.220.101.7"), "content:\n{content}");
+        assert!(content.contains("root"), "content:\n{content}");
+        assert!(content.contains("admin"), "content:\n{content}");
+    }
+
+    /// `Esc` must close the popup rather than leave the screen — the same
+    /// nested-back-out shape `site_detail` uses one level deeper.
+    #[test]
+    fn esc_closes_the_detail_popup_instead_of_leaving_the_screen() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ssh_row(RowStatus::Pending);
+        let mut message = None;
+        open_detail(&mut screen, &db);
+
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Esc), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(screen.detail.is_none());
+        assert!(
+            !drawn(&mut screen).contains("Tried to log in as"),
+            "the popup was still drawn"
+        );
+    }
+
+    /// The popup is read-only, so it must not let a keystroke meant for it
+    /// fall through and block an address behind it.
+    #[test]
+    fn a_key_with_the_popup_open_never_reaches_the_screen_underneath() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ssh_row(RowStatus::Pending);
+        let mut message = None;
+        open_detail(&mut screen, &db);
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('f')), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(screen.filter, Filter::All, "the filter changed behind it");
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// The User Agent panel's rows are keyed by user agent, not address,
+    /// so there is nothing to look up — say so rather than opening an
+    /// empty popup.
+    #[test]
+    fn inspecting_from_the_user_agent_panel_explains_itself() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ssh_row(RowStatus::Pending);
+        screen.focus = Focus::UserAgents;
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('i')), &db, &mut message)
+            .unwrap();
+
+        assert!(screen.detail.is_none());
+        assert!(
+            message.as_deref().unwrap_or_default().contains("Tab"),
+            "message was: {message:?}"
+        );
     }
 }

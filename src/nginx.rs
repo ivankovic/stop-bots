@@ -1060,6 +1060,222 @@ fn apply_block(content: &str, block: &ServerBlock, config: &BlockConfig) -> Stri
     }
 }
 
+// ---- reaching the console from outside ----
+
+/// Sentinel markers for the console's own `location` block.
+///
+/// Separate from [`BLOCK_BEGIN`]/[`BLOCK_END`] on purpose: the two live in
+/// the same `server` block and are rewritten by different actions, so one
+/// pair of markers would have "apply blocks" and "set up web access"
+/// deleting each other's work.
+const CONSOLE_BEGIN: &str = "# BEGIN stop-bots console (DO NOT EDIT)";
+const CONSOLE_END: &str = "# END stop-bots console";
+
+/// How the console is reached from outside this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleAccess {
+    /// Its own `server` block on `host`, written as a new config file.
+    ///
+    /// Served over plain HTTP. Adding a certificate is a separate step
+    /// (certbot), and until it is taken, the console's password form and
+    /// its session cookie cross the network in the clear — which is why
+    /// [`ConsoleAccess::Path`] is the default the panel offers.
+    Subdomain { host: String },
+    /// A `location` block inserted into an existing site's `server` block,
+    /// which is how the console inherits that site's certificate.
+    Path {
+        /// Normalised with a leading and trailing slash, e.g. `/stop-bots/`.
+        prefix: String,
+        /// The site's config file, from `Db::list_sites`.
+        config_path: PathBuf,
+        /// The `server_name` whose block to edit.
+        server_name: String,
+    },
+}
+
+/// The `location` block that proxies to the console, shared by both modes.
+///
+/// `proxy_pass` deliberately has **no** trailing slash, and the location
+/// keeps its prefix: this server matches the full path including the
+/// prefix and generates links that do too, so a `proxy_pass` that stripped
+/// it would leave every link pointing outside the location block. See
+/// `--base-path` in `main.rs` for the same warning aimed at whoever writes
+/// this by hand.
+fn console_location(prefix: &str, upstream: &std::net::SocketAddr) -> String {
+    format!(
+        "    {CONSOLE_BEGIN}\n    \
+         location {prefix} {{\n        \
+         proxy_pass http://{upstream};\n        \
+         proxy_set_header Host $host;\n        \
+         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        \
+         proxy_set_header X-Forwarded-Proto $scheme;\n    \
+         }}\n    {CONSOLE_END}\n"
+    )
+}
+
+/// A whole `server` block serving the console on `host` at `/`.
+pub fn console_server_block(host: &str, upstream: &std::net::SocketAddr) -> String {
+    format!(
+        "# Written by stop-bots (`Web Access` panel). Safe to edit or delete.\n\
+         #\n\
+         # Plain HTTP: the console's password and session cookie are in the clear\n\
+         # until this host has a certificate for {host}. Get one with:\n\
+         #\n\
+         #     certbot --nginx -d {host}\n\
+         #\n\
+         # then set `web:secure_cookie` so the cookie is HTTPS-only.\n\
+         server {{\n    \
+         listen 80;\n    \
+         listen [::]:80;\n    \
+         server_name {host};\n\n\
+         {}}}\n",
+        console_location("/", upstream)
+    )
+}
+
+/// Where a subdomain-mode config file goes: `conf.d/<name>.conf` under the
+/// config root.
+///
+/// `conf.d` rather than `sites-available` plus a symlink into
+/// `sites-enabled`: Debian's default `nginx.conf` includes both, `conf.d`
+/// needs no second step to take effect, and one file is one thing to
+/// delete when an operator changes their mind.
+pub fn console_site_path(root: &Path) -> PathBuf {
+    root.join("conf.d").join("stop-bots-console.conf")
+}
+
+/// Inserts (or updates) the console's `location` block inside
+/// `server_name`'s block in `content`.
+///
+/// Returns `None` if that file has no matching `server` block — a
+/// mismatch between the database's idea of where a site lives and what is
+/// on disk, which is a refusal rather than something to guess at.
+fn with_console_location(
+    content: &str,
+    server_name: &str,
+    prefix: &str,
+    upstream: &std::net::SocketAddr,
+) -> Option<String> {
+    let blocks = parse_server_blocks(content);
+    // Prefer the TLS block. A site normally has two — a port-80 redirect
+    // and the real HTTPS one — and putting the console in the first would
+    // serve its login form over cleartext on a host that has a
+    // certificate sitting right there.
+    let block = blocks
+        .iter()
+        .filter(|b| b.names.iter().any(|n| n == server_name))
+        .max_by_key(|b| b.is_tls)?;
+
+    let new_block = console_location(prefix, upstream);
+    Some(match locate_console_block(content, block) {
+        Some((start, end)) => {
+            let mut out = String::with_capacity(content.len());
+            out.push_str(&content[..start]);
+            out.push_str(&new_block);
+            out.push_str(&content[end..]);
+            out
+        }
+        None => {
+            let mut out = String::with_capacity(content.len() + new_block.len() + 1);
+            out.push_str(&content[..block.open + 1]);
+            out.push('\n');
+            out.push_str(&new_block);
+            out.push_str(&content[block.open + 1..]);
+            out
+        }
+    })
+}
+
+/// [`locate_existing_block`] for the console markers.
+fn locate_console_block(content: &str, block: &ServerBlock) -> Option<(usize, usize)> {
+    let region = &content[block.open..block.close];
+    let begin_rel = region.find(CONSOLE_BEGIN)?;
+    let begin_abs = block.open + begin_rel;
+    let line_start = content[..begin_abs].rfind('\n').map(|i| i + 1).unwrap_or(0);
+
+    let end_rel = region[begin_rel..].find(CONSOLE_END)?;
+    let end_marker_abs = begin_abs + end_rel + CONSOLE_END.len();
+    let line_end = content[end_marker_abs..]
+        .find('\n')
+        .map(|i| end_marker_abs + i + 1)
+        .unwrap_or(content.len());
+    Some((line_start, line_end))
+}
+
+/// Writes `content` to `path`, validates the whole NGINX config, and puts
+/// the previous state back if validation fails.
+///
+/// The reason this exists rather than a plain write: `apply_all_sites`
+/// writes then tests, which is survivable when it edited an existing file
+/// — but a *new* `server` block that fails `nginx -t` leaves the config
+/// unloadable, and nothing looks wrong because the running NGINX keeps
+/// serving from memory. The next reload is then somebody else's problem,
+/// most likely certbot's renewal hook at 3am.
+fn write_validated(path: &Path, content: &str, commands: &NginxCommands) -> Result<()> {
+    let previous = fs::read_to_string(path).ok();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+
+    if let Err(err) = test_config(commands) {
+        // Put it back before reporting, so the operator is not left with a
+        // config that cannot be loaded.
+        let restored = match &previous {
+            Some(text) => fs::write(path, text),
+            None => fs::remove_file(path),
+        };
+        let note = if restored.is_ok() {
+            "the previous config was restored"
+        } else {
+            "AND RESTORING THE PREVIOUS CONFIG ALSO FAILED — fix this by hand"
+        };
+        anyhow::bail!("{err:#}\n\n{}: {}", note, path.display());
+    }
+    Ok(())
+}
+
+/// Sets the console up to be reachable, and returns what it did.
+///
+/// Validated before it can take effect (see [`write_validated`]) and
+/// reloaded only on success. The caller is responsible for the two
+/// database settings that have to agree with this config — `web:base_path`
+/// and `web:allowed_hosts` — because a console reachable at a path it does
+/// not serve, or under a `Host` it refuses, is broken in a way that looks
+/// like a 404 or a 403 rather than like a configuration mistake.
+pub fn apply_console_access(
+    root: &Path,
+    access: &ConsoleAccess,
+    upstream: &std::net::SocketAddr,
+    commands: &NginxCommands,
+) -> Result<PathBuf> {
+    match access {
+        ConsoleAccess::Subdomain { host } => {
+            let path = console_site_path(root);
+            write_validated(&path, &console_server_block(host, upstream), commands)?;
+            Ok(path)
+        }
+        ConsoleAccess::Path {
+            prefix,
+            config_path,
+            server_name,
+        } => {
+            let content = fs::read_to_string(config_path)
+                .with_context(|| format!("failed to read {}", config_path.display()))?;
+            let updated = with_console_location(&content, server_name, prefix, upstream)
+                .with_context(|| {
+                    format!(
+                        "{} has no `server` block for {server_name} — re-scan sites and try again",
+                        config_path.display()
+                    )
+                })?;
+            write_validated(config_path, &updated, commands)?;
+            Ok(config_path.clone())
+        }
+    }
+}
+
 /// Recursively walks `root` looking for NGINX config files containing
 /// `server { ... }` blocks, returning one [`DiscoveredSite`] per block (named
 /// after its first `server_name`). Files with no server block, or that
@@ -3061,6 +3277,190 @@ mod tests {
         crate::golden::assert_golden(
             "nginx-block-tarpit.conf",
             &block_text(&cfg_response(BlockResponse::Tarpit)).unwrap(),
+        );
+    }
+    // ---- reaching the console from outside ----
+
+    /// `NginxCommands` whose test either passes or fails, without needing
+    /// a real NGINX. `/bin/true` and `/bin/false` rather than a written
+    /// script: fewer moving parts, and nothing to make executable.
+    fn commands_that(pass: bool) -> NginxCommands {
+        let program = if pass { "true" } else { "false" };
+        NginxCommands {
+            test: vec![program.to_string()],
+            reload: vec!["true".to_string()],
+        }
+    }
+
+    const TWO_BLOCK_SITE: &str = "\
+server {
+    listen 80;
+    server_name example.com;
+    return 301 https://$host$request_uri;
+}
+server {
+    listen 443 ssl;
+    server_name example.com;
+    ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
+    root /var/www/example.com;
+}
+";
+
+    fn upstream() -> std::net::SocketAddr {
+        "127.0.0.1:8787".parse().unwrap()
+    }
+
+    /// The console's login form must not end up on the port-80 redirect
+    /// block when the site has a certificate sitting right there.
+    #[test]
+    fn path_mode_picks_the_tls_block_not_the_redirect() {
+        let updated =
+            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
+                .expect("the site has a matching block");
+
+        // Against the parsed block's own span, not the order of
+        // directives: the block is inserted at the top of the `server`
+        // block, so it precedes `listen 443` while still being inside it.
+        let console_at = updated.find(CONSOLE_BEGIN).expect("the block was inserted");
+        let blocks = parse_server_blocks(&updated);
+        let tls = blocks
+            .iter()
+            .find(|b| b.is_tls)
+            .expect("the fixture has a TLS block");
+        assert!(
+            console_at > tls.open && console_at < tls.close,
+            "the console landed outside the TLS block:\n{updated}"
+        );
+    }
+
+    /// `proxy_pass` must not have a trailing slash and the location must
+    /// keep its prefix — otherwise NGINX strips the prefix and every link
+    /// this console generates points outside the location block.
+    #[test]
+    fn the_console_location_does_not_strip_its_prefix() {
+        let block = console_location("/stop-bots/", &upstream());
+
+        assert!(
+            block.contains("location /stop-bots/ {"),
+            "block was:\n{block}"
+        );
+        assert!(
+            block.contains("proxy_pass http://127.0.0.1:8787;"),
+            "a trailing slash here strips the prefix:\n{block}"
+        );
+    }
+
+    #[test]
+    fn path_mode_is_idempotent() {
+        let once = with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
+            .unwrap();
+        let twice =
+            with_console_location(&once, "example.com", "/stop-bots/", &upstream()).unwrap();
+
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches(CONSOLE_BEGIN).count(), 1);
+    }
+
+    /// Rewritten in place, so changing the prefix does not leave the old
+    /// location block behind alongside the new one.
+    #[test]
+    fn changing_the_prefix_replaces_the_block_rather_than_adding_one() {
+        let first =
+            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
+                .unwrap();
+        let second =
+            with_console_location(&first, "example.com", "/console/", &upstream()).unwrap();
+
+        assert_eq!(second.matches(CONSOLE_BEGIN).count(), 1);
+        assert!(second.contains("location /console/ {"), "was:\n{second}");
+        assert!(!second.contains("location /stop-bots/ {"), "was:\n{second}");
+    }
+
+    /// The console markers must not collide with the bot-blocking ones:
+    /// both live in the same `server` block and are rewritten by different
+    /// actions.
+    #[test]
+    fn the_console_block_and_the_blocking_block_coexist() {
+        let with_console =
+            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
+                .unwrap();
+        let blocks = parse_server_blocks(&with_console);
+        let tls = blocks.iter().find(|b| b.is_tls).unwrap();
+        let config = BlockConfig::new(vec!["BadBot".to_string()], BlockResponse::Forbidden);
+
+        let both = apply_block(&with_console, tls, &config);
+
+        assert!(both.contains(CONSOLE_BEGIN), "console block lost:\n{both}");
+        assert!(both.contains(BLOCK_BEGIN), "blocking block lost:\n{both}");
+        assert!(both.contains("location /stop-bots/ {"), "was:\n{both}");
+    }
+
+    #[test]
+    fn a_site_with_no_matching_block_is_a_refusal() {
+        assert!(
+            with_console_location(TWO_BLOCK_SITE, "other.example.org", "/x/", &upstream())
+                .is_none()
+        );
+    }
+
+    /// The failure this guards against: a new `server` block that does not
+    /// parse leaves the whole config unloadable, and nothing looks wrong
+    /// because the running NGINX keeps serving from memory.
+    #[test]
+    fn a_config_that_fails_validation_is_rolled_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conf.d/stop-bots-console.conf");
+
+        let err = write_validated(&path, "server { broken", &commands_that(false)).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("restored"),
+            "the operator must be told the rollback happened: {err:#}"
+        );
+        assert!(
+            !path.exists(),
+            "a file that never validated must not be left behind"
+        );
+    }
+
+    /// Rolling back an *edit* puts the previous content back, rather than
+    /// deleting somebody's site config.
+    #[test]
+    fn a_failed_edit_restores_the_previous_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.com");
+        fs::write(&path, TWO_BLOCK_SITE).unwrap();
+
+        let _ = write_validated(&path, "server { broken", &commands_that(false));
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), TWO_BLOCK_SITE);
+    }
+
+    #[test]
+    fn a_config_that_validates_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("conf.d/stop-bots-console.conf");
+        let block = console_server_block("console.example.com", &upstream());
+
+        write_validated(&path, &block, &commands_that(true)).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), block);
+    }
+
+    /// Plain HTTP is a real downgrade for a page with a password form, so
+    /// the generated file has to say so where whoever opens it will look.
+    #[test]
+    fn the_subdomain_block_warns_that_it_is_cleartext() {
+        let block = console_server_block("console.example.com", &upstream());
+
+        assert!(
+            block.contains("certbot --nginx -d console.example.com"),
+            "was:\n{block}"
+        );
+        assert!(block.contains("in the clear"), "was:\n{block}");
+        assert!(
+            block.contains("server_name console.example.com;"),
+            "was:\n{block}"
         );
     }
 }

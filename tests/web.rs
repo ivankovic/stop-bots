@@ -51,13 +51,19 @@ fn app_under(base: &str) -> (Router, String, tempfile::TempDir, std::path::PathB
 
     // `apply_for_real: false` throughout — a test must never reload the
     // developer's NGINX or run a firewall script at them.
-    let state = AppState::with_base(
+    let mut state = AppState::with_base(
         Db::open(&db_path).unwrap(),
         nginx_root,
         None,
         false,
         stop_bots::web::BasePath::parse(base).unwrap(),
     );
+    // An explicit override, not left at `None`: without one the path
+    // follows the backend and lands under `/etc/stop-bots/`, which a test
+    // must never write to. It doubles as the assertion that an explicit
+    // path wins over the backend's own default — the iptables tests below
+    // still find their script at this `.nft` name.
+    state.firewall_out = Some(tmp.path().join("firewall.nft"));
     (server::router(state), password, tmp, db_path)
 }
 
@@ -774,15 +780,8 @@ async fn writing_the_firewall_script_produces_a_file_and_records_the_signature()
         .block_address_permanently("192.0.2.10")
         .unwrap();
 
-    let out = tmp.path().join("firewall.sh");
-    let (_, flash) = act(
-        &app,
-        &cookie,
-        &csrf,
-        "/render-firewall",
-        &format!("out={}&backend=nftables", out.display()),
-    )
-    .await;
+    let out = tmp.path().join("firewall.nft");
+    let (_, flash) = act(&app, &cookie, &csrf, "/render-firewall", "backend=nftables").await;
 
     assert!(flash.contains("Wrote"), "was: {flash}");
     let script = std::fs::read_to_string(&out).expect("the script must exist on disk");
@@ -797,20 +796,36 @@ async fn writing_the_firewall_script_produces_a_file_and_records_the_signature()
     );
 }
 
+/// The destination used to come from a free-text form field, which made
+/// this the one handler that could create a root-owned file anywhere on the
+/// host — and the file it creates is an executable script. The console is
+/// deliberately the restricted front-end, so it writes where it was
+/// configured to and nowhere else.
 #[tokio::test]
-async fn writing_the_firewall_script_needs_somewhere_to_write_it() {
-    let (app, password, _tmp, _db) = app_with_db();
+async fn the_firewall_script_goes_where_the_server_was_configured_to_put_it() {
+    let (app, password, tmp, _db) = app_with_db();
     let (cookie, csrf) = login(&app, &password).await;
 
+    let elsewhere = tmp.path().join("elsewhere.sh");
     let (_, flash) = act(
         &app,
         &cookie,
         &csrf,
         "/render-firewall",
-        "out=&backend=nftables",
+        &format!("out={}&backend=nftables", elsewhere.display()),
     )
     .await;
-    assert!(flash.contains("path"), "was: {flash}");
+
+    assert!(flash.contains("Wrote"), "was: {flash}");
+    assert!(
+        !elsewhere.exists(),
+        "the form steered the write to {}",
+        elsewhere.display()
+    );
+    assert!(
+        tmp.path().join("firewall.nft").exists(),
+        "the configured destination was not written"
+    );
 }
 
 #[tokio::test]
@@ -1759,4 +1774,337 @@ async fn a_trusted_forwarded_address_keeps_one_clients_flood_off_another() {
         StatusCode::SEE_OTHER,
         "one address's flood must not stand between the operator and their own console"
     );
+}
+
+/// The detail panel is reached by a query parameter rather than an htmx
+/// fragment, so it has to survive an ordinary GET — including one typed
+/// into the URL bar with an address that is not in the table.
+#[tokio::test]
+async fn inspecting_an_address_renders_its_detail_panel() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let _ = csrf;
+
+    let db = Db::open(&db_path).unwrap();
+    db.register_reputation_source(&stop_bots::db::ReputationSource {
+        id: "tor-exits".into(),
+        name: "Tor exit nodes".into(),
+        url: "https://example.invalid/tor".into(),
+        enabled: true,
+        last_fetched_at: None,
+        range_count: 0,
+    })
+    .unwrap();
+    db.set_reputation_source_enabled("tor-exits", true).unwrap();
+    db.replace_reputation_ranges("tor-exits", &["185.220.101.0/24".to_string()])
+        .unwrap();
+    drop(db);
+
+    let response = app
+        .clone()
+        .oneshot(with_cookie(
+            get("/dynamic?filter=all&inspect=185.220.101.7"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+
+    assert!(body.contains("About 185.220.101.7"), "body was:\n{body}");
+    assert!(body.contains("Tor exit nodes"), "body was:\n{body}");
+}
+
+/// The parameter is whatever is in the URL bar. A value that is not an
+/// address at all must render a page saying so, not a 500.
+#[tokio::test]
+async fn inspecting_something_that_is_not_an_address_still_renders() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let response = app
+        .clone()
+        .oneshot(with_cookie(get("/dynamic?inspect=not-an-address"), &cookie))
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+
+    assert!(body.contains("Not a valid IP address"), "body was:\n{body}");
+}
+
+/// The complaint that started this: selecting a country told the operator
+/// to go and run a CLI command. A console that knows what needs doing
+/// should offer to do it.
+#[tokio::test]
+async fn selecting_a_country_names_a_button_rather_than_a_cli_command() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/geo-add", "country=ru").await;
+
+    assert!(
+        !flash.contains("stop-bots update-country-ranges"),
+        "the message still sends the operator to the CLI: {flash}"
+    );
+    assert!(flash.contains("Update everything"), "was: {flash}");
+}
+
+/// Both new buttons have to be on the page and carry the token, or they
+/// are 403s waiting to happen — and they belong in "System-wide settings",
+/// which is where an operator looks for the things that act on the whole
+/// host rather than on one list.
+#[tokio::test]
+async fn the_dashboard_offers_update_everything_and_apply_everything() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let response = app
+        .clone()
+        .oneshot(with_cookie(get("/"), &cookie))
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+
+    for action in ["/update-all", "/apply-all"] {
+        assert!(body.contains(action), "no form posts to {action}:\n{body}");
+    }
+    assert!(
+        body.matches(r#"name="csrf""#).count() >= 2,
+        "the new forms must carry the token too"
+    );
+
+    let panel = panel_html(&body, "System-wide settings");
+    for action in ["/update-all", "/apply-all"] {
+        assert!(
+            panel.contains(action),
+            "{action} is on the page but not in System-wide settings:\n{panel}"
+        );
+    }
+}
+
+/// Loose content — anything that is not the full-bleed table — has to sit
+/// in a `.panel-body`, because that is the only thing carrying the side
+/// padding. Web Access shipped without it and its dropdowns sat flush
+/// against the panel edge.
+#[tokio::test]
+async fn every_panel_puts_its_loose_content_in_a_padded_body() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let response = app
+        .clone()
+        .oneshot(with_cookie(get("/"), &cookie))
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+
+    for title in ["Web Access", "System-wide settings"] {
+        let panel = panel_html(&body, title);
+        // A table is full-bleed by design and provides its own cell
+        // padding; everything after it is the loose content in question.
+        let loose = match panel.rfind("</table>") {
+            Some(at) => &panel[at + "</table>".len()..],
+            None => {
+                panel
+                    .split_once("</h2>")
+                    .expect("a panel with no heading")
+                    .1
+            }
+        };
+        assert!(
+            loose.starts_with(r#"<div class="panel-body""#),
+            "{title} puts loose content outside a .panel-body:\n{loose}"
+        );
+    }
+}
+
+/// The markup of one `section.panel`, picked out by its heading.
+fn panel_html<'a>(body: &'a str, title: &str) -> &'a str {
+    let heading = body
+        .find(title)
+        .unwrap_or_else(|| panic!("no panel titled {title}:\n{body}"));
+    let start = body[..heading]
+        .rfind("<section")
+        .expect("a heading outside any section");
+    let end = body[start..]
+        .find("</section>")
+        .expect("an unclosed section");
+    &body[start..start + end]
+}
+
+/// `--no-apply` is the flag that keeps a test — or a cautious operator —
+/// from having their real firewall rewritten under them. The fixture sets
+/// it, so this is also the assertion that the suite cannot run `nft`.
+#[tokio::test]
+async fn apply_everything_writes_but_does_not_enforce_under_no_apply() {
+    let (app, password, tmp, _db) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/apply-all", "").await;
+
+    assert!(flash.contains("not applied: --no-apply"), "was: {flash}");
+    assert!(
+        tmp.path().join("firewall.nft").exists(),
+        "the script should still have been written"
+    );
+}
+
+/// The render form's new "run it after writing" box, under the same flag.
+#[tokio::test]
+async fn the_render_form_can_ask_for_an_apply_and_still_respects_no_apply() {
+    let (app, password, tmp, _db) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/render-firewall",
+        "backend=iptables&apply=1",
+    )
+    .await;
+
+    assert!(flash.contains("not applied: --no-apply"), "was: {flash}");
+    assert!(tmp.path().join("firewall.nft").exists(), "was: {flash}");
+}
+
+/// The backend choice is remembered, so a one-click "Apply everything" has
+/// an answer and an operator who chose iptables is not handed an nftables
+/// script next time.
+#[tokio::test]
+async fn the_chosen_firewall_backend_is_remembered() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/render-firewall",
+        "backend=iptables&apply=1",
+    )
+    .await;
+
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(
+        stop_bots::firewall::stored_backend(&db).unwrap(),
+        stop_bots::firewall::FirewallBackend::Iptables
+    );
+}
+
+/// Path mode end to end: the `location` block, the base path and the host
+/// allowlist all have to land, because any one of them missing produces a
+/// console that looks broken rather than misconfigured — a 404 for the
+/// prefix, a 403 for the host.
+#[tokio::test]
+async fn setting_up_path_access_writes_the_config_and_both_settings() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let site = tmp.path().join("nginx/sites-enabled/example.com");
+    std::fs::write(
+        &site,
+        "server {\n    listen 443 ssl;\n    server_name example.com;\n}\n",
+    )
+    .unwrap();
+
+    let db = Db::open(&db_path).unwrap();
+    // `nginx -t` is what validates the generated config, and a test must
+    // never run the developer's real one — this is the same
+    // `set-nginx-commands` escape hatch the container tests use.
+    db.set_text_setting(stop_bots::nginx::NginxCommands::TEST_KEY, "true")
+        .unwrap();
+    let scanned = stop_bots::nginx::discover_sites(&tmp.path().join("nginx")).unwrap();
+    for found in &scanned {
+        db.upsert_site(&found.server_name, &found.config_path.to_string_lossy())
+            .unwrap();
+    }
+    drop(db);
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/web-access",
+        "mode=path&site=example.com&prefix=/stop-bots/&host=",
+    )
+    .await;
+
+    assert!(flash.contains("Wrote"), "was: {flash}");
+    let written = std::fs::read_to_string(&site).unwrap();
+    assert!(
+        written.contains("location /stop-bots/ {"),
+        "config was:\n{written}"
+    );
+    assert!(
+        written.contains("proxy_pass http://127.0.0.1:8787;"),
+        "config was:\n{written}"
+    );
+
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(
+        stop_bots::web::BasePath::from_db(&db).unwrap().as_str(),
+        "/stop-bots",
+        "without this every link the console generates leaves the location block"
+    );
+    assert!(
+        stop_bots::web::configured_hosts(&db)
+            .unwrap()
+            .contains(&"example.com".to_string()),
+        "without this the proxied request's Host is refused"
+    );
+}
+
+/// Mounting the console at the site root would take over the whole site.
+#[tokio::test]
+async fn path_access_refuses_the_site_root() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/web-access",
+        "mode=path&site=example.com&prefix=/&host=",
+    )
+    .await;
+
+    assert!(flash.contains("needs a prefix"), "was: {flash}");
+}
+
+#[tokio::test]
+async fn subdomain_access_needs_a_host_name() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/web-access",
+        "mode=subdomain&site=&prefix=/stop-bots/&host=not+a+host",
+    )
+    .await;
+
+    assert!(flash.contains("host name"), "was: {flash}");
+}
+
+/// The panel has to be on the page with both modes offered.
+#[tokio::test]
+async fn the_dashboard_offers_a_web_access_panel() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let response = app
+        .clone()
+        .oneshot(with_cookie(get("/"), &cookie))
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+
+    assert!(body.contains("Web Access"), "no panel:\n{body}");
+    assert!(body.contains("/web-access"), "no form action");
+    for mode in ["Path on an existing site", "Its own subdomain"] {
+        assert!(body.contains(mode), "missing mode {mode}");
+    }
 }

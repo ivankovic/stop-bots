@@ -43,6 +43,35 @@
 //! next, so a single selection index still walks them in reading order:
 //! Down at the foot of one column arrives at the head of the next.
 //!
+//! ## The host-wide actions
+//!
+//! Three keys here act on the whole host rather than on the selected row,
+//! and each is the TUI's half of something the console has as a button or
+//! a panel:
+//!
+//! - `u` downloads every list this host uses ([`crate::refresh`]), one
+//!   source at a time — `KeyOutcome::UpdateEverything`.
+//! - `a` writes the NGINX config and then writes and runs the firewall
+//!   script — `KeyOutcome::ApplyEverything`. Two independent halves, the
+//!   same two `batch --apply` does. The NGINX reload it triggers overlaps
+//!   the firewall render rather than preceding it: both are started from
+//!   `App::finish_site_apply`, and neither reads what the other writes.
+//! - `w` opens the Web Access form ([`Popup::WebAccess`]), which puts this
+//!   console behind NGINX on a subdomain or a path prefix
+//!   ([`crate::webaccess`]).
+//!
+//! None of the three is behind a confirmation popup, matching the
+//! console's one-click buttons: an update only downloads, and the apply
+//! goes through the same anti-lockout guard the render popup does.
+//!
+//! They are hinted in the *Summary* panel's title rather than in
+//! "System-wide settings"', where they belong by meaning. That panel is
+//! half-width — 37 title columns on an 80-column terminal — and ratatui
+//! truncates a longer `Block` title silently, which loses most of a hint
+//! that says what the keys do. A title short enough to fit names the keys
+//! and nothing else. Summary is full-width and already the panel that
+//! says "press f".
+//!
 //! ## Geo-blocking
 //!
 //! A second, independently-focused list (`countries_state`, switched to via
@@ -186,6 +215,21 @@ enum Popup {
         apply_after_write: bool,
         error: Option<String>,
     },
+    /// Putting this console behind NGINX: path mode on a scanned site, or
+    /// a subdomain of its own. The console's "Web Access" panel is the
+    /// same form, and both hand the answer to [`crate::webaccess`].
+    ///
+    /// Two text fields rather than one that changes meaning with the
+    /// mode: switching modes to see what the other one looks like must
+    /// not throw away what was already typed.
+    WebAccess {
+        subdomain: bool,
+        /// Index into [`Dashboard::sites`].
+        site: usize,
+        prefix: String,
+        host: String,
+        error: Option<String>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -228,12 +272,18 @@ pub struct Dashboard {
     /// How many rules a render would write, for the Summary panel — see
     /// its three-state line, which reads differently at zero.
     rule_count: usize,
+    /// Every scanned site's `server_name`, for the Web Access popup to
+    /// offer. Names rather than rows: the popup only needs to hand one
+    /// back, and `webaccess::plan` looks the rest up itself.
+    sites: Vec<String>,
 }
 
 impl Dashboard {
     /// Reloads everything shown on the dashboard from `db`.
     pub fn refresh(&mut self, db: &Db) -> Result<()> {
-        self.site_count = db.list_sites()?.len();
+        let sites = db.list_sites()?;
+        self.site_count = sites.len();
+        self.sites = sites.into_iter().map(|s| s.server_name).collect();
         self.sources = db.list_sources()?;
         self.scanner_default = db.get_category_default(Category::Scanner)?;
         self.search_default = db.get_category_default(Category::Search)?;
@@ -530,7 +580,13 @@ impl Dashboard {
                 (n, false) => format!("Firewall rules: {n}, script up to date"),
             }),
         ])
-        .block(Block::bordered().title("Summary"));
+        // The two host-wide actions are hinted here rather than in
+        // "System-wide settings"' own title, where they belong by
+        // meaning: that panel is half-width — 37 title columns at 80 — and
+        // ratatui truncates a longer title silently, so the half that says
+        // what the keys do would be the half that vanished. This panel is
+        // full-width, and already the one that says "press f".
+        .block(Block::bordered().title("Summary — u update everything, a apply everything"));
         frame.render_widget(summary, area);
     }
 
@@ -771,6 +827,71 @@ impl Dashboard {
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(paragraph, popup_area);
             }
+            Popup::WebAccess {
+                subdomain,
+                site,
+                prefix,
+                host,
+                error,
+            } => {
+                let title = "Reach this console from outside";
+                // Marked with a caret as well as reversed: the selected
+                // row must still be identifiable on a terminal that
+                // renders reverse video poorly, or over a connection that
+                // drops the attribute.
+                let chosen = |on: bool, text: &str| {
+                    let span = Span::from(format!("{} {text}", if on { ">" } else { " " }));
+                    if on {
+                        span.reversed()
+                    } else {
+                        span.dim()
+                    }
+                };
+                let site_label = match self.sites.get(site) {
+                    Some(name) => format!("  < {name} >"),
+                    None => "  (no sites scanned yet — press s, then r)".to_string(),
+                };
+
+                let mut lines = vec![
+                    Line::from("Mode:").bold(),
+                    Line::from(vec![
+                        Span::from("  "),
+                        chosen(!subdomain, "Path on an existing site"),
+                    ]),
+                    Line::from(vec![
+                        Span::from("  "),
+                        chosen(subdomain, "Its own subdomain"),
+                    ]),
+                    Line::from(""),
+                ];
+                if subdomain {
+                    lines.push(Line::from(format!("Host: {host}_")));
+                    lines.push(
+                        Line::from(
+                            "Port 80 until certbot runs; the password would be in the clear.",
+                        )
+                        .dim(),
+                    );
+                } else {
+                    lines.push(Line::from("Site:").bold());
+                    lines.push(Line::from(site_label));
+                    lines.push(Line::from(format!("Prefix: {prefix}_")));
+                }
+                if let Some(err) = &error {
+                    lines.push(Line::from(err.as_str()).red());
+                }
+                lines.push(Line::from("").dim());
+                lines.push(Line::from("↑/↓ mode  ←/→ site  Enter confirm  Esc cancel").dim());
+
+                let popup_area = centered_rect(
+                    widest_line(&lines).max(title.chars().count() as u16) + 4,
+                    lines.len() as u16 + 2,
+                    area,
+                );
+                let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
+                frame.render_widget(Clear, popup_area);
+                frame.render_widget(paragraph, popup_area);
+            }
         }
     }
 
@@ -793,6 +914,7 @@ impl Dashboard {
                 Popup::Protection { .. } => self.handle_protection_popup_key(key, db, message),
                 Popup::GeoMode { .. } => self.handle_geo_mode_popup_key(key, db, message),
                 Popup::RenderFirewall { .. } => self.handle_render_firewall_popup_key(key),
+                Popup::WebAccess { .. } => self.handle_web_access_popup_key(key),
             };
         }
 
@@ -802,6 +924,31 @@ impl Dashboard {
                     GeoMode::Blocklist => 0,
                     GeoMode::Allowlist => 1,
                 },
+            });
+            return Ok(KeyOutcome::Consumed);
+        }
+
+        // Host-wide, one key each, and deliberately not behind a popup:
+        // they mirror the console's two buttons, which are one click each
+        // too. Neither is irreversible — an update only downloads, and the
+        // apply goes through the same anti-lockout guard the render popup
+        // does (see `App::start_everything_firewall`).
+        if key.code == KeyCode::Char('u') {
+            return Ok(KeyOutcome::UpdateEverything);
+        }
+        if key.code == KeyCode::Char('a') {
+            return Ok(KeyOutcome::ApplyEverything);
+        }
+
+        // 'w' opens the Web Access form — the TUI's half of the
+        // console's panel of the same name.
+        if key.code == KeyCode::Char('w') {
+            self.popup = Some(Popup::WebAccess {
+                subdomain: false,
+                site: 0,
+                prefix: crate::webaccess::DEFAULT_PREFIX.to_string(),
+                host: String::new(),
+                error: None,
             });
             return Ok(KeyOutcome::Consumed);
         }
@@ -1259,6 +1406,82 @@ impl Dashboard {
                     force: false,
                     apply: apply_after_write,
                 })
+            }
+            _ => Ok(KeyOutcome::Consumed),
+        }
+    }
+
+    /// Mode with Up/Down, the site with Left/Right, and one text field
+    /// whose meaning follows the mode.
+    ///
+    /// Arrow keys only, no `j`/`k` aliases, for the reason the render
+    /// popup's handler spells out: both fields here are free text, and a
+    /// host name or a path prefix may contain either letter.
+    fn handle_web_access_popup_key(&mut self, key: KeyEvent) -> Result<KeyOutcome> {
+        let site_count = self.sites.len();
+        let Some(Popup::WebAccess {
+            subdomain,
+            site,
+            prefix,
+            host,
+            error,
+        }) = &mut self.popup
+        else {
+            unreachable!("dispatched on this variant")
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.popup = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Up => {
+                *subdomain = false;
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Down => {
+                *subdomain = true;
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Left => {
+                *site = site.saturating_sub(1);
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Right => {
+                *site = (*site + 1).min(site_count.saturating_sub(1));
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Char(c) if c.is_ascii_punctuation() || c.is_ascii_alphanumeric() => {
+                if *subdomain { host } else { prefix }.push(c);
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Backspace => {
+                if *subdomain { host } else { prefix }.pop();
+                *error = None;
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::Enter => {
+                if *subdomain {
+                    let request = crate::webaccess::Request::Subdomain { host: host.clone() };
+                    self.popup = None;
+                    return Ok(KeyOutcome::SetWebAccess(request));
+                }
+                // Refused here rather than in `webaccess::plan`, which
+                // never sees the empty list: with nothing scanned there is
+                // no site to name, and the honest answer is to say so and
+                // leave the form open.
+                let Some(site) = self.sites.get(*site).cloned() else {
+                    *error = Some("No sites scanned yet — press s, then r.".to_string());
+                    return Ok(KeyOutcome::Consumed);
+                };
+                let request = crate::webaccess::Request::Path {
+                    site,
+                    prefix: prefix.clone(),
+                };
+                self.popup = None;
+                Ok(KeyOutcome::SetWebAccess(request))
             }
             _ => Ok(KeyOutcome::Consumed),
         }
@@ -2260,6 +2483,253 @@ mod tests {
         assert_eq!(outcome, KeyOutcome::Consumed);
         assert!(dashboard.popup.is_none());
         assert_eq!(db.get_geo_mode().unwrap(), GeoMode::Blocklist);
+    }
+
+    /// The popup is sized from its own content, and the thing that goes
+    /// first when it is not is the key hint on the last line — which is
+    /// how the render popup once shipped with "Esc cancel" cut in half.
+    #[test]
+    fn the_web_access_popup_draws_its_whole_key_hint_in_both_modes() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_site("example.com", "/etc/nginx/sites-enabled/example")
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+
+        for keys in [vec!['w'], vec!['w', 'x']] {
+            dashboard.popup = None;
+            for key in keys {
+                let code = if key == 'w' {
+                    KeyCode::Char('w')
+                } else {
+                    KeyCode::Down
+                };
+                dashboard
+                    .handle_key(KeyEvent::from(code), &db, &mut message)
+                    .unwrap();
+            }
+
+            let mut terminal = test_terminal();
+            terminal
+                .draw(|frame| {
+                    dashboard.render(
+                        frame,
+                        frame.area(),
+                        Theme::Dark,
+                        &None,
+                        &std::collections::HashSet::new(),
+                    )
+                })
+                .unwrap();
+            let content = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+
+            assert!(content.contains("Esc cancel"), "content was:\n{content}");
+            assert!(
+                content.contains("Reach this console from outside"),
+                "content was:\n{content}"
+            );
+        }
+    }
+
+    /// The Web Access popup in path mode hands back the site it is
+    /// pointing at, not the one the operator typed — there is nothing to
+    /// type, which is the point of picking from the scanned list.
+    #[test]
+    fn w_then_enter_asks_to_mount_the_console_on_the_selected_site() {
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_site("a.example.com", "/etc/nginx/sites-enabled/a")
+            .unwrap();
+        db.upsert_site("b.example.com", "/etc/nginx/sites-enabled/b")
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('w')), &db, &mut message)
+            .unwrap();
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Right), &db, &mut message)
+            .unwrap();
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            KeyOutcome::SetWebAccess(crate::webaccess::Request::Path {
+                site: "b.example.com".to_string(),
+                prefix: crate::webaccess::DEFAULT_PREFIX.to_string(),
+            })
+        );
+        assert!(dashboard.popup.is_none());
+    }
+
+    /// Switching modes must not throw away what was typed in the other
+    /// one, which is why the popup keeps two fields rather than one.
+    #[test]
+    fn the_web_access_popup_keeps_both_fields_across_a_mode_switch() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('w')), &db, &mut message)
+            .unwrap();
+        // Clear the default prefix and type another.
+        for _ in 0..crate::webaccess::DEFAULT_PREFIX.len() {
+            dashboard
+                .handle_key(KeyEvent::from(KeyCode::Backspace), &db, &mut message)
+                .unwrap();
+        }
+        for c in "/admin/".chars() {
+            dashboard
+                .handle_key(KeyEvent::from(KeyCode::Char(c)), &db, &mut message)
+                .unwrap();
+        }
+        // Down to subdomain mode, type a host, back up again.
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        for c in "console.example.com".chars() {
+            dashboard
+                .handle_key(KeyEvent::from(KeyCode::Char(c)), &db, &mut message)
+                .unwrap();
+        }
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Up), &db, &mut message)
+            .unwrap();
+
+        match dashboard.popup.as_ref().unwrap() {
+            Popup::WebAccess {
+                subdomain,
+                prefix,
+                host,
+                ..
+            } => {
+                assert!(!subdomain);
+                assert_eq!(prefix, "/admin/");
+                assert_eq!(host, "console.example.com");
+            }
+            other => panic!("the popup changed: {other:?}"),
+        }
+    }
+
+    /// With nothing scanned there is no site to name, and the form says so
+    /// rather than sending `App` a request that cannot be planned.
+    #[test]
+    fn the_web_access_popup_refuses_path_mode_with_no_scanned_sites() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('w')), &db, &mut message)
+            .unwrap();
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        match dashboard.popup.as_ref().unwrap() {
+            Popup::WebAccess { error, .. } => {
+                assert!(error.as_deref().unwrap_or_default().contains("No sites"))
+            }
+            other => panic!("the popup changed: {other:?}"),
+        }
+    }
+
+    /// Subdomain mode is the other half: one typed host, no site list.
+    #[test]
+    fn the_web_access_popup_asks_for_a_subdomain_when_that_mode_is_picked() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('w')), &db, &mut message)
+            .unwrap();
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
+            .unwrap();
+        for c in "console.example.com".chars() {
+            dashboard
+                .handle_key(KeyEvent::from(KeyCode::Char(c)), &db, &mut message)
+                .unwrap();
+        }
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            KeyOutcome::SetWebAccess(crate::webaccess::Request::Subdomain {
+                host: "console.example.com".to_string(),
+            })
+        );
+    }
+
+    /// The two host-wide actions the console has as buttons. They hand
+    /// off to `App` rather than acting here, for the same reason every
+    /// other network- or process-touching key does: this handler stays
+    /// free of I/O.
+    #[test]
+    fn u_and_a_hand_the_host_wide_actions_to_app() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+
+        assert_eq!(
+            dashboard
+                .handle_key(KeyEvent::from(KeyCode::Char('u')), &db, &mut message)
+                .unwrap(),
+            KeyOutcome::UpdateEverything
+        );
+        assert_eq!(
+            dashboard
+                .handle_key(KeyEvent::from(KeyCode::Char('a')), &db, &mut message)
+                .unwrap(),
+            KeyOutcome::ApplyEverything
+        );
+        assert!(
+            dashboard.popup.is_none(),
+            "neither is behind a popup, the same as the console's buttons"
+        );
+    }
+
+    /// A popup owns every key while it is open — `a` is a letter someone
+    /// types into the country field, not an apply of the whole host.
+    #[test]
+    fn a_popup_swallows_the_host_wide_action_keys() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.popup = Some(Popup::AddCountry {
+            input: String::new(),
+            error: None,
+        });
+
+        let mut message = None;
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('a')), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        match dashboard.popup.as_ref().unwrap() {
+            Popup::AddCountry { input, .. } => assert_eq!(input, "a"),
+            other => panic!("the popup changed: {other:?}"),
+        }
     }
 
     #[test]

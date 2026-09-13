@@ -77,7 +77,7 @@ use crate::cron::CronJob;
 use crate::db::Db;
 use crate::firewall::{self, FirewallBackend, LockoutStatus};
 use crate::protection::Detector;
-use crate::{accessstats, botlist, ipranges, nginx};
+use crate::{accessstats, nginx, refresh};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -195,62 +195,39 @@ fn scan_sites(db: &Db, root: &Path) -> Result<String> {
 /// Refreshes every list the blocking policy is built from. See the module
 /// doc comment for why reputation feeds and countries are filtered and the
 /// other two aren't.
+/// Every downloadable list, through the shared plan in `refresh`.
+///
+/// This used to enumerate the four kinds of source itself, which is how
+/// the web console ended up unable to offer the same button: the loop held
+/// `&Db` across every `.await`, and `Db` is not `Sync`. `refresh::plan`
+/// now decides *what* to update and both front-ends drive the fetching in
+/// whatever order their runtime allows.
 async fn update_lists(db: &Db) -> Vec<Step> {
-    let mut steps = Vec::new();
+    let plan = match refresh::plan(db) {
+        Ok(plan) => plan,
+        Err(err) => return vec![Step::new("update lists", Err(err))],
+    };
 
-    for kind in botlist::SourceKind::ALL {
-        let outcome = botlist::update(db, kind)
-            .await
-            .map(|count| format!("{count} bot(s)"));
-        steps.push(Step::new(format!("bot list {}", kind.id()), outcome));
+    let mut outcomes = Vec::new();
+    for source in plan {
+        let outcome = match refresh::fetch(&source).await {
+            Ok(raw) => refresh::store(db, &source, &raw),
+            Err(err) => Err(err),
+        };
+        outcomes.push((source, outcome.map_err(|err| format!("{err:#}"))));
     }
 
-    let mut ip_ranges_ok = true;
-    for kind in ipranges::IpRangeSourceKind::ALL {
-        let outcome = ipranges::update(db, kind)
-            .await
-            .map(|count| format!("{count} range(s)"));
-        ip_ranges_ok &= outcome.is_ok();
-        steps.push(Step::new(format!("crawler ranges {}", kind.id()), outcome));
-    }
-    // The internal cron treats all three as one job, so it is only "done"
-    // when all three worked — otherwise the TUI would skip re-fetching the
-    // one that failed until tomorrow.
-    if ip_ranges_ok {
-        record(db, CronJob::UpdateIpRanges, "updated by batch run");
+    if refresh::crawler_ranges_all_succeeded(&outcomes) {
+        crate::cron::record_run(db, CronJob::UpdateIpRanges, "updated by batch run");
     }
 
-    match db.list_reputation_sources() {
-        Ok(sources) => {
-            for source in sources.iter().filter(|s| s.enabled) {
-                let outcome = update_reputation(db, &source.id)
-                    .await
-                    .map(|count| format!("{count} range(s)"));
-                steps.push(Step::new(format!("feed {}", source.id), outcome));
-            }
-        }
-        Err(err) => steps.push(Step::new("feeds", Err(err))),
-    }
-
-    match db.list_selected_countries() {
-        Ok(countries) => {
-            for country in countries {
-                let outcome = ipranges::update_country(db, &country)
-                    .await
-                    .map(|count| format!("{count} range(s)"));
-                steps.push(Step::new(format!("country {country}"), outcome));
-            }
-        }
-        Err(err) => steps.push(Step::new("countries", Err(err))),
-    }
-
-    steps
-}
-
-async fn update_reputation(db: &Db, source_id: &str) -> Result<usize> {
-    let kind = ipranges::reputation::ReputationSourceKind::from_id(source_id)
-        .with_context(|| format!("unknown reputation source: {source_id}"))?;
-    ipranges::reputation::update(db, kind).await
+    outcomes
+        .into_iter()
+        .map(|(source, outcome)| Step {
+            name: source.label(),
+            outcome,
+        })
+        .collect()
 }
 
 /// Tallies the access log and runs every switched-on detector.
@@ -294,14 +271,14 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
         None => Ok("skipped: no NGINX access log".to_string()),
     };
     if stats.is_ok() {
-        record(db, CronJob::RecordAccessStats, "recorded by batch run");
+        crate::cron::record_run(db, CronJob::RecordAccessStats, "recorded by batch run");
     }
     steps.push(Step::new("access stats", stats));
 
     for detector in Detector::ALL {
         let outcome = run_one_detector(db, detector, &access_log, &ssh_log);
         if let Ok(summary) = &outcome {
-            record(db, CronJob::Detect(detector), summary);
+            crate::cron::record_run(db, CronJob::Detect(detector), summary);
         }
         steps.push(Step::new(detector.spec().label, outcome));
     }
@@ -384,7 +361,7 @@ fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
     })();
     let step = Step::new("firewall", outcome);
     if step.outcome.is_ok() {
-        record(db, CronJob::RenderFirewall, "rendered by batch run");
+        crate::cron::record_run(db, CronJob::RenderFirewall, "rendered by batch run");
     }
     step
 }
@@ -425,16 +402,4 @@ fn lockout_verdict(rules: &[crate::db::FirewallRule], options: &BatchOptions) ->
         }
         _ => Ok(()),
     }
-}
-
-/// Stamps a job as having run, under the same key the TUI's internal cron
-/// uses. A failure to record is deliberately ignored: it would be an odd
-/// thing to fail a whole batch run over, and the work itself already
-/// happened.
-fn record(db: &Db, job: CronJob, summary: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default();
-    let _ = db.set_cron_last_run(job.id(), now, summary);
 }

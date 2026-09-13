@@ -25,18 +25,22 @@ pub mod cron;
 pub mod db;
 pub mod dynamic;
 pub mod event;
+pub mod fetch;
 pub mod firewall;
 #[cfg(test)]
 mod golden;
 pub mod install;
+pub mod ipdetail;
 pub mod ipranges;
 pub mod iptables;
 pub mod nftables;
 pub mod nginx;
 pub mod protection;
+pub mod refresh;
 pub mod scanblock;
 pub mod sshlog;
 #[cfg(test)]
 mod testing;
 pub mod tui;
 pub mod web;
+pub mod webaccess;

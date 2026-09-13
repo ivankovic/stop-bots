@@ -81,7 +81,10 @@ everything that ends up in **NGINX config**. That split decides where any given 
   to any job currently running in the background). `Up`/`Down` flow between the three lists;
   `m` switches geo mode. Press `f` to render the current firewall rules to a script — the
   popup also has an "apply after writing" toggle (Space) for actually enforcing it
-  immediately, instead of applying it by hand afterward.
+  immediately, instead of applying it by hand afterward. Three more keys act on the whole
+  host: `u` downloads every list, `a` applies both planes (NGINX, then the firewall), and
+  `w` puts this console behind NGINX — the same three the browser has as buttons and a
+  panel.
 - **Bot settings**: lists every known bot-list source (with an action to refresh it) and every
   individual bot, searchable by name, with a per-bot override (Allowed / Blocked / follow the
   category default).
@@ -98,6 +101,12 @@ everything that ends up in **NGINX config**. That split decides where any given 
   `NOT BLOCKED`/`BLOCKED` (shown in red). `Tab`/`Shift+Tab` switch which of the two panels
   `Up`/`Down` apply to; `f` cycles a shared filter (all / not blocked only / blocked only);
   `Enter` blocks the selected `NOT BLOCKED` row, or unblocks it if it's already `BLOCKED`.
+  `i` inspects the selected address: which of the reputation feeds list it, whether it is
+  inside a published crawler range (which is what separates a real Googlebot from a user
+  agent that merely says so), which country it belongs to, and which accounts it tried to
+  log in as. All of it from lists this host has already downloaded — there is no reverse
+  DNS or whois lookup here, because a PTR record is written by whoever holds the address
+  and would be attacker-supplied text that reads as authoritative.
 - **Help**: the full key-binding reference.
 
 Bot settings, where every list source and every individual bot lives:
@@ -245,11 +254,13 @@ exempt verified search-engine crawlers, which would otherwise match every one of
 
 Every firewall decision above is *generated*, never applied automatically: `render-firewall`
 (or the Dashboard's `f` key) writes an iptables or nftables script for you to review and apply
-yourself, and refuses to write one that would lock out a currently-connected SSH session. The
-Dashboard's render popup can also apply it for you immediately, but only when you explicitly
-ask it to (the "apply after writing" toggle) — never as a side effect of anything automatic
-like the internal cron. The one way to have it applied unattended is `batch --apply`, which
-you have to put in a crontab yourself; see [Unattended, from cron](#unattended-from-cron).
+yourself, and refuses to write one that would lock out a currently-connected SSH session.
+
+Three things can apply it for you, and all three need you to ask: the TUI's render popup
+("apply after writing") or its `a` key, the web console's firewall panel ("run it after
+writing") or its "Apply everything" button, and `batch --apply` from a crontab you wrote — see
+[Unattended, from cron](#unattended-from-cron). None of them is a side effect of anything
+automatic: the internal cron renders the script and never runs it.
 
 The same applies on the NGINX side: changing a setting only changes what *would* be written.
 Site settings shows each site as `STALE` until you apply.
@@ -325,6 +336,20 @@ ssh -L 8787:127.0.0.1:8787 your-server
 
 then open <http://127.0.0.1:8787/>.
 
+Three host-wide actions live on the Dashboard, in the browser as buttons and in the TUI
+as single keys:
+
+- **Update everything** (`u`) downloads every bot list, every crawler IP range, every
+  *enabled* reputation feed and every *selected* country — the same set `stop-bots batch`
+  fetches, from the same plan. One source failing does not stop the rest, and nothing is
+  enforced until something applies it.
+- **Apply everything** (`a`) writes and reloads the NGINX config, then writes and runs the
+  firewall script. The two planes are independent: whichever fails, the other still gets
+  its turn, because a half-applied host beats one where an NGINX syntax error also left
+  the firewall stale.
+- **Web Access** (`w`) sets NGINX up to serve the console itself — see
+  [Behind NGINX](#behind-nginx-a-subdomain-or-a-path-prefix).
+
 ## As a service (Debian)
 
 ```
@@ -388,6 +413,21 @@ per-client.
 
 ## Behind NGINX: a subdomain, or a path prefix
 
+**The console can set this up for you**, and so can the TUI (`w` on the Dashboard). Both
+write the NGINX config, record the path prefix and add the host name to the allowlist — the
+three things that have to agree, because a missing prefix makes every link leave the
+`location` block and a missing host name makes every request a 403. Both validate with
+`nginx -t` before the config can take effect, roll it back if that fails, and record the
+new address only once it validated.
+
+Two modes, and *path* is the default for a reason: it adds a `location` block to a site you
+already have, so the console inherits that site's certificate. A subdomain needs its own,
+and until `certbot --nginx -d <host>` has run, this console's password form and session
+cookie cross the network in the clear.
+
+The rest of this section is the same thing by hand, which is worth reading once even if you
+use the panel — the trailing-slash trap below is the mistake it exists to prevent.
+
 **A subdomain is the simpler deployment**, and the one to take if you can:
 
 ```nginx
@@ -433,17 +473,23 @@ half-works.
 
 ## What it will not do
 
-Three things are missing on purpose, and the Help screen says so with the reasons:
+Two things are missing on purpose, and the Help screen says so with the reasons:
 
-- **It writes the firewall script but never runs it.** A written script is inert; running
-  it is the one operation that can take the host off the network, and that is not going
-  behind a button in a browser.
 - **It will not unblock something a downloaded list blocked** — the next refresh of that
   list would silently undo it.
 - **It will not change its own password.** Use `stop-bots web --set-password` on the host.
 
 It also refuses to block the address you are connected from, which would take away the
 console you'd use to undo it.
+
+**It used to be three.** Applying the firewall script was the third, on the grounds that
+running it is the one operation that can take the host off the network. That is now
+available — "Apply everything" on the Dashboard (`a` in the TUI), or the "run it after
+writing" box in the firewall panel — because the guard that makes it safe from cron makes it safe from a
+button: the rules are checked against the clients currently logged in over SSH, in the
+order the script itself will evaluate them, and a rule that would block one of them is a
+refusal rather than a warning. Start the console with `--no-apply` to get the old
+write-only behaviour back.
 
 Login attempts are throttled. Not because the password is guessable — it is generated,
 144 bits — but because verifying one runs Argon2id, and letting an unauthenticated caller

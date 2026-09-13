@@ -14,18 +14,37 @@ list — which meant the open items below were unfindable inside it.
   screen at a time. The footer already renders global state (the in-flight job
   spinner), which makes it the obvious home for the message too — one fix rather
   than an alert popup per screen.
-* **Time the tarpit.** `set $limit_rate 1;` throttles the response body and a
-  default error page is a few hundred bytes, so a tarpitted client should wait
-  minutes — but how much NGINX writes before the throttle engages on a body that
-  small has never been measured. Cheap now: one test in `tests/container.rs`
-  timing `curl` against a tarpitted request.
 * **`ua_matches_blocked_bot_patterns`** (`dynamic.rs`) does case-insensitive
   *substring* matching over `|`-split alternatives, while NGINX enforces a real
   `~*` regex. The `BLOCKLIST` tag can therefore disagree with what actually gets
   blocked — and since the web UI arrived it says so on two screens rather than
   one, because both front-ends now read this from `crate::dynamic`.
+* **A username containing `" from "` hides the whole line** (`sshlog.rs`).
+  `ip_after` takes the *first* `" from "` after its marker, but sshd writes the
+  address last — so `Failed password for invalid user x from y from 1.2.3.4 port
+  22 ssh2` parses the username fragment as the address, fails, and the line is
+  dropped from every count in that module, `scanning_ips` included. A client that
+  names itself that way is invisible to SSH scan detection. Taking the *last*
+  `" from "` before `" port "` would close it, but it changes which lines
+  `scanning_ips` counts, so it wants its own change with its own test.
+  **This is attacker-selectable, not just a parse quirk**: the username is chosen
+  by whoever is connecting, so a scanner that offers `x from y` as its username
+  hides itself from detection for the cost of one string. Pinned as
+  current behaviour by `a_username_containing_from_defeats_the_whole_line`.
 * **Recommend only the backend that is installed.** Nothing checks whether
   `nft` or `iptables` exists before offering both.
+* **"Update everything" and the internal cron can fetch the same feeds at
+  once.** `Job::UpdateEverything` and `Job::Cron(UpdateIpRanges)` are separate
+  entries in `jobs_in_flight`, and `check_cron` keeps ticking while `u` runs —
+  the `record_run` that would mark the job done only lands at the end. Nothing
+  corrupts (every store replaces), but it is duplicate traffic to three third
+  parties and two background jobs competing for one message line. Same in the
+  console, whose `/update-all` has no interlock with its own cron either.
+* **A changed path prefix needs a restart.** `BasePath` is read once when the
+  router is built, so after Web Access mounts the console under `/stop-bots/`
+  — from either front-end — the running console keeps generating links without
+  it until it is restarted. Both say so in the message; neither can do
+  anything about it without rebuilding the router in place.
 * **No CLI verb for the web UI's own settings.** `web:secure_cookie` and
   `web:trust_forwarded_for` have to be set by hand, unlike `web:bind` and
   `web:allowed_hosts`, which `stop-bots web --save` writes. A
@@ -44,6 +63,11 @@ eventually ask for, with the reason it isn't there.
 * **TUI screens that don't exist**: firewall rules (CLI-only), and crawler
   IP-range sources (Googlebot/Bingbot/GPTBot — also CLI-only, unlike country
   ranges, which do have a Dashboard panel).
+* **No `--firewall-out` for the TUI.** `App::firewall_out` exists so a test can
+  point the `a` key's write somewhere harmless, but nothing on the command line
+  sets it; the render popup takes a path from the operator instead, and `a`
+  uses whatever the stored backend implies. `stop-bots web` does have the flag,
+  because its console has no field to type one into.
 * **No way to refresh an already-fetched country from the TUI.** Re-adding a
   code that is already fetched reuses the cached ranges. The CLI's
   `update-country-ranges` does force a re-fetch.

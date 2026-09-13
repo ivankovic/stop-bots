@@ -16,6 +16,7 @@ help:
 	@echo 'hooks             install the pre-commit hook (fmt + clippy)'
 	@echo 'screenshots       regenerate docs/screenshots/ from seeded fiction'
 	@echo 'build             release binary, after unit-test'
+	@echo 'deploy            build, then install it on $$DEPLOY_HOST and restart the service'
 	@echo
 	@echo 'test runner: $(RUNNER)'
 
@@ -57,5 +58,46 @@ screenshots:
 build: unit-test
 	cargo build --release
 
+# Where the deployed binary has to land, and why it is not the login
+# directory.
+#
+# `install web` writes a unit whose ExecStart names an absolute path, and
+# that unit sets ProtectHome=yes — so a binary under /root or /home is
+# invisible to the service even when it is plainly there. scp'ing to the
+# login directory therefore deploys a file nothing runs, silently: the
+# console keeps serving, from the previous binary, and the only symptom is
+# that the change you just shipped is not in it.
+DEPLOY_HOST ?= www
+DEPLOY_PATH ?= /usr/local/bin/stop-bots
+DEPLOY_UNIT ?= stop-bots-web.service
+
+# Staged next to the target and moved into place rather than written over
+# it: replacing a running executable in place fails with ETXTBSY, and a
+# rename swaps the directory entry while the running process keeps the old
+# inode until it restarts.
+#
+# `try-restart` rather than `restart` so this is still correct on a host
+# where the console is run by hand instead of by systemd — it restarts the
+# unit if it is running and does nothing if it is not. Guarded by
+# `systemctl cat` so a host with no unit at all says so instead of failing.
+#
+# It prints the unit's ExecStart and the deployed file's timestamp, because
+# `--version` cannot tell two builds of the same 0.0.x apart: the way this
+# fails is that everything succeeds and the console keeps serving the old
+# code, and the only two facts that distinguish that are *where* the unit
+# looks and *when* the file landed.
 deploy: build
-	scp ./target/release/stop-bots www:
+	scp ./target/release/stop-bots '$(DEPLOY_HOST):$(DEPLOY_PATH).new'
+	ssh '$(DEPLOY_HOST)' 'set -e; \
+		chmod 755 $(DEPLOY_PATH).new; \
+		mv $(DEPLOY_PATH).new $(DEPLOY_PATH); \
+		if systemctl cat $(DEPLOY_UNIT) >/dev/null 2>&1; then \
+			systemctl try-restart $(DEPLOY_UNIT); \
+			printf "unit runs: "; \
+			systemctl show $(DEPLOY_UNIT) -p ExecStart --value | \
+				sed -n "s/.*argv\\[\\]=\\([^ ]*\\).*/\\1/p"; \
+		else \
+			echo "no $(DEPLOY_UNIT) on this host — nothing restarted"; \
+		fi; \
+		printf "deployed:  "; ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ $(DEPLOY_PATH) | \
+			awk "{print \$$6, \$$7}"'

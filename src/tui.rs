@@ -165,6 +165,11 @@ pub enum KeyOutcome {
     Back,
     /// Not relevant to this screen; let the caller handle it.
     Ignored,
+    /// The Dynamic Protection screen wants the detail for one address.
+    /// `App` assembles it, because the failed-login usernames come from
+    /// the SSH log text `App` read in the background and the screen does
+    /// not keep a copy — see `ipdetail` for what goes into the answer.
+    InspectAddress(String),
     /// The Bot settings screen confirmed updating a bot-list source,
     /// identified by its stable id (e.g. `"well-known-bots"`, not its
     /// display name) so `App` can resolve which `botlist::SourceKind` to
@@ -214,6 +219,21 @@ pub enum KeyOutcome {
     /// `App` performs them, off the event loop, rather than the screen's
     /// key handler doing it inline.
     SiteAction(crate::tui::site_settings::SiteAction),
+    /// The Dashboard's `u` key: download every list this host uses. Eight
+    /// or more network round-trips, so it goes to `App` for exactly the
+    /// reason [`Self::UpdateSource`] does — the screen's key handler stays
+    /// free of I/O, and its tests stay fast and offline.
+    UpdateEverything,
+    /// The Dashboard's `a` key: write and reload the NGINX config, then
+    /// write and run the firewall script. Both halves shell out, so — same
+    /// reasoning as [`Self::ReloadNginx`] and [`Self::RenderFirewall`] —
+    /// `App` performs them.
+    ApplyEverything,
+    /// The Dashboard's Web Access popup was confirmed. `App` validates it
+    /// against the database, rewrites the NGINX config and reloads — all
+    /// three are things the screen's key handler must not do, same as
+    /// [`Self::SiteAction`].
+    SetWebAccess(crate::webaccess::Request),
 }
 
 /// Braille "dots" spinner frames, in rotation order.

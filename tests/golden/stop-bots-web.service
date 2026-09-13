@@ -39,10 +39,16 @@ RestrictRealtime=yes
 RestrictNamespaces=yes
 SystemCallArchitectures=native
 # AF_UNIX for the dbus socket `systemctl reload nginx` talks over,
-# AF_INET/AF_INET6 for the console itself and the crawler-range
-# downloads. Nothing here uses a raw or netlink socket: this service
-# writes the firewall script, it never applies it.
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# AF_INET/AF_INET6 for the console itself and the list downloads,
+# and AF_NETLINK because the console applies the firewall script:
+# both `nft` and Debian's nft-backed `iptables` talk to the kernel
+# over netlink. Without it the apply fails with
+# "Unable to initialize Netlink socket: Address family not
+# supported by protocol", which names neither this file nor the
+# reason. This line said the opposite until applying arrived; a
+# comment asserting what a service does not need is a comment that
+# goes stale the moment it starts needing it.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # The database holds the console's password hash.
 UMask=0077
 

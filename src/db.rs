@@ -482,7 +482,19 @@ pub struct IpRangeSource {
 /// would slip past this check and fail at *apply* time instead, and on
 /// iptables (whose generated script runs under `set -e`) that means the
 /// script aborts partway through, having applied only some of its rules.
-fn is_valid_address(address: &str) -> bool {
+///
+/// This is a security boundary, not a tidiness check. Every address stored
+/// here is interpolated verbatim into a generated firewall script, and that
+/// script is executable input: `sh` for iptables, `nft -f` for nftables. An
+/// unvalidated `1.2.3.4/24; touch /tmp/pwned` from a downloaded feed renders
+/// as `iptables -A STOP-BOTS -s 1.2.3.4/24; touch /tmp/pwned -j DROP`, which
+/// `firewall::apply_script` then runs as root. So every write path into an
+/// address column goes through this — admin-entered rules *and* the
+/// downloaded ranges in `ip_ranges`/`country_ip_ranges`, which used to be
+/// trusted on the grounds that their upstreams are reputable. Reputable is
+/// not the same as uncompromised, and `SECURITY.md` puts a hostile upstream
+/// list explicitly in scope.
+pub fn is_valid_address(address: &str) -> bool {
     use std::net::IpAddr;
 
     let address = address.trim();
@@ -505,6 +517,43 @@ fn is_valid_address(address: &str) -> bool {
     }
 }
 
+/// The entries of `addresses` that may be stored and later rendered into a
+/// firewall script: valid (see [`is_valid_address`]) and trimmed.
+///
+/// Dropping rather than erroring, unlike the admin-entry paths. These lists
+/// are fetched unattended from six different upstreams in four different
+/// formats, and one bad line in a 29,000-line zone file should cost that
+/// line, not the country. Rejecting the whole fetch would also be the more
+/// dangerous failure: it leaves the *previous* ranges in place while
+/// reporting an error nobody is awake to read.
+fn usable_addresses(addresses: &[String]) -> impl Iterator<Item = &str> {
+    addresses
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| is_valid_address(a))
+}
+
+/// Refuses a fetch in which *nothing* was usable.
+///
+/// Dropping bad lines is right for a bad line; it is wrong for a feed that
+/// changed format, moved, or started serving an HTML error page — and the
+/// two look identical one line at a time. Every `replace_*_ranges` deletes
+/// before it inserts, so without this a format change quietly replaces a
+/// working list with an empty one and reports "0 stored" to a cron log
+/// nobody reads. Called inside the transaction, so the delete rolls back
+/// and the previous ranges survive to be used for another day.
+fn reject_a_wholly_unusable_fetch(source: &str, addresses: &[String]) -> Result<()> {
+    if !addresses.is_empty() && usable_addresses(addresses).next().is_none() {
+        anyhow::bail!(
+            "{source}: none of the {} entries fetched is an IP address or CIDR range — \
+             keeping the ranges already stored, since a whole list of bad entries is a \
+             changed or broken feed rather than a bad line",
+            addresses.len()
+        );
+    }
+    Ok(())
+}
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -517,9 +566,28 @@ pub struct Db {
     conn: Connection,
 }
 
+/// How long to wait for another process to let go of the database before
+/// giving up.
+///
+/// SQLite's default is zero: a second writer does not wait, it fails
+/// immediately with `SQLITE_BUSY` ("database is locked"). More than one
+/// process wants this file in ordinary use — the console and the TUI, a
+/// `stop-bots batch` from crontab while the console is up, and the
+/// installer and the service it has just started — and every one of those
+/// collisions is short, because the long-running holder is the console,
+/// which only takes the lock for the length of one query.
+///
+/// Five seconds is chosen to be far longer than any transaction this
+/// project runs (the slowest is a feed's worth of ranges in one
+/// transaction) and short enough that a genuine deadlock still surfaces as
+/// an error rather than a hang.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Db {
     /// Opens (creating if necessary) the database at `path`, creating parent
     /// directories as needed, and ensures the schema is up to date.
+    ///
+    /// Sets [`BUSY_TIMEOUT`], which SQLite does not do for you.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -530,6 +598,8 @@ impl Db {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database: {}", path.display()))?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .context("failed to set the database busy timeout")?;
         let db = Db { conn };
         db.init_schema()?;
         Ok(db)
@@ -1756,6 +1826,10 @@ impl Db {
         if !is_valid_address(address) {
             anyhow::bail!("invalid firewall rule address: {address}");
         }
+        // Stored trimmed, because validated trimmed: `is_valid_address`
+        // parses `address.trim()`, so a trailing newline passes the check
+        // and would otherwise be written into the middle of a rule line.
+        let address = address.trim();
         self.prune_expired_firewall_rules()?;
         let changed = self.conn.execute(
             "UPDATE firewall_rules SET action = 'block', expires_at = NULL, enabled = 1
@@ -1776,16 +1850,12 @@ impl Db {
         if !is_valid_address(&rule.address) {
             anyhow::bail!("invalid firewall rule address: {}", rule.address);
         }
+        // Trimmed for the same reason as `block_address_permanently`.
+        let address = rule.address.trim();
         self.conn.execute(
             "INSERT INTO firewall_rules (address, port, action, enabled, created_at, expires_at)
              VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-            params![
-                rule.address,
-                rule.port,
-                rule.action.as_str(),
-                now(),
-                expires_at
-            ],
+            params![address, rule.port, rule.action.as_str(), now(), expires_at],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1933,11 +2003,12 @@ impl Db {
     /// upstream list on a later fetch doesn't linger here forever.
     pub fn replace_ip_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
         self.batch(|| {
+            reject_a_wholly_unusable_fetch(source_id, cidrs)?;
             self.conn.execute(
                 "DELETE FROM ip_ranges WHERE source_id = ?1",
                 params![source_id],
             )?;
-            for cidr in cidrs {
+            for cidr in usable_addresses(cidrs) {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO ip_ranges (source_id, cidr) VALUES (?1, ?2)",
                     params![source_id, cidr],
@@ -1991,6 +2062,62 @@ impl Db {
         Ok(addrs)
     }
 
+    /// Every crawler CIDR alongside the name of the source that published
+    /// it — `[("Googlebot IP ranges", "66.249.64.0/19"), ...]`.
+    ///
+    /// [`Self::blocked_ip_ranges`] answers "is this address blocked" and
+    /// flattens the attribution away to do it. The per-address detail view
+    /// needs the opposite: not whether to block, but *which* list vouches
+    /// for an address, so "claims to be Googlebot and is inside Google's
+    /// ranges" can be told from "claims it and is not". One query rather
+    /// than a `list_ip_range_sources` loop — three round trips to answer
+    /// one question is three chances for the answer to be assembled from
+    /// two different reads.
+    pub fn ip_ranges_by_source_name(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.name, r.cidr FROM ip_ranges r
+             JOIN ip_range_sources s ON s.id = r.source_id
+             ORDER BY s.name, r.cidr",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list crawler ranges by source")
+    }
+
+    /// The same for the reputation feeds, restricted to *enabled* sources.
+    ///
+    /// Disabled ones are excluded for the reason
+    /// [`Self::enabled_reputation_ranges`] excludes them: a source switched
+    /// off keeps its rows so re-enabling needs no refetch, and reporting
+    /// "this address is a Tor exit" from a feed the admin turned off would
+    /// describe a list that is not in effect.
+    pub fn enabled_reputation_ranges_by_source_name(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.name, r.cidr FROM reputation_ranges r
+             JOIN reputation_sources s ON s.id = r.source_id
+             WHERE s.enabled != 0
+             ORDER BY s.name, r.cidr",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list reputation ranges by source")
+    }
+
+    /// Every fetched country's CIDRs, keyed by country code.
+    ///
+    /// Only countries whose zone file has actually been fetched are in
+    /// this table, so an address outside all of them is "not in a country
+    /// this host has data for" — not "stateless". The detail view has to
+    /// say which, or it reports absence of evidence as evidence.
+    pub fn country_ranges_by_code(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT country_code, cidr FROM country_ip_ranges ORDER BY country_code, cidr",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list country ranges by code")
+    }
+
     // ---- country IP ranges and host-wide geo blocking ----
 
     /// Replaces every CIDR known for `country_code` with `cidrs`, stamping
@@ -2000,11 +2127,12 @@ impl Db {
     pub fn replace_country_ranges(&self, country_code: &str, cidrs: &[String]) -> Result<usize> {
         let fetched_at = now();
         self.batch(|| {
+            reject_a_wholly_unusable_fetch(country_code, cidrs)?;
             self.conn.execute(
                 "DELETE FROM country_ip_ranges WHERE country_code = ?1",
                 params![country_code],
             )?;
-            for cidr in cidrs {
+            for cidr in usable_addresses(cidrs) {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO country_ip_ranges (country_code, cidr, fetched_at)
                      VALUES (?1, ?2, ?3)",
@@ -2013,7 +2141,15 @@ impl Db {
             }
             Ok(())
         })?;
-        Ok(cidrs.len())
+        // The stored count, not `cidrs.len()`: entries this rejected never
+        // reached the table, and reporting the raw input length would tell
+        // an admin a zone file was stored that largely wasn't.
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM country_ip_ranges WHERE country_code = ?1",
+            params![country_code],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     /// Every country code with at least one fetched CIDR, alongside how many
@@ -2191,11 +2327,12 @@ impl Db {
     /// later fetch stops being blocked, rather than accumulating forever.
     pub fn replace_reputation_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
         self.batch(|| {
+            reject_a_wholly_unusable_fetch(source_id, cidrs)?;
             self.conn.execute(
                 "DELETE FROM reputation_ranges WHERE source_id = ?1",
                 params![source_id],
             )?;
-            for cidr in cidrs {
+            for cidr in usable_addresses(cidrs) {
                 self.conn.execute(
                     "INSERT OR IGNORE INTO reputation_ranges (source_id, cidr) VALUES (?1, ?2)",
                     params![source_id, cidr],
@@ -2357,6 +2494,43 @@ pub(crate) fn escape_for_nginx_regex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two processes want this database in ordinary use: the console and
+    /// the TUI, a `stop-bots batch` from crontab while the console is up,
+    /// and — the one that actually broke — `install web` and the service
+    /// it has just started.
+    ///
+    /// SQLite's default is to not wait at all: the second writer fails
+    /// instantly with "database is locked". This asserts the connection
+    /// really carries a timeout, which is what deleting the line from
+    /// `open` would take away.
+    ///
+    /// Deliberately a property check rather than two threads racing for a
+    /// lock. The behavioural version worked, but SQLite's busy handler
+    /// backs off in increasing sleeps, so it took anywhere up to two
+    /// seconds to notice a lock had been released — an unpredictable
+    /// several-second test under a 300ms budget. What it was really
+    /// proving is proved instead by `install_web_writes_a_unit_that_\
+    /// systemd_actually_starts` in `tests/container.rs`, where the
+    /// installer and the service it started genuinely contend.
+    #[test]
+    fn an_opened_database_waits_for_a_lock_rather_than_giving_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("db.sqlite3")).unwrap();
+
+        let millis: i64 = db
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(
+            millis,
+            BUSY_TIMEOUT.as_millis() as i64,
+            "a connection with no busy timeout fails the instant another \
+             process holds the database"
+        );
+        assert!(millis > 0, "zero is SQLite's default: do not wait at all");
+    }
 
     /// Storing a real-sized feed must not autocommit per row.
     ///
@@ -3300,6 +3474,128 @@ mod tests {
         assert_eq!(sources[0].range_count, 1);
         assert!(sources[0].last_fetched_at.is_some());
         assert_eq!(sources[0].category, Category::Search);
+    }
+
+    /// A downloaded feed is executable input by the time it reaches a
+    /// generated script: `1.2.3.4/24; touch /tmp/pwned` renders as
+    /// `iptables -A STOP-BOTS -s 1.2.3.4/24; touch /tmp/pwned -j DROP`,
+    /// and `firewall::apply_script` runs that under `sh` as root.
+    #[test]
+    fn a_fetched_range_that_is_not_an_address_is_never_stored() {
+        let db = Db::open_in_memory().unwrap();
+        let hostile = [
+            "1.2.3.4/24; touch /tmp/pwned".to_string(),
+            "5.6.7.8".to_string(),
+            "1.2.3.4\nflush ruleset".to_string(),
+            "$(reboot)".to_string(),
+        ];
+
+        let stored = db.replace_country_ranges("xx", &hostile).unwrap();
+        assert_eq!(stored, 1, "only the one real address should be stored");
+        assert_eq!(
+            db.country_ranges("xx").unwrap(),
+            vec!["5.6.7.8".to_string()],
+        );
+
+        db.register_ip_range_source(&IpRangeSource {
+            id: "src".to_string(),
+            name: "src".to_string(),
+            url: "https://example.invalid/src.json".to_string(),
+            category: Category::Ai,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        assert_eq!(db.replace_ip_ranges("src", &hostile).unwrap(), 1);
+        assert_eq!(
+            db.ip_ranges_for_source("src").unwrap(),
+            vec!["5.6.7.8".to_string()],
+        );
+
+        db.register_reputation_source(&ReputationSource {
+            id: "rep".to_string(),
+            name: "rep".to_string(),
+            url: "https://example.invalid/rep.txt".to_string(),
+            enabled: true,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        db.set_reputation_source_enabled("rep", true).unwrap();
+        assert_eq!(db.replace_reputation_ranges("rep", &hostile).unwrap(), 1);
+        assert_eq!(
+            db.enabled_reputation_ranges().unwrap(),
+            vec!["5.6.7.8".to_string()],
+        );
+    }
+
+    /// A bad line costs that line; a list that is *entirely* bad is a feed
+    /// that changed, moved, or started serving an error page, and replacing
+    /// a working list with nothing is the worse outcome.
+    #[test]
+    fn a_fetch_with_nothing_usable_in_it_leaves_the_previous_ranges_alone() {
+        let db = Db::open_in_memory().unwrap();
+        db.replace_country_ranges("xx", &["5.6.7.8".to_string()])
+            .unwrap();
+
+        let err = db
+            .replace_country_ranges(
+                "xx",
+                &["<!DOCTYPE html>".to_string(), "<h1>404</h1>".into()],
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("none of the 2 entries"),
+            "was: {err:#}"
+        );
+        assert_eq!(
+            db.country_ranges("xx").unwrap(),
+            vec!["5.6.7.8".to_string()],
+            "the previous ranges must survive a broken fetch"
+        );
+    }
+
+    /// An upstream that legitimately has nothing to say is not a failure —
+    /// only a non-empty list with nothing usable in it is.
+    #[test]
+    fn an_empty_fetch_is_not_treated_as_a_broken_one() {
+        let db = Db::open_in_memory().unwrap();
+        db.replace_country_ranges("xx", &["5.6.7.8".to_string()])
+            .unwrap();
+
+        assert_eq!(db.replace_country_ranges("xx", &[]).unwrap(), 0);
+        assert!(db.country_ranges("xx").unwrap().is_empty());
+    }
+
+    /// `is_valid_address` parses the *trimmed* string, so storing the raw
+    /// one accepted a trailing newline into the middle of a rendered rule
+    /// line — which, under iptables' `set -e`, aborts the script partway
+    /// through and leaves the host half-configured.
+    #[test]
+    fn a_stored_address_is_trimmed_to_what_was_validated() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&NewFirewallRule {
+            address: "  9.9.9.9\n".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+        db.block_address_permanently(" 8.8.8.8 ").unwrap();
+        db.replace_country_ranges("xx", &[" 7.7.7.0/24 ".to_string()])
+            .unwrap();
+
+        let stored: Vec<String> = db
+            .list_firewall_rules()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.address)
+            .collect();
+        assert_eq!(stored, vec!["9.9.9.9".to_string(), "8.8.8.8".to_string()]);
+        assert_eq!(
+            db.country_ranges("xx").unwrap(),
+            vec!["7.7.7.0/24".to_string()],
+        );
     }
 
     #[test]

@@ -133,6 +133,26 @@ pub enum AppEvent {
     SitesApplied {
         outcome: std::sync::Arc<crate::tui::site_settings::ApplyOutcome>,
     },
+    /// One source of an "update everything" run has been downloaded (see
+    /// `App::start_update_everything`). Carries the raw body, not parsed
+    /// rows: parsing and storing both want `Db`, which isn't `Sync`, so
+    /// they happen back on the main thread in
+    /// `App::finish_update_everything_source` — which then starts the next
+    /// download. One event per source, rather than one at the end with
+    /// every payload in it, for the reason `App::update_all` documents.
+    EverythingSourceFetched {
+        source: crate::refresh::Source,
+        result: Result<String, String>,
+    },
+    /// The NGINX config change that puts this console behind a subdomain
+    /// or a path prefix has been written and validated (see
+    /// `App::start_web_access`). The plan comes back with it because
+    /// recording the new address is a `Db` write, and so waits for the
+    /// main thread.
+    WebAccessApplied {
+        plan: Box<crate::webaccess::Plan>,
+        result: Result<std::path::PathBuf, String>,
+    },
     /// A background pass over every site's config file, working out which
     /// of them still match what their settings render to (see
     /// `App::start_site_status_check`). In the site list's order.

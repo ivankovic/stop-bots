@@ -26,7 +26,7 @@
 
 use crate::botlist::slugify;
 use crate::db::NewBot;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 pub const SOURCE_ID: &str = "nginx-bad-bots";
 pub const SOURCE_NAME: &str = "Nginx Ultimate Bad Bot Blocker";
@@ -89,15 +89,7 @@ pub fn parse(text: &str) -> Result<Vec<NewBot>> {
 
 /// Downloads the raw bad-user-agents list over HTTP.
 pub async fn fetch() -> Result<String> {
-    let body = reqwest::get(SOURCE_URL)
-        .await
-        .context("failed to fetch nginx-ultimate-bad-bot-blocker list")?
-        .error_for_status()
-        .context("nginx-ultimate-bad-bot-blocker request failed")?
-        .text()
-        .await
-        .context("failed to read nginx-ultimate-bad-bot-blocker response body")?;
-    Ok(body)
+    crate::fetch::text(SOURCE_URL, "the nginx-ultimate-bad-bot-blocker list").await
 }
 
 #[cfg(test)]

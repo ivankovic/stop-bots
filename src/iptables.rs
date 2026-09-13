@@ -116,6 +116,20 @@ pub fn render(rules: &[FirewallRule]) -> String {
         out.push('\n');
     }
     for rule in enabled {
+        // Defence in depth. `Db` refuses to store an address this would
+        // reject, so reaching here means a row predating that check (or a
+        // database edited by hand). The script is executable input — `sh`
+        // for this backend — so an address that isn't one is dropped rather
+        // than interpolated. `{:?}` in the note, not `{}`: an unvalidated
+        // address can contain a newline, which would end the comment and
+        // make the remainder of it a command.
+        if !crate::db::is_valid_address(&rule.address) {
+            out.push_str(&format!(
+                "# skipped (not an IP address or CIDR range): {:?}\n",
+                rule.address
+            ));
+            continue;
+        }
         if is_ipv6(&rule.address) {
             out.push_str(&format!(
                 "# skipped (IPv6, not supported by iptables): {} — use nftables instead\n",
@@ -319,5 +333,41 @@ mod tests {
             disabled("10.0.0.1"),
         ];
         crate::golden::assert_golden("firewall.iptables.sh", &render(&rules));
+    }
+    /// The database now refuses such a row, so this can only come from a
+    /// database written before that check existed — but the script is
+    /// executable input, and the cost of checking again here is nothing.
+    #[test]
+    fn render_skips_an_address_that_is_not_one_rather_than_emitting_it() {
+        let rendered = render(&[block("1.2.3.4/24; touch /tmp/pwned")]);
+
+        let statements: Vec<&str> = rendered
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+            .collect();
+        assert!(
+            !statements.iter().any(|line| line.contains("touch")),
+            "the payload reached a statement line:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("skipped (not an IP address or CIDR range)"),
+            "rendered was:\n{rendered}"
+        );
+    }
+
+    /// A newline in the address would end the `#` comment the skip note is
+    /// written as, making the rest of it a statement — so the note escapes.
+    #[test]
+    fn the_skip_note_cannot_be_escaped_with_a_newline() {
+        let rendered = render(&[block("1.2.3.4\nflush ruleset")]);
+
+        let statements: Vec<&str> = rendered
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
+            .collect();
+        assert!(
+            !statements.iter().any(|line| line.contains("flush")),
+            "the payload escaped the comment:\n{rendered}"
+        );
     }
 }

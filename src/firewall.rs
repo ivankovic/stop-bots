@@ -50,6 +50,77 @@ impl FirewallBackend {
             FirewallBackend::Nftables => "nft -f",
         }
     }
+
+    /// Stored form, named `stored`/`from_stored` for the reason
+    /// `BlockResponse` is: this is a database representation, not a
+    /// display one.
+    pub fn stored(self) -> &'static str {
+        match self {
+            FirewallBackend::Iptables => "iptables",
+            FirewallBackend::Nftables => "nftables",
+        }
+    }
+
+    /// Falls back to nftables for anything unrecognised, the same
+    /// never-fail-a-read-over-a-stored-enum convention `GeoMode` uses.
+    /// Nftables rather than iptables because it is the only backend that
+    /// can represent IPv6 and an allowlist catch-all — a host that gets
+    /// the fallback should get the one that can express every rule.
+    pub fn from_stored(s: &str) -> Self {
+        match s {
+            "iptables" => FirewallBackend::Iptables,
+            _ => FirewallBackend::Nftables,
+        }
+    }
+}
+
+/// Which backend this host renders for.
+///
+/// Stored rather than asked for every time, so a one-click "Apply
+/// everything" has an answer without guessing, and so an operator who
+/// picked iptables once is not silently handed an nftables script on the
+/// next render. The CLI's `--backend` stays authoritative for the run it
+/// is passed to; it is what writes this.
+pub const BACKEND_KEY: &str = "firewall:backend";
+
+/// The script path for `backend` when nobody has said otherwise.
+///
+/// The extension is part of the answer, not decoration: a `.nft` file
+/// holding `#!/bin/sh` and 12,000 `iptables -A` lines is what a host ends
+/// up with when the path is chosen once at startup and the backend is
+/// chosen per render. That happened on a real host, and it is confusing
+/// precisely when it matters — while deciding which of two scripts to run.
+pub fn default_output_path(backend: FirewallBackend) -> std::path::PathBuf {
+    let base = std::path::PathBuf::from(DEFAULT_OUTPUT_PATH);
+    match backend {
+        FirewallBackend::Nftables => base,
+        FirewallBackend::Iptables => base.with_extension("sh"),
+    }
+}
+
+/// Where to write: `override_path` if an operator named one, otherwise the
+/// default for `backend`.
+///
+/// An explicit `--firewall-out` wins outright, extension and all. Someone
+/// who names a path has said where they want it, and silently rewriting
+/// their suffix would be the same class of surprise in the other
+/// direction.
+pub fn output_path(override_path: Option<&Path>, backend: FirewallBackend) -> std::path::PathBuf {
+    match override_path {
+        Some(path) => path.to_path_buf(),
+        None => default_output_path(backend),
+    }
+}
+
+pub fn stored_backend(db: &Db) -> Result<FirewallBackend> {
+    Ok(db
+        .get_text_setting(BACKEND_KEY)?
+        .map(|value| FirewallBackend::from_stored(&value))
+        .unwrap_or(FirewallBackend::Nftables))
+}
+
+pub fn store_backend(db: &Db, backend: FirewallBackend) -> Result<()> {
+    db.set_text_setting(BACKEND_KEY, backend.stored())
 }
 
 /// Every synthetic (never persisted) `FirewallRule` derived from
@@ -244,11 +315,30 @@ pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
 /// only ever writing it — the Dashboard's render popup's "apply after
 /// writing" toggle (`App::start_firewall_render`), gated by the same
 /// `apply_firewall`/explicit-confirmation guard `nginx::reload` uses for
-/// NGINX reloads. Never called from anywhere unattended (no cron job calls
-/// this): keeping `README.md`'s "generated, never applied *automatically*"
-/// guarantee intact — this only ever runs from an explicit, interactive
-/// admin action, the same lockout-risk check (`assess_lockout_risk`) having
-/// already run before the script was even written.
+/// NGINX reloads.
+///
+/// There are exactly three callers, and one of them *is* unattended — this
+/// comment once claimed there were none of those, which is the wrong answer
+/// to the one question anyone reads it to ask:
+///
+/// - `App::start_firewall_render`, from the TUI Dashboard's render popup,
+///   only when the TUI was started without `--no-apply`.
+/// - `web::dashboard::write_and_apply_firewall`, from the console's "run it
+///   after writing" box or its "Apply everything" button, only when the
+///   console was started without `--no-apply`. The console refusing to do
+///   this at all was a deliberate omission until it was reversed on
+///   request; the guard below is what replaced the omission.
+/// - `batch::render_and_apply_firewall`, under `batch --apply`, which is
+///   the documented crontab entry point and has nobody watching.
+///
+/// All three run `assess_lockout_risk` over the same rules, in the same
+/// order the script will evaluate them, before the script is written — and
+/// under `batch --apply` a guard that merely *could not run* is a refusal
+/// too.
+/// So `README.md`'s "generated, never applied *automatically*" holds in the
+/// sense that matters: nothing applies a script without an operator having
+/// asked for it, whether by pressing a key or by putting `--apply` in a
+/// crontab. It does not hold in the sense of "a human is looking".
 pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
     let output = match backend {
         FirewallBackend::Iptables => std::process::Command::new("sh")
@@ -262,14 +352,47 @@ pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
             .context("failed to run `nft -f` on the generated nftables script")?,
     };
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
-            "{} exited with {}: {}",
+            "{} exited with {}: {}{}",
             backend.apply_command(),
             output.status,
-            String::from_utf8_lossy(&output.stderr)
+            stderr.trim(),
+            sandbox_hint(&stderr)
         );
     }
     Ok(())
+}
+
+/// An explanation to append when the apply failed for a reason the tool
+/// itself cannot name.
+///
+/// `nft` and Debian's nft-backed `iptables` both reach the kernel over a
+/// netlink socket, and the systemd unit `stop-bots install web` writes
+/// restricts which address families the service may open. Get that wrong
+/// and the failure is `Unable to initialize Netlink socket: Address family
+/// not supported by protocol` — which is accurate, mentions neither
+/// systemd nor this project, and sends whoever reads it looking for a
+/// kernel module or a missing package.
+///
+/// Reported here rather than fixed here because the fix is in a file this
+/// process does not own: an operator running an older unit needs to be
+/// told which line to change, not have it changed under them.
+fn sandbox_hint(stderr: &str) -> &'static str {
+    let netlink_denied = stderr.contains("Netlink")
+        && (stderr.contains("Address family not supported")
+            || stderr.contains("Operation not permitted"));
+    if !netlink_denied {
+        return "";
+    }
+    "\n\nThat error means the kernel refused a netlink socket, which usually \
+     means this process is sandboxed. If it is running from the unit \
+     `stop-bots install web` writes, check that its RestrictAddressFamilies \
+     line includes AF_NETLINK:\n\n    \
+     systemctl show stop-bots-web.service -p RestrictAddressFamilies\n\n\
+     Units written before the console could apply the firewall do not have \
+     it. Re-run `stop-bots install web --force` to get the current unit, \
+     then `systemctl restart stop-bots-web.service`."
 }
 
 #[cfg(test)]
@@ -526,5 +649,90 @@ mod tests {
 
         let err = apply_script(FirewallBackend::Iptables, &script).unwrap_err();
         assert!(err.to_string().contains("exited with"), "err was: {err}");
+    }
+    // ---- the path follows the backend ----
+
+    /// The bug this prevents, from a real host: `/etc/stop-bots/firewall.nft`
+    /// whose first line was `#!/bin/sh`, holding 12,000 `iptables -A` rules.
+    /// The path was decided once at startup and the backend per render, so
+    /// the two drifted apart — and they drift apart exactly when it matters,
+    /// while someone is deciding which of two scripts to run.
+    #[test]
+    fn the_default_path_matches_the_backend_that_writes_it() {
+        let nft = default_output_path(FirewallBackend::Nftables);
+        let ipt = default_output_path(FirewallBackend::Iptables);
+
+        assert_eq!(nft.extension().unwrap(), "nft", "was: {}", nft.display());
+        assert_eq!(ipt.extension().unwrap(), "sh", "was: {}", ipt.display());
+        assert_ne!(nft, ipt);
+    }
+
+    /// Whichever backend renders, the file it lands in must announce the
+    /// same one — checked against the script's own first line rather than
+    /// against a second copy of the mapping.
+    #[test]
+    fn the_extension_agrees_with_the_scripts_own_interpreter() {
+        for (backend, shebang) in [
+            (FirewallBackend::Nftables, "#!/usr/sbin/nft -f"),
+            (FirewallBackend::Iptables, "#!/bin/sh"),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            let built = build_script(&db, backend).unwrap();
+            let path = default_output_path(backend);
+
+            assert!(
+                built.script.starts_with(shebang),
+                "{:?} renders {shebang}?\n{}",
+                backend,
+                &built.script[..40]
+            );
+            let expected = if shebang.contains("nft") { "nft" } else { "sh" };
+            assert_eq!(
+                path.extension().unwrap(),
+                expected,
+                "{:?} writes {shebang} into {}",
+                backend,
+                path.display()
+            );
+        }
+    }
+
+    /// An operator who names a path has said where they want it. Rewriting
+    /// their suffix would be the same surprise in the other direction.
+    #[test]
+    fn an_explicit_path_wins_over_the_backends_default() {
+        let chosen = Path::new("/srv/rules.txt");
+
+        for backend in [FirewallBackend::Nftables, FirewallBackend::Iptables] {
+            assert_eq!(output_path(Some(chosen), backend), chosen);
+        }
+        assert_eq!(
+            output_path(None, FirewallBackend::Iptables),
+            default_output_path(FirewallBackend::Iptables)
+        );
+    }
+
+    // ---- the sandbox hint ----
+
+    /// The message an operator actually saw, from a console running under
+    /// the unit `install web` wrote before the console could apply.
+    #[test]
+    fn a_netlink_refusal_explains_itself() {
+        let hint = sandbox_hint(
+            "src/mnl.c:64: Unable to initialize Netlink socket: \
+             Address family not supported by protocol",
+        );
+
+        assert!(hint.contains("AF_NETLINK"), "was: {hint}");
+        assert!(
+            hint.contains("stop-bots install web --force"),
+            "it has to say how to get a unit that works: {hint}"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_failure_gets_no_hint() {
+        assert_eq!(sandbox_hint("nft: command not found"), "");
+        assert_eq!(sandbox_hint("Error: syntax error, unexpected newline"), "");
     }
 }

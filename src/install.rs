@@ -91,6 +91,15 @@ pub struct Layout {
     /// untested. Injecting it beats putting a fake on `PATH`, which is
     /// process-global and races under a threaded test runner.
     pub systemctl: PathBuf,
+    /// Whether this describes the running host rather than a staging tree,
+    /// i.e. whether the prefix was `/`.
+    ///
+    /// `--prefix` writes a unit into a directory nothing will ever start,
+    /// so the checks that are about what *this host's* systemd would do —
+    /// see [`hidden_from_unit`] — have nothing to be true or false about
+    /// there. Applying them anyway would refuse every `--prefix` run whose
+    /// staging tree sits under `/tmp`, which is all of them.
+    real: bool,
 }
 
 impl Layout {
@@ -114,6 +123,13 @@ impl Layout {
             systemd_marker: prefix.join("run/systemd/system"),
             debian_marker: prefix.join("etc/debian_version"),
             systemctl: PathBuf::from("systemctl"),
+            // Derived, not a parameter: `main.rs` builds every layout —
+            // prefixed or not — with `under`, so a flag a caller had to
+            // remember to set would have been `false` on the one path
+            // that matters. That is not hypothetical; it is what the first
+            // version of this did, and the check below was dead in
+            // production while every test passed.
+            real: prefix == Path::new("/"),
         }
     }
 
@@ -154,6 +170,67 @@ pub fn is_build_artifact(binary: &Path) -> bool {
         }
     }
     false
+}
+
+/// Why the unit's own sandbox would not be able to see `binary`, if it
+/// would not — named as the directive responsible.
+///
+/// [`preflight`] checking `binary.is_file()` is not the same question as
+/// "can systemd execute this", because `ExecStart` is resolved inside the
+/// mount namespace [`web_unit`] asks for, and that is a different
+/// filesystem from the installer's:
+///
+/// - `ProtectHome=yes` replaces `/root`, `/home` and `/run/user` with
+///   empty directories.
+/// - `PrivateTmp=yes` gives the service a fresh `/tmp` and `/var/tmp`.
+///
+/// A binary in any of those exists for the installer and does not exist
+/// for systemd. The failure is `status=203/EXEC` with `Unable to locate
+/// executable: No such file or directory` — which sends whoever reads it
+/// hunting for a missing file that is plainly, verifiably there. Reported
+/// here in terms of what to do about it instead.
+///
+/// Found the hard way: `./stop-bots install web` run from `/root`, which
+/// is exactly where someone who just downloaded a release binary is
+/// standing.
+pub fn hidden_from_unit(binary: &Path) -> Option<&'static str> {
+    let path = binary.to_string_lossy();
+    // Prefix matching on the path as written. `ExecStart` names this path
+    // verbatim, so what matters is the literal string systemd will resolve
+    // — not what it might canonicalise to.
+    for prefix in ["/root/", "/home/", "/run/user/"] {
+        if path.starts_with(prefix) {
+            return Some("ProtectHome=yes");
+        }
+    }
+    for prefix in ["/tmp/", "/var/tmp/"] {
+        if path.starts_with(prefix) {
+            return Some("PrivateTmp=yes");
+        }
+    }
+    None
+}
+
+/// What to tell an operator whose binary the unit's sandbox would hide.
+///
+/// Pure and separately tested, because the *message* is the entire value
+/// of this check: systemd's own report (`status=203/EXEC`, "No such file or
+/// directory") is accurate and useless, and the thing that saves an
+/// afternoon is naming the directive and giving a command to paste.
+fn hidden_binary_error(binary: &Path, directive: &str) -> String {
+    format!(
+        "{} exists, but the unit sets {}, which hides that directory from the \
+         service — systemd would fail with `status=203/EXEC` and \"No such file \
+         or directory\" for a file that is plainly there.\n\n\
+         Copy the binary somewhere the service can see, then re-run:\n\n    \
+         install -m 755 {} /usr/local/bin/stop-bots\n    \
+         /usr/local/bin/stop-bots install web\n\n\
+         Or pass --binary with a path outside /root, /home and /tmp if the \
+         binary already lives somewhere else.",
+        binary.display(),
+        directive,
+        binary.display(),
+    )
 }
 
 /// The unit file's exact contents.
@@ -212,10 +289,16 @@ pub fn web_unit(layout: &Layout) -> String {
          RestrictNamespaces=yes\n\
          SystemCallArchitectures=native\n\
          # AF_UNIX for the dbus socket `systemctl reload nginx` talks over,\n\
-         # AF_INET/AF_INET6 for the console itself and the crawler-range\n\
-         # downloads. Nothing here uses a raw or netlink socket: this service\n\
-         # writes the firewall script, it never applies it.\n\
-         RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n\
+         # AF_INET/AF_INET6 for the console itself and the list downloads,\n\
+         # and AF_NETLINK because the console applies the firewall script:\n\
+         # both `nft` and Debian's nft-backed `iptables` talk to the kernel\n\
+         # over netlink. Without it the apply fails with\n\
+         # \"Unable to initialize Netlink socket: Address family not\n\
+         # supported by protocol\", which names neither this file nor the\n\
+         # reason. This line said the opposite until applying arrived; a\n\
+         # comment asserting what a service does not need is a comment that\n\
+         # goes stale the moment it starts needing it.\n\
+         RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n\
          # The database holds the console's password hash.\n\
          UMask=0077\n\
          \n\
@@ -269,11 +352,37 @@ pub fn preflight(layout: &Layout, options: &Options) -> Result<()> {
         );
     }
 
+    // Before `is_file`, because a relative path can be a real file and
+    // still produce a unit systemd refuses outright: it requires an
+    // absolute `ExecStart`, and rejects the unit at load time rather than
+    // at start time, which is a different and more confusing failure.
+    // Reachable only via `--binary`; `current_exe` is always absolute.
+    if !layout.binary.is_absolute() {
+        anyhow::bail!(
+            "--binary needs an absolute path, and {} is relative. systemd \
+             requires an absolute ExecStart and would refuse to load the unit \
+             at all.\n\n\
+             Did you mean:\n\n    --binary {}",
+            layout.binary.display(),
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&layout.binary))
+                .unwrap_or_else(|_| layout.binary.clone())
+                .display()
+        );
+    }
+
     if !layout.binary.is_file() {
         anyhow::bail!(
             "{} is not a file, so the unit's ExecStart would point at nothing",
             layout.binary.display()
         );
+    }
+
+    // After the `is_file` check, and a different question: that one asks
+    // the installer's filesystem, this one asks the unit's. See
+    // `hidden_from_unit`.
+    if let Some(directive) = hidden_from_unit(&layout.binary).filter(|_| layout.real) {
+        anyhow::bail!("{}", hidden_binary_error(&layout.binary, directive));
     }
 
     // Checked by trying, not by comparing euid to 0: what matters is
@@ -364,6 +473,24 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
     Ok(steps)
 }
 
+/// Tightens the database file itself to 0600.
+///
+/// The state *directory* is already 0700, which is what actually keeps the
+/// console's password hash off a shared host — but the file inside it is
+/// created by whichever process got there first, under that process's
+/// umask, and so is usually 0644. The unit's `UMask=0077` does not help:
+/// it applies to files the *service* creates, and this one is created by
+/// the installer. A mode travels with a file through a backup or a `cp`
+/// in a way the directory it used to live in does not.
+///
+/// Called after the database has been written, because it has to exist.
+pub fn secure_database(path: &Path) -> Result<()> {
+    if path.exists() {
+        set_mode(path, 0o600)?;
+    }
+    Ok(())
+}
+
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -410,11 +537,27 @@ fn systemctl(layout: &Layout, args: &[&str]) -> Result<()> {
             )
         })?;
     if !output.status.success() {
+        // `enable --now` is two operations, and the first one sticks even
+        // when the second fails: the unit ends up enabled, failing, and
+        // enabled again at the next boot. Systemd's own start limit stops
+        // the restart loop after a few tries, so this is untidy rather
+        // than dangerous — but an operator reading this needs to be told
+        // the state they are now in, and the one command that undoes it.
+        let cleanup = if args.contains(&"enable") {
+            format!(
+                "\n\nThe unit was written and enabled before this failed, so it will \
+                 try again at the next boot. To undo that:\n\n    \
+                 systemctl disable --now {WEB_UNIT}"
+            )
+        } else {
+            String::new()
+        };
         anyhow::bail!(
-            "`systemctl {}` exited with {}: {}",
+            "`systemctl {}` exited with {}: {}{}",
             args.join(" "),
             output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&output.stderr).trim(),
+            cleanup
         );
     }
     Ok(())
@@ -437,6 +580,18 @@ mod tests {
         let binary = dir.join("stop-bots");
         std::fs::write(&binary, b"#!/bin/true\n").unwrap();
         Layout::under(dir, binary)
+    }
+
+    /// A fake `systemctl` running `body`, wired into `layout`.
+    ///
+    /// Injected through `Layout` rather than placed on `PATH`: `PATH` is
+    /// process-global and a threaded test runner would race on it.
+    fn with_fake_systemctl(layout: &mut Layout, dir: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("fake-systemctl");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        layout.systemctl = script;
     }
 
     /// The exact unit an operator gets. A golden rather than substring
@@ -684,13 +839,9 @@ mod tests {
     /// the operator has to know that.
     #[test]
     fn a_failing_systemctl_stops_the_install() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let mut layout = staged(dir.path());
-        let script = dir.path().join("failing-systemctl");
-        std::fs::write(&script, "#!/bin/sh\necho 'no such unit' >&2\nexit 1\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        layout.systemctl = script;
+        with_fake_systemctl(&mut layout, dir.path(), "echo 'no such unit' >&2\nexit 1");
 
         let err = activate(&layout, &Options::default()).unwrap_err();
 
@@ -750,6 +901,136 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(layout.unit_path()).unwrap(),
             web_unit(&layout)
+        );
+    }
+    /// The bug this check exists for, reported from a real Debian host:
+    /// `./stop-bots install web` run from `/root` wrote
+    /// `ExecStart=/root/stop-bots`, which systemd could not execute
+    /// because the unit's own `ProtectHome=yes` makes `/root` empty for
+    /// the service. `is_file()` said yes; systemd said
+    /// `status=203/EXEC`, `No such file or directory`.
+    #[test]
+    fn the_hidden_binary_message_names_the_directive_and_the_fix() {
+        let message = hidden_binary_error(Path::new("/root/stop-bots"), "ProtectHome=yes");
+
+        assert!(
+            message.contains("ProtectHome=yes"),
+            "the message must name the directive responsible: {message}"
+        );
+        assert!(
+            message.contains("install -m 755 /root/stop-bots /usr/local/bin/stop-bots"),
+            "the message must be copy-pasteable: {message}"
+        );
+        assert!(
+            message.contains("203/EXEC"),
+            "it must connect to what systemd actually printed: {message}"
+        );
+    }
+
+    /// End to end through `preflight`, using the tempdir's own binary —
+    /// which is under the temporary directory `PrivateTmp=yes` replaces,
+    /// so it is a file that exists and that the unit could not execute.
+    /// Skipped, loudly, if this machine's temp directory is somewhere the
+    /// unit does not hide.
+    #[test]
+    fn preflight_refuses_a_binary_the_units_own_sandbox_would_hide() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        layout.real = true;
+        assert!(layout.binary.is_file(), "the fixture binary must exist");
+        let Some(directive) = hidden_from_unit(&layout.binary) else {
+            eprintln!(
+                "skipped: {} is not a directory the unit hides",
+                layout.binary.display()
+            );
+            return;
+        };
+
+        let err = preflight(&layout, &Options::default()).unwrap_err();
+
+        assert!(format!("{err:#}").contains(directive), "was: {err:#}");
+    }
+
+    /// Every directory the unit replaces or privatises, checked against
+    /// the unit text itself so adding a sandbox directive that hides
+    /// somewhere new cannot silently outrun this list.
+    #[test]
+    fn every_directory_the_unit_hides_is_refused() {
+        for (path, directive) in [
+            ("/root/stop-bots", "ProtectHome=yes"),
+            ("/home/marko/stop-bots", "ProtectHome=yes"),
+            ("/run/user/1000/stop-bots", "ProtectHome=yes"),
+            ("/tmp/stop-bots", "PrivateTmp=yes"),
+            ("/var/tmp/stop-bots", "PrivateTmp=yes"),
+        ] {
+            assert_eq!(
+                hidden_from_unit(Path::new(path)),
+                Some(directive),
+                "{path} should be refused because of {directive}"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let layout = staged(dir.path());
+            assert!(
+                web_unit(&layout).contains(directive),
+                "{directive} is no longer in the unit, so this refusal is stale"
+            );
+        }
+    }
+
+    #[test]
+    fn an_installed_binary_is_not_refused() {
+        for path in [
+            "/usr/local/bin/stop-bots",
+            "/usr/bin/stop-bots",
+            "/opt/stop-bots/stop-bots",
+            // Not a prefix match on "/root": a sibling directory whose
+            // name merely starts the same way is a different place.
+            "/rootfs/stop-bots",
+        ] {
+            assert_eq!(hidden_from_unit(Path::new(path)), None, "{path}");
+        }
+    }
+
+    /// `enable --now` half-succeeds: the enable sticks, the start does
+    /// not. An operator who sees only "exited with 1" is not told they now
+    /// have a unit that will try again at the next boot.
+    #[test]
+    fn a_failed_enable_says_how_to_undo_the_half_that_worked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        // `daemon-reload` succeeds and `enable` fails — the real shape of
+        // this failure, and the reason the message has something to say.
+        with_fake_systemctl(
+            &mut layout,
+            dir.path(),
+            "case \"$1\" in enable) echo 'Job failed' >&2; exit 1 ;; *) exit 0 ;; esac",
+        );
+
+        let err = activate(&layout, &Options::default()).unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!("systemctl disable --now {WEB_UNIT}")),
+            "message was: {message}"
+        );
+    }
+
+    /// systemd rejects a relative `ExecStart` when it *loads* the unit,
+    /// not when it starts it — so this failure does not even look like a
+    /// failed service.
+    #[test]
+    fn preflight_refuses_a_relative_binary_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        layout.binary = PathBuf::from("stop-bots");
+
+        let err = preflight(&layout, &Options::default()).unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("absolute"), "was: {message}");
+        assert!(
+            message.contains("--binary /"),
+            "it should suggest the absolute form: {message}"
         );
     }
 }

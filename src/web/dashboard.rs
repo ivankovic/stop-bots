@@ -30,6 +30,7 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::db::{Category, Db, GeoMode, Policy};
+use crate::firewall::{FirewallBackend, LockoutStatus};
 use crate::protection::Detector;
 use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
@@ -54,6 +55,23 @@ struct View {
     sources_stale: usize,
     rule_count: usize,
     firewall_needs_update: bool,
+    /// Where the "Write script" button writes, from `AppState`. Shown, not
+    /// asked for — see [`render_firewall`] for why the console does not
+    /// take a destination from the form.
+    firewall_out: String,
+    /// The remembered backend, so the dropdown opens on the one this host
+    /// actually renders for.
+    firewall_backend: FirewallBackend,
+    /// Sites the console could be mounted under, for Path mode's dropdown.
+    /// Empty means "no sites scanned yet", which the panel has to say
+    /// rather than render an empty select.
+    sites: Vec<(String, String)>,
+    /// Where the console currently thinks it is reachable — the bind
+    /// address, the path prefix and the host allowlist, all three of which
+    /// this panel writes.
+    bind: String,
+    base_path: String,
+    allowed_hosts: Vec<String>,
     jobs: Vec<crate::cron::JobStatus>,
 }
 
@@ -61,7 +79,7 @@ struct View {
 /// TUI's Summary panel.
 const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 
-fn load(db: &Db) -> anyhow::Result<View> {
+fn load(db: &Db, firewall_out: Option<&std::path::Path>) -> anyhow::Result<View> {
     let sources = db.list_sources()?;
     let now = now_secs();
     let sources_stale = sources
@@ -91,6 +109,28 @@ fn load(db: &Db) -> anyhow::Result<View> {
         sources_total: sources.len(),
         sources_stale,
         rule_count: rules.len(),
+        // The path the *current* backend would write to, not a fixed one:
+        // showing `firewall.nft` next to an iptables selection is how the
+        // two drifted apart in the first place.
+        firewall_out: crate::firewall::output_path(
+            firewall_out,
+            crate::firewall::stored_backend(db)?,
+        )
+        .display()
+        .to_string(),
+        firewall_backend: crate::firewall::stored_backend(db)?,
+        sites: db
+            .list_sites()?
+            .into_iter()
+            .map(|site| (site.server_name, site.config_path))
+            .collect(),
+        bind: crate::web::resolve_bind(db, None)
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| crate::web::DEFAULT_BIND.to_string()),
+        base_path: db
+            .get_text_setting(crate::web::BASE_PATH_KEY)?
+            .unwrap_or_default(),
+        allowed_hosts: crate::web::configured_hosts(db)?,
         firewall_needs_update: db.get_firewall_rendered_signature()?.as_deref()
             != Some(signature.as_str()),
         jobs: crate::cron::status(db)?,
@@ -109,7 +149,11 @@ pub async fn page(
     auth: Auth,
     Query(flash): Query<FlashQuery>,
 ) -> Response {
-    let view = match state.with_db(load).await {
+    let firewall_out = state.firewall_out.clone();
+    let view = match state
+        .with_db(move |db| load(db, firewall_out.as_deref()))
+        .await
+    {
         Ok(view) => view,
         Err(err) => return internal_error(&err.to_string()),
     };
@@ -125,6 +169,7 @@ fn body(view: &View, ctx: &Ctx) -> Markup {
             (detectors_panel(view, ctx))
             (feeds_panel(view, ctx))
             (summary_panel(view, ctx))
+            (web_access_panel(view, ctx))
             (jobs_panel(view))
         }
     }
@@ -163,6 +208,29 @@ fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
                             }
                         }
                     }
+                }
+            }
+
+            .panel-body {
+                .row {
+                    form .inline method="post" action=(ctx.url("/update-all")) {
+                        (layout::csrf_field(ctx))
+                        button .primary type="submit" { "Update everything" }
+                    }
+                    form .inline method="post" action=(ctx.url("/apply-all")) {
+                        (layout::csrf_field(ctx))
+                        button .primary type="submit" { "Apply everything" }
+                    }
+                }
+                p .hint {
+                    "\u{201c}Update everything\u{201d} downloads every bot list, every "
+                    "enabled reputation feed, the crawler IP ranges, and the ranges for "
+                    "every country you selected \u{2014} one source failing does not stop "
+                    "the rest. \u{201c}Apply everything\u{201d} then writes and reloads "
+                    "the NGINX config and writes and runs the firewall script, the same "
+                    "two halves, and in the same order, as "
+                    code { "stop-bots batch --apply" }
+                    "."
                 }
             }
         },
@@ -466,26 +534,193 @@ fn summary_panel(view: &View, ctx: &Ctx) -> Markup {
                     (layout::csrf_field(ctx))
                     label .field {
                         "Write the firewall script to"
-                        input type="text" name="out" value="/etc/stop-bots/firewall.sh" size="34";
+                        code { (view.firewall_out) }
                     }
                     label .field {
                         "Backend"
                         select name="backend" {
-                            option value="nftables" { "nftables" }
-                            option value="iptables" { "iptables" }
+                            @for backend in [FirewallBackend::Nftables, FirewallBackend::Iptables] {
+                                option value=(backend.stored())
+                                    selected[backend == view.firewall_backend] {
+                                    (backend.stored())
+                                }
+                            }
                         }
+                    }
+                    label .field {
+                        "Run it after writing"
+                        input type="checkbox" name="apply" value="1";
                     }
                     button .primary type="submit" { "Write script" }
                 }
                 p .hint {
-                    "Writing is inert — the script does nothing until it is run. Applying it "
-                    "is deliberately not offered here; run it yourself, or use "
+                    "Writing is inert — the script does nothing until it is run. Ticking "
+                    "\u{201c}run it after writing\u{201d} enforces it immediately, after the same "
+                    "anti-lockout check "
                     code { "stop-bots batch --apply" }
-                    " from cron."
+                    " runs: rules that would block a currently-connected SSH client are "
+                    "refused rather than written."
+                }
+
+            }
+        },
+    )
+}
+
+// ---- web access ----
+
+/// How to reach the console from outside, and the button that sets it up.
+///
+/// Path mode is offered first and is the default. A subdomain needs its own
+/// certificate; a path attaches to a site that already has one, and this
+/// console has a password form and a session cookie, so "inherits the
+/// existing TLS" is worth more than "has a tidier URL".
+fn web_access_panel(view: &View, ctx: &Ctx) -> Markup {
+    layout::panel(
+        "Web Access",
+        Some("Reach this console from outside, through NGINX"),
+        html! {
+            table {
+                tbody {
+                    tr {
+                        td { "Listening on" }
+                        td .mono { (view.bind) }
+                    }
+                    tr {
+                        td { "Path prefix" }
+                        td .mono {
+                            @if view.base_path.is_empty() { "/" } @else { "/" (view.base_path) }
+                        }
+                    }
+                    tr {
+                        td { "Answers to" }
+                        td {
+                            @if view.allowed_hosts.is_empty() {
+                                span .hint { "localhost only" }
+                            } @else {
+                                span .mono { (view.allowed_hosts.join(", ")) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            .panel-body {
+                form method="post" action=(ctx.url("/web-access")) {
+                    (layout::csrf_field(ctx))
+                    label .field {
+                        "Mode"
+                        select name="mode" {
+                            option value="path" { "Path on an existing site" }
+                            option value="subdomain" { "Its own subdomain" }
+                        }
+                    }
+                    label .field {
+                        "Site (path mode)"
+                        select name="site" {
+                            @if view.sites.is_empty() {
+                                option value="" { "no sites scanned yet" }
+                            }
+                            @for (name, _) in &view.sites {
+                                option value=(name) { (name) }
+                            }
+                        }
+                    }
+                    label .field {
+                        "Path prefix"
+                        input type="text" name="prefix" value=(crate::webaccess::DEFAULT_PREFIX) size="18";
+                    }
+                    label .field {
+                        "Subdomain host"
+                        input type="text" name="host" placeholder="console.example.com" size="26";
+                    }
+                    button .primary type="submit" { "Set up NGINX" }
+                }
+
+                p .hint {
+                    "Path mode adds a "
+                    code { "location" }
+                    " block to the site you pick, so the console inherits that site\u{2019}s "
+                    "certificate. It also records the prefix and the host name, because this "
+                    "server matches the full path including the prefix and refuses a request "
+                    "carrying a host it was not told about."
+                }
+                p .hint {
+                    "Subdomain mode writes a new "
+                    code { "server" }
+                    " block on port 80. Until you run "
+                    code { "certbot --nginx -d <host>" }
+                    ", the password form and the session cookie cross the network in the "
+                    "clear \u{2014} which is why path mode is the default."
                 }
             }
         },
     )
+}
+
+#[derive(Deserialize)]
+struct WebAccessForm {
+    mode: String,
+    site: String,
+    prefix: String,
+    host: String,
+}
+
+/// Writes the NGINX config that makes this console reachable, plus the two
+/// settings that have to agree with it.
+///
+/// All three or none: a `location` block without `web:base_path` serves a
+/// console whose every link points outside it, and either mode without the
+/// host in `web:allowed_hosts` serves a 403 to every proxied request. The
+/// config is written last, because it is the one that can fail validation
+/// and the one this can roll back.
+async fn set_web_access(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Form(form): Form<WebAccessForm>,
+) -> Response {
+    let request = match form.mode.as_str() {
+        "subdomain" => crate::webaccess::Request::Subdomain { host: form.host },
+        _ => crate::webaccess::Request::Path {
+            site: form.site,
+            prefix: form.prefix,
+        },
+    };
+
+    // Plan, apply and record in one hop onto the blocking pool: all three
+    // are synchronous, and the two that touch `Db` cannot cross an
+    // `.await` anyway. The TUI splits them, because its `Db` lives on the
+    // main thread; here the split would buy nothing.
+    let root = state.nginx_root.clone();
+    let written = state
+        .with_db(move |db| {
+            let plan = crate::webaccess::plan(db, &request)?;
+            let path = crate::webaccess::apply(&plan, &root)?;
+            crate::webaccess::record(db, &plan)?;
+            anyhow::Ok(path)
+        })
+        .await;
+
+    match written {
+        Ok(path) => {
+            let reload = reload_nginx(&state).await;
+            let note = match reload {
+                Ok(note) => note,
+                Err(err) => format!("reload failed: {err:#}"),
+            };
+            back_with(
+                &state.base,
+                "/",
+                &format!(
+                    "Wrote {} and recorded the host. NGINX {note}. Restart the console for a \
+                     changed path prefix to take effect.",
+                    path.display()
+                ),
+                true,
+            )
+        }
+        Err(err) => back_with(&state.base, "/", &format!("{err:#}"), false),
+    }
 }
 
 // ---- scheduled jobs ----
@@ -553,6 +788,9 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
         .route(&base.url("/detector-ttl"), post(set_detector_ttl))
         .route(&base.url("/feed"), post(set_feed))
         .route(&base.url("/render-firewall"), post(render_firewall))
+        .route(&base.url("/update-all"), post(update_all))
+        .route(&base.url("/apply-all"), post(apply_all))
+        .route(&base.url("/web-access"), post(set_web_access))
 }
 
 #[derive(Deserialize)]
@@ -644,16 +882,41 @@ async fn add_country(
             false,
         );
     }
+    // Records the selection; does not download.
+    //
+    // The TUI fetches the zone file when a country is selected, and the
+    // asymmetry here is deliberate rather than an oversight. Two reasons:
+    // an aggregated zone file is hundreds of kilobytes from a third party,
+    // and blocking a request handler on that makes the button feel broken
+    // on a slow link; and this project keeps its test suite free of
+    // network access (see "Testing without nginx, iptables or the
+    // network" in SPECS.md) — a handler that downloads on POST made
+    // `the_geo_mode_and_country_selection_round_trip` reach ipdeny.com.
+    //
+    // What this used to do instead was tell the operator to go and run
+    // `stop-bots update-country-ranges --country RU` themselves, which is
+    // a console that knows what needs doing and asks you to do it. It now
+    // names the button that does it.
     let stored = code.clone();
     match state
         .with_db(move |db| db.set_country_selected(&stored, true))
         .await
     {
-        Ok(()) => back_with(&state.base, "/",
-            &format!("Selected {code}. Its ranges still need downloading with `stop-bots update-country-ranges --country {code}`."),
+        Ok(()) => back_with(
+            &state.base,
+            "/",
+            &format!(
+                "Selected {code}. Press \u{201c}Update everything\u{201d} to download its \
+                 ranges, then \u{201c}Apply everything\u{201d} to enforce them."
+            ),
             true,
         ),
-        Err(err) => back_with(&state.base, "/", &format!("Could not select {code}: {err}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("Could not select {code}: {err}"),
+            false,
+        ),
     }
 }
 
@@ -791,10 +1054,223 @@ async fn set_feed(
     }
 }
 
+/// Downloads every list this host uses — the console's half of what
+/// `stop-bots batch` does, through the same `refresh::plan`.
+///
+/// One source failing is reported and the rest still run: these are eight
+/// third parties, and a transient failure at one of them is not a reason to
+/// leave the other seven stale.
+async fn update_all(State(state): State<AppState>, _auth: Auth) -> Response {
+    let plan = match state.with_db(crate::refresh::plan).await {
+        Ok(plan) => plan,
+        Err(err) => {
+            return back_with(
+                &state.base,
+                "/",
+                &format!("Could not work out what to update: {err}"),
+                false,
+            )
+        }
+    };
+
+    let mut done = 0;
+    let mut failures: Vec<String> = Vec::new();
+    let mut outcomes = Vec::new();
+    for source in plan {
+        // Fetch off the database lock, store on it — `Db` is not `Sync`,
+        // so nothing holding it can cross an `.await`.
+        let fetched = crate::refresh::fetch(&source).await;
+        let source_for_store = source.clone();
+        let outcome = match fetched {
+            Ok(raw) => state
+                .with_db(move |db| crate::refresh::store(db, &source_for_store, &raw))
+                .await
+                .map_err(|err| format!("{err:#}")),
+            Err(err) => Err(format!("{err:#}")),
+        };
+        match &outcome {
+            Ok(_) => done += 1,
+            Err(err) => failures.push(format!("{}: {err}", source.label())),
+        }
+        outcomes.push((source, outcome));
+    }
+
+    // Only when all three crawler sources worked, for the reason
+    // `refresh::crawler_ranges_all_succeeded` documents.
+    if crate::refresh::crawler_ranges_all_succeeded(&outcomes) {
+        let _ = state
+            .with_db(|db| {
+                crate::cron::record_run(
+                    db,
+                    crate::cron::CronJob::UpdateIpRanges,
+                    "updated from the console",
+                );
+                anyhow::Ok(())
+            })
+            .await;
+    }
+
+    let message = if failures.is_empty() {
+        format!("Updated {done} list(s).")
+    } else {
+        format!(
+            "Updated {done} list(s). {} failed — {}",
+            failures.len(),
+            failures.join("; ")
+        )
+    };
+    back_with(&state.base, "/", &message, failures.is_empty())
+}
+
+/// Writes and enforces both planes: the NGINX config, then the firewall.
+///
+/// The two are independent on purpose, same as `batch --apply`: whichever
+/// fails, the other still gets its turn, because a half-applied host is
+/// better than one where an NGINX syntax error also left the firewall
+/// stale.
+async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
+    let mut parts: Vec<String> = Vec::new();
+    let mut ok = true;
+
+    let root = state.nginx_root.clone();
+    match state
+        .with_db(move |db| crate::nginx::apply_all_sites(db, &root))
+        .await
+    {
+        Ok(outcome) => {
+            parts.push(format!("NGINX: {} file(s) changed", outcome.changed));
+            if outcome.changed > 0 {
+                match reload_nginx(&state).await {
+                    Ok(note) => parts.push(note),
+                    Err(err) => {
+                        ok = false;
+                        parts.push(format!("reload failed: {err}"));
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            ok = false;
+            parts.push(format!("NGINX failed: {err:#}"));
+        }
+    }
+
+    match write_and_apply_firewall(&state).await {
+        Ok(note) => parts.push(note),
+        Err(err) => {
+            ok = false;
+            parts.push(format!("firewall failed: {err:#}"));
+        }
+    }
+
+    back_with(&state.base, "/", &parts.join(". "), ok)
+}
+
+/// Renders the firewall script, writes it, and runs it.
+///
+/// The console refusing to *apply* the script used to be one of its three
+/// deliberate omissions. That was reversed on request, so this is the one
+/// place it happens, and the guards are what make it defensible:
+///
+/// - `assess_lockout_risk` runs against the rules in the order the script
+///   will evaluate them, before anything is written — the same guard
+///   `batch --apply` runs, and a risk is a refusal, not a warning.
+/// - `apply_for_real` gates the run itself, so `stop-bots web --no-apply`
+///   keeps the old write-only behaviour.
+/// - The script that runs is the one just written to `firewall_out`, not a
+///   freshly derived one, so what executes is what the guard approved and
+///   what the operator can read afterwards.
+///
+/// The lockout guard covers SSH, not this console: the console's own
+/// address is protected separately by the "refusing to block the address
+/// you are connected from" check on the block handlers, which is what
+/// keeps a blocked rule from reaching the table in the first place.
+async fn write_and_apply_firewall(state: &AppState) -> anyhow::Result<String> {
+    write_firewall(state, true).await
+}
+
+/// Renders and writes the script, and runs it when `apply` is set.
+async fn write_firewall(state: &AppState, apply: bool) -> anyhow::Result<String> {
+    let out_override = state.firewall_out.clone();
+    let ssh_log = state.ssh_log.clone();
+    let (path, count, backend) = state
+        .with_db(move |db| {
+            let backend = crate::firewall::stored_backend(db)?;
+            // Derived from the backend inside the same closure that chose
+            // it, so the two cannot disagree — an iptables script in a
+            // `.nft` file is what happens when they are decided apart.
+            let out = crate::firewall::output_path(out_override.as_deref(), backend);
+            let built = crate::firewall::build_script(db, backend)?;
+            match crate::firewall::assess_lockout_risk(&built.rules, ssh_log.as_deref()) {
+                LockoutStatus::Risks(risks) if !risks.is_empty() => {
+                    let names: Vec<String> = risks
+                        .into_iter()
+                        .map(|(ip, rule)| format!("{ip} (by rule {rule})"))
+                        .collect();
+                    anyhow::bail!(
+                        "refusing to write: these rules would block a currently-connected SSH \
+                         client — {}. Unblock it first.",
+                        names.join(", ")
+                    )
+                }
+                LockoutStatus::Risks(_) | LockoutStatus::LogUnavailable => {}
+            }
+            crate::firewall::write_script(&out, &built.script)?;
+            db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
+            anyhow::Ok((out, built.rules.len(), backend))
+        })
+        .await?;
+
+    if !apply {
+        return Ok(format!(
+            "Wrote {count} rule(s) to {}. Run it to apply.",
+            path.display()
+        ));
+    }
+    if !state.apply_for_real {
+        return Ok(format!(
+            "Wrote {count} rule(s) to {} (not applied: --no-apply)",
+            path.display()
+        ));
+    }
+
+    // Blocking: this runs `nft -f` or `sh`, which is a subprocess, and a
+    // subprocess on the async runtime blocks whatever else that thread was
+    // going to serve.
+    let script = path.clone();
+    let applied =
+        tokio::task::spawn_blocking(move || crate::firewall::apply_script(backend, &script))
+            .await
+            .map_err(|err| anyhow::anyhow!("the apply thread panicked: {err}"))?;
+    applied
+        .map_err(|err| err.context(format!("wrote {count} rule(s), but applying them failed")))?;
+
+    Ok(format!(
+        "Wrote and applied {count} rule(s) to {}.",
+        path.display()
+    ))
+}
+
+/// Reloads NGINX, honouring `--no-apply`.
+async fn reload_nginx(state: &AppState) -> anyhow::Result<String> {
+    if !state.apply_for_real {
+        return Ok("not reloaded (--no-apply)".to_string());
+    }
+    state
+        .with_db(|db| {
+            let commands = crate::nginx::NginxCommands::from_db(db)?;
+            crate::nginx::reload_with(&commands)
+        })
+        .await?;
+    Ok("reloaded".to_string())
+}
+
 #[derive(Deserialize)]
 struct RenderForm {
-    out: String,
     backend: String,
+    /// Present only when the checkbox is ticked — HTML omits an unchecked
+    /// box entirely rather than sending `false`.
+    apply: Option<String>,
 }
 
 /// Writes the firewall script.
@@ -810,63 +1286,26 @@ async fn render_firewall(
     _auth: Auth,
     Form(form): Form<RenderForm>,
 ) -> Response {
-    use crate::firewall::{FirewallBackend, LockoutStatus};
-
-    let backend = match form.backend.as_str() {
-        "iptables" => FirewallBackend::Iptables,
-        _ => FirewallBackend::Nftables,
-    };
-    let out = std::path::PathBuf::from(form.out.trim());
-    if out.as_os_str().is_empty() {
-        return back_with(
-            &state.base,
-            "/",
-            "Give the script a path to be written to.",
-            false,
-        );
+    let backend = FirewallBackend::from_stored(&form.backend);
+    // Remembered, so a one-click "Apply everything" has an answer and an
+    // operator who chose iptables is not handed an nftables script next
+    // time.
+    if state
+        .with_db(move |db| crate::firewall::store_backend(db, backend))
+        .await
+        .is_err()
+    {
+        // Not worth failing the render over: the choice for *this* render
+        // is already in hand.
     }
 
-    let ssh_log = state.ssh_log.clone();
-    let written = state
-        .with_db(move |db| {
-            let built = crate::firewall::build_script(db, backend)?;
-            // The same guard `render-firewall` and `batch --apply` run.
-            // A written script is inert, but it is written to be run
-            // later, and by then nobody is watching.
-            match crate::firewall::assess_lockout_risk(&built.rules, ssh_log.as_deref()) {
-                LockoutStatus::Risks(risks) if !risks.is_empty() => {
-                    let names: Vec<String> = risks
-                        .into_iter()
-                        .map(|(ip, rule)| format!("{ip} (by rule {rule})"))
-                        .collect();
-                    anyhow::bail!(
-                        "refusing to write: these rules would block a currently-connected SSH \
-                         client — {}. Unblock it first.",
-                        names.join(", ")
-                    )
-                }
-                // A missing log is not itself a risk, and refusing here
-                // would make the button useless on a host whose auth log
-                // this process cannot read.
-                LockoutStatus::Risks(_) | LockoutStatus::LogUnavailable => {}
-            }
-            crate::firewall::write_script(&out, &built.script)?;
-            db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
-            Ok((out, built.rules.len()))
-        })
-        .await;
-
-    match written {
-        Ok((path, count)) => back_with(
-            &state.base,
-            "/",
-            &format!(
-                "Wrote {count} rule(s) to {}. Run it to apply.",
-                path.display()
-            ),
-            true,
-        ),
-        Err(err) => back_with(&state.base, "/", &format!("{err}"), false),
+    // Both paths go through one function. They used to be two copies of
+    // build-guard-write that differed only in the last step, which is how
+    // the write-only one kept deriving its destination separately from the
+    // backend it rendered for.
+    match write_firewall(&state, form.apply.is_some()).await {
+        Ok(note) => back_with(&state.base, "/", &note, true),
+        Err(err) => back_with(&state.base, "/", &format!("{err:#}"), false),
     }
 }
 
@@ -911,7 +1350,7 @@ mod tests {
         crate::botlist::register_all_sources(&db).unwrap();
         crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
 
-        let view = load(&db).unwrap();
+        let view = load(&db, None).unwrap();
         let rendered = body(&view, &Ctx::for_tests()).into_string();
 
         assert!(rendered.contains("Sites discovered"));
@@ -930,7 +1369,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         crate::botlist::register_all_sources(&db).unwrap();
         crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
-        let view = load(&db).unwrap();
+        let view = load(&db, None).unwrap();
         let rendered = body(&view, &Ctx::new("the-token", Default::default())).into_string();
 
         let forms = rendered.matches("<form").count();
@@ -951,11 +1390,50 @@ mod tests {
         })
         .unwrap();
 
-        let view = load(&db).unwrap();
+        let view = load(&db, None).unwrap();
         let rendered = body(&view, &Ctx::for_tests()).into_string();
         assert!(
             rendered.contains("SCRIPT IS STALE"),
             "a rule added since the last render makes the on-disk script stale"
         );
+    }
+    /// The panel must show the path the *current* backend would write to.
+    /// Showing `firewall.nft` beside an iptables selection is how a real
+    /// host ended up with a `#!/bin/sh` script in a `.nft` file.
+    #[test]
+    fn the_panel_shows_the_path_the_chosen_backend_writes_to() {
+        let db = Db::open_in_memory().unwrap();
+
+        crate::firewall::store_backend(&db, FirewallBackend::Iptables).unwrap();
+        let iptables = load(&db, None).unwrap();
+        crate::firewall::store_backend(&db, FirewallBackend::Nftables).unwrap();
+        let nftables = load(&db, None).unwrap();
+
+        assert!(
+            iptables.firewall_out.ends_with(".sh"),
+            "iptables should write a shell script, not {}",
+            iptables.firewall_out
+        );
+        assert!(
+            nftables.firewall_out.ends_with(".nft"),
+            "nftables should write an nft script, not {}",
+            nftables.firewall_out
+        );
+    }
+
+    /// An operator who passed `--firewall-out` gets that path whichever
+    /// backend renders.
+    #[test]
+    fn an_explicit_path_is_shown_unchanged_for_either_backend() {
+        let db = Db::open_in_memory().unwrap();
+        let chosen = std::path::Path::new("/srv/rules.txt");
+
+        for backend in [FirewallBackend::Iptables, FirewallBackend::Nftables] {
+            crate::firewall::store_backend(&db, backend).unwrap();
+            assert_eq!(
+                load(&db, Some(chosen)).unwrap().firewall_out,
+                "/srv/rules.txt"
+            );
+        }
     }
 }

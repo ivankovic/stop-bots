@@ -55,14 +55,22 @@ pub struct AppState {
     /// Mirrors the TUI's `--no-reload`, and the integration tests run with
     /// it off so that a test never reloads the developer's NGINX.
     pub apply_for_real: bool,
-    /// Where the internal cron's `RenderFirewall` job writes its script.
+    /// An explicit override for where the firewall script is written, from
+    /// `stop-bots web --firewall-out`.
     ///
-    /// A field rather than [`crate::firewall::DEFAULT_OUTPUT_PATH`] read at
-    /// the point of use, for the same reason the TUI passes it as a
-    /// parameter: the default is a real path under `/etc`, and a test that
-    /// drives a tick must be able to point it at a temp directory instead
-    /// of writing to the developer's system.
-    pub firewall_out: PathBuf,
+    /// `None` means "follow the backend", which is what
+    /// [`crate::firewall::output_path`] does: an nftables render lands in
+    /// `.nft` and an iptables one in `.sh`. It used to be a plain
+    /// `PathBuf` fixed at startup, which is how a host ended up with an
+    /// `iptables`-flavoured `#!/bin/sh` script in a file called
+    /// `firewall.nft` — the path was decided once and the backend was
+    /// decided per render.
+    ///
+    /// A field at all, rather than reading the default at the point of
+    /// use, for the same reason the TUI passes one: the default is a real
+    /// path under `/etc`, and a test that drives a tick must be able to
+    /// point it somewhere harmless.
+    pub firewall_out: Option<PathBuf>,
 }
 
 impl AppState {
@@ -97,7 +105,7 @@ impl AppState {
             login_throttle: Arc::new(LoginThrottle::default()),
             base,
             apply_for_real,
-            firewall_out: PathBuf::from(crate::firewall::DEFAULT_OUTPUT_PATH),
+            firewall_out: None,
         }
     }
 

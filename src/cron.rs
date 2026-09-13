@@ -189,6 +189,18 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// `RenderFirewall` reads the SSH log without being a detector: it needs
 /// the currently-connected clients for its lockout guard, not a log to
 /// scan for attackers.
+/// Records that `job` just ran, ignoring a failure to write it.
+///
+/// Ignored deliberately, and it was `batch`'s private helper before the
+/// console needed the same thing: the work has already happened by the
+/// time this is called, so failing the caller over the bookkeeping would
+/// report a successful update as a failure. Shared so the three
+/// front-ends cannot drift on which key they stamp — that key is what
+/// makes one schedule apply to all of them.
+pub fn record_run(db: &Db, job: CronJob, summary: &str) {
+    let _ = db.set_cron_last_run(job.id(), now(), summary);
+}
+
 pub fn uses_ssh_log(job: CronJob) -> bool {
     match job {
         CronJob::Detect(detector) => detector.spec().uses_ssh_log,
@@ -247,7 +259,7 @@ pub fn run_log_job(
     db: &Db,
     job: CronJob,
     log_text: Option<&str>,
-    firewall_out: &std::path::Path,
+    firewall_out: Option<&std::path::Path>,
 ) -> Result<String> {
     let summary = match job {
         // Every detector runs through one arm. What differs between them —
@@ -320,9 +332,21 @@ fn run_detector(db: &Db, detector: Detector, log_text: Option<&str>) -> String {
 ///
 /// **Writes, never applies.** A script on disk does nothing until someone
 /// runs it; see this module's docs for why that line is where it is.
-fn render_firewall(db: &Db, out_path: &std::path::Path, ssh_log_text: Option<&str>) -> String {
+fn render_firewall(
+    db: &Db,
+    out_override: Option<&std::path::Path>,
+    ssh_log_text: Option<&str>,
+) -> String {
     let result: Result<String> = (|| {
-        let built = crate::firewall::build_script(db, crate::firewall::FirewallBackend::Nftables)?;
+        // The *stored* backend, not a hardcoded one. This used to always
+        // render nftables while the console applied with whatever the
+        // operator had chosen — so on a host set to iptables, each tick
+        // quietly replaced their iptables script with an nftables one at
+        // the same path, and the next apply ran `sh` over nftables syntax.
+        let backend = crate::firewall::stored_backend(db)?;
+        let out_path = crate::firewall::output_path(out_override, backend);
+        let out_path = out_path.as_path();
+        let built = crate::firewall::build_script(db, backend)?;
         if let Some(text) = ssh_log_text {
             let connected_ips = crate::sshlog::parse_accepted_ips(text);
             let risks = crate::firewall::lockout_risks(&built.rules, &connected_ips);
@@ -398,11 +422,15 @@ pub fn store_ip_ranges(
     let mut failed = 0;
     for (kind, result) in results {
         match result {
-            Ok(cidrs) => {
-                crate::ipranges::store(db, kind, &cidrs)?;
-                updated += 1;
-            }
-            Err(_) => failed += 1,
+            // Storing can fail on the feed as well as on the database: it
+            // refuses a fetch with nothing usable in it, rather than
+            // replacing a working list with an empty one. Counted as a
+            // failure like any other rather than propagated — a `?` here
+            // would abandon the loop *and* skip `set_cron_last_run` below,
+            // which leaves the job permanently due and re-fetching every
+            // one of these sources on every tick.
+            Ok(cidrs) if crate::ipranges::store(db, kind, &cidrs).is_ok() => updated += 1,
+            _ => failed += 1,
         }
     }
     let summary = if failed == 0 {
@@ -480,14 +508,14 @@ mod tests {
         let detector = Detector::SshScanners;
 
         detector.set_enabled(&db, false).unwrap();
-        let summary = run_log_job(&db, CronJob::Detect(detector), None, &out).unwrap();
+        let summary = run_log_job(&db, CronJob::Detect(detector), None, Some(&out)).unwrap();
         assert_eq!(summary, "disabled");
 
         detector.set_enabled(&db, true).unwrap();
-        let summary = run_log_job(&db, CronJob::Detect(detector), None, &out).unwrap();
+        let summary = run_log_job(&db, CronJob::Detect(detector), None, Some(&out)).unwrap();
         assert_eq!(summary, "SSH log unavailable");
 
-        let summary = run_log_job(&db, CronJob::RecordAccessStats, None, &out).unwrap();
+        let summary = run_log_job(&db, CronJob::RecordAccessStats, None, Some(&out)).unwrap();
         assert_eq!(summary, "NGINX access log unavailable");
 
         // Recorded, not just returned — a job that ran and reported
@@ -510,7 +538,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("fw.nft");
 
-        let summary = render_firewall(&db, &out_path, None);
+        let summary = render_firewall(&db, Some(&out_path), None);
 
         assert!(summary.contains("wrote"), "summary was: {summary}");
         assert!(out_path.exists());
@@ -530,7 +558,7 @@ mod tests {
         std::fs::write(&blocker, "").unwrap();
         let out_path = blocker.join("fw.nft");
 
-        let summary = render_firewall(&db, &out_path, None);
+        let summary = render_firewall(&db, Some(&out_path), None);
 
         assert!(summary.starts_with("error: "), "summary was: {summary}");
         assert!(
@@ -550,7 +578,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("nested/does/not/exist/fw.nft");
 
-        let summary = render_firewall(&db, &out_path, None);
+        let summary = render_firewall(&db, Some(&out_path), None);
 
         assert!(summary.contains("wrote"), "summary was: {summary}");
         assert!(out_path.exists());
@@ -648,5 +676,45 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), CronJob::all().len());
+    }
+    /// Storing can now fail on the *feed* — it refuses a fetch with nothing
+    /// usable in it rather than replacing a working list with an empty one.
+    /// That must stay a counted failure: propagating it would abandon the
+    /// loop before `set_cron_last_run`, leaving the job permanently due and
+    /// re-fetching every source on every tick.
+    #[test]
+    fn one_unusable_source_is_counted_rather_than_stalling_the_whole_job() {
+        use crate::ipranges::IpRangeSourceKind;
+
+        let db = test_db();
+        let results = vec![
+            (
+                IpRangeSourceKind::GoogleBot,
+                Ok(vec!["<!DOCTYPE html>".to_string()]),
+            ),
+            (
+                IpRangeSourceKind::GptBot,
+                Ok(vec!["1.2.3.0/24".to_string()]),
+            ),
+        ];
+
+        let summary = store_ip_ranges(&db, results).unwrap();
+
+        assert!(
+            summary.contains("updated 1 crawler source(s), 1 failed"),
+            "summary was: {summary}"
+        );
+        assert!(
+            db.get_cron_last_run(CronJob::UpdateIpRanges.id())
+                .unwrap()
+                .is_some(),
+            "the run must be recorded, or the job stays due forever"
+        );
+        assert_eq!(
+            db.ip_ranges_for_source(IpRangeSourceKind::GptBot.id())
+                .unwrap(),
+            vec!["1.2.3.0/24".to_string()],
+            "the source that worked must still have been stored"
+        );
     }
 }

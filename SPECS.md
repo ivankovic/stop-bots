@@ -3955,3 +3955,566 @@ proxy. Verified end to end — with it on, an attacker at one address is
 throttled while the operator at another logs in normally, and there is a test
 asserting exactly that. It already mattered for the anti-lockout guard; this
 gives it a second reason to be set, and the README now says so.
+
+## Security pass: untrusted feeds, an unbounded write, and unbounded fetches (`src/db.rs`, `src/fetch.rs`, `src/web/dashboard.rs`)
+
+Three findings from a pass scoped to the four categories `SECURITY.md` says
+are in scope. Each was confirmed by running the code, not by reading it.
+
+### A feed line reaching a root shell
+
+The generated firewall script is not data. iptables' is run with `sh`, and
+nftables' with `nft -f`; both are parsers that take statement separators.
+`iptables::render` and `nftables::render` interpolate `FirewallRule.address`
+verbatim, so an address is code by the time it lands.
+
+`Db::insert_firewall_rule` had validated admin-entered addresses since an
+earlier review, which explicitly exempted the fetched ranges — "those come
+from trusted upstream sources, not admin input". Reputable is not
+uncompromised, and `SECURITY.md` puts a hostile upstream list in scope.
+`replace_ip_ranges`, `replace_country_ranges` and `replace_reputation_ranges`
+validated nothing at all, and `ipranges::parse_zone_file` /
+`parse_prefixes_json` pass through whatever an upstream sends. Feeding
+`1.2.3.4/24; touch /tmp/pwned` through `replace_country_ranges` and rendering
+produced:
+
+```
+iptables -A STOP-BOTS -s 1.2.3.4/24; touch /tmp/pwned -j DROP
+```
+
+`ipranges::reputation::looks_like_address` was meant to be the guard for the
+six reputation feeds and was not one: it only inspected the part before the
+first `/`, so `1.2.3.4/$(reboot)` passed it. (The `;` and `#` forms happened
+to be caught there already — both are comment markers in those feeds and are
+stripped before the filter runs — which is why the hole survived review.)
+
+The fix is one validator at three depths:
+
+- `db::is_valid_address` is now `pub`, and `db::usable_addresses` filters and
+  trims through it. All four address tables use it. `looks_like_address`
+  delegates to it.
+- Feed entries are **dropped, not rejected as a batch**. These are fetched
+  unattended, in four formats from eight upstreams; one bad line in a
+  29,000-line zone file should cost that line. Failing the whole fetch is
+  also the more dangerous outcome — it leaves the *previous* ranges in place
+  while reporting an error nobody is awake to read. `replace_country_ranges`
+  now returns the stored count rather than `cidrs.len()`, so the number an
+  admin sees is the number that landed.
+- Both renderers check again and emit `# skipped (not an IP address or CIDR
+  range): {addr:?}` instead of a rule. Defence in depth for a database
+  written by an older version — and `{:?}` rather than `{}` because an
+  unvalidated address can contain a newline, which would end the comment and
+  make the remainder of it a statement.
+
+Addresses are also now stored **trimmed**, because they were validated
+trimmed: `is_valid_address` parses `address.trim()`, so `"1.2.3.4\n"` passed
+and was written into the middle of a rule line. Not injection — trim only
+reaches the ends — but under iptables' `set -e` the script aborts there and
+leaves the host with a partial rule set.
+
+### The console's arbitrary root write
+
+`web::dashboard::render_firewall` took its destination from a free-text form
+field and handed it to `firewall::write_script`, which `create_dir_all`s the
+parent. The console runs as root and the file it writes is an executable
+script, so `/etc/profile.d/`, `/etc/cron.d/` and a unit directory were all
+reachable — a way around every restriction this console is built around (it
+may not apply the firewall script, unblock a blocklist entry, or change its
+own password).
+
+The destination is now `AppState.firewall_out`, set by the new
+`stop-bots web --firewall-out` and shown in the panel rather than asked for.
+Where the script goes is an install-time decision made from a root shell, not
+a per-request one. A posted `out=` is ignored rather than rejected — axum's
+`Form` extractor drops a key the struct has no field for — and there is a
+test that posts one and asserts the file did not appear at that path.
+
+`install web` does **not** write `--firewall-out` into the generated unit,
+and shouldn't: `ExecStart` already omits every flag with a working default,
+and the installer creates `/etc/stop-bots/` for exactly this file. An
+operator who wants it elsewhere uses a drop-in (`systemctl edit
+stop-bots-web.service`, `ExecStart=` then the replacement line), which
+`install::preflight`'s edited-unit refusal does not touch — it compares the
+unit file itself, not the `.d/` directory beside it. Editing the unit in
+place would need `--force` on every later install; the drop-in is the
+systemd-native route and survives them.
+
+### Unbounded fetches
+
+All six downloads were bare `reqwest::get(url).text()`: no connect timeout,
+no total timeout, no bound on what is read into memory. Under the internal
+cron — which is where they now mostly run — an upstream that accepts the
+connection and then says nothing holds the job forever.
+
+New `src/fetch.rs` is the one place this project makes an outbound request:
+one shared `Client` (60s total, 10s connect, 5 redirects, a `stop-bots/x.y.z`
+user agent) and `fetch::text(url, what)`. The 32MB cap is checked against
+`Content-Length` first, so an oversized body is refused before a byte is
+read, and then against the bytes actually arriving, because nothing obliges
+a peer to declare a true length. An oversized body is refused rather than
+truncated: a truncated blocklist is one with entries silently missing.
+
+`what` names the source rather than the URL — "the ai.robots.txt list" is
+what an admin recognises in a cron log.
+
+Tested against a real loopback server rather than a mocked client (the thing
+under test is behaviour against bytes on a socket), with the limit as a
+parameter on a private `capped_text` so the refusal paths cost eight bytes
+instead of 32MB. One of those tests exists only because the client is now
+shared: bailing on an over-cap response drops the `Response` mid-body, so it
+checks that a refused fetch leaves the connection pool able to serve the
+next one.
+
+### What the new refusal did to its callers
+
+`reject_a_wholly_unusable_fetch` turns an outcome that used to be `Ok(0)`
+into an `Err`, and three callers reached it with a `?`:
+
+- `cron::store_ip_ranges` would have abandoned its loop *and* skipped
+  `set_cron_last_run`, leaving `UpdateIpRanges` permanently due — so a
+  single broken feed would have had the console re-fetching all three
+  sources every tick. A store failure is now counted alongside a fetch
+  failure, which is what the summary already reported.
+- `App::finish_reputation_fetch` and `App::finish_country_select` would have
+  propagated it out of the event handler. A feed serving an error page must
+  not be able to take the TUI down; both now set `self.message`, matching
+  how every other failure in those handlers is already reported, and the
+  country is not marked selected on the strength of ranges that were never
+  stored.
+
+### One doc comment that was simply wrong
+
+`firewall::apply_script` said "Never called from anywhere unattended (no cron
+job calls this)". `batch::render_and_apply_firewall` calls it under
+`--apply`, and `batch` is the documented crontab entry point. The comment now
+names both callers and says what the guarantee actually is: nothing applies a
+script without an operator having asked for it, by pressing a key or by
+putting `--apply` in a crontab — which is not the same as a human looking.
+
+## Per-address detail on Dynamic Protection (`src/ipdetail.rs`, `i` in the TUI, `?inspect=` in the web UI)
+
+The reflex answer to "what is this address" is reverse DNS and whois. Neither
+is here, and the reasoning is the feature's main design decision.
+
+Both are outbound requests, one per row, to infrastructure an attacker
+frequently controls — so a detail view that did them on render would hand
+every visible row's latency to whoever is attacking, which is the shape of
+the unbounded-fetch problem the security pass had just fixed arriving through
+a different door. Worse, a PTR record is written by whoever holds the
+address. It is attacker-supplied text that *reads* as authoritative, and a
+row showing `crawl-66-249-66-1.googlebot.com` beside an attack count invites
+exactly the wrong conclusion.
+
+What this host already downloads answers most of the same question, offline
+and instantly: six reputation feeds (`reputation_ranges`), three crawler
+sources (`ip_ranges`), and whichever countries have been fetched
+(`country_ip_ranges`). "Is this a hosting provider, a Tor exit, a known-bad
+address, or a crawler that is who it claims to be" is most of what anyone
+opens a whois for, and the crawler answer is *better* than whois gives —
+being inside Google's published ranges is the thing a user agent string
+cannot fake.
+
+### What the model holds
+
+`IpDetail` carries the feed hits (with the matching range: "in Google's
+ranges" and "in `66.249.64.0/19`" are different amounts of evidence, and the
+second is free), the country, the block status, and the usernames. Three
+details that are each there because the obvious version is wrong:
+
+- **`AddressKind`** short-circuits private and malformed addresses. Every
+  detector in `accesslog` already skips loopback and RFC1918, and a panel
+  solemnly reporting "in none of six reputation feeds" for `10.0.0.5` is
+  true and actively misleading — no feed lists those because none can.
+- **`country_data_available`** exists so `country: None` can be told from
+  "no zone file has ever been fetched". Without it the view reports a fact
+  about this host's data as a fact about the address.
+- **One hit per source.** A feed listing both a /16 and a /24 covering one
+  address has said one thing, not two.
+
+`status` is passed in from the row rather than recomputed, so the verdict
+shown in two places at once has one source of truth.
+
+### Usernames
+
+`sshlog` parsed straight past the username to get at the address. It is now
+kept — "root, admin, oracle, test" is the single most informative thing an
+SSH log holds about an attacker — bounded by the *same* `" from "`
+[`ip_after`] uses, so a line the address parse rejects is rejected here too
+and the pair can never come from two readings of one line.
+
+It is attacker-controlled text: capped at 48 characters and stripped of
+control characters at the parser, not in each front-end, because the TUI
+draws into fixed-width cells and an escape sequence reaching the alternate
+screen is a corrupted display. A username containing the literal `" from "`
+defeats `ip_after` and so drops the line from every count in that module —
+pre-existing, a detection weakness rather than a display one, pinned by a
+test and recorded in TODO.md rather than worked around here.
+
+### Cost
+
+The lookup scans the range lists rather than indexing them. That is the cost
+model already shipping: `dynamic::Live::load` pulls `blocked_ip_ranges` and
+scans it per row on *every* render of the screen this opens from, so one
+scan on an explicit keypress is strictly cheaper than the surrounding
+screen. Measured at 16ms over 20,000 ranges — the test goes at `hits`
+directly rather than through `IpDetail::load`, because inserting 20,000 rows
+to re-measure the database read put the test's own setup, not the scan, up
+against the 300ms budget.
+
+The username breakdown is computed **for one address, when a detail view is
+actually opened** — not for every address on every refresh. The first
+version did the latter, and it was measured rather than assumed: building
+the whole map took `dynamic::Live::load` from 78ms to 293ms on a
+120,000-line auth.log, paid by both front-ends on every render whether or
+not anyone ever pressed `i`. (The log *read* is 6ms of that — parsing
+dominates entirely, so the "it's behind a slow read anyway" intuition was
+simply wrong.) Scoped to one address it is 45ms, once, on the keypress.
+`dynamic::Live` is unchanged as a result.
+
+Getting there needed the TUI screen to reach the log text, which it does not
+keep — and giving one screen's `handle_key` an extra parameter would break
+the uniform dispatch signature all four screens share. `KeyOutcome` already
+exists for exactly this: `i` returns `KeyOutcome::InspectAddress`, and `App`
+— which holds `ssh_log_text` from its background read — assembles the detail
+and hands it back via `show_detail`, the same shape `UpdateSource` and
+`SelectCountry` already use. It is synchronous, unlike its `start_`/`finish_`
+neighbours, because nothing it touches is slow: the log is already in memory
+and the rest is a scan the surrounding screen does per render anyway. The web
+handler already knows `inspect` inside the closure that reads the log, so it
+needs none of this.
+
+### Two front-ends, two shapes
+
+The TUI gets a popup on `i`, which claims `Esc` while open (the nested
+back-out `site_detail` already uses) and swallows every other key, so a
+keystroke meant for the popup can never block an address behind it. The
+User Agent panel says why it has nothing to inspect rather than opening an
+empty popup: its rows are keyed by user agent, not address.
+
+The web UI uses `?inspect=<address>` on the same page rather than an htmx
+fragment — the page is already parameterised by `?filter=`, so this is the
+same shape, and it survives a reload and can be linked to. The address is
+percent-encoded into that URL by a hand-rolled encoder: one query parameter
+does not justify a dependency, and the only way to get it wrong is to be too
+permissive.
+
+### The help screen has no slack, and now says so in code
+
+Adding one line to `tui/help.rs` pushed the last line — the one that says how
+to close the help screen — off the bottom. The file's comment already warned
+that "adding an entry here means merging or dropping another"; a comment was
+not enough, and the only thing that noticed was an end-to-end pty test
+failing fifteen seconds later with a timeout. There is now a `MAX_LINES`
+constant, a `debug_assert`, and a unit test that renders at the pty harness's
+body size and asserts the last line survives. The Dynamic Protection entries
+were merged onto one line to stay inside the budget.
+
+## `install web`: the binary has to exist inside the unit's own sandbox
+
+Reported from a real Debian host. `./stop-bots install web`, run from
+`/root`, wrote `ExecStart=/root/stop-bots` and then:
+
+```
+Process: ExecStart=/root/stop-bots web ... (code=exited, status=203/EXEC)
+(top-bots)[191414]: Unable to locate executable '/root/stop-bots': No such file or directory
+```
+
+The file was there. The unit sets `ProtectHome=yes`, which replaces `/root`,
+`/home` and `/run/user` with empty directories for the service — so
+`ExecStart` is resolved in a filesystem where the binary genuinely does not
+exist. `PrivateTmp=yes` does the same to `/tmp` and `/var/tmp`.
+
+`preflight` checked `binary.is_file()`, which asks the *installer's*
+filesystem. That is a different question from "can systemd execute this",
+and the hardening the installer writes is what makes the two disagree. The
+check that was missing is `hidden_from_unit`, and its test asserts the
+directive it names is still in `web_unit`'s text — so adding a sandbox
+directive that hides somewhere new cannot silently outrun the list.
+
+The message is the whole value here: systemd's own report is accurate and
+useless, so `hidden_binary_error` is a pure function, separately tested, that
+names the directive and gives two commands to paste. A relative `--binary`
+is refused in the same place, before `is_file`, because systemd requires an
+absolute `ExecStart` and rejects such a unit at *load* time — a failure that
+does not even present as a failed service.
+
+### The flag that was dead in production
+
+The check only makes sense for a real install: `--prefix` writes a unit
+nothing will ever start, and every `--prefix` staging tree is under `/tmp`,
+so applying it there would refuse all of them. The first version put a
+`real: bool` on `Layout`, set by `Layout::system`.
+
+`main.rs` never calls `Layout::system`. It builds every layout with
+`Layout::under(&prefix, binary)`, prefix defaulting to `/` — so `real` was
+`false` on the one path that mattered and the new check was dead in
+production while all 21 install tests passed. It was caught by reproducing
+the reported failure against the built binary rather than trusting the
+tests, and the fix is to derive the flag inside `under` from `prefix == "/"`
+so there is nothing for a caller to forget.
+
+### What a failed activation leaves behind
+
+`systemctl enable --now` is two operations and the first one sticks: a
+failed start leaves the unit enabled, failed, and enabled again at the next
+boot. Systemd's own start limit ends the restart loop after a few attempts,
+so this is untidy rather than dangerous — but the error said only "exited
+with 1". It now names `systemctl disable --now stop-bots-web.service`.
+
+## Web Access, "Update everything", "Apply everything", and applying the firewall from the console
+
+Four requests, two changes. The first three run machinery that already
+existed from a button; the Web Access panel is new NGINX codegen with its
+own failure mode, so it landed separately.
+
+### `src/refresh.rs`: one answer to "what does 'everything' mean"
+
+`batch::update_lists` enumerated the four kinds of downloadable source
+itself, and could not be reused: it was an `async fn` holding `&Db` across
+every fetch. `Db` is not `Sync`, and the console reaches its database
+through `spawn_blocking`, which needs `Send + 'static`. So that function
+works exactly once — in `batch`, on a current-thread runtime — and nowhere
+else.
+
+`refresh::plan` now decides *what* to update; `fetch` touches no database
+and `store` touches no network, so either front-end drives them in whatever
+order its runtime allows. `batch::update_lists` is a loop over the same
+plan. That matters beyond tidiness: a button labelled "Update everything"
+that skipped reputation feeds or selected countries would be lying, and the
+test for it is that after pressing it, nothing in the UI still tells you to
+go and run a CLI command.
+
+Only *enabled* feeds and *selected* countries are planned. A feed nobody
+turned on and a country nobody chose are not lists this host uses, and
+fetching them would be pointless requests and a table of ranges no rule
+references.
+
+### Selecting a country does not download, deliberately
+
+The TUI fetches a country's zone file when you select it, and the console
+does not. The asymmetry is on purpose, and it is worth recording because
+the obvious fix is to match the TUI:
+
+- An aggregated zone file is hundreds of kilobytes from a third party.
+  Blocking a request handler on that makes the button feel broken on a slow
+  link, where the TUI does it on a background thread with a spinner.
+- This project keeps its test suite free of network access (see "Testing
+  without nginx, iptables or the network"). Fetching on POST made
+  `the_geo_mode_and_country_selection_round_trip` reach ipdeny.com — it
+  went from 0.35s to 0.93s of real HTTP, which is how it was noticed.
+
+What the handler no longer does is tell the operator to run
+`stop-bots update-country-ranges` themselves. It names the button.
+
+### Applying the firewall from the console
+
+One of the console's three deliberate omissions, reversed on request. It
+happens in exactly one place, `write_and_apply_firewall`, and three things
+make it defensible:
+
+- `assess_lockout_risk` runs against the rules in the order the script will
+  evaluate them, *before* anything is written. A risk is a refusal, not a
+  warning — the same guard `batch --apply` uses.
+- `apply_for_real` gates the run, so `stop-bots web --no-apply` keeps the
+  old write-only behaviour.
+- What executes is the script just written to `firewall_out`, not a freshly
+  derived one, so it is what the guard approved and what the operator can
+  read afterwards.
+
+The apply itself goes through `spawn_blocking`: it runs `nft -f` or `sh`,
+and a subprocess on the async runtime blocks whatever else that thread was
+about to serve.
+
+`FirewallBackend` is now stored (`firewall:backend`), because a one-click
+"Apply everything" needs an answer without guessing, and an operator who
+picked iptables once should not be handed an nftables script next time. It
+falls back to nftables, that being the only backend that can express IPv6
+and an allowlist catch-all.
+
+### The Web Access panel
+
+Path mode is the default because the console has a password form and a
+session cookie: a path attaches to a site that already has a certificate,
+where a subdomain needs its own. Within the chosen site it takes the **TLS**
+`server` block, not the port-80 redirect — a site normally has both, and
+putting the login form in the first would serve it in the clear on a host
+with a certificate sitting right there.
+
+Three things are written and all three must agree:
+
+- the `location` block (own sentinels, `CONSOLE_BEGIN`/`CONSOLE_END` — the
+  bot-blocking markers live in the same `server` block and are rewritten by
+  a different action, so one pair would have the two deleting each other's
+  work);
+- `web:base_path`, because this server matches the full path *including* the
+  prefix and generates links that do too;
+- `web:allowed_hosts`, because a proxied request arrives carrying the site's
+  host name and the host guard refuses one it was not told about.
+
+Miss the second and every link leaves the location block. Miss the third and
+every request is a 403. Both failures look like a broken console rather than
+a missing setting, which is why the panel writes all three or none.
+
+`proxy_pass` deliberately has no trailing slash, and there is a test for it:
+a trailing slash makes NGINX strip the prefix, which breaks the first thing
+in that list.
+
+### `write_validated`: the one that can hurt an operator
+
+`apply_all_sites` writes then tests. That is survivable for an edit to a
+file NGINX already loads. A *new* `server` block that fails `nginx -t` leaves
+the entire config unloadable — and nothing looks wrong, because the running
+NGINX keeps serving from memory. The bill arrives at the next reload, most
+likely certbot's renewal hook in the middle of the night.
+
+So the console's NGINX writes go through `write_validated`: keep the
+previous content, write, `nginx -t`, and on failure put the previous state
+back (or delete the file if there wasn't one) before reporting. The error
+says the rollback happened, and says so much louder if the rollback itself
+failed. Validation is not gated by `--no-apply`: it is read-only and it is
+the safety mechanism. `--no-apply` gates the reload.
+
+## The firewall backend is the single source of truth
+
+Two bugs from one host, both from the same shape: the backend was decided in
+one place and something that depends on it was decided in another.
+
+### An iptables script in a file called `firewall.nft`
+
+`AppState.firewall_out` was a `PathBuf` fixed at startup, defaulting to
+`/etc/stop-bots/firewall.nft`, while the backend came from a form on every
+render. On a host set to iptables, the console wrote `#!/bin/sh` and 12,000
+`iptables -A` lines into a file named for the other backend. Confusing
+exactly when it matters — while deciding which of two scripts to run.
+
+Worse, and found while fixing it: `cron::render_firewall` hardcoded
+`FirewallBackend::Nftables`. With iptables stored, every tick quietly
+replaced the operator's iptables script with an nftables one *at the same
+path*, and the next "Apply everything" ran `sh` over nftables syntax.
+
+The backend now decides both. `firewall::default_output_path(backend)` is
+the one mapping (`main.rs` delegates to it), `firewall::output_path` layers
+an explicit `--firewall-out` over it, and `AppState.firewall_out` is an
+`Option` meaning "override" rather than "the path". The cron reads
+`stored_backend`. The console derives the path inside the same closure that
+reads the backend, so the two cannot be computed apart.
+
+The test worth having is not a second copy of the mapping: it renders each
+backend, reads the script's own shebang, and asserts the extension agrees
+with it.
+
+An explicit path wins outright, extension and all. Someone who passes
+`--firewall-out /srv/rules.txt` has said where they want it, and rewriting
+their suffix would be the same surprise in the other direction.
+
+### The unit's sandbox forbade the thing the console had just learned to do
+
+`stop-bots install web` writes `RestrictAddressFamilies=AF_UNIX AF_INET
+AF_INET6`, under a comment that read:
+
+> Nothing here uses a raw or netlink socket: this service writes the
+> firewall script, it never applies it.
+
+That was true when it was written. Adding "apply the firewall from the
+console" made it false without touching the file, and the symptom was:
+
+```
+nft -f exited with exit status: 3: src/mnl.c:64:
+Unable to initialize Netlink socket: Address family not supported by protocol
+```
+
+Both `nft` and Debian's nft-backed `iptables` talk to the kernel over
+netlink. Reproduced in one line —
+`systemd-run --user -p RestrictAddressFamilies='AF_UNIX AF_INET AF_INET6' ip link show`
+prints the same "Address family not supported by protocol" — which is what
+turned a plausible guess into a diagnosis before anything was changed.
+
+`AF_NETLINK` is now in the list. It is a real widening of the sandbox, and
+it is the price of the feature: there is no way to load a ruleset without
+talking to the kernel.
+
+The second half is `firewall::sandbox_hint`. nft's message is accurate,
+mentions neither systemd nor this project, and sends whoever reads it
+hunting for a missing kernel module. A netlink refusal now appends the
+directive to check, the command to check it with, and the fact that units
+written before applying existed do not have it — `install web --force` and a
+restart. It is a *hint*, not a fix: the file belongs to the host, and an
+operator running an older unit needs to be told which line to change rather
+than have it changed under them.
+
+**Both of these are the same lesson as `apply_script`'s doc comment in the
+security pass, and as the `ProtectHome` install bug**: a comment or a
+constant that asserts what the code does not need is a claim with no test
+behind it, and it goes stale the moment the code starts needing it. The
+golden unit file is what tests this one now — the `AF_NETLINK` line cannot
+change without the golden diff showing it.
+
+## The same three actions in the TUI
+
+"Make sure the TUI also has this functionality" is the request that decides
+whether a feature was built in the right place. Two of the three had been:
+`u` reuses `refresh::plan`/`fetch`/`store`, and `a` chains the two
+background pairs the TUI already had (`start_site_action(ApplyAll)` and
+`start_firewall_render`) rather than reimplementing either. Reimplementing
+the second would have meant a second copy of the anti-lockout guard, which
+is exactly the duplication the console's version had just collapsed.
+
+The third had not. `set_web_access` was 120 lines of validation, NGINX
+codegen and settings writes living inside an axum handler, and none of it
+was reachable from the TUI. It is now `src/webaccess.rs`, split the same
+three ways `refresh` is and for the same reason — the middle step runs a
+subprocess and must be able to run where `Db` cannot:
+
+- `plan(db, request)` reads the scanned sites, the bind address and the
+  NGINX commands, and validates what was typed.
+- `apply(plan, root)` writes the config and runs `nginx -t`. No `Db`.
+- `record(db, plan)` stores the host name and path prefix, **only after**
+  the config validated. A host allowlist naming somewhere NGINX never got
+  is a setting that only makes the console harder to reach, and there is a
+  test that a refused `nginx -t` leaves both settings untouched.
+
+The console does all three inside one `with_db` closure, because all three
+are synchronous and its `Db` is already on a blocking thread; splitting
+there would buy nothing. The TUI splits them across the thread boundary,
+because its `Db` lives on the main thread. Same three functions either way.
+
+### One event per source, not one payload bundle
+
+`u` fetches one source and stores it before starting the next. The plan on
+a real host is three bot lists, three crawler ranges, whatever feeds are
+enabled and whatever countries are selected — eight or more downloads of
+several megabytes each. Fetch-all-then-store-all would hold every payload
+in memory at once and leave the message line empty until the last one
+landed. `AppEvent::EverythingSourceFetched` carries one body, and
+`finish_update_everything_source` stores it and starts the next.
+
+### Where the keys are hinted, and why not where they belong
+
+`u`, `a` and `w` act on the whole host, so by meaning they belong to the
+"System-wide settings" panel — which is where the console's two buttons
+moved. The hint is in the *Summary* panel's title instead, and the reason
+is measured rather than assumed: that panel is half-width, which is 37
+title columns at an 80-column terminal, and ratatui truncates a longer
+`Block` title silently. "System-wide settings — u update everything, a
+apply everything" loses everything past "a app" there. A title short enough
+to fit — "System-wide settings — u/a/w" — names the keys without saying
+what they do. Summary is full-width, and already the panel that says
+"press f".
+
+The Help screen's `MAX_LINES = 27` had zero slack, so adding three keys
+meant merging three lines first: `m`/`f` onto one line, and the Dashboard's
+`(focus)` line folded into Navigation's `Up/Down`. Budgeting before wiring
+is cheaper than discovering it from a pty test timing out.
+
+### The panel padding bug the move surfaced
+
+`.panel-body { padding: 4px 16px 14px; }` is the only thing giving a
+panel's loose content side padding. A `table` is full-bleed by design and
+brings its own cell padding; anything after it has to be wrapped. The Web
+Access panel emitted its form and hints bare, so its dropdowns sat flush
+against the panel edge — and moving the two buttons into "System-wide
+settings" would have reproduced it exactly, since that panel's content is
+also a bare table.
+
+The test is a rule rather than two assertions: for each panel, whatever
+follows the last `</table>` must start with a `.panel-body`.

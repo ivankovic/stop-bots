@@ -69,9 +69,15 @@ pub enum Job {
     ScanSites,
     /// Rewriting site config files. See [`App::start_site_action`].
     ApplySites,
+    /// Writing the NGINX config that serves this console, and running
+    /// `nginx -t` over it. See [`App::start_web_access`].
+    ApplyWebAccess,
     /// Reading each site's config file to work out whether its block is
     /// current. See [`App::start_site_status_check`].
     CheckSiteStatuses,
+    /// Downloading every list this host uses, one source at a time. See
+    /// [`App::start_update_everything`].
+    UpdateEverything,
 }
 
 impl Job {
@@ -86,7 +92,9 @@ impl Job {
             Job::RenderFirewall => "writing the firewall script".to_string(),
             Job::ScanSites => "scanning the NGINX config".to_string(),
             Job::ApplySites => "writing site config".to_string(),
+            Job::ApplyWebAccess => "setting up NGINX for this console".to_string(),
             Job::CheckSiteStatuses => "checking site config".to_string(),
+            Job::UpdateEverything => "downloading every list".to_string(),
         }
     }
 }
@@ -170,6 +178,46 @@ pub struct App {
     /// both exist for exactly the same "don't really execute system-
     /// changing commands under test" reason.
     apply_firewall: bool,
+    /// Where "Apply everything" writes the firewall script. `None` means
+    /// "follow the backend", which is what [`crate::firewall::output_path`]
+    /// does: an nftables render lands in `.nft` and an iptables one in
+    /// `.sh`.
+    ///
+    /// A field rather than a call at the point of use for the same reason
+    /// the console has one: the default is a real path under `/etc`, and a
+    /// test that presses the key must be able to point it somewhere
+    /// harmless. The render *popup* takes its path from the admin instead,
+    /// which is why this only covers the one-key path.
+    pub firewall_out: Option<std::path::PathBuf>,
+    /// An "update everything" run in progress: the sources still to fetch
+    /// and what the finished ones came to. `None` when none is running.
+    ///
+    /// One source at a time, deliberately. The whole plan is eight or more
+    /// downloads of several megabytes each; fetching them all at once
+    /// would hold every payload in memory and show nothing until the last
+    /// one landed, while one-at-a-time keeps it to a single body and gives
+    /// the message line something true to say throughout.
+    update_all: Option<UpdateAllRun>,
+    /// Set while "Apply everything" is waiting on its NGINX half, so
+    /// [`App::finish_site_apply`] knows to start the firewall half after
+    /// it. The two are independent — whichever fails, the other still gets
+    /// its turn — they are merely sequenced so that their messages do not
+    /// overwrite each other.
+    apply_everything: bool,
+}
+
+/// The state of one "Apply everything"/"Update everything"'s update half.
+struct UpdateAllRun {
+    /// Sources not yet fetched, in plan order, popped from the front.
+    remaining: std::collections::VecDeque<crate::refresh::Source>,
+    /// How many stored cleanly so far.
+    done: usize,
+    /// `"<source>: <error>"` for each that did not, to report at the end.
+    failures: Vec<String>,
+    /// Every outcome so far, which is what
+    /// [`crate::refresh::crawler_ranges_all_succeeded`] needs to decide
+    /// whether the `UpdateIpRanges` job can be marked run.
+    outcomes: Vec<(crate::refresh::Source, Result<String, String>)>,
 }
 
 /// Runs a downloaded body's parser on the blocking pool.
@@ -342,6 +390,9 @@ impl App {
             reload_nginx_for_real: reload_nginx,
             apply_firewall: reload_nginx,
             ssh_log,
+            firewall_out: None,
+            update_all: None,
+            apply_everything: false,
         };
         botlist::register_all_sources(&app.db)?;
         // Same reason bot-list sources are registered here: the Dashboard's
@@ -483,12 +534,18 @@ impl App {
                     std::sync::Arc::try_unwrap(outcome).unwrap_or_else(|shared| (*shared).clone());
                 self.finish_site_apply(outcome)?;
             }
+            Event::App(AppEvent::EverythingSourceFetched { source, result }) => {
+                self.finish_update_everything_source(source, result)?
+            }
+            Event::App(AppEvent::WebAccessApplied { plan, result }) => {
+                self.finish_web_access(*plan, result)?
+            }
         }
         Ok(())
     }
     // ---- background work: every `start_` has a `finish_` ----
     //
-    // The shape is the same eleven times over, and it is the reason the
+    // The shape is the same thirteen times over, and it is the reason the
     // TUI never blocks. A `start_` method does the `Db` reads on the main
     // thread, puts the slow half on a runtime or blocking-pool task, and
     // returns immediately; the task sends an `AppEvent`; the matching
@@ -508,6 +565,28 @@ impl App {
     /// `Db`'s connection isn't `Sync` — the spawned task only fetches and
     /// parses; storing the result happens back on the main thread in
     /// `finish_source_update`.
+    /// Assembles the per-address detail the Dynamic Protection screen
+    /// asked for, and hands it back to that screen.
+    ///
+    /// Synchronous, unlike its `start_`/`finish_` neighbours, because it
+    /// touches nothing slow: the SSH log is already read and in memory,
+    /// and the rest is a database scan the surrounding screen already does
+    /// per render. The username breakdown is computed here, for this one
+    /// address, rather than for every address on every refresh — which
+    /// measured 138ms on a 120,000-line auth.log, paid whether or not
+    /// anyone ever pressed `i`.
+    fn inspect_address(&mut self, address: &str) -> Result<()> {
+        let usernames = self
+            .ssh_log_text
+            .as_deref()
+            .map(|text| crate::sshlog::failed_attempt_usernames_for(text, address))
+            .unwrap_or_default();
+        let status = self.dynamic_protection.status_of(address);
+        let detail = crate::ipdetail::IpDetail::load(&self.db, address, status, usernames)?;
+        self.dynamic_protection.show_detail(detail);
+        Ok(())
+    }
+
     fn start_source_update(&mut self, source_id: String) {
         self.message = Some(format!("Updating {}…", source_display_name(&source_id)));
         let sender = self.events.sender();
@@ -631,12 +710,17 @@ impl App {
                     "{name} returned no usable addresses — upstream format may have changed"
                 ));
             }
-            Ok(cidrs) => {
-                let count = self.db.replace_reputation_ranges(&source_id, &cidrs)?;
-                self.message = Some(format!(
-                    "{name}: {count} range(s) stored — render the firewall (f) to apply"
-                ));
-            }
+            // A store failure is a message, not a `?`: storing now refuses
+            // a fetch with nothing usable in it, and a bad feed must not be
+            // able to take the TUI down with it.
+            Ok(cidrs) => match self.db.replace_reputation_ranges(&source_id, &cidrs) {
+                Ok(count) => {
+                    self.message = Some(format!(
+                        "{name}: {count} range(s) stored — render the firewall (f) to apply"
+                    ));
+                }
+                Err(err) => self.message = Some(format!("{name}: {err}")),
+            },
             Err(err) => {
                 self.message = Some(format!("{name} update failed: {err}"));
             }
@@ -661,7 +745,18 @@ impl App {
         let label = country_code.to_uppercase();
         match result {
             Ok(cidrs) => {
-                let count = self.db.replace_country_ranges(&country_code, &cidrs)?;
+                // Same reasoning as `finish_reputation_fetch`: a country
+                // zone file that came back unusable is reported, and the
+                // country is not selected on the strength of ranges that
+                // were never stored.
+                let count = match self.db.replace_country_ranges(&country_code, &cidrs) {
+                    Ok(count) => count,
+                    Err(err) => {
+                        self.message = Some(format!("{label}: {err}"));
+                        self.refresh()?;
+                        return Ok(());
+                    }
+                };
                 self.db.set_country_selected(&country_code, true)?;
                 let verb = match self.db.get_geo_mode()? {
                     crate::db::GeoMode::Blocklist => "Blocked",
@@ -904,6 +999,9 @@ impl App {
         if changed_a_file {
             self.start_nginx_reload();
         }
+        if self.apply_everything {
+            self.start_everything_firewall();
+        }
         Ok(())
     }
 
@@ -1024,12 +1122,9 @@ impl App {
     /// the two can't drift.
     fn finish_cron_log_job(&mut self, job: CronJob, log_text: Option<String>) -> Result<()> {
         self.jobs_in_flight.remove(&Job::Cron(job));
-        crate::cron::run_log_job(
-            &self.db,
-            job,
-            log_text.as_deref(),
-            std::path::Path::new(crate::firewall::DEFAULT_OUTPUT_PATH),
-        )?;
+        // `None`: no override, so the path follows the stored backend —
+        // an nftables render lands in `.nft` and an iptables one in `.sh`.
+        crate::cron::run_log_job(&self.db, job, log_text.as_deref(), None)?;
         self.refresh()?;
         Ok(())
     }
@@ -1120,6 +1215,232 @@ impl App {
         self.refresh()
     }
 
+    /// Downloads every list this host uses, one source at a time — the
+    /// TUI's half of what `stop-bots batch` and the console's "Update
+    /// everything" button do, through the same [`crate::refresh::plan`].
+    ///
+    /// One source failing is reported and the rest still run: these are
+    /// eight third parties, and a transient failure at one of them is not
+    /// a reason to leave the other seven stale.
+    fn start_update_everything(&mut self) {
+        if self.jobs_in_flight.contains(&Job::UpdateEverything) {
+            self.message = Some("Already downloading every list.".to_string());
+            return;
+        }
+
+        // Planning reads `Db`, so it happens here, on the main thread.
+        let plan = match crate::refresh::plan(&self.db) {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.message = Some(format!("Could not work out what to update: {err}"));
+                return;
+            }
+        };
+        self.jobs_in_flight.insert(Job::UpdateEverything);
+        self.update_all = Some(UpdateAllRun {
+            remaining: plan.into(),
+            done: 0,
+            failures: Vec::new(),
+            outcomes: Vec::new(),
+        });
+        self.fetch_next_everything_source();
+    }
+
+    /// Sends the next source of an in-flight "update everything" to the
+    /// network, or finishes the run when there is none left.
+    fn fetch_next_everything_source(&mut self) {
+        let Some(run) = self.update_all.as_mut() else {
+            return;
+        };
+        let Some(source) = run.remaining.pop_front() else {
+            self.finish_update_everything();
+            return;
+        };
+
+        self.message = Some(format!("Downloading {}\u{2026}", source.label()));
+        let sender = self.events.sender();
+        // A runtime task rather than the blocking pool: `refresh::fetch`
+        // is `async` all the way down, and it touches no `Db`.
+        tokio::spawn(async move {
+            let result = crate::refresh::fetch(&source)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = sender.send(Event::App(AppEvent::EverythingSourceFetched {
+                source,
+                result,
+            }));
+        });
+    }
+
+    /// Stores one downloaded source and starts the next.
+    ///
+    /// Storing is a `Db` write, so it waits for the main thread like every
+    /// other one — which is also why the event carries the raw body rather
+    /// than parsed rows.
+    fn finish_update_everything_source(
+        &mut self,
+        source: crate::refresh::Source,
+        result: Result<String, String>,
+    ) -> Result<()> {
+        // A run that was never started (or already finished) has nothing
+        // to record. Reachable only if an event outlives its run, but
+        // dropping it beats panicking on a live server.
+        if self.update_all.is_none() {
+            return Ok(());
+        }
+
+        let outcome = match result {
+            Ok(raw) => {
+                crate::refresh::store(&self.db, &source, &raw).map_err(|err| format!("{err:#}"))
+            }
+            Err(err) => Err(err),
+        };
+        let run = self.update_all.as_mut().expect("checked above");
+        match &outcome {
+            Ok(_) => run.done += 1,
+            Err(err) => run.failures.push(format!("{}: {err}", source.label())),
+        }
+        run.outcomes.push((source, outcome));
+
+        self.fetch_next_everything_source();
+        // Every source is a list something on screen counts or dates, so
+        // the screens are stale whether this one stored or not.
+        self.refresh()
+    }
+
+    /// Reports a finished "update everything" and clears its state.
+    fn finish_update_everything(&mut self) {
+        self.jobs_in_flight.remove(&Job::UpdateEverything);
+        let Some(run) = self.update_all.take() else {
+            return;
+        };
+
+        // Only when all three crawler sources worked, for the reason
+        // `refresh::crawler_ranges_all_succeeded` documents.
+        if crate::refresh::crawler_ranges_all_succeeded(&run.outcomes) {
+            crate::cron::record_run(
+                &self.db,
+                crate::cron::CronJob::UpdateIpRanges,
+                "updated from the Dashboard",
+            );
+        }
+
+        self.message = Some(if run.failures.is_empty() {
+            format!("Updated {} list(s).", run.done)
+        } else {
+            format!(
+                "Updated {} list(s). {} failed \u{2014} {}",
+                run.done,
+                run.failures.len(),
+                run.failures.join("; ")
+            )
+        });
+    }
+
+    /// Writes and enforces both planes: the NGINX config, then the
+    /// firewall — the TUI's half of the console's "Apply everything".
+    ///
+    /// The two are independent, same as `batch --apply`: whichever fails,
+    /// the other still gets its turn, because a half-applied host is
+    /// better than one where an NGINX syntax error also left the firewall
+    /// stale. The *writes* are sequenced rather than concurrent only
+    /// because the TUI has one message line and two jobs finishing at once
+    /// would overwrite each other's answer. The NGINX reload that follows
+    /// the site apply does overlap the firewall render — both are started
+    /// from `finish_site_apply` — which is fine, because neither reads
+    /// what the other writes.
+    fn start_apply_everything(&mut self) -> Result<()> {
+        if self.jobs_in_flight.contains(&Job::ApplySites)
+            || self.jobs_in_flight.contains(&Job::RenderFirewall)
+        {
+            self.message = Some("An apply is already running.".to_string());
+            return Ok(());
+        }
+
+        self.apply_everything = true;
+        self.start_site_action(crate::tui::site_settings::SiteAction::ApplyAll)?;
+        if !self.jobs_in_flight.contains(&Job::ApplySites) {
+            // The NGINX half refused before it started, so no
+            // `SitesApplied` event is coming to chain off. The firewall
+            // half is independent and still gets its turn.
+            self.start_everything_firewall();
+        }
+        Ok(())
+    }
+
+    /// The firewall half of "Apply everything": the stored backend, the
+    /// path that backend implies, and the same anti-lockout guard every
+    /// other render goes through.
+    fn start_everything_firewall(&mut self) {
+        self.apply_everything = false;
+        let backend = match crate::firewall::stored_backend(&self.db) {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.message = Some(format!("Failed to read the firewall backend: {err}"));
+                return;
+            }
+        };
+        let out = crate::firewall::output_path(self.firewall_out.as_deref(), backend);
+        // `force: false`: one key must not be able to talk its way past
+        // the lockout check. Someone who knows the log is unreadable uses
+        // the render popup, which asks.
+        self.start_firewall_render(backend, out.display().to_string(), false, true);
+    }
+
+    /// Puts this console behind NGINX, on a subdomain or a path prefix.
+    ///
+    /// Split across the thread boundary exactly the way
+    /// [`crate::webaccess`]'s three functions are: plan here, where `Db`
+    /// lives; write and `nginx -t` on the blocking pool; record the new
+    /// address back here once it validated.
+    fn start_web_access(&mut self, request: crate::webaccess::Request) {
+        if self.jobs_in_flight.contains(&Job::ApplyWebAccess) {
+            self.message = Some("Already setting NGINX up for this console.".to_string());
+            return;
+        }
+
+        let plan = match crate::webaccess::plan(&self.db, &request) {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.message = Some(format!("{err:#}"));
+                return;
+            }
+        };
+
+        self.jobs_in_flight.insert(Job::ApplyWebAccess);
+        let root = self.site_settings.root().to_path_buf();
+        let sender = self.events.sender();
+        tokio::task::spawn_blocking(move || {
+            let result = crate::webaccess::apply(&plan, &root).map_err(|err| format!("{err:#}"));
+            let _ = sender.send(Event::App(AppEvent::WebAccessApplied {
+                plan: Box::new(plan),
+                result,
+            }));
+        });
+    }
+
+    /// Records the address the console now answers to, and reloads NGINX.
+    fn finish_web_access(
+        &mut self,
+        plan: crate::webaccess::Plan,
+        result: Result<std::path::PathBuf, String>,
+    ) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::ApplyWebAccess);
+        match result {
+            Ok(path) => {
+                crate::webaccess::record(&self.db, &plan)?;
+                self.message = Some(format!(
+                    "Wrote {} and recorded the host. Restart the console for a changed path \
+                     prefix to take effect.",
+                    path.display()
+                ));
+                self.start_nginx_reload();
+            }
+            Err(err) => self.message = Some(format!("Web access setup failed: {err}")),
+        }
+        self.refresh()
+    }
+
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             self.events.send(AppEvent::Quit);
@@ -1163,6 +1484,10 @@ impl App {
                 self.screen = Screen::Dashboard;
                 return Ok(());
             }
+            KeyOutcome::InspectAddress(address) => {
+                self.inspect_address(&address)?;
+                return Ok(());
+            }
             KeyOutcome::UpdateSource(name) => {
                 self.start_source_update(name);
                 return Ok(());
@@ -1194,6 +1519,18 @@ impl App {
             }
             KeyOutcome::SiteAction(action) => {
                 self.start_site_action(action)?;
+                return Ok(());
+            }
+            KeyOutcome::UpdateEverything => {
+                self.start_update_everything();
+                return Ok(());
+            }
+            KeyOutcome::ApplyEverything => {
+                self.start_apply_everything()?;
+                return Ok(());
+            }
+            KeyOutcome::SetWebAccess(request) => {
+                self.start_web_access(request);
                 return Ok(());
             }
             KeyOutcome::Ignored => {}
@@ -1622,6 +1959,206 @@ mod tests {
         let message = app.message.as_deref().unwrap_or_default();
         assert!(message.contains("written"), "message was: {message}");
         assert!(!message.contains("applied"), "message was: {message}");
+    }
+
+    /// One source failing must not take the run down with it: the rest
+    /// still get their turn, and the failure is named in the summary.
+    #[tokio::test]
+    async fn update_everything_names_a_failed_source_and_still_finishes() {
+        let mut app = test_app();
+        app.jobs_in_flight.insert(Job::UpdateEverything);
+        app.update_all = Some(UpdateAllRun {
+            remaining: std::collections::VecDeque::new(),
+            done: 2,
+            failures: Vec::new(),
+            outcomes: Vec::new(),
+        });
+
+        app.finish_update_everything_source(
+            crate::refresh::Source::CrawlerRanges(crate::ipranges::IpRangeSourceKind::GoogleBot),
+            Err("timed out".to_string()),
+        )
+        .unwrap();
+
+        assert!(!app.jobs_in_flight.contains(&Job::UpdateEverything));
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("Updated 2 list(s)"), "was: {message}");
+        assert!(message.contains("timed out"), "was: {message}");
+        assert!(message.contains("crawler ranges"), "was: {message}");
+        // A crawler source failed, so the job that covers all three must
+        // *not* be recorded as done — otherwise the internal cron would
+        // skip re-fetching it until tomorrow.
+        assert_eq!(
+            app.db
+                .get_cron_last_summary(CronJob::UpdateIpRanges.id())
+                .unwrap(),
+            None
+        );
+    }
+
+    /// The happy path: a downloaded body is parsed and stored on the main
+    /// thread.
+    ///
+    /// No assertion here about the `UpdateIpRanges` cron job. One crawler
+    /// source in `outcomes` makes `crawler_ranges_all_succeeded` true
+    /// vacuously, and `refresh::plan` always emits all three — so an
+    /// assertion would pass for a reason production never reaches. That
+    /// rule has its own tests in `refresh`.
+    #[tokio::test]
+    async fn update_everything_stores_what_it_downloaded() {
+        let mut app = test_app();
+        let raw = std::fs::read_to_string("tests/fixtures/ipranges/googlebot-sample.json").unwrap();
+        app.jobs_in_flight.insert(Job::UpdateEverything);
+        app.update_all = Some(UpdateAllRun {
+            remaining: std::collections::VecDeque::new(),
+            done: 0,
+            failures: Vec::new(),
+            outcomes: Vec::new(),
+        });
+
+        app.finish_update_everything_source(
+            crate::refresh::Source::CrawlerRanges(crate::ipranges::IpRangeSourceKind::GoogleBot),
+            Ok(raw),
+        )
+        .unwrap();
+
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("Updated 1 list(s)"), "was: {message}");
+        assert!(!message.contains("failed"), "was: {message}");
+        assert!(
+            !app.db.ip_ranges_by_source_name().unwrap().is_empty(),
+            "the downloaded ranges never reached the database"
+        );
+    }
+
+    /// `a` on the Dashboard is the TUI's "Apply everything": both planes,
+    /// the NGINX one and then the firewall one. The script it writes has
+    /// to be in the *stored backend's* syntax — the drift that once had a
+    /// cron writing nftables rules into a file an operator was running
+    /// with `sh`. (The path here is an explicit override, which wins
+    /// outright; that the *default* path follows the backend is
+    /// `firewall::output_path`'s own test.)
+    #[tokio::test]
+    async fn pressing_a_writes_a_script_in_the_stored_backend_s_syntax() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        crate::firewall::store_backend(&app.db, FirewallBackend::Iptables).unwrap();
+        // `None` would mean the real `/etc/stop-bots/firewall.sh` on the
+        // machine running the suite.
+        app.firewall_out = Some(dir.path().join("firewall.sh"));
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('a')))
+            .unwrap();
+        drain_background_work(&mut app).await;
+
+        let written = dir.path().join("firewall.sh");
+        assert!(
+            written.exists(),
+            "no script at {written:?}; message was: {:?}",
+            app.message.as_deref()
+        );
+        assert!(
+            std::fs::read_to_string(&written)
+                .unwrap()
+                .contains("#!/bin/sh"),
+            "the stored backend was iptables, so the script must be a shell script"
+        );
+        assert!(!app.apply_everything, "the chain flag must be cleared");
+    }
+
+    /// The whole Web Access chain, in the order the split demands: plan
+    /// on the main thread, write and validate off it, record the new
+    /// address back on it. Recording only after the config validated is
+    /// the part that matters — a host allowlist naming somewhere NGINX
+    /// never got would lock the operator out of the page they were on.
+    #[tokio::test]
+    async fn w_mounts_the_console_on_a_site_and_then_records_the_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("example.conf");
+        std::fs::write(
+            &site,
+            "server {\n    server_name example.com;\n    listen 443 ssl;\n}\n",
+        )
+        .unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_site("example.com", site.to_str().unwrap())
+            .unwrap();
+        // `nginx -t` would be the real one on whatever host runs the
+        // suite, so point the check at a command that always agrees.
+        db.set_text_setting(crate::nginx::NginxCommands::TEST_KEY, "/bin/true")
+            .unwrap();
+        let mut app = App::new(
+            db,
+            dir.path().to_path_buf(),
+            false,
+            Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
+        )
+        .unwrap();
+
+        app.start_web_access(crate::webaccess::Request::Path {
+            site: "example.com".to_string(),
+            prefix: "/stop-bots/".to_string(),
+        });
+        drain_background_work(&mut app).await;
+
+        let written = std::fs::read_to_string(&site).unwrap();
+        assert!(
+            written.contains("location /stop-bots/"),
+            "the console location never landed:\n{written}"
+        );
+        assert_eq!(
+            app.db
+                .get_text_setting(crate::web::BASE_PATH_KEY)
+                .unwrap()
+                .as_deref(),
+            Some("/stop-bots")
+        );
+        assert!(crate::web::configured_hosts(&app.db)
+            .unwrap()
+            .contains(&"example.com".to_string()));
+    }
+
+    /// A refusal from `nginx -t` must leave the console's own settings
+    /// alone: the address it answers to is only true once NGINX agrees.
+    #[tokio::test]
+    async fn a_rejected_web_access_config_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = dir.path().join("example.conf");
+        std::fs::write(&site, "server {\n    server_name example.com;\n}\n").unwrap();
+
+        let db = Db::open_in_memory().unwrap();
+        db.upsert_site("example.com", site.to_str().unwrap())
+            .unwrap();
+        db.set_text_setting(crate::nginx::NginxCommands::TEST_KEY, "/bin/false")
+            .unwrap();
+        let mut app = App::new(
+            db,
+            dir.path().to_path_buf(),
+            false,
+            Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
+        )
+        .unwrap();
+
+        app.start_web_access(crate::webaccess::Request::Path {
+            site: "example.com".to_string(),
+            prefix: "/stop-bots/".to_string(),
+        });
+        drain_background_work(&mut app).await;
+
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("failed"), "message was: {message}");
+        assert_eq!(
+            app.db.get_text_setting(crate::web::BASE_PATH_KEY).unwrap(),
+            None
+        );
+        assert!(crate::web::configured_hosts(&app.db).unwrap().is_empty());
+        assert!(
+            !std::fs::read_to_string(&site)
+                .unwrap()
+                .contains("stop-bots"),
+            "a refused config must be rolled back"
+        );
     }
 
     /// A successful write must persist the rendered rule-set signature

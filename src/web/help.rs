@@ -150,6 +150,64 @@ fn body(view: &View) -> Markup {
         ))
 
         (layout::panel(
+            "Reaching this console from outside",
+            Some("What the Dashboard\u{2019}s Web Access panel \u{2014} and the TUI\u{2019}s w key \u{2014} writes"),
+            html! {
+                table { tbody {
+                    (row(
+                        "Path on an existing site",
+                        html! {
+                            "The default, and the safer one: it adds a "
+                            code { "location" }
+                            " block to a site you pick, so this console inherits that site\u{2019}s "
+                            "certificate. It goes in the site\u{2019}s TLS "
+                            code { "server" }
+                            " block, not its port-80 redirect \u{2014} a login form does not belong on "
+                            "the cleartext half of a site that has a certificate."
+                        },
+                    ))
+                    (row(
+                        "Its own subdomain",
+                        html! {
+                            "Writes a new "
+                            code { "server" }
+                            " block on port 80. Until you run "
+                            code { "certbot --nginx -d <host>" }
+                            " this console\u{2019}s password form and session cookie cross the network "
+                            "in the clear; the generated file says so too. Set "
+                            code { "web:secure_cookie" }
+                            " once the certificate is in place."
+                        },
+                    ))
+                    (row(
+                        "Three things, not one",
+                        html! {
+                            "The panel also records the path prefix and adds the host name to the "
+                            "allowlist above, because this server matches the full path "
+                            strong { "including" }
+                            " the prefix and refuses a request carrying a host it was not told "
+                            "about. Miss either and you get a 404 or a 403 that looks like a broken "
+                            "console rather than a missing setting. A changed prefix needs a "
+                            "restart to take effect."
+                        },
+                    ))
+                    (row(
+                        "If the config does not parse",
+                        html! {
+                            "It is validated with "
+                            code { "nginx -t" }
+                            " before it can take effect, and rolled back if that fails \u{2014} a new "
+                            code { "server" }
+                            " block that does not parse would otherwise leave the whole config "
+                            "unloadable while the running NGINX carried on serving from memory, so "
+                            "the breakage would surface at somebody else\u{2019}s reload."
+                        },
+                    ))
+                } }
+            },
+        ))
+
+        (layout::panel(
             "What this host is configured to run",
             None,
             html! {
@@ -179,32 +237,79 @@ fn body(view: &View) -> Markup {
         ))
 
         (layout::panel(
+            "The two buttons that change the host",
+            Some("In \u{201c}System-wide settings\u{201d} on the Dashboard \u{2014} what they touch, and what stops them going wrong"),
+            html! {
+                table { tbody {
+                    (row(
+                        "Apply everything",
+                        html! {
+                            "Writes and reloads the NGINX config, then writes and "
+                            strong { "runs" }
+                            " the firewall script. The two are independent: whichever fails, the "
+                            "other still gets its turn, because a half-applied host beats one where "
+                            "an NGINX syntax error also left the firewall stale. Applying the "
+                            "firewall used to be deliberately absent from this console; it is here "
+                            "now, behind the guards below."
+                        },
+                    ))
+                    (row(
+                        "Update everything",
+                        html! {
+                            "Downloads every bot list, every crawler IP range, every "
+                            strong { "enabled" }
+                            " reputation feed and every "
+                            strong { "selected" }
+                            " country — the same set "
+                            code { "stop-bots batch" }
+                            " fetches, from the same plan. Nothing is enforced until something "
+                            "applies it."
+                        },
+                    ))
+                    (row(
+                        "Before the firewall script runs",
+                        html! {
+                            "The rules are checked against the clients currently logged in over "
+                            "SSH, in the order the script itself will evaluate them. A rule that "
+                            "would block one of them is a "
+                            strong { "refusal" }
+                            " — nothing is written and nothing runs. That is the same guard "
+                            code { "stop-bots batch --apply" }
+                            " uses, and it is what makes a one-click apply defensible."
+                        },
+                    ))
+                    (row(
+                        "The same two in the TUI",
+                        html! {
+                            "The terminal UI has both on its Dashboard as single keys \u{2014} "
+                            code { "u" }
+                            " updates everything and "
+                            code { "a" }
+                            " applies everything \u{2014} driving the same code this page "
+                            "describes, not a second implementation. "
+                            code { "w" }
+                            " opens the same Web Access form."
+                        },
+                    ))
+                    (row(
+                        "Turning it back off",
+                        html! {
+                            "Start the console with "
+                            code { "stop-bots web --no-apply" }
+                            " and it writes both the config and the script but runs neither, which "
+                            "is how it behaved before. The row above says which mode this console "
+                            "is in."
+                        },
+                    ))
+                } }
+            },
+        ))
+
+        (layout::panel(
             "What this screen cannot do",
             Some("Deliberate omissions, each with the reason"),
             html! {
                 table { tbody {
-                    (row(
-                        "Apply the firewall script",
-                        html! {
-                            "Writing it is here; running it is not. A written script is inert, and "
-                            "putting the one operation that can take the host off the network a "
-                            "single click away in a browser is not a trade this UI makes. Run it "
-                            "yourself, or from cron with "
-                            code { "stop-bots batch --apply" }
-                            "."
-                        },
-                    ))
-                    (row(
-                        "Download country or crawler IP ranges",
-                        html! {
-                            "Bot lists update from here because they are small and quick. The range "
-                            "feeds are neither. Use "
-                            code { "stop-bots update-country-ranges" }
-                            " and "
-                            code { "stop-bots update-ip-ranges" }
-                            ", or let the scheduled tasks do it."
-                        },
-                    ))
                     (row(
                         "Change the password from the browser",
                         html! {
@@ -322,12 +427,86 @@ mod tests {
     fn the_omissions_are_listed_with_their_reasons() {
         let rendered = body(&view(true)).into_string();
         for expected in [
-            "Apply the firewall script",
             "Change the password from the browser",
             "Block the address you are connected from",
+            "Unblock something a list blocked",
         ] {
             assert!(rendered.contains(expected), "{expected} missing");
         }
+    }
+
+    /// The console applies the firewall script now. This page used to list
+    /// that as something it deliberately would not do, which is a promise
+    /// the code no longer keeps — and a help screen that is confidently
+    /// wrong is worse than one that is silent.
+    #[test]
+    fn the_help_does_not_still_promise_that_the_firewall_is_never_applied() {
+        let rendered = body(&view(true)).into_string();
+
+        assert!(
+            !rendered.contains("running it is not"),
+            "the retired omission is still on the page:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("Apply everything"),
+            "the button that does it is not explained"
+        );
+        assert!(
+            rendered.contains("refusal"),
+            "the anti-lockout guard is what makes it defensible, so it has to be stated"
+        );
+    }
+
+    /// These three used to be console-only, and this page said so by
+    /// omission. The TUI has all three now, and a help screen that still
+    /// implies otherwise sends someone to a browser they did not need —
+    /// the same failure mode as the retired firewall omission above.
+    #[test]
+    fn the_help_says_the_tui_has_the_same_three_actions() {
+        let rendered = body(&view(true)).into_string();
+
+        assert!(
+            rendered.contains("The same two in the TUI"),
+            "the TUI equivalents are not mentioned:\n{rendered}"
+        );
+        for key in ["<code>u</code>", "<code>a</code>", "<code>w</code>"] {
+            assert!(rendered.contains(key), "{key} is not named:\n{rendered}");
+        }
+    }
+
+    /// The buttons live in "System-wide settings", which is where someone
+    /// reading this has to go to find them.
+    #[test]
+    fn the_help_names_the_panel_the_buttons_live_in() {
+        let rendered = body(&view(true)).into_string();
+        assert!(
+            rendered.contains("System-wide settings"),
+            "the page never says where the buttons are:\n{rendered}"
+        );
+    }
+
+    /// Both halves of the Web Access panel, including the one that is a
+    /// real downgrade if nobody mentions it.
+    #[test]
+    fn the_help_explains_both_web_access_modes_and_the_cleartext_caveat() {
+        let rendered = body(&view(true)).into_string();
+
+        assert!(
+            rendered.contains("Path on an existing site"),
+            "path mode missing"
+        );
+        assert!(
+            rendered.contains("Its own subdomain"),
+            "subdomain mode missing"
+        );
+        assert!(
+            rendered.contains("in the clear"),
+            "the cleartext caveat must be on the page"
+        );
+        assert!(
+            rendered.contains("certbot --nginx -d &lt;host&gt;"),
+            "the fix for it has to be there too"
+        );
     }
 
     #[test]

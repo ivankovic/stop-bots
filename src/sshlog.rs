@@ -27,7 +27,7 @@
 //! touches any log — it only ever reads.
 
 use crate::ipranges::is_local_or_private;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
@@ -147,6 +147,145 @@ fn failed_attempt_ips(log_text: &str) -> Vec<IpAddr> {
         .lines()
         .filter_map(|line| ip_after(line, "Failed ").or_else(|| ip_after(line, "Invalid user ")))
         .collect()
+}
+
+/// Longest username kept, in characters.
+///
+/// The username on a failed-auth line is whatever the client offered, so
+/// it is attacker-controlled and unbounded — sshd will happily log a
+/// kilobyte of it. Capped here rather than in each front-end so neither
+/// has to remember: the TUI draws into fixed-width cells and the web UI
+/// into a table column, and a row that pushes every other column off the
+/// screen is a defacement even when it is correctly escaped.
+const MAX_USERNAME_CHARS: usize = 48;
+
+/// The username offered on a failed-auth line, as the client sent it.
+///
+/// Deliberately bounded by the *same* `" from "` [`ip_after`] uses, so a
+/// line the IP parse rejects is rejected here too and the pair can never
+/// come from two different readings of one line. (That boundary is the
+/// first `" from "` after `marker`, which means a username containing the
+/// literal `" from "` defeats both — see the note on
+/// [`failed_attempt_usernames`].)
+///
+/// Control characters are replaced rather than passed through. sshd
+/// escapes non-printables in modern versions, but this parser is pointed
+/// at whatever file the admin names, and an escape sequence that reaches
+/// the TUI's alternate screen is a corrupted display at best.
+fn username_after<'a>(line: &'a str, marker: &str) -> Option<std::borrow::Cow<'a, str>> {
+    let marker_at = line.find(marker)?;
+    let rest = &line[marker_at..];
+    let from_at = rest.find(" from ")?;
+    let head = &rest[marker.len()..from_at];
+
+    // `Invalid user <user> from ...` puts the name straight after the
+    // marker; `Failed <method> for [invalid user] <user> from ...` puts it
+    // after a ` for `, optionally behind sshd's own "invalid user" note.
+    let raw = match head.find(" for ") {
+        Some(at) => &head[at + " for ".len()..],
+        None => head,
+    };
+    let raw = raw.trim();
+    let raw = raw.strip_prefix("invalid user ").unwrap_or(raw).trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Borrowed on the path every real log takes — `root`, `admin`,
+    // `oracle` — and rebuilt only for the attacker-authored case the cap
+    // and the control-character replacement exist for.
+    if raw.len() <= MAX_USERNAME_CHARS
+        && raw.is_ascii()
+        && !raw.bytes().any(|b| b.is_ascii_control())
+    {
+        return Some(std::borrow::Cow::Borrowed(raw));
+    }
+
+    let mut user: String = raw
+        .chars()
+        .take(MAX_USERNAME_CHARS)
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect();
+    if raw.chars().count() > MAX_USERNAME_CHARS {
+        user.push('\u{2026}');
+    }
+    Some(std::borrow::Cow::Owned(user))
+}
+
+/// The failed-login usernames one address offered, most-tried first.
+///
+/// One address, not a map of every address, and computed only when a detail
+/// view is actually opened. Building the whole map on every refresh cost
+/// 138ms on a 120,000-line auth.log — paid by both front-ends on every
+/// render, whether or not anyone ever pressed `i`. Scoping it to the one
+/// address someone asked about makes the common case free and the rare
+/// case a single pass.
+///
+/// "Which accounts did this client try" is the single most informative
+/// thing an SSH log holds about an attacker, and this parser used to read
+/// straight past it to get at the address.
+///
+/// Same exclusions as [`failed_attempt_counts`] — loopback and private
+/// addresses, and any address that also logged in successfully — so this
+/// can never produce a breakdown for a row the panel itself would not
+/// list. An address that fails them comes back empty.
+///
+/// A username containing the literal `" from "` makes [`ip_after`] fail to
+/// find an address at all, so such a line is dropped from *every* count in
+/// this module, not merely from this breakdown. That is pre-existing and
+/// is a detection weakness rather than a display one — it is recorded in
+/// TODO.md rather than worked around here, because narrowing it means
+/// changing which lines `scanning_ips` counts.
+pub fn failed_attempt_usernames_for(log_text: &str, address: &str) -> Vec<(String, u64)> {
+    let Ok(wanted) = address.parse::<IpAddr>() else {
+        return Vec::new();
+    };
+    if is_local_or_private(&wanted) || parse_accepted_ips(log_text).iter().any(|ip| ip == address) {
+        return Vec::new();
+    }
+
+    let mut counts: HashMap<String, u64> = HashMap::new();
+    for line in log_text.lines() {
+        let Some(user) = failed_attempt_with_user(line, |ip| *ip == wanted) else {
+            continue;
+        };
+        // Borrow-first: the same handful of account names repeat, and
+        // `entry()` would allocate a `String` per repetition to throw away.
+        match counts.get_mut(user.as_ref()) {
+            Some(count) => *count += 1,
+            None => {
+                counts.insert(user.into_owned(), 1);
+            }
+        }
+    }
+
+    let mut users: Vec<(String, u64)> = counts.into_iter().collect();
+    // Most-tried first, then alphabetical — the same count-descending,
+    // key-ascending order the panels themselves use, so a detail view never
+    // looks arbitrarily ordered.
+    users.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    users
+}
+
+/// One failed-auth line's `(address, username)` pair, trying the two
+/// markers in the same order [`failed_attempt_ips`] does.
+///
+/// `wanted` is applied to the address before the username is extracted, so
+/// a line for an address the caller is not interested in costs a parse and
+/// no allocation.
+fn failed_attempt_with_user<'a>(
+    line: &'a str,
+    wanted: impl Fn(&IpAddr) -> bool,
+) -> Option<std::borrow::Cow<'a, str>> {
+    for marker in ["Failed ", "Invalid user "] {
+        if let Some(ip) = ip_after(line, marker) {
+            if !wanted(&ip) {
+                return None;
+            }
+            return username_after(line, marker);
+        }
+    }
+    None
 }
 
 /// The `String` form of [`failed_attempt_ips`], for callers outside this
@@ -396,5 +535,77 @@ Jun 12 01:00:01 host sshd[2]: Failed password for invalid user admin from 198.51
     fn failed_attempt_counts_excludes_loopback_and_private_addresses() {
         let log = repeat_failed_attempt("10.0.0.5", 5);
         assert!(failed_attempt_counts(&log).is_empty());
+    }
+    #[test]
+    fn failed_attempt_usernames_ranks_the_accounts_a_client_tried() {
+        let log = "\
+Jun 12 01:00:00 h sshd[1]: Failed password for root from 198.51.100.1 port 1 ssh2
+Jun 12 01:00:01 h sshd[2]: Failed password for root from 198.51.100.1 port 2 ssh2
+Jun 12 01:00:02 h sshd[3]: Failed password for invalid user admin from 198.51.100.1 port 3 ssh2
+Jun 12 01:00:03 h sshd[4]: Invalid user oracle from 198.51.100.1 port 4
+";
+
+        let users = failed_attempt_usernames_for(log, "198.51.100.1");
+
+        assert_eq!(
+            users,
+            vec![
+                ("root".to_string(), 2),
+                ("admin".to_string(), 1),
+                ("oracle".to_string(), 1),
+            ],
+            "users was: {users:?}"
+        );
+    }
+
+    /// The same exclusions the panel itself applies: a client that also
+    /// logged in successfully is a clumsy human, and the detail view must
+    /// not show a breakdown for a row the panel would never list.
+    #[test]
+    fn failed_attempt_usernames_skips_a_client_that_also_logged_in() {
+        let log = "\
+Jun 12 01:00:00 h sshd[1]: Failed password for root from 198.51.100.1 port 1 ssh2
+Jun 12 01:00:01 h sshd[2]: Accepted publickey for marko from 198.51.100.1 port 2 ssh2
+";
+
+        assert!(failed_attempt_usernames_for(log, "198.51.100.1").is_empty());
+    }
+
+    /// The username is whatever the client offered, so it is
+    /// attacker-controlled: it can be long enough to push every other
+    /// column off the screen, and can carry control characters that a
+    /// terminal would act on rather than draw.
+    #[test]
+    fn an_attacker_controlled_username_is_capped_and_stripped_of_control_characters() {
+        let log = format!(
+            "Failed password for {}\x1b[2J from 198.51.100.1 port 1 ssh2\n",
+            "a".repeat(200)
+        );
+
+        let users = failed_attempt_usernames_for(&log, "198.51.100.1");
+        let name = &users[0].0;
+
+        assert!(
+            name.chars().count() <= MAX_USERNAME_CHARS + 1,
+            "username was {} chars: {name:?}",
+            name.chars().count()
+        );
+        assert!(
+            !name.chars().any(char::is_control),
+            "a control character survived: {name:?}"
+        );
+    }
+
+    /// sshd puts the address last, but the boundary is the *first*
+    /// `" from "`, so a username containing it defeats the address parse —
+    /// and therefore drops the line from every count in this module, not
+    /// just from the breakdown. Pinned as the current behaviour so a later
+    /// change to `ip_after` has to decide about it deliberately.
+    #[test]
+    fn a_username_containing_from_defeats_the_whole_line() {
+        let log = "Failed password for invalid user x from y from 198.51.100.1 port 1 ssh2\n";
+
+        assert!(failed_attempt_usernames_for(log, "198.51.100.1").is_empty());
+        assert!(parse_failed_attempt_ips(log).is_empty());
     }
 }

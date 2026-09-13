@@ -44,12 +44,18 @@ codebase** and have been considered and rejected — don't "fix" them:
 
 ## Background work in `App`
 
-Every long-running action is a `start_x` / `finish_x` pair, eleven times over:
-`start_` does the `Db` reads on the main thread, spawns the slow half, and
-returns immediately; `finish_` applies the result back on the main thread,
-where `Db` can be touched again. Adding a twelfth follows the same shape, and
-the pair is named for the work, not the verb — `start_nginx_reload`, not
+Every long-running action is a `start_x` / `finish_x` pair, thirteen times
+over: `start_` does the `Db` reads on the main thread, spawns the slow half,
+and returns immediately; `finish_` applies the result back on the main thread,
+where `Db` can be touched again. Adding a fourteenth follows the same shape,
+and the pair is named for the work, not the verb — `start_nginx_reload`, not
 `reload_nginx`, because it doesn't reload anything, it starts a reload.
+
+An action that is two existing pairs in sequence is *not* a new pair.
+`start_apply_everything` starts the site apply and sets a flag that
+`finish_site_apply` reads to start the firewall render; it adds no event and
+no `finish_` of its own. Reimplementing either half would have meant a second
+copy of the anti-lockout guard.
 
 ## Tests
 

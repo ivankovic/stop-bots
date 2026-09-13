@@ -9,6 +9,220 @@ need.
 
 ### Added
 
+- **The container suite went from 12 tests to 36, and grew a second image
+  that has a real init.** Three of the four bugs that reached a live server
+  were systemd *sandbox* failures, and the old container had no systemd at
+  all — so none of them was findable there. `Dockerfile.host` (debian:13,
+  the actual deployment target) runs systemd as PID 1, and the sandbox tests
+  each carry a negative control that strips the directive under test and
+  asserts the failure comes back. Without that control a container where the
+  sandbox silently did not apply would pass every one of them.
+
+  Probes are derived from the unit `install web` actually wrote rather than
+  hand-written, so a test cannot keep passing after the generator stops
+  emitting a directive.
+
+  Newly covered: `install web` under a real service manager, the netlink
+  sandbox for both firewall backends, `ProtectSystem` still permitting a
+  later apply, replacing the binary and restarting, the iptables backend
+  executed for real, allowlist mode as genuine default-deny, IPv6 drops,
+  the console as a listening server (login, "Apply everything", the host
+  allowlist, Web Access through the NGINX it just configured), rate
+  limiting, the tarpit, each request-shape rule against a request actually
+  shaped that way, a per-site rule proving it stops at that site, and the
+  whole detection loop — honeypot and probe paths — from a real client's
+  request through the log NGINX wrote to a rule that really blocks it.
+
+- **The tarpit is timed**, closing a TODO.md item: a tarpitted client is
+  still waiting after five seconds while an unblocked one is served in
+  under two.
+
+- **The TUI has the three host-wide Dashboard actions too.** `u` downloads every
+  list, `a` applies both planes (NGINX, then the firewall), and `w` opens the Web
+  Access form. Each goes through the same shared module the console's button or
+  panel does — `refresh`, the existing apply pairs, and a new `webaccess` — rather
+  than a second implementation that could drift from the first.
+
+  `u` fetches one source at a time and stores each before starting the next. The
+  plan is eight or more downloads of several megabytes; fetching them together
+  would hold every payload at once and show nothing until the last one landed.
+
+- **A "Web Access" panel on the Dashboard.** Sets NGINX up to serve this console
+  from outside, in one of two modes.
+
+  *Path on an existing site* is the default: it adds a sentinel-marked
+  `location /stop-bots/` block to a site you pick, so the console inherits that
+  site's certificate. It picks the site's TLS `server` block rather than its
+  port-80 redirect. *Its own subdomain* writes a new `server` block on port 80 —
+  the generated file says, in a comment where you will find it, that the password
+  form and session cookie are in the clear until `certbot --nginx -d <host>` has
+  run.
+
+  The panel writes three things that have to agree: the config, `web:base_path`
+  and `web:allowed_hosts`. Any one missing gives you a console that looks broken
+  rather than misconfigured — a 404 for the prefix, a 403 for the host.
+
+  The config is validated with `nginx -t` **before it can take effect**, and rolled
+  back if it fails. `apply_all_sites` writes-then-tests, which is survivable for an
+  edit; a new `server` block that does not parse leaves the whole config unloadable
+  while the running NGINX keeps serving from memory, so nothing looks wrong until
+  certbot's renewal reload fails at 3am.
+
+- **"Update everything" and "Apply everything" buttons in "System-wide settings".**
+  Update downloads every bot list, crawler range, enabled feed and selected
+  country; apply writes and reloads the NGINX config, then writes and runs the
+  firewall script. Both planes are independent, same as `batch --apply`: whichever
+  fails, the other still gets its turn.
+
+  Selecting a country used to say "its ranges still need downloading with
+  `stop-bots update-country-ranges --country RU`" — a console that knew what needed
+  doing and asked you to do it. It now names the button.
+
+- **The console can apply the firewall script.** Previously one of its three
+  deliberate omissions, reversed on request. Tick "run it after writing" in the
+  firewall panel, or use "Apply everything". The same anti-lockout guard
+  `batch --apply` runs still applies — rules that would block a currently-connected
+  SSH client are refused, not warned about — and `stop-bots web --no-apply` keeps
+  the old write-only behaviour. The chosen backend is now remembered, so a
+  one-click apply has an answer without guessing.
+
+### Fixed
+
+- **`batch` ignored the firewall backend this host is set to.** `--backend`
+  carried an `nftables` default and nothing consulted
+  `firewall::stored_backend`, so an operator who chose iptables in the
+  console and ran `stop-bots batch --apply` from crontab — as the README
+  recommends — got an nftables script at `firewall.nft` while the console
+  maintained an iptables one at `firewall.sh`. Both were applied, by
+  different things, and either could be stale. The same drift once had the
+  internal cron overwriting an operator's iptables script with nftables
+  syntax; that was fixed by reading the stored backend and this path was
+  missed. An explicit `--backend` still wins; without one, the host's
+  setting decides, and the output path follows from it.
+
+- **`stop-bots install web` could leave the service crash-looping.** It ran
+  `systemctl enable --now` *before* opening the database to record the bind
+  address and generate the password, so the installer and the service it had
+  just started raced for the same SQLite file. `Db::open` set no busy timeout,
+  so the loser failed instantly with "database is locked": either the service
+  exited 1 and crash-looped on `Restart=on-failure`, or the install failed
+  having already enabled the unit, or the service won and generated the
+  password itself — leaving the installer to report "a console password is
+  already set, keeping it" and the operator with no password at all. The
+  database work now finishes first, and `Db::open` waits five seconds for a
+  lock rather than giving up, which also covers the console running alongside
+  the TUI or a `batch` from crontab. Found by the new container tests, which
+  only showed it under parallel load.
+
+- **The database file was world-readable.** `install web` set the state
+  directory to 0700 but left `db.sqlite3` at the umask default, usually 0644.
+  Nothing was exposed — the directory is what protects it — but the mode
+  travels with the file through a backup or a `cp`, and the unit's
+  `UMask=0077` applies only to files the service creates, not the installer.
+
+- **The Web Access panel's form sat flush against the panel edge.** Every other
+  panel wraps its loose content in a `.panel-body`, which is the only thing
+  carrying the side padding; this one emitted the form bare. A test now asserts
+  that whatever follows a panel's table is inside one.
+
+- **The console could not apply the firewall at all under its own systemd unit.**
+  `nft` and Debian's nft-backed `iptables` reach the kernel over a netlink socket, and
+  the unit `install web` writes set `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
+  — with a comment asserting "nothing here uses a raw or netlink socket: this service
+  writes the firewall script, it never applies it", which stopped being true the moment
+  applying was added. The failure was `Unable to initialize Netlink socket: Address
+  family not supported by protocol`, which names neither systemd nor this project.
+  `AF_NETLINK` is now allowed, and a netlink refusal appends an explanation naming the
+  directive and how to get a current unit. **Existing installs need
+  `stop-bots install web --force` and a restart.**
+
+- **An iptables script could land in a file called `firewall.nft`.** The destination
+  was fixed at startup and the backend chosen per render, so on a host set to iptables
+  the console wrote `#!/bin/sh` and 12,000 `iptables -A` lines into the nftables path.
+  Worse, the internal cron hardcoded nftables regardless — so each tick replaced an
+  operator's iptables script with an nftables one at the same path, and the next apply
+  ran `sh` over nftables syntax. The backend is now the single source of truth: the
+  cron renders for the stored backend, and the path follows it (`.nft` or `.sh`) unless
+  `--firewall-out` names one explicitly, in which case that wins.
+
+- **`make deploy` did not deploy.** It copied the binary to the login directory and
+  restarted nothing, so on a host where the service runs from `/usr/local/bin` every
+  step succeeded and the console kept serving the previous build. It now installs to
+  the path the unit actually names, restarts the service if there is one, and prints
+  the unit's `ExecStart` alongside the deployed file's timestamp — `--version` is
+  `0.0.1` for every build, so it could never have shown the difference.
+
+- **`install web` wrote a unit systemd could not execute** when run from `/root` —
+  which is exactly where someone who just downloaded a release binary is standing.
+  The unit sets `ProtectHome=yes`, so `/root` is an empty directory for the
+  service, and `ExecStart=/root/stop-bots` failed with `status=203/EXEC`,
+  "No such file or directory", for a file that was plainly there. Preflight checked
+  that the binary existed; it did not check that it existed *inside the sandbox the
+  unit itself asks for*. It now refuses up front, names the directive responsible,
+  and gives the two commands that fix it. Same for `/home`, `/run/user`, `/tmp` and
+  `/var/tmp` (the last two via `PrivateTmp=yes`), and for a relative `--binary`,
+  which systemd rejects when it loads the unit rather than when it starts it.
+
+  A failed `systemctl enable --now` also now says what state it left behind: the
+  enable sticks even when the start fails, so the unit was enabled and would have
+  tried again at the next boot with nothing saying so.
+
+### Added
+
+- **Inspect an address on the Dynamic Protection screen.** `i` in the TUI, or click
+  the address in the web console. It answers "what *is* this thing" from lists this
+  host already downloads: which of the six reputation feeds list it (Tor exit,
+  FireHOL, blocklist.de, AWS, Google Cloud, DigitalOcean), whether it is inside a
+  published crawler range — which is what separates a real Googlebot from a user
+  agent that merely says so — which fetched country it belongs to, and which
+  accounts it tried to log in as.
+
+  Deliberately **not** reverse DNS or whois. Both are outbound requests, per row, to
+  infrastructure an attacker often controls, and a PTR record is written by whoever
+  holds the address — so it is attacker-supplied text that reads as authoritative.
+  Everything here is local, instant, works offline, and tells the attacker nothing.
+
+  The SSH log's failed-login usernames were being parsed past and discarded; they
+  are now kept, capped and stripped of control characters, since they are whatever
+  the client chose to send. Extracted for one address when you ask, not for every
+  address on every refresh — the latter cost 215ms per refresh on a large
+  auth.log, for an answer almost nobody had asked for.
+
+### Security
+
+- **A line from a downloaded feed could become a root shell command.** The IP-range
+  and reputation feeds are fetched unattended from eight third parties, and nothing
+  validated what they sent before it was interpolated into a generated firewall
+  script. A feed line of `1.2.3.4/24; touch /tmp/pwned` rendered as
+  `iptables -A STOP-BOTS -s 1.2.3.4/24; touch /tmp/pwned -j DROP`, and
+  `stop-bots batch --apply` runs that script under `sh` as root. On nftables the
+  same shape gets `nft -f` to accept arbitrary statements — `; flush ruleset` would
+  drop the host's entire firewall.
+
+  Admin-entered rules had been validated since an earlier review; the fetched
+  ranges were exempted on the grounds that their upstreams are reputable, which is
+  not the same as uncompromised. All four tables that hold an address now go
+  through one validator, invalid entries are dropped rather than failing the whole
+  fetch, and both renderers check again before emitting a line — the script is
+  executable input, and a database written by an older version is still out there.
+
+- **The web console could write a root-owned file anywhere on the host.** The
+  destination for "Write script" came from a free-text form field, and the file it
+  writes is an executable script — `/etc/profile.d/`, `/etc/cron.d/` and unit
+  directories were all reachable. That is a way around every restriction the console
+  is built around. It now writes to the path the server was started with, set by the
+  new `stop-bots web --firewall-out`, and takes no destination from the request.
+
+- **Fetches now have timeouts and a size limit.** Every bot list and IP-range
+  download was a bare `reqwest::get`: no connect timeout, no total timeout, and the
+  whole body read into memory. Under the internal cron that means an upstream which
+  accepts the connection and then says nothing stalls the job indefinitely. There is
+  now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
+  enforced against both the declared length and the bytes actually arriving.
+
+### Added
+
+
 - **A web UI — `stop-bots web`.** The same five screens as the TUI, in a browser.
 
   It binds `127.0.0.1:8787` and generates a password on first run, printed once.
@@ -21,10 +235,11 @@ need.
   own browser — a form post needs no readable response, and DNS rebinding defeats
   same-origin. The `Host` allowlist is what makes rebinding fail.
 
-  It refuses to block the address you are connected from, writes the firewall script
-  but never runs it, and does not offer to unblock something a downloaded list blocked.
-  The Help screen lists each omission with its reason, alongside how this console is
-  actually exposed.
+  It refuses to block the address you are connected from, will not unblock something a
+  downloaded list blocked, and will not change its own password. The Help screen lists
+  each omission with its reason, alongside how this console is actually exposed. (It also
+  would not *apply* the firewall script; see "The console can apply the firewall script"
+  below, which is the same release changing its mind.)
 
   Serve it under a path prefix with `--base-path /stop-bots` when NGINX puts it in a
   `location` block rather than on its own subdomain. The proxy must not strip the

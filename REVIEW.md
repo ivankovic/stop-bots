@@ -2,6 +2,183 @@
 
 # Completed
 
+- ✅ Two bugs from one deployed host, both "the backend was decided in one place
+  and something depending on it in another". See "The firewall backend is the
+  single source of truth" in SPECS.md.
+  - The console could not apply the firewall **at all** under the unit
+    `install web` writes: `RestrictAddressFamilies` omitted `AF_NETLINK`, under
+    a comment claiming the service never applies anything — true when written,
+    false the moment applying was added. Diagnosed before changing anything by
+    reproducing it with `systemd-run --user -p RestrictAddressFamilies=...
+    ip link show`, which prints the same message. Allowed now, plus a
+    `sandbox_hint` that names the directive, since nft's own error mentions
+    neither systemd nor this project. Existing installs need
+    `install web --force`.
+  - The path no longer drifts from the backend, and — found while fixing it —
+    `cron::render_firewall` hardcoded nftables, so on an iptables host every
+    tick overwrote the operator's script with the wrong syntax at the same
+    path and the next apply ran `sh` over it. That was the more dangerous half.
+  - `make deploy` fixed separately in the same session: it copied to the login
+    directory and restarted nothing, so on this host every command succeeded
+    and the console kept serving the previous build.
+
+- ✅ `make deploy` did not deploy. It was `scp ./target/release/stop-bots www:`,
+  which lands the binary in the login directory and restarts nothing. That
+  happened to be the path the unit ran until `install web` was re-run with the
+  binary in `/usr/local/bin`; after that, deploying wrote a file nothing
+  executes while the console carried on serving the previous build. The failure
+  mode is that every command succeeds and the change simply is not there.
+  Now stages next to the target and renames into place (writing over a running
+  executable is ETXTBSY), `try-restart`s the unit when one exists, and prints
+  the unit's ExecStart and the deployed file's timestamp — because
+  `--version` reports `0.0.1` for every build of a `0.0.x` and so cannot tell
+  two builds apart, which is exactly the confirmation that was missing.
+
+- ✅ Fixed the documentation the previous change made wrong. The console's Help
+  screen listed "apply the firewall script" and "download country or crawler IP
+  ranges" as deliberate omissions with reasons — both had just become
+  capabilities, and a help screen that is confidently wrong is worse than one
+  that is silent. Replaced with a panel explaining the two buttons that change
+  the host and the anti-lockout refusal that makes a one-click apply
+  defensible, plus a new panel for the Web Access modes including the cleartext
+  caveat on subdomain mode. Two regression tests: one asserting the retired
+  omission's wording is gone *and* the replacement is present, one asserting
+  both Web Access modes and the `certbot` fix are on the page.
+  - README: "three things are missing on purpose" is now two, with the third
+    recorded as having changed and why; "Nothing happens without you" now names
+    all three ways to apply rather than two; added the Web Access panel, the two
+    Dashboard buttons and the Dynamic Protection `i` key.
+  - `firewall::apply_script`'s doc comment said "exactly two callers". There are
+    three now. That comment was rewritten during the security pass precisely
+    because it had been wrong, so letting it go stale again would have been the
+    same mistake twice.
+  - The unreleased CHANGELOG contradicted itself: the web-UI entry said it
+    "writes the firewall script but never runs it" while a later entry in the
+    same release said it does. Fixed, with the reversal noted rather than
+    quietly edited out.
+  - `src/tui/help.rs` needed no change — it documents keys, and every key it
+    lists still does what it says.
+
+- ✅ Four requests, shipped as two changes. See "Web Access, \"Update
+  everything\", \"Apply everything\", and applying the firewall from the
+  console" in SPECS.md.
+  - New `src/refresh.rs` so "everything" means one thing. `batch::update_lists`
+    could not be reused from the console — an `async fn` holding `&Db` across
+    every fetch, and `Db` is not `Sync` — so it was rewritten on the shared
+    plan rather than duplicated. A button that skipped reputation feeds or
+    selected countries would have left the UI still telling you to run a CLI
+    command.
+  - Selecting a country deliberately does **not** download, against the
+    obvious fix of matching the TUI. Fetching on POST blocks a request
+    handler on hundreds of kilobytes from a third party, and it made
+    `the_geo_mode_and_country_selection_round_trip` reach ipdeny.com —
+    0.35s to 0.93s of real HTTP, which is how it was caught. The message now
+    names the "Update everything" button instead of a CLI command.
+  - The console can apply the firewall script now, reversing one of its three
+    deliberate omissions on request. Same anti-lockout refusal as
+    `batch --apply`, gated by `apply_for_real` so `--no-apply` keeps the old
+    behaviour, and it runs the script that was just written rather than a
+    freshly derived one.
+  - The Web Access panel's NGINX writes go through `write_validated`: write,
+    `nginx -t`, roll back on failure. `apply_all_sites` writes-then-tests,
+    which is fine for an edit — but a new `server` block that does not parse
+    leaves the whole config unloadable while the running NGINX keeps serving
+    from memory, so the failure surfaces at somebody else's reload.
+  - Path mode writes three things that must agree: the `location` block,
+    `web:base_path` and `web:allowed_hosts`. Missing the second makes every
+    link leave the location block; missing the third makes every request a
+    403. Both look like a broken console rather than a missing setting.
+
+- ✅ Fixed a real `install web` failure reported from a Debian host:
+  `./stop-bots install web` from `/root` wrote `ExecStart=/root/stop-bots`,
+  which systemd could not execute because the unit's own `ProtectHome=yes`
+  makes `/root` empty for the service — `status=203/EXEC`, "No such file or
+  directory", for a file that was plainly there. `preflight` checked that the
+  binary existed on the *installer's* filesystem, never that it existed
+  inside the sandbox the unit itself asks for. See "`install web`: the binary
+  has to exist inside the unit's own sandbox" in SPECS.md.
+  - The first fix was dead in production. It gated the new check on a
+    `real: bool` that only `Layout::system` set — and `main.rs` never calls
+    `Layout::system`, it calls `Layout::under` with a prefix defaulting to
+    `/`. All 21 install tests passed while the check never ran on the one
+    path that matters. Caught by reproducing the reported failure against the
+    built binary; the flag is now derived inside `under` from the prefix, so
+    no caller can forget it.
+  - Fixed alongside: a relative `--binary` (systemd rejects such a unit at
+    load time, which does not present as a failed service), and a failed
+    `systemctl enable --now` not saying that the enable half stuck and the
+    unit would try again at the next boot.
+
+- ✅ Per-address detail on Dynamic Protection (`i` in the TUI, clicking the
+  address in the web console), built after weighing reverse DNS and whois and
+  deciding against both: each is an outbound request per row to infrastructure
+  the attacker often controls, and a PTR record is authored by whoever holds
+  the address. What the host already downloads — six reputation feeds, three
+  crawler range sources, the fetched country zones — answers most of the same
+  question offline and instantly, and the crawler answer is better than whois
+  gives, since being inside Google's published ranges is what a user agent
+  string cannot fake. New `src/ipdetail.rs`; `sshlog` now keeps the
+  failed-login usernames it used to parse past, capped and stripped of control
+  characters at the parser because they are whatever the client sent. See
+  "Per-address detail on Dynamic Protection" in SPECS.md.
+  - Caught while building it: adding one line to the TUI help pushed the last
+    line — how to close the help screen — off the bottom. The file's comment
+    already warned that adding an entry means merging another; a comment was
+    not enough, and the only thing that noticed was a pty test timing out
+    fifteen seconds later. Now a `MAX_LINES` constant with a `debug_assert`
+    and a unit test that renders at the harness's size, verified to fail when
+    a line is added.
+  - Caught by measuring rather than assuming: the first version built the
+    username breakdown for every address on every refresh, which took
+    `Live::load` from 78ms to 293ms on a 120,000-line auth.log — paid by
+    both front-ends whether or not anyone opened a detail. Now scoped to
+    the one address asked about (45ms, on the keypress), routed through
+    `KeyOutcome::InspectAddress` so `App` supplies the log text it already
+    holds. `src/dynamic.rs` ends up unchanged.
+  - Reported, not fixed: a username containing the literal `" from "` defeats
+    `sshlog::ip_after` and so drops the line from every count in that module,
+    `scanning_ips` included. Pinned by a test, recorded in TODO.md — narrowing
+    it changes which lines scan detection counts, which is its own change.
+
+- ✅ Security and robustness pass over the whole repository, scoped to the
+  four categories `SECURITY.md` says are in scope. Three findings, each
+  confirmed by running the code rather than by reading it, all fixed — see
+  "Security pass: untrusted feeds, an unbounded write, and unbounded
+  fetches" in SPECS.md for the full account.
+  - **A line from a downloaded IP-range feed became a root shell command.**
+    `replace_ip_ranges`, `replace_country_ranges` and
+    `replace_reputation_ranges` validated nothing, and the addresses they
+    store are interpolated verbatim into a generated firewall script that
+    `batch --apply` runs under `sh`. Confirmed:
+    `1.2.3.4/24; touch /tmp/pwned` rendered as
+    `iptables -A STOP-BOTS -s 1.2.3.4/24; touch /tmp/pwned -j DROP`. On
+    nftables the same shape reaches `nft -f`, where `; flush ruleset` drops
+    the host's whole firewall. `looks_like_address`, meant to be the guard
+    for the six reputation feeds, only inspected the part before the first
+    `/`. Fixed by routing all four address tables, both renderers and that
+    filter through one validator; feed entries are dropped rather than
+    failing the batch. **This reverses the decision recorded below** that
+    "crawler/country-derived CIDRs still bypass this check ... since those
+    come from trusted upstream sources" — reputable is not uncompromised,
+    and `SECURITY.md` says so explicitly.
+  - **The web console could write a root-owned executable file anywhere on
+    the host**, because "Write script" took its destination from a free-text
+    form field. That is a way around every restriction the console is built
+    around. Fixed: it writes to the path the server was started with, via
+    the new `stop-bots web --firewall-out`, and takes no destination from
+    the request.
+  - **No upstream fetch had a timeout or a size limit.** Six bare
+    `reqwest::get(...).text()` calls, now one shared client in the new
+    `src/fetch.rs` (60s total, 10s connect, 5 redirects) with a 32MB cap
+    checked against both the declared length and the arriving bytes.
+  - Two smaller ones fixed alongside: an address was validated trimmed and
+    stored untrimmed, so `"1.2.3.4\n"` was written into the middle of a rule
+    line (under iptables' `set -e`, that aborts the script partway through);
+    and `firewall::apply_script`'s doc comment claimed no unattended caller
+    exists when `batch --apply` is exactly that, which is the wrong answer
+    to the one question anyone reads it to ask.
+
+
 Each entry describes a change as it was made, and is not kept up to date
 afterwards — several below have since been superseded (the internal cron
 runs from the web UI as well as the TUI now; `src/botlist.rs` is a

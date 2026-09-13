@@ -163,15 +163,7 @@ impl ReputationSourceKind {
     }
 
     pub async fn fetch(self) -> Result<String> {
-        let body = reqwest::get(self.url())
-            .await
-            .with_context(|| format!("failed to fetch {}", self.name()))?
-            .error_for_status()
-            .with_context(|| format!("{} request failed", self.name()))?
-            .text()
-            .await
-            .with_context(|| format!("failed to read {} response body", self.name()))?;
-        Ok(body)
+        crate::fetch::text(self.url(), self.name()).await
     }
 
     pub fn as_source(self) -> ReputationSource {
@@ -211,17 +203,17 @@ fn parse_plain_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// A cheap sanity check, not a validator: the address is only ever
-/// re-emitted into a firewall script, and both backends do their own
-/// parsing. This exists to keep obvious junk (a stray HTML error page
-/// served instead of the list, a header line) out of the database.
+/// Whether `s` is an address this may store.
+///
+/// This used to be a deliberately cheap check that only inspected the part
+/// before the first `/`, on the reasoning that "both backends do their own
+/// parsing". They do — but for iptables the backend is `sh`, which splits
+/// on `;` long before `iptables` sees anything, so a feed line of
+/// `1.2.3.4/24; touch /tmp/pwned` passed the cheap check and reached a root
+/// shell. It now defers to the same validator every write path into an
+/// address column uses.
 fn looks_like_address(s: &str) -> bool {
-    let base = s.split('/').next().unwrap_or(s);
-    !base.is_empty()
-        && base
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
-        && (base.contains('.') || base.contains(':'))
+    crate::db::is_valid_address(s)
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,5 +479,16 @@ mod tests {
             db.enabled_reputation_ranges().unwrap(),
             vec!["3.3.3.3".to_string()]
         );
+    }
+    /// The old filter only looked at the part before the first `/`, so
+    /// anything at all could ride along in the prefix length. The `;` and
+    /// `#` forms were already neutralised here — both are comment markers
+    /// in these feeds and are stripped above — but `$(...)` is neither, and
+    /// iptables' generated script is run by `sh`.
+    #[test]
+    fn a_payload_in_the_prefix_length_is_dropped() {
+        let parsed = parse_plain_list("1.2.3.4/$(reboot)\n5.6.7.8\n9.9.9.9/33\nnope\n");
+
+        assert_eq!(parsed, vec!["5.6.7.8".to_string()], "parsed: {parsed:?}");
     }
 }

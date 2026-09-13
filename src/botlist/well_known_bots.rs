@@ -105,15 +105,7 @@ pub fn parse(json: &str) -> Result<Vec<NewBot>> {
 
 /// Downloads the raw well-known-bots JSON document over HTTP.
 pub async fn fetch() -> Result<String> {
-    let body = reqwest::get(SOURCE_URL)
-        .await
-        .context("failed to fetch well-known-bots list")?
-        .error_for_status()
-        .context("well-known-bots request failed")?
-        .text()
-        .await
-        .context("failed to read well-known-bots response body")?;
-    Ok(body)
+    crate::fetch::text(SOURCE_URL, "the well-known-bots list").await
 }
 
 #[cfg(test)]

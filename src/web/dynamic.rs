@@ -30,6 +30,7 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::dynamic::{Filter, Live, RowStatus, SshRow, UaRow};
+use crate::ipdetail::{AddressKind, IpDetail};
 use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, ClientAddr, FlashQuery};
 use crate::web::state::AppState;
@@ -39,6 +40,12 @@ use crate::web::state::AppState;
 pub struct Params {
     /// `all`, `pending` or `blocked` — the TUI's `f` key, as a link.
     pub filter: Option<String>,
+    /// An address to show the detail panel for — the TUI's `i` key, as a
+    /// link. A query parameter rather than an htmx fragment so the panel
+    /// survives a reload and can be linked to, the same shape `filter`
+    /// already uses. Untrusted: it is whatever is in the URL bar, and
+    /// `IpDetail::load` is what decides whether it is an address at all.
+    pub inspect: Option<String>,
     #[serde(flatten)]
     pub flash: FlashQuery,
 }
@@ -65,6 +72,7 @@ pub async fn page(
     Query(params): Query<Params>,
 ) -> Response {
     let filter = filter_from(params.filter.as_deref());
+    let inspect = params.inspect.clone();
     let ssh_log = state.ssh_log.clone();
 
     // The log read happens inside the same blocking closure as the
@@ -81,12 +89,37 @@ pub async fn page(
                 crate::sshlog::LogSource::Found(text) => Some(text),
                 crate::sshlog::LogSource::Unavailable => None,
             };
-            Live::load(db, text.as_deref())
+            let live = Live::load(db, text.as_deref())?;
+            // In the same closure as the row load, from the same read of
+            // the log: a detail panel assembled from a second, later read
+            // would describe a different moment than the table beside it.
+            let detail = match &inspect {
+                Some(address) => {
+                    let status = live
+                        .ssh
+                        .iter()
+                        .find(|row| &row.address == address)
+                        .map(|row| row.status)
+                        .unwrap_or(RowStatus::Pending);
+                    // Scanned for this one address, from the same read of
+                    // the log the table came from. Nobody pays for it on a
+                    // page view that is not inspecting anything.
+                    let usernames = text
+                        .as_deref()
+                        .map(|t| crate::sshlog::failed_attempt_usernames_for(t, address))
+                        .unwrap_or_default();
+                    Some(crate::ipdetail::IpDetail::load(
+                        db, address, status, usernames,
+                    )?)
+                }
+                None => None,
+            };
+            anyhow::Ok((live, detail))
         })
         .await;
 
-    let live = match live {
-        Ok(live) => live,
+    let (live, detail) = match live {
+        Ok(pair) => pair,
         Err(err) => return internal_error(&err.to_string()),
     };
 
@@ -95,11 +128,11 @@ pub async fn page(
         Tab::Dynamic,
         &ctx,
         params.flash.into_flash(),
-        body(&live, filter, &ctx),
+        body(&live, filter, detail.as_ref(), &ctx),
     )
 }
 
-fn body(live: &Live, filter: Filter, ctx: &Ctx) -> Markup {
+fn body(live: &Live, filter: Filter, detail: Option<&IpDetail>, ctx: &Ctx) -> Markup {
     let ssh: Vec<&SshRow> = live
         .ssh
         .iter()
@@ -113,6 +146,10 @@ fn body(live: &Live, filter: Filter, ctx: &Ctx) -> Markup {
 
     html! {
         (filter_bar(filter, ctx))
+
+        @if let Some(detail) = detail {
+            (detail_panel(detail, filter, ctx))
+        }
 
         .cols {
 
@@ -146,7 +183,16 @@ fn body(live: &Live, filter: Filter, ctx: &Ctx) -> Markup {
                                     tr {
                                         td .num { (row.count) }
                                         td { (status_pill(row.status)) }
-                                        td .mono { (row.address) }
+                                        td .mono {
+                                            // The address itself is the
+                                            // link: one less column to fit
+                                            // at phone width, and the
+                                            // thing you want to know more
+                                            // about is the thing you click.
+                                            a href=(inspect_url(&row.address, filter, ctx)) {
+                                                (row.address)
+                                            }
+                                        }
                                         td .right { (address_action(row, ctx)) }
                                     }
                                 }
@@ -229,6 +275,37 @@ fn filter_bar(current: Filter, ctx: &Ctx) -> Markup {
     }
 }
 
+/// The link that opens the detail panel for `address`, keeping the current
+/// filter so closing the panel returns to the same view.
+///
+/// Percent-encodes the address rather than trusting it to be one: these
+/// come from a parsed log today, but this builds a URL, and a value
+/// carrying `&` or `#` would otherwise silently become a different
+/// parameter.
+fn inspect_url(address: &str, filter: Filter, ctx: &Ctx) -> String {
+    ctx.url(&format!(
+        "/dynamic?filter={}&inspect={}",
+        filter_name(filter),
+        percent_encode(address)
+    ))
+}
+
+/// Percent-encodes everything outside the unreserved set. Deliberately
+/// conservative and hand-rolled: one query parameter does not justify a
+/// dependency, and the only way to get this wrong is to be too permissive.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn status_pill(status: RowStatus) -> Markup {
     let kind = match status {
         RowStatus::Pending => PillKind::Neutral,
@@ -246,6 +323,99 @@ fn status_pill(status: RowStatus) -> Markup {
 /// A `BLOCKLIST` row gets none: the block came from a downloaded list, and
 /// offering an "unblock" that the next list refresh silently undoes would
 /// be a lie about what the button does.
+/// The detail panel for one address.
+///
+/// Everything on it is already in this host's database — see
+/// [`crate::ipdetail`] for why a console that can reach the network
+/// deliberately does not do a reverse DNS lookup here.
+fn detail_panel(detail: &IpDetail, filter: Filter, ctx: &Ctx) -> Markup {
+    let close = ctx.url(&format!("/dynamic?filter={}", filter_name(filter)));
+    layout::panel(
+        &format!("About {}", detail.address),
+        Some("From lists this host already downloads — nothing was looked up over the network"),
+        html! {
+            .row {
+                (status_pill(detail.status))
+                a .button href=(close) { "Close" }
+            }
+
+            @match detail.kind {
+                AddressKind::LocalOrPrivate => {
+                    p .hint {
+                        "A loopback or private address. No reputation or crawler feed lists "
+                        "these, so there is nothing to look up."
+                    }
+                }
+                AddressKind::Malformed => {
+                    p .hint { "Not a valid IP address or range." }
+                }
+                AddressKind::Public => {
+                    @if detail.is_unknown() {
+                        p .hint {
+                            "In none of the crawler or reputation feeds this host has fetched."
+                        }
+                    }
+                    @if !detail.crawlers.is_empty() || !detail.reputation.is_empty() {
+                        table {
+                            tbody {
+                                @for hit in &detail.crawlers {
+                                    tr {
+                                        td { "Crawler" }
+                                        td { (hit.source) }
+                                        td .mono { (hit.range) }
+                                    }
+                                }
+                                @for hit in &detail.reputation {
+                                    tr {
+                                        td { "Feed" }
+                                        td { (hit.source) }
+                                        td .mono { (hit.range) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    p .hint {
+                        @match (&detail.country, detail.country_data_available) {
+                            (Some(code), _) => { "Country: " (code) }
+                            // Not the same statement: with no zone file
+                            // fetched this is a fact about the host's data,
+                            // not about the address.
+                            (None, true) => { "Not inside any country this host has fetched." }
+                            (None, false) => { "No country data has been fetched on this host." }
+                        }
+                    }
+                }
+            }
+
+            @if !detail.usernames.is_empty() {
+                h3 { "Tried to log in as" }
+                .table-scroll {
+                    table {
+                        colgroup { col .w-count; col; }
+                        thead { tr {
+                            th .right { "Attempts" }
+                            th { "Account" }
+                        } }
+                        tbody {
+                            @for (user, count) in &detail.usernames {
+                                tr {
+                                    td .num { (count) }
+                                    // Attacker-chosen text. maud escapes
+                                    // it, and `sshlog` has already capped
+                                    // its length and replaced control
+                                    // characters.
+                                    td .mono { (user) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
 fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
     match row.status {
         RowStatus::Blocklist => html! { span .hint { "from a blocklist" } },
@@ -540,7 +710,7 @@ mod tests {
     /// the truncation has no width to truncate against.
     #[test]
     fn both_long_tables_are_wrapped_in_a_scroll_container() {
-        let rendered = body(&live_with(40, 40), Filter::All, &Ctx::for_tests()).into_string();
+        let rendered = body(&live_with(40, 40), Filter::All, None, &Ctx::for_tests()).into_string();
 
         assert_eq!(
             rendered.matches(r#"class="table-scroll""#).count(),
@@ -567,7 +737,7 @@ mod tests {
             }],
         };
 
-        let rendered = body(&live, Filter::All, &Ctx::for_tests()).into_string();
+        let rendered = body(&live, Filter::All, None, &Ctx::for_tests()).into_string();
 
         assert!(
             rendered.contains(&format!(r#"title="{long}""#)),
@@ -588,7 +758,7 @@ mod tests {
             }],
         };
 
-        let rendered = body(&live, Filter::All, &Ctx::for_tests()).into_string();
+        let rendered = body(&live, Filter::All, None, &Ctx::for_tests()).into_string();
 
         assert!(
             !rendered.contains(r#"onfocus="alert(1)"#),
@@ -612,5 +782,110 @@ mod tests {
             "the quote must be escaped, not closed: {rendered}"
         );
         assert!(rendered.contains("&quot;"), "was: {rendered}");
+    }
+    #[test]
+    fn percent_encode_escapes_everything_that_could_start_a_new_parameter() {
+        assert_eq!(percent_encode("198.51.100.9"), "198.51.100.9");
+        assert_eq!(percent_encode("2001:db8::1"), "2001%3Adb8%3A%3A1");
+        assert_eq!(percent_encode("a&b=c#d"), "a%26b%3Dc%23d");
+    }
+
+    /// Closing the panel must land back on the view it was opened from,
+    /// not on the unfiltered default.
+    #[test]
+    fn the_inspect_link_carries_the_current_filter() {
+        let url = inspect_url("198.51.100.9", Filter::BlockedOnly, &Ctx::for_tests());
+
+        assert!(url.contains("filter=blocked"), "url was: {url}");
+        assert!(url.contains("inspect=198.51.100.9"), "url was: {url}");
+    }
+
+    #[test]
+    fn the_detail_panel_names_the_feeds_and_the_accounts_tried() {
+        let detail = IpDetail {
+            address: "185.220.101.7".to_string(),
+            kind: AddressKind::Public,
+            reputation: vec![crate::ipdetail::RangeHit {
+                source: "Tor exit nodes".to_string(),
+                range: "185.220.101.0/24".to_string(),
+            }],
+            crawlers: vec![],
+            country: Some("NL".to_string()),
+            country_data_available: true,
+            status: RowStatus::Pending,
+            usernames: vec![("root".to_string(), 9)],
+        };
+
+        let rendered = detail_panel(&detail, Filter::All, &Ctx::for_tests()).into_string();
+
+        for needle in [
+            "185.220.101.7",
+            "Tor exit nodes",
+            "185.220.101.0/24",
+            "NL",
+            "root",
+        ] {
+            assert!(rendered.contains(needle), "missing {needle}:\n{rendered}");
+        }
+    }
+
+    /// The username is whatever the client offered, so it reaches the page
+    /// as attacker-authored text.
+    #[test]
+    fn a_hostile_username_cannot_break_out_of_the_detail_table() {
+        let detail = IpDetail {
+            address: "198.51.100.9".to_string(),
+            kind: AddressKind::Public,
+            reputation: vec![],
+            crawlers: vec![],
+            country: None,
+            country_data_available: false,
+            status: RowStatus::Pending,
+            usernames: vec![("<script>alert(1)</script>".to_string(), 1)],
+        };
+
+        let rendered = detail_panel(&detail, Filter::All, &Ctx::for_tests()).into_string();
+
+        assert!(
+            !rendered.contains("<script>"),
+            "the username was not escaped:\n{rendered}"
+        );
+        assert!(rendered.contains("&lt;script&gt;"), "rendered:\n{rendered}");
+    }
+
+    /// "Not in any feed" and "no feed data on this host" are different
+    /// claims, and only one of them is about the address.
+    #[test]
+    fn an_absent_country_is_not_reported_as_a_fact_about_the_address() {
+        let base = IpDetail {
+            address: "198.51.100.9".to_string(),
+            kind: AddressKind::Public,
+            reputation: vec![],
+            crawlers: vec![],
+            country: None,
+            country_data_available: false,
+            status: RowStatus::Pending,
+            usernames: vec![],
+        };
+
+        let without_data = detail_panel(&base, Filter::All, &Ctx::for_tests()).into_string();
+        let with_data = detail_panel(
+            &IpDetail {
+                country_data_available: true,
+                ..base
+            },
+            Filter::All,
+            &Ctx::for_tests(),
+        )
+        .into_string();
+
+        assert!(
+            without_data.contains("No country data has been fetched"),
+            "rendered:\n{without_data}"
+        );
+        assert!(
+            with_data.contains("Not inside any country"),
+            "rendered:\n{with_data}"
+        );
     }
 }

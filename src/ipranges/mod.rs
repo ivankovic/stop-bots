@@ -97,15 +97,7 @@ impl IpRangeSourceKind {
     }
 
     pub async fn fetch(self) -> Result<String> {
-        let body = reqwest::get(self.url())
-            .await
-            .with_context(|| format!("failed to fetch {}", self.name()))?
-            .error_for_status()
-            .with_context(|| format!("{} request failed", self.name()))?
-            .text()
-            .await
-            .with_context(|| format!("failed to read {} response body", self.name()))?;
-        Ok(body)
+        crate::fetch::text(self.url(), self.name()).await
     }
 
     fn as_source(self) -> IpRangeSource {
@@ -201,15 +193,11 @@ pub fn validate_country_code(country_code: &str) -> Result<String> {
 pub async fn fetch_country(country_code: &str) -> Result<String> {
     let cc = validate_country_code(country_code)?;
     let url = country_zone_url(&cc);
-    let body = reqwest::get(&url)
-        .await
-        .with_context(|| format!("failed to fetch IP ranges for country {cc}"))?
-        .error_for_status()
-        .with_context(|| format!("IP range request for country {cc} failed (unknown code?)"))?
-        .text()
-        .await
-        .with_context(|| format!("failed to read IP range response body for country {cc}"))?;
-    Ok(body)
+    crate::fetch::text(
+        &url,
+        &format!("the IP ranges for country {cc} (unknown code?)"),
+    )
+    .await
 }
 
 /// Parses an IPdeny zone file (one CIDR per line, blank lines allowed) into

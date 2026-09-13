@@ -114,7 +114,7 @@ async fn run_log_job(state: &AppState, job: CronJob) -> anyhow::Result<()> {
 
     let out = state.firewall_out.clone();
     state
-        .with_db(move |db| cron::run_log_job(db, job, log_text.as_deref(), &out))
+        .with_db(move |db| cron::run_log_job(db, job, log_text.as_deref(), out.as_deref()))
         .await?;
     Ok(())
 }
@@ -157,7 +157,7 @@ mod tests {
         db.set_cron_last_run(CronJob::UpdateIpRanges.id(), now_secs(), "skipped for test")
             .unwrap();
         let mut state = AppState::new(db, PathBuf::from("/nonexistent"), Some(ssh_log), false);
-        state.firewall_out = dir.join("fw.nft");
+        state.firewall_out = Some(dir.join("fw.nft"));
         state
     }
 
@@ -204,9 +204,9 @@ mod tests {
         tick(&state).await;
 
         assert!(
-            state.firewall_out.exists(),
+            state.firewall_out.as_ref().unwrap().exists(),
             "no script at {}",
-            state.firewall_out.display()
+            state.firewall_out.as_ref().unwrap().display()
         );
         let summary = state
             .with_db(|db| db.get_cron_last_summary(CronJob::RenderFirewall.id()))
