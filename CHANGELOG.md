@@ -88,6 +88,17 @@ need.
 
 ### Fixed
 
+- **`make deploy` could land a new binary and leave the console down.** The
+  remote half used `systemctl try-restart`, which does nothing at all to a
+  unit that is enabled but not running — which is exactly where a service
+  that crash-looped and was given up on ends up. It now restarts an
+  *enabled* unit and try-restarts one that merely exists, so a host where
+  the console is deliberately run by hand does not get a second copy
+  competing for the port. It also prints the state it left the unit in.
+
+  The remote half moved to `scripts/deploy-remote.sh`, piped over ssh, so
+  that a container test can run that exact file against a real systemd.
+
 - **`batch` ignored the firewall backend this host is set to.** `--backend`
   carried an `nftables` default and nothing consulted
   `firewall::stored_backend`, so an operator who chose iptables in the

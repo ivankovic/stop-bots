@@ -71,33 +71,11 @@ DEPLOY_HOST ?= www
 DEPLOY_PATH ?= /usr/local/bin/stop-bots
 DEPLOY_UNIT ?= stop-bots-web.service
 
-# Staged next to the target and moved into place rather than written over
-# it: replacing a running executable in place fails with ETXTBSY, and a
-# rename swaps the directory entry while the running process keeps the old
-# inode until it restarts.
-#
-# `try-restart` rather than `restart` so this is still correct on a host
-# where the console is run by hand instead of by systemd — it restarts the
-# unit if it is running and does nothing if it is not. Guarded by
-# `systemctl cat` so a host with no unit at all says so instead of failing.
-#
-# It prints the unit's ExecStart and the deployed file's timestamp, because
-# `--version` cannot tell two builds of the same 0.0.x apart: the way this
-# fails is that everything succeeds and the console keeps serving the old
-# code, and the only two facts that distinguish that are *where* the unit
-# looks and *when* the file landed.
+# The remote half lives in scripts/deploy-remote.sh, piped over ssh rather
+# than inlined here: it is branching shell that decides whether the host
+# keeps serving the old build, and `tests/container.rs` runs that exact
+# file against a real systemd. See the script for what it does and why.
 deploy: build
 	scp ./target/release/stop-bots '$(DEPLOY_HOST):$(DEPLOY_PATH).new'
-	ssh '$(DEPLOY_HOST)' 'set -e; \
-		chmod 755 $(DEPLOY_PATH).new; \
-		mv $(DEPLOY_PATH).new $(DEPLOY_PATH); \
-		if systemctl cat $(DEPLOY_UNIT) >/dev/null 2>&1; then \
-			systemctl try-restart $(DEPLOY_UNIT); \
-			printf "unit runs: "; \
-			systemctl show $(DEPLOY_UNIT) -p ExecStart --value | \
-				sed -n "s/.*argv\\[\\]=\\([^ ]*\\).*/\\1/p"; \
-		else \
-			echo "no $(DEPLOY_UNIT) on this host — nothing restarted"; \
-		fi; \
-		printf "deployed:  "; ls -l --time-style=+%Y-%m-%dT%H:%M:%SZ $(DEPLOY_PATH) | \
-			awk "{print \$$6, \$$7}"'
+	ssh '$(DEPLOY_HOST)' 'sh -s' '$(DEPLOY_PATH)' '$(DEPLOY_UNIT)' \
+		< scripts/deploy-remote.sh

@@ -590,6 +590,23 @@ impl Host {
         self.sh("nft list ruleset")
     }
 
+    /// Copies a file from the working tree into the container.
+    ///
+    /// Not into `/tmp`: systemd mounts a tmpfs there during boot, which
+    /// shadows whatever `docker cp` wrote into the image's own `/tmp`.
+    /// The copy reports success and the file is not there.
+    fn put(&self, local: &str, remote: &str) {
+        let out = Command::new("docker")
+            .args(["cp", local, &format!("{}:{remote}", self.name)])
+            .output()
+            .expect("failed to run docker cp");
+        assert!(
+            out.status.success(),
+            "docker cp {local} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     /// Blocks until the console answers, meaning its start-up writes to
     /// the database are done.
     ///
@@ -1048,6 +1065,85 @@ fn replacing_the_binary_and_restarting_runs_the_new_one() {
     assert!(
         host.run("test -e /run/new-build-ran").0,
         "the service restarted but re-executed the old binary"
+    );
+}
+
+/// **The deploy half of the same bug.** `make deploy` pipes
+/// `scripts/deploy-remote.sh` to the target over ssh; this runs that exact
+/// file against a real systemd, because it is the only part of a deploy
+/// that decides whether the host keeps serving the old build.
+///
+/// The case that matters is a unit that is *enabled but not running* —
+/// where systemd is meant to be running the console and currently is not,
+/// which is precisely where a crash-looping service ends up. `try-restart`
+/// does nothing at all to such a unit, so the old script would have landed
+/// the new binary and left the console down.
+#[test]
+fn deploying_onto_a_stopped_console_starts_it_again() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-deploy-stopped");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+    host.wait_for_console();
+    host.put("scripts/deploy-remote.sh", "/opt/deploy-remote.sh");
+
+    // The state a crash-loop leaves behind: enabled, so systemd is
+    // supposed to be running it, but not running.
+    host.sh("systemctl stop stop-bots-web.service");
+    assert_eq!(
+        host.unit("stop-bots-web.service", "ActiveState"),
+        "inactive"
+    );
+    assert_eq!(
+        host.unit("stop-bots-web.service", "UnitFileState"),
+        "enabled"
+    );
+
+    // A deploy arrives, exactly as `make deploy` stages it.
+    host.sh("cp /usr/local/bin/stop-bots /usr/local/bin/stop-bots.real");
+    host.sh("printf '#!/bin/sh\\ntouch /run/deployed-build-ran\\nexec /usr/local/bin/stop-bots.real \"$@\"\\n' > /usr/local/bin/stop-bots.new");
+    let out = host.sh("sh /opt/deploy-remote.sh /usr/local/bin/stop-bots stop-bots-web.service");
+
+    assert_eq!(
+        host.unit("stop-bots-web.service", "ActiveState"),
+        "active",
+        "the deploy left the console down. it said:\n{out}\njournal:\n{}",
+        host.journal("stop-bots-web.service")
+    );
+    assert!(
+        host.run("test -e /run/deployed-build-ran").0,
+        "the console came back but re-executed the old binary"
+    );
+    assert!(
+        out.contains("unit state: active"),
+        "the deploy did not report the state it left the unit in:\n{out}"
+    );
+}
+
+/// The other direction: a host where the console is run by hand has the
+/// unit installed but disabled, and a deploy must not start a second copy
+/// competing for the port.
+#[test]
+fn deploying_does_not_start_a_console_nobody_asked_systemd_to_run() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-deploy-byhand");
+    host.sh("systemctl start nginx");
+    host.sh("stop-bots install web");
+    host.wait_for_console();
+    host.put("scripts/deploy-remote.sh", "/opt/deploy-remote.sh");
+
+    host.sh("systemctl disable --now stop-bots-web.service");
+    host.sh("cp /usr/local/bin/stop-bots /usr/local/bin/stop-bots.new");
+    let out = host.sh("sh /opt/deploy-remote.sh /usr/local/bin/stop-bots stop-bots-web.service");
+
+    assert_eq!(
+        host.unit("stop-bots-web.service", "ActiveState"),
+        "inactive",
+        "a deploy started a service that was deliberately disabled:\n{out}"
     );
 }
 
