@@ -3591,12 +3591,33 @@ result 5.8 (MEDIUM), up from 7.8 (EXPOSED) before the additions.
 
 ### Settings do not go in the unit
 
-`ExecStart` carries `--db`, `--root` and `--ssh-log`, which are paths. The
-bind address, host allowlist, path prefix and exposure flag go to the
-`settings` table, because the running server re-reads them on every request —
-a flag in `ExecStart` would be a second source of truth that loses to the
-database on the next restart. The unit says so in a comment, so the next
-person to add a flag reads the reason first.
+`ExecStart` carries `--db` and `--root`, which are paths. The bind address,
+host allowlist, path prefix and exposure flag go to the `settings` table,
+because the running server re-reads them on every request — a flag in
+`ExecStart` would be a second source of truth that loses to the database on
+the next restart. The unit says so in a comment, so the next person to add a
+flag reads the reason first.
+
+`--ssh-log` used to be in that list, defaulted to `/var/log/auth.log`, and it
+is the one that went wrong in production. Debian 12 dropped rsyslog from
+default installs, so on a current Debian host sshd logs only to the journal
+and that file does not exist. An explicit `--ssh-log` deliberately skips the
+`journalctl` fallback in `sshlog::find_default_source` — it means "read this,
+not whatever you can find" — so the service read nothing at all. The visible
+half was a permanently empty SSH panel in the console. The expensive half was
+silent: the brute-force detector runs inside that same service and inherits
+the same path, so on the host most exposed to this traffic nothing was ever
+detected or blocked. Neither surfaced as an error, because an unreadable log
+is "could not check" rather than "checked and clear" — the right call
+everywhere except when the path was a guess the installer made.
+
+So the installer now names no SSH log unless the operator passes one.
+`Layout::ssh_log` is an `Option`, `None` by default, and the flag reaches
+`ExecStart` only when set. Two tests hold the line: one asserts a default unit
+contains no `--ssh-log`, the other that an explicit path still arrives. The
+general rule this is an instance of: a default that encodes a guess about the
+host belongs at the point of use, where it can be retried and fall back, not
+frozen into a unit file at install time.
 
 ### How it is verified
 

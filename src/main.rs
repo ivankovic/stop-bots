@@ -873,9 +873,15 @@ enum Command {
         /// NGINX config root the service will scan.
         #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
         root: PathBuf,
-        /// SSH log the service will read.
-        #[arg(long, default_value = "/var/log/auth.log")]
-        ssh_log: PathBuf,
+        /// Pin the service to this SSH log instead of letting it find one.
+        ///
+        /// Leave it off unless the log is somewhere this would not look.
+        /// Without it the service tries /var/log/auth.log, /var/log/secure
+        /// and then journalctl, every time it reads — which is what works
+        /// on a host that keeps sshd's output only in the journal. Naming
+        /// a path here disables that search for the life of the unit.
+        #[arg(long)]
+        ssh_log: Option<PathBuf>,
         /// Install into this prefix instead of `/`. For inspecting the
         /// result without root; a unit written under a prefix is not a
         /// unit systemd will ever see, so this skips systemctl entirely.
@@ -1867,7 +1873,7 @@ struct InstallWeb {
     start: bool,
     binary: Option<PathBuf>,
     root: PathBuf,
-    ssh_log: PathBuf,
+    ssh_log: Option<PathBuf>,
     prefix: Option<PathBuf>,
     bind: Option<String>,
     base_path: Option<String>,
@@ -1901,11 +1907,14 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
 
     let prefix = options.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
     let mut layout = Layout::under(&prefix, binary);
-    // `--root` and `--ssh-log` have their own defaults and are absolute, so
-    // they replace what the prefix produced rather than being joined onto
-    // it. Under a prefix that means the unit names the real paths, which is
-    // right: a prefixed install is for reading the output, not running it.
+    // `--root` has its own default and is absolute, so it replaces what the
+    // prefix produced rather than being joined onto it. Under a prefix that
+    // means the unit names the real path, which is right: a prefixed install
+    // is for reading the output, not running it.
     layout.nginx_root = options.root;
+    // Stays `None` unless the operator passed `--ssh-log`, which is what
+    // keeps the flag out of `ExecStart` and leaves the service free to find
+    // the log itself. See `install::Layout::ssh_log`.
     layout.ssh_log = options.ssh_log;
 
     let opts = Options {

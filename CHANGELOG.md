@@ -7,6 +7,22 @@ need.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`install web` no longer pins the service to `/var/log/auth.log`.** It wrote
+  that path into the unit's `ExecStart` at install time, and Debian 12 dropped
+  rsyslog from default installs — so on a current Debian host the file does not
+  exist and sshd logs only to the journal. An explicit `--ssh-log` skips the
+  `journalctl` fallback by design, so the service read nothing: the console's
+  SSH panel stayed empty and the brute-force detector, which runs inside that
+  same service, never saw an attempt to act on. Neither reported an error,
+  because an unreadable log means "could not check".
+
+  The unit now names no SSH log unless `install web --ssh-log` asked for one,
+  which leaves the service to search `/var/log/auth.log`, `/var/log/secure` and
+  then `journalctl` on every read. Existing installs keep the old unit until
+  `install web --force` rewrites it.
+
 ### Changed
 
 - `argon2` 0.5 → 0.6 and `rand` 0.9 → 0.10. Both moved the API this code

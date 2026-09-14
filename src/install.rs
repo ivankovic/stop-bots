@@ -75,8 +75,26 @@ pub struct Layout {
     pub binary: PathBuf,
     /// The NGINX config root to scan.
     pub nginx_root: PathBuf,
-    /// The SSH log to read. Debian's is `/var/log/auth.log`.
-    pub ssh_log: PathBuf,
+    /// An explicit SSH log for the unit to name, or `None` to let the
+    /// service find its own at runtime.
+    ///
+    /// `None` is the default, and the important one. This used to be a
+    /// plain `PathBuf` defaulting to `/var/log/auth.log`, which baked a
+    /// guess about the host into `ExecStart` at install time — and Debian
+    /// 12 dropped rsyslog from default installs, so on a current Debian
+    /// host that guess names a file which does not exist. The service then
+    /// read nothing, found no SSH attempts, and said so as an empty panel
+    /// rather than an error, because an unreadable log is "could not
+    /// check", not "checked and clear".
+    ///
+    /// Passing no flag is not the same as passing this path. With no
+    /// `--ssh-log`, `sshlog::find_default_source` tries `/var/log/auth.log`
+    /// and `/var/log/secure`, *then* falls back to `journalctl`, which is
+    /// where a journald-only host keeps its sshd lines. An explicit path
+    /// deliberately skips that fallback — it means "read this, not whatever
+    /// you can find" — so it belongs in the unit only when an operator
+    /// asked for it.
+    pub ssh_log: Option<PathBuf>,
     /// Exists only under systemd. The documented way to detect it — a
     /// `systemctl` binary on `PATH` proves only that the package is
     /// installed, which is true inside a Docker container that is not
@@ -119,7 +137,7 @@ impl Layout {
             db_path: prefix.join("var/lib/stop-bots/db.sqlite3"),
             binary,
             nginx_root: prefix.join("etc/nginx"),
-            ssh_log: prefix.join("var/log/auth.log"),
+            ssh_log: None,
             systemd_marker: prefix.join("run/systemd/system"),
             debian_marker: prefix.join("etc/debian_version"),
             systemctl: PathBuf::from("systemctl"),
@@ -239,12 +257,18 @@ fn hidden_binary_error(binary: &Path, directive: &str) -> String {
 /// bytes an operator will actually get rather than a rendering of them.
 pub fn web_unit(layout: &Layout) -> String {
     let mut exec = format!(
-        "{} web --db {} --root {} --ssh-log {}",
+        "{} web --db {} --root {}",
         layout.binary.display(),
         layout.db_path.display(),
         layout.nginx_root.display(),
-        layout.ssh_log.display()
     );
+    // Only when the operator named one. Omitting the flag is what leaves
+    // the service free to try the log files and then `journalctl`; naming
+    // a path here would pin it to that path forever, including on the
+    // hosts that do not have it. See `Layout::ssh_log`.
+    if let Some(path) = &layout.ssh_log {
+        exec.push_str(&format!(" --ssh-log {}", path.display()));
+    }
     exec.push('\n');
 
     format!(
@@ -343,12 +367,11 @@ pub fn preflight(layout: &Layout, options: &Options) -> Result<()> {
         anyhow::bail!(
             "this does not look like Debian ({} does not exist).\n\n\
              The unit `install web` writes is almost certainly correct on any \
-             systemd distribution, but the SSH log path it assumes \
-             ({}) is Debian's, and nobody has checked the rest. \
-             Write the unit by hand, or open an issue saying which distribution \
-             this is.",
+             systemd distribution — it names no distribution-specific path, and \
+             the service finds its own logs at runtime — but nobody has run it \
+             anywhere else. Write the unit by hand, or open an issue saying \
+             which distribution this is.",
             layout.debian_marker.display(),
-            layout.ssh_log.display()
         );
     }
 
@@ -604,6 +627,41 @@ mod tests {
         crate::golden::assert_golden("stop-bots-web.service", &web_unit(&system_layout()));
     }
 
+    /// The unit must not name an SSH log unless asked to.
+    ///
+    /// This is the regression that took a production host out quietly. The
+    /// unit used to carry `--ssh-log /var/log/auth.log` always, and on a
+    /// Debian 12 host — where rsyslog is no longer installed by default and
+    /// sshd logs only to the journal — that file does not exist. An
+    /// explicit path skips the `journalctl` fallback by design, so the
+    /// service read nothing: the console's SSH panel sat empty and the
+    /// brute-force detector, which runs inside that same service, found
+    /// nothing to block. Neither said anything was wrong, because an
+    /// unreadable log means "could not check".
+    #[test]
+    fn the_unit_names_no_ssh_log_by_default() {
+        let unit = web_unit(&system_layout());
+
+        assert!(
+            !unit.contains("--ssh-log"),
+            "the unit pinned an SSH log nobody asked for; the service has to be \
+             free to fall back to journalctl. Unit was:\n{unit}"
+        );
+    }
+
+    /// The flag is still there for the host where the log really is
+    /// somewhere else — it just has to be asked for.
+    #[test]
+    fn an_explicit_ssh_log_still_reaches_the_unit() {
+        let mut layout = system_layout();
+        layout.ssh_log = Some(PathBuf::from("/srv/logs/auth.log"));
+
+        assert!(
+            web_unit(&layout).contains("--ssh-log /srv/logs/auth.log"),
+            "an operator who named a log did not get it"
+        );
+    }
+
     /// `Path::join` with an absolute path throws the prefix away, which
     /// would point a `--prefix` install at the developer's real /etc.
     #[test]
@@ -617,7 +675,6 @@ mod tests {
             &layout.output_dir,
             &layout.db_path,
             &layout.nginx_root,
-            &layout.ssh_log,
             &layout.systemd_marker,
             &layout.debian_marker,
         ] {

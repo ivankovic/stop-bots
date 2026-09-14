@@ -16,7 +16,7 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-ExecStart=/usr/local/bin/stop-bots web --db /var/lib/stop-bots/db.sqlite3 --root /etc/nginx --ssh-log /var/log/auth.log
+ExecStart=/usr/local/bin/stop-bots web --db /var/lib/stop-bots/db.sqlite3 --root /etc/nginx
 Restart=on-failure
 RestartSec=5s
 
