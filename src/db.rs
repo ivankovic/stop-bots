@@ -1558,15 +1558,15 @@ impl Db {
         seen_at: i64,
     ) -> Result<()> {
         self.batch(|| {
+            let mut upsert = self.conn.prepare_cached(
+                "INSERT INTO user_agent_stats (user_agent, hit_count, last_seen_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(user_agent) DO UPDATE SET
+                    hit_count = hit_count + excluded.hit_count,
+                    last_seen_at = excluded.last_seen_at",
+            )?;
             for (user_agent, count) in counts {
-                self.conn.execute(
-                    "INSERT INTO user_agent_stats (user_agent, hit_count, last_seen_at)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(user_agent) DO UPDATE SET
-                        hit_count = hit_count + excluded.hit_count,
-                        last_seen_at = excluded.last_seen_at",
-                    params![user_agent, *count as i64, seen_at],
-                )?;
+                upsert.execute(params![user_agent, *count as i64, seen_at])?;
             }
             Ok(())
         })
@@ -2025,11 +2025,14 @@ impl Db {
                 "DELETE FROM ip_ranges WHERE source_id = ?1",
                 params![source_id],
             )?;
+            // One prepared statement for the whole list: `execute` would
+            // compile the SQL again for every one of the tens of thousands of
+            // rows a range list is, and the compile is most of the cost.
+            let mut insert = self.conn.prepare_cached(
+                "INSERT OR IGNORE INTO ip_ranges (source_id, cidr) VALUES (?1, ?2)",
+            )?;
             for cidr in usable_addresses(cidrs) {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO ip_ranges (source_id, cidr) VALUES (?1, ?2)",
-                    params![source_id, cidr],
-                )?;
+                insert.execute(params![source_id, cidr])?;
             }
             Ok(())
         })?;
@@ -2149,12 +2152,15 @@ impl Db {
                 "DELETE FROM country_ip_ranges WHERE country_code = ?1",
                 params![country_code],
             )?;
-            for cidr in usable_addresses(cidrs) {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO country_ip_ranges (country_code, cidr, fetched_at)
+            // One prepared statement for the whole list: `execute` would
+            // compile the SQL again for every one of the tens of thousands of
+            // rows a range list is, and the compile is most of the cost.
+            let mut insert = self.conn.prepare_cached(
+                "INSERT OR IGNORE INTO country_ip_ranges (country_code, cidr, fetched_at)
                      VALUES (?1, ?2, ?3)",
-                    params![country_code, cidr, fetched_at],
-                )?;
+            )?;
+            for cidr in usable_addresses(cidrs) {
+                insert.execute(params![country_code, cidr, fetched_at])?;
             }
             Ok(())
         })?;
@@ -2349,11 +2355,14 @@ impl Db {
                 "DELETE FROM reputation_ranges WHERE source_id = ?1",
                 params![source_id],
             )?;
+            // One prepared statement for the whole list: `execute` would
+            // compile the SQL again for every one of the tens of thousands of
+            // rows a range list is, and the compile is most of the cost.
+            let mut insert = self.conn.prepare_cached(
+                "INSERT OR IGNORE INTO reputation_ranges (source_id, cidr) VALUES (?1, ?2)",
+            )?;
             for cidr in usable_addresses(cidrs) {
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO reputation_ranges (source_id, cidr) VALUES (?1, ?2)",
-                    params![source_id, cidr],
-                )?;
+                insert.execute(params![source_id, cidr])?;
             }
             Ok(())
         })?;

@@ -66,9 +66,10 @@ fake executables on PATH, golden files; 300ms per test in `src/`, 1s in
 - **A test should read as a claim, not a script.** The name states the
   property; the body should get to the interesting part within a few lines.
   Setup longer than the assertion is a sign a fixture is missing.
-- **Shared fixtures live in `src/testing.rs`** (unit tests) and in the
-  helpers at the top of each file in `tests/` (integration tests, which
-  cannot see a `#[cfg(test)]` module). Prefer them over hand-rolled struct
+- **Shared fixtures live in `src/testing.rs`** (unit tests), in
+  `tests/common/mod.rs` (what two or more integration binaries use —
+  they cannot see a `#[cfg(test)]` module), and otherwise in the helpers
+  at the top of each file in `tests/`. Prefer them over hand-rolled struct
   literals: `block("10.0.0.1")` says what an eight-field `FirewallRule`
   literal makes you decode.
 - **The bar for a new fixture is that the call site reads better**, not

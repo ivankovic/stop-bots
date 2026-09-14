@@ -6,7 +6,8 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
-use walkdir::WalkDir;
+mod common;
+use common::{copy_dir_all, path_with, scan_sites, seed_bots, stop_bots};
 
 // Every end-to-end test below drives the real binary against a throwaway
 // database and NGINX root. The helpers here wrap the incantations that made
@@ -105,38 +106,6 @@ impl Fixture {
     }
 }
 
-/// Runs `stop-bots` with `args`, asserting it succeeded, and returns the
-/// assertion so a caller can go on to check stdout.
-fn stop_bots(args: &[&str]) -> assert_cmd::assert::Assert {
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args(args)
-        .assert()
-        .success()
-}
-
-/// Seeds the bot list from the checked-in sample, so tests never touch the
-/// network.
-fn seed_bots(db: &Path) {
-    stop_bots(&[
-        "update-bot-lists",
-        "--db",
-        db.to_str().unwrap(),
-        "--source",
-        "tests/fixtures/botlists/well-known-bots-sample.json",
-    ]);
-}
-
-fn scan_sites(db: &Path, root: &Path) -> assert_cmd::assert::Assert {
-    stop_bots(&[
-        "scan-sites",
-        "--root",
-        root.to_str().unwrap(),
-        "--db",
-        db.to_str().unwrap(),
-    ])
-}
-
 /// `--no-reload` throughout: these run on whatever machine hosts the test
 /// suite, and an apply without it shells out to the real `nginx -t` and
 /// `systemctl reload nginx`.
@@ -206,28 +175,6 @@ fn fake_tools(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     (bin, log)
-}
-
-/// PATH with `bin` in front, for handing to a spawned child.
-fn path_with(bin: &Path) -> String {
-    format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    )
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) {
-    for entry in WalkDir::new(src).into_iter().filter_map(|e| e.ok()) {
-        let rel = entry.path().strip_prefix(src).unwrap();
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(&target).unwrap();
-        } else {
-            fs::create_dir_all(target.parent().unwrap()).unwrap();
-            fs::copy(entry.path(), &target).unwrap();
-        }
-    }
 }
 
 #[test]

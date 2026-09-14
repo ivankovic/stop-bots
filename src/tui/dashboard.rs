@@ -19,33 +19,38 @@
 //! The Dashboard: the default screen on app start. An overview of global
 //! settings (Scanners/Search Bots/AI Bots defaults, navigable and editable
 //! via a popup, mirroring how Bot settings edits a single bot's override),
-//! how many sites are known, whether bot-list sources are up to date, and
-//! host-wide geo-blocking (see "Geo-blocking" below). The "Summary" panel is
-//! deliberately just a glance — it used to also fold in top user agents
-//! seen in successful traffic, but that's moved to its own dedicated
-//! "Dynamic Protection" screen (`crate::tui::dynamic_protection`), which
-//! also lets an admin act on it (permanently block one), not just look at
-//! it.
+//! host-wide geo-blocking (see "Geo-blocking" below), the detectors and
+//! feeds that block on their own, and what the rules become. Top user
+//! agents seen in successful traffic used to be folded in here too, but
+//! that has its own "Dynamic Protection" screen
+//! (`crate::tui::dynamic_protection`), which also lets an admin act on
+//! them, not just look.
 //!
 //! ## Layout
 //!
-//! "System-wide settings" and "Geo-blocking" share the top row — one is
-//! three fixed rows and the other a list of country codes, so between them
-//! they were using a quarter of the width. "Automatic blocking" gets the
-//! full width below them, and deals its rows into as many columns as that
-//! width allows so that all of them are visible at once. It used to share
-//! a row with Geo-blocking and show five of its fourteen.
+//! Two columns over a log. The left column is *policy* — "Policy" (the
+//! category defaults), "Geo" (the country list, with the mode in its
+//! title) and "Firewall script" (rule count, whether the script on disk
+//! is stale, and the inputs it is rendered from). The right column is
+//! what the host does on its own — "Automatic blocking", which deals its
+//! rows into as many columns as its own width allows so that all of them
+//! are visible at once, and "Scheduled". The "Log" at the foot spans
+//! both: every message `App` has shown, newest first. On a short terminal
+//! Automatic blocking is the panel that gives (it falls back to
+//! scrolling); Scheduled never vanishes, because it reports what the
+//! detectors just did.
 //!
-//! Focus still flows *linearly* through the three lists (Categories ->
-//! Countries -> Protection) via Up/Down, and only the focused one draws a
-//! highlight, so there's never ambiguity about which list the arrows move.
-//! Within Automatic blocking the rows fill one column before starting the
-//! next, so a single selection index still walks them in reading order:
-//! Down at the foot of one column arrives at the head of the next.
+//! Focus flows *linearly* through the three lists (Categories ->
+//! Countries -> Protection) via Up/Down, and Tab/Shift+Tab step between
+//! them; only the focused one draws a highlight, so there's never
+//! ambiguity about which list the arrows move. Within Automatic blocking
+//! the rows fill one column before starting the next, so a single
+//! selection index still walks them in reading order: Down at the foot of
+//! one column arrives at the head of the next.
 //!
 //! ## The host-wide actions
 //!
-//! Three keys here act on the whole host rather than on the selected row,
+//! Four keys here act on the whole host rather than on the selected row,
 //! and each is the TUI's half of something the console has as a button or
 //! a panel:
 //!
@@ -56,21 +61,17 @@
 //!   same two `batch --apply` does. The NGINX reload it triggers overlaps
 //!   the firewall render rather than preceding it: both are started from
 //!   `App::finish_site_apply`, and neither reads what the other writes.
+//! - `F` opens the render popup ([`Popup::RenderFirewall`]) — capital,
+//!   like `A` on Site settings, because it writes to the host.
 //! - `w` opens the Web Access form ([`Popup::WebAccess`]), which puts this
 //!   console behind NGINX on a subdomain or a path prefix
 //!   ([`crate::webaccess`]).
 //!
-//! None of the three is behind a confirmation popup, matching the
+//! None of the four is behind a confirmation popup, matching the
 //! console's one-click buttons: an update only downloads, and the apply
-//! goes through the same anti-lockout guard the render popup does.
-//!
-//! They are hinted in the *Summary* panel's title rather than in
-//! "System-wide settings"', where they belong by meaning. That panel is
-//! half-width — 37 title columns on an 80-column terminal — and ratatui
-//! truncates a longer `Block` title silently, which loses most of a hint
-//! that says what the keys do. A title short enough to fit names the keys
-//! and nothing else. Summary is full-width and already the panel that
-//! says "press f".
+//! goes through the same anti-lockout guard the render popup does. They
+//! are hinted in the footer (see [`Dashboard::hints`]), which is
+//! context-sensitive, so panel titles stay titles.
 //!
 //! ## Geo-blocking
 //!
@@ -121,7 +122,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// or wasn't fetched in the last week.
 const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 
-/// The rows of the editable "System-wide settings" list, in display order.
+/// The rows of the editable "Policy" list, in display order.
 const CATEGORIES: [Category; 3] = [Category::Scanner, Category::Search, Category::Ai];
 
 /// Which of the Dashboard's three lists arrow keys currently move through.
@@ -264,13 +265,13 @@ pub struct Dashboard {
     /// Whether the current rule set (`firewall::all_rules`) differs from
     /// what was in effect the last time the firewall was actually rendered
     /// (`firewall::rules_signature`, compared via
-    /// `Db::get_firewall_rendered_signature`) — shown as a Summary panel
-    /// row so an admin can tell, without opening the render popup, whether
+    /// `Db::get_firewall_rendered_signature`) — shown as the Firewall
+    /// script panel's tag so an admin can tell, without opening the render popup, whether
     /// e.g. a scanner blocked since the last daily `RenderFirewall` cron
     /// tick is actually reflected in the on-disk script yet.
     firewall_needs_update: bool,
-    /// How many rules a render would write, for the Summary panel — see
-    /// its three-state line, which reads differently at zero.
+    /// How many rules a render would write, for the Firewall script panel
+    /// — see its three-state line, which reads differently at zero.
     rule_count: usize,
     /// The last health probe, re-assessed on every refresh. `None` until
     /// the internal cron has taken one — see [`crate::health`].
@@ -351,8 +352,8 @@ impl Dashboard {
             .count()
     }
 
-    /// Whether the Summary panel's firewall row currently reads "needs
-    /// updating" — `pub(crate)` and test-only, purely so `App`'s own tests
+    /// Whether the Firewall script panel currently reads `[ STALE ]` —
+    /// `pub(crate)` and test-only, purely so `App`'s own tests
     /// (a different module) can assert that a render triggered through the
     /// key/outcome flow actually refreshes this cached value, not just the
     /// underlying `Db` signature (see `App::handle_key_event`'s
@@ -452,14 +453,18 @@ impl Dashboard {
             Constraint::Length(4),
         ])
         .areas(left);
-        let protection_height = self.protection_panel_height(right.width);
+        // Measured once for both the height it needs and the drawing:
+        // the same width goes into both, and measuring means formatting
+        // every row's label.
+        let (label_width, columns) = self.protection_columns(right.width);
+        let protection_height = self.protection_panel_height(columns);
         let [protection_area, cron_area] =
             Layout::vertical([Constraint::Max(protection_height), Constraint::Min(3)]).areas(right);
 
         self.render_categories(frame, settings_area, theme);
         self.render_geo(frame, geo_area, theme);
         self.render_firewall(frame, firewall_area, theme);
-        self.render_protection(frame, protection_area, theme);
+        self.render_protection(frame, protection_area, theme, label_width, columns);
         self.render_cron(frame, cron_area, theme, running_jobs);
         self.render_log(frame, log_area, theme, log);
 
@@ -535,12 +540,9 @@ impl Dashboard {
         (label_width, columns)
     }
 
-    /// How tall the Automatic blocking panel wants to be at this width:
-    /// two border lines plus however many rows survive being dealt into
-    /// columns. Asked before the layout is solved, so it takes its
-    /// column's width.
-    fn protection_panel_height(&self, width: u16) -> u16 {
-        let (_, columns) = self.protection_columns(width);
+    /// How tall the Automatic blocking panel wants to be once dealt into
+    /// `columns`: two border lines plus however many rows survive.
+    fn protection_panel_height(&self, columns: u16) -> u16 {
         (self.protection_rows().len() as u16).div_ceil(columns) + 2
     }
 
@@ -552,9 +554,15 @@ impl Dashboard {
     /// them in reading order: Down at the foot of one column arrives at the
     /// head of the next. Only the column holding the selection draws a
     /// highlight, and it draws it at the row's index *within that column*.
-    fn render_protection(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+    fn render_protection(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: Theme,
+        label_width: u16,
+        columns: u16,
+    ) {
         let rows = self.protection_rows();
-        let (label_width, columns) = self.protection_columns(area.width);
         let per_column = (rows.len() as u16).div_ceil(columns) as usize;
 
         // The block is drawn once, around the lot; the columns are laid
@@ -565,10 +573,10 @@ impl Dashboard {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        let column_areas = Layout::horizontal(
-            std::iter::repeat_n(Constraint::Ratio(1, u32::from(columns)), columns as usize)
-                .collect::<Vec<_>>(),
-        )
+        let column_areas = Layout::horizontal(std::iter::repeat_n(
+            Constraint::Ratio(1, u32::from(columns)),
+            columns as usize,
+        ))
         .split(inner);
 
         let selected = self.protection_state.selected();
@@ -595,8 +603,8 @@ impl Dashboard {
     }
 
     /// What the rules become: the script, and whether the one on disk is
-    /// still the one these rules would write. The summary the old Summary
-    /// panel carried (sites found, bot-list freshness) is the second line,
+    /// still the one these rules would write. What used to be a Summary
+    /// panel of its own (sites found, bot-list freshness) is the second line,
     /// because those are the inputs the script is rendered from.
     fn render_firewall(&self, frame: &mut Frame, area: Rect, theme: Theme) {
         // Three states, not two. A fresh install has no rules at all,
@@ -3044,9 +3052,9 @@ mod tests {
     }
 
     /// With no rules at all — a fresh install — the panel must not say
-    /// "needs updating (press f)". Pressing `f` there renders an empty
-    /// script, which looks like the tool doing nothing, and it is the
-    /// first screen a new user sees.
+    /// "F to write". Pressing `F` there renders an empty script, which
+    /// looks like the tool doing nothing, and it is the first screen a
+    /// new user sees.
     #[test]
     fn the_firewall_summary_row_does_not_send_a_fresh_install_to_render_nothing() {
         let db = Db::open_in_memory().unwrap();

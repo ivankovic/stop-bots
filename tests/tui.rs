@@ -4,7 +4,8 @@
 //! category popup right on the Dashboard -> Bot settings shows the seeded
 //! source and opens its update-confirmation popup -> quit.
 
-use assert_cmd::Command as AssertCommand;
+mod common;
+use common::{path_with, scan_sites, seed_bots, writable_nginx_fixture};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -246,24 +247,7 @@ fn seed_cron_state(db_path: &Path) {
 }
 
 fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
-    seed_cron_state(db_path);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
-    // `--no-reload`: some of these tests drive a real Site settings apply
-    // through this real spawned process, and without this it would shell
-    // out to the real `nginx -t`/`systemctl reload nginx` on whatever
-    // machine runs the test suite (see `main.rs`'s `apply-blocks
-    // --no-reload`, the same escape hatch for the CLI's own apply path).
-    cmd.args(["tui", "--db", db_path.to_str().unwrap(), "--no-reload"]);
-    // A fixture SSH log, for the same reason the CLI tests pass --ssh-log:
-    // auto-detection reads whatever log the host machine has — or shells
-    // out to `journalctl`, which costs upwards of half a second per
-    // Dynamic Protection refresh on some hosts and made every test in this
-    // file carry that as fixed overhead.
-    cmd.args(["--ssh-log", "tests/fixtures/logs/auth.log"]);
-    cmd.args(extra_args);
-    cmd.env("TERM", "xterm-256color");
-
-    spawn_in_pty(cmd, 32, 100, Duration::from_millis(timeout_ms()))
+    spawn_tui_cmd(db_path, extra_args, None)
 }
 
 /// Like [`spawn_tui`], but *without* `--no-reload` and with `fakebin`
@@ -274,7 +258,7 @@ fn spawn_tui_with_args(db_path: &Path, extra_args: &[&str]) -> PtySession {
 /// tools at all; this is the opposite: run them, and control what they
 /// resolve to.
 fn spawn_tui_with_fake_tools(db_path: &Path, fakebin: &Path) -> PtySession {
-    spawn_tui_with_fake_tools_and_args(db_path, fakebin, &[])
+    spawn_tui_cmd(db_path, &[], Some(fakebin))
 }
 
 /// [`spawn_tui_with_fake_tools`] plus extra arguments — for the one test
@@ -286,20 +270,36 @@ fn spawn_tui_with_fake_tools_and_args(
     fakebin: &Path,
     extra_args: &[&str],
 ) -> PtySession {
+    spawn_tui_cmd(db_path, extra_args, Some(fakebin))
+}
+
+/// The one place the child process is put together. Every spawner above
+/// is this with a different `fakebin`: with one, the tools on that PATH
+/// are run for real; without one, `--no-reload` keeps the child from
+/// shelling out to the real `nginx -t`/`systemctl reload nginx` on
+/// whatever machine runs the test suite (see `main.rs`'s `apply-blocks
+/// --no-reload`, the same escape hatch for the CLI's own apply path).
+fn spawn_tui_cmd(db_path: &Path, extra_args: &[&str], fakebin: Option<&Path>) -> PtySession {
     seed_cron_state(db_path);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
     cmd.args(["tui", "--db", db_path.to_str().unwrap()]);
-    cmd.args(extra_args);
+    match fakebin {
+        Some(fakebin) => {
+            cmd.env("PATH", path_with(fakebin));
+        }
+        None => {
+            cmd.arg("--no-reload");
+        }
+    }
+    // A fixture SSH log, for the same reason the CLI tests pass --ssh-log:
+    // auto-detection reads whatever log the host machine has — or shells
+    // out to `journalctl`, which costs upwards of half a second per
+    // Dynamic Protection refresh on some hosts and made every test in this
+    // file carry that as fixed overhead.
     cmd.args(["--ssh-log", "tests/fixtures/logs/auth.log"]);
+    cmd.args(extra_args);
     cmd.env("TERM", "xterm-256color");
-    cmd.env(
-        "PATH",
-        format!(
-            "{}:{}",
-            fakebin.display(),
-            std::env::var("PATH").unwrap_or_default()
-        ),
-    );
+
     spawn_in_pty(cmd, 32, 100, Duration::from_millis(timeout_ms()))
 }
 
@@ -415,17 +415,7 @@ fn navigate_change_a_setting_and_quit() {
 
     // Seed one bot-list source (no network access) so the Bot settings
     // screen below has a source row to show.
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
 
     let mut session = spawn_tui(&db_path);
 
@@ -546,17 +536,7 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
     let db_path = tmp.path().join("db.sqlite3");
 
     // Seed four bots (no network access) so there's something to search.
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
 
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
@@ -662,27 +642,6 @@ fn site_settings_scan_now_discovers_sites_from_the_tui() {
         .expect("process should exit after q on the Dashboard");
 }
 
-/// Recursively copies `src` into `dst`, creating `dst` and any
-/// intermediate directories as needed. Used to get a writable copy of the
-/// (checked-in, read-only) NGINX fixtures for tests that actually write to
-/// disk — mirrors `tests/cli.rs`'s own `copy_dir_all`, not shared with it
-/// since these are two separate test binaries.
-fn copy_dir_all(src: &Path, dst: &Path) {
-    for entry in walkdir::WalkDir::new(src)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        let rel = entry.path().strip_prefix(src).unwrap();
-        let target = dst.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target).unwrap();
-        } else {
-            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
-
 /// Sets up a TUI over a writable copy of the NGINX fixture tree, with a
 /// fake `nginx` and a fake `systemctl` on PATH — the two tools a Site
 /// settings apply really executes.
@@ -701,31 +660,10 @@ fn site_tui_with_a_holdable_reload() -> (tempfile::TempDir, PtySession, PathBuf,
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
-    let nginx_root = tmp.path().join("nginx");
-    copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
+    let nginx_root = writable_nginx_fixture(tmp.path());
 
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
 
     let fakebin = tmp.path().join("bin");
     fs::create_dir_all(&fakebin).unwrap();
@@ -779,14 +717,14 @@ fn wait_for_systemctl_calls(calls: &Path, want: usize) -> String {
     }
 }
 
-/// Selects the site named `name` in Site settings' list and applies it.
-/// The list is sorted by server name, and the selection starts at the top.
-fn apply_site(session: &mut PtySession, name: &str) {
+/// Applies the site currently selected in Site settings' list: `a`, then
+/// Cancel -> Apply now. The list is sorted by server name and the
+/// selection starts at the top, so the caller picks the site with Down.
+fn apply_selected_site(session: &mut PtySession) {
     send_key(session, "a");
     session.exp_string("Cancel").unwrap();
     send_key(session, "\x1b[B"); // Cancel -> Apply now
     send_key(session, "\r");
-    let _ = name;
 }
 
 /// The reload NGINX needs after an apply runs in the background now, so
@@ -805,7 +743,7 @@ fn applying_a_site_reloads_nginx_without_blocking_the_tui() {
 
     send_key(&mut session, "s");
     session.exp_string("Sites").unwrap();
-    apply_site(&mut session, "example.com");
+    apply_selected_site(&mut session);
 
     // The apply's own result lands immediately, with the reload still out.
     session.exp_string("UP").unwrap();
@@ -853,10 +791,10 @@ fn a_second_apply_during_a_reload_still_gets_its_own_reload() {
 
     // Both applies happen while the gate holds the first reload open, so
     // the second one is necessarily requested mid-flight.
-    apply_site(&mut session, "example.com");
+    apply_selected_site(&mut session);
     session.exp_string("UP").unwrap();
     send_key(&mut session, "\x1b[B"); // next site in the list
-    apply_site(&mut session, "localhost");
+    apply_selected_site(&mut session);
     session.exp_string("UP").unwrap();
 
     std::fs::remove_file(&gate).unwrap();
@@ -874,34 +812,13 @@ fn a_second_apply_during_a_reload_still_gets_its_own_reload() {
 fn site_settings_apply_writes_the_selected_sites_rule_to_its_own_file() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
-    let nginx_root = tmp.path().join("nginx");
-    copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
+    let nginx_root = writable_nginx_fixture(tmp.path());
 
     // Seed bots (AISearchBot is AI, blocked by the global default with no
     // overrides at all) and scan the writable fixture copy, entirely via
     // the CLI — the apply itself is what this test drives through the TUI.
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
 
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
@@ -953,31 +870,10 @@ fn site_settings_apply_writes_the_selected_sites_rule_to_its_own_file() {
 fn site_settings_apply_all_writes_the_rule_to_every_sites_own_file() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
-    let nginx_root = tmp.path().join("nginx");
-    copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
+    let nginx_root = writable_nginx_fixture(tmp.path());
 
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
 
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
@@ -1029,31 +925,10 @@ fn site_settings_apply_failure_shows_a_dismissible_alert_with_a_root_suggestion(
 
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
-    let nginx_root = tmp.path().join("nginx");
-    copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
+    let nginx_root = writable_nginx_fixture(tmp.path());
 
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            nginx_root.to_str().unwrap(),
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
+    scan_sites(&db_path, &nginx_root);
 
     // Make example.com's config file read-only, simulating running the
     // TUI without the privileges nginx's own config directory normally
@@ -1115,28 +990,8 @@ fn open_site_detail(tmp: &tempfile::TempDir) -> PtySession {
     // Seed 4 bots (jyxo-crawler among them, tagged "unknown" — no category
     // flags at all) and both fixture sites via the CLI; the detail view
     // itself is driven entirely through the TUI below.
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "update-bot-lists",
-            "--db",
-            db_path.to_str().unwrap(),
-            "--source",
-            "tests/fixtures/botlists/well-known-bots-sample.json",
-        ])
-        .assert()
-        .success();
-    AssertCommand::cargo_bin("stop-bots")
-        .unwrap()
-        .args([
-            "scan-sites",
-            "--root",
-            "tests/fixtures/nginx",
-            "--db",
-            db_path.to_str().unwrap(),
-        ])
-        .assert()
-        .success();
+    seed_bots(&db_path);
+    scan_sites(&db_path, Path::new("tests/fixtures/nginx"));
 
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
@@ -1238,46 +1093,10 @@ fn help_screen_opens_and_returns_to_the_previous_screen() {
         .expect("process should exit after q on the Dashboard");
 }
 
-/// The Dashboard's geo-blocking panel, added below "System-wide settings".
+/// The Dashboard's geo-blocking panel, the "Geo" list below "Policy".
 /// Seeds an already-fetched-but-unblocked country directly (no network
 /// access): the TUI only hits the network for a country that hasn't been
 /// fetched yet (`App::start_country_block`), so blocking one that's already
-/// The command palette end to end: `:` opens it over whatever screen is
-/// up, typing narrows the list, Enter runs the selected command — here
-/// "Re-read the SSH log", whose first effect is landing on Dynamic
-/// Protection, a screen change the pty can see.
-#[test]
-fn the_command_palette_runs_a_typed_command() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
-    session.exp_string("Dashboard").unwrap();
-
-    send_key(&mut session, "s");
-    session.exp_string("Sites").unwrap();
-
-    send_key(&mut session, ":");
-    session.exp_string("Commands").unwrap();
-    // A word from the unfiltered list that is not on Site settings.
-    session.exp_string("Dynamic").unwrap();
-
-    // Narrow to one row. Not checked on the query line: each keystroke
-    // redraws one cell, so "re-read" never arrives contiguously. The
-    // filtered row does — it moves to the top of the list, where "Go to
-    // Dashboard" was, and differs from it in every cell.
-    send_key(&mut session, "re-read");
-    session.exp_string("Re-read").unwrap();
-
-    send_key(&mut session, "\r");
-    session.exp_string("Failed").unwrap();
-
-    send_key(&mut session, "q");
-    session.exp_string("Automatic").unwrap();
-    send_key(&mut session, "q");
-    session
-        .exp_eof()
-        .expect("process should exit after q on the Dashboard");
-}
-
 /// fetched is the synchronous path this test can exercise without touching
 /// the network.
 #[test]
@@ -1327,6 +1146,42 @@ fn dashboard_geo_blocking_add_and_remove_a_country() {
     send_key(&mut session, "\r");
     session.exp_string("Remov").unwrap();
 
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
+/// The command palette end to end: `:` opens it over whatever screen is
+/// up, typing narrows the list, Enter runs the selected command — here
+/// "Re-read the SSH log", whose first effect is landing on Dynamic
+/// Protection, a screen change the pty can see.
+#[test]
+fn the_command_palette_runs_a_typed_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+
+    send_key(&mut session, ":");
+    session.exp_string("Commands").unwrap();
+    // A word from the unfiltered list that is not on Site settings.
+    session.exp_string("Dynamic").unwrap();
+
+    // Narrow to one row. Not checked on the query line: each keystroke
+    // redraws one cell, so "re-read" never arrives contiguously. The
+    // filtered row does — it moves to the top of the list, where "Go to
+    // Dashboard" was, and differs from it in every cell.
+    send_key(&mut session, "re-read");
+    session.exp_string("Re-read").unwrap();
+
+    send_key(&mut session, "\r");
+    session.exp_string("Failed").unwrap();
+
+    send_key(&mut session, "q");
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()

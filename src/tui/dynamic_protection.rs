@@ -17,10 +17,11 @@
  */
 
 //! The Dynamic Protection screen: a live, actionable view of what's
-//! currently hitting the server, split into two panels — "Top IPs
-//! attempting SSH connection" and "Top User Agents" — each ranked by count
-//! and tagged `NOT BLOCKED` or `BLOCKED` (rendered in red). `Tab`/`Shift+Tab`
-//! switch which panel `Up`/`Down` (or `j`/`k`) move through; `f` cycles a
+//! currently hitting the server, split into two panels — "Failed SSH
+//! logins" and "Top user agents" — each ranked by count with a bar, and
+//! tagged `NOT BLOCKED` (dim), `BLOCKED` (red) or `BLOCKLIST` (yellow).
+//! `Tab`/`Shift+Tab` switch which panel `Up`/`Down` (or `j`/`k`) move
+//! through; `y` copies the selected row; `R` re-reads the log; `f` cycles a
 //! shared display filter (All / Not blocked only / Blocked only) applied to
 //! both panels; `Enter` toggles the selected row's block state — blocks a
 //! `NOT BLOCKED` row, unblocks a `BLOCKED` one. All of this is storage-only,

@@ -57,17 +57,16 @@ You can exit the app, or back out of a popup/submenu, with 'q' or Escape.
 
 ## Theme
 
-You can switch between the dark and light theme with 'c'. The app will try to auto-detect the theme,
+You can switch between the dark and light theme with 't'. The app will try to auto-detect the theme,
 but for some terminal and multiplexer combinations there isn't enough information available to make
 the correct choice.
 
 ## Screens
 
-Tab / Shift+Tab (or Left/Right, or their vim `h`/`l` aliases) cycle through the tabs below;
-`d`/`b`/`s`/`p` jump straight to one; `?` toggles a full key-binding reference at any time.
-On the two screens that have more than one list side by side — Site settings and Dynamic
-Protection — Tab switches between *those* instead, and you cycle screens with Left/Right or
-the direct jumps.
+`1`–`4` (or `d`/`b`/`s`/`p`) jump straight to a screen; Left/Right, or their vim `h`/`l`
+aliases, step through them; `?` toggles a full key-binding reference at any time, and `:`
+opens a command palette listing every action by name. Tab / Shift+Tab always move between
+the *panels* of the current screen, never between screens.
 
 The Dashboard owns everything that ends up in the **firewall script**; Site settings owns
 everything that ends up in **NGINX config**. That split decides where any given setting lives.
@@ -75,11 +74,13 @@ everything that ends up in **NGINX config**. That split decides where any given 
 - **Dashboard** (the default screen): system-wide category defaults (Scanners / Search Bots /
   AI Bots — Allowed or Blocked); host-wide geo-blocking (block or allow-list specific
   countries); an "Automatic blocking" panel with an on/off switch for each detector and each
-  third-party blocklist; a Summary panel (sites discovered, bot-list source freshness, and
-  whether the firewall script on disk still matches the current rules); and a "Scheduled
-  tasks" panel showing the internal cron's jobs and when they last ran (with a spinner next
-  to any job currently running in the background). `Up`/`Down` flow between the three lists;
-  `m` switches geo mode. Press `f` to render the current firewall rules to a script — the
+  third-party blocklist; a "Firewall script" panel (how many rules a render would write,
+  whether the script on disk is stale, and the sites and bot lists it is rendered from); a
+  "Scheduled" panel showing the internal cron's jobs and when they last ran (with a spinner
+  next to any job currently running in the background); and a Log of what the app last
+  did. A status strip under the tabs shows the host's health checks on every screen.
+  `Up`/`Down` flow between the three lists; `m` switches geo mode. Press `F` to render the
+  current firewall rules to a script — the
   popup also has an "apply after writing" toggle (Space) for actually enforcing it
   immediately, instead of applying it by hand afterward. Three more keys act on the whole
   host: `u` downloads every list, `a` applies both planes (NGINX, then the firewall), and
@@ -371,7 +372,15 @@ ssh -L 8787:127.0.0.1:8787 your-server
 
 then open <http://127.0.0.1:8787/>.
 
-Three host-wide actions live on the Dashboard, in the browser as buttons and in the TUI
+![The web console's dashboard: health chips and the two host-wide buttons in the header, policy, geo-blocking and third-party feeds in one column, automatic blocking and scheduled tasks in the other](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/web-dashboard.png)
+
+The console follows the operating system's light or dark setting, with a toggle in the
+header; the TUI screenshots above are the dark theme, these the light one. The keys the
+TUI uses work here too: `1`–`4` switch screens, `/` focuses the search box, `?` opens Help.
+
+![The web console's Dynamic Protection page: failed SSH logins and top user agents, each with a count bar and a state tag, and a block or unblock button per row](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/web-dynamic-protection.png)
+
+Three host-wide actions live in the header, in the browser as buttons and in the TUI
 as single keys:
 
 - **Update everything** (`u`) downloads every bot list, every crawler IP range, every

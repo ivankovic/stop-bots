@@ -79,7 +79,7 @@ impl Ctx {
             .map(|(report, _)| report);
         let mut ctx = Self::new(csrf, state.base.clone());
         ctx.chrome = Chrome {
-            host: host_name(),
+            host: crate::host::name().map(str::to_string),
             health,
         };
         ctx
@@ -286,7 +286,7 @@ pub fn login_page(base: &BasePath, error: Option<&str>) -> Markup {
                     section .panel {
                         h2 {
                             "stop-bots"
-                            @if let Some(host) = host_name() {
+                            @if let Some(host) = crate::host::name() {
                                 span .hint { "@ " (host) }
                             }
                         }
@@ -368,16 +368,6 @@ fn chip_label(check: &crate::health::Check) -> &'static str {
         "log-sources" => "logs",
         _ => check.title,
     }
-}
-
-/// This machine's host name, as the kernel has it. `None` when it cannot
-/// be read, which is not an error anyone needs to hear about.
-pub fn host_name() -> Option<String> {
-    ["/proc/sys/kernel/hostname", "/etc/hostname"]
-        .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
 }
 
 /// A titled panel.

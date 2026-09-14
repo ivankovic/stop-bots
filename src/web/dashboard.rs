@@ -87,7 +87,7 @@ struct View {
 }
 
 /// A bot list older than this reads as needing a refresh. Matches the
-/// TUI's Summary panel.
+/// TUI's Firewall script panel.
 const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 
 fn load(

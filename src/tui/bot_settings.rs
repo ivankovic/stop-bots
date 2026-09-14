@@ -677,7 +677,7 @@ mod tests {
             Policy::Blocked
         );
 
-        let mut allowed_bot = bot.clone();
+        let mut allowed_bot = bot;
         allowed_bot.status = BotStatus::Allowed;
         assert_eq!(
             effective_policy(

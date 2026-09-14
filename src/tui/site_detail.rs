@@ -1061,7 +1061,7 @@ mod tests {
         .unwrap();
         db.set_bot_status("gptbot", BotStatus::Allowed).unwrap();
 
-        let mut detail = SiteDetail::new(site.clone());
+        let mut detail = SiteDetail::new(site);
         detail.refresh(&db).unwrap();
         search_for(&mut detail, &db, "gpt");
 

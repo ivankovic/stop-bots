@@ -11,3 +11,11 @@ slow-timeout = { period = "300ms", terminate-after = 10 }
 filter = "binary(cli) | binary(tui) | binary(web)"
 slow-timeout = { period = "1s", terminate-after = 15 }
 
+
+# The container suite is gated by STOP_BOTS_CONTAINER_TESTS (every test
+# returns at once without it), not excluded here — so when it *is* on,
+# each test boots a real container or a real systemd and needs a budget
+# to match, not the 300ms default that would kill all of them at 3s.
+[[profile.default.overrides]]
+filter = "binary(container)"
+slow-timeout = { period = "60s", terminate-after = 5 }

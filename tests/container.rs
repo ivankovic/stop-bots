@@ -204,6 +204,37 @@ impl Network {
     }
 }
 
+/// Runs a shell command inside a container, returning (exit status
+/// success, stdout, stderr). The one `docker exec` every assertion in this
+/// file flows through.
+fn exec_in(container: &str, cmd: &str) -> (bool, String, String) {
+    let out = Command::new("docker")
+        .args(["exec", container, "sh", "-c", cmd])
+        .output()
+        .expect("failed to run docker exec");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// [`exec_in`], asserting the command succeeded.
+fn sh_in(container: &str, cmd: &str) -> String {
+    let (ok, stdout, stderr) = exec_in(container, cmd);
+    assert!(
+        ok,
+        "command failed: {cmd}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stdout
+}
+
+/// `docker rm -f`, for the `Drop` impls. Errors are ignored: a container
+/// that is already gone is the outcome wanted.
+fn remove_container(name: &str) {
+    let _ = Command::new("docker").args(["rm", "-f", name]).output();
+}
+
 impl Drop for Network {
     fn drop(&mut self) {
         let _ = Command::new("docker")
@@ -286,9 +317,7 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.name])
-            .output();
+        remove_container(&self.name);
     }
 }
 
@@ -340,25 +369,12 @@ impl Server {
     /// Runs a shell command inside the container, returning
     /// (exit status success, stdout, stderr).
     fn run(&self, cmd: &str) -> (bool, String, String) {
-        let out = Command::new("docker")
-            .args(["exec", &self.name, "sh", "-c", cmd])
-            .output()
-            .expect("failed to run docker exec");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
+        exec_in(&self.name, cmd)
     }
 
     /// Runs a command and asserts it succeeded.
     fn sh(&self, cmd: &str) -> String {
-        let (ok, stdout, stderr) = self.run(cmd);
-        assert!(
-            ok,
-            "command failed: {cmd}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        stdout
+        sh_in(&self.name, cmd)
     }
 
     /// Seeds one blocked bot, in the real well-known-bots source format,
@@ -441,9 +457,7 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.name])
-            .output();
+        remove_container(&self.name);
     }
 }
 
@@ -460,8 +474,35 @@ struct Host {
     name: String,
 }
 
+/// Where `stop-bots install web` puts the console's database on a host.
+const HOST_DB: &str = "/var/lib/stop-bots/db.sqlite3";
+
 impl Host {
+    /// A booted host with NGINX running — every test here wants that
+    /// much, so it is not a line they each repeat. See [`Host::installed`]
+    /// for the next step most of them take.
     fn start(name: &str) -> Host {
+        let host = Host::boot(name);
+        host.sh("systemctl start nginx");
+        host
+    }
+
+    /// [`Host::start`] with the console installed as a service, the way
+    /// `stop-bots install web` leaves a real host. For the tests that
+    /// exercise the *installed* host rather than the install itself.
+    fn installed(name: &str) -> Host {
+        let host = Host::start(name);
+        host.sh("stop-bots install web");
+        host
+    }
+
+    /// Runs `stop-bots` on the host against the installed console's
+    /// database. `--db` is a per-subcommand flag, so it goes last.
+    fn stop_bots(&self, args: &str) -> String {
+        self.sh(&format!("stop-bots {args} --db {HOST_DB}"))
+    }
+
+    fn boot(name: &str) -> Host {
         build_host_image();
         // Leftover from a previous aborted run.
         let _ = Command::new("docker").args(["rm", "-f", name]).output();
@@ -538,25 +579,12 @@ impl Host {
     /// Runs a shell command inside the container, returning
     /// (exit status success, stdout, stderr).
     fn run(&self, cmd: &str) -> (bool, String, String) {
-        let out = Command::new("docker")
-            .args(["exec", &self.name, "sh", "-c", cmd])
-            .output()
-            .expect("failed to run docker exec");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
+        exec_in(&self.name, cmd)
     }
 
     /// Runs a command and asserts it succeeded.
     fn sh(&self, cmd: &str) -> String {
-        let (ok, stdout, stderr) = self.run(cmd);
-        assert!(
-            ok,
-            "command failed: {cmd}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-        );
-        stdout
+        sh_in(&self.name, cmd)
     }
 
     /// One property of a unit, as systemd itself reports it.
@@ -678,22 +706,22 @@ impl Host {
     /// The stored console password hash, read with the tool's own
     /// database rather than by poking at SQLite's file format.
     fn password_hash(&self) -> String {
-        self.sh("sqlite3 /var/lib/stop-bots/db.sqlite3 \"select value from settings where key like 'web:password%'\"")
-            .trim()
-            .to_string()
+        self.sh(&format!(
+            "sqlite3 {HOST_DB} \"select value from settings where key like 'web:password%'\""
+        ))
+        .trim()
+        .to_string()
     }
 
     /// Seeds one blocked bot through the real parser, so an apply has
     /// something to write. Same format and same reasoning as
     /// [`Server::seed_bot`].
-    fn seed_bot(&self, id: &str, pattern: &str, db: &str) {
+    fn seed_bot(&self, id: &str, pattern: &str) {
         let json = format!(
             r#"[{{"id":"{id}","categories":["ai"],"pattern":{{"accepted":["{pattern}"],"forbidden":[]}},"url":"https://example.invalid/{id}"}}]"#
         );
         self.sh(&format!("cat > /tmp/bots.json <<'JSON'\n{json}\nJSON"));
-        self.sh(&format!(
-            "stop-bots update-bot-lists --source /tmp/bots.json --db {db}"
-        ));
+        self.stop_bots("update-bot-lists --source /tmp/bots.json");
     }
 
     /// Runs `command` as a oneshot unit carrying **the generated web
@@ -736,15 +764,7 @@ struct Console {
 
 impl Console {
     fn run(&self, cmd: &str) -> (bool, String, String) {
-        let out = Command::new("docker")
-            .args(["exec", &self.name, "sh", "-c", cmd])
-            .output()
-            .expect("failed to run docker exec");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        )
+        exec_in(&self.name, cmd)
     }
 
     /// Fetches a page as the logged-in user.
@@ -790,9 +810,7 @@ impl Console {
 
 impl Drop for Host {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.name])
-            .output();
+        remove_container(&self.name);
     }
 }
 
@@ -810,7 +828,6 @@ fn install_web_writes_a_unit_that_systemd_actually_starts() {
         return;
     }
     let host = Host::start("stop-bots-install");
-    host.sh("systemctl start nginx");
 
     let out = host.sh("stop-bots install web");
     assert!(
@@ -864,14 +881,9 @@ fn the_generated_sandbox_lets_the_firewall_reach_netlink() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-netlink");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-netlink");
 
-    let db = "/var/lib/stop-bots/db.sqlite3";
-    host.sh(&format!(
-        "stop-bots add-firewall-rule --address 203.0.113.9 --db {db}"
-    ));
+    host.stop_bots("add-firewall-rule --address 203.0.113.9");
     // `batch --apply` rather than a bespoke verb: it is the only thing
     // that applies the firewall unattended, and it is what a real cron
     // entry runs — so this probes the sandbox through the same call the
@@ -879,7 +891,7 @@ fn the_generated_sandbox_lets_the_firewall_reach_netlink() {
     // lockout guard to read, `--no-fetch` to keep the run offline.
     let apply = format!(
         "/usr/local/bin/stop-bots batch --apply --force --no-fetch \
-         --root /etc/nginx/sites-enabled --out /etc/stop-bots/firewall.nft --db {db}"
+         --root /etc/nginx/sites-enabled --out /etc/stop-bots/firewall.nft --db {HOST_DB}"
     );
 
     // First the control: strip AF_NETLINK back out, and the apply must
@@ -927,7 +939,6 @@ fn installing_from_a_hidden_directory_is_refused_before_systemd_can_fail() {
         return;
     }
     let host = Host::start("stop-bots-hidden");
-    host.sh("systemctl start nginx");
     host.sh("cp /usr/local/bin/stop-bots /root/stop-bots");
 
     let (ok, stdout, stderr) = host.run("/root/stop-bots install web");
@@ -973,16 +984,11 @@ fn the_sandbox_still_lets_the_service_rewrite_nginx_config() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-protectsystem");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-protectsystem");
 
-    let db = "/var/lib/stop-bots/db.sqlite3";
-    host.sh(&format!(
-        "stop-bots scan-sites --root /etc/nginx/sites-enabled --db {db}"
-    ));
-    host.seed_bot("badbot", "BadBot", db);
-    let apply = format!("/usr/local/bin/stop-bots apply-blocks --root /etc/nginx/sites-enabled --no-reload --db {db}");
+    host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    host.seed_bot("badbot", "BadBot");
+    let apply = format!("/usr/local/bin/stop-bots apply-blocks --root /etc/nginx/sites-enabled --no-reload --db {HOST_DB}");
 
     let strict = host.oneshot_under_web_sandbox(
         "probe-protect-full",
@@ -1024,9 +1030,7 @@ fn replacing_the_binary_and_restarting_runs_the_new_one() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-redeploy");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-redeploy");
 
     let before = host.unit("stop-bots-web.service", "MainPID");
     assert_ne!(before, "0", "the service is not running to begin with");
@@ -1083,9 +1087,7 @@ fn deploying_onto_a_stopped_console_starts_it_again() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-deploy-stopped");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-deploy-stopped");
     host.wait_for_console();
     host.put("scripts/deploy-remote.sh", "/opt/deploy-remote.sh");
 
@@ -1130,9 +1132,7 @@ fn deploying_does_not_start_a_console_nobody_asked_systemd_to_run() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-deploy-byhand");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-deploy-byhand");
     host.wait_for_console();
     host.put("scripts/deploy-remote.sh", "/opt/deploy-remote.sh");
 
@@ -1155,9 +1155,7 @@ fn reinstalling_leaves_an_edited_unit_alone_unless_forced() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-reinstall");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-reinstall");
     host.wait_for_console();
     host.sh("printf '\\n# operator edit\\n' >> /etc/systemd/system/stop-bots-web.service");
 
@@ -1204,7 +1202,6 @@ fn reinstalling_keeps_the_first_password() {
         return;
     }
     let host = Host::start("stop-bots-password");
-    host.sh("systemctl start nginx");
 
     let first = host.sh("stop-bots install web");
     let hash = host.password_hash();
@@ -1228,9 +1225,7 @@ fn the_database_is_not_readable_by_other_users() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-perms");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-perms");
 
     // The property that matters is reachability, not the mode digits:
     // `install web` chmods the *directory* to 0700 and leaves the file at
@@ -1270,9 +1265,7 @@ fn systemd_itself_accepts_every_directive_in_the_generated_unit() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-verify");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-verify");
 
     let (ok, stdout, stderr) =
         host.run("systemd-analyze verify /etc/systemd/system/stop-bots-web.service");
@@ -1296,15 +1289,10 @@ fn the_generated_sandbox_lets_the_iptables_backend_reach_netlink() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-iptables-sandbox");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-iptables-sandbox");
 
-    let db = "/var/lib/stop-bots/db.sqlite3";
-    host.sh(&format!(
-        "stop-bots add-firewall-rule --address 203.0.113.11 --db {db}"
-    ));
-    let apply = format!("/usr/local/bin/stop-bots batch --apply --force --no-fetch --backend iptables --root /etc/nginx/sites-enabled --out /etc/stop-bots/firewall.sh --db {db}");
+    host.stop_bots("add-firewall-rule --address 203.0.113.11");
+    let apply = format!("/usr/local/bin/stop-bots batch --apply --force --no-fetch --backend iptables --root /etc/nginx/sites-enabled --out /etc/stop-bots/firewall.sh --db {HOST_DB}");
 
     let ran = host.oneshot_under_web_sandbox("probe-iptables", &apply, "");
     assert!(
@@ -1333,17 +1321,11 @@ fn apply_everything_from_the_console_enforces_on_both_planes() {
         return;
     }
     let host = Host::start("stop-bots-apply-all");
-    host.sh("systemctl start nginx");
     let console = host.console();
 
-    let db = "/var/lib/stop-bots/db.sqlite3";
-    host.sh(&format!(
-        "stop-bots scan-sites --root /etc/nginx/sites-enabled --db {db}"
-    ));
-    host.seed_bot("badbot", "BadBot", db);
-    host.sh(&format!(
-        "stop-bots add-firewall-rule --address 203.0.113.40 --db {db}"
-    ));
+    host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    host.seed_bot("badbot", "BadBot");
+    host.stop_bots("add-firewall-rule --address 203.0.113.40");
 
     let flash = console.post("/apply-all", &[]);
 
@@ -1378,11 +1360,8 @@ fn web_access_path_mode_serves_the_console_through_nginx() {
         return;
     }
     let host = Host::start("stop-bots-webaccess");
-    host.sh("systemctl start nginx");
     let console = host.console();
-    host.sh(
-        "stop-bots scan-sites --root /etc/nginx/sites-enabled --db /var/lib/stop-bots/db.sqlite3",
-    );
+    host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
 
     let flash = console.post(
         "/web-access",
@@ -1439,7 +1418,6 @@ fn the_console_refuses_a_host_header_it_was_not_told_about() {
         return;
     }
     let host = Host::start("stop-bots-hosts");
-    host.sh("systemctl start nginx");
     host.console();
 
     let loopback = host.sh("curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/login");
@@ -1756,21 +1734,14 @@ fn status_reports_generated_rules_that_never_reached_the_kernel() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-status-unenforced");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-status-unenforced");
 
-    let db = "/var/lib/stop-bots/db.sqlite3";
-    host.sh(&format!(
-        "stop-bots add-firewall-rule --address 203.0.113.60 --db {db}"
-    ));
-    host.sh(&format!(
-        "stop-bots render-firewall --backend nftables --out /etc/stop-bots/firewall.nft --db {db}"
-    ));
+    host.stop_bots("add-firewall-rule --address 203.0.113.60");
+    host.stop_bots("render-firewall --backend nftables --out /etc/stop-bots/firewall.nft");
 
     // Written, never applied — exactly what `render-firewall` promises and
     // exactly the gap nothing used to look at.
-    let (ok, out, err) = host.run(&format!("stop-bots status --db {db}"));
+    let (ok, out, err) = host.run(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
         !ok,
@@ -1784,7 +1755,7 @@ fn status_reports_generated_rules_that_never_reached_the_kernel() {
 
     // Load them, and the same command has to change its mind.
     host.sh("nft -f /etc/stop-bots/firewall.nft");
-    let (ok, out, err) = host.run(&format!("stop-bots status --db {db}"));
+    let (ok, out, err) = host.run(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
         !said.contains("none loaded into the kernel"),
@@ -1805,10 +1776,8 @@ fn status_notices_that_the_ruleset_will_not_survive_a_reboot() {
         return;
     }
     let host = Host::start("stop-bots-status-persist");
-    host.sh("systemctl start nginx");
-    let db = "/var/lib/stop-bots/db.sqlite3";
 
-    let (_, out, err) = host.run(&format!("stop-bots status --db {db}"));
+    let (_, out, err) = host.run(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
         said.contains("nftables.service is not enabled"),
@@ -1816,7 +1785,7 @@ fn status_notices_that_the_ruleset_will_not_survive_a_reboot() {
     );
 
     host.sh("systemctl enable nftables.service");
-    let (_, out, err) = host.run(&format!("stop-bots status --db {db}"));
+    let (_, out, err) = host.run(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
         !said.contains("is not enabled"),
@@ -1832,7 +1801,6 @@ fn status_run_without_root_says_it_could_not_look() {
         return;
     }
     let host = Host::start("stop-bots-status-unprivileged");
-    host.sh("systemctl start nginx");
     host.sh("useradd --create-home --shell /bin/sh checker");
     host.sh("install -d -o checker /home/checker/state");
 
@@ -1857,18 +1825,15 @@ fn the_console_records_a_health_probe_for_the_dashboards_to_read() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-status-cached");
-    host.sh("systemctl start nginx");
-    host.sh("stop-bots install web");
+    let host = Host::installed("stop-bots-status-cached");
     host.wait_for_console();
 
-    let db = "/var/lib/stop-bots/db.sqlite3";
     // The internal cron runs every due job shortly after start-up, and the
     // health check has never run on a fresh database, so it is due.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut said = String::new();
     while std::time::Instant::now() < deadline {
-        let (_, out, err) = host.run(&format!("stop-bots status --cached --db {db}"));
+        let (_, out, err) = host.run(&format!("stop-bots status --cached --db {HOST_DB}"));
         said = format!("{out}{err}");
         if !said.contains("no health probe has been recorded") {
             break;
@@ -1906,12 +1871,9 @@ fn the_console_writes_each_backend_to_its_own_path_in_its_own_syntax() {
         return;
     }
     let host = Host::start("stop-bots-drift");
-    host.sh("systemctl start nginx");
     let console = host.console();
 
-    host.sh(
-        "stop-bots add-firewall-rule --address 203.0.113.23 --db /var/lib/stop-bots/db.sqlite3",
-    );
+    host.stop_bots("add-firewall-rule --address 203.0.113.23");
 
     // A decoy from "the other backend", to catch a render that writes to
     // whichever path it happened to be started with.
@@ -1967,22 +1929,16 @@ fn batch_follows_the_stored_backend_unless_the_flag_says_otherwise() {
         return;
     }
     let host = Host::start("stop-bots-batch-backend");
-    host.sh("systemctl start nginx");
     let console = host.console();
 
-    let db = "/var/lib/stop-bots/db.sqlite3";
-    host.sh(&format!(
-        "stop-bots add-firewall-rule --address 203.0.113.50 --db {db}"
-    ));
+    host.stop_bots("add-firewall-rule --address 203.0.113.50");
 
     // The console is where the backend is chosen, so choose it there.
     console.post("/render-firewall", &[("backend", "iptables"), ("out", "")]);
     host.sh("rm -f /etc/stop-bots/firewall.sh /etc/stop-bots/firewall.nft");
 
     // No --backend: the stored choice has to decide both syntax and path.
-    host.sh(&format!(
-        "stop-bots batch --no-fetch --force --root /etc/nginx/sites-enabled --db {db}"
-    ));
+    host.stop_bots("batch --no-fetch --force --root /etc/nginx/sites-enabled");
     assert!(
         !host.run("test -e /etc/stop-bots/firewall.nft").0,
         "a crontab-shaped run wrote an nftables script to a host set to iptables"
@@ -1994,9 +1950,7 @@ fn batch_follows_the_stored_backend_unless_the_flag_says_otherwise() {
     );
 
     // An explicit flag still overrides it, in both syntax and path.
-    host.sh(&format!(
-        "stop-bots batch --no-fetch --force --backend nftables --root /etc/nginx/sites-enabled --db {db}"
-    ));
+    host.stop_bots("batch --no-fetch --force --backend nftables --root /etc/nginx/sites-enabled");
     let forced = host.sh("cat /etc/stop-bots/firewall.nft");
     assert!(
         !forced.starts_with("#!/bin/sh") && forced.contains("203.0.113.50"),
@@ -2233,7 +2187,6 @@ fn exempt_paths_and_well_known_stay_reachable_for_a_blocked_client() {
     );
 
     // An exempt path, plus a request rule that forces /.well-known/ open.
-    server.sh("stop-bots --db /tmp/db.sqlite3 list-sites 2>/dev/null | head -1 >/dev/null || true");
     server.stop_bots("set-site-rule --site test.example --rule no-user-agent --enabled true");
     server.stop_bots("exempt-path --site test.example --path /blog");
     server.apply_and_reload();

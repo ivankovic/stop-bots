@@ -30,6 +30,7 @@ pub mod firewall;
 #[cfg(test)]
 mod golden;
 pub mod health;
+pub mod host;
 pub mod install;
 pub mod ipdetail;
 pub mod ipranges;

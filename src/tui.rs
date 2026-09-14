@@ -201,15 +201,13 @@ pub fn select_in<'a>(list: List<'a>, focused: bool, theme: Theme) -> List<'a> {
     }
 }
 
-/// The screens the TUI can show. Cycled with Tab/Shift+Tab, Left/Right, or
-/// their vim `h`/`l` aliases (see `App::handle_key_event`'s global fallback
-/// match — all four only fire once the active screen itself has ignored the
-/// key), jumped to directly with `d`/`b`/`s`/`p`, with Help reachable via
-/// `?` from anywhere. Dynamic Protection itself uses Tab/Shift+Tab
-/// internally (to switch between its SSH/User Agent panels — see
-/// `crate::tui::dynamic_protection`), so it consumes those two keys rather
-/// than cycling screens while it's active; Left/Right/`h`/`l`/`d`/`b`/`s`/
-/// `p`/Esc still work as the way out.
+/// The screens the TUI can show. Jumped to with the digit the tab bar
+/// shows (`1`–`4`, or the `d`/`b`/`s`/`p` aliases), stepped through with
+/// Left/Right or their vim `h`/`l` aliases (see `App::handle_key_event`'s
+/// global fallback match — these only fire once the active screen itself
+/// has ignored the key), with Help reachable via `?` and the command
+/// palette via `:` from anywhere. Tab is never a screen key: on every
+/// screen it moves between that screen's panels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Screen {
     #[default]
@@ -475,7 +473,7 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         "stop-bots".fg(theme.accent()).bold(),
         format!(" {}", env!("CARGO_PKG_VERSION")).fg(theme.dim()),
     ];
-    if let Some(host) = hostname() {
+    if let Some(host) = crate::host::name() {
         brand.push(format!("  {host}").fg(theme.dim()));
     }
     frame.render_widget(Paragraph::new(Line::from(brand)), brand_area);
@@ -515,29 +513,6 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(Line::from(tabs)), tabs_area);
 
     frame.render_widget(Paragraph::new(status_line(app)), status_area);
-}
-
-static HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
-/// Pins the host name the header shows. For the screenshot generator,
-/// which must not put the maintainer's machine in the README; a no-op
-/// once the header has been drawn.
-pub fn override_hostname(name: &str) {
-    let _ = HOST.set(Some(name.to_string()));
-}
-
-/// The host name, for the header. Read once; a host does not rename
-/// itself while a console is open, and the header redraws thirty times a
-/// second.
-fn hostname() -> Option<&'static str> {
-    HOST.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .or_else(|_| std::fs::read_to_string("/etc/hostname"))
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
-    .as_deref()
 }
 
 /// One line under the tabs answering "is this host protected", check by

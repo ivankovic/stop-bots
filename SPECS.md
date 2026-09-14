@@ -4734,3 +4734,76 @@ palette teaches the map.
 
 **Not done here.** README still documents `c` for the theme and `Tab`
 for cycling screens (README edits are by request only).
+
+## Code health pass: readability and performance
+
+Measured first, again. `cargo clippy` with `pedantic`, `nursery` and
+`perf` on top of the clean `-D warnings` baseline; the tally was
+dominated by lints this codebase has already considered and rejected
+(`struct_excessive_bools`, `doc_markdown`, `cast_possible_truncation` on
+terminal-cell arithmetic) plus a long tail of `format!` appended to a
+`String`. The findings worth a change:
+
+**The bulk range inserts compiled their SQL once per row.** Every
+`replace_*_ranges` ran inside `Db::batch` (one transaction, one fsync —
+that part was already right) but called `Connection::execute` in the
+loop, which prepares the statement afresh each time. A `prepare_cached`
+outside the loop takes 20,000 CIDRs from ~116ms to ~79ms in a release
+build, and the same change went into `record_user_agent_hits`. This is
+the only genuinely hot path that changed: it runs on every crawler-range
+and country fetch, and the country lists are the biggest tables in the
+database.
+
+**The host name was read from `/proc` twice per console page.** Now one
+cached read in `src/host.rs`, shared with the TUI header, which had its
+own copy (and its own `OnceLock`). The screenshot generator pins it
+through the same module.
+
+**The Dashboard measured its detector labels twice per frame** — once
+to size the panel, once to draw it, each formatting every row's label.
+Measured once, passed to both. Thirty frames a second makes small things
+worth a line.
+
+**Comments that described the previous chrome.** `Screen`'s doc said
+Tab cycled screens; the Dashboard module doc described a Summary panel
+and a "press f"; field docs pointed at the Summary panel; the web
+dashboard's stale-list constant said it matched it. All now describe
+what is on screen.
+
+**Integration tests share fixtures.** `tests/common/mod.rs` holds what
+`tests/cli.rs` and `tests/tui.rs` both had copies of — `stop_bots`,
+`seed_bots`, `scan_sites`, `path_with`, `copy_dir_all` — plus a
+`writable_nginx_fixture`. Eight pty tests opened with a fourteen-line
+`update-bot-lists` invocation and five with a `scan-sites` one; each is
+now one line, which is the AGENTS.md bar ("setup longer than the
+assertion is a sign a fixture is missing"). The two pty spawners that
+differed only in `--no-reload` versus a fake-tool PATH are one
+`spawn_tui_cmd`. `apply_site` took a site name it ignored; it is
+`apply_selected_site` now and says what it does. The palette test had
+been dropped into the middle of another test's doc comment.
+
+**The container harness had three copies of `docker exec` and four of
+`docker rm -f`.** One `exec_in`/`sh_in`/`remove_container` each, called
+by the one-line methods the tests read. A no-op shell line in one test
+(output discarded, failure suppressed, `--db` in the wrong position) is
+gone. The nextest config gained an override for the container binary:
+it is gated by an environment variable, not excluded, so with the
+variable set every test used to fall under the 300ms unit budget and
+would have been killed at three seconds.
+
+**Considered and rejected.** The thirty-odd `push_str(&format!(..))`
+in the firewall renderers would be `write!` — one avoided allocation per
+rule line, a millisecond at 20,000 rules, not worth thirty-odd noisier
+lines. `sshlog` and `accesslog` read the whole log into memory; the text
+is held for thirty seconds and parsed by every detector, streaming would
+change every detector's signature, and logrotate keeps the files small.
+`main.rs`'s twenty `PathBuf` parameters that could be `&Path` are churn
+in a dispatch layer. The container suite's fixed 300ms sleep after an
+NGINX reload is real time (up to 2.4s in the table-driven tests) but
+replacing it with a poll needs a signal that the new worker is serving,
+and `nginx -s reload` offers none that is cheaper than the sleep.
+The container suite's `Host` tests all opened with the same three lines;
+`Host::start` now boots *with* NGINX running, `Host::installed` adds the
+console service, and `Host::stop_bots` supplies the installed console's
+database path (`HOST_DB`), so a test starts at its first interesting
+line.

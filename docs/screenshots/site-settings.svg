@@ -79,10 +79,10 @@
 <text x="532.8" y="295.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">rescan</text>
 <text x="600.0" y="295.5" fill="#2ee6d6" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab</text>
 <text x="633.6" y="295.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">settings</text>
-<text x="717.6" y="295.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
-<text x="734.4" y="295.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">help</text>
-<text x="784.8" y="295.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">t</text>
-<text x="801.6" y="295.5" fill="#6b7c8c" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">theme</text>
-<text x="860.4" y="295.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">q</text>
-<text x="877.2" y="295.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">quit</text>
+<text x="717.6" y="295.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<text x="734.4" y="295.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">commands</text>
+<text x="818.4" y="295.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
+<text x="835.2" y="295.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">help</text>
+<text x="885.6" y="295.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">t</text>
+<text x="902.4" y="295.5" fill="#6b7c8c" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">th</text>
 </svg>

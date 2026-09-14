@@ -209,8 +209,12 @@ make screenshots
 
 `examples/screenshots.rs` seeds a throwaway database with fiction — addresses from
 the documentation ranges reserved by RFC 5737, `example.com` hostnames — draws each
-screen through `TestBackend`, the same in-memory backend the unit tests use, and
-writes SVG.
+TUI screen through `TestBackend`, the same in-memory backend the unit tests use, and
+writes SVG. It then renders the web console's pages from the same database through
+the real router in-process, the way `tests/web.rs` drives it, and rasterises them in
+the light theme with whichever of Firefox or Chromium it finds on `PATH`, headless,
+into PNG. With neither installed it says so and leaves the previous PNGs alone. The
+TUI is shown dark and the console light on purpose: one of each palette.
 
 Two reasons it works this way rather than someone pressing a key and cropping a
 terminal. The first is that this tool reads real SSH and NGINX logs: a hand-taken
@@ -219,7 +223,10 @@ maintainer's server and the hostname of every site on it. The second is that the
 output is a pure function of the seed, so a screenshot that has gone stale shows up
 as a diff in review rather than as a picture nobody thought to re-take.
 
-Re-run it after any change to a screen's layout, and commit the result. The README
+Re-run it after any change to a screen's layout, and commit the result. The SVGs are
+a pure function of the seed; the PNGs also depend on the fonts installed on the
+machine that rendered them, so expect a byte-level diff from another machine even
+when nothing changed. The README
 references the files by absolute `raw.githubusercontent.com` URL, because relative
 image paths do not resolve on crates.io (which is also why `Cargo.toml` excludes
 `docs/` from the package).

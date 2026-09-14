@@ -143,8 +143,8 @@
 <text x="583.2" y="493.5" fill="#6b7c8c" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">next panel</text>
 <text x="684.0" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">R</text>
 <text x="700.8" y="493.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">re-read</text>
-<text x="776.4" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
-<text x="793.2" y="493.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">help</text>
-<text x="843.6" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">t</text>
-<text x="860.4" y="493.5" fill="#6b7c8c" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">theme</text>
+<text x="776.4" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<text x="793.2" y="493.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">commands</text>
+<text x="877.2" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
+<text x="894.0" y="493.5" fill="#6b7c8c" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">hel</text>
 </svg>

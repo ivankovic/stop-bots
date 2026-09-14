@@ -2463,8 +2463,8 @@ mod tests {
 
     /// A successful write must persist the rendered rule-set signature
     /// (`Db::get_firewall_rendered_signature`), which is what the
-    /// Dashboard's Summary panel compares against to show "up to date"
-    /// instead of "needs updating" right after a render.
+    /// Dashboard's Firewall script panel compares against to show
+    /// `[ UP TO DATE ]` instead of `[ STALE ]` right after a render.
     #[tokio::test]
     async fn render_firewall_persists_the_rendered_signature() {
         let mut app = test_app();
@@ -2482,10 +2482,10 @@ mod tests {
     /// itself, only recomputed by `Dashboard::refresh`. Confirming the
     /// render popup drives through `KeyOutcome::RenderFirewall`, not
     /// `start_firewall_render` directly, so this exercises `App::handle_key_event`
-    /// end to end (via the real 'f' keypress, backspacing the default path
+    /// end to end (via the real `F` keypress, backspacing the default path
     /// out and typing a writable temp one, then Enter) to prove that arm
-    /// actually calls `self.refresh()` afterward — without it, the Summary
-    /// panel would keep reading "needs updating" right after the admin did
+    /// actually calls `self.refresh()` afterward — without it, the Firewall
+    /// script panel would keep reading `[ STALE ]` right after the admin did
     /// exactly what its own hint told them to do.
     #[tokio::test]
     async fn pressing_f_then_enter_refreshes_the_dashboards_stale_indicator() {
