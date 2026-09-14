@@ -7,6 +7,43 @@ need.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.0.1] — 2026-09-14
+
+First published release. The sections below describe the whole of what became
+installable, starting with the blocking the crate was built for.
+
+### Blocking, in NGINX config
+
+- Known-bot blocking by category (scanner / search engine / AI crawler), from ArcJet's
+  Well-Known Bots, ai.robots.txt and the NGINX Ultimate Bad Bot Blocker list, injected as a
+  sentinel-marked block into each discovered site.
+- Per-site category and per-bot overrides, and per-site path exemptions.
+- Configurable response for a blocked request: `403`, or `444` to close the connection
+  without answering.
+- Optional generated `robots.txt`, listing every blocked bot plus the honeypot path.
+- Optional per-client rate limiting (`limit_req`).
+
+### Blocking, in a generated firewall script
+
+- Automatic detection, each independently switchable, each adding a block that expires on
+  its own: SSH brute-force scanners, web scanners (many distinct 404s), forged crawler user
+  agents, requests for exposed-secret paths, and honeypot hits.
+- Host-wide geo-blocking via IPdeny, in blocklist or allowlist mode.
+- Third-party CIDR feeds: FireHOL level 1, Tor exit nodes, blocklist.de, and the published
+  address space of AWS, Google Cloud and DigitalOcean. All off by default.
+- Ad-hoc IP/CIDR allow and block rules.
+- iptables and nftables output, generated and never applied without an explicit request,
+  with a check that refuses to write a script that would lock out a connected SSH session.
+
+### Interface
+
+- A TUI (Dashboard, Bot settings, Site settings, Dynamic Protection, Help) and a CLI over
+  the same SQLite database and the same underlying logic.
+- An internal scheduler that runs the detectors while the TUI is open; the equivalent CLI
+  subcommands are safe to run unattended from a real cron.
+
 ### Added
 
 - **`stop-bots status`, and a System status panel on both Dashboards.** Every
@@ -109,123 +146,6 @@ need.
   the old write-only behaviour. The chosen backend is now remembered, so a
   one-click apply has an answer without guessing.
 
-### Fixed
-
-- **The console returned 421 on a site's second `server_name`.** A block
-  reading `server_name www.example.com example.com;` is routine and NGINX
-  answers for both, but `scan-sites` stores a site under the first name only
-  — one row, one name — so Web Access allowlisted just that one. The console
-  then worked on `www.example.com` and refused `example.com`, the
-  DNS-rebinding guard correctly rejecting a host nobody had told it about.
-  `nginx::server_names_for` now reads every name off the block the console's
-  `location` is going into, and `Plan.host` became `Plan.hosts`. A config
-  that cannot be read still yields the stored name, so it degrades to the
-  old behaviour rather than to an empty allowlist.
-
-- **The Web Access panel showed a path prefix with a doubled slash.** It
-  rendered `"/" + base_path` where the stored value already carried its
-  leading slash, so `/stop-bots` displayed as `//stop-bots`. Only the display
-  was wrong. The panel now reads the prefix through `BasePath`, so a setting
-  written by hand without a leading slash also displays as a path.
-
-- **Recording a path prefix looked like it had done nothing.** The prefix is
-  read once, when the router is built, so a newly recorded one left the
-  console still answering on the old one: the panel showed the new prefix,
-  every link 404'd, and nothing on the page explained it. The Web Access
-  panel now carries a "Restart needed" row naming what this process is
-  actually serving and the command to pick up the change.
-
-- **`make deploy` could land a new binary and leave the console down.** The
-  remote half used `systemctl try-restart`, which does nothing at all to a
-  unit that is enabled but not running — which is exactly where a service
-  that crash-looped and was given up on ends up. It now restarts an
-  *enabled* unit and try-restarts one that merely exists, so a host where
-  the console is deliberately run by hand does not get a second copy
-  competing for the port. It also prints the state it left the unit in.
-
-  The remote half moved to `scripts/deploy-remote.sh`, piped over ssh, so
-  that a container test can run that exact file against a real systemd.
-
-- **`batch` ignored the firewall backend this host is set to.** `--backend`
-  carried an `nftables` default and nothing consulted
-  `firewall::stored_backend`, so an operator who chose iptables in the
-  console and ran `stop-bots batch --apply` from crontab — as the README
-  recommends — got an nftables script at `firewall.nft` while the console
-  maintained an iptables one at `firewall.sh`. Both were applied, by
-  different things, and either could be stale. The same drift once had the
-  internal cron overwriting an operator's iptables script with nftables
-  syntax; that was fixed by reading the stored backend and this path was
-  missed. An explicit `--backend` still wins; without one, the host's
-  setting decides, and the output path follows from it.
-
-- **`stop-bots install web` could leave the service crash-looping.** It ran
-  `systemctl enable --now` *before* opening the database to record the bind
-  address and generate the password, so the installer and the service it had
-  just started raced for the same SQLite file. `Db::open` set no busy timeout,
-  so the loser failed instantly with "database is locked": either the service
-  exited 1 and crash-looped on `Restart=on-failure`, or the install failed
-  having already enabled the unit, or the service won and generated the
-  password itself — leaving the installer to report "a console password is
-  already set, keeping it" and the operator with no password at all. The
-  database work now finishes first, and `Db::open` waits five seconds for a
-  lock rather than giving up, which also covers the console running alongside
-  the TUI or a `batch` from crontab. Found by the new container tests, which
-  only showed it under parallel load.
-
-- **The database file was world-readable.** `install web` set the state
-  directory to 0700 but left `db.sqlite3` at the umask default, usually 0644.
-  Nothing was exposed — the directory is what protects it — but the mode
-  travels with the file through a backup or a `cp`, and the unit's
-  `UMask=0077` applies only to files the service creates, not the installer.
-
-- **The Web Access panel's form sat flush against the panel edge.** Every other
-  panel wraps its loose content in a `.panel-body`, which is the only thing
-  carrying the side padding; this one emitted the form bare. A test now asserts
-  that whatever follows a panel's table is inside one.
-
-- **The console could not apply the firewall at all under its own systemd unit.**
-  `nft` and Debian's nft-backed `iptables` reach the kernel over a netlink socket, and
-  the unit `install web` writes set `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
-  — with a comment asserting "nothing here uses a raw or netlink socket: this service
-  writes the firewall script, it never applies it", which stopped being true the moment
-  applying was added. The failure was `Unable to initialize Netlink socket: Address
-  family not supported by protocol`, which names neither systemd nor this project.
-  `AF_NETLINK` is now allowed, and a netlink refusal appends an explanation naming the
-  directive and how to get a current unit. **Existing installs need
-  `stop-bots install web --force` and a restart.**
-
-- **An iptables script could land in a file called `firewall.nft`.** The destination
-  was fixed at startup and the backend chosen per render, so on a host set to iptables
-  the console wrote `#!/bin/sh` and 12,000 `iptables -A` lines into the nftables path.
-  Worse, the internal cron hardcoded nftables regardless — so each tick replaced an
-  operator's iptables script with an nftables one at the same path, and the next apply
-  ran `sh` over nftables syntax. The backend is now the single source of truth: the
-  cron renders for the stored backend, and the path follows it (`.nft` or `.sh`) unless
-  `--firewall-out` names one explicitly, in which case that wins.
-
-- **`make deploy` did not deploy.** It copied the binary to the login directory and
-  restarted nothing, so on a host where the service runs from `/usr/local/bin` every
-  step succeeded and the console kept serving the previous build. It now installs to
-  the path the unit actually names, restarts the service if there is one, and prints
-  the unit's `ExecStart` alongside the deployed file's timestamp — `--version` is
-  `0.0.1` for every build, so it could never have shown the difference.
-
-- **`install web` wrote a unit systemd could not execute** when run from `/root` —
-  which is exactly where someone who just downloaded a release binary is standing.
-  The unit sets `ProtectHome=yes`, so `/root` is an empty directory for the
-  service, and `ExecStart=/root/stop-bots` failed with `status=203/EXEC`,
-  "No such file or directory", for a file that was plainly there. Preflight checked
-  that the binary existed; it did not check that it existed *inside the sandbox the
-  unit itself asks for*. It now refuses up front, names the directive responsible,
-  and gives the two commands that fix it. Same for `/home`, `/run/user`, `/tmp` and
-  `/var/tmp` (the last two via `PrivateTmp=yes`), and for a relative `--binary`,
-  which systemd rejects when it loads the unit rather than when it starts it.
-
-  A failed `systemctl enable --now` also now says what state it left behind: the
-  enable sticks even when the start fails, so the unit was enabled and would have
-  tried again at the next boot with nothing saying so.
-
-### Added
 
 - **Inspect an address on the Dynamic Protection screen.** `i` in the TUI, or click
   the address in the web console. It answers "what *is* this thing" from lists this
@@ -246,39 +166,6 @@ need.
   address on every refresh — the latter cost 215ms per refresh on a large
   auth.log, for an answer almost nobody had asked for.
 
-### Security
-
-- **A line from a downloaded feed could become a root shell command.** The IP-range
-  and reputation feeds are fetched unattended from eight third parties, and nothing
-  validated what they sent before it was interpolated into a generated firewall
-  script. A feed line of `1.2.3.4/24; touch /tmp/pwned` rendered as
-  `iptables -A STOP-BOTS -s 1.2.3.4/24; touch /tmp/pwned -j DROP`, and
-  `stop-bots batch --apply` runs that script under `sh` as root. On nftables the
-  same shape gets `nft -f` to accept arbitrary statements — `; flush ruleset` would
-  drop the host's entire firewall.
-
-  Admin-entered rules had been validated since an earlier review; the fetched
-  ranges were exempted on the grounds that their upstreams are reputable, which is
-  not the same as uncompromised. All four tables that hold an address now go
-  through one validator, invalid entries are dropped rather than failing the whole
-  fetch, and both renderers check again before emitting a line — the script is
-  executable input, and a database written by an older version is still out there.
-
-- **The web console could write a root-owned file anywhere on the host.** The
-  destination for "Write script" came from a free-text form field, and the file it
-  writes is an executable script — `/etc/profile.d/`, `/etc/cron.d/` and unit
-  directories were all reachable. That is a way around every restriction the console
-  is built around. It now writes to the path the server was started with, set by the
-  new `stop-bots web --firewall-out`, and takes no destination from the request.
-
-- **Fetches now have timeouts and a size limit.** Every bot list and IP-range
-  download was a bare `reqwest::get`: no connect timeout, no total timeout, and the
-  whole body read into memory. Under the internal cron that means an upstream which
-  accepts the connection and then says nothing stalls the job indefinitely. There is
-  now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
-  enforced against both the declared length and the bytes actually arriving.
-
-### Added
 
 
 - **A web UI — `stop-bots web`.** The same five screens as the TUI, in a browser.
@@ -477,6 +364,121 @@ need.
 
 ### Fixed
 
+- **The console returned 421 on a site's second `server_name`.** A block
+  reading `server_name www.example.com example.com;` is routine and NGINX
+  answers for both, but `scan-sites` stores a site under the first name only
+  — one row, one name — so Web Access allowlisted just that one. The console
+  then worked on `www.example.com` and refused `example.com`, the
+  DNS-rebinding guard correctly rejecting a host nobody had told it about.
+  `nginx::server_names_for` now reads every name off the block the console's
+  `location` is going into, and `Plan.host` became `Plan.hosts`. A config
+  that cannot be read still yields the stored name, so it degrades to the
+  old behaviour rather than to an empty allowlist.
+
+- **The Web Access panel showed a path prefix with a doubled slash.** It
+  rendered `"/" + base_path` where the stored value already carried its
+  leading slash, so `/stop-bots` displayed as `//stop-bots`. Only the display
+  was wrong. The panel now reads the prefix through `BasePath`, so a setting
+  written by hand without a leading slash also displays as a path.
+
+- **Recording a path prefix looked like it had done nothing.** The prefix is
+  read once, when the router is built, so a newly recorded one left the
+  console still answering on the old one: the panel showed the new prefix,
+  every link 404'd, and nothing on the page explained it. The Web Access
+  panel now carries a "Restart needed" row naming what this process is
+  actually serving and the command to pick up the change.
+
+- **`make deploy` could land a new binary and leave the console down.** The
+  remote half used `systemctl try-restart`, which does nothing at all to a
+  unit that is enabled but not running — which is exactly where a service
+  that crash-looped and was given up on ends up. It now restarts an
+  *enabled* unit and try-restarts one that merely exists, so a host where
+  the console is deliberately run by hand does not get a second copy
+  competing for the port. It also prints the state it left the unit in.
+
+  The remote half moved to `scripts/deploy-remote.sh`, piped over ssh, so
+  that a container test can run that exact file against a real systemd.
+
+- **`batch` ignored the firewall backend this host is set to.** `--backend`
+  carried an `nftables` default and nothing consulted
+  `firewall::stored_backend`, so an operator who chose iptables in the
+  console and ran `stop-bots batch --apply` from crontab — as the README
+  recommends — got an nftables script at `firewall.nft` while the console
+  maintained an iptables one at `firewall.sh`. Both were applied, by
+  different things, and either could be stale. The same drift once had the
+  internal cron overwriting an operator's iptables script with nftables
+  syntax; that was fixed by reading the stored backend and this path was
+  missed. An explicit `--backend` still wins; without one, the host's
+  setting decides, and the output path follows from it.
+
+- **`stop-bots install web` could leave the service crash-looping.** It ran
+  `systemctl enable --now` *before* opening the database to record the bind
+  address and generate the password, so the installer and the service it had
+  just started raced for the same SQLite file. `Db::open` set no busy timeout,
+  so the loser failed instantly with "database is locked": either the service
+  exited 1 and crash-looped on `Restart=on-failure`, or the install failed
+  having already enabled the unit, or the service won and generated the
+  password itself — leaving the installer to report "a console password is
+  already set, keeping it" and the operator with no password at all. The
+  database work now finishes first, and `Db::open` waits five seconds for a
+  lock rather than giving up, which also covers the console running alongside
+  the TUI or a `batch` from crontab. Found by the new container tests, which
+  only showed it under parallel load.
+
+- **The database file was world-readable.** `install web` set the state
+  directory to 0700 but left `db.sqlite3` at the umask default, usually 0644.
+  Nothing was exposed — the directory is what protects it — but the mode
+  travels with the file through a backup or a `cp`, and the unit's
+  `UMask=0077` applies only to files the service creates, not the installer.
+
+- **The Web Access panel's form sat flush against the panel edge.** Every other
+  panel wraps its loose content in a `.panel-body`, which is the only thing
+  carrying the side padding; this one emitted the form bare. A test now asserts
+  that whatever follows a panel's table is inside one.
+
+- **The console could not apply the firewall at all under its own systemd unit.**
+  `nft` and Debian's nft-backed `iptables` reach the kernel over a netlink socket, and
+  the unit `install web` writes set `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
+  — with a comment asserting "nothing here uses a raw or netlink socket: this service
+  writes the firewall script, it never applies it", which stopped being true the moment
+  applying was added. The failure was `Unable to initialize Netlink socket: Address
+  family not supported by protocol`, which names neither systemd nor this project.
+  `AF_NETLINK` is now allowed, and a netlink refusal appends an explanation naming the
+  directive and how to get a current unit. **Existing installs need
+  `stop-bots install web --force` and a restart.**
+
+- **An iptables script could land in a file called `firewall.nft`.** The destination
+  was fixed at startup and the backend chosen per render, so on a host set to iptables
+  the console wrote `#!/bin/sh` and 12,000 `iptables -A` lines into the nftables path.
+  Worse, the internal cron hardcoded nftables regardless — so each tick replaced an
+  operator's iptables script with an nftables one at the same path, and the next apply
+  ran `sh` over nftables syntax. The backend is now the single source of truth: the
+  cron renders for the stored backend, and the path follows it (`.nft` or `.sh`) unless
+  `--firewall-out` names one explicitly, in which case that wins.
+
+- **`make deploy` did not deploy.** It copied the binary to the login directory and
+  restarted nothing, so on a host where the service runs from `/usr/local/bin` every
+  step succeeded and the console kept serving the previous build. It now installs to
+  the path the unit actually names, restarts the service if there is one, and prints
+  the unit's `ExecStart` alongside the deployed file's timestamp — `--version` is
+  `0.0.1` for every build, so it could never have shown the difference.
+
+- **`install web` wrote a unit systemd could not execute** when run from `/root` —
+  which is exactly where someone who just downloaded a release binary is standing.
+  The unit sets `ProtectHome=yes`, so `/root` is an empty directory for the
+  service, and `ExecStart=/root/stop-bots` failed with `status=203/EXEC`,
+  "No such file or directory", for a file that was plainly there. Preflight checked
+  that the binary existed; it did not check that it existed *inside the sandbox the
+  unit itself asks for*. It now refuses up front, names the directive responsible,
+  and gives the two commands that fix it. Same for `/home`, `/run/user`, `/tmp` and
+  `/var/tmp` (the last two via `PrivateTmp=yes`), and for a relative `--binary`,
+  which systemd rejects when it loads the unit rather than when it starts it.
+
+  A failed `systemctl enable --now` also now says what state it left behind: the
+  enable sticks even when the start fails, so the unit was enabled and would have
+  tried again at the next boot with nothing saying so.
+
+
 - `--version` now exists. It also shows in the TUI's header, which is where someone is
   standing when they decide to report something.
 - `stop-bots --help` is scannable: twenty subcommands printed their entire description —
@@ -540,40 +542,37 @@ need.
 - Storing a bot list no longer fsyncs once per bot — with the ~700-entry
   real lists that was seconds of disk waits per fetch.
 
-## [0.0.1] — 2026-08-18
+### Security
 
-First published release. Everything below already existed in the repository; this is the
-point it became installable.
+- **A line from a downloaded feed could become a root shell command.** The IP-range
+  and reputation feeds are fetched unattended from eight third parties, and nothing
+  validated what they sent before it was interpolated into a generated firewall
+  script. A feed line of `1.2.3.4/24; touch /tmp/pwned` rendered as
+  `iptables -A STOP-BOTS -s 1.2.3.4/24; touch /tmp/pwned -j DROP`, and
+  `stop-bots batch --apply` runs that script under `sh` as root. On nftables the
+  same shape gets `nft -f` to accept arbitrary statements — `; flush ruleset` would
+  drop the host's entire firewall.
 
-### Blocking, in NGINX config
+  Admin-entered rules had been validated since an earlier review; the fetched
+  ranges were exempted on the grounds that their upstreams are reputable, which is
+  not the same as uncompromised. All four tables that hold an address now go
+  through one validator, invalid entries are dropped rather than failing the whole
+  fetch, and both renderers check again before emitting a line — the script is
+  executable input, and a database written by an older version is still out there.
 
-- Known-bot blocking by category (scanner / search engine / AI crawler), from ArcJet's
-  Well-Known Bots, ai.robots.txt and the NGINX Ultimate Bad Bot Blocker list, injected as a
-  sentinel-marked block into each discovered site.
-- Per-site category and per-bot overrides, and per-site path exemptions.
-- Configurable response for a blocked request: `403`, or `444` to close the connection
-  without answering.
-- Optional generated `robots.txt`, listing every blocked bot plus the honeypot path.
-- Optional per-client rate limiting (`limit_req`).
+- **The web console could write a root-owned file anywhere on the host.** The
+  destination for "Write script" came from a free-text form field, and the file it
+  writes is an executable script — `/etc/profile.d/`, `/etc/cron.d/` and unit
+  directories were all reachable. That is a way around every restriction the console
+  is built around. It now writes to the path the server was started with, set by the
+  new `stop-bots web --firewall-out`, and takes no destination from the request.
 
-### Blocking, in a generated firewall script
-
-- Automatic detection, each independently switchable, each adding a block that expires on
-  its own: SSH brute-force scanners, web scanners (many distinct 404s), forged crawler user
-  agents, requests for exposed-secret paths, and honeypot hits.
-- Host-wide geo-blocking via IPdeny, in blocklist or allowlist mode.
-- Third-party CIDR feeds: FireHOL level 1, Tor exit nodes, blocklist.de, and the published
-  address space of AWS, Google Cloud and DigitalOcean. All off by default.
-- Ad-hoc IP/CIDR allow and block rules.
-- iptables and nftables output, generated and never applied without an explicit request,
-  with a check that refuses to write a script that would lock out a connected SSH session.
-
-### Interface
-
-- A TUI (Dashboard, Bot settings, Site settings, Dynamic Protection, Help) and a CLI over
-  the same SQLite database and the same underlying logic.
-- An internal scheduler that runs the detectors while the TUI is open; the equivalent CLI
-  subcommands are safe to run unattended from a real cron.
+- **Fetches now have timeouts and a size limit.** Every bot list and IP-range
+  download was a bare `reqwest::get`: no connect timeout, no total timeout, and the
+  whole body read into memory. Under the internal cron that means an upstream which
+  accepts the connection and then says nothing stalls the job indefinitely. There is
+  now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
+  enforced against both the declared length and the bytes actually arriving.
 
 [Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.1...HEAD
 [0.0.1]: https://github.com/ivankovic/stop-bots/releases/tag/v0.0.1
