@@ -24,8 +24,12 @@ No repository secrets are needed — nothing in CI talks to crates.io.
 
 ## Releasing
 
-For the very first release the version and changelog are already in place, so start at
-step 3.
+Do all seven steps, in order. An earlier draft of this section claimed the first release
+could start at step 3 because the version and changelog were already in place. The version
+was; the changelog was not. `0.0.1` had been written against the original scope in August
+and then sat untouched while five months of work accumulated under `Unreleased`, so
+starting at step 3 would have published a changelog describing a fraction of the code that
+shipped with it. Step 2 is cheap to run and the only thing that catches that.
 
 1. **Bump the version** in `Cargo.toml`, and run any cargo command so `Cargo.lock` picks up
    the new version too:
