@@ -29,6 +29,12 @@ need.
   looking for a bug in the fallback chain instead of at the path they passed.
   Both the SSH and access-log messages now name the path actually read.
 
+### Security
+
+- `rustls` 0.23.40 → 0.23.45, for RUSTSEC-2026-0285: TLS 1.3 handshake messages
+  were accepted across encryption level boundaries. Reached only through
+  `reqwest`, which this uses to fetch bot lists and IP-range feeds over HTTPS.
+
 ### Changed
 
 - `argon2` 0.5 → 0.6 and `rand` 0.9 → 0.10. Both moved the API this code
