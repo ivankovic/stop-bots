@@ -2540,10 +2540,19 @@ fn read_access_log(access_log: Option<&Path>) -> Result<String> {
     };
     match source {
         accesslog::LogSource::Found(text) => Ok(text),
-        accesslog::LogSource::Unavailable => anyhow::bail!(
-            "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
-             --access-log, or run as root, for this to work"
-        ),
+        // Same distinction as `read_ssh_log`: name the path that was
+        // actually tried, not the one the reader might assume.
+        accesslog::LogSource::Unavailable => match access_log {
+            Some(path) => anyhow::bail!(
+                "couldn't read the NGINX access log at {} — pass a different --access-log, \
+                 or run as root, for this to work",
+                path.display()
+            ),
+            None => anyhow::bail!(
+                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
+                 --access-log, or run as root, for this to work"
+            ),
+        },
     }
 }
 
@@ -2558,10 +2567,24 @@ fn read_ssh_log(ssh_log: Option<&Path>) -> Result<String> {
     };
     match source {
         sshlog::LogSource::Found(text) => Ok(text),
-        sshlog::LogSource::Unavailable => anyhow::bail!(
-            "couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — \
-             pass --ssh-log, or run as root, for this to work"
-        ),
+        // Two different failures, and saying the wrong one costs real time.
+        // An explicit path is read and nothing else is tried, so claiming a
+        // search happened sends the reader looking for a bug in the
+        // fallback chain instead of at the path they passed — which is
+        // exactly how a service pinned to a missing auth.log stayed
+        // invisible on a journald-only host.
+        sshlog::LogSource::Unavailable => match ssh_log {
+            Some(path) => anyhow::bail!(
+                "couldn't read the SSH log at {} — that path was given explicitly, so \
+                 /var/log/secure and journalctl were not tried. Drop --ssh-log to search \
+                 all three, point it somewhere readable, or run as root.",
+                path.display()
+            ),
+            None => anyhow::bail!(
+                "couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, \
+                 journalctl) — pass --ssh-log, or run as root, for this to work"
+            ),
+        },
     }
 }
 

@@ -23,6 +23,12 @@ need.
   then `journalctl` on every read. Existing installs keep the old unit until
   `install web --force` rewrites it.
 
+- **The "couldn't read the log" errors no longer describe a search that did not
+  happen.** Passing `--ssh-log` reads that path and nothing else, but the
+  failure still listed all three sources as tried, which sends the reader
+  looking for a bug in the fallback chain instead of at the path they passed.
+  Both the SSH and access-log messages now name the path actually read.
+
 ### Changed
 
 - `argon2` 0.5 → 0.6 and `rand` 0.9 → 0.10. Both moved the API this code
