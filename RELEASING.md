@@ -140,3 +140,9 @@ by something rather than by memory:
   `--fail-under-lines`.
 
 The first two are why the announcement goes out after step 6, not before it.
+
+All three hold as of `0.0.1`, published 2026-09-14: the badge resolves, the releases page
+has the `x86_64` tarball and its checksum, and the coverage job is green. They are listed
+here because each *release* has to re-establish them, not because any of them is still
+outstanding. A badge that has gone back to rendering an error means the publish did not
+land, whatever the terminal said.
