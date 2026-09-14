@@ -74,7 +74,7 @@ pub async fn page(
         Err(err) => return internal_error(&err.to_string()),
     };
 
-    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(Tab::Help, &ctx, flash.into_flash(), body(&view))
 }
 
@@ -238,8 +238,20 @@ fn body(view: &View) -> Markup {
 
         (layout::panel(
             "The two buttons that change the host",
-            Some("In \u{201c}System-wide settings\u{201d} on the Dashboard \u{2014} what they touch, and what stops them going wrong"),
+            Some("In the header, on every screen \u{2014} what they touch, and what stops them going wrong"),
             html! {
+                .panel-body {
+                    p .hint {
+                        "\u{201c}Update everything\u{201d} downloads every bot list, every "
+                        "enabled reputation feed, the crawler IP ranges, and the ranges for "
+                        "every country you selected \u{2014} one source failing does not stop "
+                        "the rest. \u{201c}Apply everything\u{201d} then writes and reloads "
+                        "the NGINX config and writes and runs the firewall script, the same "
+                        "two halves, and in the same order, as "
+                        code { "stop-bots batch --apply" }
+                        "."
+                    }
+                }
                 table { tbody {
                     (row(
                         "Apply everything",
@@ -474,13 +486,13 @@ mod tests {
         }
     }
 
-    /// The buttons live in "System-wide settings", which is where someone
-    /// reading this has to go to find them.
+    /// The buttons live in the header, which is where someone reading
+    /// this has to go to find them.
     #[test]
     fn the_help_names_the_panel_the_buttons_live_in() {
         let rendered = body(&view(true)).into_string();
         assert!(
-            rendered.contains("System-wide settings"),
+            rendered.contains("In the header, on every screen"),
             "the page never says where the buttons are:\n{rendered}"
         );
     }

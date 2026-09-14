@@ -19,12 +19,7 @@
 //! The Help screen: a static reference of key bindings. No state, no key
 //! handling beyond what `App` already does to open/close it.
 
-use ratatui::{
-    layout::Rect,
-    text::Line,
-    widgets::{Block, Paragraph},
-    Frame,
-};
+use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
 
 /// The most lines [`render`] may emit.
 ///
@@ -32,7 +27,7 @@ use ratatui::{
 /// the screen area is silently cut off — and what goes first is the
 /// "Global" section at the bottom, including how to close this very
 /// screen. The budget is the body area of the smallest terminal the pty
-/// tests drive (32 rows, less a 2-row header, a 1-row footer and the
+/// tests drive (32 rows, less a 3-row header, a 1-row footer and the
 /// block's two borders).
 ///
 /// It is a constant with a test behind it because the comment that used to
@@ -41,40 +36,39 @@ use ratatui::{
 /// end-to-end pty test failing 15 seconds later with a timeout. Adding an
 /// entry here still means merging or dropping another — now you find that
 /// out in milliseconds.
-const MAX_LINES: usize = 27;
+const MAX_LINES: usize = 26;
 
-pub fn render(frame: &mut Frame, area: Rect) {
+pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
     let lines = vec![
         Line::from("Navigation"),
-        Line::from("  Up/Down, j/k       move selection (on the Dashboard it flows across all three panels)"),
-        Line::from("  Enter, Space       open/change the focused setting"),
-        Line::from("  Tab, Shift+Tab     switch screen (also Left/Right, h/l) — or panel, where a screen has two"),
-        Line::from("  d / b / s / p      jump to Dashboard / Bot settings / Site settings / Dynamic Protection"),
+        Line::from("  1 2 3 4, d b s p   jump to a screen (Left/Right and h/l step through them)"),
+        Line::from("  :                  command palette: every action here by name, fuzzy-matched"),
+        Line::from("  Tab, Shift+Tab     next / previous panel on this screen"),
+        Line::from("  Up/Down, j/k       move selection (it also flows from one panel into the next)"),
+        Line::from("  Enter              open or change the selected item;  Space toggles an on/off row"),
         Line::from(""),
         Line::from("Dashboard"),
-        Line::from("  m / f              switch geo mode (Blocklist / Allowlist) / render the firewall script"),
+        Line::from("  m / F              switch geo mode (Blocklist / Allowlist) / write the firewall script"),
         Line::from("  u / a              download every list / apply both planes (NGINX, then the firewall)"),
         Line::from("  w                  put this console behind NGINX (a subdomain, or a path on a site)"),
         Line::from(""),
-        Line::from("Bot settings"),
-        Line::from("  /                  search the Bot details panel; type to filter, Enter opens, Esc stops"),
+        Line::from("Bot settings         /  searches the bots; type to filter, Enter opens, Esc leaves the box"),
         Line::from(""),
         Line::from("Site settings"),
-        Line::from("  Tab                switch between the NGINX settings panel and the site list"),
         Line::from("  r / a / A          scan for sites / apply this site / apply every site"),
-        Line::from("  Enter, Space       open the selected site's category & bot overrides"),
-        Line::from("  (inside a site)    / searches its bots; Enter opens a setting; Esc backs out"),
+        Line::from("  Enter              open the selected site's category, request-rule and bot overrides"),
         Line::from(""),
         Line::from("Dynamic Protection"),
         Line::from("  Enter              block the selected NOT BLOCKED row, or unblock a BLOCKED one"),
-        Line::from("  i / f              inspect the selected SSH address / cycle the display filter"),
+        Line::from("  i / y / R          inspect the address / copy the address or user agent / re-read the log"),
+        Line::from("  f                  cycle the display filter (all / not blocked / blocked)"),
         Line::from(""),
         Line::from("Global"),
         Line::from("  q, Esc             quit (from a screen: go back; from a popup: close it)"),
-        Line::from("  c / ?              toggle light/dark theme / toggle this help screen"),
+        Line::from("  t / ?              toggle light/dark theme / toggle this help screen"),
     ];
     debug_assert!(lines.len() <= MAX_LINES);
-    let paragraph = Paragraph::new(lines).block(Block::bordered().title("Help"));
+    let paragraph = Paragraph::new(lines).block(crate::tui::panel("Help", true, theme));
     frame.render_widget(paragraph, area);
 }
 
@@ -89,9 +83,11 @@ mod tests {
     #[test]
     fn every_help_line_fits_the_smallest_terminal_the_tests_drive() {
         // The body area the app hands this screen at the pty tests' 32x100:
-        // 32 rows less a 2-row header and a 1-row footer.
-        let mut terminal = Terminal::new(TestBackend::new(100, 29)).unwrap();
-        terminal.draw(|frame| render(frame, frame.area())).unwrap();
+        // 32 rows less a 3-row header and a 1-row footer.
+        let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+        terminal
+            .draw(|frame| render(frame, frame.area(), crate::tui::Theme::Dark))
+            .unwrap();
 
         let content: String = terminal
             .backend()

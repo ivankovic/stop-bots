@@ -179,21 +179,30 @@ pub async fn page(
         Ok(view) => view,
         Err(err) => return internal_error(&err.to_string()),
     };
-    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(Tab::Dashboard, &ctx, flash.into_flash(), body(&view, &ctx))
 }
 
 fn body(view: &View, ctx: &Ctx) -> Markup {
+    // Two columns that stack independently, not a grid: a grid aligns
+    // its rows, so a three-row panel beside a nine-row one left a hole
+    // the height of the difference. The left column is what the
+    // operator decides (policy, geo, feeds, the script); the right is
+    // what the host does on its own (detectors, cron) and how it is.
     html! {
         .cols {
-            (health_panel(view))
-            (categories_panel(view, ctx))
-            (geo_panel(view, ctx))
-            (detectors_panel(view, ctx))
-            (feeds_panel(view, ctx))
-            (summary_panel(view, ctx))
-            (web_access_panel(view, ctx))
-            (jobs_panel(view))
+            .col {
+                (categories_panel(view, ctx))
+                (geo_panel(view, ctx))
+                (feeds_panel(view, ctx))
+                (firewall_panel(view, ctx))
+                (web_access_panel(view, ctx))
+            }
+            .col {
+                (detectors_panel(view, ctx))
+                (jobs_panel(view))
+                (health_panel(view))
+            }
         }
     }
 }
@@ -218,6 +227,10 @@ fn health_panel(view: &View) -> Markup {
         );
     };
 
+    // The header's chips already say which checks passed; this panel is
+    // for the ones that did not, with what to do about them. A check that
+    // could not run is kept too — "needs root" is worth a line.
+    let attention = report.at_least(health::Level::Unknown);
     layout::panel(
         "System status",
         Some(&format!(
@@ -226,9 +239,14 @@ fn health_panel(view: &View) -> Markup {
             age(*taken_at)
         )),
         html! {
+            @if attention.is_empty() {
+                .panel-body {
+                    p .hint { "Every check passed. Nothing to do here." }
+                }
+            } @else {
             table {
                 tbody {
-                    @for check in &report.checks {
+                    @for check in attention {
                         tr {
                             td { (check.title) }
                             td { (level_pill(check.level)) }
@@ -242,6 +260,7 @@ fn health_panel(view: &View) -> Markup {
                         }
                     }
                 }
+            }
             }
         },
     )
@@ -279,7 +298,7 @@ fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
         (Category::Ai, view.ai),
     ];
     layout::panel(
-        "System-wide settings",
+        "Policy",
         Some("What each category of known bot gets by default"),
         html! {
             table {
@@ -306,26 +325,19 @@ fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
                 }
             }
 
+            // What the policy is applied to and drawn from, in one line:
+            // the two facts that used to be a Summary panel of their own.
             .panel-body {
-                .row {
-                    form .inline method="post" action=(ctx.url("/update-all")) {
-                        (layout::csrf_field(ctx))
-                        button .primary type="submit" { "Update everything" }
-                    }
-                    form .inline method="post" action=(ctx.url("/apply-all")) {
-                        (layout::csrf_field(ctx))
-                        button .primary type="submit" { "Apply everything" }
-                    }
-                }
                 p .hint {
-                    "\u{201c}Update everything\u{201d} downloads every bot list, every "
-                    "enabled reputation feed, the crawler IP ranges, and the ranges for "
-                    "every country you selected \u{2014} one source failing does not stop "
-                    "the rest. \u{201c}Apply everything\u{201d} then writes and reloads "
-                    "the NGINX config and writes and runs the firewall script, the same "
-                    "two halves, and in the same order, as "
-                    code { "stop-bots batch --apply" }
-                    "."
+                    "Sites discovered: " span .mono { (view.site_count) }
+                    " \u{00b7} Bot list sources: " span .mono { (view.sources_total) } " "
+                    @if view.sources_stale == 0 && view.sources_total > 0 {
+                        (layout::pill("UP TO DATE", PillKind::Allowed))
+                    } @else if view.sources_total == 0 {
+                        "none registered"
+                    } @else {
+                        (layout::pill(&format!("{} NEED UPDATING", view.sources_stale), PillKind::Warn))
+                    }
                 }
             }
         },
@@ -455,7 +467,7 @@ fn geo_panel(view: &View, ctx: &Ctx) -> Markup {
             .panel-body {
                 form .row method="post" action=(ctx.url("/geo-add")) {
                     (layout::csrf_field(ctx))
-                    input type="text" name="country" placeholder="Country code, e.g. CN"
+                    input type="text" name="country" placeholder="CN" aria-label="Country code"
                         maxlength="2" size="4" required;
                     button .primary type="submit" { "Add" }
                     span .hint {
@@ -502,11 +514,11 @@ fn detectors_panel(view: &View, ctx: &Ctx) -> Markup {
                             }
                             td .num { (ttl_days) "d" }
                             td {
-                                form .row method="post" action=(ctx.url("/detector-ttl")) style="gap:6px" {
+                                form .row.tight method="post" action=(ctx.url("/detector-ttl")) {
                                     (layout::csrf_field(ctx))
                                     input type="hidden" name="detector" value=(detector.id());
-                                    input type="number" name="days" min="1" max="3650"
-                                        value=(ttl_days) size="4" style="width:5.5em";
+                                    input .short type="number" name="days" min="1" max="3650"
+                                        value=(ttl_days) size="4";
                                     button type="submit" { "Set" }
                                 }
                             }
@@ -582,33 +594,22 @@ fn feeds_panel(view: &View, ctx: &Ctx) -> Markup {
     )
 }
 
-// ---- summary ----
+// ---- the firewall script ----
 
-fn summary_panel(view: &View, ctx: &Ctx) -> Markup {
+/// The one artifact the Dashboard exists to produce: how many rules it
+/// holds, whether the copy on disk still matches, and the form that
+/// writes it.
+fn firewall_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
-        "Summary",
-        None,
+        "Firewall script",
+        Some(&format!(
+            "{} \u{2192} {}",
+            view.firewall_backend.stored(),
+            view.firewall_out
+        )),
         html! {
             table {
                 tbody {
-                    tr {
-                        td { "Sites discovered" }
-                        td .num { (view.site_count) }
-                        td {}
-                    }
-                    tr {
-                        td { "Bot list sources" }
-                        td .num { (view.sources_total) }
-                        td {
-                            @if view.sources_stale == 0 && view.sources_total > 0 {
-                                (layout::pill("UP TO DATE", PillKind::Allowed))
-                            } @else if view.sources_total == 0 {
-                                span .hint { "none registered" }
-                            } @else {
-                                (layout::pill(&format!("{} NEED UPDATING", view.sources_stale), PillKind::Warn))
-                            }
-                        }
-                    }
                     tr {
                         td { "Firewall rules" }
                         td .num { (view.rule_count) }
@@ -627,10 +628,6 @@ fn summary_panel(view: &View, ctx: &Ctx) -> Markup {
             .panel-body {
                 form .row method="post" action=(ctx.url("/render-firewall")) {
                     (layout::csrf_field(ctx))
-                    label .field {
-                        "Write the firewall script to"
-                        code { (view.firewall_out) }
-                    }
                     label .field {
                         "Backend"
                         select name="backend" {
@@ -856,7 +853,7 @@ fn jobs_panel(view: &View) -> Markup {
             table {
                 thead { tr {
                     th { "Task" }
-                    th { "Last run" }
+                    th .nowrap { "Last run" }
                     th { "Result" }
                     th { "" }
                 } }
@@ -864,7 +861,7 @@ fn jobs_panel(view: &View) -> Markup {
                     @for status in &view.jobs {
                         tr {
                             td { (status.job.label()) }
-                            td {
+                            td .mono.nowrap {
                                 @match status.last_run {
                                     Some(at) => { (relative(at)) }
                                     None => { span .hint { "never" } }

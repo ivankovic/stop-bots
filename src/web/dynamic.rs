@@ -123,7 +123,7 @@ pub async fn page(
         Err(err) => return internal_error(&err.to_string()),
     };
 
-    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(
         Tab::Dynamic,
         &ctx,
@@ -143,6 +143,9 @@ fn body(live: &Live, filter: Filter, detail: Option<&IpDetail>, ctx: &Ctx) -> Ma
         .iter()
         .filter(|r| filter.matches(r.status))
         .collect();
+
+    let ssh_max = ssh.iter().map(|r| r.count).max().unwrap_or(0);
+    let ua_max = uas.iter().map(|r| r.count).max().unwrap_or(0);
 
     html! {
         (filter_bar(filter, ctx))
@@ -181,7 +184,7 @@ fn body(live: &Live, filter: Filter, detail: Option<&IpDetail>, ctx: &Ctx) -> Ma
                             tbody {
                                 @for row in &ssh {
                                     tr {
-                                        td .num { (row.count) }
+                                        td .num { (meter(row.count, ssh_max)) }
                                         td { (status_pill(row.status)) }
                                         td .mono {
                                             // The address itself is the
@@ -238,7 +241,7 @@ fn body(live: &Live, filter: Filter, detail: Option<&IpDetail>, ctx: &Ctx) -> Ma
                                         // rows" unpredictable. `title`
                                         // keeps the whole string a hover
                                         // away, and in the DOM.
-                                        td .num { (row.count) }
+                                        td .num { (meter(row.count, ua_max)) }
                                         td { (status_pill(row.status)) }
                                         td .mono title=(row.user_agent) { (row.user_agent) }
                                         td .right { (ua_action(row, ctx)) }
@@ -255,22 +258,47 @@ fn body(live: &Live, filter: Filter, detail: Option<&IpDetail>, ctx: &Ctx) -> Ma
     }
 }
 
+/// The shared display filter, as a segmented control. One control for
+/// both tables because it is one filter — the TUI's `f` — and the
+/// current segment is a class, not an inline style: the CSP's
+/// `style-src 'self'` drops a `style` attribute on the floor.
 fn filter_bar(current: Filter, ctx: &Ctx) -> Markup {
     html! {
-        .row style="margin-bottom:16px" {
-            span .hint { "Show:" }
-            @for (filter, label) in [
-                (Filter::All, "All"),
-                (Filter::PendingOnly, "Not blocked"),
-                (Filter::BlockedOnly, "Blocked"),
-            ] {
-                @if filter == current {
-                    a .button href=(ctx.url(&format!("/dynamic?filter={}", filter_name(filter))))
-                        style="border-color:var(--accent);color:var(--accent);font-weight:600" { (label) }
-                } @else {
-                    a .button href=(ctx.url(&format!("/dynamic?filter={}", filter_name(filter)))) { (label) }
+        .filterbar {
+            span .hint { "Show" }
+            .seg {
+                @for (filter, label) in [
+                    (Filter::All, "All"),
+                    (Filter::PendingOnly, "Not blocked"),
+                    (Filter::BlockedOnly, "Blocked"),
+                ] {
+                    @if filter == current {
+                        a .on href=(ctx.url(&format!("/dynamic?filter={}", filter_name(filter)))) aria-current="true" { (label) }
+                    } @else {
+                        a href=(ctx.url(&format!("/dynamic?filter={}", filter_name(filter)))) { (label) }
+                    }
                 }
             }
+        }
+    }
+}
+
+/// A count with a bar beside it, scaled to the largest count in the same
+/// table, so the shape of the traffic reads before the digits do.
+///
+/// The width is one of twenty classes rather than an inline `style`,
+/// which the CSP would discard — see [`filter_bar`]. Twenty steps is as
+/// fine as a 60px track can show.
+fn meter(count: u64, max: u64) -> Markup {
+    let step = if max == 0 || count == 0 {
+        0
+    } else {
+        (count * 20).div_ceil(max).clamp(1, 20)
+    };
+    html! {
+        (count)
+        span .meter aria-hidden="true" {
+            span class=(format!("bar p{step}")) {}
         }
     }
 }

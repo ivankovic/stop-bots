@@ -1,56 +1,101 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 931 348" width="931" height="348" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="14">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 931 366" width="931" height="366" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="14">
 <rect width="100%" height="100%" rx="8" fill="#12161c"/>
-<rect x="20.4" y="66.0" width="268.8" height="18.0" fill="#c8d0da"/>
-<rect x="289.2" y="66.0" width="218.4" height="18.0" fill="#c8d0da"/>
-<rect x="507.6" y="66.0" width="403.2" height="18.0" fill="#c8d0da"/>
-<rect x="20.4" y="174.0" width="201.6" height="18.0" fill="#42b3c2"/>
-<rect x="222.0" y="174.0" width="109.2" height="18.0" fill="#8cc265"/>
-<rect x="331.2" y="174.0" width="92.4" height="18.0" fill="#42b3c2"/>
-<rect x="423.6" y="174.0" width="487.2" height="18.0" fill="#42b3c2"/>
-<text x="12.0" y="25.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">stop-bots</text>
-<text x="87.6" y="25.5" fill="#c8d0da" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> 0.0.1</text>
-<text x="12.0" y="43.5" fill="#c8d0da" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Dashboard │ </text>
-<text x="121.2" y="43.5" fill="#42b3c2" textLength="100.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Bot settings</text>
-<text x="222.0" y="43.5" fill="#c8d0da" textLength="697.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> │ Site settings │ Dynamic Protection                                              </text>
-<text x="12.0" y="61.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌Bot list sources — Enter to update────────────────────────────────────────────────────────────────────────┐</text>
-<text x="12.0" y="79.5" fill="#c8d0da" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="79.5" fill="#c8d0da" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">ai.robots.txt                   </text>
-<text x="289.2" y="79.5" fill="#c8d0da" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">   62 bots  updated 0s ago</text>
-<text x="910.8" y="79.5" fill="#c8d0da" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="97.5" fill="#c8d0da" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="97.5" fill="#c8d0da" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Nginx Ultimate Bad Bot Blocker  </text>
-<text x="289.2" y="97.5" fill="#c8d0da" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">  597 bots  updated 0s ago</text>
-<text x="507.6" y="97.5" fill="#c8d0da" textLength="411.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                                │</text>
-<text x="12.0" y="115.5" fill="#c8d0da" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="115.5" fill="#c8d0da" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">ArcJet Well-Known Bots          </text>
-<text x="289.2" y="115.5" fill="#c8d0da" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> 1384 bots  updated 0s ago</text>
-<text x="507.6" y="115.5" fill="#c8d0da" textLength="411.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                                │</text>
-<text x="12.0" y="133.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
-<text x="12.0" y="151.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌Bot details───────────────────────────────────────────────────────────────────────────────────────────────┐</text>
-<text x="12.0" y="169.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│/bot█                                                                                                     │</text>
-<text x="12.0" y="187.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="187.5" fill="#c8d0da" textLength="201.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Bingbot               </text>
-<text x="222.0" y="187.5" fill="#c8d0da" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ ALLOWED ] </text>
-<text x="331.2" y="187.5" fill="#c8d0da" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (override)</text>
-<text x="910.8" y="187.5" fill="#42b3c2" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="205.5" fill="#42b3c2" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│  CCBot                 </text>
-<text x="222.0" y="205.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
-<text x="331.2" y="205.5" fill="#42b3c2" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (system)</text>
-<text x="406.8" y="205.5" fill="#42b3c2" textLength="512.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                                            │</text>
-<text x="12.0" y="223.5" fill="#42b3c2" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│  ClaudeBot             </text>
-<text x="222.0" y="223.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
-<text x="331.2" y="223.5" fill="#42b3c2" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (system)</text>
-<text x="406.8" y="223.5" fill="#42b3c2" textLength="512.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                                            │</text>
-<text x="12.0" y="241.5" fill="#42b3c2" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│  Googlebot             </text>
-<text x="222.0" y="241.5" fill="#8cc265" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ ALLOWED ] </text>
-<text x="331.2" y="241.5" fill="#42b3c2" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (system)</text>
-<text x="406.8" y="241.5" fill="#42b3c2" textLength="512.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                                            │</text>
-<text x="12.0" y="259.5" fill="#42b3c2" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│  GPTBot                </text>
-<text x="222.0" y="259.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
-<text x="331.2" y="259.5" fill="#42b3c2" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (system)</text>
-<text x="406.8" y="259.5" fill="#42b3c2" textLength="512.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">                                                            │</text>
-<text x="12.0" y="277.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                                                          │</text>
-<text x="12.0" y="295.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│                                                                                                          │</text>
-<text x="12.0" y="313.5" fill="#42b3c2" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
-<text x="12.0" y="331.5" fill="#c8d0da" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">q quit  Tab/Shift+Tab/←→ switch  d/b/s/p jump  ? help  c theme (dark)                                       </text>
+<rect x="20.4" y="192.0" width="210.0" height="18.0" fill="#10262a"/>
+<rect x="230.4" y="192.0" width="109.2" height="18.0" fill="#10262a"/>
+<rect x="339.6" y="192.0" width="92.4" height="18.0" fill="#10262a"/>
+<rect x="432.0" y="192.0" width="478.8" height="18.0" fill="#10262a"/>
+<text x="12.0" y="25.5" fill="#2ee6d6" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">stop-bots</text>
+<text x="87.6" y="25.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 0.0.1  web-01</text>
+<text x="12.0" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1</text>
+<text x="28.8" y="43.5" fill="#6b7c8c" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dashboard</text>
+<text x="129.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">2</text>
+<text x="146.4" y="43.5" fill="#2ee6d6" textLength="100.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Bot settings</text>
+<text x="272.4" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">3</text>
+<text x="289.2" y="43.5" fill="#6b7c8c" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Site settings</text>
+<text x="423.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">4</text>
+<text x="440.4" y="43.5" fill="#6b7c8c" textLength="151.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dynamic Protection</text>
+<text x="616.8" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
+<text x="633.6" y="43.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Help</text>
+<text x="12.0" y="61.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">status</text>
+<text x="79.2" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
+<text x="96.0" y="61.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">kernel</text>
+<text x="163.2" y="61.5" fill="#d18f52" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▲</text>
+<text x="171.6" y="61.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> reboot  </text>
+<text x="247.2" y="61.5" fill="#d18f52" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▲</text>
+<text x="255.6" y="61.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> script  </text>
+<text x="331.2" y="61.5" fill="#d18f52" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▲</text>
+<text x="339.6" y="61.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> nginx  </text>
+<text x="406.8" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
+<text x="423.6" y="61.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">console</text>
+<text x="499.2" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
+<text x="516.0" y="61.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">disk</text>
+<text x="566.4" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
+<text x="583.2" y="61.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">logs</text>
+<text x="12.0" y="79.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Bot list sources ────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="97.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="28.8" y="97.5" fill="#c8d0da" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">ai.robots.txt                   </text>
+<text x="297.6" y="97.5" fill="#c8d0da" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">   62 bots  updated 0s ago</text>
+<text x="910.8" y="97.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="115.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="28.8" y="115.5" fill="#c8d0da" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Nginx Ultimate Bad Bot Blocker  </text>
+<text x="297.6" y="115.5" fill="#c8d0da" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">  597 bots  updated 0s ago</text>
+<text x="910.8" y="115.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="133.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="28.8" y="133.5" fill="#c8d0da" textLength="268.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">ArcJet Well-Known Bots          </text>
+<text x="297.6" y="133.5" fill="#c8d0da" textLength="218.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> 1384 bots  updated 0s ago</text>
+<text x="910.8" y="133.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="151.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="169.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<text x="20.4" y="169.5" fill="#2ee6d6" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Bot details </text>
+<text x="129.6" y="169.5" fill="#2ee6d6" textLength="789.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">─────────────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="187.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="187.5" fill="#c8d0da" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">/bot█                                                                                                     </text>
+<text x="910.8" y="187.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="205.5" fill="#c8d0da" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">▎  Bingbot               </text>
+<text x="230.4" y="205.5" fill="#8cc265" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> [ ALLOWED ] </text>
+<text x="339.6" y="205.5" fill="#c8d0da" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.55"> (override)</text>
+<text x="910.8" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="223.5" fill="#c8d0da" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   CCBot                 </text>
+<text x="230.4" y="223.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="339.6" y="223.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (system)</text>
+<text x="910.8" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="241.5" fill="#c8d0da" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   ClaudeBot             </text>
+<text x="230.4" y="241.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="339.6" y="241.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (system)</text>
+<text x="910.8" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="259.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="259.5" fill="#c8d0da" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   Googlebot             </text>
+<text x="230.4" y="259.5" fill="#8cc265" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ ALLOWED ] </text>
+<text x="339.6" y="259.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (system)</text>
+<text x="910.8" y="259.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="277.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="277.5" fill="#c8d0da" textLength="210.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   GPTBot                </text>
+<text x="230.4" y="277.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="339.6" y="277.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55"> (system)</text>
+<text x="910.8" y="277.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="295.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="295.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="313.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="910.8" y="313.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="331.5" fill="#2ee6d6" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="349.5" fill="#2ee6d6" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Bots</text>
+<text x="62.4" y="349.5" fill="#2ee6d6" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">type</text>
+<text x="104.4" y="349.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">filter</text>
+<text x="171.6" y="349.5" fill="#2ee6d6" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">↑↓</text>
+<text x="196.8" y="349.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">move</text>
+<text x="247.2" y="349.5" fill="#2ee6d6" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Enter</text>
+<text x="297.6" y="349.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">override</text>
+<text x="381.6" y="349.5" fill="#2ee6d6" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Esc</text>
+<text x="415.2" y="349.5" fill="#6b7c8c" textLength="100.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">leave search</text>
+<text x="532.8" y="349.5" fill="#2ee6d6" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab</text>
+<text x="566.4" y="349.5" fill="#6b7c8c" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">next panel</text>
+<text x="667.2" y="349.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
+<text x="684.0" y="349.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">help</text>
+<text x="734.4" y="349.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">t</text>
+<text x="751.2" y="349.5" fill="#6b7c8c" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">theme</text>
+<text x="810.0" y="349.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">q</text>
+<text x="826.8" y="349.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">quit</text>
 </svg>

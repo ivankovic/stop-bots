@@ -45,7 +45,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -141,7 +141,7 @@ impl BotSettings {
         self.render_details(frame, details_area, theme);
 
         if let Some(popup) = &self.popup {
-            self.render_popup(frame, area, popup);
+            self.render_popup(frame, area, popup, theme);
         }
     }
 
@@ -161,21 +161,18 @@ impl BotSettings {
             .map(|source| ListItem::new(source_line(source, name_width)))
             .collect();
 
-        let mut block = Block::bordered().title("Bot list sources — Enter to update");
-        if self.focus == Focus::Sources {
-            block = block.fg(theme.accent());
-        }
-        let list = List::new(items)
-            .block(block)
-            .highlight_style(ratatui::style::Style::new().reversed());
+        let focused = self.focus == Focus::Sources;
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel("Bot list sources", focused, theme)),
+            focused,
+            theme,
+        );
         frame.render_stateful_widget(list, area, &mut self.sources_state);
     }
 
     fn render_details(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let mut block = Block::bordered().title("Bot details");
-        if self.focus == Focus::Search {
-            block = block.fg(theme.accent());
-        }
+        let focused = self.focus == Focus::Search;
+        let block = crate::tui::panel("Bot details", focused, theme);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -216,8 +213,43 @@ impl BotSettings {
                 ))
             })
             .collect();
-        let list = List::new(items).highlight_style(ratatui::style::Style::new().reversed());
+        let list = crate::tui::select_in(List::new(items), focused, theme);
         frame.render_stateful_widget(list, results_area, &mut self.results_state);
+    }
+
+    /// The footer's key hints for the focused panel.
+    pub fn hints(&self) -> crate::tui::Hints {
+        if self.popup.is_some() {
+            return (
+                "Popup",
+                vec![
+                    ("\u{2191}\u{2193}", "choose"),
+                    ("Enter", "confirm"),
+                    ("Esc", "cancel"),
+                ],
+            );
+        }
+        match self.focus {
+            Focus::Sources => (
+                "Sources",
+                vec![
+                    ("\u{2191}\u{2193}", "move"),
+                    ("Enter", "update"),
+                    ("/", "search bots"),
+                    ("Tab", "next panel"),
+                ],
+            ),
+            Focus::Search => (
+                "Bots",
+                vec![
+                    ("type", "filter"),
+                    ("\u{2191}\u{2193}", "move"),
+                    ("Enter", "override"),
+                    ("Esc", "leave search"),
+                    ("Tab", "next panel"),
+                ],
+            ),
+        }
     }
 
     fn search_line(&self) -> Line<'static> {
@@ -230,7 +262,7 @@ impl BotSettings {
         }
     }
 
-    fn render_popup(&self, frame: &mut Frame, area: Rect, popup: &Popup) {
+    fn render_popup(&self, frame: &mut Frame, area: Rect, popup: &Popup, theme: Theme) {
         let title = match &popup.target {
             PopupTarget::Source(id) => {
                 let name = self
@@ -268,7 +300,7 @@ impl BotSettings {
                 ListItem::new(line)
             })
             .collect();
-        let list = List::new(items).block(Block::bordered().title(title));
+        let list = List::new(items).block(crate::tui::popup(title, theme));
         frame.render_widget(Clear, popup_area);
         frame.render_widget(list, popup_area);
     }
@@ -313,6 +345,16 @@ impl BotSettings {
                 }
                 _ => return Ok(KeyOutcome::Consumed),
             }
+        }
+
+        // Tab hops between the two panels without touching the query, so
+        // a half-typed search survives a look at the sources.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.focus = match self.focus {
+                Focus::Sources => Focus::Search,
+                Focus::Search => Focus::Sources,
+            };
+            return Ok(KeyOutcome::Consumed);
         }
 
         match self.focus {

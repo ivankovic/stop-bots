@@ -117,6 +117,15 @@ pub struct App {
     /// The screen to return to when the Help screen is closed.
     before_help: Screen,
     pub message: Option<String>,
+    /// Every message the screens have produced, newest last, with the
+    /// unix time it appeared: the Dashboard's Log panel. `message` is
+    /// still what a screen writes to — this is `App` watching it, so the
+    /// hundred places that set a message did not each have to learn about
+    /// a log.
+    pub log: Vec<(i64, String)>,
+    db_last_logged: Option<String>,
+    /// The command palette, while it is open. See [`crate::tui::palette`].
+    pub palette: Option<tui::palette::Palette>,
     pub db: Db,
     pub dashboard: tui::dashboard::Dashboard,
     pub bot_settings: tui::bot_settings::BotSettings,
@@ -360,6 +369,9 @@ impl App {
             screen: Screen::default(),
             before_help: Screen::default(),
             message: None,
+            log: Vec::new(),
+            db_last_logged: None,
+            palette: None,
             db,
             dashboard: tui::dashboard::Dashboard::default(),
             bot_settings: tui::bot_settings::BotSettings::default(),
@@ -476,11 +488,32 @@ impl App {
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         while self.running {
             self.refresh_if_stale()?;
+            self.note_message();
             terminal.draw(|frame| tui::render(&mut self, frame))?;
             let event = self.events.next().await?;
             self.handle_event(event)?;
         }
         Ok(())
+    }
+
+    /// Appends `message` to the log if it is new since the last frame.
+    /// Called once per frame rather than from every place that sets a
+    /// message, so the log needs no plumbing through the screens. The
+    /// cap keeps a console left open for a month from growing without
+    /// bound; nobody scrolls past the last hundred anyway.
+    pub fn note_message(&mut self) {
+        if self.message.is_some() && self.message != self.db_last_logged {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            self.log
+                .push((now, self.message.clone().unwrap_or_default()));
+            if self.log.len() > 100 {
+                self.log.remove(0);
+            }
+            self.db_last_logged.clone_from(&self.message);
+        }
     }
 
     /// Dispatches a single event. Split out of `run` so tests can drive the
@@ -1495,6 +1528,23 @@ impl App {
             return Ok(());
         }
 
+        if let Some(palette) = &mut self.palette {
+            match key.code {
+                KeyCode::Esc => self.palette = None,
+                KeyCode::Enter => {
+                    let action = palette.selected_action();
+                    self.palette = None;
+                    if let Some(action) = action {
+                        self.run_command(action)?;
+                    }
+                }
+                other => {
+                    palette.handle_key(other);
+                }
+            }
+            return Ok(());
+        }
+
         if self.screen == Screen::Help {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q' | '?')) {
                 self.screen = self.before_help;
@@ -1581,6 +1631,12 @@ impl App {
                 self.start_web_access(request);
                 return Ok(());
             }
+            KeyOutcome::RereadLogs => {
+                self.ssh_log_read_at = None;
+                self.start_ssh_log_read();
+                self.message = Some("Re-reading the SSH log\u{2026}".to_string());
+                return Ok(());
+            }
             KeyOutcome::Ignored => {}
         }
 
@@ -1589,31 +1645,159 @@ impl App {
                 self.events.send(AppEvent::Quit);
             }
             KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Dashboard,
-            KeyCode::Char('c') => self.theme = self.theme.toggle(),
+            // `t` is the documented theme key; `c` stays as the alias it
+            // used to be, for hands that learned it.
+            KeyCode::Char('t' | 'c') => self.theme = self.theme.toggle(),
             KeyCode::Char('?') => {
                 self.before_help = self.screen;
                 self.screen = Screen::Help;
             }
-            KeyCode::Char('d') => self.screen = Screen::Dashboard,
-            KeyCode::Char('b') => self.screen = Screen::BotSettings,
-            KeyCode::Char('s') => self.screen = Screen::SiteSettings,
-            KeyCode::Char('p') => self.screen = Screen::DynamicProtection,
-            // Left/Right and their vim h/l aliases cycle screens exactly
-            // like Tab/Shift+Tab — all four only ever reach here when the
-            // active screen's own `handle_key` returned `Ignored` for the
-            // key (see `KeyOutcome`'s doc comment), so a screen that gives
-            // Left/Right/h/l its own meaning (none currently do — Dynamic
-            // Protection's own Tab/Shift+Tab panel switch is a separate,
-            // narrower case, see `Screen`'s doc comment) would still take
-            // priority, and a search/text-entry focus that owns every
-            // `Char` already stops 'h'/'l' from leaking through, the same
-            // way it already stops 'd'/'b'/'s'/'p' from jumping screens
-            // mid-search.
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.screen = self.screen.next(),
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => {
-                self.screen = self.screen.previous()
-            }
+            KeyCode::Char(':') => self.palette = Some(tui::palette::Palette::new(self.commands())),
+            // Digits, as every tabbed terminal tool has them and as the tab
+            // bar shows them; the mnemonic letters stay as aliases.
+            KeyCode::Char('d' | '1') => self.screen = Screen::Dashboard,
+            KeyCode::Char('b' | '2') => self.screen = Screen::BotSettings,
+            KeyCode::Char('s' | '3') => self.screen = Screen::SiteSettings,
+            KeyCode::Char('p' | '4') => self.screen = Screen::DynamicProtection,
+            // Left/Right and their vim h/l aliases cycle screens. Tab is
+            // *not* among them any more: it always means "next panel on
+            // this screen", so that it means one thing everywhere (it used
+            // to switch screens on the two screens with one list and
+            // panels on the two with several). All of these only reach
+            // here when the active screen's own `handle_key` returned
+            // `Ignored` for the key (see `KeyOutcome`'s doc comment), so a
+            // search/text-entry focus that owns every `Char` already stops
+            // 'h'/'l' and the digits from leaking through mid-search.
+            KeyCode::Right | KeyCode::Char('l') => self.screen = self.screen.next(),
+            KeyCode::Left | KeyCode::Char('h') => self.screen = self.screen.previous(),
             _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl App {
+    /// Everything the command palette can do, in the order it lists them
+    /// with an empty query: navigation, then the host-wide actions, then
+    /// one row per detector saying which way it would flip.
+    fn commands(&self) -> Vec<tui::palette::Command> {
+        use tui::palette::{Action, Command};
+        let key = |screen: Screen, c: char| Action::Key(screen, KeyCode::Char(c));
+        let mut commands = vec![
+            ("Go to Dashboard", "1", Action::Screen(Screen::Dashboard)),
+            (
+                "Go to Bot settings",
+                "2",
+                Action::Screen(Screen::BotSettings),
+            ),
+            (
+                "Go to Site settings",
+                "3",
+                Action::Screen(Screen::SiteSettings),
+            ),
+            (
+                "Go to Dynamic Protection",
+                "4",
+                Action::Screen(Screen::DynamicProtection),
+            ),
+            ("Help: the key map", "?", Action::Screen(Screen::Help)),
+            (
+                "Update everything: download every list",
+                "u",
+                key(Screen::Dashboard, 'u'),
+            ),
+            (
+                "Apply everything: NGINX, then the firewall",
+                "a",
+                key(Screen::Dashboard, 'a'),
+            ),
+            (
+                "Write the firewall script",
+                "F",
+                key(Screen::Dashboard, 'F'),
+            ),
+            (
+                "Web access: put this console behind NGINX",
+                "w",
+                key(Screen::Dashboard, 'w'),
+            ),
+            (
+                "Geo mode: blocklist or allowlist",
+                "m",
+                key(Screen::Dashboard, 'm'),
+            ),
+            ("Search bots", "/", key(Screen::BotSettings, '/')),
+            (
+                "Rescan for NGINX sites",
+                "r",
+                key(Screen::SiteSettings, 'r'),
+            ),
+            (
+                "Apply blocking to every site",
+                "A",
+                key(Screen::SiteSettings, 'A'),
+            ),
+            (
+                "Re-read the SSH log",
+                "R",
+                key(Screen::DynamicProtection, 'R'),
+            ),
+            ("Toggle light/dark theme", "t", Action::Theme),
+            ("Quit", "q", Action::Quit),
+        ]
+        .into_iter()
+        .map(|(label, hint, action)| Command {
+            label: label.to_string(),
+            hint,
+            action,
+        })
+        .collect::<Vec<_>>();
+        for detector in crate::protection::Detector::ALL {
+            let on = detector.is_enabled(&self.db).unwrap_or(false);
+            commands.push(Command {
+                label: format!(
+                    "Turn {} {}",
+                    if on { "off" } else { "on" },
+                    detector.spec().label
+                ),
+                hint: "",
+                action: Action::Detector(detector, !on),
+            });
+        }
+        commands
+    }
+
+    /// Runs a palette command. `Key` goes through [`Self::handle_key_event`]
+    /// as if the key had been pressed on that screen, so a command can
+    /// never do something its key cannot — same popups, same guards.
+    fn run_command(&mut self, action: tui::palette::Action) -> Result<()> {
+        use tui::palette::Action;
+        match action {
+            Action::Screen(Screen::Help) => {
+                self.before_help = self.screen;
+                self.screen = Screen::Help;
+            }
+            Action::Screen(screen) => self.screen = screen,
+            Action::Key(screen, code) => {
+                self.screen = screen;
+                if screen == Screen::SiteSettings {
+                    // `r` and `A` are keys of the site list, not of the
+                    // settings panel above it or of an open site's detail.
+                    self.site_settings.show_sites();
+                }
+                self.handle_key_event(KeyEvent::from(code))?;
+            }
+            Action::Theme => self.theme = self.theme.toggle(),
+            Action::Quit => self.events.send(AppEvent::Quit),
+            Action::Detector(detector, on) => {
+                detector.set_enabled(&self.db, on)?;
+                self.message = Some(format!(
+                    "{} detection {}",
+                    detector.spec().label,
+                    if on { "on" } else { "off" }
+                ));
+                self.refresh()?;
+            }
         }
         Ok(())
     }
@@ -1662,6 +1846,74 @@ mod tests {
             Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
         )
         .unwrap()
+    }
+
+    /// Types `text` into the open palette and presses Enter.
+    fn run_palette(app: &mut App, text: &str) {
+        app.handle_key_event(KeyEvent::from(KeyCode::Char(':')))
+            .unwrap();
+        assert!(app.palette.is_some(), "`:` should open the palette");
+        for c in text.chars() {
+            app.handle_key_event(KeyEvent::from(KeyCode::Char(c)))
+                .unwrap();
+        }
+        app.handle_key_event(KeyEvent::from(KeyCode::Enter))
+            .unwrap();
+        assert!(app.palette.is_none(), "Enter should close the palette");
+    }
+
+    #[tokio::test]
+    async fn the_palette_runs_the_best_match_for_what_was_typed() {
+        let mut app = test_app();
+        let before = app.theme;
+        run_palette(&mut app, "theme");
+        assert_eq!(app.theme, before.toggle());
+
+        run_palette(&mut app, "dynamic");
+        assert_eq!(app.screen, Screen::DynamicProtection);
+    }
+
+    /// A `Key` command is the key: it lands on the right screen and goes
+    /// through the screen's own handler, popup and all.
+    #[tokio::test]
+    async fn the_palette_presses_a_screens_key_from_any_screen() {
+        let mut app = test_app();
+        app.screen = Screen::BotSettings;
+        run_palette(&mut app, "write fire");
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert!(
+            app.dashboard.render_popup_is_open(),
+            "the render popup should be open"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_palette_flips_a_detector_and_says_so() {
+        use crate::protection::Detector;
+        let mut app = test_app();
+        assert!(!Detector::Honeypot.is_enabled(&app.db).unwrap());
+        run_palette(&mut app, "honeypot");
+        assert!(Detector::Honeypot.is_enabled(&app.db).unwrap());
+        assert_eq!(app.message.as_deref(), Some("Honeypot path detection on"));
+        // Reopened, the same row now offers the other direction.
+        run_palette(&mut app, "honeypot");
+        assert!(!Detector::Honeypot.is_enabled(&app.db).unwrap());
+    }
+
+    #[tokio::test]
+    async fn escape_closes_the_palette_and_runs_nothing() {
+        let mut app = test_app();
+        let before = app.theme;
+        app.handle_key_event(KeyEvent::from(KeyCode::Char(':')))
+            .unwrap();
+        for c in "theme".chars() {
+            app.handle_key_event(KeyEvent::from(KeyCode::Char(c)))
+                .unwrap();
+        }
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(app.palette.is_none());
+        assert_eq!(app.theme, before);
+        assert_eq!(app.screen, Screen::Dashboard);
     }
 
     #[tokio::test]
@@ -2244,7 +2496,7 @@ mod tests {
 
         assert!(app.dashboard.firewall_needs_update());
 
-        app.handle_key_event(KeyEvent::from(KeyCode::Char('f')))
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('F')))
             .unwrap();
         for _ in 0..crate::firewall::DEFAULT_OUTPUT_PATH.len() {
             app.handle_key_event(KeyEvent::from(KeyCode::Backspace))

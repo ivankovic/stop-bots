@@ -85,7 +85,7 @@ pub async fn page(
         Ok(view) => view,
         Err(err) => return internal_error(&err.to_string()),
     };
-    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(Tab::Sites, &ctx, flash.into_flash(), body(&view, &ctx))
 }
 
@@ -219,13 +219,13 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
 fn sites_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
         "Sites",
-        Some("Discovered under the configured NGINX root"),
+        Some(&format!("Discovered under {}", view.root.display())),
         html! {
             .panel-body {
                 .row {
                     form .inline method="post" action=(ctx.url("/sites/scan")) {
                         (layout::csrf_field(ctx))
-                        button type="submit" { "Rescan " (view.root.display()) }
+                        button type="submit" title=(format!("Look for server blocks under {}", view.root.display())) { "Rescan" }
                     }
                     form .inline method="post" action=(ctx.url("/sites/apply-all")) {
                         (layout::csrf_field(ctx))
@@ -322,7 +322,7 @@ pub async fn detail(
         Ok(detail) => detail,
         Err(err) => return internal_error(&err.to_string()),
     };
-    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(
         Tab::Sites,
         &ctx,

@@ -41,7 +41,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -256,7 +256,7 @@ impl SiteDetail {
         self.render_details(frame, details_area, theme);
 
         if let Some(popup) = &self.popup {
-            self.render_popup(frame, area, popup);
+            self.render_popup(frame, area, popup, theme);
         }
     }
 
@@ -266,13 +266,16 @@ impl SiteDetail {
             .map(|&category| ListItem::new(self.category_line(category)))
             .collect();
 
-        let mut block = Block::bordered().title(format!("{} — categories", self.site.server_name));
-        if self.focus == Focus::Categories {
-            block = block.fg(theme.accent());
-        }
-        let list = List::new(items)
-            .block(block)
-            .highlight_style(ratatui::style::Style::new().reversed());
+        let focused = self.focus == Focus::Categories;
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel(
+                format!("{} \u{2014} categories", self.site.server_name),
+                focused,
+                theme,
+            )),
+            focused,
+            theme,
+        );
         frame.render_stateful_widget(list, area, &mut self.categories_state);
     }
 
@@ -298,14 +301,12 @@ impl SiteDetail {
             })
             .collect();
 
-        let mut block = Block::bordered().title("Request rules — Enter to change");
-        if self.focus == Focus::Options {
-            block = block.fg(theme.accent());
-        }
-        let mut list = List::new(items).block(block);
-        if self.focus == Focus::Options {
-            list = list.highlight_style(ratatui::style::Style::new().reversed());
-        }
+        let focused = self.focus == Focus::Options;
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel("Request rules", focused, theme)),
+            focused,
+            theme,
+        );
         frame.render_stateful_widget(list, area, &mut self.options_state);
     }
 
@@ -320,14 +321,12 @@ impl SiteDetail {
                 }))
                 .collect();
 
-        let mut block = Block::bordered().title("Path exemptions — Enter to add/remove");
-        if self.focus == Focus::Exemptions {
-            block = block.fg(theme.accent());
-        }
-        let mut list = List::new(items).block(block);
-        if self.focus == Focus::Exemptions {
-            list = list.highlight_style(ratatui::style::Style::new().reversed());
-        }
+        let focused = self.focus == Focus::Exemptions;
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel("Path exemptions", focused, theme)),
+            focused,
+            theme,
+        );
         frame.render_stateful_widget(list, area, &mut self.exemptions_state);
     }
 
@@ -346,10 +345,8 @@ impl SiteDetail {
     }
 
     fn render_details(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let mut block = Block::bordered().title("Bot overrides");
-        if self.focus == Focus::Search {
-            block = block.fg(theme.accent());
-        }
+        let focused = self.focus == Focus::Search;
+        let block = crate::tui::panel("Bot overrides", focused, theme);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -380,8 +377,39 @@ impl SiteDetail {
             .iter()
             .map(|bot| ListItem::new(self.bot_line(bot)))
             .collect();
-        let list = List::new(items).highlight_style(ratatui::style::Style::new().reversed());
+        let list = crate::tui::select_in(List::new(items), focused, theme);
         frame.render_stateful_widget(list, results_area, &mut self.results_state);
+    }
+
+    /// The footer's key hints for the focused panel.
+    pub fn hints(&self) -> crate::tui::Hints {
+        if self.popup.is_some() {
+            return ("Popup", vec![("Enter", "confirm"), ("Esc", "cancel")]);
+        }
+        let common = [("Tab", "next panel"), ("Esc", "back to sites")];
+        let (name, own): (&'static str, Vec<(&'static str, &'static str)>) = match self.focus {
+            Focus::Categories => (
+                "Categories",
+                vec![("\u{2191}\u{2193}", "move"), ("Enter", "override")],
+            ),
+            Focus::Options => (
+                "Request rules",
+                vec![("\u{2191}\u{2193}", "move"), ("Enter", "change")],
+            ),
+            Focus::Exemptions => (
+                "Exemptions",
+                vec![("\u{2191}\u{2193}", "move"), ("Enter", "add/remove")],
+            ),
+            Focus::Search => (
+                "Bot overrides",
+                vec![
+                    ("type", "filter"),
+                    ("\u{2191}\u{2193}", "move"),
+                    ("Enter", "override"),
+                ],
+            ),
+        };
+        (name, own.into_iter().chain(common).collect())
     }
 
     fn bot_line(&self, bot: &Bot) -> Line<'static> {
@@ -422,7 +450,7 @@ impl SiteDetail {
         }
     }
 
-    fn render_popup(&self, frame: &mut Frame, area: Rect, popup: &Popup) {
+    fn render_popup(&self, frame: &mut Frame, area: Rect, popup: &Popup, theme: Theme) {
         let title = match &popup.target {
             PopupTarget::Category(category) => {
                 format!("{} on {}", category_label(*category), self.site.server_name)
@@ -444,7 +472,7 @@ impl SiteDetail {
             }
             let width = hint.len().max(title.len()) as u16 + 4;
             let popup_area = centered_rect(width, lines.len() as u16 + 2, area);
-            let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
+            let paragraph = Paragraph::new(lines).block(crate::tui::popup(title, theme));
             frame.render_widget(Clear, popup_area);
             frame.render_widget(paragraph, popup_area);
             return;
@@ -475,7 +503,7 @@ impl SiteDetail {
                 ListItem::new(line)
             })
             .collect();
-        let list = List::new(items).block(Block::bordered().title(title));
+        let list = List::new(items).block(crate::tui::popup(title, theme));
         frame.render_widget(Clear, popup_area);
         frame.render_widget(list, popup_area);
     }
@@ -501,6 +529,37 @@ impl SiteDetail {
 
         if self.popup.is_some() {
             return self.handle_option_popup_key(key, db, message);
+        }
+
+        // Tab walks the panels top to bottom (BackTab bottom to top);
+        // Up/Down still flow across them for hands that never learned it.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            const ORDER: [Focus; 4] = [
+                Focus::Categories,
+                Focus::Options,
+                Focus::Exemptions,
+                Focus::Search,
+            ];
+            let at = ORDER.iter().position(|f| *f == self.focus).unwrap_or(0);
+            let next = if key.code == KeyCode::Tab {
+                (at + 1) % ORDER.len()
+            } else {
+                (at + ORDER.len() - 1) % ORDER.len()
+            };
+            self.focus = ORDER[next];
+            match self.focus {
+                Focus::Categories if self.categories_state.selected().is_none() => {
+                    self.categories_state.select(Some(0));
+                }
+                Focus::Options if self.options_state.selected().is_none() => {
+                    self.options_state.select(Some(0));
+                }
+                Focus::Exemptions if self.exemptions_state.selected().is_none() => {
+                    self.exemptions_state.select(Some(0));
+                }
+                _ => {}
+            }
+            return Ok(KeyOutcome::Consumed);
         }
 
         match self.focus {

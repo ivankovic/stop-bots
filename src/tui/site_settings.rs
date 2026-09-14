@@ -68,7 +68,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use std::path::{Path, PathBuf};
@@ -290,7 +290,11 @@ impl SiteSettings {
                 self.root.display()
             ))
             .wrap(Wrap { trim: true })
-            .block(Block::bordered().title("Sites").fg(theme.accent()));
+            .block(crate::tui::panel(
+                "Sites",
+                self.focus == Focus::Sites,
+                theme,
+            ));
             frame.render_widget(placeholder, area);
         } else {
             let items: Vec<ListItem> = self
@@ -311,25 +315,31 @@ impl SiteSettings {
                 })
                 .collect();
 
-            let list = List::new(items)
-                .block(
-                    Block::bordered()
-                        .title("Sites — Enter for overrides, r to rescan, a to apply, A for all")
-                        .fg(theme.accent()),
-                )
-                .highlight_style(ratatui::style::Style::new().reversed());
+            let focused = self.focus == Focus::Sites;
+            let list = crate::tui::select_in(
+                List::new(items).block(crate::tui::panel("Sites", focused, theme)),
+                focused,
+                theme,
+            );
             frame.render_stateful_widget(list, area, &mut self.list_state);
         }
 
         if let Some(popup) = &self.popup {
-            self.render_popup(frame, area, popup);
+            self.render_popup(frame, area, popup, theme);
         }
         if let Some(popup) = &self.setting_popup {
             let (title, options) = setting_options(popup.setting);
-            crate::tui::dashboard::render_option_list(frame, area, title, &options, popup.selected);
+            crate::tui::dashboard::render_option_list(
+                frame,
+                area,
+                title,
+                &options,
+                popup.selected,
+                theme,
+            );
         }
         if let Some(alert) = &self.alert {
-            self.render_alert(frame, area, alert);
+            self.render_alert(frame, area, alert, theme);
         }
     }
 
@@ -366,18 +376,65 @@ impl SiteSettings {
             })
             .collect();
 
-        let mut list = List::new(items).block(
-            Block::bordered()
-                .title("NGINX settings — Tab to focus, Enter to change")
-                .fg(theme.accent()),
+        let focused = self.focus == Focus::Settings;
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel("NGINX settings", focused, theme)),
+            focused,
+            theme,
         );
-        if self.focus == Focus::Settings {
-            list = list.highlight_style(ratatui::style::Style::new().reversed());
-        }
         frame.render_stateful_widget(list, area, &mut self.settings_state);
     }
 
-    fn render_alert(&self, frame: &mut Frame, area: Rect, alert: &str) {
+    /// Back to the site list with focus on it, closing an open site's
+    /// detail view. For the command palette, whose "rescan" and "apply
+    /// every site" are keys of the list and nothing else.
+    pub fn show_sites(&mut self) {
+        self.detail = None;
+        self.focus = Focus::Sites;
+    }
+
+    /// The footer's key hints for the focused panel.
+    pub fn hints(&self) -> crate::tui::Hints {
+        if let Some(detail) = &self.detail {
+            return detail.hints();
+        }
+        if self.alert.is_some() {
+            return ("Apply failed", vec![("Enter", "dismiss")]);
+        }
+        if self.popup.is_some() || self.setting_popup.is_some() {
+            return (
+                "Popup",
+                vec![
+                    ("\u{2191}\u{2193}", "choose"),
+                    ("Enter", "confirm"),
+                    ("Esc", "cancel"),
+                ],
+            );
+        }
+        match self.focus {
+            Focus::Settings => (
+                "NGINX settings",
+                vec![
+                    ("\u{2191}\u{2193}", "move"),
+                    ("Enter", "change"),
+                    ("Tab", "sites"),
+                ],
+            ),
+            Focus::Sites => (
+                "Sites",
+                vec![
+                    ("\u{2191}\u{2193}", "move"),
+                    ("Enter", "overrides"),
+                    ("a", "apply site"),
+                    ("A", "apply all"),
+                    ("r", "rescan"),
+                    ("Tab", "settings"),
+                ],
+            ),
+        }
+    }
+
+    fn render_alert(&self, frame: &mut Frame, area: Rect, alert: &str, theme: Theme) {
         const DISMISS_HINT: &str = "Press Enter or Esc to dismiss";
         let lines: Vec<&str> = alert.lines().collect();
         let content_width = lines
@@ -392,14 +449,15 @@ impl SiteSettings {
         text.push(Line::from(""));
         text.push(Line::from(DISMISS_HINT).dim());
 
-        let paragraph = Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(Block::bordered().title("Apply failed").red());
+        let paragraph = Paragraph::new(text).wrap(Wrap { trim: false }).block(
+            crate::tui::popup("Apply failed", theme)
+                .border_style(ratatui::style::Style::new().red()),
+        );
         frame.render_widget(Clear, popup_area);
         frame.render_widget(paragraph, popup_area);
     }
 
-    fn render_popup(&self, frame: &mut Frame, area: Rect, popup: &Popup) {
+    fn render_popup(&self, frame: &mut Frame, area: Rect, popup: &Popup, theme: Theme) {
         let title = match popup.action {
             PopupAction::Scan => format!("Scan {}?", self.root.display()),
             PopupAction::Apply(index) => {
@@ -434,7 +492,7 @@ impl SiteSettings {
                 ListItem::new(line)
             })
             .collect();
-        let list = List::new(items).block(Block::bordered().title(title));
+        let list = List::new(items).block(crate::tui::popup(title, theme));
         frame.render_widget(Clear, popup_area);
         frame.render_widget(list, popup_area);
     }

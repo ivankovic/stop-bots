@@ -67,6 +67,12 @@ const COLS: u16 = 108;
 #[tokio::main]
 async fn main() -> Result<()> {
     silence_the_event_reader();
+    // The Night Grid palette is 24-bit; without this the screens render
+    // in the terminal's own cyan, and the screenshot would show whatever
+    // the generating machine's terminal happened to be.
+    std::env::set_var("COLORTERM", "truecolor");
+    // The header names the host. This one is fiction, like the rest.
+    tui::override_hostname("web-01");
 
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/screenshots");
     std::fs::create_dir_all(&out)?;
@@ -95,6 +101,23 @@ async fn main() -> Result<()> {
     // `App::new` schedules a read of the SSH log, which the footer would
     // otherwise report as in flight in every screenshot.
     app.jobs_in_flight.clear();
+
+    // A health probe, so the status strip reads as it does on a real host
+    // rather than "not checked yet". The values are the ones a correctly
+    // set-up host reports, bar the one warning worth showing.
+    stop_bots::health::store_probe(
+        &app.db,
+        &stop_bots::health::Probe {
+            live_rules: Some(6_506),
+            live_backend: Some("nftables".into()),
+            firewall_persists: Some(false),
+            unit_active: Some(true),
+            unit_binary: None,
+            db_free_bytes: Some(140 * 1024 * 1024 * 1024),
+            ssh_log_readable: Some(true),
+            access_log_readable: Some(true),
+        },
+    )?;
 
     app.dashboard.refresh(&app.db)?;
     app.bot_settings.refresh(&app.db)?;
@@ -130,9 +153,9 @@ async fn main() -> Result<()> {
     // numbers are the shortest terminal on which nothing is cut off.
     for (screen, name, rows) in [
         (Screen::Dashboard, "dashboard", 38),
-        (Screen::BotSettings, "bot-settings", 18),
-        (Screen::SiteSettings, "site-settings", 15),
-        (Screen::DynamicProtection, "dynamic-protection", 26),
+        (Screen::BotSettings, "bot-settings", 19),
+        (Screen::SiteSettings, "site-settings", 16),
+        (Screen::DynamicProtection, "dynamic-protection", 27),
     ] {
         app.screen = screen;
         let path = out.join(format!("{name}.svg"));

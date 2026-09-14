@@ -4582,3 +4582,155 @@ needs one. The TUI gets a single line in the Summary panel, coloured by the
 worst check, because a host that has quietly stopped being protected should
 be visible from the screen the admin already has open rather than behind a
 key they would have to know to press.
+
+## Look and feel: Night Grid and Greenhouse (`src/tui.rs`, `src/tui/*`, `src/web/assets/style.css`, `src/web/layout.rs`)
+
+A visual pass over both surfaces, done from screenshots rather than from
+the code: the four seeded SVGs in `docs/screenshots/` and headless-browser
+captures of every console page. What it found was not missing features
+but missing *hierarchy* — the TUI painted borders, titles, labels and body
+text all in the one accent, so a focused panel looked like an unfocused
+one; the console was a competent generic admin panel with no typographic
+voice. The redesign is mostly chrome, and it is the same on both surfaces
+on purpose: someone who knows one should recognise the other.
+
+**Two palettes, one set of roles.** "Night Grid" (dark): blue-black
+ground, phosphor cyan `#2ee6d6` for structure and focus, magenta `#ff5fd2`
+reserved for what is *live* right now (spinner, running job, the newest
+log line). "Greenhouse" (light): warm paper, deep teal-green `#0f7a6a`,
+copper `#b8551c` where the dark theme uses magenta. Ok/warn/danger never
+double as the accent. `Theme` in `src/tui.rs` exposes the roles —
+`accent`, `live`, `dim`, `selection_bg`, `surface` — and `style.css`
+defines the same roles as custom properties, so a component is written
+once against the token and looks right in both.
+
+**The TUI keeps the terminal's default foreground for body text** (the
+AGENTS.md rule stands). The role colours are 24-bit when `COLORTERM`
+says `truecolor`/`24bit` and named ANSI colours otherwise, so a curated
+terminal scheme still supplies its own hues. Read once through a
+`OnceLock`, because every list on every frame asks.
+
+**Focus is the border, not the row.** `tui::panel(title, focused, theme)`
+draws the focused panel with an accent border and bold accent title and
+every other panel dim-bordered with a plain title. `tui::select_in` gives
+the focused list a `▎` stripe and a tinted background instead of reverse
+video, so a red `[ BLOCKED ]` on the selected row stays red — focus and
+state no longer fight for the same cells. Unfocused lists reserve the
+stripe column and draw nothing in it, so rows do not shift sideways when
+focus moves. Popups get `tui::popup`: the focused treatment on the
+`surface` ground, one step off the terminal background, so they read as
+lifted rather than drawn on.
+
+**A side effect of the popup surface worth knowing about.** The pty tests
+match on the raw diffed byte stream, and ratatui only transmits cells
+that changed. The old `Block::fg(accent)` set a style on every cell of a
+panel, blanks included, so a popup's spaces over them were "changes" and
+came down the wire; a popup over default-styled blanks sends only its
+letters, and `exp_string("Apply blocking rules to example.com")` never
+sees the spaces. The surface tint restores that property (every popup
+cell differs from what was under it) — but it is there because a lifted
+popup is the right design, and the tests were re-anchored on single
+words wherever the new layout moved them regardless. `tests/tui.rs` has
+the convention written at its top; it now bites more often, so it is
+worth reading before adding an expectation.
+
+**Chrome.** Three header rows and one footer, on every screen. Row one:
+brand, version, host name (from `/proc/sys/kernel/hostname`, then
+`/etc/hostname`), and on the right whatever job is in flight, in the
+live colour — moved up from the footer. Row two: the tab bar, hand-built
+rather than `Tabs` so each screen's jump digit can sit in the accent in
+front of its name. Row three: the status strip — the seven health checks
+from `health::cached_report`, one symbol and one word each (`● kernel`,
+`▲ reboot`, `○ console`), so "is this host protected" is answered on
+whatever screen the operator has open. The footer is context-sensitive:
+each screen's `hints()` returns the focused panel's name and its
+`(key, action)` pairs, then `? help`, `t theme`, `q quit`. This is what
+let the panel titles go back to being titles — "Summary — u update
+everything, a apply everything" was a title doing a footer's job.
+
+**Dashboard layout.** Two columns over a log. Left is *policy* — what
+the host blocks by category ("Policy", was "System-wide settings"), by
+country ("Geo · blocklist"), and the script those become ("Firewall
+script": rule count, `[ STALE ]`/`[ UP TO DATE ]`, sites found and
+bot-list freshness — the old Summary panel's content). Right is what the
+host does on its own — "Automatic blocking" dealt into as many columns as
+its own width allows, and "Scheduled". The Log panel spans both: every
+message `App` has shown, newest first with a relative time, the newest
+in the live colour. `App` watches `message` once per frame
+(`note_message`) rather than every setter learning about a log, capped
+at a hundred entries. The System status line the Summary used to carry
+is now the strip in the header.
+
+**Dynamic Protection rows.** Count, a ten-cell bar scaled to the panel's
+largest count, the state tag in a fixed column, then the value. The tag
+carries the colour (red blocked, yellow blocklist, dim not-blocked); the
+address or user agent stays default so a long one reads as text rather
+than as a red stripe. Panel titles carry the row count and, when a filter
+is on, which one.
+
+**Keys.** One map, consistent enough to print on a line:
+
+- `1`–`4` jump to screens, shown in the tab bar; `d`/`b`/`s`/`p` stay as
+  aliases.
+- `Tab`/`Shift+Tab` always mean next/previous *panel* on the current
+  screen — including on the Dashboard (three panels) and Bot settings
+  (two), where they used to cycle screens. Screens cycle with
+  `←`/`→`/`h`/`l` and the digits. One meaning per key.
+- `F` writes the firewall script (was `f`). Capitals for actions that
+  touch the host, as `A` already was; lower-case `f` is "filter"
+  wherever a list has one.
+- `Space` toggles an Automatic-blocking row in place, keeping a
+  detector's TTL; `Enter` still opens the chooser.
+- `y` copies the selected address or user agent via OSC 52 (a
+  twenty-line base64 in `src/tui.rs` rather than a dependency), which
+  reaches the local clipboard through SSH and tmux.
+- `R` re-reads the SSH log now (`KeyOutcome::RereadLogs`), rather than
+  when the 30-second cache says so.
+- `t` toggles the theme; `c` still works as the alias it was.
+
+**The console.** Same tokens, three-state theme structure unchanged.
+Mono for what the tool is about — panel titles (uppercase, tracked),
+tags, counts, addresses, paths, key caps — and sans for the sentences
+that explain them. No web fonts: the CSP is `default-src 'none'` and the
+console may be reached over an SSH tunnel from a machine with no route
+to a font CDN, so the identity comes from *where* the monospace is used,
+not which one. Corners 3px, no shadows, tags squared with a 2px left
+stripe (the web's `[ BLOCKED ]`). The header carries the host, the
+health checks as chips, and a command bar with Update everything and
+Apply everything — the TUI's `u` and `a`, which were buried mid-panel
+under a paragraph. Dashboard columns stack independently (two `.col`
+flex columns inside the grid) so a short panel no longer leaves a hole
+beside a tall one. The keyboard map is the same as the TUI's, added to
+the one hashed inline script (digits and letters for tabs, `/` focuses
+search, `?` help, `t` theme, `Esc` blurs) — the CSP hash is computed
+from the constant at runtime, so it tracks.
+
+**Screenshots.** `examples/screenshots.rs` now pins `COLORTERM` so the
+SVGs carry the Night Grid palette rather than the generating terminal's
+cyan, seeds a health probe so the strip shows something, and pins the
+header's host name to `web-01` through `tui::override_hostname` — the
+first regeneration put the maintainer's real machine name in the README.
+
+**The command palette (`src/tui/palette.rs`).** `:` on any screen opens
+a popup near the top with a query line and every action by name, fuzzy
+matched as you type (each query character in order; a hit at a word
+start or in a run scores higher, so "apply all" lists "Apply everything"
+first and "Apply blocking to every site" second). It is the
+discoverability layer the Help screen tries to be, and the reason rare
+host actions do not each need a letter. The palette owns its state,
+matching and drawing; `App::commands` says what the rows are and
+`App::run_command` what running one does, because every one touches a
+screen or the database. Most rows are `Action::Key(screen, key)`: switch
+to that screen and press the key through `handle_key_event`, so a
+command can never do something its key cannot — same popups, same
+anti-lockout guards, same background jobs. Site settings' `r`/`A` first
+go through `SiteSettings::show_sites`, because those are keys of the
+site list and the palette may have been opened from an open site's
+detail. The detector rows are snapshotted when the palette opens, so
+each says "Turn on" or "Turn off" for the state at that moment; running
+one is a direct `Detector::set_enabled` and a refresh. The hint column
+on the right shows the key that does the same thing, which is how the
+palette teaches the map.
+
+**Not done here.** README still documents `c` for the theme and `Tab`
+for cycling screens (README edits are by request only).

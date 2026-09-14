@@ -69,9 +69,9 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Style, Stylize},
+    style::Stylize,
     text::Line,
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 
@@ -191,8 +191,55 @@ impl DynamicProtection {
             }
             KeyCode::Enter => self.toggle_block_selected(db, message),
             KeyCode::Char('i') => self.inspect_selected(message),
+            KeyCode::Char('y') => Ok(self.copy_selected(message)),
+            KeyCode::Char('R') => Ok(KeyOutcome::RereadLogs),
             _ => Ok(KeyOutcome::Ignored),
         }
+    }
+
+    /// `y`: the selected address or user agent to the clipboard, because
+    /// the next thing anyone does with an address is paste it somewhere.
+    /// Via OSC 52, which reaches the local clipboard through SSH and
+    /// tmux; a terminal that does not honour it ignores the sequence.
+    fn copy_selected(&self, message: &mut Option<String>) -> KeyOutcome {
+        let value = match self.focus {
+            Focus::Ssh => self.ssh_state.selected().and_then(|i| {
+                self.visible_ssh_rows()
+                    .get(i)
+                    .map(|row| row.address.clone())
+            }),
+            Focus::UserAgents => self.ua_state.selected().and_then(|i| {
+                self.visible_ua_rows()
+                    .get(i)
+                    .map(|row| row.user_agent.clone())
+            }),
+        };
+        let Some(value) = value else {
+            return KeyOutcome::Consumed;
+        };
+        crate::tui::copy_to_clipboard(&value);
+        *message = Some(format!("Copied \"{value}\" to the clipboard"));
+        KeyOutcome::Consumed
+    }
+
+    /// The footer's key hints for the focused panel.
+    pub fn hints(&self) -> crate::tui::Hints {
+        if self.detail.is_some() {
+            return ("Inspect", vec![("Esc", "close")]);
+        }
+        let (name, inspect): (&'static str, &[(&'static str, &'static str)]) = match self.focus {
+            Focus::Ssh => ("SSH", &[("i", "inspect")]),
+            Focus::UserAgents => ("User agents", &[]),
+        };
+        let mut hints = vec![("\u{2191}\u{2193}", "move"), ("Enter", "block/unblock")];
+        hints.extend_from_slice(inspect);
+        hints.extend([
+            ("y", "copy"),
+            ("f", "filter"),
+            ("Tab", "next panel"),
+            ("R", "re-read"),
+        ]);
+        (name, hints)
     }
 
     fn active_state(&mut self) -> &mut ListState {
@@ -337,13 +384,13 @@ impl DynamicProtection {
         let [ssh_area, ua_area] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
 
-        let reversed = Style::new().reversed();
-
         let reading = jobs.contains(&crate::app::Job::ReadSshLog);
+        let ssh_rows = self.visible_ssh_rows();
+        let ssh_max = ssh_rows.iter().map(|row| row.count).max().unwrap_or(0);
         let ssh_items: Vec<ListItem> = empty_or(
-            self.visible_ssh_rows()
+            ssh_rows
                 .into_iter()
-                .map(ssh_row_line)
+                .map(|row| ssh_row_line(row, ssh_max, theme))
                 .map(ListItem::new)
                 .collect(),
             if reading {
@@ -354,27 +401,28 @@ impl DynamicProtection {
                 "Nothing matches this filter. Press f to change it."
             },
         );
-        let ssh_list = List::new(ssh_items)
-            .block(
-                Block::bordered()
-                    .title(panel_title(
-                        "Failed SSH logins",
-                        self.filter.label(),
-                        ssh_area.width,
-                    ))
-                    .fg(theme.accent()),
-            )
-            .highlight_style(if self.focus == Focus::Ssh {
-                reversed
-            } else {
-                Style::default()
-            });
+        let ssh_focused = self.focus == Focus::Ssh;
+        let ssh_list = crate::tui::select_in(
+            List::new(ssh_items).block(crate::tui::panel(
+                panel_title(
+                    "Failed SSH logins",
+                    self.ssh_rows.len(),
+                    self.filter.label(),
+                ),
+                ssh_focused,
+                theme,
+            )),
+            ssh_focused,
+            theme,
+        );
         frame.render_stateful_widget(ssh_list, ssh_area, &mut self.ssh_state);
 
+        let ua_rows = self.visible_ua_rows();
+        let ua_max = ua_rows.iter().map(|row| row.count).max().unwrap_or(0);
         let ua_items: Vec<ListItem> = empty_or(
-            self.visible_ua_rows()
+            ua_rows
                 .into_iter()
-                .map(ua_row_line)
+                .map(|row| ua_row_line(row, ua_max, theme))
                 .map(ListItem::new)
                 .collect(),
             if self.ua_rows.is_empty() {
@@ -383,21 +431,16 @@ impl DynamicProtection {
                 "Nothing matches this filter. Press f to change it."
             },
         );
-        let ua_list = List::new(ua_items)
-            .block(
-                Block::bordered()
-                    .title(panel_title(
-                        "Top user agents",
-                        self.filter.label(),
-                        ua_area.width,
-                    ))
-                    .fg(theme.accent()),
-            )
-            .highlight_style(if self.focus == Focus::UserAgents {
-                reversed
-            } else {
-                Style::default()
-            });
+        let ua_focused = self.focus == Focus::UserAgents;
+        let ua_list = crate::tui::select_in(
+            List::new(ua_items).block(crate::tui::panel(
+                panel_title("Top user agents", self.ua_rows.len(), self.filter.label()),
+                ua_focused,
+                theme,
+            )),
+            ua_focused,
+            theme,
+        );
         frame.render_stateful_widget(ua_list, ua_area, &mut self.ua_state);
 
         // Last, and over the whole screen rather than one panel: it
@@ -410,11 +453,8 @@ impl DynamicProtection {
                 lines.len() as u16 + 2,
                 area,
             );
-            let paragraph = Paragraph::new(lines).block(
-                Block::bordered()
-                    .title(format!(" {} ", detail.address))
-                    .fg(theme.accent()),
-            );
+            let paragraph =
+                Paragraph::new(lines).block(crate::tui::popup(detail.address.clone(), theme));
             frame.render_widget(Clear, popup);
             frame.render_widget(paragraph, popup);
         }
@@ -528,13 +568,13 @@ fn widest_line(lines: &[Line<'_>]) -> u16 {
 /// old titles ran past the border and were cut mid-word, so the last
 /// thing on screen was half a hint. What has to survive is the name of
 /// the panel and which filter is on; the hints are in `?` too.
-fn panel_title(name: &str, filter: &str, width: u16) -> String {
-    let short = format!("{name} ({filter})");
-    let full = format!("{short} — Enter block/unblock, f filter");
-    if full.chars().count() + 2 <= width as usize {
-        full
+/// "Failed SSH logins · 5" and, when a filter is on, which one: the
+/// count says how many rows there are, the filter says why fewer show.
+fn panel_title(name: &str, total: usize, filter: &str) -> String {
+    if filter == "all" {
+        format!("{name} \u{00b7} {total}")
     } else {
-        short
+        format!("{name} \u{00b7} {total} \u{00b7} {filter}")
     }
 }
 
@@ -552,38 +592,48 @@ fn empty_or(items: Vec<ListItem<'static>>, message: &str) -> Vec<ListItem<'stati
     }
 }
 
-fn ssh_row_line(row: &SshRow) -> Line<'static> {
-    let line = Line::from(format!(
-        "{:>8}  {:<24}  {}",
-        row.count,
-        row.status.label(),
-        row.address
-    ));
-    style_by_status(line, row.status)
+fn ssh_row_line(row: &SshRow, max: u64, theme: Theme) -> Line<'static> {
+    row_line(row.count, max, row.status, row.address.clone(), theme)
 }
 
-fn ua_row_line(row: &UaRow) -> Line<'static> {
-    let line = Line::from(format!(
-        "{:>8}  {:<24}  {}",
-        row.count,
-        row.status.label(),
-        row.user_agent
-    ));
-    style_by_status(line, row.status)
+fn ua_row_line(row: &UaRow, max: u64, theme: Theme) -> Line<'static> {
+    row_line(row.count, max, row.status, row.user_agent.clone(), theme)
 }
 
-/// Red for a blocked row, unstyled for a pending one — shared by both
-/// panels so "blocked" reads the same way everywhere in this app (matches
-/// `dashboard.rs::policy_tag`'s fixed, theme-independent red/green, not
-/// varied per light/dark theme). Blocklist items are shown in red on gray
-/// background.
-fn style_by_status(line: Line<'static>, status: RowStatus) -> Line<'static> {
-    use ratatui::style::Color;
-    match status {
-        RowStatus::Blocklist => line.fg(Color::Red).bg(Color::Gray),
-        _ if status.is_blocked() => line.red(),
-        _ => line,
-    }
+/// How many cells the count bar gets. Long enough to tell 4812 from
+/// 3004 at a glance, short enough to leave the user agent its column.
+const BAR_WIDTH: usize = 10;
+
+/// One row of either panel: the count, a bar scaled to the panel's
+/// largest count, the state tag in a fixed column, then the value. The
+/// tag carries the colour; the value stays default so a long user agent
+/// reads as text rather than as a red stripe.
+fn row_line(count: u64, max: u64, status: RowStatus, value: String, theme: Theme) -> Line<'static> {
+    let filled = if max == 0 {
+        0
+    } else {
+        // Ceiling, so the smallest row still gets one cell.
+        (count as usize * BAR_WIDTH).div_ceil(max as usize)
+    };
+    let bar = format!(
+        "{}{}",
+        "\u{2588}".repeat(filled),
+        " ".repeat(BAR_WIDTH - filled)
+    );
+    let tag = format!("[ {} ]", status.label());
+    let tag = match status {
+        RowStatus::Blocklist => tag.yellow(),
+        RowStatus::Blocked { .. } => tag.red(),
+        RowStatus::Pending => tag.fg(theme.dim()),
+    };
+    Line::from(vec![
+        format!("{count:>6} ").into(),
+        bar.fg(theme.accent()),
+        "  ".into(),
+        tag,
+        "  ".into(),
+        value.into(),
+    ])
 }
 
 /// `list_state`'s selection must always point at a valid row once `len`
@@ -819,23 +869,35 @@ mod tests {
             .draw(|frame| screen.render(frame, frame.area(), Theme::Dark, &HashSet::new()))
             .unwrap();
 
+        // The tag carries the colour, not the address: a row reads as
+        // text with a red `[ BLOCKED ]` beside it, not as a red stripe.
         let buffer = terminal.backend().buffer();
-        let pending_cell = buffer
-            .content
-            .iter()
-            .find(|cell| cell.symbol() == "1")
-            .expect("the pending row's address digit should be on screen");
-        let blocked_cell = buffer
-            .content
-            .iter()
-            .find(|cell| cell.symbol() == "9")
-            .expect("the blocked row's address digit should be on screen");
-
-        assert_eq!(blocked_cell.fg, Color::Red, "blocked row must render red");
-        assert_ne!(
-            pending_cell.fg,
+        let row_of = |needle: &str| {
+            (0..buffer.area.height)
+                .find(|&y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .expect("row should be on screen")
+        };
+        let tag_fg = |y: u16| {
+            (0..buffer.area.width)
+                .map(|x| &buffer[(x, y)])
+                .find(|cell| cell.symbol() == "[")
+                .map(|cell| cell.fg)
+                .expect("row should have a tag")
+        };
+        assert_eq!(
+            tag_fg(row_of("9.9.9.9")),
             Color::Red,
-            "pending row must not render red"
+            "blocked row's tag must render red"
+        );
+        assert_ne!(
+            tag_fg(row_of("1.1.1.1")),
+            Color::Red,
+            "pending row's tag must not render red"
         );
     }
 

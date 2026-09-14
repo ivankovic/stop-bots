@@ -103,7 +103,7 @@ pub async fn page(
         Ok(view) => view,
         Err(err) => return internal_error(&err.to_string()),
     };
-    let ctx = Ctx::new(auth.csrf.clone(), state.base.clone());
+    let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(
         Tab::Bots,
         &ctx,

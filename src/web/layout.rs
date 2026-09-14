@@ -38,6 +38,22 @@ pub struct Ctx {
     pub csrf: String,
     /// The path prefix this console is served under.
     pub base: BasePath,
+    /// What the header says about the host. Empty on an error page and
+    /// in unit tests; a page is still a page without it.
+    pub chrome: Chrome,
+}
+
+/// The facts the header shows on every screen: which host this is, and
+/// whether it is actually protected. Read per request rather than cached,
+/// because the health report changes whenever the cron probes and a
+/// header that lags the panel it summarises is worse than none.
+#[derive(Debug, Clone, Default)]
+pub struct Chrome {
+    /// The kernel's host name, so an operator with three consoles open
+    /// can tell which one is about to have its firewall rewritten.
+    pub host: Option<String>,
+    /// The last health report, if a probe has run.
+    pub health: Option<crate::health::Report>,
 }
 
 impl Ctx {
@@ -45,7 +61,28 @@ impl Ctx {
         Self {
             csrf: csrf.into(),
             base,
+            chrome: Chrome::default(),
         }
+    }
+
+    /// The context a page handler wants: the session's token, the base
+    /// path, and the header's facts. Neither the host name nor the health
+    /// report is allowed to fail the page — a console that 500s because
+    /// `/etc/hostname` is unreadable has its priorities wrong — so both
+    /// degrade to "not shown".
+    pub async fn for_request(csrf: &str, state: &crate::web::state::AppState) -> Self {
+        let health = state
+            .with_db(crate::health::cached_report)
+            .await
+            .ok()
+            .flatten()
+            .map(|(report, _)| report);
+        let mut ctx = Self::new(csrf, state.base.clone());
+        ctx.chrome = Chrome {
+            host: host_name(),
+            health,
+        };
+        ctx
     }
 
     /// A URL a browser can follow. **Every** link, form action and
@@ -87,6 +124,20 @@ impl Tab {
             Tab::Sites => "/sites",
             Tab::Dynamic => "/dynamic",
             Tab::Help => "/help",
+        }
+    }
+
+    /// The key that jumps to this tab — shown in the tab itself, which is
+    /// what teaches the map without a manual. Digits rather than the
+    /// TUI's mnemonic letters because a digit can be printed next to
+    /// "Dynamic Protection" and `p` cannot; the letters work too.
+    pub fn key(self) -> &'static str {
+        match self {
+            Tab::Dashboard => "1",
+            Tab::Bots => "2",
+            Tab::Sites => "3",
+            Tab::Dynamic => "4",
+            Tab::Help => "?",
         }
     }
 
@@ -155,25 +206,51 @@ pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Marku
                     .brand {
                         strong { "stop-bots" }
                         span .version { (env!("CARGO_PKG_VERSION")) }
-                        span .spacer {}
-                        // No `onclick`: an inline event handler needs
-                        // `unsafe-hashes` in the CSP, which is exactly the
-                        // hole hashing the script was meant to avoid. The
-                        // handler is attached from the hashed script below.
-                        button #theme-toggle type="button" title="Switch between the light and dark theme" {
-                            "Theme"
+                        @if let Some(host) = &ctx.chrome.host {
+                            span .host { "@ " (host) }
                         }
-                        form .inline method="post" action=(ctx.url("/logout")) {
-                            (csrf_field(ctx))
-                            button type="submit" { "Log out" }
+                        (status_chips(ctx.chrome.health.as_ref()))
+                        span .spacer {}
+                        // The two actions that change the whole host, on
+                        // every screen: they are the TUI's `u` and `a`,
+                        // and a key that works everywhere belongs in the
+                        // chrome rather than halfway down one panel.
+                        .cmdbar {
+                            form .inline method="post" action=(ctx.url("/update-all")) {
+                                (csrf_field(ctx))
+                                button type="submit" title="Download every bot list, feed and IP range this host uses" {
+                                    "Update everything" kbd { "u" }
+                                }
+                            }
+                            form .inline method="post" action=(ctx.url("/apply-all")) {
+                                (csrf_field(ctx))
+                                button .primary type="submit" title="Write and reload the NGINX config, then write and run the firewall script" {
+                                    "Apply everything" kbd { "a" }
+                                }
+                            }
+                            // No `onclick`: an inline event handler needs
+                            // `unsafe-hashes` in the CSP, which is exactly the
+                            // hole hashing the script was meant to avoid. The
+                            // handler is attached from the hashed script below.
+                            button #theme-toggle type="button" title="Switch between the light and dark theme" {
+                                "\u{25d0}" kbd { "t" }
+                            }
+                            form .inline method="post" action=(ctx.url("/logout")) {
+                                (csrf_field(ctx))
+                                button type="submit" { "Log out" }
+                            }
                         }
                     }
                     nav .tabs {
                         @for candidate in Tab::ALL {
                             @if candidate == tab {
-                                a href=(ctx.url(candidate.path())) aria-current="page" { (candidate.label()) }
+                                a href=(ctx.url(candidate.path())) aria-current="page" {
+                                    span .key { (candidate.key()) } (candidate.label())
+                                }
                             } @else {
-                                a href=(ctx.url(candidate.path())) { (candidate.label()) }
+                                a href=(ctx.url(candidate.path())) {
+                                    span .key { (candidate.key()) } (candidate.label())
+                                }
                             }
                         }
                     }
@@ -207,18 +284,24 @@ pub fn login_page(base: &BasePath, error: Option<&str>) -> Markup {
             body {
                 .login-wrap {
                     section .panel {
-                        h2 { "stop-bots" }
+                        h2 {
+                            "stop-bots"
+                            @if let Some(host) = host_name() {
+                                span .hint { "@ " (host) }
+                            }
+                        }
                         .panel-body {
                             @if let Some(error) = error {
                                 .flash.err { (error) }
                             }
                             form method="post" action=(base.url("/login")) {
-                                label .field {
-                                    "Password"
-                                    // `autofocus` so the only thing on the
-                                    // page is ready to be typed into.
-                                    input type="password" name="password" autocomplete="current-password" autofocus required;
-                                }
+                                // A prompt rather than a form label: this
+                                // is the one page that gets a flourish, and
+                                // a caret is the whole of it.
+                                p .prompt aria-hidden="true" { "password" span .caret {} }
+                                // `autofocus` so the only thing on the
+                                // page is ready to be typed into.
+                                input type="password" name="password" aria-label="Password" autocomplete="current-password" autofocus required;
                                 button .primary type="submit" { "Log in" }
                             }
                             p .hint {
@@ -233,6 +316,68 @@ pub fn login_page(base: &BasePath, error: Option<&str>) -> Markup {
             }
         }
     }
+}
+
+/// The header's one-glance answer to "is this host protected": one chip
+/// per health check, marked by level. The detail and the fix stay in the
+/// Dashboard's System status panel; a chip's `title` carries the detail
+/// for a hover.
+fn status_chips(report: Option<&crate::health::Report>) -> Markup {
+    use crate::health::Level;
+    let Some(report) = report else {
+        return html! {
+            .chips {
+                span .chip.unknown title="No health check has run yet" {
+                    i { "\u{25cb}" } "not checked"
+                }
+            }
+        };
+    };
+    html! {
+        .chips {
+            @for check in &report.checks {
+                @let class = match check.level {
+                    Level::Ok => "chip ok",
+                    Level::Unknown => "chip unknown",
+                    Level::Warn => "chip warn",
+                    Level::Critical => "chip crit",
+                };
+                @let mark = match check.level {
+                    Level::Ok => "\u{25cf}",
+                    Level::Unknown => "\u{25cb}",
+                    Level::Warn | Level::Critical => "\u{25b2}",
+                };
+                span class=(class) title=(format!("{}: {}", check.title, check.detail)) {
+                    i { (mark) } (chip_label(check))
+                }
+            }
+        }
+    }
+}
+
+/// The word a chip has room for. Keyed on the check's stable id, with the
+/// title as the fallback for a check added later.
+fn chip_label(check: &crate::health::Check) -> &'static str {
+    match check.id {
+        "firewall-enforced" => "kernel",
+        "firewall-persists" => "reboot",
+        "script-fresh" => "script",
+        "nginx-applied" => "nginx",
+        "service-health" => "service",
+        "disk-room" => "disk",
+        "log-sources" => "logs",
+        _ => check.title,
+    }
+}
+
+/// This machine's host name, as the kernel has it. `None` when it cannot
+/// be read, which is not an error anyone needs to hear about.
+pub fn host_name() -> Option<String> {
+    ["/proc/sys/kernel/hostname", "/etc/hostname"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 /// A titled panel.
@@ -314,6 +459,30 @@ const THEME_BOOTSTRAP: &str = r#"
     if (button) button.addEventListener('click', toggle);
   });
 
+  // The TUI's key map, for the same product in a browser: digits and
+  // their mnemonics jump to a tab, `/` reaches the search box, `t` is
+  // the theme. Only while nothing is being typed into.
+  var tabKeys = { '1': 0, 'd': 0, '2': 1, 'b': 1, '3': 2, 's': 2, '4': 3, 'p': 3, '?': 4 };
+  document.addEventListener('keydown', function (event) {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    var target = event.target;
+    if (target && target.matches && target.matches('input, textarea, select, [contenteditable]')) {
+      if (event.key === 'Escape') target.blur();
+      return;
+    }
+    var nav = document.querySelector('nav.tabs');
+    if (nav && Object.prototype.hasOwnProperty.call(tabKeys, event.key)) {
+      var link = nav.querySelectorAll('a')[tabKeys[event.key]];
+      if (link) window.location.href = link.href;
+      return;
+    }
+    if (event.key === 't') { toggle(); return; }
+    if (event.key === '/') {
+      var search = document.querySelector('input[name="q"], input[type="search"]');
+      if (search) { event.preventDefault(); search.focus(); }
+    }
+  });
+
   // Delegated, so a select rendered anywhere submits its form on change
   // without needing an inline handler of its own. Progressive
   // enhancement: without script the visible submit button still works.
@@ -378,7 +547,12 @@ mod tests {
             1,
             "exactly one tab is current"
         );
-        assert!(rendered.contains(r#"<a href="/bots" aria-current="page">Bot settings</a>"#));
+        assert!(
+            rendered.contains(
+                r#"<a href="/bots" aria-current="page"><span class="key">2</span>Bot settings</a>"#
+            ),
+            "was: {rendered}"
+        );
     }
 
     #[test]

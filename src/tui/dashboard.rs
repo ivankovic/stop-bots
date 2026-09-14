@@ -110,9 +110,9 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Layout, Rect},
-    style::{Style, Stylize},
+    style::Stylize,
     text::{Line, Span},
-    widgets::{Block, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -362,8 +362,63 @@ impl Dashboard {
         self.firewall_needs_update
     }
 
+    #[cfg(test)]
+    pub(crate) fn render_popup_is_open(&self) -> bool {
+        matches!(self.popup, Some(Popup::RenderFirewall { .. }))
+    }
+
+    #[cfg(test)]
     fn needs_update_count(&self) -> usize {
         self.sources.len() - self.up_to_date_count()
+    }
+
+    /// The last health report, for the status strip every screen shows.
+    pub fn health(&self) -> Option<&(crate::health::Report, i64)> {
+        self.health.as_ref()
+    }
+
+    /// The footer's key hints for the focused panel.
+    pub fn hints(&self) -> crate::tui::Hints {
+        if self.popup.is_some() {
+            return (
+                "Popup",
+                vec![
+                    ("\u{2191}\u{2193}", "choose"),
+                    ("Enter", "confirm"),
+                    ("Esc", "cancel"),
+                ],
+            );
+        }
+        let host = [
+            ("Tab", "next panel"),
+            ("u", "update all"),
+            ("a", "apply all"),
+            ("F", "firewall"),
+            ("w", "web access"),
+        ];
+        let (name, own): (&'static str, Vec<(&'static str, &'static str)>) = match self.focus {
+            Focus::Categories => (
+                "Policy",
+                vec![("\u{2191}\u{2193}", "move"), ("Enter", "change")],
+            ),
+            Focus::Countries => (
+                "Geo",
+                vec![
+                    ("\u{2191}\u{2193}", "move"),
+                    ("Enter", "add/remove"),
+                    ("m", "mode"),
+                ],
+            ),
+            Focus::Protection => (
+                "Automatic",
+                vec![
+                    ("\u{2191}\u{2193}", "move"),
+                    ("Space", "on/off"),
+                    ("Enter", "change"),
+                ],
+            ),
+        };
+        (name, own.into_iter().chain(host).collect())
     }
 
     pub fn render(
@@ -371,74 +426,45 @@ impl Dashboard {
         frame: &mut Frame,
         area: Rect,
         theme: Theme,
-        message: &Option<String>,
+        log: &[(i64, String)],
         running_jobs: &std::collections::HashSet<crate::app::Job>,
     ) {
-        // Panel heights, and which panel absorbs a short terminal. Every
-        // detector added grows Scheduled tasks by a row, so a layout of
-        // all-fixed heights inevitably pushes the *last* panel off screen
-        // — which used to be Messages, i.e. the one that reports what just
-        // happened. Scheduled tasks is `Min` instead: it takes whatever is
-        // left over and is the panel that clips when there isn't enough,
-        // which is the right thing to lose (it's a status list, and the
-        // same information is in `stop-bots`' CLI output). Everything
-        // above it, including Messages, always renders.
-        // Automatic blocking gets its own full-width row and asks for the
-        // height that shows every one of its rows at once — 14 of them
-        // today, and it used to share half the width with Geo-blocking and
-        // show five. It lays them out in columns rather than one long list
-        // (see `render_protection`), so "all of them" costs seven rows
-        // rather than fourteen.
+        // Two columns over a log. The left column is *policy* — what this
+        // host blocks by category, by country, and the script those become;
+        // the right column is what the host does on its own — the
+        // detectors and feeds, and the cron that runs them. The log at
+        // the foot is the one panel that spans both, because a message
+        // can come from either side.
         //
-        // `Max`, not `Length`: on a terminal too short for everything,
-        // this is the panel that gives, falling back to the scrolling it
-        // used to do. Scheduled tasks holding `Min(3)` is what makes that
-        // happen — without it, the panel that vanished on a 30-row
-        // terminal would be the one reporting what the detectors just did.
-        let protection_height = self.protection_panel_height(area.width);
-        let [top_area, protection_area, stats_area, cron_area, message_area] = Layout::vertical([
-            Constraint::Length(7),
-            Constraint::Max(protection_height),
-            // 2 border lines plus four: sites, sources, firewall rules,
-            // and the system-status line.
-            Constraint::Length(6),
-            // 2 border lines + one line per known job, when there's room.
-            Constraint::Min(3),
-            Constraint::Length(3),
-        ])
-        .areas(area);
+        // On a short terminal the panel that gives is Automatic blocking
+        // (`Max`), which falls back to scrolling; Scheduled tasks below it
+        // holds `Min(3)` so that it is never the one that vanishes — it
+        // is the panel reporting what the detectors just did.
+        let [columns_area, log_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(LOG_HEIGHT)]).areas(area);
+        let [left, right] =
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
+                .areas(columns_area);
 
-        // System-wide settings and Geo-blocking share a row instead, and
-        // they are the right pair for it: one is three fixed rows and the
-        // other a list of country codes, so between them they were using a
-        // quarter of the width and five vertical rows that Automatic
-        // blocking now needs. Focus still flows linearly through all three
-        // (Categories -> Countries -> Protection) via Up/Down, and only
-        // the focused panel draws a highlight.
-        let [settings_area, geo_area] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(top_area);
+        let [settings_area, geo_area, firewall_area] = Layout::vertical([
+            Constraint::Length(CATEGORIES.len() as u16 + 2),
+            Constraint::Min(4),
+            Constraint::Length(4),
+        ])
+        .areas(left);
+        let protection_height = self.protection_panel_height(right.width);
+        let [protection_area, cron_area] =
+            Layout::vertical([Constraint::Max(protection_height), Constraint::Min(3)]).areas(right);
 
         self.render_categories(frame, settings_area, theme);
         self.render_geo(frame, geo_area, theme);
+        self.render_firewall(frame, firewall_area, theme);
         self.render_protection(frame, protection_area, theme);
-        self.render_summary(frame, stats_area);
-        self.render_cron(frame, cron_area, running_jobs);
-        self.render_message(frame, message_area, message);
+        self.render_cron(frame, cron_area, theme, running_jobs);
+        self.render_log(frame, log_area, theme, log);
 
         if let Some(popup) = self.popup.clone() {
-            self.render_popup(frame, area, popup);
-        }
-    }
-
-    /// Highlighting only ever applies to the list that currently has focus,
-    /// so three reversed rows can never be on screen at once — which is what
-    /// makes a single linear Up/Down flow across three panels readable.
-    fn highlight_for(&self, focus: Focus) -> Style {
-        if self.focus == focus {
-            Style::new().reversed()
-        } else {
-            Style::default()
+            self.render_popup(frame, area, popup, theme);
         }
     }
 
@@ -447,13 +473,12 @@ impl Dashboard {
             .iter()
             .map(|&category| ListItem::new(self.row_line(category)))
             .collect();
-        let list = List::new(items)
-            .block(
-                Block::bordered()
-                    .title("System-wide settings")
-                    .fg(theme.accent()),
-            )
-            .highlight_style(self.highlight_for(Focus::Categories));
+        let focused = self.focus == Focus::Categories;
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel("Policy", focused, theme)),
+            focused,
+            theme,
+        );
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
 
@@ -466,22 +491,23 @@ impl Dashboard {
                         .map(|cc| ListItem::new(self.country_row_line(cc))),
                 )
                 .collect();
+        // The *mode* is in the title and nothing else is: Allowlist turns
+        // the host into default-deny, so it must never be what a narrow
+        // panel truncates away.
         let mode_label = match self.geo_mode {
-            GeoMode::Blocklist => "Blocklist",
-            GeoMode::Allowlist => "Allowlist",
+            GeoMode::Blocklist => "blocklist",
+            GeoMode::Allowlist => "allowlist",
         };
-        let list = List::new(items)
-            .block(
-                Block::bordered()
-                    // Short, because this panel is half-width and a title
-                    // longer than its border is silently truncated. The
-                    // *mode* is the one part that must never be what gets
-                    // cut — Allowlist turns the host into default-deny — so
-                    // it comes first; the add/remove hint moved to Help.
-                    .title(format!("Geo-blocking ({mode_label}) — m for mode"))
-                    .fg(theme.accent()),
-            )
-            .highlight_style(self.highlight_for(Focus::Countries));
+        let focused = self.focus == Focus::Countries;
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel(
+                format!("Geo \u{00b7} {mode_label}"),
+                focused,
+                theme,
+            )),
+            focused,
+            theme,
+        );
         frame.render_stateful_widget(list, area, &mut self.countries_state);
     }
 
@@ -491,7 +517,9 @@ impl Dashboard {
     /// Measured from the rows actually on screen rather than fixed, so a
     /// detector with a longer label than any of today's widens its column
     /// instead of being cut off. At least one column, so a terminal too
-    /// narrow for even that scrolls rather than dividing by zero.
+    /// narrow for even that scrolls rather than dividing by zero. The
+    /// selection column ([`crate::tui::select_in`] reserves one cell) is
+    /// counted in, or the last character of every row would be clipped.
     fn protection_columns(&self, width: u16) -> (u16, u16) {
         let rows = self.protection_rows();
         let widest = |f: fn(&Self, ProtectionRow) -> String| {
@@ -501,7 +529,7 @@ impl Dashboard {
                 .unwrap_or(0)
         };
         let label_width = widest(Self::protection_label);
-        let column_width = label_width + PROTECTION_TAG_WIDTH + widest(Self::protection_detail);
+        let column_width = 1 + label_width + PROTECTION_TAG_WIDTH + widest(Self::protection_detail);
         let columns =
             (width.saturating_sub(2) / column_width.max(1)).clamp(1, rows.len().max(1) as u16);
         (label_width, columns)
@@ -509,8 +537,8 @@ impl Dashboard {
 
     /// How tall the Automatic blocking panel wants to be at this width:
     /// two border lines plus however many rows survive being dealt into
-    /// columns. Asked before the layout is solved, so it takes the whole
-    /// screen's width — which is the panel's, now that it has its own row.
+    /// columns. Asked before the layout is solved, so it takes its
+    /// column's width.
     fn protection_panel_height(&self, width: u16) -> u16 {
         let (_, columns) = self.protection_columns(width);
         (self.protection_rows().len() as u16).div_ceil(columns) + 2
@@ -532,11 +560,8 @@ impl Dashboard {
         // The block is drawn once, around the lot; the columns are laid
         // out inside it. Rendering a bordered block per column would put a
         // line between every pair of them.
-        let block = Block::bordered()
-            // The trailing "5d" on an enabled detector is how long its
-            // blocks last, which nothing else on screen says.
-            .title("Automatic blocking — Enter to change, days = how long a block lasts")
-            .fg(theme.accent());
+        let focused = self.focus == Focus::Protection;
+        let block = crate::tui::panel("Automatic blocking", focused, theme);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -559,78 +584,62 @@ impl Dashboard {
             // `Some(index)` only for the column the selection is in;
             // `None` everywhere else, so exactly one row is highlighted.
             let mut state = ListState::default();
-            state.select(
-                selected
-                    .filter(|i| (first..first + chunk.len()).contains(i))
-                    .map(|i| i - first),
-            );
-            let list = List::new(items).highlight_style(self.highlight_for(Focus::Protection));
+            let in_column = selected
+                .filter(|i| (first..first + chunk.len()).contains(i))
+                .map(|i| i - first);
+            state.select(in_column);
+            let list =
+                crate::tui::select_in(List::new(items), focused && in_column.is_some(), theme);
             frame.render_stateful_widget(list, *column_area, &mut state);
         }
     }
 
-    fn render_summary(&self, frame: &mut Frame, area: Rect) {
-        let summary = Paragraph::new(vec![
-            Line::from(format!("Sites discovered: {}", self.site_count)),
-            Line::from(format!(
-                "Bot list sources: {} up to date, {} need updating",
+    /// What the rules become: the script, and whether the one on disk is
+    /// still the one these rules would write. The summary the old Summary
+    /// panel carried (sites found, bot-list freshness) is the second line,
+    /// because those are the inputs the script is rendered from.
+    fn render_firewall(&self, frame: &mut Frame, area: Rect, theme: Theme) {
+        // Three states, not two. A fresh install has no rules at all,
+        // and telling someone to press `F` there sends them to render
+        // an empty script — which looks like the tool doing nothing.
+        let script = match (self.rule_count, self.firewall_needs_update) {
+            (0, _) => Line::from(vec![
+                " no rules yet".into(),
+                " \u{2014} enable a detector".fg(theme.dim()),
+            ]),
+            (n, true) => Line::from(vec![
+                format!(" {n} rules  ").into(),
+                "[ STALE ]".yellow(),
+                "  F to write".fg(theme.dim()),
+            ]),
+            (n, false) => Line::from(vec![
+                format!(" {n} rules  ").into(),
+                "[ UP TO DATE ]".green(),
+            ]),
+        };
+        let inputs = Line::from(vec![
+            format!(" {} site(s)", self.site_count).into(),
+            "  \u{00b7}  ".fg(theme.dim()),
+            format!(
+                "{}/{} bot lists fresh",
                 self.up_to_date_count(),
-                self.needs_update_count()
-            )),
-            // Three states, not two. A fresh install has no rules at all,
-            // and telling someone to press `f` there sends them to render
-            // an empty script — which looks like the tool doing nothing.
-            Line::from(match (self.rule_count, self.firewall_needs_update) {
-                (0, _) => {
-                    "Firewall rules: none yet — switch on some automatic blocking above".to_string()
-                }
-                (n, true) => format!("Firewall rules: {n} to write (press f)"),
-                (n, false) => format!("Firewall rules: {n}, script up to date"),
-            }),
-            // The one line that answers "is this host actually protected",
-            // as opposed to "is the script this tool would write up to
-            // date" — which the three lines above are all about.
-            self.health_line(),
-        ])
-        // The two host-wide actions are hinted here rather than in
-        // "System-wide settings"' own title, where they belong by
-        // meaning: that panel is half-width — 37 title columns at 80 — and
-        // ratatui truncates a longer title silently, so the half that says
-        // what the keys do would be the half that vanished. This panel is
-        // full-width, and already the one that says "press f".
-        .block(Block::bordered().title("Summary — u update everything, a apply everything"));
-        frame.render_widget(summary, area);
-    }
-
-    /// The Summary panel's system-status line.
-    ///
-    /// Coloured by the worst check, because the point of putting it here
-    /// is that a host that has quietly stopped being protected should be
-    /// visible from the screen the admin already has open.
-    fn health_line(&self) -> Line<'static> {
-        use crate::health::Level;
-
-        let Some((report, _)) = &self.health else {
-            return Line::from("System status: not checked yet").dim();
-        };
-        let worst = report.worst();
-        let text = match report.at_least(Level::Warn).first() {
-            Some(check) => format!("System status: {} — {}", check.title, check.detail),
-            None => format!("System status: {}", report.headline()),
-        };
-        let line = Line::from(text);
-        match worst {
-            Level::Critical => line.red(),
-            Level::Warn => line.yellow(),
-            Level::Unknown => line.dim(),
-            Level::Ok => line.green(),
-        }
+                self.sources.len()
+            )
+            .into(),
+        ]);
+        let panel = Paragraph::new(vec![script, inputs]).block(crate::tui::panel(
+            "Firewall script",
+            false,
+            theme,
+        ));
+        frame.render_widget(panel, area);
     }
 
     fn render_cron(
         &self,
         frame: &mut Frame,
         area: Rect,
+        theme: Theme,
         running_jobs: &std::collections::HashSet<crate::app::Job>,
     ) {
         let lines: Vec<Line> = self
@@ -638,20 +647,37 @@ impl Dashboard {
             .iter()
             .map(|status| {
                 let running = running_jobs.contains(&crate::app::Job::Cron(status.job));
-                cron_status_line(status, running)
+                cron_status_line(status, running, theme)
             })
             .collect();
-        let panel = Paragraph::new(lines).block(
-            Block::bordered()
-                .title("Scheduled tasks (internal cron — runs while the TUI or web UI is open)"),
-        );
+        let panel = Paragraph::new(lines).block(crate::tui::panel("Scheduled", false, theme));
         frame.render_widget(panel, area);
     }
 
-    fn render_message(&self, frame: &mut Frame, area: Rect, message: &Option<String>) {
-        let text = message.as_deref().unwrap_or("No recent actions.");
+    /// The newest messages, newest first, each with how long ago it
+    /// appeared. The newest is drawn in the live colour: it is the one
+    /// that answers "what just happened".
+    fn render_log(&self, frame: &mut Frame, area: Rect, theme: Theme, log: &[(i64, String)]) {
+        let rows = usize::from(area.height.saturating_sub(2)).max(1);
+        let mut lines: Vec<Line> = log
+            .iter()
+            .rev()
+            .take(rows)
+            .enumerate()
+            .map(|(i, (at, text))| {
+                let when = format!(" {:<9}", format_relative_time(*at));
+                if i == 0 {
+                    Line::from(vec![when.fg(theme.live()), text.clone().into()])
+                } else {
+                    Line::from(vec![when.fg(theme.dim()), text.clone().fg(theme.dim())])
+                }
+            })
+            .collect();
+        if lines.is_empty() {
+            lines.push(Line::from(" No recent actions.").fg(theme.dim()));
+        }
         frame.render_widget(
-            Paragraph::new(text).block(Block::bordered().title("Messages")),
+            Paragraph::new(lines).block(crate::tui::panel("Log", false, theme)),
             area,
         );
     }
@@ -770,7 +796,7 @@ impl Dashboard {
         ])
     }
 
-    fn render_popup(&self, frame: &mut Frame, area: Rect, popup: Popup) {
+    fn render_popup(&self, frame: &mut Frame, area: Rect, popup: Popup, theme: Theme) {
         match popup {
             // Three of the five popups are the same widget with different
             // strings: a centred list, one row per option, the selected row
@@ -782,6 +808,7 @@ impl Dashboard {
                 &self.protection_label(row),
                 &protection_options(row.is_detector()),
                 selected,
+                theme,
             ),
             Popup::Category { category, selected } => render_option_list(
                 frame,
@@ -789,6 +816,7 @@ impl Dashboard {
                 &format!("{} default", category_label(category)),
                 &["Allowed".to_string(), "Blocked".to_string()],
                 selected,
+                theme,
             ),
             Popup::GeoMode { selected } => render_option_list(
                 frame,
@@ -799,6 +827,7 @@ impl Dashboard {
                     "Allowlist (block everything except selected)".to_string(),
                 ],
                 selected,
+                theme,
             ),
             Popup::AddCountry { input, error } => {
                 let title = "Add a country (2-letter code)";
@@ -815,7 +844,7 @@ impl Dashboard {
                     lines.len() as u16 + 2,
                     area,
                 );
-                let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
+                let paragraph = Paragraph::new(lines).block(crate::tui::popup(title, theme));
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(paragraph, popup_area);
             }
@@ -860,7 +889,7 @@ impl Dashboard {
                 // path longer than the default.
                 let popup_area =
                     centered_rect(widest_line(&lines) + 4, lines.len() as u16 + 2, area);
-                let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
+                let paragraph = Paragraph::new(lines).block(crate::tui::popup(title, theme));
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(paragraph, popup_area);
             }
@@ -925,7 +954,7 @@ impl Dashboard {
                     lines.len() as u16 + 2,
                     area,
                 );
-                let paragraph = Paragraph::new(lines).block(Block::bordered().title(title));
+                let paragraph = Paragraph::new(lines).block(crate::tui::popup(title, theme));
                 frame.render_widget(Clear, popup_area);
                 frame.render_widget(paragraph, popup_area);
             }
@@ -990,8 +1019,36 @@ impl Dashboard {
             return Ok(KeyOutcome::Consumed);
         }
 
-        // 'f' key opens the firewall render popup
-        if key.code == KeyCode::Char('f') {
+        // Tab always means "next panel" on this screen (BackTab the
+        // previous), so it means the same thing it does on Site settings
+        // and Dynamic Protection. Up/Down still flow across the panels
+        // too, for hands that never learned Tab.
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let forward = key.code == KeyCode::Tab;
+            self.focus = match (self.focus, forward) {
+                (Focus::Categories, true) | (Focus::Protection, false) => Focus::Countries,
+                (Focus::Countries, true) | (Focus::Categories, false) => Focus::Protection,
+                (Focus::Protection, true) | (Focus::Countries, false) => Focus::Categories,
+            };
+            match self.focus {
+                Focus::Categories if self.list_state.selected().is_none() => {
+                    self.list_state.select(Some(0));
+                }
+                Focus::Countries if self.countries_state.selected().is_none() => {
+                    self.countries_state.select(Some(0));
+                }
+                Focus::Protection if self.protection_state.selected().is_none() => {
+                    self.protection_state.select(Some(0));
+                }
+                _ => {}
+            }
+            return Ok(KeyOutcome::Consumed);
+        }
+
+        // Capital F: it writes to the host. Lower-case `f` is "filter" on
+        // every screen that has a list worth filtering, and this one does
+        // not, so the key is free rather than overloaded.
+        if key.code == KeyCode::Char('F') {
             self.popup = Some(Popup::RenderFirewall {
                 backend_selected: 0, // default to nftables (recommended)
                 out_path: crate::firewall::DEFAULT_OUTPUT_PATH.to_string(),
@@ -1062,11 +1119,46 @@ impl Dashboard {
                         self.protection_state.select_next();
                     }
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => self.open_protection_popup(),
+                KeyCode::Enter => self.open_protection_popup(),
+                // Space flips the switch where it stands. Detectors and
+                // feeds are booleans first and a TTL second; Enter is
+                // still there for the TTL.
+                KeyCode::Char(' ') => return self.toggle_protection_row(db, message),
                 _ => return Ok(KeyOutcome::Ignored),
             },
         }
         Ok(KeyOutcome::Consumed)
+    }
+
+    /// Space on an "Automatic blocking" row: off if it is on, on if it is
+    /// off — keeping a detector's TTL, so switching one back on restores
+    /// what was there. Goes through [`Self::commit_protection`] so a feed
+    /// that has never been fetched still gets its download.
+    fn toggle_protection_row(
+        &mut self,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(row) = self
+            .protection_state
+            .selected()
+            .and_then(|i| self.protection_rows().get(i).copied())
+        else {
+            return Ok(KeyOutcome::Consumed);
+        };
+        let selected = if self.protection_enabled(row) {
+            0
+        } else if !row.is_detector() {
+            1
+        } else {
+            let ttl = self.protection_ttl_days(row);
+            PROTECTION_TTL_CHOICES
+                .iter()
+                .position(|choice| *choice == ttl)
+                .map(|i| i + 1)
+                .unwrap_or(1)
+        };
+        self.commit_protection(db, row, selected, message)
     }
 
     /// Opens the edit popup for the focused "Automatic blocking" row,
@@ -1587,6 +1679,7 @@ pub(crate) fn render_option_list(
     title: &str,
     options: &[String],
     selected: usize,
+    theme: Theme,
 ) {
     let content_width = options
         .iter()
@@ -1612,7 +1705,7 @@ pub(crate) fn render_option_list(
         })
         .chain(std::iter::once(ListItem::new(Line::from(HINT).dim())))
         .collect();
-    let list = List::new(items).block(Block::bordered().title(title.to_string()));
+    let list = List::new(items).block(crate::tui::popup(title, theme));
     frame.render_widget(Clear, popup_area);
     frame.render_widget(list, popup_area);
 }
@@ -1675,30 +1768,36 @@ fn widest_line(lines: &[Line<'_>]) -> u16 {
 }
 
 /// The `[ ON  ]`/`[ OFF ]` tag, plus the gutter either side of it.
+/// The Log panel: two border lines and two messages. The newest is the
+/// one that matters; the one before it is context.
+const LOG_HEIGHT: u16 = 4;
+
 const PROTECTION_TAG_WIDTH: u16 = 9;
 
-fn cron_status_line(status: &crate::cron::JobStatus, running: bool) -> Line<'static> {
+fn cron_status_line(status: &crate::cron::JobStatus, running: bool, theme: Theme) -> Line<'static> {
     let last_run = match status.last_run {
         Some(t) => format_relative_time(t),
         None => "never".to_string(),
     };
-    let outcome = if running {
-        format!("{} Running now", crate::tui::spinner_frame())
+    // Deliberately compact (no fixed-width padding): the panel has no
+    // wrapping, so a long label/summary combination must fit the column's
+    // width rather than get silently clipped.
+    let mut line = vec![
+        format!(" {}: ", status.job.label()).into(),
+        format!("{last_run}, ").fg(theme.dim()),
+    ];
+    line.push(if running {
+        format!("{} running now", crate::tui::spinner_frame()).fg(theme.live())
     } else if status.due {
-        "due now".to_string()
+        "due now".into()
     } else {
         status
             .last_summary
             .clone()
             .unwrap_or_else(|| "-".to_string())
-    };
-    // Deliberately compact (no fixed-width padding): the panel is a fixed
-    // 4-line block with no wrapping, so a long label/summary combination
-    // must fit the terminal's width rather than get silently clipped.
-    Line::from(format!(
-        "{}: last ran {last_run}, {outcome}",
-        status.job.label()
-    ))
+            .into()
+    });
+    Line::from(line)
 }
 
 /// Formats a Unix timestamp `t` (assumed to be in the past) as a short
@@ -1810,7 +1909,7 @@ mod tests {
             last_summary: None,
             due: true,
         };
-        let rendered = cron_status_line(&status, false).to_string();
+        let rendered = cron_status_line(&status, false, Theme::Dark).to_string();
         assert!(rendered.contains("never"), "rendered was:\n{rendered}");
         assert!(rendered.contains("due now"), "rendered was:\n{rendered}");
     }
@@ -1823,7 +1922,7 @@ mod tests {
             last_summary: Some("blocked 2 IP(s)".to_string()),
             due: false,
         };
-        let rendered = cron_status_line(&status, false).to_string();
+        let rendered = cron_status_line(&status, false, Theme::Dark).to_string();
         assert!(rendered.contains("1h ago"), "rendered was:\n{rendered}");
         assert!(
             rendered.contains("blocked 2 IP(s)"),
@@ -1844,8 +1943,8 @@ mod tests {
             last_summary: Some("wrote 3 rule(s) to /etc/stop-bots/firewall.nft".to_string()),
             due: true,
         };
-        let rendered = cron_status_line(&status, true).to_string();
-        assert!(rendered.contains("Running now"), "rendered was: {rendered}");
+        let rendered = cron_status_line(&status, true, Theme::Dark).to_string();
+        assert!(rendered.contains("running now"), "rendered was: {rendered}");
         assert!(!rendered.contains("due now"), "rendered was: {rendered}");
         assert!(
             !rendered.contains("wrote 3 rule(s)"),
@@ -1873,7 +1972,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -1886,10 +1985,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(
-            content.contains("Scheduled tasks"),
-            "content was:\n{content}"
-        );
+        assert!(content.contains("Scheduled"), "content was:\n{content}");
         assert!(
             content.contains("Block SSH scanners"),
             "content was:\n{content}"
@@ -1923,7 +2019,7 @@ mod tests {
         )]);
         let mut terminal = test_terminal();
         terminal
-            .draw(|frame| dashboard.render(frame, frame.area(), Theme::Dark, &None, &running_jobs))
+            .draw(|frame| dashboard.render(frame, frame.area(), Theme::Dark, &[], &running_jobs))
             .unwrap();
 
         let content = terminal
@@ -1933,7 +2029,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Running now"), "content was: {content}");
+        assert!(content.contains("running now"), "content was: {content}");
         assert!(
             !content.contains("blocked 3 IP(s)"),
             "content was: {content}"
@@ -1956,7 +2052,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -1969,11 +2065,11 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Summary"), "content was:\n{content}");
         assert!(
-            content.contains("Sites discovered: 1"),
+            content.contains("Firewall script"),
             "content was:\n{content}"
         );
+        assert!(content.contains("1 site(s)"), "content was:\n{content}");
     }
 
     #[test]
@@ -2050,7 +2146,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &Some("Stored 4 bot(s)".to_string()),
+                    &[(now_secs(), "Stored 4 bot(s)".to_string())],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -2065,10 +2161,7 @@ mod tests {
             .collect::<String>();
         assert!(content.contains("Scanners"), "content was:\n{content}");
         assert!(content.contains("BLOCKED"), "content was:\n{content}");
-        assert!(
-            content.contains("Sites discovered: 1"),
-            "content was:\n{content}"
-        );
+        assert!(content.contains("1 site(s)"), "content was:\n{content}");
         assert!(
             content.contains("Stored 4 bot(s)"),
             "content was:\n{content}"
@@ -2432,7 +2525,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -2445,8 +2538,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(content.contains("Geo-blocking"), "content was:\n{content}");
-        assert!(content.contains("Blocklist"), "content was:\n{content}");
+        assert!(content.contains("Geo"), "content was:\n{content}");
+        assert!(content.contains("blocklist"), "content was:\n{content}");
         assert!(content.contains("Add a country"), "content was:\n{content}");
         assert!(content.contains("NL"), "content was:\n{content}");
         assert!(content.contains("1 range(s)"), "content was:\n{content}");
@@ -2554,7 +2647,7 @@ mod tests {
                         frame,
                         frame.area(),
                         Theme::Dark,
-                        &None,
+                        &[],
                         &std::collections::HashSet::new(),
                     )
                 })
@@ -2777,7 +2870,7 @@ mod tests {
 
         let mut message = None;
         dashboard
-            .handle_key(KeyEvent::from(KeyCode::Char('f')), &db, &mut message)
+            .handle_key(KeyEvent::from(KeyCode::Char('F')), &db, &mut message)
             .unwrap();
 
         match dashboard.popup.unwrap() {
@@ -2967,7 +3060,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -2980,11 +3073,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(
-            content.contains("Firewall rules: none yet"),
-            "content was:\n{content}"
-        );
-        assert!(!content.contains("press f"), "content was:\n{content}");
+        assert!(content.contains("no rules yet"), "content was:\n{content}");
+        assert!(!content.contains("F to write"), "content was:\n{content}");
     }
 
     #[test]
@@ -3008,7 +3098,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -3021,11 +3111,9 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(
-            content.contains("Firewall rules: 1 to write"),
-            "content was:\n{content}"
-        );
-        assert!(content.contains("press f"), "content was:\n{content}");
+        assert!(content.contains("1 rules"), "content was:\n{content}");
+        assert!(content.contains("STALE"), "content was:\n{content}");
+        assert!(content.contains("F to write"), "content was:\n{content}");
     }
 
     #[test]
@@ -3051,7 +3139,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -3064,10 +3152,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(
-            content.contains("script up to date"),
-            "content was:\n{content}"
-        );
+        assert!(content.contains("UP TO DATE"), "content was:\n{content}");
         assert!(
             !content.contains("needs updating"),
             "content was:\n{content}"
@@ -3405,7 +3490,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -3414,12 +3499,8 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let highlighted: Vec<String> = (0..buffer.area.height)
             .filter(|&y| {
-                (0..buffer.area.width).any(|x| {
-                    buffer[(x, y)]
-                        .style()
-                        .add_modifier
-                        .contains(ratatui::style::Modifier::REVERSED)
-                })
+                (0..buffer.area.width)
+                    .any(|x| buffer[(x, y)].style().bg == Some(Theme::Dark.selection_bg()))
             })
             .map(|y| {
                 (0..buffer.area.width)
@@ -3484,7 +3565,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -3519,7 +3600,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })
@@ -3554,7 +3635,7 @@ mod tests {
         dashboard.refresh(&db).unwrap();
         let mut message = None;
         dashboard
-            .handle_key(KeyEvent::from(KeyCode::Char('f')), &db, &mut message)
+            .handle_key(KeyEvent::from(KeyCode::Char('F')), &db, &mut message)
             .unwrap();
 
         let mut terminal = test_terminal();
@@ -3564,7 +3645,7 @@ mod tests {
                     frame,
                     frame.area(),
                     Theme::Dark,
-                    &None,
+                    &[],
                     &std::collections::HashSet::new(),
                 )
             })

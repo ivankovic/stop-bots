@@ -1848,10 +1848,10 @@ async fn selecting_a_country_names_a_button_rather_than_a_cli_command() {
     assert!(flash.contains("Update everything"), "was: {flash}");
 }
 
-/// Both new buttons have to be on the page and carry the token, or they
-/// are 403s waiting to happen — and they belong in "System-wide settings",
-/// which is where an operator looks for the things that act on the whole
-/// host rather than on one list.
+/// Both buttons have to be on the page and carry the token, or they are
+/// 403s waiting to happen — and they belong in the header, on every
+/// screen, because they act on the whole host rather than on one list
+/// and are the TUI's `u` and `a`, which work from anywhere.
 #[tokio::test]
 async fn the_dashboard_offers_update_everything_and_apply_everything() {
     let (app, password, _tmp, _db) = app_with_db();
@@ -1872,11 +1872,11 @@ async fn the_dashboard_offers_update_everything_and_apply_everything() {
         "the new forms must carry the token too"
     );
 
-    let panel = panel_html(&body, "System-wide settings");
+    let (header, _) = body.split_once("</header>").expect("a page with a header");
     for action in ["/update-all", "/apply-all"] {
         assert!(
-            panel.contains(action),
-            "{action} is on the page but not in System-wide settings:\n{panel}"
+            header.contains(action),
+            "{action} is on the page but not in the header:\n{header}"
         );
     }
 }
@@ -2011,7 +2011,7 @@ async fn every_panel_puts_its_loose_content_in_a_padded_body() {
         .unwrap();
     let body = body_string(response).await;
 
-    for title in ["Web Access", "System-wide settings"] {
+    for title in ["Web Access", "Policy"] {
         let panel = panel_html(&body, title);
         // A table is full-bleed by design and provides its own cell
         // padding; everything after it is the loose content in question.

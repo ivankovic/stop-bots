@@ -533,7 +533,7 @@ fn bot_settings_shows_the_known_sources_before_any_fetch_has_ever_run() {
     // never re-sends that exact text — "wide" only appears once we're
     // actually back.
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -562,7 +562,7 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
     session.exp_string("Dashboard").unwrap();
 
     send_key(&mut session, "b");
-    session.exp_string("Bot details").unwrap();
+    session.exp_string("details").unwrap();
 
     // Before typing anything, the panel just hints at the search box rather
     // than dumping every bot — that's the whole point of this screen.
@@ -607,7 +607,7 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
     send_escape(&mut session);
 
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -655,7 +655,7 @@ fn site_settings_scan_now_discovers_sites_from_the_tui() {
     session.exp_string("example.com").unwrap();
 
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -812,7 +812,7 @@ fn applying_a_site_reloads_nginx_without_blocking_the_tui() {
     // And the TUI keeps taking input while it is: jump to the Dashboard
     // and watch it draw, with `systemctl` still parked on the gate.
     send_key(&mut session, "d");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
 
     let so_far = std::fs::read_to_string(&calls).unwrap_or_default();
     assert!(
@@ -863,7 +863,7 @@ fn a_second_apply_during_a_reload_still_gets_its_own_reload() {
     wait_for_systemctl_calls(&calls, 2);
 
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -926,7 +926,7 @@ fn site_settings_apply_writes_the_selected_sites_rule_to_its_own_file() {
     session.exp_string("UP TO DATE").unwrap();
 
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -998,7 +998,7 @@ fn site_settings_apply_all_writes_the_rule_to_every_sites_own_file() {
     session.exp_string("UP TO DATE").unwrap();
 
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -1090,7 +1090,7 @@ fn site_settings_apply_failure_shows_a_dismissible_alert_with_a_root_suggestion(
     send_key(&mut session, "\r");
 
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -1205,7 +1205,7 @@ fn site_detail_searches_for_a_bot_and_overrides_it_for_one_site() {
     send_escape(&mut session);
     send_escape(&mut session);
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
+    session.exp_string("Automatic").unwrap();
 }
 
 #[test]
@@ -1219,7 +1219,7 @@ fn help_screen_opens_and_returns_to_the_previous_screen() {
 
     send_key(&mut session, "?");
     session.exp_string("Navigation").unwrap();
-    session.exp_string("toggle this help screen").unwrap();
+    session.exp_string("light/dark").unwrap();
 
     // Esc on Help goes back to Site settings, not the Dashboard.
     send_key(&mut session, "\x1b");
@@ -1231,8 +1231,7 @@ fn help_screen_opens_and_returns_to_the_previous_screen() {
     // same cell the previous screen's "Sites" title left a coincidentally
     // identical "S", so the diffed terminal output never re-sends it.)
     send_key(&mut session, "q");
-    session.exp_string("wide").unwrap();
-    session.exp_string("settings").unwrap();
+    session.exp_string("Automatic").unwrap();
     send_key(&mut session, "q");
     session
         .exp_eof()
@@ -1243,6 +1242,42 @@ fn help_screen_opens_and_returns_to_the_previous_screen() {
 /// Seeds an already-fetched-but-unblocked country directly (no network
 /// access): the TUI only hits the network for a country that hasn't been
 /// fetched yet (`App::start_country_block`), so blocking one that's already
+/// The command palette end to end: `:` opens it over whatever screen is
+/// up, typing narrows the list, Enter runs the selected command — here
+/// "Re-read the SSH log", whose first effect is landing on Dynamic
+/// Protection, a screen change the pty can see.
+#[test]
+fn the_command_palette_runs_a_typed_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "s");
+    session.exp_string("Sites").unwrap();
+
+    send_key(&mut session, ":");
+    session.exp_string("Commands").unwrap();
+    // A word from the unfiltered list that is not on Site settings.
+    session.exp_string("Dynamic").unwrap();
+
+    // Narrow to one row. Not checked on the query line: each keystroke
+    // redraws one cell, so "re-read" never arrives contiguously. The
+    // filtered row does — it moves to the top of the list, where "Go to
+    // Dashboard" was, and differs from it in every cell.
+    send_key(&mut session, "re-read");
+    session.exp_string("Re-read").unwrap();
+
+    send_key(&mut session, "\r");
+    session.exp_string("Failed").unwrap();
+
+    send_key(&mut session, "q");
+    session.exp_string("Automatic").unwrap();
+    send_key(&mut session, "q");
+    session
+        .exp_eof()
+        .expect("process should exit after q on the Dashboard");
+}
+
 /// fetched is the synchronous path this test can exercise without touching
 /// the network.
 #[test]
@@ -1257,7 +1292,7 @@ fn dashboard_geo_blocking_add_and_remove_a_country() {
 
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
-    session.exp_string("Geo-blocking").unwrap();
+    session.exp_string("Geo").unwrap();
     session.exp_string("Add a country").unwrap();
 
     // Down past the last category row (Scanners/Search Bots/AI Bots) flows
@@ -1307,7 +1342,7 @@ fn dashboard_geo_mode_toggle_switches_to_allowlist() {
     let tmp = tempfile::tempdir().unwrap();
     let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
     session.exp_string("Dashboard").unwrap();
-    session.exp_string("Blocklist").unwrap();
+    session.exp_string("blocklist").unwrap();
 
     send_key(&mut session, "m");
     session.exp_string("Geo mode").unwrap();
@@ -1326,18 +1361,16 @@ fn dashboard_geo_mode_toggle_switches_to_allowlist() {
     session.exp_string("except").unwrap();
     session.exp_string("selected)").unwrap();
 
-    // Move to "Allowlist" and confirm. The panel title (above the message
-    // box in render order) updates in the same frame, so it's checked
-    // first — "Allowlist" here is the title's occurrence, not the
-    // message's. The rest of the confirmation sentence is checked as two
-    // split substrings, not verbatim: a couple of characters in the
-    // middle ("o " between "set t" and "Allowlist") coincidentally match
-    // whatever was already on screen at that exact position, so the
-    // diffed terminal never retransmits them.
+    // Move to "Allowlist" and confirm. The confirmation lands in the Log
+    // panel; checked as two split substrings, not verbatim, because the
+    // spaces between "set", "to" and "Allowlist" coincidentally match
+    // blank cells already on screen at that position, so the diffed
+    // terminal never retransmits them. (The Geo panel's title flips to
+    // "allowlist" in the same frame, but shares too many letters with
+    // "blocklist" at the same cells to be a needle.)
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\r");
-    session.exp_string("Allowlist").unwrap();
-    session.exp_string("Geo mode set t").unwrap();
+    session.exp_string("Geo mode").unwrap();
     session.exp_string("Allowlist:").unwrap();
 
     send_key(&mut session, "q");
@@ -1378,7 +1411,7 @@ fn dashboard_render_popup_applies_the_script_through_nft() {
     session.exp_string("Dashboard").unwrap();
 
     // Open the render popup; replace the default output path with ours.
-    send_key(&mut session, "f");
+    send_key(&mut session, "F");
     // Single-word needles throughout: the diffed terminal only transmits
     // cells that changed, and the spaces between words routinely land on
     // cells that were already blank — so a multi-word needle may never
