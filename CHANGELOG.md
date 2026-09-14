@@ -7,7 +7,24 @@ need.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- `argon2` 0.5 → 0.6 and `rand` 0.9 → 0.10. Both moved the API this code
+  touches: `rand`'s `OsRng` became `rngs::SysRng` and `TryRngCore` became
+  `TryRng`, while `argon2` dropped the salt argument from `hash_password`,
+  moved `PasswordHash` under `phc`, and now takes raw salt bytes instead of an
+  encoded `SaltString` — which deletes the base64 step this file used to do by
+  hand. Default cost parameters are unchanged (m=19456, t=2, p=1), so the stored
+  hashes and the OWASP figures in the docs both still stand.
+
+### Added
+
+- A test that a password hash written by the *previous* `argon2` still
+  verifies. Every other test in `web::auth` hashes and verifies in one process
+  with one version, so none of them could fail on the upgrade that stopped
+  reading what is already in operators' databases. That failure would surface as
+  an operator locked out of the console that manages their firewall, after they
+  deployed.
 
 ## [0.0.1] — 2026-09-14
 

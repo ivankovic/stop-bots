@@ -46,9 +46,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::phc::PasswordHash;
+use argon2::password_hash::{PasswordHasher, PasswordVerifier};
 use argon2::Argon2;
-use rand::TryRngCore;
+use rand::TryRng;
 use subtle::ConstantTimeEq;
 
 use crate::db::Db;
@@ -429,20 +430,23 @@ pub fn csrf_matches(expected: &str, submitted: &str) -> bool {
 
 /// Hashes `password` with Argon2id and stores the PHC string in `db`.
 pub fn set_password(db: &Db, password: &str) -> Result<()> {
-    // The salt bytes come from `rand`'s OsRng and are encoded here, rather
-    // than from `SaltString::generate`. argon2 0.5 is built on rand_core
-    // 0.6, whose `OsRng` sits behind a feature this crate would otherwise
-    // have to turn on just to reach a second path to the same system
-    // entropy — and having one source of randomness in this file is worth
-    // more than the two lines it saves.
+    // The salt bytes come from this file's own `SysRng` rather than from
+    // `hash_password`, which would generate its own. Both end at the same
+    // system entropy, but every other secret here — session ids, CSRF
+    // tokens, the generated password — is drawn the same way, and one
+    // source of randomness in this file is worth more than the two lines
+    // it saves.
+    //
+    // 16 raw bytes: the length `password_hash` recommends, and comfortably
+    // inside the 8..=48 a PHC salt may occupy. Base64 encoding happens
+    // inside the hasher now; it used to be done here, against a
+    // `SaltString`.
     let mut salt_bytes = [0u8; 16];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut salt_bytes)
         .context("the operating system refused to provide randomness")?;
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|e| anyhow::anyhow!("failed to encode the salt: {e}"))?;
     let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password_with_salt(password.as_bytes(), &salt_bytes)
         .map_err(|e| anyhow::anyhow!("failed to hash the password: {e}"))?
         .to_string();
     db.set_text_setting(PASSWORD_HASH_KEY, &hash)
@@ -479,7 +483,7 @@ pub fn verify_password(db: &Db, password: &str) -> Result<bool> {
 /// in.
 pub fn generate_password() -> Result<String> {
     let mut bytes = [0u8; 18];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .context("the operating system refused to provide randomness")?;
     Ok(base64url(&bytes))
@@ -487,7 +491,7 @@ pub fn generate_password() -> Result<String> {
 
 fn random_token() -> Result<String> {
     let mut bytes = [0u8; TOKEN_BYTES];
-    rand::rngs::OsRng
+    rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)
         .context("the operating system refused to provide randomness")?;
     Ok(base64url(&bytes))
@@ -746,6 +750,41 @@ mod tests {
         assert!(
             stored.starts_with("$argon2id$"),
             "expected an Argon2id PHC string, got: {stored}"
+        );
+    }
+
+    /// A hash written by an older build must still let its owner in.
+    ///
+    /// The string below was produced by `argon2` 0.5 — the version 0.0.1
+    /// shipped with — and is frozen here deliberately. Every other test in
+    /// this file hashes and verifies with the same code in the same
+    /// process, so all of them would keep passing on the day an upgrade
+    /// quietly stopped reading what is already in operators' databases.
+    /// The failure that would cause is not a red test; it is an operator
+    /// locked out of the console that manages their firewall, discovered
+    /// after they deployed.
+    ///
+    /// Regenerate it only against the version that wrote it, never by
+    /// pasting what the current code emits — a fixture the current code
+    /// produced tests nothing.
+    #[test]
+    fn a_hash_written_by_the_previous_argon2_still_verifies() {
+        const ARGON2_0_5_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$\
+             P7iCYXZZ42l48eJFg3PGMQ$IzzZ5yaG88g7mVKFAqzMqWxkjYVHHb34BYwSp4IsZuo";
+        const PASSWORD: &str = "correct horse battery staple";
+
+        let db = Db::open_in_memory().unwrap();
+        db.set_text_setting(PASSWORD_HASH_KEY, ARGON2_0_5_HASH)
+            .unwrap();
+
+        assert!(
+            verify_password(&db, PASSWORD).unwrap(),
+            "a password hashed by argon2 0.5 no longer verifies; upgrading would \
+             lock every existing operator out of their own console"
+        );
+        assert!(
+            !verify_password(&db, "not the password").unwrap(),
+            "the wrong password was accepted against the frozen hash"
         );
     }
 
