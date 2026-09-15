@@ -108,8 +108,33 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The failure output is echoed back as workflow *annotations*, not
+      # just left in the log. Job logs need admin on this repository,
+      # while annotations are readable by anyone who can see the run — so
+      # without this, a red `container` job says only "exit code 101" to
+      # everyone except the owner, and the flakes this suite is prone to
+      # (it races a real systemd, a real nginx and a real SQLite) cost a
+      # reproduction attempt each to identify. `pipefail` because the
+      # exit status that matters is cargo's, not tee's.
       - name: End-to-end against real nginx and nftables
-        run: STOP_BOTS_CONTAINER_TESTS=1 cargo test --test container
+        shell: bash
+        run: |
+          set -o pipefail
+          if STOP_BOTS_CONTAINER_TESTS=1 cargo test --test container 2>&1 | tee /tmp/container.log; then
+            exit 0
+          fi
+          echo "::error::container suite failed"
+          # GitHub keeps only the first handful of error annotations per
+          # step, so this spends them on the two things worth having: the
+          # names of the tests that failed, then the panic text of the
+          # first one.
+          grep -E '^    [a-z_0-9]+$' /tmp/container.log | head -5 | while IFS= read -r line; do
+            echo "::error::failed test:${line}"
+          done
+          grep -A 8 '^---- ' /tmp/container.log | head -12 | while IFS= read -r line; do
+            [ -n "$line" ] && echo "::error::${line}"
+          done
+          exit 1
 
   # The badge claims a *floor* of 90%, and this is what enforces it. The
   # figure actually achieved is higher — 93.29% at the time of writing, and

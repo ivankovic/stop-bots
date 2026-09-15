@@ -142,6 +142,13 @@ need.
   including the `dbstat`/`PRAGMA page_count` reads and the `VACUUM` the
   maintenance job runs. The MSRV is unmoved at 1.88.
 
+- **A failing `container` job now says what failed.** Its step echoes the
+  failing test names and the first panic back as workflow annotations.
+  Job logs need admin on this repository; annotations do not, so a red
+  `container` used to read as "exit code 101" to everyone but the owner
+  — and this suite races a real systemd, a real nginx and a real SQLite,
+  so it is the job most likely to need reading.
+
 - **`reqwest` 0.12 → 0.13.** No code changed, and the TLS stack is
   unmoved — still `rustls` 0.23.45, so the RUSTSEC-2026-0285 fix stays
   where it was. Checked by actually downloading all three bot lists over
