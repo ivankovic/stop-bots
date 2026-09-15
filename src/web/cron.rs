@@ -233,6 +233,34 @@ mod tests {
         }
     }
 
+    /// `VACUUM` cannot run inside a transaction, and `maintenance` runs
+    /// inside `with_db` — so the question this pins is structural: does
+    /// that wrapper leave the connection in autocommit? It does (a mutex
+    /// and `spawn_blocking`, no `BEGIN`), and nothing else in the suite
+    /// would notice if that changed, because every other web test uses an
+    /// in-memory database whose freelist never reaches the threshold
+    /// `cron::maintenance` compacts at. A failure here would otherwise
+    /// only show up in production, as an `eprintln!` from `run_due_jobs`
+    /// once a day.
+    #[tokio::test]
+    async fn the_database_can_be_compacted_from_inside_the_web_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new(
+            Db::open(dir.path().join("web.sqlite3")).unwrap(),
+            PathBuf::from("/nonexistent"),
+            None,
+            false,
+        );
+
+        let reclaimed = state.with_db(|db| db.vacuum()).await;
+
+        assert!(
+            reclaimed.is_ok(),
+            "vacuum failed inside with_db: {:?}",
+            reclaimed.unwrap_err()
+        );
+    }
+
     /// The point of sharing `Db::set_cron_last_run` with the TUI and with
     /// `stop-bots batch`: once a job has run, it stops being due, so a
     /// second front-end ticking a moment later does nothing rather than

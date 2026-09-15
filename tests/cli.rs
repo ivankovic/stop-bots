@@ -2815,6 +2815,59 @@ fn install_web_refuses_a_host_that_is_not_debian() {
         .stderr(predicate::str::contains("not look like Debian"));
 }
 
+// ---- maintenance ----
+
+/// The flow an admin reaches for after looking at `du`: prune what has
+/// accumulated, hand the free pages back, and say what moved.
+///
+/// Seeds a user agent last seen well outside the 90-day window, which is
+/// the row the scheduled job exists to remove.
+#[test]
+fn maintain_prunes_stale_user_agents_and_reports_the_size() {
+    let fixture = Fixture::new();
+    let stale = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - (120 * 24 * 60 * 60);
+    {
+        let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+        let mut counts = std::collections::HashMap::new();
+        counts.insert("long-gone-crawler".to_string(), 7);
+        db.record_user_agent_hits(&counts, stale).unwrap();
+    }
+
+    fixture
+        .run(&["maintain"])
+        .stdout(predicate::str::contains("pruned 1 stale user agents"))
+        .stdout(predicate::str::contains("Database is"));
+
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    assert!(
+        db.list_user_agent_stats().unwrap().is_empty(),
+        "the stale row should be gone"
+    );
+    assert!(
+        db.get_cron_last_run(stop_bots::cron::CronJob::Maintenance.id())
+            .unwrap()
+            .is_some(),
+        "running it by hand should satisfy the internal cron's schedule too"
+    );
+}
+
+/// `--force-compact` rewrites the file whatever the thresholds say. The
+/// claim under test is that the flag reaches `VACUUM` at all — a fixture
+/// database has nothing worth reclaiming, so the scheduled job would
+/// (correctly) leave it alone and the line would never appear.
+#[test]
+fn maintain_can_be_told_to_compact_regardless() {
+    let fixture = Fixture::new();
+
+    fixture
+        .run(&["maintain", "--force-compact"])
+        .stdout(predicate::str::contains("Compacted anyway"));
+}
+
 /// A plain `Command`, for the tests above that need one without the
 /// `Fixture`'s NGINX environment.
 fn stop_bots_cmd(args: &[&str]) -> Command {
