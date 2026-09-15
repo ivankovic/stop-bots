@@ -1878,8 +1878,7 @@ fn format_relative_time(t: i64) -> String {
 /// file's bytes happen to match", which is also unaffected by which
 /// backend/output path that last render used (see `rules_signature`'s doc).
 fn firewall_needs_update(db: &Db) -> Result<bool> {
-    let current = crate::firewall::rules_signature(&crate::firewall::all_rules(db)?);
-    Ok(db.get_firewall_rendered_signature()?.as_deref() != Some(current.as_str()))
+    crate::firewall::needs_render(db)
 }
 
 fn is_stale(last_fetched_at: Option<i64>) -> bool {

@@ -289,6 +289,27 @@ pub fn rules_signature(rules: &[FirewallRule]) -> String {
         })
 }
 
+/// Whether the rules have changed since the last successful render — the
+/// one question three different callers were each answering with their own
+/// copy of the same two lines (the Dashboard's Summary panel,
+/// `health::script_freshness`, and now `cron::is_due`).
+///
+/// Comparing against the signature this app persisted on its last write
+/// (`Db::get_firewall_rendered_signature`) rather than against the file on
+/// disk keeps it hermetic — no dependency on a real system path — and
+/// answers "did the desired rules change since our own last render", not
+/// "do some file's bytes happen to match". It is also unaffected by which
+/// backend or output path that render used; see [`rules_signature`].
+///
+/// Costs one pass over every rule, derived ones included — about 50ms on a
+/// host with 44,000 of them. Cheap enough to ask once a minute, which is
+/// what the internal cron does with it, and far cheaper than the render it
+/// decides against.
+pub fn needs_render(db: &Db) -> Result<bool> {
+    let current = rules_signature(&all_rules(db)?);
+    Ok(db.get_firewall_rendered_signature()?.as_deref() != Some(current.as_str()))
+}
+
 /// Gathers every firewall rule (see [`all_rules`]) and renders them for
 /// `backend`. Fails immediately, before gathering or rendering anything, if
 /// `backend` is iptables and geo mode is Allowlist — see `iptables`'s

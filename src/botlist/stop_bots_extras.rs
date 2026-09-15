@@ -88,6 +88,14 @@ enum Kind {
     /// A vulnerability scanner, attack-surface mapper, or commercial
     /// crawler whose traffic is nobody's idea of a visitor.
     Scanner,
+    /// Something that must be *recognised* and never blocked by a category
+    /// default — carried here so nothing invites an admin to block it.
+    ///
+    /// Carries no category flag at all, which is what makes it inert:
+    /// `Db::compute_blocked_patterns` ORs the three flags together, so an
+    /// entry with none can never be blocked by policy. An admin who really
+    /// wants to can still pin it by hand; nothing here will suggest it.
+    Infrastructure,
 }
 
 /// `(display name, user-agent substring, category)`.
@@ -95,6 +103,18 @@ enum Kind {
 /// The substring is matched case-insensitively and unanchored, the same
 /// way every other source's pattern is — see `nginx::block_text`.
 const EXTRAS: &[(&str, &str, Kind)] = &[
+    // ---- known-good, carried so nothing proposes blocking them ----
+    // Seen 68 times on the host this list came from, and in *no* bot list
+    // at all — which meant the Dynamic Protection screen showed it beside
+    // the scanners with nothing to say it was different. Blocking it
+    // breaks ACME HTTP-01 renewal, and the damage surfaces as an expired
+    // certificate two months later, long after anyone would connect the
+    // two. Recognising it costs one row.
+    (
+        "Let's Encrypt validation",
+        "Let's Encrypt",
+        Kind::Infrastructure,
+    ),
     // ---- AI crawlers ai.robots.txt did not carry ----
     // xAI ships at least three names; all three were seen, and the last
     // arrives inside randomised browser strings (see the note below).
@@ -177,6 +197,8 @@ pub fn bots() -> Vec<NewBot> {
             name: (*name).to_string(),
             is_ai: *kind == Kind::Ai,
             is_search_engine: false,
+            // `Infrastructure` sets none of the three, so no category
+            // default can reach it — see `Kind::Infrastructure`.
             is_scanner: *kind == Kind::Scanner,
             user_agent_pattern: (*pattern).to_string(),
             source_id: SOURCE_ID.to_string(),
@@ -234,15 +256,43 @@ mod tests {
         ),
     ];
 
+    /// Checked against the entries that can *block* — `Ai` and `Scanner`.
+    /// `Infrastructure` entries are excluded because matching is their
+    /// entire job: they exist so that something like Let's Encrypt is
+    /// recognised rather than left looking unidentified, and they carry no
+    /// category flag, so no policy can act on the match.
     #[test]
-    fn no_pattern_matches_something_that_must_not_be_blocked() {
+    fn no_blocking_pattern_matches_something_that_must_not_be_blocked() {
         for (subject, why) in MUST_NOT_MATCH {
-            for (name, pattern, _) in EXTRAS {
+            for (name, pattern, kind) in EXTRAS {
+                if *kind == Kind::Infrastructure {
+                    continue;
+                }
                 assert!(
                     !subject.to_lowercase().contains(&pattern.to_lowercase()),
                     "{name:?} (pattern {pattern:?}) matches {subject:?} — {why}"
                 );
             }
+        }
+    }
+
+    /// And the other half: an `Infrastructure` entry must carry no
+    /// category flag, or the policy that blocks scanners would block it.
+    #[test]
+    fn an_infrastructure_entry_can_never_be_blocked_by_a_category() {
+        for bot in bots() {
+            let (_, _, kind) = EXTRAS
+                .iter()
+                .find(|(name, _, _)| *name == bot.name)
+                .expect("every bot comes from an entry");
+            if *kind != Kind::Infrastructure {
+                continue;
+            }
+            assert!(
+                !bot.is_ai && !bot.is_search_engine && !bot.is_scanner,
+                "{} carries a category flag, so a policy could block it",
+                bot.name
+            );
         }
     }
 
@@ -350,14 +400,20 @@ mod tests {
     /// unreachable by any category default and can only ever be blocked by
     /// hand, which defeats the point of shipping it.
     #[test]
-    fn every_bot_carries_exactly_one_category() {
-        for bot in bots() {
+    fn every_blocking_bot_carries_exactly_one_category() {
+        for (name, _, kind) in EXTRAS {
+            if *kind == Kind::Infrastructure {
+                continue;
+            }
+            let bot = bots()
+                .into_iter()
+                .find(|b| b.name == *name)
+                .expect("every entry becomes a bot");
             let flags = [bot.is_ai, bot.is_search_engine, bot.is_scanner];
             assert_eq!(
                 flags.iter().filter(|f| **f).count(),
                 1,
-                "{} has {flags:?}",
-                bot.name
+                "{name} has {flags:?}"
             );
         }
     }

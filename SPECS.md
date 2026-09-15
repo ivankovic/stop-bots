@@ -5262,3 +5262,88 @@ as well: the flags are OR-ed, so it changes nothing while the AI category
 is blocked and misleads whenever it is not. A separate "block everything
 on this list" switch: the category defaults already answer that, and a
 second answer would eventually disagree with the first.
+
+## Enforcing a detection in minutes rather than a day (`cron::is_due`, `firewall::needs_render`)
+
+The detectors run every sixty seconds. The render that turns what they
+find into a script ran every twenty-four hours. On the host this was
+measured on, fifteen blocks had been detected and were sitting in the
+database unrendered, the newest two hours old and the last render
+twenty-one hours old — so the gap between "we know" and "the kernel
+knows" was a day, and nothing said so.
+
+`CronJob::RenderFirewall` is now due either on its interval *or* when the
+rule set has changed since the last render. The signature that answers
+the second question already existed, written twice — once in the
+Dashboard's Summary panel and once in `health::script_freshness` — and is
+now `firewall::needs_render`, called from three places. It costs one pass
+over every rule, about 50ms at 44,000 of them, and is only asked of the
+one job that renders and only after the cheap time check has said no.
+
+**The interval stays the ceiling rather than being replaced.** A render
+also drops rules that expired since the last one, and an expiry changes
+no signature — the rule simply stops being returned, which
+`needs_render` cannot tell from nothing having happened.
+
+**And a floor, which is the part that is not obvious.** A render that
+fails — an unwritable `/etc/stop-bots` is the usual one — leaves the
+rules unrendered and therefore still "changed", so without a minimum gap
+the cron would retry it every single tick, forever. Five minutes bounds
+that to a retry every five minutes and costs at most five minutes of the
+latency this exists to remove.
+
+## `UNKNOWN`: the user agents no list has heard of (`dynamic::RowStatus`)
+
+Finding the 46 entries for the built-in list took a script: match every
+observed user agent against every pattern, discard the browsers, read
+what is left. Dynamic Protection could not show that, because `NOT
+BLOCKED` covers both "a list knows this and allows it" and "nothing here
+has ever heard of it", which are completely different situations for an
+admin deciding what to do.
+
+A row is `UNKNOWN` when it announces itself as a bot and no list has a
+pattern for it. Announcing itself is a test of the *string* —
+`bot`/`crawler`/`spider`/`scanner`/`scraper`/`probe`, or the `+http`
+convention of citing a page about yourself — deliberately not of
+behaviour, which `AssetRatio` and `RotatingUserAgent` already judge. The
+string test is what makes a missing list entry worth attention rather
+than just another visitor.
+
+Without the bot-shape half the tag would be worthless: a browser matches
+no bot pattern either, so every visitor on the screen would wear it.
+Checked against 6,493 user agents from a real log, the test flags 1,070
+and **none** of the 4,644 carrying an ordinary browser's product tokens;
+the handful that looked like false positives were `Storebot-Google` and
+browser strings claiming to be an iPhone running on Linux.
+
+**Building it surfaced a bug that had been there all along.** The first
+preview against real data tagged `Googlebot/2.1`, `YandexBot`, `Qwantbot`
+and `Let's Encrypt validation server` as unknown. `ua_matches_blocked_bot_patterns`
+compares by substring, and 217 of 1,606 patterns arrive regex-escaped
+from `nginx-bad-bots` — `Googlebot\/` — which no user agent can contain.
+Those patterns had never matched anything on this screen, so its
+`BLOCKLIST` tag had been wrong for 13% of the catalogue since it was
+written; the new tag only made it visible. `unescape_pattern` strips the
+escapes before comparing, and the count of unknown rows on that host fell
+from 186 to 123.
+
+**Let's Encrypt was the other half of that preview, and a worse
+problem.** It is in no bot list at all, so it was correctly unknown — and
+a tag inviting an admin to look at it is the last thing that particular
+user agent needs. It is now the first entry in the built-in list, as
+`Kind::Infrastructure`: recognised, and carrying no category flag at all,
+so `compute_blocked_patterns`'s OR over the three flags can never reach
+it. An admin who really means to can still pin it by hand; nothing
+suggests it. The must-not-block test now runs over the blocking kinds
+only, with a second test asserting an `Infrastructure` entry carries no
+flag — matching is that kind's whole job, so the original test would
+otherwise have forbidden the fix.
+
+**Considered and rejected.** Tagging every row no list knows, browsers
+included: true, and useless at roughly nine rows in ten. A filter value
+instead of a tag: it would hide the signal behind a keypress, and the
+volume column beside the tag is half of what makes a row worth acting on.
+Teaching the screen real regex: the comparison is best-effort by design
+and documented as such, and an unmatched genuine regex like
+`AdsBot-Google([^-]|$)` errs toward calling a known row unknown — a
+missed hint, not a wrong block.

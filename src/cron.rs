@@ -188,14 +188,50 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// The shortest gap between two renders triggered by a rule *change*
+/// rather than by the clock.
+///
+/// Without a floor, a render that keeps failing — an unwritable
+/// `/etc/stop-bots`, which is the common one — would leave the rules
+/// permanently unrendered and so permanently "changed", and the cron would
+/// retry it on every tick, forever, once a minute. The floor turns that
+/// into a retry every five minutes, and costs at most five minutes of
+/// enforcement lag on the path it exists to speed up.
+const RENDER_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
 /// Whether `job` is due: it's never run, or its interval has elapsed since
 /// it last did.
+///
+/// [`CronJob::RenderFirewall`] has one extra way to become due, and it is
+/// the difference between a block being enforced in minutes and in a day.
+/// Its interval is 24 hours because nothing about rendering is
+/// time-sensitive — but the *rules* are: the detectors add blocks every
+/// minute, and on a real host fifteen of them sat in the database for
+/// twenty-one hours, detected and unenforced, waiting for a clock. So a
+/// changed rule set makes the render due too, subject to
+/// [`RENDER_MIN_INTERVAL`].
+///
+/// The interval stays the *maximum* staleness rather than becoming the
+/// only trigger: a render also refreshes rules that expired since the last
+/// one, and those change no signature — a lapsed rule simply stops being
+/// returned, which `firewall::needs_render` cannot distinguish from
+/// nothing having happened until something else changes too.
 pub fn is_due(db: &Db, job: CronJob) -> Result<bool> {
-    let last_run = db.get_cron_last_run(job.id())?;
-    Ok(match last_run {
-        None => true,
-        Some(last_run) => now() - last_run >= job.interval().as_secs() as i64,
-    })
+    let Some(last_run) = db.get_cron_last_run(job.id())? else {
+        return Ok(true);
+    };
+    let elapsed = now() - last_run;
+    if elapsed >= job.interval().as_secs() as i64 {
+        return Ok(true);
+    }
+    // Only asked of the one job that has this trigger, and only once the
+    // cheap time check has already said no — `needs_render` walks every
+    // rule, and there is no reason to pay that for a job that is due
+    // anyway or for one this does not apply to.
+    if job == CronJob::RenderFirewall && elapsed >= RENDER_MIN_INTERVAL.as_secs() as i64 {
+        return crate::firewall::needs_render(db);
+    }
+    Ok(false)
 }
 
 /// When `job` is next expected to run — its last run plus its interval —
@@ -861,6 +897,113 @@ mod tests {
         // generated config, and a minute-interval job would reload a live
         // NGINX every time one bot arrived.
         assert_eq!(CronJob::ApplyNginx.interval().as_secs(), 60 * 60);
+    }
+
+    /// A rule added a minute ago must not wait for tomorrow's clock. This
+    /// is the whole point of the change trigger: on a real host fifteen
+    /// detected blocks sat undetectably-to-nftables for twenty-one hours,
+    /// because the only thing that could render them ran daily.
+    #[test]
+    fn a_changed_rule_set_makes_the_render_due_before_its_interval() {
+        let db = test_db();
+        // Rendered ten minutes ago: far inside the 24h interval, and past
+        // the five-minute floor.
+        db.set_cron_last_run(CronJob::RenderFirewall.id(), now() - 600, "rendered")
+            .unwrap();
+        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(
+            &crate::firewall::all_rules(&db).unwrap(),
+        ))
+        .unwrap();
+        assert!(
+            !is_due(&db, CronJob::RenderFirewall).unwrap(),
+            "nothing changed, so nothing is due"
+        );
+
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.7".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+
+        assert!(
+            is_due(&db, CronJob::RenderFirewall).unwrap(),
+            "a new block should make the render due"
+        );
+    }
+
+    /// The floor, which is what stops a render that cannot write turning
+    /// into a once-a-minute retry forever: a failed render leaves the
+    /// rules still unrendered and so still "changed", and without this it
+    /// would be due again on the very next tick.
+    #[test]
+    fn a_change_does_not_make_the_render_due_again_within_five_minutes() {
+        let db = test_db();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.7".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+        // Ran one minute ago and left no signature — exactly what a render
+        // that failed to write its file looks like.
+        db.set_cron_last_run(CronJob::RenderFirewall.id(), now() - 60, "error: denied")
+            .unwrap();
+
+        assert!(
+            !is_due(&db, CronJob::RenderFirewall).unwrap(),
+            "a failing render must back off, not spin"
+        );
+    }
+
+    /// The interval stays the ceiling. A rule that lapsed since the last
+    /// render changes no signature — it just stops being returned — so
+    /// without the clock a host whose rules only ever *expire* would never
+    /// re-render.
+    #[test]
+    fn the_daily_interval_still_makes_the_render_due_with_nothing_changed() {
+        let db = test_db();
+        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(
+            &crate::firewall::all_rules(&db).unwrap(),
+        ))
+        .unwrap();
+        db.set_cron_last_run(
+            CronJob::RenderFirewall.id(),
+            now() - 25 * 60 * 60,
+            "rendered",
+        )
+        .unwrap();
+
+        assert!(is_due(&db, CronJob::RenderFirewall).unwrap());
+    }
+
+    /// The trigger belongs to one job. Asking every job would mean walking
+    /// all 44,000 rules once a minute per job, for jobs that render
+    /// nothing.
+    #[test]
+    fn no_other_job_is_made_due_by_a_changed_rule_set() {
+        let db = test_db();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.7".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+        for job in CronJob::all() {
+            if job == CronJob::RenderFirewall {
+                continue;
+            }
+            // Just ran, so nothing but a change trigger could make it
+            // due — the detectors' own interval is sixty seconds, so an
+            // older timestamp would make them due on the clock alone and
+            // prove nothing.
+            db.set_cron_last_run(job.id(), now(), "ran").unwrap();
+            assert!(
+                !is_due(&db, job).unwrap(),
+                "{} became due because the firewall rules changed",
+                job.id()
+            );
+        }
     }
 
     #[test]

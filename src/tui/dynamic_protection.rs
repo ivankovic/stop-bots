@@ -689,6 +689,10 @@ fn row_line(
         RowStatus::Blocklist => text.yellow(),
         RowStatus::Blocked { .. } => text.red(),
         RowStatus::Pending => text.fg(theme.dim()),
+        // Not dim like `Pending`: the whole point of the tag is that this
+        // row is worth a look, and dimming it would bury it among the
+        // browsers it sits between.
+        RowStatus::Unknown => text.yellow(),
     };
     Line::from(vec![
         format!("{count:>6} ").into(),

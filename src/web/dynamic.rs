@@ -342,6 +342,10 @@ fn status_pill(status: RowStatus) -> Markup {
         // something a list decided, and un-blocking it here would not
         // stick — the next refresh of that list puts it back.
         RowStatus::Blocklist => PillKind::Warn,
+        // Not a verdict, a gap: nothing on this host has an opinion about
+        // it yet. `Neutral` would read as "allowed on purpose", which is
+        // the one thing it is not.
+        RowStatus::Unknown => PillKind::Warn,
     };
     layout::pill(&status.label(), kind)
 }
@@ -454,7 +458,11 @@ fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
                 button type="submit" { "Unblock" }
             }
         },
-        RowStatus::Pending => html! {
+        // `Unknown` is about a user agent, and these rows are addresses,
+        // so it cannot arise here — it gets the same Block button as
+        // `Pending` rather than its own arm, which would be dead code
+        // pretending to be a decision.
+        RowStatus::Pending | RowStatus::Unknown => html! {
             form .inline method="post" action=(ctx.url("/dynamic/block-address")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="address" value=(row.address);
@@ -474,7 +482,9 @@ fn ua_action(row: &UaRow, ctx: &Ctx) -> Markup {
                 button type="submit" { "Unblock" }
             }
         },
-        RowStatus::Pending => html! {
+        // Same action either way — the tag says why it is worth looking
+        // at, the button does the same thing.
+        RowStatus::Pending | RowStatus::Unknown => html! {
             form .inline method="post" action=(ctx.url("/dynamic/block-ua")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="user_agent" value=(row.user_agent);

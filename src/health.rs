@@ -478,9 +478,8 @@ fn firewall_persistence(probe: &Probe, backend: FirewallBackend) -> Check {
 /// updating" row — folded in so that one panel answers the whole question
 /// rather than half of it in two places.
 fn script_freshness(db: &Db, expected: usize) -> Result<Check> {
-    let current = firewall::rules_signature(&firewall::all_rules(db)?);
     let rendered = db.get_firewall_rendered_signature()?;
-    let stale = rendered.as_deref() != Some(current.as_str());
+    let stale = firewall::needs_render(db)?;
 
     // Nothing to render and nothing rendered is not staleness, it is a
     // host that has not been configured yet. Saying otherwise puts a

@@ -9,6 +9,15 @@ need.
 
 ### Added
 
+- **Dynamic Protection marks user agents no bot list has heard of.** A new
+  `UNKNOWN` tag, for rows that announce themselves as a bot — a `bot`,
+  `crawler`, `scanner`… token, or the `+http` convention of citing a page
+  about yourself — and that match no pattern in any list. That is the
+  signal that turned up 46 missing entries, and it needed a script to
+  find. Ordinary browsers are not tagged: checked against 6,493 real user
+  agents, the test flags none of the 4,644 carrying a browser's product
+  tokens.
+
 - **A built-in bot list of this project's own** — the first source that is
   compiled into the binary rather than downloaded, so a fresh install is
   covered before it has network access and on a host that cannot reach
@@ -77,6 +86,23 @@ need.
   whose render is already overdue, because neither is a schedule.
 
 ### Fixed
+
+- **A detected block no longer waits a day to be rendered.** The firewall
+  render was on a fixed 24-hour clock while the detectors add blocks every
+  minute — on a real host fifteen detections sat in the database for
+  twenty-one hours, found and unenforced. A changed rule set now makes the
+  render due as well, reusing the signature the health check already
+  computes, with a five-minute floor so a render that keeps failing backs
+  off instead of retrying every tick. The 24 hours stays as the maximum,
+  because a rule that merely *expired* changes no signature.
+
+- **Dynamic Protection could not see 217 of its own bot patterns.** It
+  compares user agents to patterns by substring, but 13% of them arrive
+  regex-escaped from `nginx-bad-bots` — `Googlebot\/`, `Mediapartners
+  \(Googlebot\)` — and no user agent contains a backslash, so those
+  patterns never matched anything. The screen believed the commonest
+  crawler on the web was in no list at all. Escapes are stripped before
+  comparing now.
 
 - **"BLOCKED until 1d" now reads "BLOCKED for 1d".** The time beside it is
   how long is left, not a moment, so "until" described something the
