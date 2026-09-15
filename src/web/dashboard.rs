@@ -59,6 +59,7 @@ struct View {
     sources_stale: usize,
     rule_count: usize,
     firewall_needs_update: bool,
+    auto_apply_firewall: bool,
     /// Where the "Write script" button writes, from `AppState`. Shown, not
     /// asked for — see [`render_firewall`] for why the console does not
     /// take a destination from the form.
@@ -152,6 +153,7 @@ fn load(
         base_path: crate::web::BasePath::from_db(db)?.as_str().to_string(),
         serving_base_path: serving.as_str().to_string(),
         allowed_hosts: crate::web::configured_hosts(db)?,
+        auto_apply_firewall: db.get_auto_apply_firewall()?,
         firewall_needs_update: db.get_firewall_rendered_signature()?.as_deref()
             != Some(signature.as_str()),
         jobs: crate::cron::status(db)?,
@@ -623,6 +625,36 @@ fn firewall_panel(view: &View, ctx: &Ctx) -> Markup {
                             }
                         }
                     }
+                    tr {
+                        td {
+                            "Auto-apply"
+                            br;
+                            span .hint {
+                                "Lets the daily render run the script too. It refuses unless \
+                                 the anti-lockout check actually ran \u{2014} which needs a \
+                                 readable SSH log."
+                            }
+                        }
+                        td {}
+                        td {
+                            .row {
+                                @if view.auto_apply_firewall {
+                                    (layout::pill("ON", PillKind::Allowed))
+                                } @else {
+                                    (layout::pill("OFF", PillKind::Neutral))
+                                }
+                                form .inline method="post"
+                                    action=(ctx.url("/auto-apply-firewall")) {
+                                    (layout::csrf_field(ctx))
+                                    input type="hidden" name="enabled"
+                                        value=(if view.auto_apply_firewall { "0" } else { "1" });
+                                    button type="submit" {
+                                        @if view.auto_apply_firewall { "Turn off" } @else { "Turn on" }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             .panel-body {
@@ -908,6 +940,10 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
         .route(&base.url("/detector-ttl"), post(set_detector_ttl))
         .route(&base.url("/feed"), post(set_feed))
         .route(&base.url("/render-firewall"), post(render_firewall))
+        .route(
+            &base.url("/auto-apply-firewall"),
+            post(set_auto_apply_firewall),
+        )
         .route(&base.url("/update-all"), post(update_all))
         .route(&base.url("/apply-all"), post(apply_all))
         .route(&base.url("/web-access"), post(set_web_access))
@@ -1391,6 +1427,50 @@ struct RenderForm {
     /// Present only when the checkbox is ticked — HTML omits an unchecked
     /// box entirely rather than sending `false`.
     apply: Option<String>,
+}
+
+/// Turns automatic applying of the firewall script on or off.
+///
+/// The confirmation names the refusal this switch makes, because it is the
+/// one that will most often stop it doing anything: a host whose SSH log
+/// the cron cannot read renders daily and applies never, and without being
+/// told so here the only sign is a summary line on the Scheduled tasks
+/// panel a day later.
+async fn set_auto_apply_firewall(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Form(form): Form<AutoApplyForm>,
+) -> Response {
+    let on = form.enabled == "1";
+    match state
+        .with_db(move |db| db.set_auto_apply_firewall(on))
+        .await
+    {
+        Ok(()) => back_with(
+            &state.base,
+            "/",
+            if on {
+                "Auto-apply on for the firewall. The daily render will run the script too \
+                 \u{2014} unless the anti-lockout check cannot run, which needs a readable SSH \
+                 log, in which case it writes and refuses."
+            } else {
+                "Auto-apply off for the firewall. The daily render writes the script and \
+                 leaves running it to you."
+            },
+            true,
+        ),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("Could not save that: {err}"),
+            false,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct AutoApplyForm {
+    enabled: String,
 }
 
 /// Writes the firewall script.

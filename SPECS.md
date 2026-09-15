@@ -5119,3 +5119,63 @@ about. Making the CLI's `set-auto-apply` apply immediately: a `set-`
 subcommand that reloaded NGINX would be the worst surprise available from
 a command whose name says it sets a value — there is a test that it
 rewrites no config.
+
+## The firewall's own auto-apply switch (`Db::get_auto_apply_firewall`)
+
+Auto-apply shipped covering NGINX only, and the reasoning for that split
+was written down above. Asked for the other half, the answer was a
+*second* switch rather than widening the first.
+
+**Two switches, because the risks are not comparable.** A bad NGINX
+config is caught by `nginx -t` and costs a failed reload; a bad firewall
+ruleset locks you out of the host, and nothing done here can undo that
+remotely. One toggle that turned on both would make the cheap decision
+carry the expensive one.
+
+**Unattended, it is stricter than the button it automates.** The
+interactive paths — the console's "run it after writing", the TUI's
+render popup — treat `LockoutStatus::LogUnavailable` as a pass. That is
+defensible with a person reading the result, who can get back in. The
+cron reads the SSH log through `read_log_for`, which falls back to
+`journalctl` and can legitimately come back with nothing, so the same
+rule unattended means applying a ruleset whose lockout check never ran.
+`render_firewall` therefore tracks whether the guard *ran*, which is a
+different fact from whether it objected, and refuses to apply when it did
+not. The script is still written; only the running is withheld, and the
+summary says which condition stopped it so the fix (point `--ssh-log` at
+a readable log) is in front of the admin rather than inferred.
+
+**It lives in `RenderFirewall`, not a job of its own.** The script that
+runs is the one just written, so what executes is what the guard
+approved — the same reasoning the console's `write_and_apply_firewall`
+gives for applying the file rather than a freshly derived ruleset. A
+separate job would have to re-derive or re-read, and could apply a script
+a later render had already replaced.
+
+`run_log_job` gained an `apply_for_real` parameter to carry each
+front-end's "may touch the system" flag (`--no-apply`, the TUI's
+`reload_nginx`) down to it, rather than the job reaching for a global.
+
+**Where the switch lives.** The Dashboard's "Automatic blocking" list, as
+a third `ProtectionRow` — the one row there that adds no blocks of its
+own. It earns the place: every other row decides what ends up in the
+firewall script, and this answers what happens to that script afterwards,
+which is the question an admin has immediately after switching one of the
+others on. The NGINX half stays on Site settings next to the config it
+applies, which is the same split `tui/site_settings.rs`'s module doc
+already draws. `is_detector` changed from "not a feed" to "is a detector"
+so the option-count, popup-index and toggle paths all treat the new row
+as the plain Off/On it is, with no further arms.
+
+**A stale claim, removed.** `cron`'s module doc said "nothing here
+applies a firewall script" and called applying "a manual step for the
+admin". That is no longer true for an admin who sets the switch, and a
+module doc that promises a safety property the code no longer has is
+worse than no doc.
+
+**Considered and rejected.** Reusing `Db::get_auto_apply` — see above.
+Treating `LogUnavailable` as a pass for consistency with the interactive
+paths: consistency is the wrong thing to optimise when the difference is
+whether anyone will read the outcome. Making the refusal an error rather
+than a summary: `run_due_jobs` prints errors to stderr and carries on, so
+the one host where this matters would never see it.

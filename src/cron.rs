@@ -41,13 +41,26 @@
 //! schedulers computing "what this job does" separately are two
 //! schedulers that will eventually disagree.
 //!
-//! **Each job only does what its equivalent CLI subcommand does — nothing
-//! here applies a firewall script.** `RenderFirewall` writes the script to
-//! disk on a timer, same as `render-firewall`; actually applying it
-//! (`sh`/`nft -f`) remains a manual step for the admin, on purpose (see
-//! `src/iptables.rs`/`src/nftables.rs`'s "generate-only" module docs) — an
-//! internal cron that silently executed firewall changes would be a very
-//! different, much riskier feature than this one.
+//! **Each job only does what its equivalent CLI subcommand does, and by
+//! default that stops at writing.** `RenderFirewall` writes the script to
+//! disk on a timer, same as `render-firewall`; running it (`sh`/`nft -f`)
+//! is the admin's, on purpose — see `src/iptables.rs`/`src/nftables.rs`'s
+//! "generate-only" module docs.
+//!
+//! Two switches move that line, and only for the admin who sets them.
+//! `Db::get_auto_apply` lets `ApplyNginx` write site configs and reload
+//! NGINX; `Db::get_auto_apply_firewall` lets `RenderFirewall` run the
+//! script it just wrote. Both are off by default and each is set
+//! separately, because the risks are not comparable: a bad NGINX config is
+//! caught by `nginx -t` and costs a failed reload, while a bad firewall
+//! ruleset locks you out of the host.
+//!
+//! The firewall one carries an extra condition the interactive paths do
+//! not. They treat `LockoutStatus::LogUnavailable` — the anti-lockout
+//! check could not read an SSH log, so it could not run — as a pass, which
+//! is reasonable while a person is reading the result and can get back in.
+//! Here it is a refusal. "The check could not run" is not "the check
+//! passed" when nobody is watching.
 
 use crate::db::Db;
 use crate::nginx::NginxCommands;
@@ -321,6 +334,7 @@ pub fn run_log_job(
     job: CronJob,
     log_text: Option<&str>,
     firewall_out: Option<&std::path::Path>,
+    apply_for_real: bool,
 ) -> Result<String> {
     let summary = match job {
         // Every detector runs through one arm. What differs between them —
@@ -338,7 +352,7 @@ pub fn run_log_job(
             },
             None => "NGINX access log unavailable".to_string(),
         },
-        CronJob::RenderFirewall => render_firewall(db, firewall_out, log_text),
+        CronJob::RenderFirewall => render_firewall(db, firewall_out, log_text, apply_for_real),
         CronJob::UpdateIpRanges => {
             unreachable!("UpdateIpRanges is run via fetch_ip_ranges/store_ip_ranges")
         }
@@ -590,12 +604,18 @@ fn run_detector(db: &Db, detector: Detector, log_text: Option<&str>) -> String {
 /// `firewall::lockout_risks` directly. `None` (log unavailable) skips the
 /// check entirely, matching the interactive path's `LogUnavailable` case.
 ///
-/// **Writes, never applies.** A script on disk does nothing until someone
-/// runs it; see this module's docs for why that line is where it is.
+/// **Writes, and applies only when told to twice.** A script on disk does
+/// nothing until someone runs it, and that stays the default; see this
+/// module's docs for why the line is where it is. `Db::get_auto_apply_firewall`
+/// moves it, and even then this refuses unless the lockout guard actually
+/// *ran* — `ssh_log_text` of `None` means it could not, which the
+/// interactive paths treat as a pass and this does not. A person reading
+/// a refusal can get back into the host; a cron job at 3am cannot.
 fn render_firewall(
     db: &Db,
     out_override: Option<&std::path::Path>,
     ssh_log_text: Option<&str>,
+    apply_for_real: bool,
 ) -> String {
     let result: Result<String> = (|| {
         // The *stored* backend, not a hardcoded one. This used to always
@@ -607,6 +627,9 @@ fn render_firewall(
         let out_path = crate::firewall::output_path(out_override, backend);
         let out_path = out_path.as_path();
         let built = crate::firewall::build_script(db, backend)?;
+        // Whether the guard *ran*, which is a different fact from whether
+        // it objected — and the one that decides if this may apply.
+        let mut guard_ran = false;
         if let Some(text) = ssh_log_text {
             let connected_ips = crate::sshlog::parse_accepted_ips(text);
             let risks = crate::firewall::lockout_risks(&built.rules, &connected_ips);
@@ -616,6 +639,7 @@ fn render_firewall(
                     risks.len()
                 );
             }
+            guard_ran = true;
         }
         // Named in the error, because this is the one failure here an
         // operator has to act on outside stop-bots, and "Permission
@@ -626,11 +650,30 @@ fn render_firewall(
         crate::firewall::write_script(out_path, &built.script)
             .with_context(|| format!("could not write {}", out_path.display()))?;
         db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
-        Ok(format!(
-            "wrote {} rule(s) to {}",
-            built.written,
-            out_path.display()
-        ))
+        let wrote = format!("wrote {} rule(s) to {}", built.written, out_path.display());
+
+        if !db.get_auto_apply_firewall()? {
+            return Ok(wrote);
+        }
+        if !guard_ran {
+            // The one refusal this switch exists to make. `batch --apply`
+            // takes the same line for the same reason: a guard that could
+            // not run has not passed.
+            return Ok(format!(
+                "{wrote}; not applied: the SSH log could not be read, so the lockout check \
+                 could not run"
+            ));
+        }
+        if !apply_for_real {
+            return Ok(format!("{wrote}; not applied (--no-apply)"));
+        }
+        // The script just written, not a freshly derived one, so what runs
+        // is what the guard approved and what an operator can read
+        // afterwards.
+        Ok(match crate::firewall::apply_script(backend, out_path) {
+            Ok(()) => format!("{wrote}, and applied them"),
+            Err(err) => format!("{wrote}, but applying them failed: {err:#}"),
+        })
     })();
     match result {
         Ok(summary) => summary,
@@ -727,6 +770,73 @@ mod tests {
         let summary = apply_nginx(&db, std::path::Path::new("/nonexistent/nginx"), false);
 
         assert_eq!(summary, "auto-apply is off");
+    }
+
+    /// The refusal this switch exists to make: with auto-apply on but no
+    /// SSH log, the script is still written and is deliberately *not*
+    /// run. The interactive paths treat "the check could not run" as a
+    /// pass; unattended that is how a host is lost, so this refuses and
+    /// says which condition stopped it.
+    #[test]
+    fn the_firewall_is_not_applied_when_the_lockout_check_could_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("rules.nft");
+        let db = test_db();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.7".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+        db.set_auto_apply_firewall(true).unwrap();
+
+        // `None` is what `read_log_for` hands over when no SSH log could
+        // be read — a file that is not there, or a `journalctl` with
+        // nothing in it.
+        let summary = render_firewall(&db, Some(&out), None, true);
+
+        assert!(out.exists(), "the script should still be written");
+        assert!(
+            summary.contains("not applied"),
+            "it should refuse, not apply: {summary}"
+        );
+        assert!(
+            summary.contains("lockout check"),
+            "it should say which check stopped it: {summary}"
+        );
+    }
+
+    /// And with the switch off, a readable log changes nothing: writing
+    /// without applying stays the default, and the summary says only what
+    /// it wrote.
+    #[test]
+    fn the_firewall_is_only_written_while_auto_apply_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("rules.nft");
+        let db = test_db();
+        assert!(!db.get_auto_apply_firewall().unwrap(), "off is the default");
+
+        let summary = render_firewall(&db, Some(&out), Some(""), true);
+
+        assert!(out.exists());
+        assert!(summary.starts_with("wrote "), "{summary}");
+        assert!(!summary.contains("applied"), "{summary}");
+    }
+
+    /// `--no-apply` outranks the switch, the same way it outranks every
+    /// other apply in this project.
+    #[test]
+    fn the_firewall_is_not_applied_under_no_apply_even_with_the_switch_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("rules.nft");
+        let db = test_db();
+        db.set_auto_apply_firewall(true).unwrap();
+
+        // An empty log reads as "no connected clients", so the guard runs
+        // and finds nothing — the one case that would otherwise apply.
+        let summary = render_firewall(&db, Some(&out), Some(""), false);
+
+        assert!(summary.contains("not applied (--no-apply)"), "{summary}");
     }
 
     /// The switched-*on* path is covered in `tests/cli.rs`, not here.
@@ -887,14 +997,15 @@ mod tests {
         let detector = Detector::SshScanners;
 
         detector.set_enabled(&db, false).unwrap();
-        let summary = run_log_job(&db, CronJob::Detect(detector), None, Some(&out)).unwrap();
+        let summary = run_log_job(&db, CronJob::Detect(detector), None, Some(&out), false).unwrap();
         assert_eq!(summary, "disabled");
 
         detector.set_enabled(&db, true).unwrap();
-        let summary = run_log_job(&db, CronJob::Detect(detector), None, Some(&out)).unwrap();
+        let summary = run_log_job(&db, CronJob::Detect(detector), None, Some(&out), false).unwrap();
         assert_eq!(summary, "SSH log unavailable");
 
-        let summary = run_log_job(&db, CronJob::RecordAccessStats, None, Some(&out)).unwrap();
+        let summary =
+            run_log_job(&db, CronJob::RecordAccessStats, None, Some(&out), false).unwrap();
         assert_eq!(summary, "NGINX access log unavailable");
 
         // Recorded, not just returned — a job that ran and reported
@@ -917,7 +1028,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("fw.nft");
 
-        let summary = render_firewall(&db, Some(&out_path), None);
+        let summary = render_firewall(&db, Some(&out_path), None, false);
 
         assert!(summary.contains("wrote"), "summary was: {summary}");
         assert!(out_path.exists());
@@ -937,7 +1048,7 @@ mod tests {
         std::fs::write(&blocker, "").unwrap();
         let out_path = blocker.join("fw.nft");
 
-        let summary = render_firewall(&db, Some(&out_path), None);
+        let summary = render_firewall(&db, Some(&out_path), None, false);
 
         assert!(summary.starts_with("error: "), "summary was: {summary}");
         assert!(
@@ -957,7 +1068,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out_path = dir.path().join("nested/does/not/exist/fw.nft");
 
-        let summary = render_firewall(&db, Some(&out_path), None);
+        let summary = render_firewall(&db, Some(&out_path), None, false);
 
         assert!(summary.contains("wrote"), "summary was: {summary}");
         assert!(out_path.exists());

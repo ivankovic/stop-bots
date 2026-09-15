@@ -156,6 +156,16 @@ enum ProtectionRow {
     /// `Dashboard::reputation` (which is ordered by id, as
     /// `Db::list_reputation_sources` returns it).
     Feed(usize),
+    /// Whether the daily render also *runs* the script it writes
+    /// (`Db::get_auto_apply_firewall`).
+    ///
+    /// The one row here that adds no blocks of its own. It earns its place
+    /// anyway: every other row in this panel decides what ends up in the
+    /// firewall script, and this is the answer to what happens to that
+    /// script afterwards — which is the question an admin has right after
+    /// switching one of the others on. The NGINX half of the same
+    /// question lives on Site settings, beside the config it applies.
+    AutoApplyFirewall,
 }
 
 impl ProtectionRow {
@@ -163,7 +173,7 @@ impl ProtectionRow {
     /// choice) rather than a feed (a plain Off/On, with no TTL — a feed's
     /// blocks are derived at render time and never expire on their own).
     fn is_detector(self) -> bool {
-        !matches!(self, ProtectionRow::Feed(_))
+        matches!(self, ProtectionRow::Detect(_))
     }
 }
 
@@ -257,6 +267,10 @@ pub struct Dashboard {
     /// Every third-party CIDR feed, ordered by id — the order
     /// `ProtectionRow::Feed`'s index refers to.
     reputation: Vec<crate::db::ReputationSource>,
+    /// `Db::get_auto_apply_firewall`, mirrored here for the
+    /// `ProtectionRow::AutoApplyFirewall` row, the same way every other
+    /// value this panel shows is loaded in `refresh`.
+    auto_apply_firewall: bool,
     focus: Focus,
     /// The internal cron's per-job state (see `crate::cron`), read-only
     /// here — this panel only displays it, `App` is what actually runs due
@@ -303,6 +317,7 @@ impl Dashboard {
             .map(|d| Ok((d, (d.is_enabled(db)?, d.ttl_days(db)?))))
             .collect::<Result<_>>()?;
         self.reputation = db.list_reputation_sources()?;
+        self.auto_apply_firewall = db.get_auto_apply_firewall()?;
         self.cron_status = crate::cron::status(db)?;
         self.firewall_needs_update = firewall_needs_update(db)?;
         self.rule_count = crate::firewall::all_rules(db)?.len();
@@ -724,6 +739,7 @@ impl Dashboard {
             .into_iter()
             .map(ProtectionRow::Detect)
             .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
+            .chain(std::iter::once(ProtectionRow::AutoApplyFirewall))
             .collect()
     }
 
@@ -735,6 +751,7 @@ impl Dashboard {
                 .get(i)
                 .map(|s| s.name.clone())
                 .unwrap_or_default(),
+            ProtectionRow::AutoApplyFirewall => "Auto-apply the script".to_string(),
         }
     }
 
@@ -746,6 +763,7 @@ impl Dashboard {
                 .map(|(enabled, _)| *enabled)
                 .unwrap_or(false),
             ProtectionRow::Feed(i) => self.reputation.get(i).is_some_and(|s| s.enabled),
+            ProtectionRow::AutoApplyFirewall => self.auto_apply_firewall,
         }
     }
 
@@ -759,7 +777,7 @@ impl Dashboard {
             // Feeds have no TTL: their blocks are derived fresh at
             // render time from the stored ranges, so there's nothing to
             // expire.
-            ProtectionRow::Feed(_) => 0,
+            ProtectionRow::Feed(_) | ProtectionRow::AutoApplyFirewall => 0,
         }
     }
 
@@ -775,6 +793,9 @@ impl Dashboard {
                 Some(s) => format!(" {}", s.range_count),
                 None => String::new(),
             },
+            // No TTL and no count — the state is the whole story, and the
+            // tag already carries it.
+            ProtectionRow::AutoApplyFirewall => String::new(),
             _ if self.protection_enabled(row) => format!(" {}d", self.protection_ttl_days(row)),
             _ => String::new(),
         }
@@ -1214,6 +1235,24 @@ impl Dashboard {
     ) -> Result<KeyOutcome> {
         if let ProtectionRow::Feed(i) = row {
             return self.commit_feed(db, i, selected == 1, message);
+        }
+        if row == ProtectionRow::AutoApplyFirewall {
+            let on = selected == 1;
+            db.set_auto_apply_firewall(on)?;
+            self.auto_apply_firewall = on;
+            // Names the refusal, because it is what will most often stop
+            // this doing anything: a host whose SSH log the cron cannot
+            // read renders daily and applies never.
+            *message = Some(if on {
+                "Auto-apply on \u{2014} the daily render will run the script too, unless the \
+                 anti-lockout check cannot run (it needs a readable SSH log)"
+                    .to_string()
+            } else {
+                "Auto-apply off \u{2014} the daily render writes the script and leaves running \
+                 it to you"
+                    .to_string()
+            });
+            return Ok(KeyOutcome::Mutated);
         }
         let ProtectionRow::Detect(detector) = row else {
             unreachable!("feeds are committed by commit_feed")
@@ -3371,7 +3410,9 @@ mod tests {
         let rows = dashboard.protection_rows();
         assert_eq!(
             rows.len(),
-            Detector::ALL.len() + ReputationSourceKind::ALL.len()
+            // ...plus the one `AutoApplyFirewall` row, which sits after
+            // the feeds and is not one.
+            Detector::ALL.len() + ReputationSourceKind::ALL.len() + 1
         );
         assert!(rows[..Detector::ALL.len()].iter().all(|r| r.is_detector()));
         assert!(rows[Detector::ALL.len()..].iter().all(|r| !r.is_detector()));
@@ -3587,7 +3628,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 14, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 15, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");

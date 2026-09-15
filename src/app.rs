@@ -1230,7 +1230,13 @@ impl App {
         self.jobs_in_flight.remove(&Job::Cron(job));
         // `None`: no override, so the path follows the stored backend —
         // an nftables render lands in `.nft` and an iptables one in `.sh`.
-        crate::cron::run_log_job(&self.db, job, log_text.as_deref(), None)?;
+        crate::cron::run_log_job(
+            &self.db,
+            job,
+            log_text.as_deref(),
+            None,
+            self.apply_firewall,
+        )?;
         self.refresh()?;
         Ok(())
     }

@@ -162,8 +162,9 @@ async fn run_log_job(state: &AppState, job: CronJob) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("the log-reading thread panicked: {err}"))?;
 
     let out = state.firewall_out.clone();
+    let apply = state.apply_for_real;
     state
-        .with_db(move |db| cron::run_log_job(db, job, log_text.as_deref(), out.as_deref()))
+        .with_db(move |db| cron::run_log_job(db, job, log_text.as_deref(), out.as_deref(), apply))
         .await?;
     Ok(())
 }

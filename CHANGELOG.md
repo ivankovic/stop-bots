@@ -23,11 +23,18 @@ need.
   stays off on upgrade: it reloads a live web server with nobody watching,
   which is not a decision an upgrade gets to make.
 
-  NGINX only. The firewall script is rendered on a schedule but still never
-  applied on one — its anti-lockout guard passes when it *cannot read* the
-  SSH log, which is survivable with a human reading the result and is how
-  you lose a server without one. `stop-bots batch --apply` remains the way
-  to automate that, with the SSH log pointed at explicitly.
+- **A second, separate switch for the firewall script.** With it on, the
+  daily render also runs what it wrote. Separate from the NGINX switch and
+  separately off, because the risks are not comparable: a bad NGINX config
+  is caught by `nginx -t` and costs a failed reload, while a bad firewall
+  ruleset locks you out of the host.
+
+  Unattended it is **stricter than the button**. The interactive paths
+  treat "the anti-lockout check could not read an SSH log" as a pass,
+  which is reasonable while a person is reading the result; here it is a
+  refusal, because "the check could not run" is not "the check passed"
+  when nobody is watching. On the Dashboard in both front-ends, or
+  `stop-bots set-auto-apply-firewall --enabled true`.
 
 - **A daily maintenance job, and `stop-bots maintain` to run it now.** It
   prunes `user_agent_stats` rows for agents not seen in 90 days (and any

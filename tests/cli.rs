@@ -2907,6 +2907,34 @@ fn auto_apply_rewrites_a_stale_site_config_and_then_leaves_it_alone() {
     assert_eq!(again, "1 site(s) already up to date");
 }
 
+/// The firewall switch is separate from the NGINX one, and separately off.
+/// Two switches because the risks are not comparable — a bad NGINX config
+/// costs a failed `nginx -t`, a bad firewall ruleset costs the host.
+#[test]
+fn the_firewall_auto_apply_switch_is_independent_of_the_nginx_one() {
+    let fixture = Fixture::new();
+
+    fixture.run(&["set-auto-apply", "--enabled", "true"]);
+
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    assert!(db.get_auto_apply().unwrap());
+    assert!(
+        !db.get_auto_apply_firewall().unwrap(),
+        "the NGINX switch must not turn the firewall one on"
+    );
+    drop(db);
+
+    fixture
+        .run(&["set-auto-apply-firewall", "--enabled", "true"])
+        .stdout(predicate::str::contains("enabled"))
+        // The condition that most often stops it doing anything, said when
+        // it is switched on rather than discovered in a summary a day on.
+        .stdout(predicate::str::contains("anti-lockout"));
+
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    assert!(db.get_auto_apply_firewall().unwrap());
+}
+
 // ---- maintenance ----
 
 /// The flow an admin reaches for after looking at `du`: prune what has

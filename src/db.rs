@@ -1445,6 +1445,31 @@ impl Db {
         self.set_bool_setting("auto_apply", auto)
     }
 
+    /// Whether the internal cron *applies* the firewall script it renders,
+    /// rather than only writing it — see `cron::render_firewall`.
+    ///
+    /// A separate switch from [`Self::get_auto_apply`], not a second
+    /// meaning for it, because the two carry different risks and deserve
+    /// separate decisions. A bad NGINX config is caught by `nginx -t` and
+    /// costs a failed reload; a bad firewall ruleset locks you out of the
+    /// host, and no amount of care here can undo that remotely.
+    ///
+    /// **Unattended, the anti-lockout guard refuses when it cannot run.**
+    /// The interactive paths treat `LockoutStatus::LogUnavailable` as a
+    /// pass — reasonable when a person is reading the result and can get
+    /// back in. The cron reads the SSH log through `read_log_for`, which
+    /// falls back to `journalctl` and can legitimately come back with
+    /// nothing, and "the check could not run" is not "the check passed"
+    /// when nobody is watching. So this path applies only when the guard
+    /// actually ran and found nothing, which is stricter than the button.
+    pub fn get_auto_apply_firewall(&self) -> Result<bool> {
+        self.get_bool_setting("auto_apply_firewall", false)
+    }
+
+    pub fn set_auto_apply_firewall(&self, auto: bool) -> Result<()> {
+        self.set_bool_setting("auto_apply_firewall", auto)
+    }
+
     pub fn get_serve_robots_txt(&self) -> Result<bool> {
         self.get_bool_setting("serve_robots_txt", false)
     }
