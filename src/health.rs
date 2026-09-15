@@ -498,11 +498,82 @@ fn script_freshness(db: &Db, expected: usize) -> Result<Check> {
         },
         detail: match (untouched, stale) {
             (true, _) => "no rules to render yet".to_string(),
-            (_, true) => format!("the rules changed since the last render ({expected} now)"),
+            (_, true) => {
+                let changed = format!("the rules changed since the last render ({expected} now)");
+                match scheduled_render(db)? {
+                    Some(at) => format!("{changed}. Will auto-render at {}", format_utc(at)),
+                    None => changed,
+                }
+            }
             (_, false) => "up to date".to_string(),
         },
         fix: (stale && !untouched).then(|| "render the firewall script again".to_string()),
     })
+}
+
+/// When the internal cron will next render the firewall by itself, or
+/// `None` if this host cannot be promised that it will.
+///
+/// Two cases return `None`, and both are the difference between "will" and
+/// "might". A `RenderFirewall` job that has never run means nothing has
+/// ever driven the internal cron here — a host configured entirely from
+/// the CLI, where the answer is never. A projected time already in the
+/// *past* means the job is overdue, which is not a schedule either: it
+/// runs within the minute if a front-end is ticking, and never if the one
+/// that used to be has stopped. Naming a time that has been and gone is
+/// the one thing worse than naming none.
+///
+/// The remaining false promise is a front-end stopped since its last run,
+/// where a future time is still projected. That is deliberate rather than
+/// missed: the console is only one of the things that drives this cron
+/// (the TUI does, and so does `stop-bots batch` from a real crontab), so
+/// there is no signal that distinguishes them, and the `service-health`
+/// check immediately below already reports a console that is not running.
+fn scheduled_render(db: &Db) -> Result<Option<i64>> {
+    let at = crate::cron::next_run_at(db, crate::cron::CronJob::RenderFirewall)?;
+    Ok(at.filter(|at| *at > now_secs()))
+}
+
+/// `secs` (Unix seconds) as `YYYY-MM-DD HH:MM UTC`.
+///
+/// The only absolute time this project formats — every other one it shows
+/// is relative ("2h ago", and see `tui::dashboard::format_relative_time`),
+/// which is why there is no date crate in the tree to ask. A relative
+/// "in 6h" would have been the house style, but this string answers "has
+/// it happened yet?" for someone reading a report rather than watching a
+/// screen, and a fixed moment survives being read an hour later.
+///
+/// UTC rather than local time, and labelled as such: resolving a local
+/// zone needs a database this does not carry, and an unlabelled time an
+/// admin misreads by an hour is worse than one they have to convert.
+///
+/// The arithmetic is Howard Hinnant's `civil_from_days`, which shifts the
+/// epoch to 0000-03-01 so that a leap day falls at the end of a cycle
+/// rather than inside one — after that shift the month lengths repeat on
+/// a fixed pattern and no case needs special-casing. `div_euclid`/
+/// `rem_euclid` rather than `/` and `%` so that a pre-1970 (negative)
+/// timestamp floors instead of truncating toward zero.
+fn format_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let seconds_into_day = secs.rem_euclid(86_400);
+    let (hour, minute) = (seconds_into_day / 3_600, (seconds_into_day % 3_600) / 60);
+
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_shifted = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_shifted + 2) / 5 + 1;
+    let month = if month_shifted < 10 {
+        month_shifted + 3
+    } else {
+        month_shifted - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
 fn nginx_applied(db: &Db) -> Result<Check> {
@@ -1094,6 +1165,106 @@ mod tests {
         assert_eq!(check(&report, "script-fresh").level, Level::Warn);
     }
 
+    /// A stale script the internal cron is going to fix by itself should
+    /// say when, so that the warning reads as "already in hand" rather
+    /// than "go and do something". The time is the `RenderFirewall` job's
+    /// last run plus its interval.
+    #[test]
+    fn a_stale_script_the_cron_will_fix_says_when_it_will_happen() {
+        let db = db();
+        with_rules(&db, 3);
+        // Ran an hour ago, so the next daily render is 23 hours out.
+        let last_run = now_secs() - 3_600;
+        db.set_cron_last_run(
+            crate::cron::CronJob::RenderFirewall.id(),
+            last_run,
+            "rendered",
+        )
+        .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+
+        let check = check(&report, "script-fresh");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains(&format!(
+                "Will auto-render at {}",
+                format_utc(last_run + 24 * 60 * 60)
+            )),
+            "no scheduled time in: {}",
+            check.detail
+        );
+    }
+
+    /// A host whose cron has never rendered gets no promise. Nothing has
+    /// ever driven the internal cron there — configured from the CLI, say
+    /// — and on that host the answer is "never", not "soon".
+    #[test]
+    fn a_stale_script_with_no_cron_history_promises_nothing() {
+        let db = db();
+        with_rules(&db, 3);
+
+        let report = assess(&db, &healthy()).unwrap();
+
+        let check = check(&report, "script-fresh");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            !check.detail.contains("auto-render"),
+            "promised a render nothing is scheduled to do: {}",
+            check.detail
+        );
+    }
+
+    /// An overdue job is not a schedule. Its projected time has already
+    /// been and gone, and naming it would tell a reader the render was due
+    /// yesterday — which says nothing about whether one is coming.
+    #[test]
+    fn a_stale_script_whose_render_is_overdue_promises_nothing() {
+        let db = db();
+        with_rules(&db, 3);
+        // Two days ago, against a daily interval: long overdue.
+        db.set_cron_last_run(
+            crate::cron::CronJob::RenderFirewall.id(),
+            now_secs() - 2 * 24 * 60 * 60,
+            "rendered",
+        )
+        .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+
+        let check = check(&report, "script-fresh");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            !check.detail.contains("auto-render"),
+            "named a time in the past: {}",
+            check.detail
+        );
+    }
+
+    /// The line belongs to the warning, not to the check: a script that
+    /// matches the rules has nothing to say about a future render.
+    #[test]
+    fn an_up_to_date_script_says_nothing_about_auto_rendering() {
+        let db = db();
+        with_rules(&db, 3);
+        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(
+            &crate::firewall::all_rules(&db).unwrap(),
+        ))
+        .unwrap();
+        db.set_cron_last_run(
+            crate::cron::CronJob::RenderFirewall.id(),
+            now_secs() - 3_600,
+            "rendered",
+        )
+        .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+        let check = check(&report, "script-fresh");
+
+        assert_eq!(check.level, Level::Ok);
+        assert!(!check.detail.contains("auto-render"), "{}", check.detail);
+    }
+
     /// `systemctl is-active` says "inactive" both for a stopped unit and
     /// for one that was never installed. Calling a host with no console
     /// "CRITICAL: installed but not running" is the false alarm that gets
@@ -1290,6 +1461,28 @@ mod tests {
 
         assert_eq!(check.level, Level::Ok);
         assert_eq!(check.detail, "in memory");
+    }
+
+    /// Cross-checked against `date -u -d @<epoch>` rather than against the
+    /// same arithmetic written twice. The cases are the ones that break a
+    /// hand-rolled civil-date conversion: both kinds of leap year (2000 is
+    /// one, being divisible by 400; 2024 the ordinary kind), the epoch
+    /// itself, a negative timestamp, and the far end of the range.
+    #[test]
+    fn format_utc_agrees_with_the_calendar() {
+        assert_eq!(format_utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_utc(951_782_400), "2000-02-29 00:00 UTC");
+        assert_eq!(format_utc(1_709_164_800), "2024-02-29 00:00 UTC");
+        assert_eq!(format_utc(1_789_483_239), "2026-09-15 14:40 UTC");
+        assert_eq!(format_utc(253_402_300_799), "9999-12-31 23:59 UTC");
+    }
+
+    /// A pre-epoch timestamp must floor, not truncate toward zero — `/`
+    /// and `%` would put this on 1970-01-01 at a negative hour.
+    #[test]
+    fn format_utc_handles_a_time_before_the_epoch() {
+        assert_eq!(format_utc(-86_400), "1969-12-31 00:00 UTC");
+        assert_eq!(format_utc(-1), "1969-12-31 23:59 UTC");
     }
 
     #[test]

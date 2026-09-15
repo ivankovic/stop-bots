@@ -171,6 +171,25 @@ pub fn is_due(db: &Db, job: CronJob) -> Result<bool> {
     })
 }
 
+/// When `job` is next expected to run — its last run plus its interval —
+/// or `None` if it has never run, since nothing can be projected from a
+/// job with no history.
+///
+/// A returned time in the *past* means the job is overdue rather than
+/// scheduled: it runs at the next tick if a front-end is driving the
+/// internal cron, and never if one is not. Callers that want to promise a
+/// time to a reader have to check that for themselves — see
+/// `health::script_freshness`, which is the reason this exists.
+///
+/// Deliberately next to [`is_due`] and built from the same two values, so
+/// the projected time and the due-check can never disagree about what
+/// [`CronJob::interval`] means.
+pub fn next_run_at(db: &Db, job: CronJob) -> Result<Option<i64>> {
+    Ok(db
+        .get_cron_last_run(job.id())?
+        .map(|last_run| last_run + job.interval().as_secs() as i64))
+}
+
 /// Every job that's currently due, in [`CronJob::all()`] order.
 pub fn due_jobs(db: &Db) -> Result<Vec<CronJob>> {
     CronJob::all()

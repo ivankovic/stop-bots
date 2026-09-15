@@ -4928,3 +4928,61 @@ it is a table rebuild, and this project still has no migration runner.
 A hard byte cap on the file: SQLite offers no way to enforce one that
 does not end in a failed write, and bounded retention plus a visible size
 is the version that actually holds.
+
+## "Will auto-render at ..." on the stale-script warning (`health::script_freshness`, `cron::next_run_at`)
+
+The firewall-staleness warning told an admin the rules had changed since
+the last render and suggested they render again. On a host running the
+console that is misleading advice: the internal cron renders daily by
+itself, so the warning is a notice, not a task. It now names the time —
+`the rules changed since the last render (44077 now). Will auto-render at
+2026-09-15 14:40 UTC`.
+
+**The time comes from `cron::next_run_at`, not from arithmetic in
+`health`.** It sits beside `is_due` and is built from the same last-run
+row and the same `CronJob::interval`, so the projected time and the
+due-check cannot disagree about what "daily" means.
+
+**Two cases deliberately say nothing, and both are the difference between
+"will" and "might".** A `RenderFirewall` job that has never run means
+nothing has ever driven the internal cron on this host — one configured
+entirely from the CLI, where the honest answer is never. A projected time
+already in the past means the job is *overdue*, which is not a schedule
+either: it renders within the minute if a front-end is ticking and never
+if the one that used to be has stopped. Naming a time that has been and
+gone is worse than naming none.
+
+The remaining false promise — a front-end stopped since its last run,
+where a future time is still projected — is accepted rather than missed.
+The console is only one of the things that drives this cron (the TUI does,
+and so does `stop-bots batch` from a real crontab), so no available signal
+distinguishes "will render" from "would have rendered"; and the
+`service-health` check immediately below already reports a console that
+is not running.
+
+**`format_utc` is the only absolute time this project formats.** Every
+other one it shows is relative ("2h ago"), which is why there is no date
+crate in the tree to ask, and a relative "in 6h" would have been the house
+style. Absolute won because this string answers "has it happened yet?" for
+someone reading a report rather than watching a screen, and a fixed moment
+survives being read an hour later. UTC and labelled: resolving a local
+zone needs a database the binary does not carry, and an unlabelled time an
+admin misreads by an hour is worse than one they have to convert. The
+arithmetic is Howard Hinnant's `civil_from_days`, tested against
+`date -u` rather than against itself — both kinds of leap year, the epoch,
+a negative timestamp, and 9999-12-31.
+
+**A gap the change surfaced.** The TUI's one-line status strip maps each
+check id to a one-word label and falls back to the id itself, so the
+`database-size` check added in the previous pass had been rendering as
+"database-size" among "disk", "logs" and "script". The fallback keeps that
+readable rather than correct, so nothing noticed. There is now a test that
+walks every check `assess` produces and fails on any that falls through —
+verified by removing the label and watching it fail.
+
+**Considered and rejected.** Gating the line on `Probe::unit_active`: it
+would be wrong on a host driven by `stop-bots batch` from a crontab, which
+has no console unit and does auto-render. Changing the `fix` line when a
+render is scheduled: rendering by hand is still a real thing an admin can
+do to fix it sooner, so the suggestion stands. Adding `chrono` or `jiff`
+for one format string, in a tree that has neither.

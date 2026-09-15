@@ -21,6 +21,14 @@ need.
   free space on the *filesystem*, which says nothing about how big this
   tool's own database has become.
 
+- **"Generated script matches the rules" now says when the script will
+  render itself.** A stale script the internal cron is about to fix is a
+  different situation from one waiting on somebody, and the warning read
+  the same either way. It now adds "Will auto-render at
+  2026-09-15 14:40 UTC" when there is a scheduled render to name — and
+  deliberately says nothing on a host whose cron has never rendered, or
+  whose render is already overdue, because neither is a schedule.
+
 ### Fixed
 
 - **The database no longer grows without bound.** On a live host it had

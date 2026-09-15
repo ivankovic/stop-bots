@@ -559,6 +559,7 @@ fn short_check_label(id: &str) -> String {
         "nginx-applied" => "nginx",
         "service-health" => "console",
         "disk-room" => "disk",
+        "database-size" => "database",
         "log-sources" => "logs",
         other => other,
     }
@@ -649,6 +650,29 @@ mod tests {
             assert_eq!(
                 busy_label(&several).as_deref(),
                 Some("Update crawler IP ranges (scheduled) (+2 more)")
+            );
+        }
+    }
+
+    /// Every check the report can produce needs a one-word name. The strip
+    /// is a single line across every screen, and an id falling through to
+    /// itself is both longer than its neighbours and in a different style
+    /// ("database-size" among "disk", "logs", "script"). The fallback
+    /// keeps that readable rather than correct, so without this nothing
+    /// notices a new check arriving without a label — which is exactly
+    /// what happened when the database-size check was added.
+    #[test]
+    fn every_health_check_has_a_short_label() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let report = crate::health::assess(&db, &crate::health::Probe::default()).unwrap();
+
+        assert!(!report.checks.is_empty(), "no checks to speak of");
+        for check in &report.checks {
+            assert_ne!(
+                short_check_label(check.id),
+                check.id,
+                "{} fell through to its own id",
+                check.id
             );
         }
     }
