@@ -50,6 +50,7 @@
 //! different, much riskier feature than this one.
 
 use crate::db::Db;
+use crate::nginx::NginxCommands;
 use crate::protection::Detector;
 use anyhow::{Context, Result};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -75,6 +76,10 @@ pub enum CronJob {
     /// that accumulates forever and hands back the free pages that churn
     /// leaves behind. See [`maintenance`].
     Maintenance,
+    /// Re-applies site configs that have fallen behind the database, and
+    /// reloads NGINX — but only when the admin has switched
+    /// `Db::get_auto_apply` on. See [`apply_nginx`].
+    ApplyNginx,
 }
 
 impl CronJob {
@@ -87,6 +92,7 @@ impl CronJob {
                 CronJob::RenderFirewall,
                 CronJob::HealthCheck,
                 CronJob::Maintenance,
+                CronJob::ApplyNginx,
             ])
             .collect()
     }
@@ -104,6 +110,7 @@ impl CronJob {
             CronJob::RenderFirewall => "render_firewall",
             CronJob::HealthCheck => "health_check",
             CronJob::Maintenance => "maintenance",
+            CronJob::ApplyNginx => "apply_nginx",
         }
     }
 
@@ -116,6 +123,7 @@ impl CronJob {
             CronJob::RenderFirewall => "Render firewall script",
             CronJob::HealthCheck => "Check system health",
             CronJob::Maintenance => "Prune and compact the database",
+            CronJob::ApplyNginx => "Auto-apply NGINX config",
         }
     }
 
@@ -136,7 +144,13 @@ impl CronJob {
             // so this is not something to do per render — but a host that
             // silently stopped being protected should not stay that way
             // for a day either.
-            CronJob::HealthCheck => Duration::from_secs(60 * 60),
+            // Hourly, and deliberately not faster. The detectors run every
+            // minute and each new block changes the generated config, so a
+            // one-minute interval here would mean reloading a live NGINX
+            // every time one bot arrived. An hour bounds the reloads while
+            // still being far inside "I turned the switch on and it
+            // happened".
+            CronJob::HealthCheck | CronJob::ApplyNginx => Duration::from_secs(60 * 60),
             CronJob::Detect(_) | CronJob::RecordAccessStats => Duration::from_secs(60),
         }
     }
@@ -251,7 +265,8 @@ pub fn uses_ssh_log(job: CronJob) -> bool {
         CronJob::RecordAccessStats
         | CronJob::UpdateIpRanges
         | CronJob::HealthCheck
-        | CronJob::Maintenance => false,
+        | CronJob::Maintenance
+        | CronJob::ApplyNginx => false,
     }
 }
 
@@ -332,6 +347,9 @@ pub fn run_log_job(
         }
         CronJob::Maintenance => {
             unreachable!("Maintenance is run via maintenance, which needs no log")
+        }
+        CronJob::ApplyNginx => {
+            unreachable!("ApplyNginx is run via apply_nginx, which needs the config root")
         }
     };
     db.set_cron_last_run(job.id(), now(), &summary)?;
@@ -436,6 +454,68 @@ pub fn maintenance(db: &Db) -> String {
     }
 
     parts.join(", ")
+}
+
+/// Re-applies every known site's config and reloads NGINX, when — and
+/// only when — `Db::get_auto_apply` is on.
+///
+/// The gap this closes: a detector blocking one new user agent changes
+/// the generated sentinel block, which puts every applied site back to
+/// `STALE` within the minute. Nothing in the internal cron applied that,
+/// so a host left to itself drifted further from its own configuration
+/// every day, and the health report's "NGINX blocks are applied" warning
+/// was the only sign.
+///
+/// **The toggle is read before any work, not after.** `apply_all_sites`
+/// walks every config file under `root`; on a host with the switch off
+/// that should not happen hourly. Same convention the detectors follow —
+/// see `protection`'s module docs.
+///
+/// `reload` is the front-end's "do things for real" flag (`stop-bots web
+/// --no-apply`, the TUI's `reload_nginx`). False still writes the config,
+/// because a written config is inert until something reloads it — the
+/// same split every other apply path here makes.
+///
+/// Never fails, like every other job: a reload that NGINX rejects becomes
+/// the recorded summary, which is what puts it in front of an admin on
+/// the Scheduled tasks panel. Returning an error instead would reach
+/// `run_due_jobs`, which prints to stderr and moves on — so on the one
+/// host where this matters, a broken config would fail silently every
+/// hour.
+pub fn apply_nginx(db: &Db, root: &std::path::Path, reload: bool) -> String {
+    match db.get_auto_apply() {
+        Ok(false) => return "auto-apply is off".to_string(),
+        Ok(true) => {}
+        Err(err) => return format!("error: {err}"),
+    }
+
+    let applied = match crate::nginx::apply_all_sites(db, root) {
+        Ok(applied) => applied,
+        Err(err) => return format!("error: {err}"),
+    };
+
+    // Writing the sentinel block does nothing until NGINX re-reads it, so
+    // there is nothing to reload when nothing changed on disk — the same
+    // condition `apply-blocks` and `batch` both gate on, and the reason
+    // an hourly job on a quiet host costs one directory walk rather than
+    // one `systemctl reload`.
+    if applied.changed == 0 {
+        return format!("{} site(s) already up to date", applied.sites);
+    }
+
+    let mut summary = format!(
+        "applied {} site(s), {} file(s) changed",
+        applied.sites, applied.changed
+    );
+    if !reload {
+        summary.push_str(", not reloaded");
+        return summary;
+    }
+    match NginxCommands::from_db(db).and_then(|commands| crate::nginx::reload_with(&commands)) {
+        Ok(()) => summary.push_str(", reloaded"),
+        Err(err) => summary.push_str(&format!(", but the reload failed: {err:#}")),
+    }
+    summary
 }
 
 /// Takes a health probe and records it, for the dashboards to read.
@@ -628,6 +708,49 @@ mod tests {
 
     fn test_db() -> Db {
         Db::open_in_memory().unwrap()
+    }
+
+    /// The safety property the whole switch rests on: off means *nothing
+    /// happens*, not "happens and is discarded".
+    ///
+    /// The root here does not exist, so `discover_sites` would bail the
+    /// moment anything walked it and the summary would start with
+    /// "error:". Getting the plain off message back is proof the toggle
+    /// was read first — which is what keeps an hourly job on a host that
+    /// never asked for it from walking the config tree twenty-four times
+    /// a day.
+    #[test]
+    fn apply_nginx_does_nothing_at_all_when_the_switch_is_off() {
+        let db = test_db();
+        assert!(!db.get_auto_apply().unwrap(), "off is the default");
+
+        let summary = apply_nginx(&db, std::path::Path::new("/nonexistent/nginx"), false);
+
+        assert_eq!(summary, "auto-apply is off");
+    }
+
+    /// The switched-*on* path is covered in `tests/cli.rs`, not here.
+    /// Exercising it means calling `apply_all_sites`, which resolves the
+    /// managed directory from `STOP_BOTS_NGINX_DIR` and would delete
+    /// `/etc/stop-bots/nginx/robots.txt` on a machine that has one — so a
+    /// test has to point that variable somewhere safe. The variable is
+    /// process-global, this binary runs its tests in threads under plain
+    /// `cargo test`, and `nginx::tests::kitchen_sink_block_matches_the_golden`
+    /// asserts against a golden holding the *default* path. Setting it
+    /// anywhere in this binary breaks that golden, which is exactly how
+    /// this was found.
+    ///
+    /// A job missing from `all()` is one the internal cron never runs and
+    /// the dashboards never list.
+    #[test]
+    fn apply_nginx_is_a_scheduled_job() {
+        assert!(CronJob::all().contains(&CronJob::ApplyNginx));
+        assert!(!uses_ssh_log(CronJob::ApplyNginx));
+        assert_eq!(CronJob::ApplyNginx.id(), "apply_nginx");
+        // Hourly, not per-minute: every block a detector adds changes the
+        // generated config, and a minute-interval job would reload a live
+        // NGINX every time one bot arrived.
+        assert_eq!(CronJob::ApplyNginx.interval().as_secs(), 60 * 60);
     }
 
     #[test]

@@ -613,6 +613,28 @@ enum Command {
         #[arg(long, action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Turn automatic applying of NGINX config on or off.
+    ///
+    /// When on, the internal cron (the one inside `stop-bots web` or the
+    /// TUI, not this command) re-writes every site's generated block and
+    /// reloads NGINX once an hour, whenever they have fallen behind the
+    /// database. That happens constantly on a busy host: every user agent
+    /// a detector blocks changes the generated block, which puts every
+    /// site back to STALE within the minute.
+    ///
+    /// Off by default. It reloads a live web server with nobody watching,
+    /// which is not something an upgrade should start doing on its own.
+    ///
+    /// NGINX only. The firewall script is rendered on a schedule but never
+    /// applied on one, and this does not change that: its anti-lockout
+    /// guard passes when it cannot read the SSH log, which is fine with a
+    /// human reading the result and is how you lose a server without one.
+    SetAutoApply {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
     /// Prints the robots.txt that would currently be generated, without
     /// writing anything
     ShowRobotsTxt {
@@ -1224,6 +1246,7 @@ async fn main() -> Result<()> {
             remove,
         }) => exempt_path(db, site, path, remove),
         Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
+        Some(Command::SetAutoApply { db, enabled }) => set_auto_apply(db, enabled),
         Some(Command::ShowRobotsTxt { db }) => show_robots_txt(db),
     }
 }
@@ -1855,6 +1878,27 @@ fn exempt_path(db_path: Option<PathBuf>, site: String, path: String, remove: boo
         println!("{}: {trimmed} is exempt from blocking", site.server_name);
     }
     println!("Run `stop-bots apply-blocks` to write it into the site config.");
+    Ok(())
+}
+
+fn set_auto_apply(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_auto_apply(enabled)?;
+    println!(
+        "Automatic NGINX applying {}",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    if enabled {
+        // Says where the work happens, because it is not here. Someone who
+        // sets this from a shell on a host with no console running has
+        // turned on a switch nothing will ever read, and the only sign
+        // would be that nothing happens.
+        println!(
+            "The internal cron applies and reloads within the hour \u{2014} it runs inside \
+             `stop-bots web` or the TUI, so one of those has to be running. The firewall \
+             script is not covered: apply it yourself, or with `stop-bots batch --apply`."
+        );
+    }
     Ok(())
 }
 
@@ -2731,6 +2775,67 @@ fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An explicit `--ssh-log` that cannot be read must say so about *that
+    /// path*, and must not claim the other two sources were tried — they
+    /// were not. The wording is the whole point of the test: a message
+    /// describing a search that never happened is what sends the reader
+    /// hunting for a bug in the fallback chain instead of looking at the
+    /// path they passed.
+    #[test]
+    fn an_unreadable_explicit_ssh_log_names_the_path_it_was_given() {
+        let err = read_ssh_log(Some(Path::new("/nonexistent/auth.log")))
+            .expect_err("a missing file should not read");
+        let said = err.to_string();
+
+        assert!(
+            said.contains("/nonexistent/auth.log"),
+            "the path the operator passed is missing from: {said}"
+        );
+        assert!(
+            !said.contains("tried /var/log/auth.log"),
+            "it claimed a search it did not perform: {said}"
+        );
+        assert!(
+            said.contains("journalctl"),
+            "it should say dropping the flag reaches journalctl: {said}"
+        );
+    }
+
+    /// With no override the search really does happen, so naming all three
+    /// sources is correct here.
+    #[test]
+    fn an_ssh_log_search_that_finds_nothing_names_every_source() {
+        // Hermetic only in the sense that matters: if this host *does* have
+        // a readable SSH log, the search succeeds and there is no message
+        // to check. Asserting on the error in that case would make the test
+        // fail on developer machines for a reason unrelated to the code.
+        if let Err(err) = read_ssh_log(None) {
+            let said = err.to_string();
+            assert!(
+                said.contains("/var/log/auth.log")
+                    && said.contains("/var/log/secure")
+                    && said.contains("journalctl"),
+                "a real search should name all three sources: {said}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_explicit_access_log_names_the_path_it_was_given() {
+        let err = read_access_log(Some(Path::new("/nonexistent/access.log")))
+            .expect_err("a missing file should not read");
+        let said = err.to_string();
+
+        assert!(
+            said.contains("/nonexistent/access.log"),
+            "the path the operator passed is missing from: {said}"
+        );
+        assert!(
+            !said.contains("tried /var/log/nginx/access.log"),
+            "it claimed a search it did not perform: {said}"
+        );
+    }
 
     #[test]
     fn resolve_user_db_path_prefers_xdg_data_home() {

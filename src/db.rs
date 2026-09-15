@@ -1419,6 +1419,32 @@ impl Db {
         Ok(())
     }
 
+    /// Whether the internal cron re-applies site configs (and reloads
+    /// NGINX) on its own when they fall behind the database — see
+    /// `cron::apply_nginx`.
+    ///
+    /// **Off by default, and it has to be.** Every other default in this
+    /// project decides what gets *written*; this one decides whether a
+    /// machine reloads a live web server with nobody watching. Turning it
+    /// on by default would change that on every existing install the
+    /// moment it upgraded, which is not a decision an upgrade gets to
+    /// make on an admin's behalf.
+    ///
+    /// Only the NGINX half. The firewall script is rendered on a schedule
+    /// but never applied on one, and this switch does not change that:
+    /// its anti-lockout guard passes when it *cannot read the SSH log*
+    /// (`LockoutStatus::LogUnavailable`), which is survivable when a human
+    /// is looking at the result and is how you lose a server at 3am when
+    /// nobody is. NGINX has a real pre-check in `nginx -t` and a bounded
+    /// failure mode; the firewall has neither, unattended.
+    pub fn get_auto_apply(&self) -> Result<bool> {
+        self.get_bool_setting("auto_apply", false)
+    }
+
+    pub fn set_auto_apply(&self, auto: bool) -> Result<()> {
+        self.set_bool_setting("auto_apply", auto)
+    }
+
     pub fn get_serve_robots_txt(&self) -> Result<bool> {
         self.get_bool_setting("serve_robots_txt", false)
     }

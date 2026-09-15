@@ -9,6 +9,26 @@ need.
 
 ### Added
 
+- **An "Auto-apply" switch.** With it on, the internal cron re-writes every
+  site's generated block and reloads NGINX once an hour, whenever they have
+  fallen behind the database — which happens constantly on a busy host,
+  because every user agent a detector blocks changes the generated block
+  and puts every site back to STALE within the minute. Until now nothing
+  applied that on a schedule, so a host left alone drifted further from its
+  own configuration every day and the health report's "NGINX blocks are
+  applied" warning was the only sign.
+
+  On the Site settings screen in the TUI, under Sites in the web UI, or
+  `stop-bots set-auto-apply --enabled true`. **Off by default**, and it
+  stays off on upgrade: it reloads a live web server with nobody watching,
+  which is not a decision an upgrade gets to make.
+
+  NGINX only. The firewall script is rendered on a schedule but still never
+  applied on one — its anti-lockout guard passes when it *cannot read* the
+  SSH log, which is survivable with a human reading the result and is how
+  you lose a server without one. `stop-bots batch --apply` remains the way
+  to automate that, with the SSH log pointed at explicitly.
+
 - **A daily maintenance job, and `stop-bots maintain` to run it now.** It
   prunes `user_agent_stats` rows for agents not seen in 90 days (and any
   excess over 20,000, least recently seen first), clears lapsed firewall

@@ -5038,3 +5038,84 @@ one-word labels with a fallback to the id itself, so the `database-size`
 check had been rendering as "database-size" among "disk", "logs" and
 "script"; it has a label, and a test now walks every check `assess`
 produces so the next one cannot slip through.
+
+## Auto-apply (`Db::get_auto_apply`, `CronJob::ApplyNginx`, `cron::apply_nginx`)
+
+Every user agent a detector blocks changes the generated sentinel block,
+which puts every applied site back to `STALE` within the minute. Nothing
+in the internal cron applied that, so a host left to itself drifted
+further from its own configuration every day; the health report's "NGINX
+blocks are applied" warning was the only sign, and it is the one that
+turned up on a real host two hours after a deploy, from a single detector
+blocking a single scanner.
+
+**One setting, off by default.** Every other default here decides what
+gets *written*. This one decides whether a machine reloads a live web
+server with nobody watching, so defaulting it on would change that on
+every existing install the moment it upgraded — which is not a decision
+an upgrade gets to make on an admin's behalf.
+
+**NGINX only, deliberately.** The firewall script is already rendered on
+a schedule and still is never applied on one. Its anti-lockout guard
+treats `LockoutStatus::LogUnavailable` as a pass, and the cron's SSH-log
+read falls back to `journalctl` and can come back empty — a guard that
+silently no-ops when it cannot read a log is survivable when a human is
+reading the result and is how a server is lost at 3am when none is. NGINX
+has a real pre-check in `nginx -t` and a bounded failure mode; the
+firewall has neither, unattended. `batch --apply`, with `--ssh-log`
+pointed at a real file, remains the supported way to automate that half.
+
+**The toggle is read before any work.** `apply_all_sites` walks every
+config file under the root; on a host with the switch off that must not
+happen hourly. Same convention the detectors follow. The test for it
+points the job at a root that does not exist: `discover_sites` bails on a
+missing root, so getting the plain "auto-apply is off" summary back —
+rather than an error — is proof nothing walked.
+
+**Hourly, and not faster.** The detectors run every minute and each new
+block changes the config, so a minute-interval job would reload a live
+NGINX every time one bot arrived. The reload is further gated on
+`changed > 0`, the same condition `apply-blocks` and `batch` use, so an
+hourly pass on a quiet host costs one directory walk rather than one
+`systemctl reload`.
+
+**A failure has to become the summary, not an error.** `run_due_jobs`
+reports a failed job to `eprintln!` and carries on, and `record_run`
+swallows write failures — so a config NGINX rejects would fail silently
+every hour on the one host where it matters. `apply_nginx` never returns
+an error: a rejected reload lands in the recorded summary, which is what
+puts it on the Scheduled tasks panel.
+
+**Two front-ends, two shapes, one reason.** The console runs the whole
+job inside one `with_db` closure: `with_db` is already a `spawn_blocking`
+task, and the config write and the reload that publishes it should not be
+separated by a window in which another request rewrites the same files.
+The TUI cannot do that — `Db` is not `Sync`, and `apply_all_sites` plus
+`nginx -t` plus `systemctl reload` is seconds with nothing redrawing — so
+it starts the *same* work the operator's own "Apply everything" starts,
+through `start_site_action`, whose plan/run split already puts the `Db`
+reads on the main thread and the file writes on the blocking pool, and
+whose `finish_site_apply` already chains the reload behind the same
+flag. A `cron_apply_nginx` flag marks that the run was the cron's, so the
+outcome is recorded against the job; it comes back down immediately if
+the apply refused to start, or the *operator's* next apply would be
+recorded as this job's.
+
+**Where the switch lives.** `NginxSetting`, on the Site settings screen,
+beside Block response, robots.txt and Rate limit — not on the Dashboard,
+whose panel is explicitly "what adds firewall blocks without me doing
+anything?", and not in `protection.rs`, whose module doc says everything
+there gates a detector writing `firewall_rules` rows and never NGINX
+config. It is the one row on that screen that does not change the *text*
+of the generated block; it decides who writes it, which is why it belongs
+directly above the list showing which sites are stale.
+
+**Considered and rejected.** A single switch covering the firewall too —
+see above; if that is ever wanted it is a second switch with its own
+defaults argument. Defaulting on for new installs only: "new" is
+indistinguishable from "existing" by the time `Db::open` runs, and a
+default that depends on install date is a default nobody can reason
+about. Making the CLI's `set-auto-apply` apply immediately: a `set-`
+subcommand that reloaded NGINX would be the worst surprise available from
+a command whose name says it sets a value — there is a test that it
+rewrites no config.

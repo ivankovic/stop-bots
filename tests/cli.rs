@@ -2815,6 +2815,98 @@ fn install_web_refuses_a_host_that_is_not_debian() {
         .stderr(predicate::str::contains("not look like Debian"));
 }
 
+// ---- auto-apply ----
+
+/// The switch itself: off by default, settable, and readable back.
+///
+/// Off by default is the part worth pinning. Every other default in this
+/// project decides what gets *written*; this one decides whether a machine
+/// reloads a live web server unattended, and an upgrade must not start
+/// doing that on an existing install's behalf.
+#[test]
+fn auto_apply_is_off_until_it_is_turned_on() {
+    let fixture = Fixture::new();
+
+    fixture.run(&["set-auto-apply", "--enabled", "false"]);
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    assert!(!db.get_auto_apply().unwrap(), "off is the default");
+    drop(db);
+
+    fixture
+        .run(&["set-auto-apply", "--enabled", "true"])
+        .stdout(predicate::str::contains("enabled"))
+        // Says where the work happens, because it is not in this command:
+        // setting this on a host with no console running turns on a switch
+        // nothing will ever read.
+        .stdout(predicate::str::contains("internal cron"));
+
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    assert!(db.get_auto_apply().unwrap());
+}
+
+/// Turning the switch on must not, by itself, apply anything: the CLI sets
+/// a flag, and the internal cron inside the console or the TUI is what acts
+/// on it. A `set-` command that quietly reloaded NGINX would be the worst
+/// possible surprise from a subcommand whose name says "set".
+#[test]
+fn setting_auto_apply_does_not_itself_touch_any_config() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    let site = fixture.write_site("example.com");
+    let before = fs::read_to_string(&site).unwrap();
+
+    fixture.run(&["set-auto-apply", "--enabled", "true"]);
+
+    assert_eq!(
+        fs::read_to_string(&site).unwrap(),
+        before,
+        "setting the switch rewrote a site config"
+    );
+}
+
+/// The switched-on path, end to end: a config that has fallen behind the
+/// database is rewritten, and a second pass finds nothing left to do.
+///
+/// Lives here rather than beside the code because `apply_all_sites`
+/// resolves its managed directory from `STOP_BOTS_NGINX_DIR`, and with
+/// robots.txt and rate limiting both off it *deletes* the files that
+/// variable points at — `/etc/stop-bots/nginx/robots.txt` on a machine
+/// that has one. So the variable has to be pointed somewhere safe, and it
+/// is process-global: setting it in the library's own test binary breaks
+/// `nginx::tests::kitchen_sink_block_matches_the_golden`, whose golden
+/// holds the default path. Nothing in this binary reads that default —
+/// every other test here passes the directory to a spawned command — so
+/// this is the one place it can be set without breaking something else.
+///
+/// `reload` is false: a test that let the reload through would run
+/// `systemctl reload nginx` on whatever machine hosts the suite.
+#[test]
+fn auto_apply_rewrites_a_stale_site_config_and_then_leaves_it_alone() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    let site = fixture.write_site("example.com");
+    unsafe { std::env::set_var("STOP_BOTS_NGINX_DIR", &fixture.managed) };
+
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    db.set_auto_apply(true).unwrap();
+
+    let summary = stop_bots::cron::apply_nginx(&db, &fixture.nginx_root, false);
+    assert!(summary.contains("applied 1 site(s)"), "{summary}");
+    assert!(summary.contains("1 file(s) changed"), "{summary}");
+    // The reload is the step with a side effect outside this project's
+    // files, so "did not reload" is said rather than assumed.
+    assert!(summary.contains("not reloaded"), "{summary}");
+    assert!(
+        fs::read_to_string(&site).unwrap().contains("stop-bots"),
+        "the generated block never reached the config"
+    );
+
+    // Nothing changed on disk the second time, so there is nothing to
+    // reload — what makes an hourly job cheap on a quiet host.
+    let again = stop_bots::cron::apply_nginx(&db, &fixture.nginx_root, false);
+    assert_eq!(again, "1 site(s) already up to date");
+}
+
 // ---- maintenance ----
 
 /// The flow an admin reaches for after looking at `du`: prune what has

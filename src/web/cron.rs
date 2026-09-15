@@ -99,6 +99,7 @@ pub async fn tick(state: &AppState) -> usize {
             }
             CronJob::HealthCheck => health_check(state).await,
             CronJob::Maintenance => maintenance(state).await,
+            CronJob::ApplyNginx => apply_nginx(state).await,
         };
         match result {
             Ok(()) => ran += 1,
@@ -106,6 +107,33 @@ pub async fn tick(state: &AppState) -> usize {
         }
     }
     ran
+}
+
+/// Re-applies site configs and reloads NGINX, when the admin has switched
+/// auto-apply on.
+///
+/// Off the async runtime rather than merely off the lock: `apply_all_sites`
+/// walks the whole config root and the reload shells out to `nginx -t` and
+/// `systemctl`, none of which belongs on a thread that is meant to be
+/// serving requests. `with_db` already runs its closure via
+/// `spawn_blocking`, so putting the whole job inside one closure is both
+/// the simplest shape and the right one — the config write and the reload
+/// that publishes it should not be separated by a window in which another
+/// request can write the same files.
+///
+/// `apply_for_real` is honoured, so `stop-bots web --no-apply` keeps
+/// writing configs without ever reloading, exactly as it does for a reload
+/// an operator asks for by hand.
+async fn apply_nginx(state: &AppState) -> anyhow::Result<()> {
+    let root = state.nginx_root.clone();
+    let reload = state.apply_for_real;
+    state
+        .with_db(move |db| {
+            let summary = cron::apply_nginx(db, &root, reload);
+            cron::record_run(db, CronJob::ApplyNginx, &summary);
+            Ok(())
+        })
+        .await
 }
 
 /// Prunes and compacts the database.
@@ -258,6 +286,43 @@ mod tests {
             reclaimed.is_ok(),
             "vacuum failed inside with_db: {:?}",
             reclaimed.unwrap_err()
+        );
+    }
+
+    /// With the switch off — every install, until someone says otherwise
+    /// — a tick leaves the config alone.
+    ///
+    /// Only the off path is tested here. The on path writes through
+    /// `apply_all_sites`, which needs `STOP_BOTS_NGINX_DIR` pointed
+    /// somewhere safe, and setting that anywhere in this binary breaks
+    /// `nginx::tests::kitchen_sink_block_matches_the_golden` — see the note
+    /// on `cron::tests::apply_nginx_is_a_scheduled_job`. It lives in
+    /// `tests/cli.rs` instead.
+    #[tokio::test]
+    async fn a_tick_leaves_site_configs_alone_when_auto_apply_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("nginx");
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("example.com.conf");
+        let original = "server {\n    listen 80;\n    server_name example.com;\n}\n";
+        std::fs::write(&config, original).unwrap();
+
+        let mut state = state_in(dir.path());
+        state.nginx_root = root;
+        state
+            .with_db(|db| {
+                crate::testing::blocked_bot(db, "badbot", "BadBot");
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        tick(&state).await;
+
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            original,
+            "a config was rewritten with the switch off"
         );
     }
 

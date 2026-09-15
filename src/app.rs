@@ -213,6 +213,11 @@ pub struct App {
     /// its turn — they are merely sequenced so that their messages do not
     /// overwrite each other.
     apply_everything: bool,
+    /// Set while the internal cron's `ApplyNginx` job is waiting on the
+    /// site apply it started, so `finish_site_apply` knows to record the
+    /// outcome against that job rather than leaving it looking like it
+    /// never ran. Same flag-then-finish shape as `apply_everything`.
+    cron_apply_nginx: bool,
 }
 
 /// The state of one "Apply everything"/"Update everything"'s update half.
@@ -405,6 +410,7 @@ impl App {
             firewall_out: None,
             update_all: None,
             apply_everything: false,
+            cron_apply_nginx: false,
         };
         botlist::register_all_sources(&app.db)?;
         // Same reason bot-list sources are registered here: the Dashboard's
@@ -849,6 +855,56 @@ impl App {
                 let summary = crate::cron::maintenance(&self.db);
                 crate::cron::record_run(&self.db, CronJob::Maintenance, &summary);
             }
+            CronJob::ApplyNginx => self.start_cron_apply_nginx()?,
+        }
+        Ok(())
+    }
+
+    /// The internal cron's auto-apply, which in the TUI is the same work
+    /// the operator's own "Apply everything" does — so it is started the
+    /// same way rather than through `cron::apply_nginx`.
+    ///
+    /// That function takes a `&Db` and does the whole job inline, which is
+    /// right for the console (where `with_db` is already a blocking task)
+    /// and wrong here: `apply_all_sites` walks the config root and the
+    /// reload shells out to `nginx -t` and `systemctl`, which is seconds
+    /// with nothing redrawing. `start_site_action` already splits that the
+    /// way every other background job here does — the `Db` reads happen on
+    /// this thread and produce an `ApplyPlan`, the file writes happen on
+    /// the blocking pool — and `finish_site_apply` already chains the
+    /// reload, gated by the same `reload_nginx_for_real` flag the console
+    /// spells `apply_for_real`. Reimplementing any of that would mean a
+    /// second copy of the plan/run split.
+    ///
+    /// The toggle is still read here, before the plan, so a host with the
+    /// switch off does no work at all — and records that it did none, so
+    /// the Scheduled tasks panel says why rather than going quiet.
+    fn start_cron_apply_nginx(&mut self) -> Result<()> {
+        let summary_if_idle = match self.db.get_auto_apply() {
+            Ok(true) => None,
+            Ok(false) => Some("auto-apply is off".to_string()),
+            Err(err) => Some(format!("error: {err}")),
+        };
+        if let Some(summary) = summary_if_idle {
+            crate::cron::record_run(&self.db, CronJob::ApplyNginx, &summary);
+            return Ok(());
+        }
+
+        self.cron_apply_nginx = true;
+        self.start_site_action(crate::tui::site_settings::SiteAction::ApplyAll)?;
+        if !self.jobs_in_flight.contains(&Job::ApplySites) {
+            // Refused before it started — an apply already running, or a
+            // plan that could not be built. No `SitesApplied` event is
+            // coming, so the flag has to come back down here or the next
+            // apply the *operator* asks for would be recorded as this
+            // job's run. Same reasoning as `start_apply_everything`'s own
+            // did-it-start check.
+            self.cron_apply_nginx = false;
+            crate::cron::record_run(
+                &self.db,
+                CronJob::ApplyNginx,
+                "an apply was already running",
+            );
         }
         Ok(())
     }
@@ -1039,6 +1095,9 @@ impl App {
     ) -> Result<()> {
         self.jobs_in_flight.remove(&Job::ApplySites);
         let (message, changed_a_file) = self.site_settings.finish_apply(outcome);
+        if std::mem::take(&mut self.cron_apply_nginx) {
+            crate::cron::record_run(&self.db, CronJob::ApplyNginx, &message);
+        }
         self.message = Some(message);
         // Before the reload, so the status tags reflect the files that
         // were just written rather than waiting on `systemctl`.
@@ -2586,6 +2645,31 @@ mod tests {
             .get_cron_last_run(CronJob::Detect(Detector::WebScanners).id())
             .unwrap()
             .is_some());
+    }
+
+    /// The TUI's half of the auto-apply switch. Off — which is every
+    /// install until someone says otherwise — it must record that it ran
+    /// and start nothing at all: no site apply, and so no walk of the
+    /// config root, which on a test host does not exist.
+    #[tokio::test]
+    async fn the_auto_apply_job_starts_nothing_while_the_switch_is_off() {
+        let mut app = test_app();
+        assert!(!app.db.get_auto_apply().unwrap(), "off is the default");
+
+        app.run_cron_job(CronJob::ApplyNginx).unwrap();
+
+        assert_eq!(
+            app.db
+                .get_cron_last_summary(CronJob::ApplyNginx.id())
+                .unwrap()
+                .as_deref(),
+            Some("auto-apply is off"),
+            "the panel should say why nothing happened"
+        );
+        assert!(
+            !app.jobs_in_flight.contains(&Job::ApplySites),
+            "an apply was started with the switch off"
+        );
     }
 
     /// `check_cron` must run every currently-due log-based job

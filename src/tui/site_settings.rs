@@ -104,6 +104,17 @@ fn setting_options(setting: NginxSetting) -> (&'static str, Vec<String>) {
         // one interaction pattern (pick one of N) and a numeric entry
         // field would be the only exception to it. The CLI takes any
         // value for anyone who needs one off this list.
+        // Says what it will do *to the server*, not just on/off. A row
+        // that reads "On" gives no hint that turning it on means a live
+        // `systemctl reload nginx` on a schedule, which is the part an
+        // admin is entitled to see before choosing it.
+        NginxSetting::AutoApply => (
+            "Apply config changes automatically",
+            vec![
+                "Off \u{2014} apply by hand with a/A".to_string(),
+                "On \u{2014} the internal cron applies and reloads NGINX, hourly".to_string(),
+            ],
+        ),
         NginxSetting::RateLimit => (
             "Rate limit per client address",
             [
@@ -154,13 +165,22 @@ enum NginxSetting {
     RobotsTxt,
     /// Whether NGINX rate-limits requests per client address.
     RateLimit,
+    /// Whether the internal cron re-applies these configs on its own.
+    ///
+    /// The one row here that does not change the *text* of the generated
+    /// block — it decides who writes it. It belongs on this screen anyway,
+    /// and specifically above the site list: every other row here puts
+    /// each site back to `STALE` the moment it changes, and this is the
+    /// answer to what happens next.
+    AutoApply,
 }
 
 impl NginxSetting {
-    const ALL: [NginxSetting; 3] = [
+    const ALL: [NginxSetting; 4] = [
         NginxSetting::Response,
         NginxSetting::RobotsTxt,
         NginxSetting::RateLimit,
+        NginxSetting::AutoApply,
     ];
 
     fn label(self) -> &'static str {
@@ -168,6 +188,7 @@ impl NginxSetting {
             NginxSetting::Response => "Block response",
             NginxSetting::RobotsTxt => "robots.txt",
             NginxSetting::RateLimit => "Rate limit",
+            NginxSetting::AutoApply => "Auto-apply",
         }
     }
 }
@@ -219,6 +240,7 @@ pub struct SiteSettings {
     setting_popup: Option<SettingPopup>,
     block_response: BlockResponse,
     serve_robots_txt: bool,
+    auto_apply: bool,
     rate_limit_enabled: bool,
     rate_limit_rps: i64,
     rate_limit_burst: i64,
@@ -240,6 +262,7 @@ impl SiteSettings {
             setting_popup: None,
             block_response: BlockResponse::default(),
             serve_robots_txt: false,
+            auto_apply: false,
             rate_limit_enabled: false,
             rate_limit_rps: 0,
             rate_limit_burst: 0,
@@ -249,6 +272,7 @@ impl SiteSettings {
     pub fn refresh(&mut self, db: &Db) -> Result<()> {
         self.block_response = db.get_block_response()?;
         self.serve_robots_txt = db.get_serve_robots_txt()?;
+        self.auto_apply = db.get_auto_apply()?;
         self.rate_limit_enabled = db.get_rate_limit_enabled()?;
         self.rate_limit_rps = db.get_rate_limit_rps()?;
         self.rate_limit_burst = db.get_rate_limit_burst()?;
@@ -368,6 +392,13 @@ impl SiteSettings {
                         }
                     }
                     NginxSetting::RateLimit => &rate_limit_label,
+                    NginxSetting::AutoApply => {
+                        if self.auto_apply {
+                            "on \u{2014} hourly"
+                        } else {
+                            "off \u{2014} by hand"
+                        }
+                    }
                 };
                 ListItem::new(Line::from(vec![
                     format!("{:<18}", setting.label()).into(),
@@ -725,6 +756,7 @@ impl SiteSettings {
                 .position(|r| *r == self.block_response)
                 .unwrap_or(0),
             NginxSetting::RobotsTxt => usize::from(self.serve_robots_txt),
+            NginxSetting::AutoApply => usize::from(self.auto_apply),
             NginxSetting::RateLimit => {
                 if !self.rate_limit_enabled {
                     0
@@ -800,6 +832,20 @@ impl SiteSettings {
                         ));
                     }
                 }
+            }
+            NginxSetting::AutoApply => {
+                let auto = popup.selected == 1;
+                if auto == self.auto_apply {
+                    return Ok(());
+                }
+                db.set_auto_apply(auto)?;
+                *message = Some(if auto {
+                    "Auto-apply on \u{2014} the internal cron will write these configs and \
+                     reload NGINX within the hour, and after every change from now on."
+                        .to_string()
+                } else {
+                    "Auto-apply off \u{2014} config changes wait for a/A again".to_string()
+                });
             }
             NginxSetting::RobotsTxt => {
                 let serve = popup.selected == 1;

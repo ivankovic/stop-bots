@@ -47,6 +47,7 @@ use crate::web::state::AppState;
 struct View {
     block_response: BlockResponse,
     serve_robots: bool,
+    auto_apply: bool,
     rate_limit: bool,
     rate_rps: i64,
     rate_burst: i64,
@@ -67,6 +68,7 @@ fn load(db: &Db, root: &Path) -> anyhow::Result<View> {
     Ok(View {
         block_response: db.get_block_response()?,
         serve_robots: db.get_serve_robots_txt()?,
+        auto_apply: db.get_auto_apply()?,
         rate_limit: db.get_rate_limit_enabled()?,
         rate_rps: db.get_rate_limit_rps()?,
         rate_burst: db.get_rate_limit_burst()?,
@@ -167,6 +169,33 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
                                     input type="hidden" name="enabled" value=(if view.serve_robots { "0" } else { "1" });
                                     button type="submit" {
                                         @if view.serve_robots { "Turn off" } @else { "Turn on" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    tr {
+                        td {
+                            "Auto-apply"
+                            br;
+                            span .hint {
+                                "Lets the internal cron write these configs and reload NGINX \
+                                 hourly, instead of waiting for Apply. NGINX only \u{2014} the \
+                                 firewall script still needs you."
+                            }
+                        }
+                        td {
+                            .row {
+                                @if view.auto_apply {
+                                    (layout::pill("ON", PillKind::Allowed))
+                                } @else {
+                                    (layout::pill("OFF", PillKind::Neutral))
+                                }
+                                form .inline method="post" action=(ctx.url("/sites/auto-apply")) {
+                                    (layout::csrf_field(ctx))
+                                    input type="hidden" name="enabled" value=(if view.auto_apply { "0" } else { "1" });
+                                    button type="submit" {
+                                        @if view.auto_apply { "Turn off" } @else { "Turn on" }
                                     }
                                 }
                             }
@@ -517,6 +546,7 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
         .route(&base.url("/sites/{id}"), axum::routing::get(detail))
         .route(&base.url("/sites/block-response"), post(set_block_response))
         .route(&base.url("/sites/robots"), post(set_robots))
+        .route(&base.url("/sites/auto-apply"), post(set_auto_apply))
         .route(&base.url("/sites/rate-limit"), post(set_rate_limit))
         .route(&base.url("/sites/scan"), post(scan))
         .route(&base.url("/sites/apply"), post(apply_one))
@@ -566,6 +596,38 @@ async fn set_block_response(
 #[derive(Deserialize)]
 struct ToggleForm {
     enabled: String,
+}
+
+/// Turns automatic applying on or off.
+///
+/// Says *when* rather than just "saved": the switch's whole point is that
+/// something happens later without anyone asking, and a confirmation that
+/// did not mention the reload would be the last chance to say so.
+async fn set_auto_apply(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Form(form): Form<ToggleForm>,
+) -> Response {
+    let on = form.enabled == "1";
+    match state.with_db(move |db| db.set_auto_apply(on)).await {
+        Ok(()) => back_with(
+            &state.base,
+            "/sites",
+            if on {
+                "Auto-apply on. The internal cron will write these configs and reload NGINX \
+                 within the hour, and after every change from now on."
+            } else {
+                "Auto-apply off. Config changes wait for Apply again."
+            },
+            true,
+        ),
+        Err(err) => back_with(
+            &state.base,
+            "/sites",
+            &format!("Could not save that: {err}"),
+            false,
+        ),
+    }
 }
 
 async fn set_robots(
