@@ -2819,6 +2819,67 @@ fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// An explicit `--ssh-log` that cannot be read must say so about *that
+    /// path*, and must not claim the other two sources were tried — they
+    /// were not. The wording is the whole point of the test: a message
+    /// describing a search that never happened is what sends the reader
+    /// hunting for a bug in the fallback chain instead of looking at the
+    /// path they passed.
+    #[test]
+    fn an_unreadable_explicit_ssh_log_names_the_path_it_was_given() {
+        let err = read_ssh_log(Some(Path::new("/nonexistent/auth.log")))
+            .expect_err("a missing file should not read");
+        let said = err.to_string();
+
+        assert!(
+            said.contains("/nonexistent/auth.log"),
+            "the path the operator passed is missing from: {said}"
+        );
+        assert!(
+            !said.contains("tried /var/log/auth.log"),
+            "it claimed a search it did not perform: {said}"
+        );
+        assert!(
+            said.contains("journalctl"),
+            "it should say dropping the flag reaches journalctl: {said}"
+        );
+    }
+
+    /// With no override the search really does happen, so naming all three
+    /// sources is correct here.
+    #[test]
+    fn an_ssh_log_search_that_finds_nothing_names_every_source() {
+        // Hermetic only in the sense that matters: if this host *does* have
+        // a readable SSH log, the search succeeds and there is no message
+        // to check. Asserting on the error in that case would make the test
+        // fail on developer machines for a reason unrelated to the code.
+        if let Err(err) = read_ssh_log(None) {
+            let said = err.to_string();
+            assert!(
+                said.contains("/var/log/auth.log")
+                    && said.contains("/var/log/secure")
+                    && said.contains("journalctl"),
+                "a real search should name all three sources: {said}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_explicit_access_log_names_the_path_it_was_given() {
+        let err = read_access_log(Some(Path::new("/nonexistent/access.log")))
+            .expect_err("a missing file should not read");
+        let said = err.to_string();
+
+        assert!(
+            said.contains("/nonexistent/access.log"),
+            "the path the operator passed is missing from: {said}"
+        );
+        assert!(
+            !said.contains("tried /var/log/nginx/access.log"),
+            "it claimed a search it did not perform: {said}"
+        );
+    }
+
     #[test]
     fn resolve_user_db_path_prefers_xdg_data_home() {
         let path = resolve_user_db_path(Some("/custom/data".into()), Some("/home/someone".into()))
