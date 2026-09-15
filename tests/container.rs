@@ -601,6 +601,36 @@ impl Host {
         exec_in(&self.name, cmd)
     }
 
+    /// Waits for `path` to appear inside the container, up to 30s.
+    ///
+    /// The deploy tests prove a restart re-executed the *new* binary by
+    /// having it `touch` a marker file. `systemctl` reporting the unit
+    /// `active` does not mean that has happened yet: these units are
+    /// `Type=simple`, where systemd calls the service started as soon as
+    /// it has forked the process — everything the process then does,
+    /// including running the first line of a shell wrapper, happens after
+    /// the `systemctl` command has already returned. The gap is
+    /// microseconds on an idle machine and wide enough to lose on a
+    /// loaded one, which is how this reached CI as an occasional
+    /// "re-executed the old binary" with nothing wrong: found here by
+    /// running the suite while a full rebuild competed for the same cores.
+    ///
+    /// Only for assertions that something *will* appear. A test asserting
+    /// a marker is absent must not wait, or it proves nothing — see the
+    /// negative check in `redeploying_over_a_running_console_restarts_it`.
+    fn wait_for_file(&self, path: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if self.run(&format!("test -e {path}")).0 {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     /// [`Self::run`], retried while SQLite says the database is locked.
     ///
     /// A CLI command and the console service are two processes sharing one
@@ -1119,8 +1149,9 @@ fn replacing_the_binary_and_restarting_runs_the_new_one() {
         host.journal("stop-bots-web.service")
     );
     assert!(
-        host.run("test -e /run/new-build-ran").0,
-        "the service restarted but re-executed the old binary"
+        host.wait_for_file("/run/new-build-ran"),
+        "the service restarted but re-executed the old binary. journal:\n{}",
+        host.journal("stop-bots-web.service")
     );
 }
 
@@ -1167,8 +1198,9 @@ fn deploying_onto_a_stopped_console_starts_it_again() {
         host.journal("stop-bots-web.service")
     );
     assert!(
-        host.run("test -e /run/deployed-build-ran").0,
-        "the console came back but re-executed the old binary"
+        host.wait_for_file("/run/deployed-build-ran"),
+        "the console came back but re-executed the old binary. it said:\n{out}\njournal:\n{}",
+        host.journal("stop-bots-web.service")
     );
     assert!(
         out.contains("unit state: active"),
