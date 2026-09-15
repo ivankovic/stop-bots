@@ -246,6 +246,35 @@ section.panel > h2 .hint {
 
 .panel-body { padding: 4px 14px 12px; }
 
+/* A sub-heading inside a panel — the two detail panels on Dynamic
+   Protection each have a second section under one `h2`. Left at the
+   browser's default it is a large serif-weight line flush against the
+   panel border, with none of the 14px gutter every other thing in a
+   panel has; this matches it to the `h2` above it, one step quieter. */
+section.panel > h3 {
+  margin: 16px 0 0;
+  padding: 0 14px 7px;
+  font: 600 11px var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+/* A long client-supplied value shown in full rather than truncated: the
+   user agent on its detail panel. Breaking anywhere is deliberate —
+   a user agent is as often one unbroken token as not, and a value that
+   cannot wrap sets the panel's width from the worst string in the log.
+   The tint is what separates "the thing you clicked" from the prose
+   around it. */
+.value {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--sel);
+  border-radius: 3px;
+  font: 12px var(--mono);
+  overflow-wrap: anywhere;
+}
+
 /* Panels sit side by side when the window can take two columns, and
    stack when it can't — one column is the default rather than the
    exception, so a narrow window and a phone need no special case.

@@ -421,27 +421,38 @@ fn detail_panel(detail: &IpDetail, filter: Filter, ctx: &Ctx) -> Markup {
         &format!("About {}", detail.address),
         Some("From lists this host already downloads — nothing was looked up over the network"),
         html! {
-            .row {
-                (status_pill(detail.status))
-                a .button href=(close) { "Close" }
+            // Prose and the button row want the panel's 14px gutter,
+            // which only a table's own cell padding supplies — see
+            // `ua_detail_panel`, which had the same flush-left problem.
+            .panel-body {
+                .row {
+                    (status_pill(detail.status))
+                    a .button href=(close) { "Close" }
+                }
+
+                @match detail.kind {
+                    AddressKind::LocalOrPrivate => {
+                        p .hint {
+                            "A loopback or private address. No reputation or crawler feed lists "
+                            "these, so there is nothing to look up."
+                        }
+                    }
+                    AddressKind::Malformed => {
+                        p .hint { "Not a valid IP address or range." }
+                    }
+                    AddressKind::Public => {
+                        @if detail.is_unknown() {
+                            p .hint {
+                                "In none of the crawler or reputation feeds this host has fetched."
+                            }
+                        }
+                    }
+                }
             }
 
             @match detail.kind {
-                AddressKind::LocalOrPrivate => {
-                    p .hint {
-                        "A loopback or private address. No reputation or crawler feed lists "
-                        "these, so there is nothing to look up."
-                    }
-                }
-                AddressKind::Malformed => {
-                    p .hint { "Not a valid IP address or range." }
-                }
+                AddressKind::LocalOrPrivate | AddressKind::Malformed => {}
                 AddressKind::Public => {
-                    @if detail.is_unknown() {
-                        p .hint {
-                            "In none of the crawler or reputation feeds this host has fetched."
-                        }
-                    }
                     @if !detail.crawlers.is_empty() || !detail.reputation.is_empty() {
                         table {
                             tbody {
@@ -462,14 +473,16 @@ fn detail_panel(detail: &IpDetail, filter: Filter, ctx: &Ctx) -> Markup {
                             }
                         }
                     }
-                    p .hint {
-                        @match (&detail.country, detail.country_data_available) {
-                            (Some(code), _) => { "Country: " (code) }
-                            // Not the same statement: with no zone file
-                            // fetched this is a fact about the host's data,
-                            // not about the address.
-                            (None, true) => { "Not inside any country this host has fetched." }
-                            (None, false) => { "No country data has been fetched on this host." }
+                    .panel-body {
+                        p .hint {
+                            @match (&detail.country, detail.country_data_available) {
+                                (Some(code), _) => { "Country: " (code) }
+                                // Not the same statement: with no zone file
+                                // fetched this is a fact about the host's data,
+                                // not about the address.
+                                (None, true) => { "Not inside any country this host has fetched." }
+                                (None, false) => { "No country data has been fetched on this host." }
+                            }
                         }
                     }
                 }
@@ -516,16 +529,22 @@ fn ua_detail_panel(detail: &UaDetail, filter: Filter, ctx: &Ctx) -> Markup {
         "About this user agent",
         Some("What the bot lists on this host say about this string — a client can claim anything"),
         html! {
-            .row {
-                (status_pill(detail.status))
-                a .button href=(close) { "Close" }
-            }
+            // Everything that is not a table goes inside a `.panel-body`:
+            // a table pads its own cells to the panel's gutter, prose
+            // does not, and without this the string sits flush against
+            // the border.
+            .panel-body {
+                .row {
+                    (status_pill(detail.status))
+                    a .button href=(close) { "Close" }
+                }
 
-            // Capped and stripped by `uadetail`; maud escapes it on top
-            // of that.
-            p .mono { (detail.user_agent) }
-            @if detail.truncated {
-                p .hint { "Shown truncated — the client sent a longer string." }
+                // Capped and stripped by `uadetail`; maud escapes it on
+                // top of that.
+                p .value { (detail.user_agent) }
+                @if detail.truncated {
+                    p .hint { "Shown truncated — the client sent a longer string." }
+                }
             }
 
             table {
@@ -558,13 +577,15 @@ fn ua_detail_panel(detail: &UaDetail, filter: Filter, ctx: &Ctx) -> Markup {
             }
 
             @if detail.matches.is_empty() {
-                @if detail.self_declared_bot {
-                    p .hint {
-                        "This string calls itself a bot, and no list on this host has a "
-                        "pattern for it. Blocking it here blocks this exact string."
+                .panel-body {
+                    @if detail.self_declared_bot {
+                        p .hint {
+                            "This string calls itself a bot, and no list on this host has a "
+                            "pattern for it. Blocking it here blocks this exact string."
+                        }
+                    } @else {
+                        p .hint { "No bot list on this host has a pattern matching this string." }
                     }
-                } @else {
-                    p .hint { "No bot list on this host has a pattern matching this string." }
                 }
             } @else {
                 h3 { "Matched by" }
@@ -1076,6 +1097,53 @@ mod tests {
         assert!(
             url.contains("inspect_ua=a%26inspect%3D1.2.3.4"),
             "url was: {url}"
+        );
+    }
+
+    /// A table pads its own cells to the panel's 14px gutter; prose and a
+    /// button row do not, and a `.panel-body` is the only thing that
+    /// gives them one. Both panels shipped without it and sat flush
+    /// against the panel border — a silent defect that renders fine,
+    /// compiles fine, and only a person looking at it catches.
+    #[test]
+    fn both_detail_panels_put_their_prose_inside_a_padded_body() {
+        let ua = ua_detail_panel(
+            &ua_detail(vec![bot_match(
+                crate::uadetail::BotVerdict::BlockedByCategory,
+            )]),
+            Filter::All,
+            &Ctx::for_tests(),
+        )
+        .into_string();
+        let address = detail_panel(
+            &IpDetail {
+                address: "185.220.101.7".to_string(),
+                kind: AddressKind::Public,
+                reputation: vec![],
+                crawlers: vec![],
+                country: None,
+                country_data_available: true,
+                status: RowStatus::Pending,
+                usernames: vec![("root".to_string(), 3)],
+            },
+            Filter::All,
+            &Ctx::for_tests(),
+        )
+        .into_string();
+
+        for (name, rendered) in [("user agent", &ua), ("address", &address)] {
+            assert!(
+                rendered.contains(r#"<div class="panel-body"><div class="row">"#),
+                "the {name} panel's button row is not in a padded body:\n{rendered}"
+            );
+        }
+        // The heading between the two halves is the other thing with no
+        // gutter of its own, and there is no `h3` rule anywhere else to
+        // notice if this one is dropped.
+        assert!(ua.contains("<h3>Matched by</h3>"), "rendered:\n{ua}");
+        assert!(
+            address.contains("<h3>Tried to log in as</h3>"),
+            "rendered:\n{address}"
         );
     }
 

@@ -9,6 +9,17 @@ need.
 
 ### Added
 
+### Fixed
+
+- **Both Dynamic Protection detail panels had no gutter.** Their prose,
+  button row and sub-heading sat flush against the panel border: a table
+  pads its own cells to the panel's 14px, and nothing else in a panel
+  does without a `.panel-body`. The `h3` between a panel's two halves had
+  no rule at all and rendered at the browser's default. The user agent
+  itself now gets a tinted block that wraps anywhere, because it is as
+  often one unbroken token as not and a value that cannot wrap sets the
+  panel's width from the worst string in the log.
+
 - **Tap a user agent for a detail popup, the way an address already
   does.** `i` in the TUI and a link on the cell in the web UI, showing
   which lists carry a matching pattern, which alternative matched, the
