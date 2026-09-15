@@ -9,17 +9,6 @@ need.
 
 ### Added
 
-### Fixed
-
-- **Both Dynamic Protection detail panels had no gutter.** Their prose,
-  button row and sub-heading sat flush against the panel border: a table
-  pads its own cells to the panel's 14px, and nothing else in a panel
-  does without a `.panel-body`. The `h3` between a panel's two halves had
-  no rule at all and rendered at the browser's default. The user agent
-  itself now gets a tinted block that wraps anywhere, because it is as
-  often one unbroken token as not and a value that cannot wrap sets the
-  panel's width from the worst string in the log.
-
 - **Tap a user agent for a detail popup, the way an address already
   does.** `i` in the TUI and a link on the cell in the web UI, showing
   which lists carry a matching pattern, which alternative matched, the
@@ -131,7 +120,31 @@ need.
   deliberately says nothing on a host whose cron has never rendered, or
   whose render is already overdue, because neither is a schedule.
 
+### Changed
+
+- **CI actions updated**, and `actions/checkout` off deprecated Node 20:
+  `actions/checkout` v4 → v7 (v7.0.0 is the ESM/Node 24 move, which is
+  what the runner's deprecation warning was asking for) and
+  `softprops/action-gh-release` v2 → v3 (the same move). v7's breaking
+  change narrows fork checkouts under `pull_request_target` and
+  `workflow_run`; this project uses neither. `Swatinem/rust-cache` and
+  `taiki-e/install-action` are already on their current major.
+
+- **Dependencies refreshed** across the tree (`cargo update`), including
+  `cc`, `clap`, `futures`, `http`, `hyper` and `tokio`. No API change
+  reached this code, the MSRV is unmoved at 1.88, and `cargo audit`
+  reports nothing.
+
 ### Fixed
+
+- **Both Dynamic Protection detail panels had no gutter.** Their prose,
+  button row and sub-heading sat flush against the panel border: a table
+  pads its own cells to the panel's 14px, and nothing else in a panel
+  does without a `.panel-body`. The `h3` between a panel's two halves had
+  no rule at all and rendered at the browser's default. The user agent
+  itself now gets a tinted block that wraps anywhere, because it is as
+  often one unbroken token as not and a value that cannot wrap sets the
+  panel's width from the worst string in the log.
 
 - **Probe-path detection was anchored to the start of the path, and
   attackers are not.** It saw `/.env` but not `/api/.env`,
@@ -380,7 +393,6 @@ installable, starting with the blocking the crate was built for.
   the old write-only behaviour. The chosen backend is now remembered, so a
   one-click apply has an answer without guessing.
 
-
 - **Inspect an address on the Dynamic Protection screen.** `i` in the TUI, or click
   the address in the web console. It answers "what *is* this thing" from lists this
   host already downloads: which of the six reputation feeds list it (Tor exit,
@@ -399,8 +411,6 @@ installable, starting with the blocking the crate was built for.
   the client chose to send. Extracted for one address when you ask, not for every
   address on every refresh — the latter cost 215ms per refresh on a large
   auth.log, for an answer almost nobody had asked for.
-
-
 
 - **A web UI — `stop-bots web`.** The same five screens as the TUI, in a browser.
 
@@ -524,7 +534,6 @@ installable, starting with the blocking the crate was built for.
   matching what `update-bot-lists` already had. For a host with no outbound access, and
   what makes the parse-and-store half of every download testable offline.
 
-
 - **`stop-bots batch` — one unattended pass, for a real crontab.** Refreshes every list,
   scans the logs, writes the NGINX blocking rules and the firewall script, and with
   `--apply` puts both into effect. Quiet when everything worked (so a healthy nightly run
@@ -537,7 +546,6 @@ installable, starting with the blocking the crate was built for.
   could be read at all, because then the check could not run. The interactive
   `render-firewall` only warns in that second case, which is defensible with a human at the
   terminal and is not from cron. Pass `--ssh-log` explicitly; `--force` overrides.
-
 
 - Seven choices for what a blocked request gets back, rather than two: `403`, `404`, `410`
   (asks crawlers to drop the URL permanently), `429`, `418` (RFC 2324's teapot), `444`
@@ -568,13 +576,11 @@ installable, starting with the blocking the crate was built for.
   about the subject and wrong about the tense, since none of them does the thing, they all
   only start it. Internal naming only; no behaviour change.
 
-
 - The Dashboard's "Automatic blocking" panel is a full-width panel of its own, and shows
   all fourteen options at once instead of five at a time behind a scroll. It deals its
   rows into as many columns as the terminal is wide enough for (two from about 100
   columns), and "System-wide settings" and "Geo-blocking" now share the row above it —
   between them they were using a quarter of the width.
-
 
 - **The TUI no longer blocks on anything it does.** Every action that touches the
   filesystem, a subprocess or the network now runs on a background thread while the
@@ -712,7 +718,6 @@ installable, starting with the blocking the crate was built for.
   enable sticks even when the start fails, so the unit was enabled and would have
   tried again at the next boot with nothing saying so.
 
-
 - `--version` now exists. It also shows in the TUI's header, which is where someone is
   standing when they decide to report something.
 - `stop-bots --help` is scannable: twenty subcommands printed their entire description —
@@ -734,7 +739,6 @@ installable, starting with the blocking the crate was built for.
 - Choice popups say `Enter choose  Esc cancel`. The one popup shape with no text besides
   its options was also the only one that never mentioned the way out.
 - The "Automatic blocking" panel says what its `5d` column means.
-
 
 - **Switching on a large blocklist feed no longer freezes the TUI for a minute or more.**
   Storing the fetched ranges inserted one row per autocommit — one `fsync` each — so AWS's
