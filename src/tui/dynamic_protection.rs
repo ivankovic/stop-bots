@@ -492,7 +492,13 @@ impl DynamicProtection {
         if let Some(detail) = &self.detail {
             let (title, lines) = match detail {
                 Detail::Address(detail) => (detail.address.clone(), detail_lines(detail)),
-                Detail::UserAgent(detail) => ("User agent".to_string(), ua_detail_lines(detail)),
+                // Built against the height actually available: the popup
+                // cannot scroll, so a body longer than this loses its own
+                // closing line rather than growing.
+                Detail::UserAgent(detail) => (
+                    "User agent".to_string(),
+                    ua_detail_lines(detail, area.height.saturating_sub(2) as usize),
+                ),
             };
             let popup = centered_rect(
                 widest_line(&lines).max(24) + 4,
@@ -611,13 +617,32 @@ const UA_WRAP_CHARS: usize = 64;
 /// is the most any bot has on a real host; the count carries the rest.
 const MAX_SOURCES_SHOWN: usize = 3;
 
-/// The user-agent-detail popup's body.
+/// At most this many wrapped rows for the user agent itself. `uadetail`
+/// already caps the string at 300 characters, which is five rows at
+/// [`UA_WRAP_CHARS`] — rows that on a short terminal would come out of
+/// the verdict below, which is what the popup was opened for.
+const MAX_UA_LINES: usize = 4;
+
+/// The user-agent-detail popup's body, built to fit `budget` rows.
 ///
 /// Reads top-down the way [`detail_lines`] does: what this host already
 /// decided, then the string itself, then what the lists say about it. The
 /// order matters more here, because the string is the one thing on the
 /// popup the client chose — see [`crate::uadetail`].
-fn ua_detail_lines(detail: &UaDetail) -> Vec<Line<'static>> {
+///
+/// Unlike `detail_lines` this is *unbounded* at the source — a string
+/// containing several vendor tokens matches several entries, and there is
+/// no ceiling on how many. The popup is clamped to the terminal and the
+/// paragraph does not scroll, so every line past the bottom is silently
+/// dropped, and the last line is the one saying how to get out. So the
+/// match list is cut to what is left after the header and that closing
+/// line, with the count of what was cut standing in for the rest.
+fn ua_detail_lines(detail: &UaDetail, budget: usize) -> Vec<Line<'static>> {
+    /// The blank line and the "Esc close" that always end the body.
+    const TRAILER: usize = 2;
+    /// Rows one matched bot takes.
+    const PER_MATCH: usize = 2;
+
     let mut lines = vec![Line::from(vec![
         "Status  ".into(),
         detail.status.label().bold(),
@@ -647,11 +672,15 @@ fn ua_detail_lines(detail: &UaDetail) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     // Already capped and stripped of control characters by `uadetail` —
     // which matters here and not in the web UI, because an escape
-    // sequence reaching the alternate screen repaints the terminal.
-    for chunk in wrapped(&detail.user_agent, UA_WRAP_CHARS) {
+    // sequence reaching the alternate screen repaints the terminal. The
+    // second cap is on *rows*: 300 characters is four wrapped lines, and
+    // on a short terminal those are four lines not spent on the verdict.
+    let wrapped_ua = wrapped(&detail.user_agent, UA_WRAP_CHARS);
+    let ua_truncated = detail.truncated || wrapped_ua.len() > MAX_UA_LINES;
+    for chunk in wrapped_ua.into_iter().take(MAX_UA_LINES) {
         lines.push(chunk.into());
     }
-    if detail.truncated {
+    if ua_truncated {
         lines.push("(truncated — the client sent more)".dim().into());
     }
 
@@ -667,7 +696,13 @@ fn ua_detail_lines(detail: &UaDetail) -> Vec<Line<'static>> {
         }
     } else {
         lines.push("Matched by".bold().into());
-        for hit in &detail.matches {
+        // One row is always kept back for the "… and N more" that the cut
+        // itself needs, so the cut can never be the thing that overflows.
+        let room = budget
+            .saturating_sub(lines.len() + TRAILER + 1)
+            .saturating_div(PER_MATCH);
+        let shown = detail.matches.len().min(room);
+        for hit in detail.matches.iter().take(shown) {
             let verdict = if hit.verdict.is_blocked() {
                 hit.verdict.label().red()
             } else {
@@ -678,14 +713,26 @@ fn ua_detail_lines(detail: &UaDetail) -> Vec<Line<'static>> {
                 verdict,
             ]));
             lines.push(Line::from(vec![
-                "    pattern  ".dim(),
-                hit.pattern.clone().into(),
-            ]));
-            lines.push(Line::from(vec![
-                "    lists    ".dim(),
-                source_summary(&hit.sources).into(),
+                format!("    {}  ", hit.pattern).dim(),
+                source_summary(&hit.sources).dim(),
             ]));
         }
+        if shown < detail.matches.len() {
+            lines.push(
+                format!("  … and {} more", detail.matches.len() - shown)
+                    .dim()
+                    .into(),
+            );
+        }
+    }
+
+    // The last word on the budget, whatever the sections above did with
+    // theirs. On a terminal too short even for the header, something has
+    // to give; what must not is the line saying how to get out.
+    let room_for_body = budget.saturating_sub(TRAILER);
+    if lines.len() > room_for_body {
+        lines.truncate(room_for_body.saturating_sub(1));
+        lines.push("\u{2026}".dim().into());
     }
 
     lines.push(Line::from(""));
@@ -1459,7 +1506,11 @@ mod tests {
     }
 
     fn drawn(screen: &mut DynamicProtection) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        drawn_at(screen, 30)
+    }
+
+    fn drawn_at(screen: &mut DynamicProtection, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
         terminal
             .draw(|frame| screen.render(frame, frame.area(), Theme::Dark, &HashSet::new()))
             .unwrap();
@@ -1684,6 +1735,68 @@ mod tests {
 
         assert_eq!(lines.len(), 10);
         assert!(lines.iter().all(|line| line.chars().count() == 10));
+    }
+
+    /// The popup is clamped to the terminal and the paragraph does not
+    /// scroll, so every line past the bottom is silently dropped — and
+    /// the last line is the one saying how to get out.
+    #[test]
+    fn a_user_agent_matching_many_bots_keeps_the_way_out_on_screen() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_source(&crate::db::Source {
+            id: "many".to_string(),
+            name: "A list with opinions".to_string(),
+            url: "https://example.invalid/list".to_string(),
+            last_fetched_at: None,
+            bot_count: 0,
+        })
+        .unwrap();
+        // Every one of these matches the string below.
+        for i in 0..15 {
+            db.upsert_bot(&crate::db::NewBot {
+                slug: format!("crawler-{i}"),
+                name: format!("Crawler {i}"),
+                is_ai: false,
+                is_search_engine: false,
+                is_scanner: true,
+                user_agent_pattern: format!("Crawler{i}/"),
+                source_id: "many".to_string(),
+            })
+            .unwrap();
+        }
+        let ua: String = (0..15).map(|i| format!("Crawler{i}/1.0 ")).collect();
+        let mut screen = screen_with_one_ua_row(&ua, RowStatus::Pending);
+        let mut message = None;
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('i')), &db, &mut message)
+            .unwrap();
+
+        // Every height from a cramped terminal up to one with room to
+        // spare: the body is built against the space available, so the
+        // closing line is not a matter of the popup happening to fit.
+        for height in [14, 20, 30, 50] {
+            let drawn = drawn_at(&mut screen, height);
+            assert!(
+                drawn.contains("Esc close"),
+                "no way out at height {height}:\n{drawn}"
+            );
+            // At 14 rows there is genuinely no room for a verdict: the
+            // body degrades to the status, the string and the count, and
+            // that is the honest outcome rather than a popup with no way
+            // out. From 20 up, the thing the popup was opened for shows.
+            if height >= 20 {
+                assert!(
+                    drawn.contains("Crawler 0"),
+                    "the first match was cut at height {height}:\n{drawn}"
+                );
+            }
+            if height < 50 {
+                assert!(
+                    drawn.contains("and") && drawn.contains("more"),
+                    "matches were cut without saying so at height {height}:\n{drawn}"
+                );
+            }
+        }
     }
 
     #[test]

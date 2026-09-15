@@ -4334,6 +4334,28 @@ the popup. `centered_rect` clamps a popup to the terminal, so an unwrapped
 300-character line would not overflow; it would be cut off at the right
 edge, which is where the interesting part of a user agent usually is.
 
+### The popup is bounded in height, which `IpDetail`'s never had to be
+
+`detail_lines` is bounded at the source: eight usernames, one line per feed,
+nine feeds. `ua_detail_lines` is not — a string carrying several vendor
+tokens matches several entries, and on a host with 1,600 bots there is no
+ceiling. The popup is clamped to the terminal and `Paragraph` has no scroll
+offset, so every line past the bottom is dropped silently, and the last line
+is the one saying `Esc close`. A popup that looks like it has no way out is
+a worse bug than a truncated list, and only a render test catches it: the
+first version of this failed at 80×30 with fifteen matches.
+
+So the body is built *against the height available*, not sized afterwards:
+`render` passes the area's rows in, the match list takes what is left after
+the header and the closing line (always keeping one row back for the "… and
+N more" that the cut itself needs), and a final pass truncates whatever
+remains over budget and re-appends the closing line. The user agent gets at
+most four wrapped rows for the same reason — 300 characters is five, and on
+a short terminal those come out of the verdict the popup was opened for. At
+14 rows there is genuinely no room for a verdict and the body degrades to
+the status, the string and a count; the test asserts the way out survives at
+every height and that the verdict survives from 20 up.
+
 ### Two front-ends, two routes
 
 `i` in the TUI opens the popup **directly** rather than going back through

@@ -568,32 +568,37 @@ fn ua_detail_panel(detail: &UaDetail, filter: Filter, ctx: &Ctx) -> Markup {
                 }
             } @else {
                 h3 { "Matched by" }
-                .table-scroll {
-                    table {
-                        thead { tr {
-                            th { "Bot" }
-                            th { "Pattern" }
-                            th { "Categories" }
-                            th { "Lists" }
-                            th { "Effect" }
-                        } }
-                        tbody {
-                            @for hit in &detail.matches {
-                                tr {
-                                    td { (hit.name) }
-                                    td .mono { (hit.pattern) }
-                                    td { (category_names(&hit.categories)) }
-                                    td { (hit.sources.join(", ")) }
-                                    td {
-                                        (layout::pill(
-                                            hit.verdict.label(),
-                                            if hit.verdict.is_blocked() {
-                                                PillKind::Blocked
-                                            } else {
-                                                PillKind::Neutral
-                                            },
-                                        ))
-                                    }
+                // A plain table, not a `.table-scroll` one: that
+                // container fixes the layout to stated column widths and
+                // forbids wrapping, which is right for a twenty-row table
+                // of one-line rows and wrong for a handful of rows whose
+                // cells are list-authored names of no predictable width.
+                // The feed table in `detail_panel` above is plain for the
+                // same reason.
+                table {
+                    thead { tr {
+                        th { "Bot" }
+                        th { "Pattern" }
+                        th { "Categories" }
+                        th { "Lists" }
+                        th { "Effect" }
+                    } }
+                    tbody {
+                        @for hit in &detail.matches {
+                            tr {
+                                td { (hit.name) }
+                                td .mono { (hit.pattern) }
+                                td { (category_names(&hit.categories)) }
+                                td { (hit.sources.join(", ")) }
+                                td {
+                                    (layout::pill(
+                                        hit.verdict.label(),
+                                        if hit.verdict.is_blocked() {
+                                            PillKind::Blocked
+                                        } else {
+                                            PillKind::Neutral
+                                        },
+                                    ))
                                 }
                             }
                         }
