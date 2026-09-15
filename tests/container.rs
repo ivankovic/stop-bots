@@ -122,11 +122,30 @@ fn build_host_image() {
 ///
 /// `CARGO_BIN_EXE_stop-bots` is the exact binary this test run compiled —
 /// not whatever happens to be on `PATH`.
+///
+/// Guarded by a `Once` of its own, and that is the point. The two image
+/// builders above have one `Once` each, which stops two threads racing to
+/// build *the same* image — but both of them call this, and both write the
+/// same file. So a thread staging for the host image could truncate and
+/// rewrite `stop-bots` while the other image's `docker build` was reading
+/// it, putting a half-copied binary inside the image: exactly the failure
+/// the per-image `Once`es were added for, arriving through the one door
+/// they left open. It presents as a scatter of unrelated-looking command
+/// failures, and it is far likelier on a slow two-core runner with a cold
+/// Docker cache than on a developer's machine — which is where it was
+/// found, as three consecutive red `container` jobs on CI with a green
+/// suite locally.
+///
+/// `call_once` blocks every other caller until the copy has finished, so
+/// the file is only ever read complete.
 fn stage_binary() -> String {
+    static ONCE: std::sync::Once = std::sync::Once::new();
     let manifest = env!("CARGO_MANIFEST_DIR");
     let ctx = format!("{manifest}/tests/container");
-    std::fs::copy(env!("CARGO_BIN_EXE_stop-bots"), format!("{ctx}/stop-bots"))
-        .expect("failed to stage the stop-bots binary into the build context");
+    ONCE.call_once(|| {
+        std::fs::copy(env!("CARGO_BIN_EXE_stop-bots"), format!("{ctx}/stop-bots"))
+            .expect("failed to stage the stop-bots binary into the build context");
+    });
     ctx
 }
 
@@ -580,6 +599,39 @@ impl Host {
     /// (exit status success, stdout, stderr).
     fn run(&self, cmd: &str) -> (bool, String, String) {
         exec_in(&self.name, cmd)
+    }
+
+    /// [`Self::run`], retried while SQLite says the database is locked.
+    ///
+    /// A CLI command and the console service are two processes sharing one
+    /// file, which is the arrangement this project is built around: `Db`
+    /// sets a five-second busy timeout precisely so the short collisions
+    /// between them resolve by waiting. That is enough on any real host and
+    /// enough here on an idle machine — but this suite runs a dozen
+    /// containers at once, and on an oversubscribed two-core CI runner the
+    /// same five seconds can elapse inside one query's scheduling gaps. The
+    /// suite was three times red on CI and green locally until a loaded
+    /// machine reproduced it here in one run.
+    ///
+    /// So the retry is about the test harness's own contention, not about
+    /// papering over a lock bug: these assertions are about what the report
+    /// *says*, and a reader that lost a race has not said anything yet.
+    /// Raising the production timeout to suit a test bench would be the
+    /// wrong direction — five seconds is chosen so that a genuine deadlock
+    /// still surfaces as an error instead of a hang.
+    fn run_uncontended(&self, cmd: &str) -> (bool, String, String) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (ok, stdout, stderr) = self.run(cmd);
+            let said = format!("{stdout}{stderr}");
+            if !said.contains("database is locked") {
+                return (ok, stdout, stderr);
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("`{cmd}` never got the database lock in 30s:\n{said}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
     }
 
     /// Runs a command and asserts it succeeded.
@@ -1741,7 +1793,7 @@ fn status_reports_generated_rules_that_never_reached_the_kernel() {
 
     // Written, never applied — exactly what `render-firewall` promises and
     // exactly the gap nothing used to look at.
-    let (ok, out, err) = host.run(&format!("stop-bots status --db {HOST_DB}"));
+    let (ok, out, err) = host.run_uncontended(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
         !ok,
@@ -1755,7 +1807,7 @@ fn status_reports_generated_rules_that_never_reached_the_kernel() {
 
     // Load them, and the same command has to change its mind.
     host.sh("nft -f /etc/stop-bots/firewall.nft");
-    let (ok, out, err) = host.run(&format!("stop-bots status --db {HOST_DB}"));
+    let (ok, out, err) = host.run_uncontended(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
         !said.contains("none loaded into the kernel"),
@@ -1777,7 +1829,7 @@ fn status_notices_that_the_ruleset_will_not_survive_a_reboot() {
     }
     let host = Host::start("stop-bots-status-persist");
 
-    let (_, out, err) = host.run(&format!("stop-bots status --db {HOST_DB}"));
+    let (_, out, err) = host.run_uncontended(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
         said.contains("nftables.service is not enabled"),
@@ -1785,7 +1837,7 @@ fn status_notices_that_the_ruleset_will_not_survive_a_reboot() {
     );
 
     host.sh("systemctl enable nftables.service");
-    let (_, out, err) = host.run(&format!("stop-bots status --db {HOST_DB}"));
+    let (_, out, err) = host.run_uncontended(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
         !said.contains("is not enabled"),
@@ -1833,7 +1885,8 @@ fn the_console_records_a_health_probe_for_the_dashboards_to_read() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut said = String::new();
     while std::time::Instant::now() < deadline {
-        let (_, out, err) = host.run(&format!("stop-bots status --cached --db {HOST_DB}"));
+        let (_, out, err) =
+            host.run_uncontended(&format!("stop-bots status --cached --db {HOST_DB}"));
         said = format!("{out}{err}");
         if !said.contains("no health probe has been recorded") {
             break;
