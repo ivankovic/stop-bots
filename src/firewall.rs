@@ -237,9 +237,9 @@ pub fn all_rules(db: &Db) -> Result<Vec<FirewallRule>> {
     Ok(rules)
 }
 
-/// A stable, backend- and path-independent snapshot of `rules` — used only
-/// to detect whether the rule *set* has changed since the firewall was last
-/// rendered (see `Db::get_firewall_rendered_signature`/
+/// A stable, backend- and path-independent fingerprint of `rules` — used
+/// only to detect whether the rule *set* has changed since the firewall
+/// was last rendered (see `Db::get_firewall_rendered_signature`/
 /// `set_firewall_rendered_signature`, and the Dashboard's Summary panel),
 /// never to render anything itself. Deliberately not tied to a specific
 /// backend's rendered text: a render with `--backend iptables` to a custom
@@ -247,9 +247,46 @@ pub fn all_rules(db: &Db) -> Result<Vec<FirewallRule>> {
 /// matters is whether the *rules* changed, not which backend/path last
 /// wrote them. `FirewallRule`'s `Debug` output is a deterministic function
 /// of its fields, so equal rule sets in the same order always produce
-/// identical strings.
+/// identical digests.
+///
+/// **This is a hash, and it has to stay one.** It used to be the rule
+/// set's whole `Debug` dump, stored verbatim in `settings`. That is fine
+/// with a handful of admin rules and ruinous with the derived ones:
+/// `all_rules` appends every enabled reputation/cloud CIDR, and on a real
+/// host that came to 44,075 rules — a single 4.7 MB `settings` value,
+/// 31% of the database, rewritten in full on every render and every
+/// hourly health check. The churn also built a 6.5 MB freelist, because
+/// SQLite reuses freed pages but never shrinks the file on its own. Only
+/// equality is ever asked of this value, so a 64-character digest answers
+/// the same question at a constant, negligible size.
+///
+/// Hashed rule by rule rather than over one `format!("{rules:?}")` string
+/// so that the 5 MB intermediate allocation goes away too, not just the
+/// stored copy. The `\n` separator cannot be confused with rule content:
+/// `Debug` for `String` escapes a literal newline as `\\n`, so no address
+/// can forge a boundary.
+///
+/// Upgrading past the verbatim form makes the first staleness check see a
+/// stored dump where it now expects a digest, report "the rules changed"
+/// once, and settle after the next render. Deliberately not migrated: a
+/// spurious "render again" is a smaller price than code that has to
+/// recognise the old format forever.
 pub fn rules_signature(rules: &[FirewallRule]) -> String {
-    format!("{rules:?}")
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for rule in rules {
+        hasher.update(format!("{rule:?}").as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 /// Gathers every firewall rule (see [`all_rules`]) and renders them for
@@ -621,6 +658,65 @@ mod tests {
             rule("1.2.3.4", FirewallAction::Block),
             rule("5.6.7.8", FirewallAction::Block),
         ];
+        assert_ne!(rules_signature(&a), rules_signature(&b));
+    }
+
+    /// The property the whole fix rests on: the stored value's size is a
+    /// constant, not a function of how many rules there are. A rule set
+    /// three orders of magnitude larger than the other must still produce
+    /// the same 64 characters — that is what stops `settings` from
+    /// carrying a multi-megabyte value again, and it is the invariant a
+    /// future "just store the rules, it's easier to debug" change would
+    /// break.
+    #[test]
+    fn rules_signature_is_a_fixed_size_however_many_rules_there_are() {
+        let one = vec![rule("1.2.3.4", FirewallAction::Block)];
+        // Three orders of magnitude apart is the point; more rules than
+        // this only buys time off the 300ms budget this file's tests have.
+        let many: Vec<FirewallRule> = (0..5_000)
+            .map(|n| {
+                rule(
+                    &format!("10.{}.{}.1", n / 256, n % 256),
+                    FirewallAction::Block,
+                )
+            })
+            .collect();
+
+        assert_eq!(rules_signature(&one).len(), 64);
+        assert_eq!(rules_signature(&many).len(), 64);
+    }
+
+    /// A digest, not a transcript: no part of a rule may be readable in
+    /// the value that gets stored. Pins the intent as well as the size —
+    /// a signature that happened to be short but still embedded an
+    /// address would pass the length test above.
+    #[test]
+    fn rules_signature_does_not_carry_the_rules_it_describes() {
+        let signature = rules_signature(&[rule("203.0.113.9", FirewallAction::Block)]);
+
+        assert!(
+            !signature.contains("203.0.113.9") && !signature.contains("Block"),
+            "the rule leaked into the signature: {signature}"
+        );
+        assert!(
+            signature.chars().all(|c| c.is_ascii_hexdigit()),
+            "not a hex digest: {signature}"
+        );
+    }
+
+    /// Order is part of the identity: `all_rules` returns admin rules
+    /// before derived ones, and `build_script` renders first-match-wins in
+    /// exactly that order, so two sets holding the same rules in a
+    /// different order are genuinely different rule sets and a render is
+    /// genuinely needed.
+    #[test]
+    fn rules_signature_distinguishes_a_reordered_rule_set() {
+        let a = vec![
+            rule("1.2.3.4", FirewallAction::Allow),
+            rule("1.2.3.0/24", FirewallAction::Block),
+        ];
+        let b = vec![a[1].clone(), a[0].clone()];
+
         assert_ne!(rules_signature(&a), rules_signature(&b));
     }
 

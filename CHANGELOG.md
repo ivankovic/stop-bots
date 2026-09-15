@@ -7,7 +7,38 @@ need.
 
 ## [Unreleased]
 
+### Added
+
+- **A daily maintenance job, and `stop-bots maintain` to run it now.** It
+  prunes `user_agent_stats` rows for agents not seen in 90 days (and any
+  excess over 20,000, least recently seen first), clears lapsed firewall
+  rules, and compacts the database when enough free space has built up to
+  be worth the rewrite. `--force-compact` compacts regardless, which is
+  what a host that has already grown wants right after upgrading.
+
+- **The health report now includes the database's size**, and its
+  reclaimable share, warning past 128MB. "Room for the database" reports
+  free space on the *filesystem*, which says nothing about how big this
+  tool's own database has become.
+
 ### Fixed
+
+- **The database no longer grows without bound.** On a live host it had
+  reached 16MB, of which a single `settings` row held 4.7MB: the
+  "rendered signature" the Dashboard uses to tell whether the firewall
+  script is stale was storing the entire rule set's debug dump rather
+  than a hash of it. With reputation feeds enabled that is every CIDR in
+  every feed — 44,075 rules — rewritten in full on every render and
+  rebuilt on every hourly health check. It is now a SHA-256 digest: 64
+  bytes, whatever the rule count.
+
+  Rewriting that value daily had also left 6.5MB of free pages SQLite
+  reuses but never returns to the filesystem, and nothing had ever
+  deleted a `user_agent_stats` row. Both are handled by the new
+  maintenance job above. Upgrading drops the old oversized value on the
+  first open; the Dashboard reports the script as needing a render once
+  afterwards, and settles after it. On the host that prompted this,
+  `stop-bots maintain` took the database from 16.0MB to 4.1MB.
 
 - **`install web` no longer pins the service to `/var/log/auth.log`.** It wrote
   that path into the unit's `ExecStart` at install time, and Debian 12 dropped

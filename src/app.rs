@@ -839,6 +839,16 @@ impl App {
                 self.start_cron_log_job(job)
             }
             CronJob::HealthCheck => self.start_cron_health_check(),
+            // Runs inline rather than on the blocking pool like its
+            // neighbours: it touches nothing but the database, and `Db`
+            // isn't `Sync`, so moving it off-thread would mean moving the
+            // handle, not just the slow half. A prune is a pair of
+            // statements and a compaction only happens on a file already
+            // known to be mostly slack.
+            CronJob::Maintenance => {
+                let summary = crate::cron::maintenance(&self.db);
+                crate::cron::record_run(&self.db, CronJob::Maintenance, &summary);
+            }
         }
         Ok(())
     }

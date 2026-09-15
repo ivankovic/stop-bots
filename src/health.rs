@@ -172,6 +172,22 @@ pub struct Probe {
 /// naming neither the disk nor the tool.
 const LOW_DISK_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Above this, the database is bigger than anything this schema explains
+/// and something is growing that nobody is watching.
+///
+/// Deliberately far above a healthy size rather than close to it. Every
+/// table here is bounded by something: the feeds' own length, the bot
+/// lists', `firewall_rules`' TTLs, and — since `cron::maintenance` —
+/// `user_agent_stats`' age window and row cap. Adding those up, a busy
+/// host with every reputation feed enabled lands in the tens of
+/// megabytes. A threshold set just above *that* would fire on a host that
+/// is merely busy, and a check that cries wolf is one nobody reads on the
+/// day it matters. This one exists to catch the thing the bounds above
+/// have missed — which is exactly how the 4.7 MB rendered-signature value
+/// went unnoticed for two months, in a database nothing ever reported the
+/// size of.
+const LARGE_DB_BYTES: u64 = 128 * 1024 * 1024;
+
 /// Runs everything that needs a subprocess or the filesystem.
 ///
 /// Never fails: a probe that cannot answer a question leaves that field
@@ -385,6 +401,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(nginx_applied(db)?);
     checks.push(service_health(probe));
     checks.push(disk_room(probe));
+    checks.push(database_size(db)?);
     checks.push(log_sources(probe));
 
     Ok(Report {
@@ -596,6 +613,51 @@ fn disk_room(probe: &Probe) -> Check {
     }
 }
 
+/// How big the database has become, and how much of that is slack the next
+/// `CronJob::Maintenance` will hand back.
+///
+/// Reports the size unconditionally rather than only when it is a problem:
+/// the size of this file was invisible everywhere until now — `disk_room`
+/// above reports free space on the *filesystem*, which says nothing about
+/// what this tool is responsible for — and a number an admin sees every
+/// time is one they notice changing.
+fn database_size(db: &Db) -> Result<Check> {
+    let (level, detail, fix) = match db.size_on_disk()? {
+        // In-memory, so there is no file and nothing that can grow.
+        None => (Level::Ok, "in memory".to_string(), None),
+        Some(size) => {
+            let slack = if size.free_bytes > 0 {
+                format!(" ({} reclaimable)", human_bytes(size.free_bytes))
+            } else {
+                String::new()
+            };
+            if size.bytes >= LARGE_DB_BYTES {
+                (
+                    Level::Warn,
+                    format!(
+                        "{}{slack} — larger than this schema accounts for",
+                        human_bytes(size.bytes)
+                    ),
+                    Some("run `stop-bots maintain`, then check what is growing".to_string()),
+                )
+            } else {
+                (
+                    Level::Ok,
+                    format!("{}{slack}", human_bytes(size.bytes)),
+                    None,
+                )
+            }
+        }
+    };
+    Ok(Check {
+        id: "database-size",
+        title: "Database size",
+        level,
+        detail,
+        fix,
+    })
+}
+
 /// The detectors are only as good as the logs they read, and a log they
 /// cannot read looks exactly like a log with nothing in it.
 fn log_sources(probe: &Probe) -> Check {
@@ -684,7 +746,7 @@ pub fn cached_report(db: &Db) -> Result<Option<(Report, i64)>> {
     Ok(Some((assess(db, &probe)?, at)))
 }
 
-fn human_bytes(bytes: u64) -> String {
+pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [(u64, &str); 4] = [
         (1024 * 1024 * 1024, "GB"),
         (1024 * 1024, "MB"),
@@ -1173,6 +1235,61 @@ mod tests {
     fn a_unit_with_no_exec_start_yields_no_binary() {
         assert_eq!(parse_exec_start("ExecStart="), None);
         assert_eq!(parse_exec_start(""), None);
+    }
+
+    /// The size check reports rather than judges on an ordinary database,
+    /// and the number it reports is the one an admin would get from `du`.
+    #[test]
+    fn database_size_reports_an_ordinary_database_without_complaint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ordinary.sqlite3");
+        let db = Db::open(&path).unwrap();
+
+        let check = database_size(&db).unwrap();
+
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.fix.is_none());
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            check.detail,
+            human_bytes(on_disk),
+            "the check should report the size the filesystem reports"
+        );
+    }
+
+    /// Slack is named separately from the total, because the two prompt
+    /// different actions: a large total is something to investigate, a
+    /// large reclaimable share is something the next maintenance run
+    /// simply fixes.
+    #[test]
+    fn database_size_names_reclaimable_space_when_there_is_any() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("slack.sqlite3")).unwrap();
+        // Long user agents, few inserts — see the note in
+        // `db::tests::vacuum_returns_pruned_space_to_the_filesystem`.
+        let mut counts = std::collections::HashMap::new();
+        for n in 0..40 {
+            counts.insert(format!("agent-{n}-{}", "x".repeat(4_000)), 1);
+        }
+        db.record_user_agent_hits(&counts, 1_000).unwrap();
+        db.prune_user_agent_stats(2_000, usize::MAX).unwrap();
+
+        let check = database_size(&db).unwrap();
+
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("reclaimable"),
+            "freed pages should be visible: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn database_size_says_so_for_an_in_memory_database() {
+        let check = database_size(&Db::open_in_memory().unwrap()).unwrap();
+
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(check.detail, "in memory");
     }
 
     #[test]

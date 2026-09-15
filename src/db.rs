@@ -447,6 +447,18 @@ pub struct NewFirewallRule {
     pub action: FirewallAction,
 }
 
+/// How big the database file is and how much of it is free space SQLite
+/// is holding on to — see [`Db::size_on_disk`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbSize {
+    /// The file's total size.
+    pub bytes: u64,
+    /// The part of `bytes` that is on the freelist: already reclaimable by
+    /// SQLite for its own reuse, and returnable to the filesystem by
+    /// [`Db::vacuum`].
+    pub free_bytes: u64,
+}
+
 /// One distinct user agent's accumulated hit count from successful
 /// (non-4xx/5xx) NGINX access-log traffic — see
 /// [`Db::record_user_agent_hits`]/[`Db::list_user_agent_stats`] and
@@ -878,6 +890,28 @@ impl Db {
                 [],
             )?;
         }
+
+        // `firewall_rendered_signature` used to hold the rule set's entire
+        // `Debug` dump rather than a digest of it (see
+        // `firewall::rules_signature`). On a host with reputation feeds
+        // enabled that is megabytes in one `settings` row — 4.7 MB, 31% of
+        // the whole database, on the host that prompted this — and nothing
+        // shrinks it until something happens to re-render. The CLI's
+        // `render-firewall` doesn't record a signature at all, so on a
+        // host driven from the command line that is *never*.
+        //
+        // Dropping it on open is the whole migration. The value is a cache
+        // of "what did we last render", so losing it costs one spurious
+        // "the rules changed" until the next render writes a digest — the
+        // same one-off the format change causes anyway. Guarded by length
+        // so it runs once and is a no-op forever after: a digest is
+        // exactly 64 hex characters, and a `Debug` dump of even a single
+        // rule is over a hundred, so the two can't be confused.
+        self.conn.execute(
+            "DELETE FROM settings
+             WHERE key = 'firewall_rendered_signature' AND length(value) <> 64",
+            [],
+        )?;
 
         // Seed default category policies, matching the product defaults shown
         // in the README: scanners and AI bots blocked by default, search engines allowed.
@@ -1589,6 +1623,111 @@ impl Db {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to list user agent stats")
+    }
+
+    /// Deletes `user_agent_stats` rows that no longer earn their space:
+    /// anything not seen since `keep_since` (Unix seconds), and then, if
+    /// more than `max_rows` survive that, the least recently seen rows
+    /// until only `max_rows` remain. Returns how many rows went.
+    ///
+    /// This table is the one unbounded consumer in the schema. Everything
+    /// else is capped by something outside itself — `firewall_rules` by
+    /// its TTLs (`prune_expired_firewall_rules`), `ip_ranges` and
+    /// `reputation_ranges` by the size of the feeds they mirror, `bots` by
+    /// the published bot lists — but `record_user_agent_hits` is additive
+    /// by design and nothing has ever removed a row. A user agent seen
+    /// once, months ago, by a scanner that never came back sits there
+    /// forever; on a real host a third of the table had not been seen in
+    /// 30 days.
+    ///
+    /// The age window is the honest limit and the row cap is the backstop:
+    /// a window alone still admits any number of *recent* one-off agents
+    /// (a rotating-UA flood is exactly that, and is precisely what this
+    /// host is deployed against), so a burst could outrun the window
+    /// between two prunes. Least-recently-seen is the eviction order
+    /// rather than lowest-hit-count: `hit_count` is a lifetime total, so
+    /// evicting by it would preferentially discard the newest arrivals,
+    /// which is the opposite of what the detectors need to see.
+    ///
+    /// Losing a row loses that agent's lifetime tally, which is the
+    /// intended trade: the tally exists to spot agents worth blocking, and
+    /// an agent absent for a whole window is not one. Already-blocked
+    /// agents live in `blocked_user_agents` and are untouched by this.
+    pub fn prune_user_agent_stats(&self, keep_since: i64, max_rows: usize) -> Result<usize> {
+        let stale = self.conn.execute(
+            "DELETE FROM user_agent_stats WHERE last_seen_at < ?1",
+            params![keep_since],
+        )?;
+        // `OFFSET ?1` past the newest `max_rows` names exactly the excess,
+        // so this is one statement whether it evicts nothing or thousands.
+        //
+        // Saturating rather than `as i64`: a cap above `i64::MAX` wraps to
+        // a *negative* offset under `as`, SQLite reads a negative offset
+        // as zero, and the statement that was meant to delete nothing
+        // deletes the entire table instead. Caught by
+        // `prune_user_agent_stats_drops_only_rows_past_the_window`, which
+        // passes `usize::MAX` to mean "no cap" — the natural way to ask
+        // for exactly the case that broke.
+        let cap = i64::try_from(max_rows).unwrap_or(i64::MAX);
+        let excess = self.conn.execute(
+            "DELETE FROM user_agent_stats WHERE user_agent IN (
+                 SELECT user_agent FROM user_agent_stats
+                 ORDER BY last_seen_at DESC, user_agent ASC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![cap],
+        )?;
+        Ok(stale + excess)
+    }
+
+    // ---- size and maintenance ----
+
+    /// How much disk the database file itself occupies, and how much of
+    /// that is free pages SQLite is holding on to. `None` for an in-memory
+    /// database, which has no file to measure.
+    ///
+    /// Read from `page_count`/`freelist_count`/`page_size` rather than
+    /// `std::fs::metadata` so that the two halves are necessarily
+    /// consistent with each other, and so it works through the same
+    /// connection the rest of the maintenance uses.
+    pub fn size_on_disk(&self) -> Result<Option<DbSize>> {
+        if self.path().is_none() {
+            return Ok(None);
+        }
+        let pragma = |name: &str| -> Result<u64> {
+            self.conn
+                .query_row(&format!("PRAGMA {name}"), [], |row| row.get::<_, i64>(0))
+                .with_context(|| format!("failed to read PRAGMA {name}"))
+                .map(|value| value.max(0) as u64)
+        };
+        let page_size = pragma("page_size")?;
+        Ok(Some(DbSize {
+            bytes: pragma("page_count")? * page_size,
+            free_bytes: pragma("freelist_count")? * page_size,
+        }))
+    }
+
+    /// Rewrites the database to give its free pages back to the
+    /// filesystem, returning how many bytes the file shrank by.
+    ///
+    /// SQLite reuses freed pages but never shrinks the file on its own
+    /// (`auto_vacuum` is off here, and switching it on would need a
+    /// rebuild of every existing database), so a table that grew and then
+    /// shrank leaves the high-water mark behind permanently. Not something
+    /// to run on a schedule for its own sake — it rewrites the whole file
+    /// and needs room for a second copy while it does — which is why
+    /// `cron::maintenance` only calls it when there is a worthwhile amount
+    /// to reclaim.
+    ///
+    /// Must not run inside a transaction; `Db::batch`'s callers therefore
+    /// cannot call this.
+    pub fn vacuum(&self) -> Result<u64> {
+        let before = self.size_on_disk()?.map(|size| size.bytes).unwrap_or(0);
+        self.conn
+            .execute_batch("VACUUM")
+            .context("failed to vacuum the database")?;
+        let after = self.size_on_disk()?.map(|size| size.bytes).unwrap_or(0);
+        Ok(before.saturating_sub(after))
     }
 
     /// How many bytes of `log_path`'s content `record_access_stats` had
@@ -3879,6 +4018,63 @@ mod tests {
         );
     }
 
+    /// The upgrade path off the verbatim-dump format: a database carrying
+    /// one must come back with it gone, not merely ignored, because the
+    /// entire point is the megabytes it was occupying.
+    #[test]
+    fn opening_a_database_drops_a_pre_digest_firewall_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.sqlite3");
+        {
+            let db = Db::open(&path).unwrap();
+            // What the old `format!("{rules:?}")` would have stored.
+            db.set_firewall_rendered_signature(
+                "[FirewallRule { id: 1, address: \"1.2.3.4\", port: None, \
+                 action: Block, enabled: true, expires_at: None }]",
+            )
+            .unwrap();
+        }
+
+        let reopened = Db::open(&path).unwrap();
+
+        assert_eq!(reopened.get_firewall_rendered_signature().unwrap(), None);
+        let rows: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = 'firewall_rendered_signature'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "the row itself should be gone, not just unreadable"
+        );
+    }
+
+    /// ...and the migration must not eat a real one. It runs on every
+    /// open, so a signature that survived one restart has to survive every
+    /// restart — otherwise the dashboard would claim the script was stale
+    /// after each one.
+    #[test]
+    fn opening_a_database_keeps_a_digest_firewall_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.sqlite3");
+        let digest = crate::firewall::rules_signature(&[crate::testing::block("1.2.3.4")]);
+        {
+            let db = Db::open(&path).unwrap();
+            db.set_firewall_rendered_signature(&digest).unwrap();
+        }
+
+        for _ in 0..2 {
+            let reopened = Db::open(&path).unwrap();
+            assert_eq!(
+                reopened.get_firewall_rendered_signature().unwrap(),
+                Some(digest.clone())
+            );
+        }
+    }
+
     #[test]
     fn firewall_rendered_signature_is_none_before_any_render() {
         let db = Db::open_in_memory().unwrap();
@@ -3988,6 +4184,147 @@ mod tests {
         let stats = db.list_user_agent_stats().unwrap();
         assert_eq!(stats[0].user_agent, "common-bot");
         assert_eq!(stats[1].user_agent, "rare-bot");
+    }
+
+    #[test]
+    fn prune_user_agent_stats_drops_only_rows_past_the_window() {
+        let db = Db::open_in_memory().unwrap();
+        let mut old = HashMap::new();
+        old.insert("gone-since-spring".to_string(), 1);
+        db.record_user_agent_hits(&old, 1_000).unwrap();
+        let mut recent = HashMap::new();
+        recent.insert("still-crawling".to_string(), 1);
+        db.record_user_agent_hits(&recent, 5_000).unwrap();
+
+        let pruned = db.prune_user_agent_stats(2_000, usize::MAX).unwrap();
+
+        assert_eq!(pruned, 1);
+        let left = db.list_user_agent_stats().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].user_agent, "still-crawling");
+    }
+
+    /// A row seen exactly at the cutoff is inside the window, not outside
+    /// it — the boundary is `<`, not `<=`. Worth pinning because the two
+    /// read identically at a glance and only one of them keeps an agent
+    /// last seen this very second.
+    #[test]
+    fn prune_user_agent_stats_keeps_a_row_seen_exactly_at_the_cutoff() {
+        let db = Db::open_in_memory().unwrap();
+        let mut counts = HashMap::new();
+        counts.insert("on-the-line".to_string(), 1);
+        db.record_user_agent_hits(&counts, 2_000).unwrap();
+
+        assert_eq!(db.prune_user_agent_stats(2_000, usize::MAX).unwrap(), 0);
+        assert_eq!(db.list_user_agent_stats().unwrap().len(), 1);
+    }
+
+    /// The backstop the age window cannot provide: every one of these is
+    /// recent, so the window keeps all of them, and only the row cap
+    /// stops a rotating-user-agent flood from filling the table.
+    #[test]
+    fn prune_user_agent_stats_enforces_the_row_cap_on_rows_inside_the_window() {
+        let db = Db::open_in_memory().unwrap();
+        for n in 0..10 {
+            let mut counts = HashMap::new();
+            counts.insert(format!("flood-{n}"), 1);
+            // Ascending timestamps, so "newest" is unambiguous.
+            db.record_user_agent_hits(&counts, 1_000 + n as i64)
+                .unwrap();
+        }
+
+        let pruned = db.prune_user_agent_stats(0, 3).unwrap();
+
+        assert_eq!(pruned, 7);
+        let left = db.list_user_agent_stats().unwrap();
+        let mut names: Vec<&str> = left.iter().map(|s| s.user_agent.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["flood-7", "flood-8", "flood-9"],
+            "kept the wrong rows"
+        );
+    }
+
+    /// Eviction order is least-recently-seen, *not* lowest-hit-count.
+    /// `hit_count` is a lifetime total, so a busy agent that stopped
+    /// months ago outranks a new arrival on hits while being exactly the
+    /// row worth losing. This test fails if someone "improves" the
+    /// ordering to `hit_count ASC`.
+    #[test]
+    fn prune_user_agent_stats_evicts_the_least_recently_seen_not_the_least_busy() {
+        let db = Db::open_in_memory().unwrap();
+        let mut busy_but_gone = HashMap::new();
+        busy_but_gone.insert("was-everywhere".to_string(), 10_000);
+        db.record_user_agent_hits(&busy_but_gone, 1_000).unwrap();
+        let mut quiet_but_here = HashMap::new();
+        quiet_but_here.insert("just-arrived".to_string(), 1);
+        db.record_user_agent_hits(&quiet_but_here, 9_000).unwrap();
+
+        db.prune_user_agent_stats(0, 1).unwrap();
+
+        let left = db.list_user_agent_stats().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].user_agent, "just-arrived");
+    }
+
+    #[test]
+    fn prune_user_agent_stats_leaves_a_table_inside_both_limits_alone() {
+        let db = Db::open_in_memory().unwrap();
+        let mut counts = HashMap::new();
+        counts.insert("well-behaved".to_string(), 5);
+        db.record_user_agent_hits(&counts, 5_000).unwrap();
+
+        assert_eq!(db.prune_user_agent_stats(1_000, 100).unwrap(), 0);
+        assert_eq!(db.list_user_agent_stats().unwrap().len(), 1);
+    }
+
+    /// Pruning frees pages onto SQLite's freelist but does not shrink the
+    /// file; only `vacuum` returns them to the filesystem. Both halves are
+    /// asserted here because the second is the one an admin looking at
+    /// `du` actually cares about, and a cleanup that only did the first
+    /// would look like it had done nothing.
+    #[test]
+    fn vacuum_returns_pruned_space_to_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("size.sqlite3");
+        let db = Db::open(&path).unwrap();
+
+        // A few long user agents rather than many short ones: the file has
+        // to be measurably smaller afterwards, and each one's overflow
+        // pages buy that for one insert rather than dozens. This file's
+        // tests have a 300ms budget and a file-backed `Db::open` has
+        // already spent most of it.
+        let mut counts = HashMap::new();
+        for n in 0..40 {
+            counts.insert(format!("agent-{n}-{}", "x".repeat(4_000)), 1);
+        }
+        db.record_user_agent_hits(&counts, 1_000).unwrap();
+        let grown = db.size_on_disk().unwrap().expect("a file-backed database");
+
+        db.prune_user_agent_stats(2_000, usize::MAX).unwrap();
+        let pruned = db.size_on_disk().unwrap().unwrap();
+        assert_eq!(
+            pruned.bytes, grown.bytes,
+            "deleting rows must not shrink the file"
+        );
+        assert!(
+            pruned.free_bytes > 0,
+            "the freed pages should be on the freelist"
+        );
+
+        let reclaimed = db.vacuum().unwrap();
+        let after = db.size_on_disk().unwrap().unwrap();
+        assert!(after.bytes < grown.bytes, "vacuum should shrink the file");
+        assert_eq!(reclaimed, grown.bytes - after.bytes);
+        assert_eq!(after.free_bytes, 0, "vacuum should leave no freelist");
+    }
+
+    /// An in-memory database has no file, and saying "0 bytes" about one
+    /// would be a measurement rather than the absence of one.
+    #[test]
+    fn size_on_disk_is_none_for_an_in_memory_database() {
+        assert_eq!(Db::open_in_memory().unwrap().size_on_disk().unwrap(), None);
     }
 
     #[test]

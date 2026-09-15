@@ -71,6 +71,10 @@ pub enum CronJob {
     /// records what it found for the dashboards to read. See
     /// [`crate::health`].
     HealthCheck,
+    /// Keeps the database from growing without bound: prunes the one table
+    /// that accumulates forever and hands back the free pages that churn
+    /// leaves behind. See [`maintenance`].
+    Maintenance,
 }
 
 impl CronJob {
@@ -82,6 +86,7 @@ impl CronJob {
                 CronJob::RecordAccessStats,
                 CronJob::RenderFirewall,
                 CronJob::HealthCheck,
+                CronJob::Maintenance,
             ])
             .collect()
     }
@@ -98,6 +103,7 @@ impl CronJob {
             CronJob::RecordAccessStats => "record_access_stats",
             CronJob::RenderFirewall => "render_firewall",
             CronJob::HealthCheck => "health_check",
+            CronJob::Maintenance => "maintenance",
         }
     }
 
@@ -109,6 +115,7 @@ impl CronJob {
             CronJob::RecordAccessStats => "Record access-log stats",
             CronJob::RenderFirewall => "Render firewall script",
             CronJob::HealthCheck => "Check system health",
+            CronJob::Maintenance => "Prune and compact the database",
         }
     }
 
@@ -122,7 +129,9 @@ impl CronJob {
     /// - `RenderFirewall`: daily — nothing about it is time-sensitive.
     pub fn interval(self) -> Duration {
         match self {
-            CronJob::UpdateIpRanges | CronJob::RenderFirewall => Duration::from_secs(24 * 60 * 60),
+            CronJob::UpdateIpRanges | CronJob::RenderFirewall | CronJob::Maintenance => {
+                Duration::from_secs(24 * 60 * 60)
+            }
             // Hourly. `nft list` on a large ruleset is megabytes of text,
             // so this is not something to do per render — but a host that
             // silently stopped being protected should not stay that way
@@ -220,7 +229,10 @@ pub fn uses_ssh_log(job: CronJob) -> bool {
     match job {
         CronJob::Detect(detector) => detector.spec().uses_ssh_log,
         CronJob::RenderFirewall => true,
-        CronJob::RecordAccessStats | CronJob::UpdateIpRanges | CronJob::HealthCheck => false,
+        CronJob::RecordAccessStats
+        | CronJob::UpdateIpRanges
+        | CronJob::HealthCheck
+        | CronJob::Maintenance => false,
     }
 }
 
@@ -299,9 +311,112 @@ pub fn run_log_job(
         CronJob::HealthCheck => {
             unreachable!("HealthCheck is run via health_check, which needs no log")
         }
+        CronJob::Maintenance => {
+            unreachable!("Maintenance is run via maintenance, which needs no log")
+        }
     };
     db.set_cron_last_run(job.id(), now(), &summary)?;
     Ok(summary)
+}
+
+/// How long a user agent may go unseen before its `user_agent_stats` row
+/// is dropped. Ninety days is well past any window the detectors look at
+/// (they read the current log, not this table) while still being long
+/// enough that a quarterly-crawling agent keeps its lifetime tally.
+pub const USER_AGENT_STATS_MAX_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// The hard ceiling on `user_agent_stats` rows, enforced after the age
+/// window. Chosen to sit far above what an ordinary host accumulates — a
+/// real one held ~3,200 rows after two months — so that reaching it means
+/// a rotating-user-agent flood, which is the case the age window alone
+/// cannot contain.
+pub const USER_AGENT_STATS_MAX_ROWS: usize = 20_000;
+
+/// Don't rewrite the whole database to reclaim less than this.
+const VACUUM_MIN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// ...or to reclaim less than this share of the file. Both thresholds
+/// have to be met: the absolute one stops a small database being rewritten
+/// over a trivial amount, the proportional one stops a large one being
+/// rewritten daily over a freelist it is about to reuse anyway.
+const VACUUM_MIN_FRACTION: f64 = 0.20;
+
+/// Whether `size`'s free pages are worth the cost of rewriting the file to
+/// get back — see [`Db::vacuum`] for what that cost is.
+///
+/// Split out from [`maintenance`] so the thresholds can be tested as
+/// arithmetic. Proving the same boundaries through `maintenance` would
+/// mean building a real multi-megabyte database per case, which is both
+/// slower than this file's test budget allows and a worse test: it would
+/// be measuring SQLite's page allocator as much as this policy.
+fn worth_compacting(size: crate::db::DbSize) -> bool {
+    size.free_bytes >= VACUUM_MIN_BYTES
+        && size.free_bytes as f64 >= size.bytes as f64 * VACUUM_MIN_FRACTION
+}
+
+/// Prunes what has accumulated and compacts the file if that left enough
+/// slack to be worth reclaiming, returning the one-line summary the
+/// Dashboard's "Scheduled tasks" panel shows.
+///
+/// Both halves matter, and only together: pruning rows frees *pages*,
+/// which SQLite keeps on its freelist for its own reuse and never returns
+/// to the filesystem by itself (`auto_vacuum` is off — see `Db::vacuum`).
+/// A cleanup that only deleted rows would leave the file exactly as large
+/// as the day it peaked, which is not what anyone who looked at `du` and
+/// asked for a cleanup means.
+///
+/// Never fails: like every other cron job here, an error becomes the
+/// recorded summary rather than something handed back to a caller who has
+/// no one to tell. Deliberately a `&Db` and nothing else — no log, no
+/// network, no filesystem beyond the database — so there is no reason for
+/// either front-end to run it off-thread.
+pub fn maintenance(db: &Db) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    let keep_since = now() - USER_AGENT_STATS_MAX_AGE.as_secs() as i64;
+    match db.prune_user_agent_stats(keep_since, USER_AGENT_STATS_MAX_ROWS) {
+        Ok(0) => parts.push("nothing stale to prune".to_string()),
+        Ok(pruned) => parts.push(format!("pruned {pruned} stale user agents")),
+        Err(err) => return format!("error: {err}"),
+    }
+
+    // Expired firewall rules are pruned on every read
+    // (`list_firewall_rules`), so this is belt-and-braces for a host whose
+    // rules nothing has listed in a while — a render, a dashboard or a
+    // detector would all have done it already.
+    if let Ok(pruned @ 1..) = db.prune_expired_firewall_rules() {
+        parts.push(format!("{pruned} expired rules"));
+    }
+
+    match db.size_on_disk() {
+        Err(err) => return format!("error: {err}"),
+        // In-memory: nothing to compact, and nothing to report about a
+        // file that does not exist.
+        Ok(None) => {}
+        Ok(Some(size)) => {
+            if worth_compacting(size) {
+                match db.vacuum() {
+                    Ok(reclaimed) => parts.push(format!(
+                        "reclaimed {}",
+                        crate::health::human_bytes(reclaimed)
+                    )),
+                    Err(err) => parts.push(format!("could not compact: {err}")),
+                }
+            }
+            let now_bytes = db
+                .size_on_disk()
+                .ok()
+                .flatten()
+                .map(|size| size.bytes)
+                .unwrap_or(size.bytes);
+            parts.push(format!(
+                "database {}",
+                crate::health::human_bytes(now_bytes)
+            ));
+        }
+    }
+
+    parts.join(", ")
 }
 
 /// Takes a health probe and records it, for the dashboards to read.
@@ -494,6 +609,82 @@ mod tests {
 
     fn test_db() -> Db {
         Db::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn maintenance_prunes_a_stale_user_agent_and_says_so() {
+        let db = test_db();
+        let mut counts = std::collections::HashMap::new();
+        counts.insert("long-gone".to_string(), 1);
+        // Last seen a day before the window even opens.
+        let long_ago = now() - USER_AGENT_STATS_MAX_AGE.as_secs() as i64 - 86_400;
+        db.record_user_agent_hits(&counts, long_ago).unwrap();
+
+        let summary = maintenance(&db);
+
+        assert!(db.list_user_agent_stats().unwrap().is_empty());
+        assert!(
+            summary.contains("pruned 1 stale user agents"),
+            "the summary should say what went: {summary}"
+        );
+    }
+
+    #[test]
+    fn maintenance_keeps_a_user_agent_seen_inside_the_window() {
+        let db = test_db();
+        let mut counts = std::collections::HashMap::new();
+        counts.insert("still-here".to_string(), 1);
+        db.record_user_agent_hits(&counts, now()).unwrap();
+
+        let summary = maintenance(&db);
+
+        assert_eq!(db.list_user_agent_stats().unwrap().len(), 1);
+        assert!(
+            summary.contains("nothing stale"),
+            "a clean database should say so plainly: {summary}"
+        );
+    }
+
+    /// The compaction thresholds, as arithmetic. Both have to be met, so
+    /// each case here fails exactly one of them — a single "yes" case
+    /// would pass against a policy that had dropped either check.
+    #[test]
+    fn worth_compacting_needs_both_a_large_and_a_proportionate_freelist() {
+        let mb = 1024 * 1024;
+        let size = |bytes, free_bytes| crate::db::DbSize { bytes, free_bytes };
+
+        // 11MB of 15MB: the state the host that prompted this was in.
+        assert!(worth_compacting(size(15 * mb, 11 * mb)));
+        // Proportionate (50%) but trivial in absolute terms — rewriting a
+        // 6MB file to win 3MB is not worth a daily rewrite.
+        assert!(!worth_compacting(size(6 * mb, 3 * mb)));
+        // Large in absolute terms (8MB) but only 8% of a 100MB file, which
+        // SQLite is about to reuse anyway.
+        assert!(!worth_compacting(size(100 * mb, 8 * mb)));
+        // A tight database is the common case and must never be rewritten.
+        assert!(!worth_compacting(size(4 * mb, 0)));
+    }
+
+    /// `maintenance` takes only a `&Db`, and an in-memory one has no file
+    /// — it must still report what it pruned and say nothing about a size
+    /// that does not exist. Both front-ends' own test suites run against
+    /// in-memory databases, so this is the path they take.
+    #[test]
+    fn maintenance_reports_no_size_for_an_in_memory_database() {
+        let summary = maintenance(&test_db());
+
+        assert!(!summary.contains("database "), "{summary}");
+        assert!(!summary.contains("reclaimed"), "{summary}");
+    }
+
+    /// A job missing from `all()` is one the internal cron never runs and
+    /// the dashboards never list — the failure mode of a variant added to
+    /// the enum and nowhere else.
+    #[test]
+    fn maintenance_is_a_scheduled_job() {
+        assert!(CronJob::all().contains(&CronJob::Maintenance));
+        assert!(!uses_ssh_log(CronJob::Maintenance));
+        assert_eq!(CronJob::Maintenance.id(), "maintenance");
     }
 
     /// `RenderFirewall` reads the SSH log without being a detector — it

@@ -4845,3 +4845,86 @@ The container suite's `Host` tests all opened with the same three lines;
 console service, and `Host::stop_bots` supplies the installed console's
 database path (`HOST_DB`), so a test starts at its first interesting
 line.
+
+## The database stopped growing (`firewall::rules_signature`, `cron::maintenance`, `Db::prune_user_agent_stats`, `stop-bots maintain`)
+
+A live host's database had reached 16 MB. Per-object page accounting
+(`dbstat`) put 4.85 MB of that in `settings` — a table of 45 rows. One
+row held 4,948,608 bytes.
+
+**`firewall_rendered_signature` was not a signature, it was a
+transcript.** `rules_signature` was `format!("{rules:?}")`: the `Debug`
+dump of every rule, stored verbatim. That is unremarkable with a handful
+of admin rules, and ruinous with the derived ones — `all_rules` appends
+every enabled reputation and cloud-provider CIDR, which on that host was
+44,075 rules at roughly 110 bytes each. Only equality is ever asked of
+the value (`script_freshness`, the Dashboard's "needs updating" row), so
+it is now a SHA-256 digest: 64 bytes, constant, whatever the rule count.
+Hashed rule by rule rather than over one joined string, so the 5 MB
+intermediate allocation goes too — it was being built on every render
+*and* every hourly health check, not just when something changed.
+
+**The churn was the second half of the problem.** `auto_vacuum` is off
+and `journal_mode` is `delete`, so rewriting a multi-megabyte overflow
+chain daily built a freelist: 1,592 pages, 6.5 MB, 40% of the file that
+SQLite would reuse but never return. Shrinking the value does not shrink
+the file; only `VACUUM` does.
+
+**`user_agent_stats` was the one genuinely unbounded table.** Its own
+schema comment says it accumulates lifetime totals, and nothing had ever
+deleted a row — a third of that host's 3,161 rows had not been seen in
+30 days, and 1,150 were seen exactly once. Everything else in the schema
+is bounded by something outside itself: `firewall_rules` by its TTLs
+(2,358 of 2,359 rows carried one, and none were overdue, so
+`prune_expired_firewall_rules` was working), `ip_ranges` and
+`reputation_ranges` by the length of the feeds they mirror, `bots` by the
+published lists.
+
+**So: a daily `CronJob::Maintenance`.** It prunes `user_agent_stats` rows
+unseen for 90 days, then evicts least-recently-seen rows above a 20,000
+cap, then compacts the file if the freelist is both ≥ 4 MB and ≥ 20% of
+it. Both vacuum thresholds have to be met — the absolute one stops a
+small database being rewritten over a trivial amount, the proportional
+one stops a large one being rewritten daily over slack it is about to
+reuse. The age window is the honest limit and the row cap is the
+backstop: a window alone still admits any number of *recent* one-off
+agents, which is exactly what a rotating-user-agent flood is, and this
+tool exists to be pointed at those. Eviction is by `last_seen_at`, not
+`hit_count`: the count is a lifetime total, so evicting by it would
+preferentially discard the newest arrivals.
+
+**A one-line migration, because the old value would otherwise outlive the
+fix.** `Db::open` deletes `firewall_rendered_signature` when its length
+is not 64. The CLI's `render-firewall` never recorded a signature at all,
+so on a command-line-driven host nothing would ever have overwritten the
+old dump. Losing the value costs one spurious "the rules changed" until
+the next render — the same one-off the format change causes anyway.
+
+**`stop-bots maintain`** runs the job now rather than waiting for the
+cron, and `--force-compact` vacuums past the thresholds. It exists
+because the host that prompted this has no `sqlite3` installed, and
+because after an upgrade that frees several megabytes at once, waiting a
+day for the file to shrink is not what someone who just ran `du` wants.
+On a copy of that host's database it went 16.0 MB → 4.1 MB in one
+invocation, `PRAGMA integrity_check` clean.
+
+**The size is now visible.** `health::database_size` reports the file and
+its reclaimable share on every probe, and warns past 128 MB. `disk_room`
+already reported free space on the *filesystem*, which says nothing about
+what this tool is responsible for — the 4.7 MB row sat there for two
+months in a database nothing ever reported the size of. The threshold is
+deliberately far above a healthy size rather than just above it: it is
+there to catch the next unbounded thing, not to nag a busy host.
+
+**Considered and rejected.** Pruning `reputation_ranges` (43,093 rows,
+3.1 MB — the largest legitimate consumer): it is the feed payload, it is
+refetched daily, and deleting it only buys a refetch. Migrating the old
+signature value to its digest rather than dropping it: that means code
+that recognises the old format forever, to save one "render again".
+`WITHOUT ROWID` for `reputation_ranges` and `user_agent_stats`, whose
+composite/TEXT primary-key autoindexes are each *larger* than the table
+they index (1.65 MB against 1.45 MB) — it would roughly halve both, but
+it is a table rebuild, and this project still has no migration runner.
+A hard byte cap on the file: SQLite offers no way to enforce one that
+does not end in a failed write, and bounded retention plus a visible size
+is the version that actually holds.

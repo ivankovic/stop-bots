@@ -98,6 +98,7 @@ pub async fn tick(state: &AppState) -> usize {
                 run_log_job(state, job).await
             }
             CronJob::HealthCheck => health_check(state).await,
+            CronJob::Maintenance => maintenance(state).await,
         };
         match result {
             Ok(()) => ran += 1,
@@ -105,6 +106,23 @@ pub async fn tick(state: &AppState) -> usize {
         }
     }
     ran
+}
+
+/// Prunes and compacts the database.
+///
+/// The whole job is database work, so unlike its neighbours there is no
+/// half to hoist out of the lock — it is one `with_db` and nothing else.
+/// Holding the lock across a compaction is the point rather than a cost:
+/// `VACUUM` rewrites the file, and a request reading through it mid-rewrite
+/// is exactly what the lock exists to prevent.
+async fn maintenance(state: &AppState) -> anyhow::Result<()> {
+    state
+        .with_db(|db| {
+            let summary = cron::maintenance(db);
+            cron::record_run(db, CronJob::Maintenance, &summary);
+            Ok(())
+        })
+        .await
 }
 
 /// Reads the log this job needs off the async runtime and outside the

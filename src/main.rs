@@ -401,6 +401,23 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Prune stale rows and compact the database.
+    ///
+    /// Drops `user_agent_stats` rows for agents not seen in 90 days (and
+    /// any excess over 20,000 rows, least recently seen first), clears
+    /// lapsed firewall rules, and rewrites the file to hand free pages
+    /// back to the filesystem if enough has accumulated to be worth it.
+    /// The internal cron does this daily on its own — this runs it now,
+    /// which is what a host that has already grown wants, and what a host
+    /// with no `sqlite3` installed has no other way to do
+    Maintain {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Compact the file even when there is little to reclaim. The
+        /// scheduled job weighs that up for itself; this overrides it
+        #[arg(long)]
+        force_compact: bool,
+    },
     /// Download one crawler's published IP ranges.
     ///
     /// Download and store the current CIDR list for one published crawler
@@ -1127,6 +1144,7 @@ async fn main() -> Result<()> {
         Some(Command::SetHoneypotPath { db, path }) => set_honeypot_path(db, path),
         Some(Command::RecordAccessStats { db, access_log }) => record_access_stats(db, access_log),
         Some(Command::ListAccessStats { db }) => list_access_stats(db),
+        Some(Command::Maintain { db, force_compact }) => maintain(db, force_compact),
         Some(Command::UpdateIpRanges {
             db,
             source_id,
@@ -2658,6 +2676,55 @@ fn list_access_stats(db_path: Option<PathBuf>) -> Result<()> {
     for stat in stats {
         println!("{:>8}  {}", stat.hit_count, stat.user_agent);
     }
+    Ok(())
+}
+
+/// Runs the maintenance the internal cron runs daily, right now, and
+/// prints what it did.
+///
+/// Prints the before/after sizes rather than only the summary line the
+/// Dashboard shows: someone reaching for this has just looked at `du` and
+/// wants the same number to have moved.
+fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+
+    let before = db.size_on_disk()?;
+    if let Some(size) = before {
+        println!(
+            "Database is {} ({} reclaimable).",
+            stop_bots::health::human_bytes(size.bytes),
+            stop_bots::health::human_bytes(size.free_bytes)
+        );
+    }
+
+    let summary = stop_bots::cron::maintenance(&db);
+    println!("{summary}");
+
+    // `cron::maintenance` compacts only when the slack is worth the
+    // rewrite. `--force-compact` is for the case its thresholds are wrong
+    // for this host — most usefully right after an upgrade that freed a
+    // lot at once, where waiting for the next scheduled run would leave
+    // the file at its old size for a day.
+    if force_compact {
+        let reclaimed = db.vacuum()?;
+        println!(
+            "Compacted anyway: reclaimed {}.",
+            stop_bots::health::human_bytes(reclaimed)
+        );
+    }
+
+    if let (Some(before), Ok(Some(after))) = (before, db.size_on_disk()) {
+        if after.bytes < before.bytes {
+            println!(
+                "Now {} — down from {}.",
+                stop_bots::health::human_bytes(after.bytes),
+                stop_bots::health::human_bytes(before.bytes)
+            );
+        }
+    }
+    // Recording the run last means an interrupted maintenance leaves the
+    // job due rather than looking done.
+    stop_bots::cron::record_run(&db, stop_bots::cron::CronJob::Maintenance, &summary);
     Ok(())
 }
 
