@@ -4986,3 +4986,55 @@ has no console unit and does auto-render. Changing the `fix` line when a
 render is scheduled: rendering by hand is still a real thing an admin can
 do to fix it sooner, so the suggestion stands. Adding `chrono` or `jiff`
 for one format string, in a tree that has neither.
+
+## Dynamic Protection: "for" not "until", and a tag column that is actually a column
+
+Two things an admin looking at the SSH panel reported, both in one row of
+one list.
+
+**"BLOCKED until 1d" was describing a duration with the preposition for a
+moment.** `format_until` returns how much time is *left* ("1d", "23h"),
+so the sentence read as though the block lifted at something called 1d.
+It is `BLOCKED for 1d` now. Only the timed label changed; `BLOCKED`,
+`NOT BLOCKED` and `BLOCKLIST` keep the all-caps tag style they share, so
+the four still read as one set of states rather than one of them having
+been restyled.
+
+**The state tag was never in a column, though the code had said so since
+the panel was written.** The four tags are four different lengths —
+`[ BLOCKED ]`, `[ BLOCKLIST ]`, `[ NOT BLOCKED ]` and the longest,
+`[ BLOCKED for 1d ]`, which varies with the time left — and nothing
+padded them, so every row began its address at a different cell and the
+states ran into the addresses. `row_line`'s own doc comment had promised
+"the state tag in a fixed column" the whole time; only the padding was
+missing.
+
+The width comes from the caller rather than from a constant, because the
+longest tag depends on the rows actually present: a panel with no
+expiring block should not indent every address past room reserved for a
+tag that is not there. It is one width across *both* panels rather than
+one each — they stack with a single left edge and every column before
+this one already lines up, so a tag column that agreed only within a
+panel would leave the two address columns a few cells apart, which reads
+as a mistake rather than as two independent tables. The padding goes
+outside the brackets: `[ BLOCKED        ]` would stretch the coloured box
+to the width of the widest state and draw the eye to the emptiest row on
+the screen.
+
+The test asserts the thing the eye actually checks — that every value
+starts at the same x, across both panels — rather than a golden
+screenful, so it still means something when a label or the bar width
+changes. It counts **cells, not bytes**: the bar is `\u{2588}` and the
+border `\u{2502}`, three bytes each, so a `str::find` offset makes a row
+with more bar look further right than one with less. The first version of
+this test did exactly that and "failed" against correct output.
+
+**Two things found while looking.** The user-agent panel's empty-state
+message had a run of spaces in the middle of it — a string literal broken
+across two source lines with no `\` continuation, so the source
+indentation was part of the text, invisible at 80 columns because it was
+clipped there. And the TUI's one-line status strip maps check ids to
+one-word labels with a fallback to the id itself, so the `database-size`
+check had been rendering as "database-size" among "disk", "logs" and
+"script"; it has a label, and a test now walks every check `assess`
+produces so the next one cannot slip through.

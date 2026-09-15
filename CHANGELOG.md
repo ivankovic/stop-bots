@@ -31,6 +31,25 @@ need.
 
 ### Fixed
 
+- **"BLOCKED until 1d" now reads "BLOCKED for 1d".** The time beside it is
+  how long is left, not a moment, so "until" described something the
+  number never was.
+
+- **The state tags on Dynamic Protection no longer run into the addresses
+  beside them.** The four tags are four different lengths, and nothing
+  padded them, so every row started its address at a different column —
+  a column the code had claimed was fixed since the panel was written.
+  Both panels now share one tag column, sized to the longest tag actually
+  on screen.
+
+- **The "no user agents tallied yet" message no longer has a gap in the
+  middle of it.** A string literal was broken across two source lines
+  without a continuation, so the indentation was part of the text.
+
+- **The database-size check now has a short name in the TUI status
+  strip**, where it had been showing as "database-size" among "disk",
+  "logs" and "script".
+
 - **The database no longer grows without bound.** On a live host it had
   reached 16MB, of which a single `settings` row held 4.7MB: the
   "rendered signature" the Dashboard uses to tell whether the firewall

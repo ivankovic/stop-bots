@@ -43,9 +43,14 @@ use crate::{ipranges, sshlog};
 /// Whether a row's address/user agent is already covered by a stored
 /// block. `Blocked { until: None }` renders as `BLOCKED`; `Some(t)`
 /// (a temporary `firewall_rules` row, e.g. from `block-scanners`) renders
-/// as `BLOCKED until <relative time>`. `Blocklist` means the item is blocked
+/// as `BLOCKED for <relative time>`. `Blocklist` means the item is blocked
 /// by the botlist configuration (bot patterns or IP ranges), not by a manual
 /// block action.
+///
+/// "for", not "until": [`format_until`] returns a *duration* ("1d", "23h"),
+/// so "BLOCKED until 1d" read as though the block lifted at some moment
+/// called 1d. The word the sentence needed was the one that takes a
+/// length of time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowStatus {
     Pending,
@@ -60,7 +65,7 @@ impl RowStatus {
             RowStatus::Blocked { until: None } => "BLOCKED".to_string(),
             RowStatus::Blocked {
                 until: Some(expires_at),
-            } => format!("BLOCKED until {}", format_until(expires_at)),
+            } => format!("BLOCKED for {}", format_until(expires_at)),
             RowStatus::Blocklist => "BLOCKLIST".to_string(),
         }
     }
@@ -368,7 +373,12 @@ mod tests {
             rows[0].status,
             RowStatus::Blocked { until: Some(_) }
         ));
-        assert!(rows[0].status.label().starts_with("BLOCKED until"));
+        // "for", not "until": `format_until` returns a duration, so the
+        // preposition has to be the one that takes a length of time.
+        // Only the prefix is asserted — the number is relative to now.
+        let label = rows[0].status.label();
+        assert!(label.starts_with("BLOCKED for "), "label was: {label}");
+        assert!(!label.contains("until"), "label was: {label}");
     }
 
     #[test]

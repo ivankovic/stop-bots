@@ -387,11 +387,23 @@ impl DynamicProtection {
 
         let reading = jobs.contains(&crate::app::Job::ReadSshLog);
         let ssh_rows = self.visible_ssh_rows();
+        let ua_rows_for_width = self.visible_ua_rows();
+        // One width for both panels, not one each. They are stacked with
+        // the same left edge and every column before this one already
+        // lines up, so a tag column that agreed only within a panel would
+        // put the two address columns a few cells apart — which reads as
+        // a mistake rather than as two independent tables.
+        let tag_width = tag_column_width(
+            ssh_rows
+                .iter()
+                .map(|row| row.status)
+                .chain(ua_rows_for_width.iter().map(|row| row.status)),
+        );
         let ssh_max = ssh_rows.iter().map(|row| row.count).max().unwrap_or(0);
         let ssh_items: Vec<ListItem> = empty_or(
             ssh_rows
                 .into_iter()
-                .map(|row| ssh_row_line(row, ssh_max, theme))
+                .map(|row| ssh_row_line(row, ssh_max, tag_width, theme))
                 .map(ListItem::new)
                 .collect(),
             if reading {
@@ -423,11 +435,12 @@ impl DynamicProtection {
         let ua_items: Vec<ListItem> = empty_or(
             ua_rows
                 .into_iter()
-                .map(|row| ua_row_line(row, ua_max, theme))
+                .map(|row| ua_row_line(row, ua_max, tag_width, theme))
                 .map(ListItem::new)
                 .collect(),
             if self.ua_rows.is_empty() {
-                "No successful requests tallied yet. This fills in as traffic arrives,                  or run `stop-bots record-access-stats`."
+                "No successful requests tallied yet. This fills in as traffic arrives, \
+                 or run `stop-bots record-access-stats`."
             } else {
                 "Nothing matches this filter. Press f to change it."
             },
@@ -593,23 +606,69 @@ fn empty_or(items: Vec<ListItem<'static>>, message: &str) -> Vec<ListItem<'stati
     }
 }
 
-fn ssh_row_line(row: &SshRow, max: u64, theme: Theme) -> Line<'static> {
-    row_line(row.count, max, row.status, row.address.clone(), theme)
+fn ssh_row_line(row: &SshRow, max: u64, tag_width: usize, theme: Theme) -> Line<'static> {
+    row_line(
+        row.count,
+        max,
+        row.status,
+        row.address.clone(),
+        tag_width,
+        theme,
+    )
 }
 
-fn ua_row_line(row: &UaRow, max: u64, theme: Theme) -> Line<'static> {
-    row_line(row.count, max, row.status, row.user_agent.clone(), theme)
+fn ua_row_line(row: &UaRow, max: u64, tag_width: usize, theme: Theme) -> Line<'static> {
+    row_line(
+        row.count,
+        max,
+        row.status,
+        row.user_agent.clone(),
+        tag_width,
+        theme,
+    )
 }
 
 /// How many cells the count bar gets. Long enough to tell 4812 from
 /// 3004 at a glance, short enough to leave the user agent its column.
 const BAR_WIDTH: usize = 10;
 
+/// The width the `[ ... ]` state tag is padded out to, over every tag
+/// that will be on screen — see [`row_line`] for why the column has to be
+/// one width rather than each row's own.
+fn tag_column_width(statuses: impl Iterator<Item = RowStatus>) -> usize {
+    statuses
+        .map(|status| tag_text(status).chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
+fn tag_text(status: RowStatus) -> String {
+    format!("[ {} ]", status.label())
+}
+
 /// One row of either panel: the count, a bar scaled to the panel's
 /// largest count, the state tag in a fixed column, then the value. The
 /// tag carries the colour; the value stays default so a long user agent
 /// reads as text rather than as a red stripe.
-fn row_line(count: u64, max: u64, status: RowStatus, value: String, theme: Theme) -> Line<'static> {
+///
+/// `tag_width` is what makes "a fixed column" true. The tags are four
+/// different lengths — `[ BLOCKED ]`, `[ BLOCKLIST ]`, `[ NOT BLOCKED ]`
+/// and `[ BLOCKED for 1d ]`, which is longest and varies with the time
+/// left — so without padding every row started its address at a different
+/// cell and the states ran into the addresses. The doc comment above had
+/// claimed the fixed column since the panel was written; only the padding
+/// was missing. It comes from the caller rather than from a constant
+/// because the longest tag depends on the rows actually present: a panel
+/// with no expiring blocks should not indent every address past a width
+/// reserved for a tag that is not there.
+fn row_line(
+    count: u64,
+    max: u64,
+    status: RowStatus,
+    value: String,
+    tag_width: usize,
+    theme: Theme,
+) -> Line<'static> {
     let filled = if max == 0 {
         0
     } else {
@@ -621,17 +680,22 @@ fn row_line(count: u64, max: u64, status: RowStatus, value: String, theme: Theme
         "\u{2588}".repeat(filled),
         " ".repeat(BAR_WIDTH - filled)
     );
-    let tag = format!("[ {} ]", status.label());
+    let text = tag_text(status);
+    // Padded outside the brackets, not inside them: `[ BLOCKED        ]`
+    // stretches the coloured box to the width of the widest state, which
+    // draws the eye to the emptiest row on the screen.
+    let padding = " ".repeat(tag_width.saturating_sub(text.chars().count()));
     let tag = match status {
-        RowStatus::Blocklist => tag.yellow(),
-        RowStatus::Blocked { .. } => tag.red(),
-        RowStatus::Pending => tag.fg(theme.dim()),
+        RowStatus::Blocklist => text.yellow(),
+        RowStatus::Blocked { .. } => text.red(),
+        RowStatus::Pending => text.fg(theme.dim()),
     };
     Line::from(vec![
         format!("{count:>6} ").into(),
         bar.fg(theme.accent()),
         "  ".into(),
         tag,
+        padding.into(),
         "  ".into(),
         value.into(),
     ])
@@ -839,6 +903,115 @@ mod tests {
             .handle_key(KeyEvent::from(KeyCode::Char('f')), &db, &mut message)
             .unwrap();
         assert_eq!(screen.filter, Filter::All);
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    }
+
+    /// The bug this column exists to stop: with four state tags of four
+    /// different lengths, every row used to start its address at a
+    /// different cell, so the states ran into the addresses instead of
+    /// sitting in a column beside them. Asserts the thing the eye
+    /// actually checks — that every address begins at the same x — rather
+    /// than a golden screenful, so it still means something when a label
+    /// or a bar width changes.
+    ///
+    /// Both panels, because the width is shared between them: they stack
+    /// with one left edge, and two addresses a few cells apart read as a
+    /// mistake rather than as two independent tables.
+    #[test]
+    fn every_row_starts_its_value_in_the_same_column() {
+        let later = now_secs() + 86_400;
+        let mut screen = DynamicProtection {
+            ssh_rows: vec![
+                SshRow {
+                    address: "203.0.113.5".to_string(),
+                    count: 3,
+                    status: RowStatus::Pending,
+                },
+                SshRow {
+                    address: "198.51.100.9".to_string(),
+                    count: 5,
+                    status: RowStatus::Blocked { until: Some(later) },
+                },
+                SshRow {
+                    address: "192.0.2.77".to_string(),
+                    count: 12,
+                    status: RowStatus::Blocked { until: None },
+                },
+                SshRow {
+                    address: "2001:db8::abcd".to_string(),
+                    count: 40,
+                    status: RowStatus::Blocklist,
+                },
+            ],
+            ua_rows: vec![UaRow {
+                user_agent: "curl/8.5.0".to_string(),
+                count: 9,
+                status: RowStatus::Pending,
+            }],
+            ..Default::default()
+        };
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.render(frame, frame.area(), Theme::Dark, &HashSet::new()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // Counted in cells, not bytes. The bar is drawn with `\u{2588}`
+        // and the border with `\u{2502}`, three bytes each, so a `find`
+        // offset would make a row with more bar look further right than
+        // one with less — which is the very thing under test.
+        let column_of = |needle: &str| {
+            (0..buffer.area.height)
+                .find_map(|y| {
+                    let row: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect();
+                    row.find(needle).map(|byte| row[..byte].chars().count())
+                })
+                .unwrap_or_else(|| panic!("{needle} should be on screen"))
+        };
+
+        let first = column_of("203.0.113.5");
+        for value in ["198.51.100.9", "192.0.2.77", "2001:db8::abcd", "curl/8.5.0"] {
+            assert_eq!(
+                column_of(value),
+                first,
+                "{value} starts in a different column from the first address"
+            );
+        }
+    }
+
+    /// The column is sized from the rows on screen, not from a constant.
+    /// `[ BLOCKED for 1d ]` is much the longest tag, so reserving room for
+    /// it unconditionally would indent every address on a panel that has
+    /// no expiring block to show.
+    #[test]
+    fn the_tag_column_reserves_no_room_for_a_state_that_is_not_shown() {
+        let timed = tag_column_width(
+            [
+                RowStatus::Blocked { until: None },
+                RowStatus::Blocked {
+                    until: Some(now_secs() + 86_400),
+                },
+            ]
+            .into_iter(),
+        );
+        let untimed =
+            tag_column_width([RowStatus::Blocked { until: None }, RowStatus::Pending].into_iter());
+
+        assert!(
+            untimed < timed,
+            "a panel with no expiring block should not pay for one: {untimed} vs {timed}"
+        );
+        assert_eq!(untimed, "[ NOT BLOCKED ]".chars().count());
     }
 
     /// The headline ask this change exists for: a `BLOCKED` row must
