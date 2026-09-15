@@ -9,6 +9,26 @@ need.
 
 ### Added
 
+- **A built-in bot list of this project's own** — the first source that is
+  compiled into the binary rather than downloaded, so a fresh install is
+  covered before it has network access and on a host that cannot reach
+  GitHub at all.
+
+  46 entries: 6 AI crawlers `ai.robots.txt` does not carry yet (xAI's
+  three names, Moonshot/Kimi, Tencent's Hunyuan, 01.AI's YiBot) and 40
+  scanners and commercial crawlers. They were read off two months of one
+  server's NGINX log — 6,493 distinct user agents over 435,782 requests —
+  by matching every one against all 1,606 patterns the three upstream
+  lists contribute and keeping what matched none. On that log the list
+  covers 22,573 requests the existing sources let through.
+
+  Entries carry the same category flags every other source's do, so the
+  host's own AI/scanner policy decides and a per-bot override still wins.
+  Patterns are bare names, never versions: the upstream `Googlebot\/`
+  already fails to match a bare `Googlebot`, and repeating that mistake
+  would be perverse. Nothing in the list matches `Let's Encrypt validation
+  server`, and there is a test that says so.
+
 - **An "Auto-apply" switch.** With it on, the internal cron re-writes every
   site's generated block and reloads NGINX once an hour, whenever they have
   fallen behind the database — which happens constantly on a busy host,

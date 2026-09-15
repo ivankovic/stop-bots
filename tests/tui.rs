@@ -558,11 +558,17 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
     send_key(&mut session, "jyxo");
     session.exp_string("Jyxo Crawler").unwrap();
 
-    // The row itself always carries a "(system)" or "(override)" tag, not
-    // just the popup — jyxo-crawler has no category (its source fixture
-    // tags it "unknown"), so it's untouched, still following the system
-    // default.
-    session.exp_string("(system)").unwrap();
+    // The row's "(system)"/"(override)" tag is *not* asserted here, and
+    // that is a deliberate retreat rather than an oversight. Since the
+    // built-in `stop-bots-extras` list is seeded at startup, `jscrawler`
+    // is also on file, so the first keystroke of "jyxo" already narrows
+    // to a list whose first row carries a "(system)" tag at exactly these
+    // cells. The later keystrokes change the name beside it but not the
+    // tag, and unchanged cells are never retransmitted (see SPECS.md on
+    // what `exp_string` can actually prove) — so waiting on it here waits
+    // forever. The tag itself is covered by
+    // `bot_settings::tests::bot_row_is_tagged_system_or_override_depending_on_its_status`,
+    // which reads the rendered line rather than the wire.
 
     // Enter on the (only) match opens its override popup.
     send_key(&mut session, "\r");

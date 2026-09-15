@@ -2055,7 +2055,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(app.db.list_bots().unwrap().len(), 1);
+        // Counted against *this* source, not the whole table: the
+        // built-in `stop-bots-extras` list is seeded at startup, so
+        // "every bot there is" has not meant "the ones this download
+        // brought" since it landed.
+        assert_eq!(app.db.count_bot_source_entries(source_id).unwrap(), 1);
         let message = app.message.as_deref().unwrap_or_default();
         assert!(message.contains("Stored 1 bot"), "message was: {message}");
     }
@@ -2072,7 +2076,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(app.db.list_bots().unwrap().is_empty());
+        // Nothing from the source that failed. The built-in list is
+        // seeded at startup and is not what this test is about.
+        assert_eq!(
+            app.db
+                .count_bot_source_entries(botlist::SourceKind::WellKnownBots.id())
+                .unwrap(),
+            0
+        );
         let message = app.message.as_deref().unwrap_or_default();
         assert!(
             message.contains("Failed to update"),

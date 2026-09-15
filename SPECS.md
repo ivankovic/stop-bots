@@ -5179,3 +5179,86 @@ paths: consistency is the wrong thing to optimise when the difference is
 whether anyone will read the outcome. Making the refusal an error rather
 than a summary: `run_due_jobs` prints errors to stderr and carries on, so
 the one host where this matters would never see it.
+
+## A built-in bot list (`src/botlist/stop_bots_extras.rs`)
+
+The three upstream sources are all downloaded. This one is compiled in,
+and that is the whole point: a fresh install is covered before it has
+network access, before `update-bot-lists` has run, and on a host that
+cannot reach GitHub. `fetch` returns an empty string and `parse` ignores
+its argument, so the source still goes through the same fetch-then-parse
+pair as the other three and needs no special case in `refresh` or
+`SourceKind::update`.
+
+**How the entries were chosen.** Two months of one server's NGINX access
+log: 6,493 distinct user agents over 435,782 requests, each matched
+against all 1,606 patterns the three upstream sources contribute. 5,283
+user agents matched none — almost all of them ordinary browsers. What
+survived the filtering is 46 entries covering 22,573 requests the
+existing lists let through, every one of which was checked by eye against
+the full list of user agents its pattern matches.
+
+**Generalised from instances to names.** `ModatScanner/1.2` became
+`ModatScanner`. The upstream lists' own worst entry is `Googlebot\/`,
+which stops matching the moment a client drops the version — that is a
+32-request gap on this one host, and over-specific patterns are exactly
+the failure this list exists to correct.
+
+**Categories, not a deny list.** Entries carry the same `is_ai`/
+`is_scanner` flags every other source's bots do, so the host's policy
+decides and a per-bot override still wins over both. That matters most
+for the AI crawlers: xAI's `xAI-SearchBot` is a documented, declared
+crawler, and a host that wants AI traffic keeps it with the switch it
+already has rather than by editing a list.
+
+**What was deliberately left out**, because a list that ships to other
+people's servers is judged by its false positives:
+
+- *Already covered upstream.* Six of the 31 user agents blocked by hand
+  on that server — `curl/7.74.0`, `WordPress/6.9.4` and friends — are
+  matched by `^curl` and `WordPress\/` already.
+- *Site-specific strings.* A URL that arrived in the user-agent field is
+  an attack artifact, not a user agent; one server's own hostname is
+  nobody else's problem.
+- *Real software pinned to a build.* `eMClient/10.4.4867.0` is a mail
+  client.
+- *Names too generic for a substring match.* `Scanner/1.0` and a bare
+  `scanner` were both seen and either would match a third of the list
+  itself.
+- *A bare `Googlebot`.* Almost certainly an impersonator, but that is
+  what `scanblock`'s spoofed-crawler detector is for, and blocking the
+  name would also block the real one wherever the search category is
+  allowed.
+- *`Let's Encrypt validation server`*, seen 68 times. Blocking it breaks
+  ACME HTTP-01 renewal and surfaces as an expired certificate two months
+  later. `no_pattern_matches_something_that_must_not_be_blocked` pins
+  that, along with the four commonest browser strings and the real
+  Googlebot and bingbot.
+
+**Seeded at registration, not only on fetch.** `register_all_sources`
+stores it as well as registering it, because a source that is already in
+the binary has nothing to wait for, and leaving it registered-but-empty
+would mean shipping a list an install never used until an unrelated
+button was pressed. `upsert_bot` writes to `bot_source_entries` and
+recomputes the merged row, so re-seeding on every startup cannot clobber
+an admin's own per-bot status.
+
+**Three tests broke, and all three were asserting too much.** Two checked
+"the whole `bots` table is empty / has one row" when what they meant was
+"this source contributed nothing / one row"; they use
+`count_bot_source_entries` now. The Bot-settings web fixture called
+`register_all_sources` only to satisfy a foreign key and now registers
+the single source it attributes its three rows to. A fourth, the pty test
+for bot search, lost one assertion: the built-in list contains
+`jscrawler`, so the first keystroke of "jyxo" already renders a row whose
+`(system)` tag sits at the same cells, and unchanged cells are never
+retransmitted — the diffing gotcha this file's own notes describe. The
+tag is covered by a unit test that reads the rendered line instead.
+
+**Considered and rejected.** Shipping the admin's 31 hand-blocked strings
+as they stand — six are redundant, three are site-specific, and two pin a
+real mail client to a build number. Marking the AI crawlers `is_search_engine`
+as well: the flags are OR-ed, so it changes nothing while the AI category
+is blocked and misleads whenever it is not. A separate "block everything
+on this list" switch: the category defaults already answer that, and a
+second answer would eventually disagree with the first.

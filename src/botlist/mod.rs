@@ -27,6 +27,7 @@
 
 pub mod ai_robots_txt;
 pub mod nginx_bad_bots;
+pub mod stop_bots_extras;
 pub mod well_known_bots;
 
 use crate::db::{Db, NewBot, Source};
@@ -38,13 +39,17 @@ pub enum SourceKind {
     WellKnownBots,
     AiRobotsTxt,
     NginxBadBots,
+    /// This project's own list — the only one compiled into the binary
+    /// rather than downloaded. See [`stop_bots_extras`].
+    StopBotsExtras,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 3] = [
+    pub const ALL: [SourceKind; 4] = [
         SourceKind::WellKnownBots,
         SourceKind::AiRobotsTxt,
         SourceKind::NginxBadBots,
+        SourceKind::StopBotsExtras,
     ];
 
     pub fn id(self) -> &'static str {
@@ -52,6 +57,7 @@ impl SourceKind {
             SourceKind::WellKnownBots => well_known_bots::SOURCE_ID,
             SourceKind::AiRobotsTxt => ai_robots_txt::SOURCE_ID,
             SourceKind::NginxBadBots => nginx_bad_bots::SOURCE_ID,
+            SourceKind::StopBotsExtras => stop_bots_extras::SOURCE_ID,
         }
     }
 
@@ -60,6 +66,7 @@ impl SourceKind {
             SourceKind::WellKnownBots => well_known_bots::SOURCE_NAME,
             SourceKind::AiRobotsTxt => ai_robots_txt::SOURCE_NAME,
             SourceKind::NginxBadBots => nginx_bad_bots::SOURCE_NAME,
+            SourceKind::StopBotsExtras => stop_bots_extras::SOURCE_NAME,
         }
     }
 
@@ -68,6 +75,7 @@ impl SourceKind {
             SourceKind::WellKnownBots => well_known_bots::SOURCE_URL,
             SourceKind::AiRobotsTxt => ai_robots_txt::SOURCE_URL,
             SourceKind::NginxBadBots => nginx_bad_bots::SOURCE_URL,
+            SourceKind::StopBotsExtras => stop_bots_extras::SOURCE_URL,
         }
     }
 
@@ -84,6 +92,7 @@ impl SourceKind {
             SourceKind::WellKnownBots => well_known_bots::parse(raw),
             SourceKind::AiRobotsTxt => ai_robots_txt::parse(raw),
             SourceKind::NginxBadBots => nginx_bad_bots::parse(raw),
+            SourceKind::StopBotsExtras => stop_bots_extras::parse(raw),
         }
     }
 
@@ -92,6 +101,7 @@ impl SourceKind {
             SourceKind::WellKnownBots => well_known_bots::fetch().await,
             SourceKind::AiRobotsTxt => ai_robots_txt::fetch().await,
             SourceKind::NginxBadBots => nginx_bad_bots::fetch().await,
+            SourceKind::StopBotsExtras => stop_bots_extras::fetch().await,
         }
     }
 
@@ -142,6 +152,15 @@ pub fn register_all_sources(db: &Db) -> Result<()> {
         for kind in SourceKind::ALL {
             db.register_source(&kind.as_source())?;
         }
+        // The built-in list is *stored*, not just registered. Every other
+        // source is empty until someone fetches it, which is right for a
+        // download; this one is already in the binary, and leaving it
+        // registered-but-empty would mean a fresh install shipped a list
+        // it never used until an unrelated button was pressed. Cheap
+        // enough to redo on every startup — forty-odd upserts inside the
+        // transaction already open — and `upsert_bot` writes only to
+        // `bot_source_entries`, so an admin's own per-bot status survives.
+        store_inner(db, SourceKind::StopBotsExtras, &stop_bots_extras::bots())?;
         Ok(())
     })
 }

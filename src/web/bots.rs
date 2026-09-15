@@ -421,9 +421,24 @@ mod tests {
     use super::*;
     use crate::db::NewBot;
 
+    /// Three bots and nothing else.
+    ///
+    /// Registers the one source these rows are attributed to rather than
+    /// calling `botlist::register_all_sources`, which also *seeds* the
+    /// built-in `stop-bots-extras` list — forty-odd more bots, which every
+    /// assertion below about "the whole list" would then have to account
+    /// for. This screen's tests are about search and ordering, not about
+    /// what ships in the binary.
     fn seeded() -> Db {
         let db = Db::open_in_memory().unwrap();
-        crate::botlist::register_all_sources(&db).unwrap();
+        db.register_source(&crate::db::Source {
+            id: "well-known-bots".into(),
+            name: "Well-known bots".into(),
+            url: "https://example.invalid/list.json".into(),
+            last_fetched_at: None,
+            bot_count: 0,
+        })
+        .unwrap();
         for (slug, name, ai, search, scanner) in [
             ("gptbot", "GPTBot", true, false, false),
             ("googlebot", "Googlebot", false, true, false),
