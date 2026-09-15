@@ -268,8 +268,8 @@ pub fn spoofed_crawler_ips(log_text: &str, claims: &[CrawlerClaim]) -> Vec<(Stri
 /// What's left is credential and source-tree exposure — files that only
 /// ever exist because of a deployment mistake, and that only ever get
 /// requested by something looking for that mistake.
-pub const DEFAULT_PROBE_PATHS: [&str; 10] = [
-    "/.env",            // and /.env.local, /.env.backup, ... (prefix match)
+pub const DEFAULT_PROBE_PATHS: [&str; 13] = [
+    "/.env",            // and /.env.local, /api/.env, ... (see the matching note)
     "/.git/",           // /.git/config, /.git/HEAD, ...
     "/.svn/",           //
     "/.hg/",            //
@@ -279,6 +279,23 @@ pub const DEFAULT_PROBE_PATHS: [&str; 10] = [
     "/vendor/phpunit/", // the eval-stdin.php RCE probe and friends
     "/.DS_Store",       // leaks a directory listing
     "/.htpasswd",       //
+    // A WordPress "plugin" that is a file-manager backdoor. Nobody
+    // installs it on purpose, and it was the single most-requested path
+    // from clients sending no user agent at all on the host this came
+    // from — 1,001 requests, not one of them answered with content.
+    "/wp-content/plugins/hellopress/",
+    // Percent-encoded dots, in both the single- and double-encoded forms
+    // actually seen. A `.` needs no encoding, so encoding one has exactly
+    // one purpose: getting a `../` past something that is looking for
+    // `../`. 22,762 requests on that host, in paths like
+    // `/$(pwd)/%2eenv%2elocal` and
+    // `/cgi-bin/.%2e/.%2e/.%2e/bin/sh` (CVE-2021-41773). The only five
+    // that were answered at all were `/%2frobots%2etxt` and
+    // `/%2f%2eds_store` — the same evasion, aimed at files that happen to
+    // exist. `%252e` is listed separately because it does not contain
+    // `%2e` as a substring: the characters are `%`,`2`,`5`,`2`,`e`.
+    "%2e",
+    "%252e",
 ];
 
 /// Every IP that requested one of `probe_paths`, paired with the path it
@@ -288,12 +305,30 @@ pub const DEFAULT_PROBE_PATHS: [&str; 10] = [
 /// for `/.env` is a bigger problem than one who gets a 404, so keying on
 /// 404 like [`scanning_ips`] does would skip exactly the worst case.
 ///
-/// Matching is a case-insensitive prefix test against the request path,
-/// which is already query-string-stripped by `parse_line`. Prefix rather
-/// than exact so `/.env.local` and `/.git/config` are covered by one entry
-/// each; anchored at the start so a legitimate path that merely *contains*
-/// one of these strings later on (`/blog/how-to-secure-your-env`) doesn't
-/// match.
+/// Matching is a case-insensitive *substring* test against the request
+/// path, which is already query-string-stripped by `parse_line`.
+///
+/// **It used to be anchored at the start, and that was wrong.** The anchor
+/// was there so a legitimate path merely containing one of these strings
+/// later on — `/blog/how-to-secure-your-env` — could not match. But that
+/// path does not contain `/.env` at all; the leading slash in every needle
+/// was already doing that work. What the anchor actually excluded was
+/// `/api/.env`, `/backend/.env`, `/laravel/.env` and every path-traversal
+/// attempt, which is 3,391 distinct paths and 39,675 requests on one
+/// host's log — *none* of which were answered with content.
+///
+/// The widening is real and worth stating: a path segment that *begins*
+/// with a needle now matches, so a URL whose last segment is `.env-file`
+/// would be flagged where it was not before. That is accepted. Serving a
+/// path segment that starts with a dot is not something sites do — most
+/// web servers deny dotfiles outright — and the evidence is one-sided: of
+/// every newly matched request in that log, zero returned 2xx.
+///
+/// Note that a traversal payload in the *query string*
+/// (`/?file=%252e%252e/.aws/credentials`) is invisible here, because
+/// `parse_line` strips the query before this sees it. Those requests are
+/// answered 200 by the homepage and are somebody else's problem — this
+/// detector is about the path.
 ///
 /// Loopback/private source IPs are excluded, same as [`scanning_ips`] —
 /// an internal backup job walking a checkout isn't an attacker.
@@ -310,7 +345,7 @@ pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, St
             continue;
         }
         let path_lower = line.path.to_lowercase();
-        if needles.iter().any(|n| path_lower.starts_with(n.as_str())) {
+        if needles.iter().any(|n| path_lower.contains(n.as_str())) {
             found.entry(line.ip).or_insert(line.path);
         }
     }
@@ -822,10 +857,56 @@ mod tests {
 
     /// Anchored at the start, so an ordinary page whose URL merely contains
     /// one of these strings is not a probe.
+    ///
+    /// The example is the one the leading slash in every needle protects:
+    /// `-env` is not `/.env`. It used to be
+    /// `/blog/how-to-secure-your/.env-file`, which the anchoring also
+    /// excluded — and so did the anchoring exclude `/api/.env`, which is
+    /// why the anchoring is gone. A path segment beginning with a dot is
+    /// not something sites serve; a word ending in "env" is.
     #[test]
-    fn probe_path_ips_does_not_match_mid_path() {
-        let log = probe_line("203.0.113.9", "/blog/how-to-secure-your/.env-file", 200);
+    fn probe_path_ips_does_not_match_a_word_that_merely_ends_in_the_needle() {
+        let log = probe_line("203.0.113.9", "/blog/how-to-secure-your-env", 200);
         assert!(probe_path_ips(&log, &default_probes()).is_empty());
+    }
+
+    /// The gap the anchoring left: every one of these was being missed,
+    /// and between them they are most of what actually probes a server.
+    #[test]
+    fn probe_path_ips_flags_a_dotfile_below_the_root() {
+        for path in [
+            "/api/.env",
+            "/backend/.env",
+            "/laravel/.env",
+            "/var/www/html/wp-config.php",
+            "/%252e%252e/%252e%252e/home/ubuntu/.ssh/id_ed25519",
+        ] {
+            let log = probe_line("203.0.113.9", path, 404);
+            assert_eq!(
+                probe_path_ips(&log, &default_probes()).len(),
+                1,
+                "missed {path}"
+            );
+        }
+    }
+
+    /// The two entries added from that log, each with the request that
+    /// earned it.
+    #[test]
+    fn probe_path_ips_flags_the_backdoor_plugin_and_encoded_dots() {
+        for path in [
+            "/wp-content/plugins/hellopress/wp_filemanager.php",
+            "/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh",
+            "/$(pwd)/%2eenv%2elocal",
+            "/%2frobots%2etxt",
+        ] {
+            let log = probe_line("203.0.113.9", path, 404);
+            assert_eq!(
+                probe_path_ips(&log, &default_probes()).len(),
+                1,
+                "missed {path}"
+            );
+        }
     }
 
     #[test]

@@ -9,6 +9,15 @@ need.
 
 ### Added
 
+- **Two more built-in probe paths**, both meeting the list's rule that a
+  path only belongs there if it is never legitimate on *any* site:
+  `/wp-content/plugins/hellopress/`, a WordPress file-manager backdoor
+  that nobody installs on purpose, and percent-encoded dots (`%2e`,
+  `%252e`). A `.` needs no encoding, so encoding one has exactly one
+  purpose — getting a `../` past something looking for `../`. That is
+  22,762 requests on one host, including the CVE-2021-41773
+  `/cgi-bin/.%2e/.%2e/bin/sh` shell RCE.
+
 - **Dynamic Protection marks user agents no bot list has heard of.** A new
   `UNKNOWN` tag, for rows that announce themselves as a bot — a `bot`,
   `crawler`, `scanner`… token, or the `+http` convention of citing a page
@@ -94,6 +103,18 @@ need.
   whose render is already overdue, because neither is a schedule.
 
 ### Fixed
+
+- **Probe-path detection was anchored to the start of the path, and
+  attackers are not.** It saw `/.env` but not `/api/.env`,
+  `/backend/.env` or `/laravel/.env`; not
+  `/%252e%252e/%252e%252e/home/ubuntu/.ssh/id_ed25519`; and not
+  `GET http://example.com/.git/HEAD`, whose absolute request URI does not
+  begin with a slash-dot at all. The anchor was there to stop
+  `/blog/how-to-secure-your-env` matching — but that path does not contain
+  `/.env`, so the leading slash in every needle was already doing that
+  work. Matching anywhere in the path takes one host's log from 28,213
+  probe requests to 67,888, and from 1,640 probing IPs to 1,811. Of the
+  39,675 newly matched requests, none was answered with content.
 
 - **A detected block no longer waits a day to be rendered.** The firewall
   render was on a fixed 24-hour clock while the detectors add blocks every

@@ -5390,3 +5390,61 @@ Verified against the host's own policies (`search: allowed`,
 `scanner: blocked`, `ai: blocked`): of 873 currently-blocked bots, no
 Google or Qwant entry appears, while `Silovik`, `ModatScanner` and
 `CyberConvoyScout` all do.
+
+## The probe-path anchor, and what it was really excluding
+
+`probe_path_ips` matched its needles as a prefix of the request path. The
+doc explained why: so a legitimate path that merely *contains* one of
+them later on — `/blog/how-to-secure-your-env` — could not match.
+
+That reasoning does not survive contact with the strings. The needle is
+`/.env`, with a leading slash, and `how-to-secure-your-env` contains no
+`/.env`. The slash was already doing the work; the anchor was doing
+something else entirely, and what it was excluding was:
+
+- `/api/.env`, `/backend/.env`, `/app/.env`, `/admin/.env`,
+  `/laravel/.env`, `/config/.env` … 3,391 distinct paths;
+- every path-traversal attempt, e.g.
+  `/%252e%252e/%252e%252e/home/ubuntu/.ssh/id_ed25519` and
+  `/%252e%252e/%252e%252e/.aws/credentials`;
+- and **absolute-form request URIs** — `GET http://example.com/.git/HEAD`
+  logs a path beginning `http:`, so no needle starting with `/` could ever
+  anchor against it. That one was found in the newly-blocked set, not by
+  reading the code.
+
+Matching anywhere in the path takes the same ten needles from 28,213 to
+67,888 matched requests on one host's log, and the detector from 1,640
+probing IPs to 1,811. Dry-run against the real log with both binaries,
+not reasoned about.
+
+**The evidence that made this safe to do.** This detector blocks on a
+single request with no threshold, so widening it is not free. Every one
+of the 3,391 newly matched distinct paths was checked by response code:
+**none returned 2xx**. The tail — where a false positive would hide — is
+entirely double-encoded traversal hunting for `id_rsa` and
+`.aws/credentials`. The widening is stated honestly in the doc: a path
+segment that *begins* with a needle now matches, so a URL ending in
+`.env-file` would be flagged where it was not before. Serving a path
+segment that starts with a dot is not something sites do, and most web
+servers deny dotfiles outright.
+
+**A trap worth recording.** Traversal payloads also arrive in the *query
+string* — `/?file=%252e%252e%2F.aws%2Fcredentials` — and those *are*
+answered 200, by the homepage. They are invisible to this detector
+because `parse_line` strips the query before it sees the path. The first
+pass at measuring false positives counted them and made the change look
+dangerous; it is not, because the detector never sees them.
+
+**Two new entries**, both passing the "never legitimate anywhere" rule
+the list is chosen by: `/wp-content/plugins/hellopress/`, a file-manager
+backdoor and the most-requested path from clients sending no user agent
+at all (1,001 requests, none answered with content), and `%2e`/`%252e`.
+The two encodings are listed separately because `%252e` does not contain
+`%2e` — its characters are `%`,`2`,`5`,`2`,`e`.
+
+**Rejected, by the same rule.** `/info.php` and `/phpinfo.php` (1,182
+requests) are sometimes deliberately present. `/SDK/webLanguage` (1,379)
+is a real Zimbra endpoint being exploited, so it is legitimate on a
+Zimbra host. `/1.php`, `/test.php` and `/login` could all be real files.
+The ≥7-distinct-404s detector catches those IPs anyway, with a threshold,
+which is the right tool for a path that is merely suspicious.
