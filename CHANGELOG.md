@@ -135,6 +135,11 @@ need.
   reached this code, the MSRV is unmoved at 1.88, and `cargo audit`
   reports nothing.
 
+- **`rusqlite` 0.31 → 0.40**, which carries the bundled SQLite from
+  3.45.0 to 3.53.2. No code changed: nothing this project uses moved,
+  including the `dbstat`/`PRAGMA page_count` reads and the `VACUUM` the
+  maintenance job runs. The MSRV is unmoved at 1.88.
+
 ### Fixed
 
 - **Both Dynamic Protection detail panels had no gutter.** Their prose,
