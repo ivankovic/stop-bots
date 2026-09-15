@@ -140,6 +140,12 @@ need.
   including the `dbstat`/`PRAGMA page_count` reads and the `VACUUM` the
   maintenance job runs. The MSRV is unmoved at 1.88.
 
+- **`reqwest` 0.12 → 0.13.** No code changed, and the TLS stack is
+  unmoved — still `rustls` 0.23.45, so the RUSTSEC-2026-0285 fix stays
+  where it was. Checked by actually downloading all three bot lists over
+  HTTPS, which is the part no unit test covers. MSRV 1.88, against
+  reqwest's own floor of 1.85.
+
 ### Fixed
 
 - **Both Dynamic Protection detail panels had no gutter.** Their prose,
