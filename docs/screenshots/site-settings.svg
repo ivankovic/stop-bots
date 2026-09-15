@@ -1,12 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 931 312" width="931" height="312" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono',monospace" font-size="14">
 <rect width="100%" height="100%" rx="8" fill="#12161c"/>
-<rect x="20.4" y="174.0" width="100.8" height="18.0" fill="#10262a"/>
-<rect x="121.2" y="174.0" width="336.0" height="18.0" fill="#10262a"/>
-<rect x="457.2" y="174.0" width="16.8" height="18.0" fill="#10262a"/>
-<rect x="474.0" y="174.0" width="134.4" height="18.0" fill="#10262a"/>
-<rect x="608.4" y="174.0" width="302.4" height="18.0" fill="#10262a"/>
+<rect x="20.4" y="192.0" width="100.8" height="18.0" fill="#10262a"/>
+<rect x="121.2" y="192.0" width="336.0" height="18.0" fill="#10262a"/>
+<rect x="457.2" y="192.0" width="16.8" height="18.0" fill="#10262a"/>
+<rect x="474.0" y="192.0" width="134.4" height="18.0" fill="#10262a"/>
+<rect x="608.4" y="192.0" width="302.4" height="18.0" fill="#10262a"/>
 <text x="12.0" y="25.5" fill="#2ee6d6" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">stop-bots</text>
-<text x="87.6" y="25.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 0.0.1  web-01</text>
+<text x="87.6" y="25.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 0.0.2  web-01</text>
 <text x="12.0" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1</text>
 <text x="28.8" y="43.5" fill="#6b7c8c" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dashboard</text>
 <text x="129.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">2</text>
@@ -31,7 +31,9 @@
 <text x="499.2" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
 <text x="516.0" y="61.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">disk</text>
 <text x="566.4" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
-<text x="583.2" y="61.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">logs</text>
+<text x="583.2" y="61.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">database</text>
+<text x="667.2" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
+<text x="684.0" y="61.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">logs</text>
 <text x="12.0" y="79.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ NGINX settings ──────────────────────────────────────────────────────────────────────────────────────────┐</text>
 <text x="12.0" y="97.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="20.4" y="97.5" fill="#c8d0da" textLength="159.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Block response    </text>
@@ -45,21 +47,23 @@
 <text x="20.4" y="133.5" fill="#c8d0da" textLength="159.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Rate limit        </text>
 <text x="180.0" y="133.5" fill="#c8d0da" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">off</text>
 <text x="910.8" y="133.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="151.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
-<text x="12.0" y="169.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
-<text x="20.4" y="169.5" fill="#2ee6d6" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Sites </text>
-<text x="79.2" y="169.5" fill="#2ee6d6" textLength="840.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">───────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
-<text x="12.0" y="187.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="187.5" fill="#c8d0da" textLength="100.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">▎example.com</text>
-<text x="121.2" y="187.5" fill="#c8d0da" textLength="336.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.55">  (/etc/nginx/sites-enabled/example.com)</text>
-<text x="474.0" y="187.5" fill="#8cc265" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> [ UP TO DATE ] </text>
-<text x="910.8" y="187.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="151.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="151.5" fill="#c8d0da" textLength="159.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Auto-apply        </text>
+<text x="180.0" y="151.5" fill="#c8d0da" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">off — by hand</text>
+<text x="910.8" y="151.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="169.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="187.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌</text>
+<text x="20.4" y="187.5" fill="#2ee6d6" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> Sites </text>
+<text x="79.2" y="187.5" fill="#2ee6d6" textLength="840.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">───────────────────────────────────────────────────────────────────────────────────────────────────┐</text>
 <text x="12.0" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="28.8" y="205.5" fill="#c8d0da" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">shop.example.com</text>
-<text x="163.2" y="205.5" fill="#c8d0da" textLength="378.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">  (/etc/nginx/sites-enabled/shop.example.com)</text>
-<text x="558.0" y="205.5" fill="#d18f52" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ STALE ] </text>
+<text x="20.4" y="205.5" fill="#c8d0da" textLength="100.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">▎example.com</text>
+<text x="121.2" y="205.5" fill="#c8d0da" textLength="336.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold" opacity="0.55">  (/etc/nginx/sites-enabled/example.com)</text>
+<text x="474.0" y="205.5" fill="#8cc265" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold"> [ UP TO DATE ] </text>
 <text x="910.8" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="28.8" y="223.5" fill="#c8d0da" textLength="134.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">shop.example.com</text>
+<text x="163.2" y="223.5" fill="#c8d0da" textLength="378.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" opacity="0.55">  (/etc/nginx/sites-enabled/shop.example.com)</text>
+<text x="558.0" y="223.5" fill="#d18f52" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ STALE ] </text>
 <text x="910.8" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="910.8" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
