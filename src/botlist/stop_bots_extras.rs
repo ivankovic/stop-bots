@@ -50,12 +50,10 @@
 //! - **Names too generic to be safe in a substring match.** `Scanner/1.0`
 //!   and a bare `scanner` were both seen; either would match a third of
 //!   the list below and plenty of software that is not a bot.
-//! - **A bare `Googlebot`** (no version), which the upstream `Googlebot\/`
-//!   pattern misses. It is almost certainly an impersonator — real
-//!   Googlebot always sends a version — but an impersonator is what
-//!   `scanblock`'s spoofed-crawler detector exists to catch, using
-//!   Google's published ranges. Blocking the name here would also block
-//!   the real one on any host that turned the search category off.
+//! - **A bare `Googlebot` as something to *block*.** It is carried, but as
+//!   a `Search` entry, so the search category decides. An impersonator
+//!   using the name is caught by address, not by string — see the comment
+//!   on that entry.
 //! - **`Let's Encrypt validation server`.** Seen 68 times, and blocking it
 //!   breaks ACME HTTP-01 renewal in a way that surfaces as an expired
 //!   certificate two months later. There is a test that no pattern here
@@ -88,6 +86,12 @@ enum Kind {
     /// A vulnerability scanner, attack-surface mapper, or commercial
     /// crawler whose traffic is nobody's idea of a visitor.
     Scanner,
+    /// A search engine's crawler. Allowed wherever the search category is,
+    /// which is the default — the point of carrying one here is that it be
+    /// *recognised*, so it is not mistaken for something nobody has heard
+    /// of, and so that a host which does switch search engines off catches
+    /// this one too.
+    Search,
     /// Something that must be *recognised* and never blocked by a category
     /// default — carried here so nothing invites an admin to block it.
     ///
@@ -115,6 +119,31 @@ const EXTRAS: &[(&str, &str, Kind)] = &[
         "Let's Encrypt",
         Kind::Infrastructure,
     ),
+    // ---- search engines the upstream lists miss ----
+    // Qwant's crawler: a real, declared European search engine, in none of
+    // the three lists. It showed up only because it was being tagged as
+    // something nobody had heard of.
+    ("Qwantbot", "Qwantbot", Kind::Search),
+    // The *unversioned* form, which `Googlebot\/` cannot match because a
+    // bare `Googlebot` has no slash after it.
+    //
+    // This entry reverses an earlier decision in this file, and the reason
+    // is worth keeping: the argument against was "blocking the name would
+    // also block the real Googlebot on a host that turned the search
+    // category off". That is not an argument, it is a description of what
+    // turning the search category off means. Filed as `Search`, the real
+    // crawler is allowed by default and blocked exactly when an admin says
+    // to block search engines, which is correct in both directions.
+    //
+    // The unversioned string is almost certainly an impersonator — real
+    // Googlebot always sends a version, and on the host this came from all
+    // 26 of them asked for `/robots.txt`, from 26 different addresses,
+    // none inside Google's published ranges. Catching *that* is
+    // `scanblock`'s spoofed-crawler detector, which checks the address
+    // rather than the name and had already blocked every one of them. This
+    // entry does not try to do the detector's job; it stops the name being
+    // reported as unrecognised.
+    ("Googlebot (unversioned)", "Googlebot", Kind::Search),
     // ---- AI crawlers ai.robots.txt did not carry ----
     // xAI ships at least three names; all three were seen, and the last
     // arrives inside randomised browser strings (see the note below).
@@ -196,7 +225,7 @@ pub fn bots() -> Vec<NewBot> {
             slug: crate::botlist::slugify(name),
             name: (*name).to_string(),
             is_ai: *kind == Kind::Ai,
-            is_search_engine: false,
+            is_search_engine: *kind == Kind::Search,
             // `Infrastructure` sets none of the three, so no category
             // default can reach it — see `Kind::Infrastructure`.
             is_scanner: *kind == Kind::Scanner,
@@ -222,15 +251,13 @@ pub fn parse(_raw: &str) -> Result<Vec<NewBot>> {
 mod tests {
     use super::*;
 
-    /// Strings that must never match anything in this list, each with the
-    /// reason it would hurt. This is the test that earns the right to ship
-    /// a blocklist to other people's servers.
-    const MUST_NOT_MATCH: &[(&str, &str)] = &[
-        (
-            "Mozilla/5.0 (compatible; Let's Encrypt validation server; +https://www.letsencrypt.org)",
-            "blocking ACME HTTP-01 breaks certificate renewal, and the damage shows up as \
-             an expired certificate two months later",
-        ),
+    /// Strings no entry here may match at all, whatever its category,
+    /// each with the reason.
+    ///
+    /// These are *visitors*: a match would mean a real person's request
+    /// carrying a bot's category, and every category default is a switch
+    /// somebody might flip.
+    const NO_ENTRY_MAY_MATCH: &[(&str, &str)] = &[
         (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
              Chrome/126.0.0.0 Safari/537.36",
@@ -245,29 +272,44 @@ mod tests {
             "Mozilla/5.0 (X11; Linux x86_64; rv:127.0) Gecko/20100101 Firefox/127.0",
             "Firefox on Linux",
         ),
+    ];
+
+    /// Strings no entry may match *as a scanner or an AI crawler*.
+    ///
+    /// A `Search` entry matching Googlebot is the point of it, and the
+    /// `Infrastructure` entry matching Let's Encrypt is the point of that
+    /// — so this cannot be "must not match anything", which is what it
+    /// said before Qwantbot and Googlebot were added and is what would
+    /// have blocked adding them. What must stay true is narrower and more
+    /// useful: switching *scanners* off must never take a search engine or
+    /// the certificate renewal with it.
+    const NO_BLOCKING_KIND_MAY_MATCH: &[(&str, &str)] = &[
         (
             "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
-            "the real Googlebot is the upstream lists' job, and a host that allows the \
-             search category must keep allowing it",
+            "blocking scanners must not block the web's largest search engine",
         ),
         (
             "Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)",
             "same, for Bing",
         ),
+        (
+            "Mozilla/5.0 (compatible; Qwantbot/1.0; +https://help.qwant.com/bot/)",
+            "Qwant is a search engine and belongs to the search category alone",
+        ),
+        (
+            "Mozilla/5.0 (compatible; Let's Encrypt validation server; \
+             +https://www.letsencrypt.org)",
+            "blocking ACME HTTP-01 breaks certificate renewal, and the damage shows up as \
+             an expired certificate two months later",
+        ),
     ];
 
-    /// Checked against the entries that can *block* — `Ai` and `Scanner`.
-    /// `Infrastructure` entries are excluded because matching is their
-    /// entire job: they exist so that something like Let's Encrypt is
-    /// recognised rather than left looking unidentified, and they carry no
-    /// category flag, so no policy can act on the match.
+    /// The test that earns the right to ship a blocklist to other people's
+    /// servers: no entry, of any kind, may match a real visitor.
     #[test]
-    fn no_blocking_pattern_matches_something_that_must_not_be_blocked() {
-        for (subject, why) in MUST_NOT_MATCH {
-            for (name, pattern, kind) in EXTRAS {
-                if *kind == Kind::Infrastructure {
-                    continue;
-                }
+    fn no_pattern_matches_an_ordinary_browser() {
+        for (subject, why) in NO_ENTRY_MAY_MATCH {
+            for (name, pattern, _) in EXTRAS {
                 assert!(
                     !subject.to_lowercase().contains(&pattern.to_lowercase()),
                     "{name:?} (pattern {pattern:?}) matches {subject:?} — {why}"
@@ -276,8 +318,25 @@ mod tests {
         }
     }
 
-    /// And the other half: an `Infrastructure` entry must carry no
-    /// category flag, or the policy that blocks scanners would block it.
+    /// And nothing that a scanner or AI policy can reach may match
+    /// something that belongs to a different category entirely.
+    #[test]
+    fn no_scanner_or_ai_pattern_matches_a_search_engine_or_infrastructure() {
+        for (subject, why) in NO_BLOCKING_KIND_MAY_MATCH {
+            for (name, pattern, kind) in EXTRAS {
+                if !matches!(kind, Kind::Ai | Kind::Scanner) {
+                    continue;
+                }
+                assert!(
+                    !subject.to_lowercase().contains(&pattern.to_lowercase()),
+                    "{name:?} (pattern {pattern:?}, {kind:?}) matches {subject:?} — {why}"
+                );
+            }
+        }
+    }
+
+    /// An `Infrastructure` entry must carry no category flag, or the
+    /// policy that blocks scanners would block it.
     #[test]
     fn an_infrastructure_entry_can_never_be_blocked_by_a_category() {
         for bot in bots() {
@@ -292,6 +351,27 @@ mod tests {
                 !bot.is_ai && !bot.is_search_engine && !bot.is_scanner,
                 "{} carries a category flag, so a policy could block it",
                 bot.name
+            );
+        }
+    }
+
+    /// A search engine belongs to the search category and nothing else —
+    /// filing one as a scanner would block it on a host that only ever
+    /// asked to block scanners.
+    #[test]
+    fn a_search_entry_is_only_a_search_engine() {
+        for (name, _, kind) in EXTRAS {
+            if *kind != Kind::Search {
+                continue;
+            }
+            let bot = bots()
+                .into_iter()
+                .find(|b| b.name == *name)
+                .expect("every entry becomes a bot");
+            assert!(
+                bot.is_search_engine && !bot.is_ai && !bot.is_scanner,
+                "{name} is filed as {:?}",
+                (bot.is_ai, bot.is_search_engine, bot.is_scanner)
             );
         }
     }
@@ -450,6 +530,9 @@ mod tests {
             "RootEvidence/1.0",
             "vuln_scanner/3.1.0 (CVE-2026-4020)",
             "RecordedFuture Global Inventory Crawler",
+            "Mozilla/5.0 (compatible; Qwantbot/1.0; +https://help.qwant.com/bot/)",
+            // The unversioned form, which `Googlebot\\/` cannot match.
+            "Googlebot",
             "Mozilla/5.0 (compatible; xAI-SearchBot/1.0; +https://x.ai)",
             // The rotating one: a plausible browser string with the bot's
             // identity spliced into the engine comment.

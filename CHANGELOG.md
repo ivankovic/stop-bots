@@ -31,8 +31,16 @@ need.
   lists contribute and keeping what matched none. On that log the list
   covers 22,573 requests the existing sources let through.
 
+  It also carries two search engines the upstream lists miss — Qwant's
+  crawler, and the *unversioned* `Googlebot` that `Googlebot\/` cannot
+  match — plus Let's Encrypt's validation server, which is in no list at
+  all and must never be blocked.
+
   Entries carry the same category flags every other source's do, so the
-  host's own AI/scanner policy decides and a per-bot override still wins.
+  host's own AI/scanner/search policy decides and a per-bot override still
+  wins. A search engine is filed as one, so it stays allowed by default
+  and is blocked only where an admin has actually asked to block search
+  engines.
   Patterns are bare names, never versions: the upstream `Googlebot\/`
   already fails to match a bare `Googlebot`, and repeating that mistake
   would be perverse. Nothing in the list matches `Let's Encrypt validation

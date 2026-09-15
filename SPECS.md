@@ -5347,3 +5347,46 @@ Teaching the screen real regex: the comparison is best-effort by design
 and documented as such, and an unmatched genuine regex like
 `AdsBot-Google([^-]|$)` errs toward calling a known row unknown — a
 missed hint, not a wrong block.
+
+## Qwantbot, Googlebot, and a category the built-in list was missing
+
+The `UNKNOWN` tag's first run against real traffic turned up two search
+engines that no list carried: **Qwantbot**, a declared European search
+crawler, and the **unversioned `Googlebot`**, which `Googlebot\/` cannot
+match because a bare name has no slash after it. Both are now in the
+built-in list.
+
+**This reverses a decision recorded a few sections above**, and the
+reversal is the interesting part. The argument for leaving a bare
+`Googlebot` out was: *blocking the name would also block the real one on
+a host that turned the search category off.* That is not an argument
+against carrying it — it is a description of what turning the search
+category off means. The mistake was assuming the entry would have to be a
+*scanner*. Filed as `Kind::Search` it is allowed by default, blocked
+exactly when an admin asks for search engines to be blocked, and correct
+in both directions.
+
+The unversioned string is still almost certainly an impersonator: all 26
+of them asked for `/robots.txt`, from 26 different addresses, none inside
+Google's published ranges. Catching that remains `scanblock`'s
+spoofed-crawler detector's job — it checks the address, not the name, and
+had already blocked every one. The entry does not try to do that work; it
+stops the name being reported as unrecognised, which is all a list entry
+can honestly claim.
+
+**The safety test had to be restated, because as written it forbade the
+fix.** It asserted that no pattern matched the real Googlebot, bingbot or
+Let's Encrypt. But matching Googlebot is now the point of a `Search`
+entry, and matching Let's Encrypt is the point of the `Infrastructure`
+one. The invariant that actually matters is narrower: *switching scanners
+off must never take a search engine or the certificate renewal with it.*
+So it is two tests now — no entry of any kind may match an ordinary
+browser, and no `Ai` or `Scanner` entry may match a search engine or
+infrastructure — plus one asserting a `Search` entry carries the search
+flag and nothing else. A test that forbids a correct change is a test
+that has encoded an assumption rather than a requirement.
+
+Verified against the host's own policies (`search: allowed`,
+`scanner: blocked`, `ai: blocked`): of 873 currently-blocked bots, no
+Google or Qwant entry appears, while `Silovik`, `ModatScanner` and
+`CyberConvoyScout` all do.
