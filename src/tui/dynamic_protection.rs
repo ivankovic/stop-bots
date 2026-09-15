@@ -21,7 +21,9 @@
 //! logins" and "Top user agents" — each ranked by count with a bar, and
 //! tagged `NOT BLOCKED` (dim), `BLOCKED` (red) or `BLOCKLIST` (yellow).
 //! `Tab`/`Shift+Tab` switch which panel `Up`/`Down` (or `j`/`k`) move
-//! through; `y` copies the selected row; `R` re-reads the log; `f` cycles a
+//! through; `i` opens a detail popup for the selected row — see
+//! [`crate::ipdetail`] and [`crate::uadetail`] for what each of the two
+//! can honestly say; `y` copies the selected row; `R` re-reads the log; `f` cycles a
 //! shared display filter (All / Not blocked only / Blocked only) applied to
 //! both panels; `Enter` toggles the selected row's block state — blocks a
 //! `NOT BLOCKED` row, unblocks a `BLOCKED` one. All of this is storage-only,
@@ -66,6 +68,7 @@ use crate::db::Db;
 use crate::dynamic::{Filter, Live, RowStatus, SshRow, UaRow};
 use crate::ipdetail::{AddressKind, IpDetail};
 use crate::tui::{centered_rect, KeyOutcome, Theme};
+use crate::uadetail::UaDetail;
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -86,6 +89,19 @@ enum Focus {
     UserAgents,
 }
 
+/// Which of the two detail popups is open.
+///
+/// Two variants rather than one generic detail because the two panels
+/// answer different questions — see [`crate::uadetail`] for why an
+/// address and a user agent are not the same kind of thing with different
+/// text in it. Boxed: an `IpDetail` carrying a few hundred range hits
+/// would otherwise set the size of every `DynamicProtection`.
+#[derive(Debug)]
+enum Detail {
+    Address(Box<IpDetail>),
+    UserAgent(Box<UaDetail>),
+}
+
 #[derive(Debug, Default)]
 pub struct DynamicProtection {
     ssh_rows: Vec<SshRow>,
@@ -94,10 +110,10 @@ pub struct DynamicProtection {
     ua_state: ListState,
     focus: Focus,
     filter: Filter,
-    /// The open address-detail popup, if any. `Some` also means `Esc`
+    /// The open detail popup, if any. `Some` also means `Esc`
     /// closes the popup rather than leaving the screen, the same
     /// nested-back-out shape `site_detail` uses one level deeper.
-    detail: Option<IpDetail>,
+    detail: Option<Detail>,
 }
 
 impl DynamicProtection {
@@ -191,7 +207,7 @@ impl DynamicProtection {
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Enter => self.toggle_block_selected(db, message),
-            KeyCode::Char('i') => self.inspect_selected(message),
+            KeyCode::Char('i') => self.inspect_selected(db, message),
             KeyCode::Char('y') => Ok(self.copy_selected(message)),
             KeyCode::Char('R') => Ok(KeyOutcome::RereadLogs),
             _ => Ok(KeyOutcome::Ignored),
@@ -228,12 +244,17 @@ impl DynamicProtection {
         if self.detail.is_some() {
             return ("Inspect", vec![("Esc", "close")]);
         }
-        let (name, inspect): (&'static str, &[(&'static str, &'static str)]) = match self.focus {
-            Focus::Ssh => ("SSH", &[("i", "inspect")]),
-            Focus::UserAgents => ("User agents", &[]),
+        let name = match self.focus {
+            Focus::Ssh => "SSH",
+            Focus::UserAgents => "User agents",
         };
-        let mut hints = vec![("\u{2191}\u{2193}", "move"), ("Enter", "block/unblock")];
-        hints.extend_from_slice(inspect);
+        // Both panels inspect now, so the hint is unconditional rather
+        // than something the SSH panel alone advertises.
+        let mut hints = vec![
+            ("\u{2191}\u{2193}", "move"),
+            ("Enter", "block/unblock"),
+            ("i", "inspect"),
+        ];
         hints.extend([
             ("y", "copy"),
             ("f", "filter"),
@@ -250,43 +271,51 @@ impl DynamicProtection {
         }
     }
 
-    /// Opens the address-detail popup for the selected SSH row.
+    /// Opens the detail popup for whichever row is selected.
     ///
-    /// SSH only. The User Agent panel's rows are keyed by user agent
-    /// string, not by address, so there is no address to look up — the
-    /// equivalent view for that panel is a different question ("which bot
-    /// pattern matched this") and is not this one wearing a disguise.
+    /// The two panels take different routes on purpose. An address detail
+    /// needs the SSH log text, which `App` read in the background and this
+    /// screen does not keep a copy of, so it goes back through
+    /// [`KeyOutcome::InspectAddress`] — the same shape `UpdateSource` and
+    /// `SelectCountry` use when the work needs a resource `App` owns. A
+    /// user-agent detail needs nothing but `db`, which is already in hand,
+    /// so routing it through `App` would be ceremony for a resource
+    /// nobody needs.
     ///
-    /// Reads the database, but nothing over the network: see
+    /// Either way: reads the database, nothing over the network. See
     /// [`crate::ipdetail`] for why a detail view here is deliberately not
-    /// reverse DNS.
-    fn inspect_selected(&mut self, message: &mut Option<String>) -> Result<KeyOutcome> {
-        if self.focus != Focus::Ssh {
-            *message = Some(
-                "Inspect works on a failed-SSH-login row — switch panels with Tab.".to_string(),
-            );
-            return Ok(KeyOutcome::Consumed);
+    /// reverse DNS, and [`crate::uadetail`] for why there is nothing to
+    /// look up about a string the client made up.
+    fn inspect_selected(&mut self, db: &Db, _message: &mut Option<String>) -> Result<KeyOutcome> {
+        match self.focus {
+            Focus::Ssh => {
+                let Some(row) = self
+                    .ssh_state
+                    .selected()
+                    .and_then(|i| self.visible_ssh_rows().get(i).copied())
+                else {
+                    return Ok(KeyOutcome::Consumed);
+                };
+                Ok(KeyOutcome::InspectAddress(row.address.clone()))
+            }
+            Focus::UserAgents => {
+                let Some(row) = self
+                    .ua_state
+                    .selected()
+                    .and_then(|i| self.visible_ua_rows().get(i).copied())
+                else {
+                    return Ok(KeyOutcome::Consumed);
+                };
+                let detail = UaDetail::load(db, &row.user_agent, row.status)?;
+                self.detail = Some(Detail::UserAgent(Box::new(detail)));
+                Ok(KeyOutcome::Consumed)
+            }
         }
-        let Some(row) = self
-            .ssh_state
-            .selected()
-            .and_then(|i| self.visible_ssh_rows().get(i).copied())
-        else {
-            return Ok(KeyOutcome::Consumed);
-        };
-
-        // `App` finishes this, for the reason `UpdateSource` and
-        // `SelectCountry` go the same way: it owns the resource the work
-        // needs — here the SSH log text it read in the background — and a
-        // screen reaching for that would mean either keeping a copy of a
-        // multi-megabyte log or reading it again at a different moment
-        // than the rows beside it.
-        Ok(KeyOutcome::InspectAddress(row.address.clone()))
     }
 
     /// Shows a detail `App` assembled for [`KeyOutcome::InspectAddress`].
     pub fn show_detail(&mut self, detail: IpDetail) {
-        self.detail = Some(detail);
+        self.detail = Some(Detail::Address(Box::new(detail)));
     }
 
     /// The status currently shown for `address`, so `App` can pass the
@@ -461,14 +490,16 @@ impl DynamicProtection {
         // answers a question about a row, and reading it against half the
         // table it came from is what a popup is for.
         if let Some(detail) = &self.detail {
-            let lines = detail_lines(detail);
+            let (title, lines) = match detail {
+                Detail::Address(detail) => (detail.address.clone(), detail_lines(detail)),
+                Detail::UserAgent(detail) => ("User agent".to_string(), ua_detail_lines(detail)),
+            };
             let popup = centered_rect(
                 widest_line(&lines).max(24) + 4,
                 lines.len() as u16 + 2,
                 area,
             );
-            let paragraph =
-                Paragraph::new(lines).block(crate::tui::popup(detail.address.clone(), theme));
+            let paragraph = Paragraph::new(lines).block(crate::tui::popup(title, theme));
             frame.render_widget(Clear, popup);
             frame.render_widget(paragraph, popup);
         }
@@ -564,6 +595,149 @@ fn detail_lines(detail: &IpDetail) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     lines.push("Esc close".dim().into());
     lines
+}
+
+/// How wide the user agent itself is allowed to draw before it wraps.
+///
+/// The popup sizes itself to its widest line and `centered_rect` clamps
+/// that to the terminal, so an unwrapped 300-character string would not
+/// overflow — it would simply be cut off at the right edge, which is the
+/// half of it nobody can read. Wrapping instead costs a few rows and
+/// keeps all of it on screen. 64 leaves room for the border and the
+/// two-space indent at the 80 columns this project treats as its floor.
+const UA_WRAP_CHARS: usize = 64;
+
+/// At most this many contributing lists are named per matched bot. Three
+/// is the most any bot has on a real host; the count carries the rest.
+const MAX_SOURCES_SHOWN: usize = 3;
+
+/// The user-agent-detail popup's body.
+///
+/// Reads top-down the way [`detail_lines`] does: what this host already
+/// decided, then the string itself, then what the lists say about it. The
+/// order matters more here, because the string is the one thing on the
+/// popup the client chose — see [`crate::uadetail`].
+fn ua_detail_lines(detail: &UaDetail) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        "Status  ".into(),
+        detail.status.label().bold(),
+    ])];
+    lines.push(Line::from(vec![
+        "Hits    ".into(),
+        match detail.hits {
+            Some(hits) => hits.to_string().into(),
+            // Not "0": the tally is pruned on a schedule, and a row can
+            // go between the table being drawn and this keypress.
+            None => "no longer counted".dim(),
+        },
+    ]));
+    if let Some(seen) = detail.last_seen_at {
+        lines.push(Line::from(vec![
+            "Seen    ".into(),
+            crate::health::format_utc(seen).into(),
+        ]));
+    }
+    if detail.blocked_by_hand {
+        lines.push(Line::from(vec![
+            "Blocked ".into(),
+            "by hand, from this screen".into(),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    // Already capped and stripped of control characters by `uadetail` —
+    // which matters here and not in the web UI, because an escape
+    // sequence reaching the alternate screen repaints the terminal.
+    for chunk in wrapped(&detail.user_agent, UA_WRAP_CHARS) {
+        lines.push(chunk.into());
+    }
+    if detail.truncated {
+        lines.push("(truncated — the client sent more)".dim().into());
+    }
+
+    lines.push(Line::from(""));
+    if detail.matches.is_empty() {
+        lines.push(
+            "No bot list here has a pattern for this string."
+                .dim()
+                .into(),
+        );
+        if detail.self_declared_bot {
+            lines.push("It calls itself a bot.".yellow().into());
+        }
+    } else {
+        lines.push("Matched by".bold().into());
+        for hit in &detail.matches {
+            let verdict = if hit.verdict.is_blocked() {
+                hit.verdict.label().red()
+            } else {
+                hit.verdict.label().dim()
+            };
+            lines.push(Line::from(vec![
+                format!("  {}  ", hit.name).into(),
+                verdict,
+            ]));
+            lines.push(Line::from(vec![
+                "    pattern  ".dim(),
+                hit.pattern.clone().into(),
+            ]));
+            lines.push(Line::from(vec![
+                "    lists    ".dim(),
+                source_summary(&hit.sources).into(),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push("Esc close".dim().into());
+    lines
+}
+
+/// The lists contributing one bot, capped so a bot every source carries
+/// cannot stretch the popup. The count is what the reader is after —
+/// three lists agreeing is different evidence from one.
+fn source_summary(sources: &[String]) -> String {
+    if sources.len() <= MAX_SOURCES_SHOWN {
+        return sources.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        sources[..MAX_SOURCES_SHOWN].join(", "),
+        sources.len() - MAX_SOURCES_SHOWN
+    )
+}
+
+/// `text` split into chunks of at most `width` characters, preferring to
+/// break at a space.
+///
+/// Counts characters, not bytes: a user agent can carry multi-byte text,
+/// and slicing one by byte offset either panics or produces mojibake.
+/// Falls back to a hard break for a run with no space in it, which is
+/// what a long base64-ish token is.
+fn wrapped(text: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let remaining = chars.len() - start;
+        if remaining <= width {
+            out.push(chars[start..].iter().collect());
+            break;
+        }
+        // The last space inside the window, so the break lands between
+        // words when there is one to land between.
+        let end = chars[start..start + width]
+            .iter()
+            .rposition(|c| *c == ' ')
+            .map(|at| start + at + 1)
+            .unwrap_or(start + width);
+        out.push(chars[start..end].iter().collect());
+        start = end;
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// The widest line in `lines`, for sizing a popup to its content.
@@ -1387,14 +1561,89 @@ mod tests {
         assert!(db.list_firewall_rules().unwrap().is_empty());
     }
 
-    /// The User Agent panel's rows are keyed by user agent, not address,
-    /// so there is nothing to look up — say so rather than opening an
-    /// empty popup.
+    fn screen_with_one_ua_row(user_agent: &str, status: RowStatus) -> DynamicProtection {
+        let mut screen = DynamicProtection {
+            ua_rows: vec![UaRow {
+                user_agent: user_agent.to_string(),
+                count: 9,
+                status,
+            }],
+            focus: Focus::UserAgents,
+            ..Default::default()
+        };
+        screen.ua_state.select(Some(0));
+        screen
+    }
+
+    /// `i` used to answer "switch panels with Tab" here. Both panels
+    /// inspect now; the two popups differ in what they can honestly say,
+    /// not in whether they exist — see [`crate::uadetail`].
     #[test]
-    fn inspecting_from_the_user_agent_panel_explains_itself() {
+    fn inspecting_from_the_user_agent_panel_opens_a_user_agent_popup() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = screen_with_one_ssh_row(RowStatus::Pending);
-        screen.focus = Focus::UserAgents;
+        let mut screen = screen_with_one_ua_row(
+            "Mozilla/5.0 (compatible; Googlebot/2.1)",
+            RowStatus::Pending,
+        );
+        let mut message = None;
+
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('i')), &db, &mut message)
+            .unwrap();
+
+        assert!(
+            matches!(screen.detail, Some(Detail::UserAgent(_))),
+            "detail was: {:?}",
+            screen.detail
+        );
+        assert_eq!(message, None, "nothing to explain any more");
+    }
+
+    /// The row's own verdict goes into the popup rather than being
+    /// recomputed, so the two can never disagree about the same string.
+    #[test]
+    fn the_user_agent_popup_shows_the_string_and_the_row_s_own_status() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ua_row("curl/8.0", RowStatus::Blocked { until: None });
+        let mut message = None;
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('i')), &db, &mut message)
+            .unwrap();
+
+        let drawn = drawn(&mut screen);
+
+        assert!(drawn.contains("curl/8.0"), "drawn:\n{drawn}");
+        assert!(drawn.contains("BLOCKED"), "drawn:\n{drawn}");
+    }
+
+    /// Escape has to close this popup too, or the screen backs out to the
+    /// Dashboard with a detail still on it.
+    #[test]
+    fn esc_closes_the_user_agent_popup_instead_of_leaving_the_screen() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ua_row("curl/8.0", RowStatus::Pending);
+        let mut message = None;
+        screen
+            .handle_key(KeyEvent::from(KeyCode::Char('i')), &db, &mut message)
+            .unwrap();
+
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Esc), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(screen.detail.is_none());
+    }
+
+    /// An empty panel has nothing to inspect. Silently doing nothing is
+    /// right; opening a popup about a row that is not there is not.
+    #[test]
+    fn inspecting_an_empty_user_agent_panel_does_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = DynamicProtection {
+            focus: Focus::UserAgents,
+            ..Default::default()
+        };
         let mut message = None;
 
         screen
@@ -1402,9 +1651,45 @@ mod tests {
             .unwrap();
 
         assert!(screen.detail.is_none());
-        assert!(
-            message.as_deref().unwrap_or_default().contains("Tab"),
-            "message was: {message:?}"
-        );
+    }
+
+    /// The popup sizes itself to its widest line, so an unwrapped string
+    /// this long would be a popup as wide as the client cared to make it
+    /// — clamped to the terminal, and therefore cut off exactly where the
+    /// interesting part usually is.
+    #[test]
+    fn a_very_long_user_agent_wraps_instead_of_running_off_the_popup() {
+        let long = format!("Mozilla/5.0 (compatible; {}bot/1.0)", "x".repeat(200));
+
+        let lines = wrapped(&long, UA_WRAP_CHARS);
+
+        assert!(lines.len() > 1, "did not wrap: {lines:?}");
+        for line in &lines {
+            assert!(
+                line.chars().count() <= UA_WRAP_CHARS,
+                "line of {} chars: {line:?}",
+                line.chars().count()
+            );
+        }
+        assert_eq!(lines.concat(), long, "wrapping lost or added characters");
+    }
+
+    /// Slicing a multi-byte string by byte offset either panics or leaves
+    /// mojibake; a user agent is whatever the client sent.
+    #[test]
+    fn wrapping_counts_characters_rather_than_bytes() {
+        let text = "\u{e9}".repeat(100);
+
+        let lines = wrapped(&text, 10);
+
+        assert_eq!(lines.len(), 10);
+        assert!(lines.iter().all(|line| line.chars().count() == 10));
+    }
+
+    #[test]
+    fn wrapping_breaks_at_a_space_when_there_is_one() {
+        let lines = wrapped("alpha beta gamma delta", 12);
+
+        assert_eq!(lines, vec!["alpha beta ", "gamma delta"]);
     }
 }

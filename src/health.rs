@@ -552,7 +552,7 @@ fn scheduled_render(db: &Db) -> Result<Option<i64>> {
 /// a fixed pattern and no case needs special-casing. `div_euclid`/
 /// `rem_euclid` rather than `/` and `%` so that a pre-1970 (negative)
 /// timestamp floors instead of truncating toward zero.
-fn format_utc(secs: i64) -> String {
+pub fn format_utc(secs: i64) -> String {
     let days = secs.div_euclid(86_400);
     let seconds_into_day = secs.rem_euclid(86_400);
     let (hour, minute) = (seconds_into_day / 3_600, (seconds_into_day % 3_600) / 60);

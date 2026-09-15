@@ -60,7 +60,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
         Line::from(""),
         Line::from("Dynamic Protection"),
         Line::from("  Enter              block the selected NOT BLOCKED row, or unblock a BLOCKED one"),
-        Line::from("  i / y / R          inspect the address / copy the address or user agent / re-read the log"),
+        Line::from("  i / y / R          inspect the selected row / copy it / re-read the log"),
         Line::from("  f                  cycle the display filter (all / not blocked / blocked)"),
         Line::from(""),
         Line::from("Global"),

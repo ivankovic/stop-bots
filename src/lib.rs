@@ -44,5 +44,6 @@ pub mod sshlog;
 #[cfg(test)]
 mod testing;
 pub mod tui;
+pub mod uadetail;
 pub mod web;
 pub mod webaccess;

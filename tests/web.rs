@@ -1831,6 +1831,82 @@ async fn inspecting_something_that_is_not_an_address_still_renders() {
     assert!(body.contains("Not a valid IP address"), "body was:\n{body}");
 }
 
+/// The user-agent panel's own route, which the unit tests cannot reach:
+/// the string arrives percent-encoded in a query parameter, and a user
+/// agent is full of characters that have to survive that trip.
+#[tokio::test]
+async fn inspecting_a_user_agent_renders_its_detail_panel() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+    let db = Db::open(&db_path).unwrap();
+    // A source of its own rather than one of the built-in ids, which the
+    // server re-registers under its own name at startup.
+    db.register_source(&stop_bots::db::Source {
+        id: "a-second-opinion".into(),
+        name: "A second opinion".into(),
+        url: "https://example.invalid/list".into(),
+        last_fetched_at: None,
+        bot_count: 0,
+    })
+    .unwrap();
+    db.upsert_bot(&stop_bots::db::NewBot {
+        slug: "googlebot".into(),
+        name: "Googlebot".into(),
+        is_ai: false,
+        is_search_engine: true,
+        is_scanner: false,
+        user_agent_pattern: "Googlebot".into(),
+        source_id: "a-second-opinion".into(),
+    })
+    .unwrap();
+    let mut counts = std::collections::HashMap::new();
+    counts.insert(ua.to_string(), 412);
+    db.record_user_agent_hits(&counts, 1_700_000_000).unwrap();
+    drop(db);
+
+    let encoded = "Mozilla%2F5.0%20%28compatible%3B%20Googlebot%2F2.1%3B%20\
+                   %2Bhttp%3A%2F%2Fwww.google.com%2Fbot.html%29"
+        .replace(char::is_whitespace, "");
+    let response = app
+        .clone()
+        .oneshot(with_cookie(
+            get(&format!("/dynamic?filter=all&inspect_ua={encoded}")),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+
+    assert!(body.contains("About this user agent"), "body was:\n{body}");
+    assert!(body.contains("A second opinion"), "body was:\n{body}");
+    assert!(body.contains("412"), "body was:\n{body}");
+}
+
+/// The parameter is whatever is in the URL bar, and unlike an address
+/// there is no such thing as a malformed user agent — a string no list
+/// has heard of must render a page saying so, not a 500 and not a blank
+/// panel.
+#[tokio::test]
+async fn inspecting_a_user_agent_no_list_knows_still_renders() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let response = app
+        .clone()
+        .oneshot(with_cookie(
+            get("/dynamic?inspect_ua=%3Cscript%3Ealert(1)%3C%2Fscript%3E"),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    let body = body_string(response).await;
+
+    assert!(body.contains("About this user agent"), "body was:\n{body}");
+    assert!(!body.contains("<script>alert"), "body was:\n{body}");
+}
+
 /// The complaint that started this: selecting a country told the operator
 /// to go and run a CLI command. A console that knows what needs doing
 /// should offer to do it.

@@ -1106,6 +1106,29 @@ impl Db {
             .context("failed to count a source's contributed bots")
     }
 
+    /// The display names of every source currently contributing an entry
+    /// for `slug`, alphabetically.
+    ///
+    /// The merged `bots` row carries a single `source_id`, which is
+    /// whichever source wrote it last — useful for nothing, and actively
+    /// misleading in a detail view, since "three lists carry this bot" and
+    /// "one does" are different amounts of evidence. This asks
+    /// `bot_source_entries`, which is where the merge cascade actually
+    /// keeps that. A source row that has since been deleted falls back to
+    /// its id rather than dropping the entry, so the count stays honest.
+    pub fn bot_source_names_for_slug(&self, slug: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COALESCE(sources.name, bot_source_entries.source_id)
+             FROM bot_source_entries
+             LEFT JOIN sources ON sources.id = bot_source_entries.source_id
+             WHERE bot_source_entries.slug = ?1
+             ORDER BY 1",
+        )?;
+        let rows = stmt.query_map(params![slug], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list a bot's contributing sources")
+    }
+
     /// Recomputes `slug`'s merged row in `bots` from every remaining
     /// `bot_source_entries` row for it: `is_ai`/`is_search_engine`/
     /// `is_scanner` are true if *any* contributing source says so;
@@ -1674,6 +1697,31 @@ impl Db {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to list user agent stats")
+    }
+
+    /// One recorded user agent's row, or `None` if nothing has been
+    /// tallied under that exact string.
+    ///
+    /// A primary-key lookup rather than a scan of
+    /// [`Self::list_user_agent_stats`]: the detail view this feeds opens
+    /// on a keypress over a table that may hold twenty thousand rows, and
+    /// re-reading all of them to find one is the kind of cost that only
+    /// shows up on the host with the most traffic.
+    pub fn user_agent_stat(&self, user_agent: &str) -> Result<Option<UserAgentStat>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT user_agent, hit_count, last_seen_at FROM user_agent_stats
+             WHERE user_agent = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![user_agent], |row| {
+            Ok(UserAgentStat {
+                user_agent: row.get(0)?,
+                hit_count: row.get(1)?,
+                last_seen_at: row.get(2)?,
+            })
+        })?;
+        rows.next()
+            .transpose()
+            .context("failed to read a user agent's statistics")
     }
 
     /// Deletes `user_agent_stats` rows that no longer earn their space:
@@ -4235,6 +4283,58 @@ mod tests {
         let stats = db.list_user_agent_stats().unwrap();
         assert_eq!(stats[0].user_agent, "common-bot");
         assert_eq!(stats[1].user_agent, "rare-bot");
+    }
+
+    #[test]
+    fn user_agent_stat_reads_one_row_without_listing_the_table() {
+        let db = Db::open_in_memory().unwrap();
+        let mut counts = HashMap::new();
+        counts.insert("curl/8.0".to_string(), 7);
+        counts.insert("wget/1.21".to_string(), 3);
+        db.record_user_agent_hits(&counts, 1_700_000_000).unwrap();
+
+        let stat = db.user_agent_stat("curl/8.0").unwrap().unwrap();
+
+        assert_eq!(stat.hit_count, 7);
+        assert_eq!(stat.last_seen_at, 1_700_000_000);
+        assert!(db.user_agent_stat("never-seen/1.0").unwrap().is_none());
+    }
+
+    /// The merged `bots` row keeps a single `source_id` — whichever list
+    /// wrote it last. "Three lists carry this" is a different claim from
+    /// "one does", and only `bot_source_entries` can tell them apart.
+    #[test]
+    fn a_bot_s_contributing_sources_are_listed_by_name() {
+        let db = Db::open_in_memory().unwrap();
+        for (id, name) in [("second", "Second list"), ("first", "First list")] {
+            db.register_source(&Source {
+                id: id.to_string(),
+                name: name.to_string(),
+                url: "https://example.invalid/list".to_string(),
+                last_fetched_at: None,
+                bot_count: 0,
+            })
+            .unwrap();
+            db.upsert_bot(&NewBot {
+                slug: "gptbot".to_string(),
+                name: "GPTBot".to_string(),
+                is_ai: true,
+                is_search_engine: false,
+                is_scanner: false,
+                user_agent_pattern: "GPTBot".to_string(),
+                source_id: id.to_string(),
+            })
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.bot_source_names_for_slug("gptbot").unwrap(),
+            vec!["First list".to_string(), "Second list".to_string()]
+        );
+        assert!(db
+            .bot_source_names_for_slug("unheard-of")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

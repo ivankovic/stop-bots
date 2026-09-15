@@ -256,12 +256,32 @@ pub fn looks_like_a_bot(ua: &str) -> bool {
 /// still known; only something no list has heard of is `Unknown`.
 pub fn ua_matches_any_bot_pattern(ua: &str, bots: &[Bot]) -> bool {
     let ua_lower = ua.to_lowercase();
-    bots.iter().any(|bot| {
-        unescape_pattern(&bot.user_agent_pattern)
-            .to_lowercase()
-            .split('|')
-            .any(|alternative| !alternative.is_empty() && ua_lower.contains(alternative))
-    })
+    bots.iter()
+        .any(|bot| matched_alternative_lowered(&ua_lower, bot).is_some())
+}
+
+/// Which of `bot`'s accepted patterns `ua` contains, if any, in the
+/// casing the list published it in.
+///
+/// The same comparison [`ua_matches_any_bot_pattern`] makes, but keeping
+/// *which* alternative matched instead of discarding it. A detail view
+/// saying "matched `Googlebot`" is worth more than one saying "matched
+/// `Googlebot|Googlebot-Image|Googlebot-News|Storebot-Google`", which is
+/// what a merged row's whole pattern often looks like after three lists
+/// have contributed to it.
+pub fn matched_alternative(ua: &str, bot: &Bot) -> Option<String> {
+    matched_alternative_lowered(&ua.to_lowercase(), bot)
+}
+
+/// [`matched_alternative`] with the lowercasing already done, so a scan
+/// over a thousand bots pays for it once rather than once per bot.
+fn matched_alternative_lowered(ua_lower: &str, bot: &Bot) -> Option<String> {
+    unescape_pattern(&bot.user_agent_pattern)
+        .split('|')
+        .find(|alternative| {
+            !alternative.is_empty() && ua_lower.contains(&alternative.to_lowercase())
+        })
+        .map(str::to_string)
 }
 
 /// Strips regex backslash-escapes from a stored pattern so it can be

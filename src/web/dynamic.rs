@@ -29,8 +29,10 @@ use axum::{Form, Router};
 use maud::{html, Markup};
 use serde::Deserialize;
 
+use crate::db::Category;
 use crate::dynamic::{Filter, Live, RowStatus, SshRow, UaRow};
 use crate::ipdetail::{AddressKind, IpDetail};
+use crate::uadetail::UaDetail;
 use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, ClientAddr, FlashQuery};
 use crate::web::state::AppState;
@@ -46,6 +48,12 @@ pub struct Params {
     /// already uses. Untrusted: it is whatever is in the URL bar, and
     /// `IpDetail::load` is what decides whether it is an address at all.
     pub inspect: Option<String>,
+    /// A user agent to show the detail panel for — the same idea as
+    /// `inspect`, and a separate parameter rather than a shared one
+    /// because the two resolve against different tables. Sharing it would
+    /// mean a stale link looking an address up as a user agent, which
+    /// answers a question nobody asked instead of failing.
+    pub inspect_ua: Option<String>,
     #[serde(flatten)]
     pub flash: FlashQuery,
 }
@@ -73,6 +81,7 @@ pub async fn page(
 ) -> Response {
     let filter = filter_from(params.filter.as_deref());
     let inspect = params.inspect.clone();
+    let inspect_ua = params.inspect_ua.clone();
     let ssh_log = state.ssh_log.clone();
 
     // The log read happens inside the same blocking closure as the
@@ -114,12 +123,27 @@ pub async fn page(
                 }
                 None => None,
             };
-            anyhow::Ok((live, detail))
+            // Same bargain as the address detail above: assembled from
+            // the rows already loaded, so the panel and the table beside
+            // it describe one moment.
+            let ua_detail = match &inspect_ua {
+                Some(user_agent) => {
+                    let status = live
+                        .user_agents
+                        .iter()
+                        .find(|row| &row.user_agent == user_agent)
+                        .map(|row| row.status)
+                        .unwrap_or(RowStatus::Pending);
+                    Some(UaDetail::load(db, user_agent, status)?)
+                }
+                None => None,
+            };
+            anyhow::Ok((live, detail, ua_detail))
         })
         .await;
 
-    let (live, detail) = match live {
-        Ok(pair) => pair,
+    let (live, detail, ua_detail) = match live {
+        Ok(triple) => triple,
         Err(err) => return internal_error(&err.to_string()),
     };
 
@@ -128,11 +152,17 @@ pub async fn page(
         Tab::Dynamic,
         &ctx,
         params.flash.into_flash(),
-        body(&live, filter, detail.as_ref(), &ctx),
+        body(&live, filter, detail.as_ref(), ua_detail.as_ref(), &ctx),
     )
 }
 
-fn body(live: &Live, filter: Filter, detail: Option<&IpDetail>, ctx: &Ctx) -> Markup {
+fn body(
+    live: &Live,
+    filter: Filter,
+    detail: Option<&IpDetail>,
+    ua_detail: Option<&UaDetail>,
+    ctx: &Ctx,
+) -> Markup {
     let ssh: Vec<&SshRow> = live
         .ssh
         .iter()
@@ -152,6 +182,9 @@ fn body(live: &Live, filter: Filter, detail: Option<&IpDetail>, ctx: &Ctx) -> Ma
 
         @if let Some(detail) = detail {
             (detail_panel(detail, filter, ctx))
+        }
+        @if let Some(detail) = ua_detail {
+            (ua_detail_panel(detail, filter, ctx))
         }
 
         .cols {
@@ -243,7 +276,14 @@ fn body(live: &Live, filter: Filter, detail: Option<&IpDetail>, ctx: &Ctx) -> Ma
                                         // away, and in the DOM.
                                         td .num { (meter(row.count, ua_max)) }
                                         td { (status_pill(row.status)) }
-                                        td .mono title=(row.user_agent) { (row.user_agent) }
+                                        td .mono title=(row.user_agent) {
+                                            // The string itself is the
+                                            // link, for the reason the
+                                            // address is one above.
+                                            a href=(inspect_ua_url(&row.user_agent, filter, ctx)) {
+                                                (row.user_agent)
+                                            }
+                                        }
                                         td .right { (ua_action(row, ctx)) }
                                     }
                                 }
@@ -315,6 +355,21 @@ fn inspect_url(address: &str, filter: Filter, ctx: &Ctx) -> String {
         "/dynamic?filter={}&inspect={}",
         filter_name(filter),
         percent_encode(address)
+    ))
+}
+
+/// The link that opens the user-agent detail panel, alongside
+/// [`inspect_url`] rather than sharing it — see `Params::inspect_ua`.
+///
+/// The percent-encoding matters more here than it does for an address: a
+/// user agent routinely contains `+`, `;` and `/`, and an attacker picks
+/// the string, so anything less than encoding the whole unreserved-set
+/// complement is a way to write a second query parameter.
+fn inspect_ua_url(user_agent: &str, filter: Filter, ctx: &Ctx) -> String {
+    ctx.url(&format!(
+        "/dynamic?filter={}&inspect_ua={}",
+        filter_name(filter),
+        percent_encode(user_agent)
     ))
 }
 
@@ -446,6 +501,125 @@ fn detail_panel(detail: &IpDetail, filter: Filter, ctx: &Ctx) -> Markup {
             }
         },
     )
+}
+
+/// The detail panel for one user agent.
+///
+/// The counterpart to [`detail_panel`], and deliberately a different
+/// shape: an address can be checked against a published range, while a
+/// user agent is a string the client chose. Everything here is therefore
+/// phrased as what the lists on this host say, not as what the client is
+/// — see [`crate::uadetail`].
+fn ua_detail_panel(detail: &UaDetail, filter: Filter, ctx: &Ctx) -> Markup {
+    let close = ctx.url(&format!("/dynamic?filter={}", filter_name(filter)));
+    layout::panel(
+        "About this user agent",
+        Some("What the bot lists on this host say about this string — a client can claim anything"),
+        html! {
+            .row {
+                (status_pill(detail.status))
+                a .button href=(close) { "Close" }
+            }
+
+            // Capped and stripped by `uadetail`; maud escapes it on top
+            // of that.
+            p .mono { (detail.user_agent) }
+            @if detail.truncated {
+                p .hint { "Shown truncated — the client sent a longer string." }
+            }
+
+            table {
+                tbody {
+                    tr {
+                        td { "Requests" }
+                        td {
+                            @match detail.hits {
+                                Some(hits) => { (hits) }
+                                // Not "0": the tally is pruned on a
+                                // schedule, and a row can go between the
+                                // table being drawn and this click.
+                                None => { "no longer counted" }
+                            }
+                        }
+                    }
+                    @if let Some(seen) = detail.last_seen_at {
+                        tr {
+                            td { "Last seen" }
+                            td { (crate::health::format_utc(seen)) }
+                        }
+                    }
+                    @if detail.blocked_by_hand {
+                        tr {
+                            td { "Blocked" }
+                            td { "by hand, from this screen" }
+                        }
+                    }
+                }
+            }
+
+            @if detail.matches.is_empty() {
+                @if detail.self_declared_bot {
+                    p .hint {
+                        "This string calls itself a bot, and no list on this host has a "
+                        "pattern for it. Blocking it here blocks this exact string."
+                    }
+                } @else {
+                    p .hint { "No bot list on this host has a pattern matching this string." }
+                }
+            } @else {
+                h3 { "Matched by" }
+                .table-scroll {
+                    table {
+                        thead { tr {
+                            th { "Bot" }
+                            th { "Pattern" }
+                            th { "Categories" }
+                            th { "Lists" }
+                            th { "Effect" }
+                        } }
+                        tbody {
+                            @for hit in &detail.matches {
+                                tr {
+                                    td { (hit.name) }
+                                    td .mono { (hit.pattern) }
+                                    td { (category_names(&hit.categories)) }
+                                    td { (hit.sources.join(", ")) }
+                                    td {
+                                        (layout::pill(
+                                            hit.verdict.label(),
+                                            if hit.verdict.is_blocked() {
+                                                PillKind::Blocked
+                                            } else {
+                                                PillKind::Neutral
+                                            },
+                                        ))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// The categories a matched bot carries, as prose. Empty is possible — a
+/// list can catalogue something without filing it anywhere — and says so
+/// rather than rendering a blank cell that reads as a bug.
+fn category_names(categories: &[Category]) -> String {
+    if categories.is_empty() {
+        return "uncategorised".to_string();
+    }
+    categories
+        .iter()
+        .map(|category| match category {
+            Category::Ai => "AI",
+            Category::Search => "Search",
+            Category::Scanner => "Scanner",
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
@@ -748,7 +922,14 @@ mod tests {
     /// the truncation has no width to truncate against.
     #[test]
     fn both_long_tables_are_wrapped_in_a_scroll_container() {
-        let rendered = body(&live_with(40, 40), Filter::All, None, &Ctx::for_tests()).into_string();
+        let rendered = body(
+            &live_with(40, 40),
+            Filter::All,
+            None,
+            None,
+            &Ctx::for_tests(),
+        )
+        .into_string();
 
         assert_eq!(
             rendered.matches(r#"class="table-scroll""#).count(),
@@ -775,7 +956,7 @@ mod tests {
             }],
         };
 
-        let rendered = body(&live, Filter::All, None, &Ctx::for_tests()).into_string();
+        let rendered = body(&live, Filter::All, None, None, &Ctx::for_tests()).into_string();
 
         assert!(
             rendered.contains(&format!(r#"title="{long}""#)),
@@ -796,7 +977,7 @@ mod tests {
             }],
         };
 
-        let rendered = body(&live, Filter::All, None, &Ctx::for_tests()).into_string();
+        let rendered = body(&live, Filter::All, None, None, &Ctx::for_tests()).into_string();
 
         assert!(
             !rendered.contains(r#"onfocus="alert(1)"#),
@@ -836,6 +1017,126 @@ mod tests {
 
         assert!(url.contains("filter=blocked"), "url was: {url}");
         assert!(url.contains("inspect=198.51.100.9"), "url was: {url}");
+    }
+
+    fn ua_detail(matches: Vec<crate::uadetail::BotMatch>) -> UaDetail {
+        UaDetail {
+            user_agent: "Mozilla/5.0 (compatible; Googlebot/2.1)".to_string(),
+            truncated: false,
+            status: RowStatus::Blocklist,
+            hits: Some(412),
+            last_seen_at: Some(1_700_000_000),
+            blocked_by_hand: false,
+            matches,
+            self_declared_bot: true,
+        }
+    }
+
+    fn bot_match(verdict: crate::uadetail::BotVerdict) -> crate::uadetail::BotMatch {
+        crate::uadetail::BotMatch {
+            slug: "googlebot".to_string(),
+            name: "Googlebot".to_string(),
+            pattern: "Googlebot".to_string(),
+            categories: vec![Category::Search],
+            sources: vec!["Well-known bots".to_string()],
+            verdict,
+        }
+    }
+
+    /// The user agent's cell is the link, the same shape the address
+    /// column uses — the thing you want to know more about is the thing
+    /// you click.
+    #[test]
+    fn the_user_agent_cell_links_to_its_own_detail_panel() {
+        let live = live_with(0, 1);
+
+        let rendered = body(&live, Filter::All, None, None, &Ctx::for_tests()).into_string();
+
+        assert!(
+            rendered.contains("inspect_ua=SomeCrawler%2F0.0"),
+            "no user-agent link: {rendered}"
+        );
+    }
+
+    /// A user agent routinely carries `+`, `;` and `/`, and the client
+    /// picks the string — anything less than encoding the whole
+    /// complement of the unreserved set is a way to write a second query
+    /// parameter.
+    #[test]
+    fn the_user_agent_link_encodes_a_string_that_could_forge_a_parameter() {
+        let url = inspect_ua_url("a&inspect=1.2.3.4", Filter::PendingOnly, &Ctx::for_tests());
+
+        assert!(url.contains("filter=pending"), "url was: {url}");
+        assert!(!url.contains("&inspect=1.2.3.4"), "url was: {url}");
+        assert!(
+            url.contains("inspect_ua=a%26inspect%3D1.2.3.4"),
+            "url was: {url}"
+        );
+    }
+
+    /// The four-way verdict is the reason the panel exists: "blocked"
+    /// alone does not say whether un-blocking means clearing an override
+    /// or changing a category default.
+    #[test]
+    fn the_user_agent_panel_says_which_list_matched_and_why_it_blocks() {
+        let detail = ua_detail(vec![bot_match(
+            crate::uadetail::BotVerdict::BlockedByCategory,
+        )]);
+
+        let rendered = ua_detail_panel(&detail, Filter::All, &Ctx::for_tests()).into_string();
+
+        for needle in [
+            "Googlebot",
+            "Well-known bots",
+            "Search",
+            "blocked by category",
+            "412",
+        ] {
+            assert!(rendered.contains(needle), "missing {needle}:\n{rendered}");
+        }
+    }
+
+    /// An empty match list is not the same statement as a blocked one,
+    /// and with a bot-shaped string it is the case the `UNKNOWN` tag
+    /// exists to surface.
+    #[test]
+    fn a_user_agent_no_list_knows_says_so_rather_than_showing_an_empty_table() {
+        let rendered =
+            ua_detail_panel(&ua_detail(vec![]), Filter::All, &Ctx::for_tests()).into_string();
+
+        assert!(
+            rendered.contains("calls itself a bot"),
+            "rendered:\n{rendered}"
+        );
+    }
+
+    /// The whole string is client-chosen, which makes this panel the
+    /// largest piece of attacker-authored text on the screen.
+    #[test]
+    fn a_hostile_user_agent_cannot_break_out_of_the_detail_panel() {
+        let mut detail = ua_detail(vec![]);
+        detail.user_agent = "<script>alert(1)</script>".to_string();
+
+        let rendered = ua_detail_panel(&detail, Filter::All, &Ctx::for_tests()).into_string();
+
+        assert!(!rendered.contains("<script>"), "rendered:\n{rendered}");
+        assert!(rendered.contains("&lt;script&gt;"), "rendered:\n{rendered}");
+    }
+
+    /// The tally is pruned on a schedule, so a row can go between the
+    /// table being drawn and the click. "No count" is not "zero hits".
+    #[test]
+    fn a_user_agent_with_no_tally_left_is_not_reported_as_zero_hits() {
+        let mut detail = ua_detail(vec![]);
+        detail.hits = None;
+        detail.last_seen_at = None;
+
+        let rendered = ua_detail_panel(&detail, Filter::All, &Ctx::for_tests()).into_string();
+
+        assert!(
+            rendered.contains("no longer counted"),
+            "rendered:\n{rendered}"
+        );
     }
 
     #[test]

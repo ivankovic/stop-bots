@@ -9,6 +9,24 @@ need.
 
 ### Added
 
+- **Tap a user agent for a detail popup, the way an address already
+  does.** `i` in the TUI and a link on the cell in the web UI, showing
+  which lists carry a matching pattern, which alternative matched, the
+  categories, and — the reason it exists — *why* it is blocked or allowed:
+  a per-bot override, a category default, or nothing. "Blocked" on its own
+  never said whether un-blocking meant clearing one override or changing a
+  default that governs hundreds of other bots.
+
+  Deliberately a different model from the address detail rather than the
+  same one with different text. An address can be checked against a
+  published range; a user agent is a string the client typed and can say
+  anything, so everything here is phrased as what the lists on this host
+  say, never as what the client is. Nothing is looked up over the network,
+  for that reason and because there is nothing to ask. The string is capped
+  and stripped of control characters at the model — nothing sanitises a
+  user agent on the way in, and an escape sequence reaching the TUI's
+  alternate screen repaints the terminal.
+
 - **Two more built-in probe paths**, both meeting the list's rule that a
   path only belongs there if it is never legitimate on *any* site:
   `/wp-content/plugins/hellopress/`, a WordPress file-manager backdoor

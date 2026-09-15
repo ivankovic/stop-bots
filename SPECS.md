@@ -4225,9 +4225,10 @@ needs none of this.
 
 The TUI gets a popup on `i`, which claims `Esc` while open (the nested
 back-out `site_detail` already uses) and swallows every other key, so a
-keystroke meant for the popup can never block an address behind it. The
-User Agent panel says why it has nothing to inspect rather than opening an
-empty popup: its rows are keyed by user agent, not address.
+keystroke meant for the popup can never block an address behind it. The User
+Agent panel used to answer `i` with "switch panels with Tab"; it now opens a
+detail of its own — see the next section for why that is a different model
+rather than this one with different text in it.
 
 The web UI uses `?inspect=<address>` on the same page rather than an htmx
 fragment — the page is already parameterised by `?filter=`, so this is the
@@ -4246,6 +4247,109 @@ failing fifteen seconds later with a timeout. There is now a `MAX_LINES`
 constant, a `debug_assert`, and a unit test that renders at the pty harness's
 body size and asserts the last line survives. The Dynamic Protection entries
 were merged onto one line to stay inside the budget.
+
+## Per-user-agent detail on Dynamic Protection (`src/uadetail.rs`, `i` in the TUI, `?inspect_ua=` in the web UI)
+
+The obvious move, once the address panel had a detail popup, was to make the
+user agent panel share it. It does not, and the reason is the whole design.
+
+**An address can be checked. A user agent cannot.** `66.249.64.10` either is
+or is not inside Google's published ranges, and nothing the client does
+changes that — which is why `ipdetail` can say "this is who it claims to be"
+and mean it. A user agent is a string the client typed. It can say anything.
+The 26 forged `Googlebot` requests that this project found on one host are
+exactly what that looks like in practice. So the only honest thing this view
+can report is **what the lists on this host say about that string**, never
+what the client *is*, and every line of the panel is phrased that way —
+down to the subtitle, "a client can claim anything".
+
+That also settles the network question before it is asked. `ipdetail` refuses
+reverse DNS and whois because they are outbound requests to attacker-run
+infrastructure returning attacker-authored text; here there is additionally
+nothing to ask. No registry knows anything about a string.
+
+### What the model holds
+
+`UaDetail` is a join over data that was already there for other reasons —
+`bots`/`bot_source_entries`, the per-bot status overrides and the three
+category defaults, which is precisely what `compute_blocked_patterns` renders
+the NGINX map from, read back as a per-string explanation:
+
+- **Which lists know it, by name.** From `bot_source_entries`, not from the
+  merged `bots` row's `source_id` — that field is whichever source wrote the
+  row last, which is useful for nothing and misleading here. "Three lists
+  carry this" and "one does" are different amounts of evidence.
+- **The alternative that matched**, not the whole merged pattern. After three
+  lists have contributed, a merged `user_agent_pattern` reads
+  `Googlebot|Googlebot-Image|Googlebot-News|Storebot-Google`; saying which
+  one actually matched is the useful half. Matching goes through
+  `dynamic::matched_alternative`, which shares `unescape_pattern` with the
+  `UNKNOWN` tag — so the regex-escaped patterns from `nginx-bad-bots`
+  (`Googlebot\/`) are matched here too, rather than the view silently
+  believing the commonest crawler on the web is in no list at all.
+- **Why it is blocked or allowed, four ways**: an explicit per-bot `Blocked`,
+  an explicit per-bot `Allowed`, a category default, or nothing. This is the
+  reason the view exists. "Blocked" on its own does not tell an admin whether
+  un-blocking means clearing an override they set once, or changing a
+  category default that governs hundreds of other bots. The precedence is
+  the same one `compute_blocked_patterns` and
+  `ua_matches_blocked_bot_patterns` apply, stated once as a reason instead of
+  a boolean — an allowed bot stays allowed with its whole category blocked,
+  which is the one case a view reporting only the category default would get
+  backwards.
+- **`hits: Option<u64>`**, not `u64`. `user_agent_stats` is pruned on a
+  schedule (90 days / 20,000 rows), so a row can be gone between the table
+  being drawn and the click that inspects it. "No longer counted" and "zero
+  hits" are different claims.
+- **`self_declared_bot`**, reusing `dynamic::looks_like_a_bot` rather than
+  recomputing the judgement differently from the `UNKNOWN` tag beside it.
+  With no list matches, this is exactly the case that tag exists to surface.
+
+`status` is passed in from the row, same as `IpDetail`, so the popup and the
+table beside it cannot disagree.
+
+### What is deliberately not on it
+
+**Which addresses used this user agent.** The rows come from
+`user_agent_stats`, a rolling tally that holds no addresses; they are only in
+the access log. Reading it here would describe a different moment than the
+table the view was opened from — the same reason `dynamic::Live::load` takes
+its log text from the caller instead of finding it.
+
+### The string is the largest piece of attacker-authored text on the screen
+
+Nothing truncates or sanitises a user agent on the way in: `accesslog` takes
+the second quoted field and stores it. So `uadetail` caps it at 300
+characters and replaces control characters, once, at the model — the same
+bargain `sshlog` makes for usernames, and for the same reason. maud escapes
+the web copy on top of that, but escaping does nothing about an escape
+sequence reaching the TUI's alternate screen, where it repaints the
+terminal.
+
+The cap is display-only. Lookups use the string the caller passed, or a long
+user agent would be reported on as some *other* one — pinned by a test.
+
+In the TUI the string also wraps at 64 characters rather than running off
+the popup. `centered_rect` clamps a popup to the terminal, so an unwrapped
+300-character line would not overflow; it would be cut off at the right
+edge, which is where the interesting part of a user agent usually is.
+
+### Two front-ends, two routes
+
+`i` in the TUI opens the popup **directly** rather than going back through
+`KeyOutcome`. `InspectAddress` exists because an address detail needs the SSH
+log text, which `App` owns and the screen does not keep; a user-agent detail
+needs nothing but `&Db`, which `handle_key` already has. Routing it through
+`App` would be ceremony for a resource nobody needs. The popup state became a
+two-variant enum for the same reason it is two models.
+
+The web UI uses a **separate** `?inspect_ua=` parameter rather than
+overloading `?inspect=`. The two resolve against different tables, and a
+shared parameter would mean a stale link looking an address up as a user
+agent — answering a question nobody asked instead of failing. The existing
+hand-rolled `percent_encode` covers it, and matters more here than for an
+address: a user agent routinely carries `+`, `;` and `/`, and the client
+picks the string.
 
 ## `install web`: the binary has to exist inside the unit's own sandbox
 
