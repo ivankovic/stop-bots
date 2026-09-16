@@ -1986,9 +1986,18 @@ fn the_console_writes_each_backend_to_its_own_path_in_its_own_syntax() {
         !nft.starts_with("#!/bin/sh"),
         "firewall.nft contains a shell script:\n{nft}"
     );
+    // Asserted on syntax rather than on the decoy surviving. The decoy may
+    // legitimately be replaced: the console has an internal cron that
+    // renders the *stored* backend, every job is due on a fresh database,
+    // and since render-on-change it fires again as soon as the rules
+    // change — which this test just did. What must never happen is one
+    // backend's output landing in the other's file, and a shebang is what
+    // tells them apart: the iptables render is a shell script, the
+    // nftables one is not.
+    let sh_after = host.sh("cat /etc/stop-bots/firewall.sh");
     assert!(
-        host.sh("cat /etc/stop-bots/firewall.sh").contains("DECOY"),
-        "an nftables render overwrote the iptables script"
+        !sh_after.contains("add rule") && !sh_after.contains("nft "),
+        "an nftables render overwrote the iptables script:\n{sh_after}"
     );
 
     // Now the other way round: switching backend must move the *path*
@@ -2006,9 +2015,16 @@ fn the_console_writes_each_backend_to_its_own_path_in_its_own_syntax() {
         sh.contains("iptables") && sh.contains("203.0.113.23"),
         "the iptables render has no rule in it:\n{sh}"
     );
+    // Same again, and this is the half that caught a real cron race: by
+    // now the stored backend is iptables, so the cron renders
+    // `firewall.sh` and leaves `firewall.nft` alone — but a tick landing
+    // between the decoy and this read would have replaced it with a
+    // perfectly legitimate nftables render, and the old assertion called
+    // that the bug.
+    let nft_after = host.sh("cat /etc/stop-bots/firewall.nft");
     assert!(
-        host.sh("cat /etc/stop-bots/firewall.nft").contains("DECOY"),
-        "an iptables render overwrote the nftables script — the bug exactly"
+        !nft_after.starts_with("#!/bin/sh"),
+        "an iptables render overwrote the nftables script — the bug exactly:\n{nft_after}"
     );
 }
 
