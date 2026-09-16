@@ -365,7 +365,12 @@ fn chip_label(check: &crate::health::Check) -> &'static str {
         "nginx-applied" => "nginx",
         "service-health" => "service",
         "disk-room" => "disk",
+        // Fell through to the title until the chips were audited for the
+        // two below; "Database size" is not a chip-sized word.
+        "database-size" => "database",
         "log-sources" => "logs",
+        "access-log-clients" => "clients",
+        "nginx-deployment" => "runtime",
         _ => check.title,
     }
 }
