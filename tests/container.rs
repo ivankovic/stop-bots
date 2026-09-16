@@ -1556,15 +1556,27 @@ fn a_tarpitted_client_is_held_while_everyone_else_is_served_at_once() {
         "the connection closed after {held:?} instead of holding the client"
     );
 
+    // The status is the assertion that matters: a tarpitted client cannot
+    // produce a 200 inside the same five-second window, it produces the
+    // "000" above. So a 200 here *is* "the throttle is scoped to the
+    // block", regardless of how long the machine took to say so.
     let started = std::time::Instant::now();
     assert_eq!(
         server.status("/", "--max-time 5 -A 'Mozilla/5.0'"),
         "200",
         "the tarpit is holding everyone, not just blocked clients"
     );
+    // A loose sanity bound underneath it, for the same reason the hold
+    // above is asserted as ">= 4s" rather than as an exact figure: the
+    // useful property is that the two clients are treated differently, and
+    // a tighter number measures the machine rather than NGINX. At 2s this
+    // failed on a loaded host with nothing wrong — the unblocked client
+    // was served, just not quickly, which is not what this test is about.
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(2),
-        "an unblocked client waited too, so the throttle is not scoped to the block"
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "an unblocked client waited {:?}, as long as a tarpitted one, so the \
+         throttle is not scoped to the block",
+        started.elapsed()
     );
 }
 
