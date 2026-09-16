@@ -4373,6 +4373,92 @@ hand-rolled `percent_encode` covers it, and matters more here than for an
 address: a user agent routinely carries `+`, `;` and `/`, and the client
 picks the string.
 
+## Detecting a containerised NGINX (`src/health.rs`, `nginx-in-container` and `access-log-clients`)
+
+`set-nginx-commands` has existed for a while, and README has documented it for
+as long. That did not help the operator who never ran it, because every symptom
+of not running it is silent: blocks are written, `apply-blocks` reports success,
+the config on disk is correct, and nothing serves it. Documentation only reaches
+the people who already suspect they have a problem. So this is a check.
+
+### It fires on positive identification, never on absence of evidence
+
+The design decision. `NginxHome` has three variants and only one of them is
+reported on:
+
+- `Host` — `systemctl is-active nginx` says `active`. Phrased that way round
+  deliberately: this is not a guess about where NGINX lives, it is the direct
+  question of whether the *default reload command* reaches it.
+- `Container { name }` — no active host unit, and a running container whose
+  image or entrypoint says NGINX.
+- `Unclear` — neither. Adds no check.
+
+A host with no Docker, or with Docker running five things that are not NGINX,
+gets no extra line, no `Unknown`, and no warning. This was verified on a machine
+running `nzbget`, `prowlarr` and four others: nine checks, none of them about
+containers. A check that fires on hosts with nothing wrong is one nobody reads on
+the day it matters — the same argument `LARGE_DB_BYTES` makes.
+
+`Unclear` is also `#[default]`, which matters because `Probe` is serialised into
+the database and carries `#[serde(default)]`: a probe cached by a version from
+before this field existed still parses, and lands on the variant that accuses the
+host of nothing.
+
+The host question is asked first and short-circuits, so an ordinary install never
+runs `docker ps` — which costs ~0.9s on a machine with a busy Docker.
+
+### Three seams, three levels
+
+They fail with very different loudness, so they do not share a level:
+
+| Seam | Failure | Level |
+| --- | --- | --- |
+| Reload command | `systemctl reload nginx` reloads nothing; every block is written and never served | **Critical** |
+| `proxy_pass` target | `webaccess` writes the console's own bind address, and `127.0.0.1` inside a container is the container | Warn |
+| Managed directory | generated config names it absolutely; NGINX resolves it against its own filesystem | Warn |
+
+Only the first is both silent and total, and it is checked first and alone: with
+the reload command wrong, the other two are not worth reporting yet. The second
+is a 502 the first time anyone opens the console. The third is caught at apply
+time by `write_validated` running `nginx -t` *inside* the container, which is one
+of the nicer consequences of the commands being configurable — the validation
+runs where the paths will be resolved.
+
+A container sharing the host's network namespace is not warned about for a
+loopback bind, because there `127.0.0.1` means the same thing on both sides.
+Reporting it would be advice to break a working host.
+
+Verified end to end against a real `nginx:alpine`: silent with no container,
+Critical with the default reload command, then Warn naming both the bind address
+and the missing directory once the commands were pointed at the container.
+
+### The one that is not about containers at all
+
+`access-log-clients` warns when *every* logged request came from a private
+address. It is in this section because a container port mapping is the commonest
+cause, but it is checked on every host however NGINX is deployed.
+
+This is the quiet failure. Every detector in `accesslog` skips private sources —
+four `is_local_or_private` guards — so a log recording a proxy's address instead
+of the visitor's does not produce wrong blocks. It produces **no** blocks, from a
+log that reads as healthy, and a report that says "checked and clear". That is
+the `--ssh-log` bug again: the detector most needed on an exposed host, switched
+off by a path nobody chose, with nothing on screen to say so.
+
+Two cases it deliberately does not warn about, both found by asking what an
+ordinary host looks like:
+
+- **An empty log.** A host that has served nothing yet is not misconfigured.
+  Confirmed on a real machine whose `/var/log/nginx/access.log` is zero bytes: it
+  reports "no requests recorded yet" at `Ok`.
+- **A few private clients among public ones.** A monitoring cron hitting its own
+  site is normal. Only *all* of them is the signal.
+
+It counts lines rather than distinct addresses, because one proxy in front of
+everything is exactly the case worth catching and it has one address. Warn rather
+than Critical: the host is still protected by everything already in its ruleset;
+what has stopped is finding new offenders.
+
 ## `install web`: the binary has to exist inside the unit's own sandbox
 
 Reported from a real Debian host. `./stop-bots install web`, run from

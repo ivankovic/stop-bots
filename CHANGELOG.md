@@ -7,6 +7,30 @@ need.
 
 ## [Unreleased]
 
+### Added
+
+- **stop-bots now notices when NGINX is in a container, and says what is
+  wrong.** `set-nginx-commands` has been documented since it shipped,
+  which never helped the operator who did not know they needed it: with
+  NGINX in Docker and the default `systemctl reload nginx`, every block is
+  written, `apply-blocks` reports success, the config on disk is correct,
+  and nothing serves it. A new `nginx-in-container` check reports that as
+  CRITICAL with the exact `set-nginx-commands` line to paste, and once the
+  commands are right it goes on to check the two remaining seams — a
+  console bound to loopback that the container cannot reach, and a managed
+  directory that does not exist inside it.
+
+  It fires only on a positive identification of a container running NGINX.
+  A host with no Docker, or with Docker running other things, gets no
+  extra line at all — not a warning, not an "unknown".
+
+- **A check that the access log records real client addresses.** Every
+  detector skips private sources, so a deployment logging a proxy's
+  address instead of the visitor's does not block the wrong people — it
+  blocks nobody, from a log that looks healthy. Warns only when *every*
+  logged request is from a private address; an empty log and a handful of
+  local requests among public ones are both normal and stay quiet.
+
 ## [0.0.2] — 2026-09-15
 
 ### Added

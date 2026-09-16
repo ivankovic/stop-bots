@@ -561,6 +561,8 @@ fn short_check_label(id: &str) -> String {
         "disk-room" => "disk",
         "database-size" => "database",
         "log-sources" => "logs",
+        "access-log-clients" => "clients",
+        "nginx-in-container" => "container",
         other => other,
     }
     .to_string()

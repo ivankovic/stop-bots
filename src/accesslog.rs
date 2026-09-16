@@ -507,6 +507,40 @@ pub fn refererless_crawl_ips(log_text: &str, min_paths: usize) -> Vec<String> {
 /// health check or monitoring probe isn't a real visitor). Lines with no
 /// user agent at all, or the conventional `-` NGINX logs for a missing
 /// `User-Agent` header, are excluded — neither identifies an actual client.
+/// How many parsed lines carried a **public** client address, and how many
+/// lines parsed at all.
+///
+/// Exists to catch a silent failure rather than a noisy one. Every
+/// detector in this module skips private sources — see the four
+/// `is_local_or_private` guards above — so a deployment where NGINX
+/// records its proxy's address instead of the client's does not produce
+/// wrong blocks. It produces *no* blocks, from a log that looks perfectly
+/// healthy and a report that says "checked and clear". That is the shape
+/// of the `--ssh-log` bug: the detector most needed on an exposed host,
+/// switched off by a path nobody chose, with nothing on screen to say so.
+///
+/// The usual cause is NGINX behind something that terminates the
+/// connection itself — a container's port mapping, a load balancer, a CDN
+/// — without `set_real_ip_from`/`real_ip_header` to recover the original
+/// address.
+///
+/// Counts lines, not distinct addresses: one proxy in front of everything
+/// is exactly the case worth catching, and it has one address.
+pub fn client_address_mix(log_text: &str) -> (usize, usize) {
+    let mut public = 0;
+    let mut parsed = 0;
+    for line in log_text.lines() {
+        let Some(entry) = parse_line(line) else {
+            continue;
+        };
+        parsed += 1;
+        if !is_local_or_private(&entry.ip) {
+            public += 1;
+        }
+    }
+    (public, parsed)
+}
+
 /// Feeds [`crate::db::Db::record_user_agent_hits`] via
 /// `crate::accessstats::record_access_stats`.
 pub fn successful_user_agent_counts(log_text: &str) -> HashMap<String, u64> {

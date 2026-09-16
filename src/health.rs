@@ -165,6 +165,55 @@ pub struct Probe {
     /// Whether each log source could actually be read.
     pub ssh_log_readable: Option<bool>,
     pub access_log_readable: Option<bool>,
+    /// Where the NGINX that serves this host's config actually runs.
+    pub nginx_home: NginxHome,
+    /// Whether [`crate::nginx::managed_dir`] resolves, at the same path,
+    /// *inside* the container. `None` when there is no container to ask.
+    ///
+    /// The generated config names that directory absolutely — the
+    /// `robots.txt` alias and the blocked-agent map both do — and NGINX
+    /// resolves it against whatever filesystem it is running on. A bind
+    /// mount at a different path, or no bind mount at all, leaves those
+    /// directives pointing at nothing.
+    pub managed_dir_in_container: Option<bool>,
+    /// Whether that container shares the host's network namespace, in
+    /// which case `127.0.0.1` means the same thing on both sides and the
+    /// generated `proxy_pass` needs no special address.
+    pub container_shares_host_network: Option<bool>,
+    /// `(public, parsed)` client addresses in the access log — see
+    /// [`crate::accesslog::client_address_mix`]. `None` when the log could
+    /// not be read, which [`log_sources`] already reports.
+    pub access_log_clients: Option<(usize, usize)>,
+}
+
+/// Where the NGINX serving this host's config runs, as far as this host
+/// can tell from outside it.
+///
+/// Deliberately has no "not sure, probably fine" variant that any check
+/// reports on. Every ordinary install lands on `Host` or `Unclear`, and
+/// both are silent: a check that fires on hosts with nothing wrong is one
+/// nobody reads on the day it matters, which is the argument
+/// [`LARGE_DB_BYTES`] makes at length a few lines below.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NginxHome {
+    /// A `systemctl is-active nginx` that answers "active". Named that way
+    /// round on purpose: the default reload command *is* `systemctl reload
+    /// nginx`, so this is not a guess about where NGINX lives, it is the
+    /// direct question of whether the configured command reaches it.
+    Host,
+    /// No active host unit, and a running container whose image or command
+    /// says NGINX.
+    Container { name: String },
+    /// Neither could be established — no host unit, and no container to
+    /// find, or no Docker to ask. Reported on by nothing.
+    ///
+    /// The default, which is also what a probe cached by an older version
+    /// deserialises to: `Probe` carries `#[serde(default)]` so a stored
+    /// probe from before this field existed still parses, and lands on the
+    /// variant that says nothing rather than one that accuses the host of
+    /// something.
+    #[default]
+    Unclear,
 }
 
 /// Below this, a database that is mostly appends starts failing writes
@@ -199,6 +248,15 @@ pub fn probe(backend: FirewallBackend, db_path: &Path, ssh_log: Option<&Path>) -
         Some(count) => (Some(count), Some(backend.stored().to_string())),
         None => (None, None),
     };
+    // Read once and answer both questions from it: two reads would be two
+    // different moments, and this one shells out to nothing but the
+    // filesystem.
+    let access_log = crate::accesslog::find_default_source();
+    let nginx_home = nginx_home();
+    let container = match &nginx_home {
+        NginxHome::Container { name } => Some(name.clone()),
+        _ => None,
+    };
     Probe {
         live_rules,
         live_backend,
@@ -213,11 +271,86 @@ pub fn probe(backend: FirewallBackend, db_path: &Path, ssh_log: Option<&Path>) -
             },
             crate::sshlog::LogSource::Found(_)
         )),
-        access_log_readable: Some(matches!(
-            crate::accesslog::find_default_source(),
-            crate::accesslog::LogSource::Found(_)
-        )),
+        access_log_readable: Some(matches!(&access_log, crate::accesslog::LogSource::Found(_))),
+        access_log_clients: match &access_log {
+            crate::accesslog::LogSource::Found(text) => {
+                Some(crate::accesslog::client_address_mix(text))
+            }
+            crate::accesslog::LogSource::Unavailable => None,
+        },
+        nginx_home,
+        managed_dir_in_container: container.as_ref().map(|name| {
+            // `test -d` inside the container, at the path the generated
+            // config names. Anything other than a clean exit — no such
+            // path, no shell, container gone between the two calls — is a
+            // "no", because every one of those means the directive would
+            // not resolve either.
+            run_ok(
+                "docker",
+                &[
+                    "exec",
+                    name,
+                    "test",
+                    "-d",
+                    &crate::nginx::managed_dir().to_string_lossy(),
+                ],
+            )
+        }),
+        container_shares_host_network: container.as_ref().map(|name| {
+            run_allowing_failure(
+                "docker",
+                &["inspect", "-f", "{{.HostConfig.NetworkMode}}", name],
+            )
+            .is_some_and(|mode| mode.trim() == "host")
+        }),
     }
+}
+
+/// Whether `program` ran and exited zero. A program that could not be
+/// spawned at all is a `false`, not a panic: on a host with no Docker
+/// this is the ordinary path.
+fn run_ok(program: &str, args: &[&str]) -> bool {
+    Command::new(program)
+        .args(args)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Where NGINX runs — see [`NginxHome`].
+///
+/// Asks the host question first and only reaches for Docker if the answer
+/// is no, so a normal install never runs `docker ps` at all.
+fn nginx_home() -> NginxHome {
+    if run_allowing_failure("systemctl", &["is-active", "nginx"])
+        .is_some_and(|state| state.trim() == "active")
+    {
+        return NginxHome::Host;
+    }
+    match nginx_container() {
+        Some(name) => NginxHome::Container { name },
+        None => NginxHome::Unclear,
+    }
+}
+
+/// The name of a running container that appears to be NGINX.
+///
+/// Matches on the image or the entrypoint rather than the container's
+/// name, which is whatever the operator called it. Takes the first match:
+/// a host running two NGINX containers is past what one health check can
+/// usefully say, and reporting on one of them is better than reporting on
+/// neither.
+fn nginx_container() -> Option<String> {
+    let listed = run_allowing_failure(
+        "docker",
+        &["ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Command}}"],
+    )?;
+    listed.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        let name = fields.next()?;
+        let rest = fields.collect::<Vec<_>>().join(" ").to_lowercase();
+        (rest.contains("nginx") && !name.is_empty()).then(|| name.to_string())
+    })
 }
 
 /// How many rules this project has loaded right now, or `None` if the
@@ -403,6 +536,11 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(disk_room(probe));
     checks.push(database_size(db)?);
     checks.push(log_sources(probe));
+    checks.push(access_log_clients(probe));
+    // Adds a line only on a host where NGINX really is in a container.
+    if let Some(check) = nginx_in_container(db, probe)? {
+        checks.push(check);
+    }
 
     Ok(Report {
         checks,
@@ -730,6 +868,151 @@ fn database_size(db: &Db) -> Result<Check> {
 
 /// The detectors are only as good as the logs they read, and a log they
 /// cannot read looks exactly like a log with nothing in it.
+/// Whether the access log is recording the *client's* address.
+///
+/// The quiet one. Every detector in `accesslog` skips private sources, so
+/// a deployment that records a proxy's address instead of the visitor's
+/// does not block the wrong people — it blocks nobody, from a log that
+/// looks healthy and a report that says everything is clear. That is the
+/// `--ssh-log` failure exactly: the detector most needed on an exposed
+/// host, switched off by a path nobody chose, with nothing on screen.
+///
+/// Warn, not Critical: the host is still protected by everything already
+/// in its ruleset. What has stopped is finding *new* offenders.
+fn access_log_clients(probe: &Probe) -> Check {
+    let (level, detail, fix) = match probe.access_log_clients {
+        // `log_sources` already reports an unreadable log; saying it twice
+        // in one report is noise, not emphasis.
+        None => (Level::Unknown, "no access log to read".to_string(), None),
+        // Not a misconfiguration. A host that has served nothing yet has
+        // nothing to say about who it served.
+        Some((_, 0)) => (Level::Ok, "no requests recorded yet".to_string(), None),
+        Some((0, parsed)) => (
+            Level::Warn,
+            format!(
+                "all {parsed} logged request(s) came from a private address \u{2014} every detector skips those, so none of them can see anything"
+            ),
+            Some(
+                "NGINX is logging its proxy's address, not the client's. If it runs behind a container port mapping, a load balancer or a CDN, set `set_real_ip_from` and `real_ip_header` so $remote_addr is the visitor again."
+                    .to_string(),
+            ),
+        ),
+        // One private address among public ones is ordinary: a monitoring
+        // cron on the host hits its own site. Only *all* of them is the
+        // signal.
+        Some((public, parsed)) => (
+            Level::Ok,
+            format!("{public} of {parsed} logged request(s) from public addresses"),
+            None,
+        ),
+    };
+    Check {
+        id: "access-log-clients",
+        title: "Access log records real clients",
+        level,
+        detail,
+        fix,
+    }
+}
+
+/// The checks that only apply when NGINX runs in a container.
+///
+/// Returns nothing at all on an ordinary host. That is deliberate and it
+/// is the main design decision here: this fires on a positive
+/// identification of the container arrangement, never on the absence of
+/// evidence for the host one. A host with no Docker, or with Docker
+/// running something unrelated, adds no check, no `Unknown`, and no line
+/// to the report.
+///
+/// Three things have to line up for a containerised NGINX, and they fail
+/// with very different loudness — so the levels differ:
+///
+/// - **The reload command.** `systemctl reload nginx` reloads nothing when
+///   NGINX is in a container. Silent, and total: every block this project
+///   writes is staged and never served. Critical.
+/// - **The proxy target.** `webaccess` writes the console's own bind
+///   address into `proxy_pass`, and `127.0.0.1` inside a container is the
+///   container. Loud — a 502 the first time anyone opens the console — so
+///   Warn.
+/// - **The managed directory.** The generated config names it absolutely;
+///   NGINX resolves it against its own filesystem. Caught at apply time by
+///   `write_validated` running `nginx -t` inside the container, so Warn.
+fn nginx_in_container(db: &Db, probe: &Probe) -> Result<Option<Check>> {
+    let NginxHome::Container { name } = &probe.nginx_home else {
+        return Ok(None);
+    };
+
+    let commands = crate::nginx::NginxCommands::from_db(db)?;
+
+    // The reload command first: it is the only one of the three that is
+    // both silent and total.
+    let reload_reaches_container = commands
+        .reload
+        .iter()
+        .any(|word| word.contains("docker") || word.contains("podman") || word.contains(name));
+    if !reload_reaches_container {
+        return Ok(Some(Check {
+            id: "nginx-in-container",
+            title: "NGINX runs in a container",
+            level: Level::Critical,
+            detail: format!(
+                "NGINX is in container `{name}`, but the reload command is `{}` \u{2014} which reloads nothing, so no block this tool writes is ever served",
+                commands.reload.join(" ")
+            ),
+            fix: Some(format!(
+                "stop-bots set-nginx-commands --test \"docker exec {name} nginx -t\" --reload \"docker exec {name} nginx -s reload\""
+            )),
+        }));
+    }
+
+    let mut problems: Vec<String> = Vec::new();
+    let mut fixes: Vec<String> = Vec::new();
+
+    let upstream = crate::web::resolve_bind(db, None)?;
+    let host_networked = probe.container_shares_host_network == Some(true);
+    if upstream.ip().is_loopback() && !host_networked {
+        problems.push(format!(
+            "the console binds {upstream}, which inside the container means the container itself, so the generated proxy_pass cannot reach it"
+        ));
+        fixes.push(
+            "bind the console where the container can reach it (the bridge gateway, e.g. --bind 172.17.0.1:8787) and re-apply Web Access, or run the container with --network host"
+                .to_string(),
+        );
+    }
+
+    if probe.managed_dir_in_container == Some(false) {
+        problems.push(format!(
+            "{} does not exist inside the container, and the generated config names it absolutely",
+            crate::nginx::managed_dir().display()
+        ));
+        fixes.push(format!(
+            "bind-mount {} into the container at the same path",
+            crate::nginx::managed_dir().display()
+        ));
+    }
+
+    Ok(Some(if problems.is_empty() {
+        Check {
+            id: "nginx-in-container",
+            title: "NGINX runs in a container",
+            level: Level::Ok,
+            detail: format!("container `{name}`, reached by the configured commands"),
+            fix: None,
+        }
+    } else {
+        Check {
+            id: "nginx-in-container",
+            title: "NGINX runs in a container",
+            level: Level::Warn,
+            detail: format!(
+                "NGINX is in container `{name}`, but {}",
+                problems.join("; and ")
+            ),
+            fix: Some(fixes.join(". ")),
+        }
+    }))
+}
+
 fn log_sources(probe: &Probe) -> Check {
     let missing: Vec<&str> = [
         (probe.ssh_log_readable, "the SSH log"),
@@ -859,7 +1142,19 @@ mod tests {
             db_free_bytes: Some(8 * 1024 * 1024 * 1024),
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
+            access_log_clients: Some((40, 41)),
+            // The ordinary host: NGINX is a unit here, and the two
+            // container fields have nothing to answer. Every
+            // container-arrangement test below states its own.
+            nginx_home: NginxHome::Host,
+            managed_dir_in_container: None,
+            container_shares_host_network: None,
         }
+    }
+
+    /// Alias for [`check`], for tests that bind a local named `check`.
+    fn check2<'a>(report: &'a Report, id: &str) -> &'a Check {
+        check(report, id)
     }
 
     fn check<'a>(report: &'a Report, id: &str) -> &'a Check {
@@ -879,6 +1174,219 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    fn in_container() -> Probe {
+        Probe {
+            nginx_home: NginxHome::Container {
+                name: "web".to_string(),
+            },
+            managed_dir_in_container: Some(true),
+            container_shares_host_network: Some(false),
+            ..healthy()
+        }
+    }
+
+    fn configured_for_docker(db: &Db) {
+        db.set_text_setting(
+            crate::nginx::NginxCommands::RELOAD_KEY,
+            "docker exec web nginx -s reload",
+        )
+        .unwrap();
+        db.set_text_setting(
+            crate::nginx::NginxCommands::TEST_KEY,
+            "docker exec web nginx -t",
+        )
+        .unwrap();
+    }
+
+    /// The design decision, pinned: a host with no container adds no line
+    /// at all. Not `Unknown`, not a reassuring `Ok` nobody asked for. A
+    /// check that fires on hosts with nothing wrong is one nobody reads on
+    /// the day it matters.
+    #[test]
+    fn an_ordinary_host_gets_no_container_check() {
+        let report = assess(&db(), &healthy()).unwrap();
+
+        assert!(
+            !report.checks.iter().any(|c| c.id == "nginx-in-container"),
+            "checks were: {:?}",
+            report.checks.iter().map(|c| c.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// And neither does a host where nothing could be established — which
+    /// is what a probe cached by a version before this field existed
+    /// deserialises to.
+    #[test]
+    fn an_unclear_deployment_accuses_the_host_of_nothing() {
+        let report = assess(
+            &db(),
+            &Probe {
+                nginx_home: NginxHome::Unclear,
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        assert!(!report.checks.iter().any(|c| c.id == "nginx-in-container"));
+        // Nothing in the report so much as mentions a container. Asserting
+        // on `worst()` would not say that: an empty test database already
+        // warns that no sites have been scanned, which is a different
+        // subject entirely.
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.detail.contains("container") || c.title.contains("container")),
+            "{:?}",
+            report.checks
+        );
+    }
+
+    /// The silent, total failure: NGINX is in a container and the reload
+    /// command still talks to systemd, so every block is written and none
+    /// is ever served.
+    #[test]
+    fn a_containerised_nginx_with_the_default_reload_is_critical() {
+        let report = assess(&db(), &in_container()).unwrap();
+
+        let check = check(&report, "nginx-in-container");
+        assert_eq!(check.level, Level::Critical);
+        assert!(
+            check.detail.contains("reloads nothing"),
+            "was: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("docker exec web"),
+            "the fix should name the container: {:?}",
+            check.fix
+        );
+    }
+
+    /// A loopback bind is unreachable from inside the container, so the
+    /// `proxy_pass` `webaccess` generates points at the container itself.
+    #[test]
+    fn a_loopback_console_bind_is_flagged_for_a_bridged_container() {
+        let db = db();
+        configured_for_docker(&db);
+
+        let check = assess(&db, &in_container()).unwrap();
+        let check = check2(&check, "nginx-in-container");
+
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("proxy_pass"), "was: {}", check.detail);
+    }
+
+    /// The same bind is correct when the container shares the host's
+    /// network namespace, where `127.0.0.1` means the same thing on both
+    /// sides. Reporting it then would be advice to break a working host.
+    #[test]
+    fn a_host_networked_container_is_happy_with_a_loopback_bind() {
+        let db = db();
+        configured_for_docker(&db);
+
+        let report = assess(
+            &db,
+            &Probe {
+                container_shares_host_network: Some(true),
+                ..in_container()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(check2(&report, "nginx-in-container").level, Level::Ok);
+    }
+
+    /// The generated config names the managed directory absolutely, and
+    /// NGINX resolves it inside the container.
+    #[test]
+    fn a_managed_directory_missing_from_the_container_is_flagged() {
+        let db = db();
+        configured_for_docker(&db);
+
+        let report = assess(
+            &db,
+            &Probe {
+                managed_dir_in_container: Some(false),
+                container_shares_host_network: Some(true),
+                ..in_container()
+            },
+        )
+        .unwrap();
+
+        let check = check2(&report, "nginx-in-container");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("does not exist inside the container"),
+            "was: {}",
+            check.detail
+        );
+    }
+
+    /// The quiet failure this pair exists for: a log full of requests,
+    /// none of which carries a client address any detector will look at.
+    #[test]
+    fn an_access_log_of_only_private_clients_is_a_warning() {
+        let report = assess(
+            &db(),
+            &Probe {
+                access_log_clients: Some((0, 900)),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        let check = check2(&report, "access-log-clients");
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("900"), "was: {}", check.detail);
+        assert!(
+            check
+                .fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("real_ip_header"),
+            "the fix should name the directive: {:?}",
+            check.fix
+        );
+    }
+
+    /// A host that has served nothing yet is not misconfigured, and must
+    /// not be told it is.
+    #[test]
+    fn an_empty_access_log_is_not_a_warning() {
+        let report = assess(
+            &db(),
+            &Probe {
+                access_log_clients: Some((0, 0)),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(check2(&report, "access-log-clients").level, Level::Ok);
+    }
+
+    /// One private client among public ones is ordinary — a monitoring
+    /// cron on the host hitting its own site. Only *all* of them is the
+    /// signal, or this fires on every healthy server there is.
+    #[test]
+    fn a_few_private_clients_among_public_ones_are_fine() {
+        let report = assess(
+            &db(),
+            &Probe {
+                access_log_clients: Some((880, 900)),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(check2(&report, "access-log-clients").level, Level::Ok);
     }
 
     /// The check this module exists for, in the exact shape a real host
