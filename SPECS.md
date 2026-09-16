@@ -4373,7 +4373,7 @@ hand-rolled `percent_encode` covers it, and matters more here than for an
 address: a user agent routinely carries `+`, `;` and `/`, and the client
 picks the string.
 
-## Detecting a containerised NGINX (`src/health.rs`, `nginx-in-container` and `access-log-clients`)
+## Where NGINX runs (`src/health.rs`, `nginx-deployment` and `access-log-clients`)
 
 `set-nginx-commands` has existed for a while, and README has documented it for
 as long. That did not help the operator who never ran it, because every symptom
@@ -4383,8 +4383,8 @@ the people who already suspect they have a problem. So this is a check.
 
 ### It fires on positive identification, never on absence of evidence
 
-The design decision. `NginxHome` has three variants and only one of them is
-reported on:
+The design decision. `NginxHome` has three variants, and the two that are an
+*answer* are both reported:
 
 - `Host` — `systemctl is-active nginx` says `active`. Phrased that way round
   deliberately: this is not a guess about where NGINX lives, it is the direct
@@ -4393,11 +4393,19 @@ reported on:
   image or entrypoint says NGINX.
 - `Unclear` — neither. Adds no check.
 
-A host with no Docker, or with Docker running five things that are not NGINX,
-gets no extra line, no `Unknown`, and no warning. This was verified on a machine
-running `nzbget`, `prowlarr` and four others: nine checks, none of them about
-containers. A check that fires on hosts with nothing wrong is one nobody reads on
-the day it matters — the same argument `LARGE_DB_BYTES` makes.
+`Host` says so out loud — "on this host, reloaded with `systemctl reload nginx`"
+— because an operator reading the report wants to know which arrangement the tool
+believes it is in, and because that line is the only evidence the detection ran at
+all. It also carries the mirror-image failure: container commands configured
+against a host NGINX reload nothing, just as silently as the reverse, and are
+Critical for the same reason.
+
+`Unclear` is the only silent one. A machine with no active NGINX unit and no
+NGINX container gets no extra line, no `Unknown`, and no warning — verified on a
+developer box running `nzbget`, `prowlarr` and four other containers: nine checks,
+none of them about NGINX's whereabouts. A check that fires on hosts with nothing
+wrong is one nobody reads on the day it matters — the same argument
+`LARGE_DB_BYTES` makes.
 
 `Unclear` is also `#[default]`, which matters because `Probe` is serialised into
 the database and carries `#[serde(default)]`: a probe cached by a version from

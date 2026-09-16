@@ -20,9 +20,15 @@ need.
   console bound to loopback that the container cannot reach, and a managed
   directory that does not exist inside it.
 
-  It fires only on a positive identification of a container running NGINX.
-  A host with no Docker, or with Docker running other things, gets no
-  extra line at all — not a warning, not an "unknown".
+  The host arrangement is stated too, rather than left to silence: "on
+  this host, reloaded with `systemctl reload nginx`" says which
+  arrangement the tool believes it is in, and is the only line that shows
+  the detection ran. The mirror-image mistake — container commands
+  configured against an NGINX that runs on the host — is CRITICAL for the
+  same reason as the reverse.
+
+  Only a machine where *neither* could be established stays silent: no
+  extra line at all, not a warning, not an "unknown".
 
 - **A check that the access log records real client addresses.** Every
   detector skips private sources, so a deployment logging a proxy's

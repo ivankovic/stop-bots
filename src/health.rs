@@ -538,7 +538,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(log_sources(probe));
     checks.push(access_log_clients(probe));
     // Adds a line only on a host where NGINX really is in a container.
-    if let Some(check) = nginx_in_container(db, probe)? {
+    if let Some(check) = nginx_deployment(db, probe)? {
         checks.push(check);
     }
 
@@ -915,14 +915,18 @@ fn access_log_clients(probe: &Probe) -> Check {
     }
 }
 
-/// The checks that only apply when NGINX runs in a container.
+/// Where NGINX runs, and whether everything that has to agree with that
+/// actually does.
 ///
-/// Returns nothing at all on an ordinary host. That is deliberate and it
-/// is the main design decision here: this fires on a positive
-/// identification of the container arrangement, never on the absence of
-/// evidence for the host one. A host with no Docker, or with Docker
-/// running something unrelated, adds no check, no `Unknown`, and no line
-/// to the report.
+/// Says the host case out loud — "on this host, reloaded with `systemctl
+/// reload nginx`" — because an operator reading the report wants to know
+/// which arrangement the tool believes it is in, and because that line is
+/// the only evidence the detection ran at all.
+///
+/// Returns nothing only when *neither* arrangement could be established.
+/// That is deliberate: this reports a positive identification, never a
+/// guess. A host with no Docker and no active NGINX unit adds no check,
+/// no `Unknown`, and no line to the report.
 ///
 /// Three things have to line up for a containerised NGINX, and they fail
 /// with very different loudness — so the levels differ:
@@ -937,23 +941,62 @@ fn access_log_clients(probe: &Probe) -> Check {
 /// - **The managed directory.** The generated config names it absolutely;
 ///   NGINX resolves it against its own filesystem. Caught at apply time by
 ///   `write_validated` running `nginx -t` inside the container, so Warn.
-fn nginx_in_container(db: &Db, probe: &Probe) -> Result<Option<Check>> {
-    let NginxHome::Container { name } = &probe.nginx_home else {
-        return Ok(None);
+fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
+    let commands = crate::nginx::NginxCommands::from_db(db)?;
+    let targets_a_container = |argv: &[String]| {
+        argv.iter()
+            .any(|word| word.contains("docker") || word.contains("podman"))
     };
 
-    let commands = crate::nginx::NginxCommands::from_db(db)?;
+    let name = match &probe.nginx_home {
+        // Said out loud rather than left as the silent case. An operator
+        // looking at this report wants to know which arrangement the tool
+        // thinks it is in — "NGINX runs on this host" is the reassurance
+        // that the commands below reach it, and it is the line that tells
+        // them the detection is working at all.
+        NginxHome::Host => {
+            return Ok(Some(if targets_a_container(&commands.reload) {
+                // The mirror image of the container case, and reachable:
+                // an operator who set container commands and later moved
+                // NGINX onto the host has a reload that reaches nothing,
+                // just as silently.
+                Check {
+                    id: "nginx-deployment",
+                    title: "Where NGINX runs",
+                    level: Level::Critical,
+                    detail: format!(
+                        "NGINX runs on this host, but the reload command is `{}` \u{2014} which targets a container, so no block this tool writes is ever served",
+                        commands.reload.join(" ")
+                    ),
+                    fix: Some("stop-bots set-nginx-commands --reset".to_string()),
+                }
+            } else {
+                Check {
+                    id: "nginx-deployment",
+                    title: "Where NGINX runs",
+                    level: Level::Ok,
+                    detail: format!(
+                        "on this host, reloaded with `{}`",
+                        commands.reload.join(" ")
+                    ),
+                    fix: None,
+                }
+            }));
+        }
+        // Nothing could be established. Still the silent case: a guess
+        // here would be a guess in the operator's report.
+        NginxHome::Unclear => return Ok(None),
+        NginxHome::Container { name } => name,
+    };
 
     // The reload command first: it is the only one of the three that is
     // both silent and total.
-    let reload_reaches_container = commands
-        .reload
-        .iter()
-        .any(|word| word.contains("docker") || word.contains("podman") || word.contains(name));
+    let reload_reaches_container =
+        targets_a_container(&commands.reload) || commands.reload.iter().any(|w| w.contains(name));
     if !reload_reaches_container {
         return Ok(Some(Check {
-            id: "nginx-in-container",
-            title: "NGINX runs in a container",
+            id: "nginx-deployment",
+            title: "Where NGINX runs",
             level: Level::Critical,
             detail: format!(
                 "NGINX is in container `{name}`, but the reload command is `{}` \u{2014} which reloads nothing, so no block this tool writes is ever served",
@@ -993,16 +1036,16 @@ fn nginx_in_container(db: &Db, probe: &Probe) -> Result<Option<Check>> {
 
     Ok(Some(if problems.is_empty() {
         Check {
-            id: "nginx-in-container",
-            title: "NGINX runs in a container",
+            id: "nginx-deployment",
+            title: "Where NGINX runs",
             level: Level::Ok,
-            detail: format!("container `{name}`, reached by the configured commands"),
+            detail: format!("in container `{name}`, reached by the configured commands"),
             fix: None,
         }
     } else {
         Check {
-            id: "nginx-in-container",
-            title: "NGINX runs in a container",
+            id: "nginx-deployment",
+            title: "Where NGINX runs",
             level: Level::Warn,
             detail: format!(
                 "NGINX is in container `{name}`, but {}",
@@ -1200,19 +1243,45 @@ mod tests {
         .unwrap();
     }
 
-    /// The design decision, pinned: a host with no container adds no line
-    /// at all. Not `Unknown`, not a reassuring `Ok` nobody asked for. A
-    /// check that fires on hosts with nothing wrong is one nobody reads on
-    /// the day it matters.
+    /// The host arrangement is stated out loud, not left to silence: the
+    /// operator wants to know which one the tool thinks it is in, and this
+    /// is the only line that says the detection ran.
     #[test]
-    fn an_ordinary_host_gets_no_container_check() {
+    fn an_ordinary_host_is_told_that_nginx_runs_on_it() {
         let report = assess(&db(), &healthy()).unwrap();
 
+        let check = check2(&report, "nginx-deployment");
+        assert_eq!(check.level, Level::Ok);
         assert!(
-            !report.checks.iter().any(|c| c.id == "nginx-in-container"),
-            "checks were: {:?}",
-            report.checks.iter().map(|c| c.id).collect::<Vec<_>>()
+            check.detail.contains("on this host"),
+            "was: {}",
+            check.detail
         );
+        assert!(
+            check.detail.contains("systemctl reload nginx"),
+            "it should name the command that reaches it: {}",
+            check.detail
+        );
+    }
+
+    /// The mirror of the container case, and reachable: an operator who
+    /// pointed the commands at a container and later moved NGINX onto the
+    /// host has a reload that reaches nothing, just as silently.
+    #[test]
+    fn container_commands_on_a_host_nginx_are_critical() {
+        let db = db();
+        configured_for_docker(&db);
+
+        let check = assess(&db, &healthy()).unwrap();
+        let check = check2(&check, "nginx-deployment");
+
+        assert_eq!(check.level, Level::Critical);
+        assert!(
+            check.detail.contains("targets a container"),
+            "was: {}",
+            check.detail
+        );
+        assert!(check.fix.as_deref().unwrap_or_default().contains("--reset"));
     }
 
     /// And neither does a host where nothing could be established — which
@@ -1229,7 +1298,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!report.checks.iter().any(|c| c.id == "nginx-in-container"));
+        assert!(!report.checks.iter().any(|c| c.id == "nginx-deployment"));
         // Nothing in the report so much as mentions a container. Asserting
         // on `worst()` would not say that: an empty test database already
         // warns that no sites have been scanned, which is a different
@@ -1251,7 +1320,7 @@ mod tests {
     fn a_containerised_nginx_with_the_default_reload_is_critical() {
         let report = assess(&db(), &in_container()).unwrap();
 
-        let check = check(&report, "nginx-in-container");
+        let check = check(&report, "nginx-deployment");
         assert_eq!(check.level, Level::Critical);
         assert!(
             check.detail.contains("reloads nothing"),
@@ -1277,7 +1346,7 @@ mod tests {
         configured_for_docker(&db);
 
         let check = assess(&db, &in_container()).unwrap();
-        let check = check2(&check, "nginx-in-container");
+        let check = check2(&check, "nginx-deployment");
 
         assert_eq!(check.level, Level::Warn);
         assert!(check.detail.contains("proxy_pass"), "was: {}", check.detail);
@@ -1300,7 +1369,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(check2(&report, "nginx-in-container").level, Level::Ok);
+        assert_eq!(check2(&report, "nginx-deployment").level, Level::Ok);
     }
 
     /// The generated config names the managed directory absolutely, and
@@ -1320,7 +1389,7 @@ mod tests {
         )
         .unwrap();
 
-        let check = check2(&report, "nginx-in-container");
+        let check = check2(&report, "nginx-deployment");
         assert_eq!(check.level, Level::Warn);
         assert!(
             check.detail.contains("does not exist inside the container"),

@@ -562,7 +562,7 @@ fn short_check_label(id: &str) -> String {
         "database-size" => "database",
         "log-sources" => "logs",
         "access-log-clients" => "clients",
-        "nginx-in-container" => "container",
+        "nginx-deployment" => "runtime",
         other => other,
     }
     .to_string()
