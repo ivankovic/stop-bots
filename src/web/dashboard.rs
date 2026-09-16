@@ -49,6 +49,8 @@ struct View {
     scanner: Policy,
     search: Policy,
     ai: Policy,
+    /// Whether the humans-only mode is forcing the three above.
+    humans_only: bool,
     geo_mode: GeoMode,
     selected_countries: Vec<String>,
     fetched_countries: Vec<(String, i64, i64)>,
@@ -118,6 +120,7 @@ fn load(
         scanner: db.get_category_default(Category::Scanner)?,
         search: db.get_category_default(Category::Search)?,
         ai: db.get_category_default(Category::Ai)?,
+        humans_only: db.get_humans_only()?,
         geo_mode: db.get_geo_mode()?,
         selected_countries: db.list_selected_countries()?,
         fetched_countries: db.list_fetched_countries()?,
@@ -303,6 +306,29 @@ fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
         "Policy",
         Some("What each category of known bot gets by default"),
         html! {
+            .panel-body {
+                .row {
+                    (layout::pill(
+                        if view.humans_only { "HUMANS ONLY" } else { "HUMANS ONLY: OFF" },
+                        if view.humans_only { PillKind::Blocked } else { PillKind::Neutral },
+                    ))
+                    form .inline method="post" action=(ctx.url("/humans-only")) {
+                        (layout::csrf_field(ctx))
+                        input type="hidden" name="enabled" value=(if view.humans_only { "false" } else { "true" });
+                        button .danger[!view.humans_only] type="submit" {
+                            @if view.humans_only { "Turn off" } @else { "Turn on" }
+                        }
+                    }
+                }
+                @if view.humans_only {
+                    p .hint {
+                        "Every catalogued bot is blocked, whatever its category — and fetching "
+                        code { "/robots.txt" }
+                        " earns a one-day block for that address. Let's Encrypt is the one "
+                        "exception, because blocking it breaks certificate renewal."
+                    }
+                }
+            }
             table {
                 tbody {
                     @for (category, policy) in rows {
@@ -310,14 +336,22 @@ fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
                             td { (category_label(category)) }
                             td { (policy_pill(policy)) }
                             td .right {
-                                form .inline method="post" action=(ctx.url("/category")) {
-                                    (layout::csrf_field(ctx))
-                                    input type="hidden" name="category" value=(category_id(category));
-                                    input type="hidden" name="policy" value=(policy_id(flip(policy)));
-                                    button type="submit" {
-                                        @match flip(policy) {
-                                            Policy::Blocked => "Block",
-                                            Policy::Allowed => "Allow",
+                                @if view.humans_only {
+                                    // No form at all rather than a disabled
+                                    // one: the POST is refused server-side
+                                    // too, and a button that looks pressable
+                                    // and is not is worse than none.
+                                    span .hint { "forced by Humans only" }
+                                } @else {
+                                    form .inline method="post" action=(ctx.url("/category")) {
+                                        (layout::csrf_field(ctx))
+                                        input type="hidden" name="category" value=(category_id(category));
+                                        input type="hidden" name="policy" value=(policy_id(flip(policy)));
+                                        button type="submit" {
+                                            @match flip(policy) {
+                                                Policy::Blocked => "Block",
+                                                Policy::Allowed => "Allow",
+                                            }
                                         }
                                     }
                                 }
@@ -933,6 +967,7 @@ pub(crate) fn relative(at: i64) -> String {
 pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
     Router::new()
         .route(&base.url("/category"), post(set_category))
+        .route(&base.url("/humans-only"), post(set_humans_only))
         .route(&base.url("/geo-mode"), post(set_geo_mode))
         .route(&base.url("/geo-add"), post(add_country))
         .route(&base.url("/geo-remove"), post(remove_country))
@@ -955,6 +990,38 @@ struct CategoryForm {
     policy: String,
 }
 
+#[derive(serde::Deserialize)]
+struct HumansOnlyForm {
+    enabled: String,
+}
+
+/// Turns the humans-only mode on or off.
+///
+/// Writes one setting and nothing else. The three category policies it
+/// forces are left exactly as the operator had them, so turning this off
+/// restores their choices rather than leaving three blocked categories
+/// behind and no record of what they were.
+async fn set_humans_only(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Form(form): Form<HumansOnlyForm>,
+) -> Response {
+    let on = form.enabled == "true";
+    match state.with_db(move |db| db.set_humans_only(on)).await {
+        Ok(()) => back_with(
+            &state.base,
+            "/",
+            if on {
+                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on Site settings to write it into the site configs."
+            } else {
+                "Humans only is off. The category policies you had before are back in force."
+            },
+            true,
+        ),
+        Err(err) => back_with(&state.base, "/", &err.to_string(), false),
+    }
+}
+
 async fn set_category(
     State(state): State<AppState>,
     _auth: Auth,
@@ -970,8 +1037,19 @@ async fn set_category(
         );
     };
 
+    // Refused here as well as hidden in the markup. The button is gone
+    // while the mode is on, but a form post is not a button — and a
+    // setting written here would be read back by nothing, leaving the
+    // operator with a screen that says Allowed and a config that blocks.
     match state
-        .with_db(move |db| db.set_category_default(category, policy))
+        .with_db(move |db| {
+            if db.get_humans_only()? {
+                anyhow::bail!(
+                    "Humans only is on, so every category is blocked. Turn it off to set categories individually."
+                );
+            }
+            db.set_category_default(category, policy)
+        })
         .await
     {
         Ok(()) => back_with(

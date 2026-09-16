@@ -45,6 +45,7 @@ pub enum ScanKind {
     /// The three behavioural detectors share a noun: each finds a client
     /// that doesn't act like a browser, by a different tell.
     NonBrowser,
+    RobotsTxt,
 }
 
 impl ScanKind {
@@ -57,6 +58,7 @@ impl ScanKind {
             ScanKind::ProbePath => "probing IP",
             ScanKind::Honeypot => "trapped IP",
             ScanKind::NonBrowser => "non-browser IP",
+            ScanKind::RobotsTxt => "robots.txt fetcher",
         }
     }
 }
@@ -146,6 +148,7 @@ pub fn run_detector(
         D::AssetRatio => block_asset_ratio(db, ttl_days, log_text, dry_run),
         D::RotatingUserAgent => block_rotating_ua(db, ttl_days, log_text, dry_run),
         D::RefererlessCrawl => block_refererless(db, ttl_days, log_text, dry_run),
+        D::RobotsTxt => block_robots_txt(db, ttl_days, log_text, dry_run),
     }
 }
 
@@ -314,6 +317,32 @@ pub fn block_spoofed_crawlers(
 /// business requesting `/.env` either — if one ever did, that request is
 /// exactly as unwelcome as anyone else's, and unlike the 404-counting
 /// detector there's no risk of mistaking ordinary link-chasing for it.
+/// Blocks every public address that fetched `/robots.txt`.
+///
+/// Reached only under "humans only" — `Detector::is_enabled` answers for
+/// this one from that switch — because outside it this rule blocks the
+/// crawlers that were trying to find out what they were allowed to do.
+/// See [`crate::accesslog::robots_txt_ips`].
+pub fn block_robots_txt(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let candidates = accesslog::robots_txt_ips(log_text);
+    let found = candidates.len();
+    add_block_rules(
+        db,
+        ScanKind::RobotsTxt,
+        found,
+        candidates,
+        0,
+        true,
+        ttl_days,
+        dry_run,
+    )
+}
+
 pub fn block_probe_paths(
     db: &Db,
     ttl_days: i64,

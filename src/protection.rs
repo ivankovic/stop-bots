@@ -169,6 +169,8 @@ pub enum Detector {
     AssetRatio,
     RotatingUserAgent,
     RefererlessCrawl,
+    /// Only ever on under "humans only" — see [`Detector::is_enabled`].
+    RobotsTxt,
 }
 
 /// The static facts about a detector: how it's stored, what it's called,
@@ -190,7 +192,7 @@ pub struct DetectorSpec {
 }
 
 impl Detector {
-    pub const ALL: [Detector; 8] = [
+    pub const ALL: [Detector; 9] = [
         Detector::SshScanners,
         Detector::WebScanners,
         Detector::SpoofedCrawlers,
@@ -199,6 +201,7 @@ impl Detector {
         Detector::AssetRatio,
         Detector::RotatingUserAgent,
         Detector::RefererlessCrawl,
+        Detector::RobotsTxt,
     ];
 
     pub fn spec(self) -> DetectorSpec {
@@ -235,6 +238,18 @@ impl Detector {
                 job_label: "Block probe paths",
                 enabled_default: PROBE_PATHS_ENABLED_DEFAULT,
                 ttl_days_default: PROBE_PATHS_TTL_DAYS_DEFAULT,
+                uses_ssh_log: false,
+            },
+            Detector::RobotsTxt => DetectorSpec {
+                id: "block_robots_txt",
+                label: "robots.txt fetchers",
+                job_label: "Block robots.txt fetchers",
+                // Never read: `is_enabled` answers for this one from the
+                // humans-only switch instead. Stated as `false` anyway, so
+                // that a future reader of the spec alone is not told the
+                // wrong thing.
+                enabled_default: false,
+                ttl_days_default: 1,
                 uses_ssh_log: false,
             },
             Detector::Honeypot => DetectorSpec {
@@ -293,8 +308,26 @@ impl Detector {
         format!("detect:{}:ttl_days", self.id())
     }
 
+    /// Whether this detector runs.
+    ///
+    /// [`Detector::RobotsTxt`] does not answer from its own setting: it is
+    /// owned by the humans-only switch, on when that is on and off when it
+    /// is not. A stored toggle would be a second place to say the same
+    /// thing, and the two would disagree — which on this detector means
+    /// either a day-long block per crawler on a host that never asked for
+    /// one, or the mode's sharpest rule quietly not running.
     pub fn is_enabled(self, db: &Db) -> Result<bool> {
+        if self == Detector::RobotsTxt {
+            return db.get_humans_only();
+        }
         db.get_bool_setting(&self.enabled_key(), self.spec().enabled_default)
+    }
+
+    /// Whether the operator can change [`Self::is_enabled`], or whether
+    /// something else owns it. The UIs grey out a row that answers `false`
+    /// rather than offering a toggle that writes a setting nothing reads.
+    pub fn is_operator_controlled(self) -> bool {
+        self != Detector::RobotsTxt
     }
 
     pub fn ttl_days(self, db: &Db) -> Result<i64> {

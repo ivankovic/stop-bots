@@ -125,6 +125,11 @@ const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 /// The rows of the editable "Policy" list, in display order.
 const CATEGORIES: [Category; 3] = [Category::Scanner, Category::Search, Category::Ai];
 
+/// Rows in the Policy list: the humans-only switch, then the three
+/// categories it forces. The switch leads because it decides whether the
+/// three below it can be touched at all.
+const POLICY_ROWS: usize = CATEGORIES.len() + 1;
+
 /// Which of the Dashboard's three lists arrow keys currently move through.
 /// Ordered as focus flows: `Down` past the last row of one moves into the
 /// next, `Up` above the first row moves back — no dedicated focus key.
@@ -271,6 +276,9 @@ pub struct Dashboard {
     /// `ProtectionRow::AutoApplyFirewall` row, the same way every other
     /// value this panel shows is loaded in `refresh`.
     auto_apply_firewall: bool,
+    /// Whether this host serves humans only. Drives both the extra
+    /// detector row and the greying of the three category rows.
+    humans_only: bool,
     focus: Focus,
     /// The internal cron's per-job state (see `crate::cron`), read-only
     /// here — this panel only displays it, `App` is what actually runs due
@@ -306,6 +314,7 @@ impl Dashboard {
         self.site_count = sites.len();
         self.sites = sites.into_iter().map(|s| s.server_name).collect();
         self.sources = db.list_sources()?;
+        self.humans_only = db.get_humans_only()?;
         self.scanner_default = db.get_category_default(Category::Scanner)?;
         self.search_default = db.get_category_default(Category::Search)?;
         self.ai_default = db.get_category_default(Category::Ai)?;
@@ -463,7 +472,7 @@ impl Dashboard {
                 .areas(columns_area);
 
         let [settings_area, geo_area, firewall_area] = Layout::vertical([
-            Constraint::Length(CATEGORIES.len() as u16 + 2),
+            Constraint::Length(POLICY_ROWS as u16 + 2),
             Constraint::Min(4),
             Constraint::Length(4),
         ])
@@ -489,9 +498,12 @@ impl Dashboard {
     }
 
     fn render_categories(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
-        let items: Vec<ListItem> = CATEGORIES
-            .iter()
-            .map(|&category| ListItem::new(self.row_line(category)))
+        let items: Vec<ListItem> = std::iter::once(ListItem::new(self.humans_only_line()))
+            .chain(
+                CATEGORIES
+                    .iter()
+                    .map(|&category| ListItem::new(self.row_line(category))),
+            )
             .collect();
         let focused = self.focus == Focus::Categories;
         let list = crate::tui::select_in(
@@ -705,9 +717,28 @@ impl Dashboard {
         );
     }
 
+    /// The switch's own row. Says what it does rather than just naming
+    /// itself, because "Humans only" alone does not tell an operator that
+    /// it is about to block every crawler they have.
+    fn humans_only_line(&self) -> Line<'static> {
+        let mut line = vec![Span::from(format!("{:<14}", "Humans only"))];
+        line.push(if self.humans_only {
+            Span::from("[ ON ]").red().bold()
+        } else {
+            Span::from("[ off ]").dim()
+        });
+        Line::from(line)
+    }
+
     fn row_line(&self, category: Category) -> Line<'static> {
         let mut line = vec![Span::from(format!("{:<14}", category_label(category)))];
         line.push(policy_tag(self.category_default(category)));
+        // Dimmed and labelled rather than hidden: the policy in force is
+        // still the useful thing to read, and the operator needs to know
+        // why it cannot be changed here.
+        if self.humans_only {
+            line.push(Span::from("  forced").dim());
+        }
         Line::from(line)
     }
 
@@ -737,6 +768,13 @@ impl Dashboard {
     fn protection_rows(&self) -> Vec<ProtectionRow> {
         Detector::ALL
             .into_iter()
+            // The robots.txt rule belongs to the humans-only switch, not to
+            // this panel: outside that mode it can never fire, and a row
+            // that is permanently off with a toggle that does nothing is
+            // the "enabled detector that can never fire" the Honeypot
+            // default already argues against. It also keeps the panel the
+            // height it was for every host that does not use the mode.
+            .filter(|detector| *detector != Detector::RobotsTxt || self.humans_only)
             .map(ProtectionRow::Detect)
             .chain((0..self.reputation.len()).map(ProtectionRow::Feed))
             .chain(std::iter::once(ProtectionRow::AutoApplyFirewall))
@@ -1094,14 +1132,16 @@ impl Dashboard {
                 KeyCode::Esc => return Ok(KeyOutcome::Ignored),
                 KeyCode::Up | KeyCode::Char('k') => self.list_state.select_previous(),
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.list_state.selected() == Some(CATEGORIES.len() - 1) {
+                    if self.list_state.selected() == Some(POLICY_ROWS - 1) {
                         self.focus = Focus::Countries;
                         self.countries_state.select(Some(0));
                     } else {
                         self.list_state.select_next();
                     }
                 }
-                KeyCode::Enter | KeyCode::Char(' ') => self.open_category_popup(),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    return self.activate_policy_row(db, message)
+                }
                 _ => return Ok(KeyOutcome::Ignored),
             },
             Focus::Countries => match key.code {
@@ -1109,7 +1149,7 @@ impl Dashboard {
                 KeyCode::Up | KeyCode::Char('k') => {
                     if self.countries_state.selected() == Some(0) {
                         self.focus = Focus::Categories;
-                        self.list_state.select(Some(CATEGORIES.len() - 1));
+                        self.list_state.select(Some(POLICY_ROWS - 1));
                     } else {
                         self.countries_state.select_previous();
                     }
@@ -1663,11 +1703,42 @@ impl Dashboard {
         }
     }
 
-    fn open_category_popup(&mut self) {
+    /// Enter on a Policy row: row 0 toggles humans-only, the rest open a
+    /// category popup — unless humans-only is on, in which case there is
+    /// nothing to open.
+    fn activate_policy_row(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
+        if self.list_state.selected() == Some(0) {
+            let on = !self.humans_only;
+            db.set_humans_only(on)?;
+            *message = Some(if on {
+                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on Site settings to enforce it.".to_string()
+            } else {
+                "Humans only is off. The category policies you had before are back in force."
+                    .to_string()
+            });
+            return Ok(KeyOutcome::Mutated);
+        }
+        self.open_category_popup(message);
+        Ok(KeyOutcome::Consumed)
+    }
+
+    fn open_category_popup(&mut self, message: &mut Option<String>) {
+        // Refused rather than offered-and-ignored. Humans-only forces all
+        // three, so a popup here would write a setting that
+        // `get_category_default` never returns — the screen would say
+        // Allowed and the config would block.
+        if self.humans_only {
+            *message = Some(
+                "Humans only is on, so every category is blocked. Turn it off to set categories individually."
+                    .to_string(),
+            );
+            return;
+        }
         let Some(selected) = self.list_state.selected() else {
             return;
         };
-        let Some(&category) = CATEGORIES.get(selected) else {
+        // Row 0 is the switch, so the categories start one later.
+        let Some(&category) = CATEGORIES.get(selected.wrapping_sub(1)) else {
             return;
         };
         let selected_option = match self.category_default(category) {
@@ -2237,6 +2308,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
+        select_first_category(&mut dashboard);
         // Row 0 is Scanners, default Blocked.
 
         let mut message = None;
@@ -2253,11 +2325,19 @@ mod tests {
         }
     }
 
+    /// Selects the first *category* row. Row 0 is the humans-only switch
+    /// now, so a test about categories has to say which row it means
+    /// rather than relying on where the cursor happens to start.
+    fn select_first_category(dashboard: &mut Dashboard) {
+        dashboard.list_state.select(Some(1));
+    }
+
     #[test]
     fn confirming_popup_writes_through_and_closes() {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
+        select_first_category(&mut dashboard);
 
         let mut message = None;
         dashboard
@@ -2285,6 +2365,7 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
+        select_first_category(&mut dashboard);
 
         let mut message = None;
         dashboard
@@ -2325,7 +2406,7 @@ mod tests {
         dashboard.refresh(&db).unwrap();
 
         let mut message = None;
-        for _ in 0..CATEGORIES.len() - 1 {
+        for _ in 0..POLICY_ROWS - 1 {
             dashboard
                 .handle_key(KeyEvent::from(KeyCode::Down), &db, &mut message)
                 .unwrap();
@@ -2353,7 +2434,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(dashboard.focus, Focus::Categories);
-        assert_eq!(dashboard.list_state.selected(), Some(CATEGORIES.len() - 1));
+        assert_eq!(dashboard.list_state.selected(), Some(POLICY_ROWS - 1));
     }
 
     #[test]
@@ -3407,14 +3488,41 @@ mod tests {
         dashboard.refresh(&db).unwrap();
 
         let rows = dashboard.protection_rows();
+        // Every detector but the robots.txt one, which only appears under
+        // humans-only...
+        let detectors = Detector::ALL.len() - 1;
         assert_eq!(
             rows.len(),
             // ...plus the one `AutoApplyFirewall` row, which sits after
             // the feeds and is not one.
-            Detector::ALL.len() + ReputationSourceKind::ALL.len() + 1
+            detectors + ReputationSourceKind::ALL.len() + 1
         );
-        assert!(rows[..Detector::ALL.len()].iter().all(|r| r.is_detector()));
-        assert!(rows[Detector::ALL.len()..].iter().all(|r| !r.is_detector()));
+        assert!(rows[..detectors].iter().all(|r| r.is_detector()));
+        assert!(rows[detectors..].iter().all(|r| !r.is_detector()));
+    }
+
+    /// The mode brings its own rule with it, and takes it away again.
+    #[test]
+    fn the_robots_txt_row_appears_only_under_humans_only() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        assert!(
+            !dashboard
+                .protection_rows()
+                .contains(&ProtectionRow::Detect(Detector::RobotsTxt)),
+            "the row is there with the mode off"
+        );
+
+        db.set_humans_only(true).unwrap();
+        dashboard.refresh(&db).unwrap();
+
+        assert!(
+            dashboard
+                .protection_rows()
+                .contains(&ProtectionRow::Detect(Detector::RobotsTxt)),
+            "the row is missing with the mode on"
+        );
     }
 
     /// Enabling a never-fetched feed must ask `App` to download it —

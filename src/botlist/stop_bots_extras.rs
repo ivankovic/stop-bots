@@ -218,6 +218,30 @@ const EXTRAS: &[(&str, &str, Kind)] = &[
 ];
 
 /// The built-in list as `NewBot` rows.
+/// The user-agent patterns that survive "humans only".
+///
+/// Humans-only blocks every catalogued bot outright rather than leaning on
+/// the three category defaults, because on a real host 642 of 1,606
+/// merged bots carry **no** category flag at all — `ahrefs-site-audit`,
+/// `adscanner-crawler`, `amazon-adbot` among them. Forcing the three
+/// categories to Blocked leaves every one of those allowed, which is the
+/// opposite of what the switch says it does. So the rule is inverted:
+/// everything is blocked, and this is the list that is not.
+///
+/// One entry, and it is here for a reason no category expresses. ACME
+/// HTTP-01 validation is how this host renews its certificate; blocking it
+/// surfaces two months later as an expired certificate, long after anyone
+/// connects the two. It is infrastructure the site depends on, not a
+/// crawler the site tolerates.
+///
+/// **Matching is by user agent, so it is spoofable**, and deliberately so:
+/// the alternative is blocking renewal. Nothing is granted by being let
+/// through here — a client claiming this name still has to answer a
+/// challenge only the real ACME server can set, so the worst a forgery
+/// buys is the right to fetch pages while telling the truth about being a
+/// bot.
+pub const HUMANS_ONLY_ALLOWED: &[&str] = &["Let's Encrypt"];
+
 pub fn bots() -> Vec<NewBot> {
     EXTRAS
         .iter()
@@ -306,6 +330,34 @@ mod tests {
 
     /// The test that earns the right to ship a blocklist to other people's
     /// servers: no entry, of any kind, may match a real visitor.
+    /// The exemption has to match the entry this list actually ships, not
+    /// a remembered spelling of it. A rename here with no matching change
+    /// there silently blocks certificate renewal.
+    #[test]
+    fn every_humans_only_exemption_matches_a_bot_in_this_list() {
+        for allowed in HUMANS_ONLY_ALLOWED {
+            assert!(
+                bots()
+                    .iter()
+                    .any(|bot| bot.user_agent_pattern.contains(allowed)),
+                "nothing in this list carries the pattern {allowed:?}"
+            );
+        }
+    }
+
+    /// And it must not be so broad that it exempts anything else here.
+    #[test]
+    fn no_humans_only_exemption_matches_another_entry() {
+        for allowed in HUMANS_ONLY_ALLOWED {
+            let matched: Vec<&str> = bots()
+                .iter()
+                .filter(|bot| bot.user_agent_pattern.contains(allowed))
+                .map(|bot| bot.name.clone().leak() as &str)
+                .collect();
+            assert_eq!(matched.len(), 1, "{allowed:?} also exempts {matched:?}");
+        }
+    }
+
     #[test]
     fn no_pattern_matches_an_ordinary_browser() {
         for (subject, why) in NO_ENTRY_MAY_MATCH {

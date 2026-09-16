@@ -655,6 +655,21 @@ enum Command {
         #[arg(long, action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Serve humans and nothing else: block every catalogued bot whatever
+    /// its category, and give any address that fetches /robots.txt a
+    /// one-day block
+    ///
+    /// The three category policies are forced to Blocked while this is on
+    /// and cannot be edited, but their stored values are untouched — turn
+    /// this off and they come back. Let's Encrypt is the one bot still
+    /// allowed, because blocking it breaks certificate renewal in a way
+    /// that only surfaces two months later.
+    SetHumansOnly {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        #[arg(long, action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
     /// Prints the robots.txt that would currently be generated, without
     /// writing anything
     ShowRobotsTxt {
@@ -1268,6 +1283,7 @@ async fn main() -> Result<()> {
         Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
         Some(Command::SetAutoApply { db, enabled }) => set_auto_apply(db, enabled),
         Some(Command::SetAutoApplyFirewall { db, enabled }) => set_auto_apply_firewall(db, enabled),
+        Some(Command::SetHumansOnly { db, enabled }) => set_humans_only(db, enabled),
         Some(Command::ShowRobotsTxt { db }) => show_robots_txt(db),
     }
 }
@@ -1919,6 +1935,38 @@ fn set_auto_apply(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
              `stop-bots web` or the TUI, so one of those has to be running. The firewall \
              script is not covered: apply it yourself, or with `stop-bots batch --apply`."
         );
+    }
+    Ok(())
+}
+
+fn set_humans_only(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_humans_only(enabled)?;
+    if enabled {
+        println!("Humans only is ON.");
+        println!(
+            "  \u{2022} Every catalogued bot is blocked, whatever its category. On a host with \
+             the usual lists that is over 1,600 patterns, including the several hundred that \
+             carry no category at all."
+        );
+        println!(
+            "  \u{2022} Let's Encrypt is the one exception, because blocking it breaks \
+             certificate renewal \u{2014} which surfaces as an expired certificate two months \
+             later, not as an error now."
+        );
+        println!(
+            "  \u{2022} Any address that fetches /robots.txt is blocked for a day. Note that \
+             this catches the crawlers polite enough to ask."
+        );
+        println!(
+            "  \u{2022} The three category policies are forced and cannot be edited until this \
+             is off. Their stored values are kept."
+        );
+        println!(
+            "\nRun apply-blocks (or Site settings' `a`/`A`) to write it into the NGINX config."
+        );
+    } else {
+        println!("Humans only is OFF. The stored category policies are back in force.");
     }
     Ok(())
 }

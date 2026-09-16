@@ -507,6 +507,36 @@ pub fn refererless_crawl_ips(log_text: &str, min_paths: usize) -> Vec<String> {
 /// health check or monitoring probe isn't a real visitor). Lines with no
 /// user agent at all, or the conventional `-` NGINX logs for a missing
 /// `User-Agent` header, are excluded — neither identifies an actual client.
+/// Every public address that fetched `/robots.txt`.
+///
+/// Only meaningful under "humans only", which is the one mode where this
+/// is a signal rather than a fact. A browser never requests this file; a
+/// crawler always does, first, and a well-behaved one does it precisely
+/// *because* it intends to obey what it finds. Blocking on it is
+/// therefore the least forgiving rule this project has — it catches the
+/// polite bots and misses the rude ones, which is defensible only when
+/// the host's answer to every bot is no.
+///
+/// Matched anywhere in the path, for the reason `probe_path_ips` is:
+/// `/blog/robots.txt` is fetched by the same clients and by nobody else.
+/// The query string is already stripped by `parse_line`, so a request for
+/// `/?x=/robots.txt` cannot reach this.
+pub fn robots_txt_ips(log_text: &str) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for line in log_text.lines() {
+        let Some(entry) = parse_line(line) else {
+            continue;
+        };
+        if is_local_or_private(&entry.ip) {
+            continue;
+        }
+        if entry.path.to_lowercase().contains("/robots.txt") {
+            seen.insert(entry.ip.to_string());
+        }
+    }
+    seen.into_iter().collect()
+}
+
 /// How many parsed lines carried a **public** client address, and how many
 /// lines parsed at all.
 ///
@@ -861,6 +891,46 @@ mod tests {
 
     fn default_probes() -> Vec<String> {
         DEFAULT_PROBE_PATHS.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn robots_txt_ips_finds_the_fetchers_and_nobody_else() {
+        let log = format!(
+            "{}{}{}",
+            line_with("203.0.113.5", 200, "Mozilla/5.0"),
+            probe_line("198.51.100.7", "/robots.txt", 200),
+            probe_line("198.51.100.8", "/blog/robots.txt", 200),
+        );
+
+        let found = robots_txt_ips(&log);
+
+        assert_eq!(found, vec!["198.51.100.7", "198.51.100.8"]);
+    }
+
+    /// The operator's own monitoring hits the site from the host, and a
+    /// day-long block on the loopback address would be a self-inflicted
+    /// outage.
+    #[test]
+    fn robots_txt_ips_skips_local_and_private_sources() {
+        let log = format!(
+            "{}{}",
+            probe_line("127.0.0.1", "/robots.txt", 200),
+            probe_line("10.0.0.5", "/robots.txt", 200),
+        );
+
+        assert!(robots_txt_ips(&log).is_empty());
+    }
+
+    /// One address that asked twice is one address.
+    #[test]
+    fn robots_txt_ips_reports_each_address_once() {
+        let log = format!(
+            "{}{}",
+            probe_line("198.51.100.7", "/robots.txt", 200),
+            probe_line("198.51.100.7", "/robots.txt", 200),
+        );
+
+        assert_eq!(robots_txt_ips(&log).len(), 1);
     }
 
     #[test]

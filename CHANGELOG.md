@@ -9,6 +9,27 @@ need.
 
 ### Added
 
+- **A "Humans only" switch**, off by default. With it on, every
+  catalogued bot is blocked whatever its category, the three category
+  policies are forced to Blocked and cannot be edited, and any address
+  that fetches `/robots.txt` is blocked for a day. Let's Encrypt is the
+  single exception, because blocking it breaks certificate renewal in a
+  way that only surfaces two months later as an expired certificate.
+
+  It does not work by setting the three category defaults, and it cannot:
+  measured on a real 793-bot list with all three categories already set
+  to Blocked, that blocks **140 of 793**. The rest are catalogued bots
+  carrying no category at all — `ahrefs-site-audit`, `adscanner-crawler`,
+  `amazon-adbot`. With the switch on, all 793 are blocked.
+
+  The stored category policies are left untouched, so turning the switch
+  off gives them back rather than leaving three blocked categories and no
+  record of what was chosen. The robots.txt rule is worth understanding
+  before turning it on: a browser never fetches that file, and a crawler
+  fetches it precisely because it intends to obey what it finds — so the
+  rule catches the polite bots and misses the rude ones, which only makes
+  sense when the answer to every bot is no anyway.
+
 - **stop-bots now notices when NGINX is in a container, and says what is
   wrong.** `set-nginx-commands` has been documented since it shipped,
   which never helped the operator who did not know they needed it: with

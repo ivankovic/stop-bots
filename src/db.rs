@@ -595,6 +595,9 @@ pub struct Db {
 /// an error rather than a hang.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `settings` key for [`Db::get_humans_only`].
+pub const HUMANS_ONLY_KEY: &str = "humans_only";
+
 impl Db {
     /// Opens (creating if necessary) the database at `path`, creating parent
     /// directories as needed, and ensures the schema is up to date.
@@ -1257,13 +1260,46 @@ impl Db {
 
     // ---- settings ----
 
+    /// The category's policy **in effect**, which is not always the one
+    /// stored: "humans only" forces all three to `Blocked`.
+    ///
+    /// Forced here rather than at each reader, because there are sixteen
+    /// readers — the NGINX render, the per-site detail, both dashboards,
+    /// `uadetail`'s verdicts and the `BLOCKLIST` tag on Dynamic Protection
+    /// — and a mode that only some of them honoured would show one answer
+    /// and enforce another. The stored value is left alone, so turning the
+    /// switch off restores whatever the operator had chosen; the UIs grey
+    /// the toggles out rather than writing over them.
     pub fn get_category_default(&self, category: Category) -> Result<Policy> {
+        if self.get_humans_only()? {
+            return Ok(Policy::Blocked);
+        }
+        self.get_stored_category_default(category)
+    }
+
+    /// The stored policy, ignoring any mode that overrides it. For the
+    /// UIs, which need to show what is configured, and for round-tripping
+    /// a setting the operator will get back when the mode goes off.
+    pub fn get_stored_category_default(&self, category: Category) -> Result<Policy> {
         let value: String = self.conn.query_row(
             "SELECT value FROM settings WHERE key = ?1",
             params![category.settings_key()],
             |row| row.get(0),
         )?;
         Policy::from_str(&value)
+    }
+
+    /// Whether this host serves humans and nothing else.
+    ///
+    /// Off by default, and deliberately a single switch rather than a
+    /// preset that writes three settings: a preset cannot be turned off
+    /// again, because nothing remembers what the settings were before.
+    pub fn get_humans_only(&self) -> Result<bool> {
+        self.get_bool_setting(HUMANS_ONLY_KEY, false)
+    }
+
+    pub fn set_humans_only(&self, on: bool) -> Result<()> {
+        self.set_bool_setting(HUMANS_ONLY_KEY, on)
     }
 
     pub fn set_category_default(&self, category: Category, policy: Policy) -> Result<()> {
@@ -2702,13 +2738,27 @@ impl Db {
         scanner: Policy,
         bot_overrides: &[SiteBotOverride],
     ) -> Result<Vec<String>> {
+        // Humans-only does not work through the three category policies,
+        // and cannot: on a real host 642 of 1,606 merged bots carry no
+        // category flag at all, so forcing the categories to Blocked
+        // leaves every one of those — `ahrefs-site-audit`,
+        // `adscanner-crawler`, `amazon-adbot` — allowed. The rule inverts
+        // instead: everything catalogued is blocked, and
+        // `HUMANS_ONLY_ALLOWED` is what is not.
+        //
+        // It also outranks a per-site override and a per-bot status, which
+        // is the whole point of a system-wide switch: a mode that any of
+        // 1,606 rows could quietly opt out of would not be one.
+        let humans_only = self.get_humans_only()?;
         let mut patterns = Vec::new();
         for bot in self.list_bots()? {
             let overridden = bot_overrides
                 .iter()
                 .find(|o| o.bot_id == bot.id)
                 .map(|o| o.policy);
-            let blocked = if let Some(policy) = overridden {
+            let blocked = if humans_only {
+                !humans_only_allows(&bot.user_agent_pattern)
+            } else if let Some(policy) = overridden {
                 policy == Policy::Blocked
             } else {
                 match bot.status {
@@ -2732,6 +2782,20 @@ impl Db {
         );
         Ok(patterns)
     }
+}
+
+/// Whether "humans only" still lets this pattern through — see
+/// [`crate::botlist::stop_bots_extras::HUMANS_ONLY_ALLOWED`] for why the
+/// list has exactly one entry and why matching by user agent is the right
+/// trade here.
+///
+/// Compared against the *merged* pattern, which is every contributing
+/// source's spelling joined with `|`, so a `contains` is what the shape
+/// calls for rather than an equality.
+fn humans_only_allows(pattern: &str) -> bool {
+    crate::botlist::stop_bots_extras::HUMANS_ONLY_ALLOWED
+        .iter()
+        .any(|allowed| pattern.contains(allowed))
 }
 
 /// Escapes every PCRE/NGINX regex metacharacter in `s` so it matches only
@@ -4283,6 +4347,150 @@ mod tests {
         let stats = db.list_user_agent_stats().unwrap();
         assert_eq!(stats[0].user_agent, "common-bot");
         assert_eq!(stats[1].user_agent, "rare-bot");
+    }
+
+    fn bot_with(slug: &str, pattern: &str, ai: bool, search: bool, scanner: bool) -> NewBot {
+        NewBot {
+            slug: slug.to_string(),
+            name: slug.to_string(),
+            is_ai: ai,
+            is_search_engine: search,
+            is_scanner: scanner,
+            user_agent_pattern: pattern.to_string(),
+            source_id: "test".to_string(),
+        }
+    }
+
+    fn db_with_a_mixed_bot_list() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.register_source(&Source {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            url: "https://example.invalid/l".to_string(),
+            last_fetched_at: None,
+            bot_count: 0,
+        })
+        .unwrap();
+        for bot in [
+            bot_with("gptbot", "GPTBot", true, false, false),
+            bot_with("googlebot", "Googlebot", false, true, false),
+            // The case the whole mode turns on: catalogued, obviously a
+            // crawler, and carrying no category at all. 642 of 1,606 bots
+            // on a real host look like this.
+            bot_with("ahrefs-site-audit", "AhrefsSiteAudit", false, false, false),
+            bot_with("lets-encrypt", "Let's Encrypt", false, false, false),
+        ] {
+            db.upsert_bot(&bot).unwrap();
+        }
+        db
+    }
+
+    /// The finding that decided the design: forcing the three categories
+    /// to Blocked leaves every uncategorised bot allowed, which is not
+    /// "humans only" by any reading.
+    #[test]
+    fn category_policies_alone_cannot_block_an_uncategorised_bot() {
+        let db = db_with_a_mixed_bot_list();
+        for category in [Category::Ai, Category::Search, Category::Scanner] {
+            db.set_category_default(category, Policy::Blocked).unwrap();
+        }
+
+        let patterns = db
+            .compute_blocked_patterns(Policy::Blocked, Policy::Blocked, Policy::Blocked, &[])
+            .unwrap();
+
+        assert!(
+            !patterns.iter().any(|p| p == "AhrefsSiteAudit"),
+            "an uncategorised bot was blocked by category policies alone: {patterns:?}"
+        );
+    }
+
+    /// And with the mode on, it is.
+    #[test]
+    fn humans_only_blocks_every_catalogued_bot_including_uncategorised_ones() {
+        let db = db_with_a_mixed_bot_list();
+        db.set_humans_only(true).unwrap();
+
+        let patterns = db
+            .compute_blocked_patterns(Policy::Allowed, Policy::Allowed, Policy::Allowed, &[])
+            .unwrap();
+
+        for expected in ["GPTBot", "Googlebot", "AhrefsSiteAudit"] {
+            assert!(
+                patterns.iter().any(|p| p == expected),
+                "{expected} was not blocked: {patterns:?}"
+            );
+        }
+    }
+
+    /// The one exception, and the reason it exists: blocking ACME
+    /// validation breaks renewal, and the breakage shows up as an expired
+    /// certificate two months later.
+    #[test]
+    fn humans_only_still_lets_lets_encrypt_through() {
+        let db = db_with_a_mixed_bot_list();
+        db.set_humans_only(true).unwrap();
+
+        let patterns = db
+            .compute_blocked_patterns(Policy::Blocked, Policy::Blocked, Policy::Blocked, &[])
+            .unwrap();
+
+        assert!(
+            !patterns.iter().any(|p| p.contains("Let's Encrypt")),
+            "certificate renewal was blocked: {patterns:?}"
+        );
+    }
+
+    /// A system-wide switch that any of 1,606 per-bot rows could opt out
+    /// of would not be one.
+    #[test]
+    fn humans_only_outranks_a_per_bot_allow() {
+        let db = db_with_a_mixed_bot_list();
+        db.set_bot_status("googlebot", BotStatus::Allowed).unwrap();
+        db.set_humans_only(true).unwrap();
+
+        let patterns = db
+            .compute_blocked_patterns(Policy::Allowed, Policy::Allowed, Policy::Allowed, &[])
+            .unwrap();
+
+        assert!(patterns.iter().any(|p| p == "Googlebot"), "{patterns:?}");
+    }
+
+    /// Reading a category back reports what is *in force*, so the screens
+    /// and the rendered config cannot disagree...
+    #[test]
+    fn humans_only_forces_every_category_to_blocked() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_category_default(Category::Search, Policy::Allowed)
+            .unwrap();
+        db.set_humans_only(true).unwrap();
+
+        for category in [Category::Ai, Category::Search, Category::Scanner] {
+            assert_eq!(db.get_category_default(category).unwrap(), Policy::Blocked);
+        }
+    }
+
+    /// ...while the stored value is left alone, so turning the mode off
+    /// gives the operator their own settings back rather than three
+    /// blocked categories and no record of what they chose.
+    #[test]
+    fn turning_humans_only_off_restores_the_stored_policies() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_category_default(Category::Search, Policy::Allowed)
+            .unwrap();
+
+        db.set_humans_only(true).unwrap();
+        assert_eq!(
+            db.get_stored_category_default(Category::Search).unwrap(),
+            Policy::Allowed,
+            "the stored value was overwritten"
+        );
+
+        db.set_humans_only(false).unwrap();
+        assert_eq!(
+            db.get_category_default(Category::Search).unwrap(),
+            Policy::Allowed
+        );
     }
 
     #[test]

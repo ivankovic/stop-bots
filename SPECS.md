@@ -4373,6 +4373,82 @@ hand-rolled `percent_encode` covers it, and matters more here than for an
 address: a user agent routinely carries `+`, `;` and `/`, and the client
 picks the string.
 
+## "Humans only" (`Db::get_humans_only`, `Detector::RobotsTxt`)
+
+One switch, off by default, that turns this host's answer to every bot into
+no. Two things make it more than a preset.
+
+### Forcing the three categories is not enough, and the numbers say so
+
+The obvious implementation is "set all three category defaults to Blocked".
+Measured against a real 793-bot list with all three categories already set to
+Blocked, that blocks **140 of 793**. The other 653 are catalogued bots carrying
+no category flag at all — `ahrefs-site-audit`, `adscanner-crawler`,
+`amazon-adbot` — and no category policy can ever reach them. On the production
+host it is 642 of 1,606.
+
+So humans-only does not work through the policies. `compute_blocked_patterns`
+inverts instead: every catalogued bot is blocked, and `HUMANS_ONLY_ALLOWED` is
+the list that is not. With the mode on, the same 793-bot list yields 793
+patterns.
+
+It also outranks a per-site override and a per-bot `Allowed` status, which is
+what makes it a system-wide switch rather than a default: a mode any of 1,606
+rows could quietly opt out of would not be one.
+
+### One exemption, and it is spoofable on purpose
+
+`HUMANS_ONLY_ALLOWED` holds exactly one entry, Let's Encrypt, and it is there
+for a reason no category expresses. ACME HTTP-01 validation is how the host
+renews its certificate; blocking it surfaces two months later as an expired
+certificate, long after anyone would connect the two.
+
+Matching is by user agent, so it can be forged. That is the accepted trade —
+the alternative is blocking renewal — and the exposure is small: being let
+through grants nothing except the right to fetch pages, and a forger still
+cannot answer a challenge only the real ACME server can set.
+
+### The categories are forced, not overwritten
+
+`get_category_default` returns `Blocked` while the mode is on;
+`get_stored_category_default` returns what the operator actually chose. The
+forcing lives in the getter because there are sixteen readers — the NGINX
+render, per-site detail, both dashboards, `uadetail`'s verdicts, the
+`BLOCKLIST` tag on Dynamic Protection — and a mode only some of them honoured
+would show one answer and enforce another.
+
+Nothing writes over the stored values, so turning the mode off gives the
+operator their settings back instead of three blocked categories and no record
+of what they were. Both front-ends refuse the edit rather than offering it:
+the web panel replaces the button with "forced by Humans only" *and* the POST
+handler rejects it, because a form post is not a button.
+
+### robots.txt as a trap, and what that costs
+
+With the mode on, any public address fetching `/robots.txt` is blocked for a
+day. `Detector::RobotsTxt` answers `is_enabled` from the humans-only switch
+rather than from a setting of its own — two places to say the same thing would
+eventually disagree, and on this detector disagreement means either day-long
+blocks on a host that never asked for them, or the mode's sharpest rule
+silently not running. For the same reason it appears as a Dashboard row only
+while the mode is on: a permanently-off row with a toggle that does nothing is
+the "enabled detector that can never fire" the Honeypot default already argues
+against.
+
+**This is the least forgiving rule in the project, and deliberately so.** A
+browser never fetches `/robots.txt`. A crawler always does, first — and a
+well-behaved one does it *because* it intends to obey what it finds. So the
+rule catches the polite bots and misses the rude ones, which is defensible
+only when the answer to every bot is no anyway. That is exactly the mode this
+lives in, and nowhere else.
+
+Two limits worth stating plainly. It is not instant: detectors run on the
+internal cron, so enforcement is minutes, and on a host without firewall
+auto-apply it is a database row and nothing in the kernel until the script is
+applied. And an operator who curls their own `/robots.txt` from a machine they
+care about gets blocked for a day like anyone else — the anti-lockout guard
+covers the SSH session it can see, not every address they might be using.
+
 ## Where NGINX runs (`src/health.rs`, `nginx-deployment` and `access-log-clients`)
 
 `set-nginx-commands` has existed for a while, and README has documented it for

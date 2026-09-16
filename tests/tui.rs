@@ -419,10 +419,14 @@ fn navigate_change_a_setting_and_quit() {
 
     let mut session = spawn_tui(&db_path);
 
-    // Dashboard is the default screen. Scanners starts out Blocked, and is
-    // the first row, already selected.
+    // Dashboard is the default screen. Scanners starts out Blocked. It is
+    // the *second* Policy row: the first is the humans-only switch, which
+    // decides whether the three category rows below it can be edited at
+    // all, so it leads the list.
     session.exp_string("Dashboard").unwrap();
     assert_eq!(expect_status_after(&mut session, "Scanners"), "BLOCKED");
+
+    send_key(&mut session, "\x1b[B");
 
     // Open the popup for the selected row (Scanners) right on the
     // Dashboard — category defaults are edited here now, not on Bot
@@ -1120,9 +1124,11 @@ fn dashboard_geo_blocking_add_and_remove_a_country() {
     session.exp_string("Geo").unwrap();
     session.exp_string("Add a country").unwrap();
 
-    // Down past the last category row (Scanners/Search Bots/AI Bots) flows
+    // Down past the last Policy row — the humans-only switch, then
+    // Scanners/Search Bots/AI Bots — flows
     // focus over into the Countries list, landing on its first row — the
     // fixed "Add a country" action.
+    send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B");
