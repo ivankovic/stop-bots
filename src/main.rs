@@ -2178,6 +2178,20 @@ async fn run_web(
 
     let db = open_db(db_path)?;
 
+    // The same registration the TUI does on startup, and for the same
+    // reason: `SourceKind::StopBotsExtras` is a list compiled into this
+    // binary, so it is *stored* here rather than waiting for a download.
+    //
+    // It was missing, and the consequence was invisible. A host that only
+    // ever runs `stop-bots web` — which is what `install web` sets up, and
+    // so what a production host is — never registered the built-in list at
+    // all: no source row, no entries, and none of its 49 patterns in the
+    // rendered config. The list was written by reading that host's own
+    // access log and it had never once been applied there. Nothing failed,
+    // because nothing was asked to; the source simply was not in the
+    // database for anything to report on.
+    stop_bots::botlist::register_all_sources(&db)?;
+
     // Resolve and *check* before anything is written. `--save` used to run
     // first, which meant `--bind 0.0.0.0:8787 --expose --save
     // --set-password` persisted an exposed bind and exited before the

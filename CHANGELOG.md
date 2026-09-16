@@ -37,6 +37,20 @@ need.
   logged request is from a private address; an empty log and a handful of
   local requests among public ones are both normal and stay quiet.
 
+### Fixed
+
+- **The built-in bot list never reached a console-only host.**
+  `register_all_sources` both registers the four sources and stores the
+  one compiled into the binary, and it was called from the TUI's startup
+  and nowhere else — so every host set up by `install web`, which is what
+  a production host is, had no `stop-bots-extras` source row, no entries,
+  and none of its 49 patterns in the rendered config. Nothing failed,
+  because nothing was asked to: the source was simply absent, on a host
+  whose own access log the list had been written from. Found on that host
+  with 0 rows, and now pinned by a container test that fails without the
+  call.
+
+
 ## [0.0.2] — 2026-09-15
 
 ### Added

@@ -1155,6 +1155,51 @@ fn replacing_the_binary_and_restarting_runs_the_new_one() {
     );
 }
 
+/// The built-in bot list has to reach a host that only ever runs the
+/// console — which is every host `install web` sets up.
+///
+/// It did not. `register_all_sources` both registers the four sources and
+/// *stores* the one compiled into the binary, and it was called from the
+/// TUI's startup and nowhere else. A production host running
+/// `stop-bots web` therefore had no `stop-bots-extras` source row, no
+/// entries, and none of its patterns in the rendered config — including
+/// Let's Encrypt, which the humans-only mode relies on being allowed.
+///
+/// Invisible from inside: nothing failed, because nothing was asked to.
+/// The source simply was not in the database for any screen to report on,
+/// and the list had been derived from the access log of the very host that
+/// was not using it. Only an end-to-end check catches a missing call.
+#[test]
+fn the_console_stores_the_built_in_bot_list_on_startup() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::installed("stop-bots-builtin-list");
+    host.wait_for_console();
+
+    let entries = host.sh(&format!(
+        "sqlite3 {HOST_DB} \"select count(*) from bot_source_entries where source_id = 'stop-bots-extras'\""
+    ));
+    let entries: i64 = entries.trim().parse().unwrap_or(0);
+    assert!(
+        entries > 0,
+        "the console started without storing the built-in list; \
+         bot_source_entries held {entries} row(s) for it"
+    );
+
+    // And the entry the humans-only allowlist is built around is one of
+    // them, by pattern rather than by slug: the slug is this project's own
+    // naming, the pattern is what actually has to match a request.
+    let le = host.sh(&format!(
+        "sqlite3 {HOST_DB} \"select count(*) from bots where user_agent_pattern like '%Let%Encrypt%'\""
+    ));
+    assert_eq!(
+        le.trim(),
+        "1",
+        "Let's Encrypt is not in the merged bot list: {le}"
+    );
+}
+
 /// **The deploy half of the same bug.** `make deploy` pipes
 /// `scripts/deploy-remote.sh` to the target over ssh; this runs that exact
 /// file against a real systemd, because it is the only part of a deploy
