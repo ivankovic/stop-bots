@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
             nginx_home: stop_bots::health::NginxHome::Host,
             managed_dir_in_container: None,
             container_shares_host_network: None,
+            firewall_covers_forward: Some(true),
         },
     )?;
 

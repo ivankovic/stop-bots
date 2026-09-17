@@ -3,17 +3,27 @@
 # with: nft -f <this file>
 #
 # Only touches our own "inet stop_bots" table (no `flush ruleset`) and
-# uses "policy accept" so this chain can't become an implicit
-# default-deny for all inbound traffic.
+# uses "policy accept" so these chains can't become an implicit
+# default-deny for traffic to the host or between containers.
+#
+# Two hooks: "input" for services on this host, "forward" for ones in
+# containers, whose traffic is DNAT'd past "input" entirely.
 
 add table inet stop_bots
 delete table inet stop_bots
 add table inet stop_bots
 add chain inet stop_bots bot_block { type filter hook input priority -1; policy accept; }
+add chain inet stop_bots bot_forward { type filter hook forward priority -1; policy accept; }
+add chain inet stop_bots bot_rules
 
 add rule inet stop_bots bot_block ct state established,related accept
 add rule inet stop_bots bot_block iif lo accept
+add rule inet stop_bots bot_block jump bot_rules
+add rule inet stop_bots bot_forward ct state established,related accept
+add rule inet stop_bots bot_forward ip saddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 } accept
+add rule inet stop_bots bot_forward ip6 saddr { ::1, fc00::/7 } accept
+add rule inet stop_bots bot_forward jump bot_rules
 
-add rule inet stop_bots bot_block ip saddr 203.0.113.0/24 accept
-add rule inet stop_bots bot_block ip saddr 0.0.0.0/0 drop
-add rule inet stop_bots bot_block ip6 saddr ::/0 drop
+add rule inet stop_bots bot_rules ip saddr 203.0.113.0/24 accept
+add rule inet stop_bots bot_rules ip saddr 0.0.0.0/0 drop
+add rule inet stop_bots bot_rules ip6 saddr ::/0 drop

@@ -130,16 +130,19 @@ are realistic hand-written examples, but copying their structure verbatim as
   add an `INPUT -j STOP-BOTS` jump *only if not already present* (via
   `iptables -C`), then `-A` one line per rule. Safe to run alongside whatever
   else is already configured, and safe to re-run (no duplicate jump rules,
-  no duplicate `-A` lines since the chain is flushed first).
+  no duplicate `-A` lines since the chain is flushed first). The same
+  guarded jump is added from `FORWARD`, and from `DOCKER-USER` where that
+  chain exists — see **Two hooks** below for why `INPUT` alone is not
+  enough. Those chains gain a jump and nothing else: a rule of our own in a
+  chain we do not own would outlive our chain and survive re-running.
 - `tests/fixtures/nftables/basic_rules.nft` opens with `flush ruleset`, which
   wipes *every* nftables table on the system, and its chain has
   `policy drop` on a `hook input priority -1` chain — meaning *any* inbound
   packet not explicitly accepted by that chain gets dropped, making it the
   de facto gatekeeper for all traffic to the host regardless of any other
   rules. `nftables::render` never flushes the whole ruleset (only
-  `flush chain inet stop_bots bot_block`, scoped to our own chain) and uses
-  `policy accept`, so the chain only ever blocks the specific addresses it's
-  told to. Idempotency for `nftables::render` works by resetting only our own
+  its own table, scoped to `inet stop_bots`) and uses `policy accept`, so the
+  chains only ever block the specific addresses they're told to. Idempotency for `nftables::render` works by resetting only our own
   table each run (`add table` (no-op if it exists) → `delete table` (now
   guaranteed to exist) → `add table` again, leaving a fresh empty table),
   rather than `flush chain`: re-declaring an already-existing hooked base
@@ -152,6 +155,50 @@ abort the script partway through, leaving some rules applied and others not.
 place pointing at `nftables::render` (which handles both families in one
 table via `ip`/`ip6 saddr`) instead of silently emitting a rule that breaks
 on a real box.
+
+### Two hooks, because `input` alone misses every container
+
+A packet for a service on the host is delivered locally and traverses the
+`input` hook. A packet for a **published container port** does not: the DNAT
+in `nat/prerouting` rewrites its destination, routing then sees an address
+that is not local, and it leaves through `forward`. An `input`-only ruleset
+never sees it, so every Block rule is inert for anything containerised —
+silently, and completely.
+
+That is not a hypothetical. NGINX in Docker with `ports: 80:80` is a common
+way to run the very thing this project protects, and there it makes
+`block_web_scanners` — whose entire output is firewall rules — do nothing at
+all.
+
+`nftables::render` therefore emits **two base chains**, `bot_block` on
+`input` and `bot_forward` on `forward`, both at `priority -1` (ahead of
+Docker's own rules at the default `filter` priority) and both
+`policy accept`. The rules themselves live in a third, unhooked chain,
+`bot_rules`, that both base chains `jump` to — one copy of the rules reached
+from two hooks, rather than two loops that can drift apart.
+
+`bot_forward` accepts every packet from a **private source address**
+(loopback, RFC1918, link-local, IPv6 unique-local) before reaching the
+rules. This is load-bearing, not tidiness. The forward hook carries traffic
+this project has no opinion about — a container reaching the internet, one
+container reaching another — and geo **allowlist** mode renders a trailing
+`0.0.0.0/0 drop`. Reaching that from `forward` would cut every container on
+the host off from the network the moment the script was applied. Inbound
+traffic is unaffected: a packet DNAT'd to a published port still carries the
+remote client's address as its source. `bot_block` deliberately does *not*
+get this guard — its semantics predate `bot_forward`, `iif lo accept`
+already covers the host itself, and an operator who chose allowlist mode may
+well mean it for traffic addressed to the host.
+
+The `firewall-reaches-containers` health check is the other half of this.
+A ruleset rendered before `bot_forward` existed loads cleanly and counts
+exactly the right number of rules, so `firewall-enforced` reports Ok while
+nothing is enforced for the container. The check reads `hook forward` out of
+the live dump (or the `FORWARD`/`DOCKER-USER` jump, on iptables) and is
+Critical when it is missing and NGINX is containerised. It is silent on a
+host NGINX, where the forward hook carries nothing this project has an
+opinion about, and silent when no rules are loaded at all, which is
+`firewall-enforced`'s Critical already.
 
 `FirewallRule` has no protocol field — ports are rendered as TCP
 (`-p tcp --dport <port>` / `tcp dport <port>`) even though the fixtures show

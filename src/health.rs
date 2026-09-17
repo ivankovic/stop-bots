@@ -180,6 +180,14 @@ pub struct Probe {
     /// which case `127.0.0.1` means the same thing on both sides and the
     /// generated `proxy_pass` needs no special address.
     pub container_shares_host_network: Option<bool>,
+    /// Whether the *loaded* ruleset polices forwarded traffic as well as
+    /// traffic addressed to the host. `None` when it could not be read.
+    ///
+    /// Not the same question as [`Self::live_rules`]. A ruleset rendered
+    /// before this project covered the forward path loads cleanly and
+    /// counts the right number of rules, while enforcing none of them for
+    /// anything behind a published container port.
+    pub firewall_covers_forward: Option<bool>,
     /// `(public, parsed)` client addresses in the access log — see
     /// [`crate::accesslog::client_address_mix`]. `None` when the log could
     /// not be read, which [`log_sources`] already reports.
@@ -244,8 +252,9 @@ const LARGE_DB_BYTES: u64 = 128 * 1024 * 1024;
 /// able to show. An error here would mean no report at all, which is the
 /// least useful outcome available.
 pub fn probe(backend: FirewallBackend, db_path: &Path, ssh_log: Option<&Path>) -> Probe {
-    let (live_rules, live_backend) = match live_rule_count(backend) {
-        Some(count) => (Some(count), Some(backend.stored().to_string())),
+    let live = live_firewall(backend);
+    let (live_rules, live_backend) = match &live {
+        Some(state) => (Some(state.rules), Some(backend.stored().to_string())),
         None => (None, None),
     };
     // Read once and answer both questions from it: two reads would be two
@@ -296,6 +305,7 @@ pub fn probe(backend: FirewallBackend, db_path: &Path, ssh_log: Option<&Path>) -
                 ],
             )
         }),
+        firewall_covers_forward: live.as_ref().map(|state| state.covers_forward),
         container_shares_host_network: container.as_ref().map(|name| {
             run_allowing_failure(
                 "docker",
@@ -353,19 +363,35 @@ fn nginx_container() -> Option<String> {
     })
 }
 
-/// How many rules this project has loaded right now, or `None` if the
-/// question could not be asked.
+/// What this project has loaded in the kernel right now, from one look.
+///
+/// Both fields come from the same read, deliberately. They used to be two
+/// functions issuing the same two `nft` calls each, which is two moments
+/// as well as twice the work — and a report that says "10 rules loaded"
+/// about one moment and "the forward path is covered" about another is
+/// describing a ruleset that may never have existed.
 ///
 /// Counts only our own table or chain. The host's other firewall rules are
 /// none of this tool's business, and a count of the whole ruleset would
 /// answer a different question.
-fn live_rule_count(backend: FirewallBackend) -> Option<usize> {
+struct LiveFirewall {
+    rules: usize,
+    /// Whether the loaded ruleset polices forwarded traffic as well as
+    /// traffic addressed to the host. The rule *count* cannot answer this:
+    /// a ruleset generated before this project covered the forward hook
+    /// loads cleanly and counts exactly right while enforcing nothing for
+    /// a containerised service. See the module docs in [`crate::nftables`].
+    covers_forward: bool,
+}
+
+/// Reads it, or `None` when the tool could not be run at all.
+fn live_firewall(backend: FirewallBackend) -> Option<LiveFirewall> {
     // The distinction that matters, and the one a bare exit status
     // destroys: "the tool would not run" is unknown, while "the tool ran
     // and our table is not there" is *zero rules loaded* — which is the
     // critical case this whole module exists to catch. Both make
     // `nft list table` exit non-zero.
-    let output = match backend {
+    match backend {
         FirewallBackend::Nftables => {
             // Cheap — just the table names. Succeeding proves `nft` is
             // usable and we may read the ruleset; our table's absence from
@@ -375,24 +401,45 @@ fn live_rule_count(backend: FirewallBackend) -> Option<usize> {
                 .lines()
                 .any(|line| line.trim() == "table inet stop_bots")
             {
-                return Some(0);
+                return Some(LiveFirewall {
+                    rules: 0,
+                    covers_forward: false,
+                });
             }
-            run("nft", &["list", "table", "inet", "stop_bots"])?
+            let dump = run("nft", &["list", "table", "inet", "stop_bots"])?;
+            Some(LiveFirewall {
+                rules: count_nft_rules(&dump),
+                covers_forward: dump.contains("hook forward"),
+            })
         }
-        FirewallBackend::Iptables => match run("iptables", &["-S", "STOP-BOTS"]) {
-            Some(output) => output,
-            // Listing a chain that certainly exists separates "no
-            // permission" from "no STOP-BOTS chain yet".
-            None => {
-                run("iptables", &["-S", "INPUT"])?;
-                return Some(0);
-            }
-        },
-    };
-    Some(match backend {
-        FirewallBackend::Nftables => count_nft_rules(&output),
-        FirewallBackend::Iptables => count_iptables_rules(&output),
-    })
+        FirewallBackend::Iptables => {
+            let rules = match run("iptables", &["-S", "STOP-BOTS"]) {
+                Some(output) => count_iptables_rules(&output),
+                // Listing a chain that certainly exists separates "no
+                // permission" from "no STOP-BOTS chain yet".
+                None => {
+                    run("iptables", &["-S", "INPUT"])?;
+                    0
+                }
+            };
+            // Unlike nftables, the jump lives in a chain we do not own, so
+            // this is a second read however it is arranged. Either jump
+            // reaches our chain, and which one is present depends on
+            // whether Docker was running when the script was applied.
+            let forward = run("iptables", &["-S", "FORWARD"])?;
+            let covers_forward = forward
+                .lines()
+                .any(|line| line.trim() == "-A FORWARD -j STOP-BOTS")
+                || run_allowing_failure("iptables", &["-S", "DOCKER-USER"]).is_some_and(|dump| {
+                    dump.lines()
+                        .any(|line| line.trim() == "-A DOCKER-USER -j STOP-BOTS")
+                });
+            Some(LiveFirewall {
+                rules,
+                covers_forward,
+            })
+        }
+    }
 }
 
 /// Rule lines inside an `nft list table` dump: the ones carrying a
@@ -539,6 +586,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(access_log_clients(probe));
     checks.push(ssh_login_allowlist(db)?);
     // Adds a line only on a host where NGINX really is in a container.
+    if let Some(check) = firewall_reaches_containers(probe) {
+        checks.push(check);
+    }
     if let Some(check) = nginx_deployment(db, probe)? {
         checks.push(check);
     }
@@ -582,6 +632,59 @@ fn firewall_enforced(probe: &Probe, expected: usize) -> Check {
         detail,
         fix,
     }
+}
+
+/// Whether the loaded ruleset actually reaches the containerised service
+/// this host is running.
+///
+/// The failure this exists for is the quietest one in the project. A
+/// ruleset rendered before the forward hook was covered loads cleanly,
+/// carries the right number of rules, and satisfies every other firewall
+/// check on this panel — while a packet for a published container port is
+/// DNAT'd straight past the only chain that was looking at it. "Firewall
+/// rules are in the kernel" says Ok; nothing is enforced.
+///
+/// Reported only where NGINX is in a container, because that is where the
+/// answer changes anything. On a host-NGINX box the forward hook carries
+/// no traffic this project has an opinion about, and a warning there is a
+/// warning nobody can act on.
+///
+/// Silent, too, when no rules are loaded at all: that is
+/// [`firewall_enforced`]'s Critical, and saying it twice in one report
+/// teaches the reader to skim.
+fn firewall_reaches_containers(probe: &Probe) -> Option<Check> {
+    let NginxHome::Container { name } = &probe.nginx_home else {
+        return None;
+    };
+    // Nothing loaded is a different check's problem.
+    if !matches!(probe.live_rules, Some(count) if count > 0) {
+        return None;
+    }
+
+    Some(if probe.firewall_covers_forward? {
+        Check {
+            id: "firewall-reaches-containers",
+            title: "Blocks reach the container",
+            level: Level::Ok,
+            detail: format!(
+                "the ruleset polices forwarded traffic, so blocks apply to `{name}` as well as to this host"
+            ),
+            fix: None,
+        }
+    } else {
+        Check {
+            id: "firewall-reaches-containers",
+            title: "Blocks reach the container",
+            level: Level::Critical,
+            detail: format!(
+                "NGINX is in container `{name}`, and the loaded ruleset only polices traffic to this host \u{2014} traffic to a published port is forwarded past it, so no block applies to it"
+            ),
+            fix: Some(
+                "re-render and re-run the generated script (the rendered one covers both paths)"
+                    .to_string(),
+            ),
+        }
+    })
 }
 
 fn firewall_persistence(probe: &Probe, backend: FirewallBackend) -> Check {
@@ -1230,6 +1333,7 @@ mod tests {
             nginx_home: NginxHome::Host,
             managed_dir_in_container: None,
             container_shares_host_network: None,
+            firewall_covers_forward: Some(true),
         }
     }
 
@@ -1373,6 +1477,82 @@ mod tests {
                 .contains("docker exec web"),
             "the fix should name the container: {:?}",
             check.fix
+        );
+    }
+
+    /// The quiet failure: a ruleset that loads, counts right, and enforces
+    /// nothing for the container it is supposed to be protecting.
+    #[test]
+    fn a_ruleset_that_misses_the_forward_path_is_critical_for_a_container() {
+        let probe = Probe {
+            firewall_covers_forward: Some(false),
+            ..in_container()
+        };
+        let report = assess(&db(), &probe).unwrap();
+
+        let check = check(&report, "firewall-reaches-containers");
+        assert_eq!(check.level, Level::Critical);
+        assert!(
+            check.detail.contains("forwarded past it"),
+            "the detail should say what happens to the packet: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("web"),
+            "the detail should name the container: {}",
+            check.detail
+        );
+        // The rule count is fine, which is the whole point: this check
+        // must fire while its neighbour reports green.
+        assert_eq!(check2(&report, "firewall-enforced").level, Level::Ok);
+    }
+
+    #[test]
+    fn a_ruleset_covering_both_paths_says_so_for_a_container() {
+        let report = assess(&db(), &in_container()).unwrap();
+        let check = check(&report, "firewall-reaches-containers");
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("forwarded traffic"),
+            "was: {}",
+            check.detail
+        );
+    }
+
+    /// On a host NGINX the forward hook carries nothing this project has
+    /// an opinion about, so there is nothing to report and no row.
+    #[test]
+    fn a_host_nginx_gets_no_container_reachability_row() {
+        let probe = Probe {
+            firewall_covers_forward: Some(false),
+            ..healthy()
+        };
+        let report = assess(&db(), &probe).unwrap();
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.id == "firewall-reaches-containers"),
+            "a host NGINX should not get this row"
+        );
+    }
+
+    /// An empty kernel table is `firewall-enforced`'s Critical. Saying it
+    /// twice, in two different wordings, is how a panel stops being read.
+    #[test]
+    fn nothing_loaded_at_all_is_left_to_the_other_check() {
+        let probe = Probe {
+            live_rules: Some(0),
+            firewall_covers_forward: Some(false),
+            ..in_container()
+        };
+        let report = assess(&db(), &probe).unwrap();
+        assert!(
+            !report
+                .checks
+                .iter()
+                .any(|c| c.id == "firewall-reaches-containers"),
+            "an empty ruleset is the other check's problem"
         );
     }
 

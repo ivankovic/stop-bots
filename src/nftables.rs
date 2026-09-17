@@ -33,11 +33,38 @@
 //!   whether a previous run already created the base chain (re-declaring an
 //!   existing hooked base chain via `add chain` is not reliably a no-op,
 //!   unlike `add table`).
-//! - `policy drop` on a chain hooked at `priority -1` on `input` makes that
-//!   chain the de facto gatekeeper for *all* inbound traffic on the host:
-//!   anything not explicitly accepted gets dropped, including ordinary
-//!   traffic to the box. We use `policy accept` instead, so this chain only
-//!   ever blocks the specific addresses it's told to.
+//! - `policy drop` on a chain hooked at `priority -1` makes that chain the
+//!   de facto gatekeeper for *all* traffic through that hook: anything not
+//!   explicitly accepted gets dropped, including ordinary traffic to the
+//!   box — and, on the `forward` hook, every packet between containers.
+//!   We use `policy accept` instead, so these chains only ever block the
+//!   specific addresses they're told to.
+//!
+//! ## Two hooks, because `input` alone misses every container
+//!
+//! A packet arriving for a service that runs *on the host* is delivered
+//! locally and traverses the `input` hook. A packet arriving for a
+//! published container port does not: the DNAT in `nat/prerouting`
+//! rewrites its destination to the container, routing then sees an address
+//! that is not local, and it leaves through `forward` instead. An
+//! `input`-only chain therefore never sees it, and every Block rule this
+//! project writes is inert for anything containerised — silently, and
+//! completely, which is the worst way for a firewall to fail.
+//!
+//! That is not a hypothetical arrangement. It is what NGINX in Docker with
+//! `ports: 80:80` is, which is a common way to run the very thing this
+//! project protects, and it is what makes `block_web_scanners` — whose
+//! entire output is firewall rules — do nothing at all on such a host.
+//!
+//! So there are two base chains, `bot_block` on `input` and `bot_forward`
+//! on `forward`, and the rules themselves live in a third, unhooked chain
+//! that both of them `jump` to. One copy of the rules, reached from two
+//! hooks: the alternative is rendering every rule twice and relying on
+//! nobody ever editing one loop and not the other.
+//!
+//! Both sit at `priority -1`, ahead of Docker's own rules at the default
+//! `filter` priority, and in our own table — so a `docker` restart, which
+//! rewrites Docker's chains, cannot displace them.
 //!
 //! This module never executes `nft` itself — applying the generated script
 //! is a manual step for the admin. Like the rest of this module, the
@@ -47,7 +74,25 @@
 use crate::db::{FirewallAction, FirewallRule};
 
 const TABLE: &str = "inet stop_bots";
+
+/// The base chain on `input`: traffic for services on the host itself.
 const CHAIN: &str = "bot_block";
+
+/// The base chain on `forward`: traffic DNAT'd onward to a container.
+/// See the module docs for why `input` alone is not enough.
+const FORWARD_CHAIN: &str = "bot_forward";
+
+/// The unhooked chain holding the rules, jumped to from both base chains
+/// so that the two hooks can never enforce different things.
+const RULES_CHAIN: &str = "bot_rules";
+
+/// The v4 ranges the forward chain lets through untouched: loopback,
+/// RFC1918 and link-local. The set `ipranges::is_local_or_private` treats
+/// as never-a-scanner, spelled as nftables literals.
+const PRIVATE_V4: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16";
+
+/// The v6 half of [`PRIVATE_V4`]: loopback and unique-local.
+const PRIVATE_V6: &str = "::1, fc00::/7";
 
 fn action_word(action: FirewallAction) -> &'static str {
     match action {
@@ -73,8 +118,11 @@ pub fn render(rules: &[FirewallRule]) -> String {
     out.push_str("# with: nft -f <this file>\n");
     out.push_str("#\n");
     out.push_str("# Only touches our own \"inet stop_bots\" table (no `flush ruleset`) and\n");
-    out.push_str("# uses \"policy accept\" so this chain can't become an implicit\n");
-    out.push_str("# default-deny for all inbound traffic.\n\n");
+    out.push_str("# uses \"policy accept\" so these chains can't become an implicit\n");
+    out.push_str("# default-deny for traffic to the host or between containers.\n");
+    out.push_str("#\n");
+    out.push_str("# Two hooks: \"input\" for services on this host, \"forward\" for ones in\n");
+    out.push_str("# containers, whose traffic is DNAT'd past \"input\" entirely.\n\n");
 
     // Reset just our own table to a fresh, empty state (see module docs for
     // why this is the idempotent idiom rather than `flush chain`).
@@ -82,13 +130,63 @@ pub fn render(rules: &[FirewallRule]) -> String {
     out.push_str(&format!("delete table {TABLE}\n"));
     out.push_str(&format!("add table {TABLE}\n"));
     out.push_str(&format!(
-        "add chain {TABLE} {CHAIN} {{ type filter hook input priority -1; policy accept; }}\n\n"
+        "add chain {TABLE} {CHAIN} {{ type filter hook input priority -1; policy accept; }}\n"
     ));
+    out.push_str(&format!(
+        "add chain {TABLE} {FORWARD_CHAIN} {{ type filter hook forward priority -1; policy accept; }}\n"
+    ));
+    // No hook and no policy: reached only by the jumps below, so a packet
+    // that falls off the end of it simply returns to whichever base chain
+    // sent it.
+    out.push_str(&format!("add chain {TABLE} {RULES_CHAIN}\n\n"));
 
     out.push_str(&format!(
         "add rule {TABLE} {CHAIN} ct state established,related accept\n"
     ));
     out.push_str(&format!("add rule {TABLE} {CHAIN} iif lo accept\n"));
+    out.push_str(&format!("add rule {TABLE} {CHAIN} jump {RULES_CHAIN}\n"));
+
+    // The same short-circuit on the forward path. `iif lo` has no meaning
+    // here — a forwarded packet never arrives on the loopback interface —
+    // so it is not repeated.
+    out.push_str(&format!(
+        "add rule {TABLE} {FORWARD_CHAIN} ct state established,related accept\n"
+    ));
+
+    // Everything from a private address passes, and this is load-bearing
+    // rather than tidy.
+    //
+    // The forward hook carries traffic this project has no opinion about:
+    // a container reaching the internet, one container reaching another,
+    // the host reaching either. Their source addresses are RFC1918 or
+    // unique-local — precisely what `ipranges::is_local_or_private` calls
+    // "necessarily either this host talking to itself or a client on the
+    // same private network, not an internet scanner", and what this tool
+    // therefore never blocks on purpose.
+    //
+    // It can block them by accident, though, and the allowlist case shows
+    // how: geo allowlist mode renders a trailing `0.0.0.0/0 drop`, and
+    // reaching that from the forward hook would drop every packet a
+    // container sent anywhere, the moment the script was applied. The same
+    // goes for an operator who blocks a private range meaning "keep it off
+    // this host". Inbound traffic is unaffected: a packet DNAT'd to a
+    // published port still carries the remote client's address as its
+    // source, so the rules below still see it.
+    //
+    // The input chain deliberately does not get this: its semantics
+    // predate the forward chain, `iif lo accept` already covers the host
+    // itself, and a host whose operator has chosen allowlist mode may well
+    // mean it for traffic addressed to the host.
+    out.push_str(&format!(
+        "add rule {TABLE} {FORWARD_CHAIN} ip saddr {{ {PRIVATE_V4} }} accept\n"
+    ));
+    out.push_str(&format!(
+        "add rule {TABLE} {FORWARD_CHAIN} ip6 saddr {{ {PRIVATE_V6} }} accept\n"
+    ));
+
+    out.push_str(&format!(
+        "add rule {TABLE} {FORWARD_CHAIN} jump {RULES_CHAIN}\n"
+    ));
 
     let enabled: Vec<&FirewallRule> = rules.iter().filter(|r| r.enabled).collect();
     if !enabled.is_empty() {
@@ -111,7 +209,7 @@ pub fn render(rules: &[FirewallRule]) -> String {
         }
         let family = if is_ipv6(&rule.address) { "ip6" } else { "ip" };
         out.push_str(&format!(
-            "add rule {TABLE} {CHAIN} {family} saddr {}",
+            "add rule {TABLE} {RULES_CHAIN} {family} saddr {}",
             rule.address
         ));
         if let Some(port) = rule.port {
@@ -186,7 +284,13 @@ mod tests {
             rendered.contains("iif lo accept"),
             "rendered was:\n{rendered}"
         );
-        assert!(!rendered.contains("saddr"), "rendered was:\n{rendered}");
+        // Not `!contains("saddr")` any more: the forward chain's
+        // private-source guard is structure, not a rule, and uses `saddr`
+        // too. What must be absent is anything in the rules chain.
+        assert!(
+            !rendered.contains(&format!("add rule {TABLE} {RULES_CHAIN}")),
+            "rendered was:\n{rendered}"
+        );
     }
 
     #[test]
@@ -224,12 +328,75 @@ mod tests {
             ),
         ];
         for (shape, line) in expected {
-            let full = format!("add rule inet stop_bots bot_block {line}");
+            let full = format!("add rule inet stop_bots {RULES_CHAIN} {line}");
             assert!(
                 rendered.contains(&full),
                 "{shape} should render as {full:?}, but the script was:\n{rendered}"
             );
         }
+    }
+
+    /// The reason this backend has two base chains at all.
+    ///
+    /// A host that publishes a container port sees the traffic for it on
+    /// `forward`, never on `input`, so an `input`-only ruleset enforces
+    /// nothing for anything containerised. The failure is silent, which is
+    /// why it is pinned by a test rather than left to the golden: a golden
+    /// that someone regenerates without reading takes the property with it.
+    #[test]
+    fn both_hooks_are_covered_so_container_traffic_cannot_slip_past() {
+        let rendered = render(&[block("1.2.3.4")]);
+
+        for (hook, chain) in [("input", CHAIN), ("forward", FORWARD_CHAIN)] {
+            let decl = format!(
+                "add chain {TABLE} {chain} {{ type filter hook {hook} priority -1; policy accept; }}"
+            );
+            assert!(
+                rendered.contains(&decl),
+                "the {hook} hook should be covered by {decl:?}, but the script was:\n{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("add rule {TABLE} {chain} jump {RULES_CHAIN}")),
+                "{chain} should reach the rules, but the script was:\n{rendered}"
+            );
+        }
+    }
+
+    /// One copy of the rules, not two.
+    ///
+    /// Rendering each rule into both base chains would enforce the same
+    /// thing today and drift the first time someone edits one loop, so the
+    /// rules live in the jumped-to chain and nowhere else.
+    #[test]
+    fn a_rule_is_rendered_once_into_the_shared_chain() {
+        let rendered = render(&[block("1.2.3.4")]);
+        assert_eq!(
+            rendered.matches("saddr 1.2.3.4").count(),
+            1,
+            "the rule should appear exactly once, but the script was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "add rule {TABLE} {RULES_CHAIN} ip saddr 1.2.3.4 drop"
+            )),
+            "the rule belongs in {RULES_CHAIN}, but the script was:\n{rendered}"
+        );
+    }
+
+    /// `policy accept` on `forward` is load-bearing in a way the `input`
+    /// one is not: a `policy drop` there would cut every container on the
+    /// host off from the network the moment the script ran.
+    #[test]
+    fn the_forward_chain_never_becomes_a_default_deny() {
+        let rendered = render(&[]);
+        let forward_decl = rendered
+            .lines()
+            .find(|line| line.contains(FORWARD_CHAIN) && line.contains("hook forward"))
+            .expect("the forward chain should be declared");
+        assert!(
+            forward_decl.contains("policy accept"),
+            "the forward chain must not default-deny, but it was:\n{forward_decl}"
+        );
     }
 
     #[test]

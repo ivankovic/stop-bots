@@ -84,9 +84,10 @@ pub fn render(rules: &[FirewallRule]) -> String {
     out.push_str("# with: sh <this file>\n");
     out.push_str("#\n");
     out.push_str(&format!(
-        "# Only ever touches the dedicated {CHAIN} chain: existing rules, other\n"
+        "# Only ever touches the dedicated {CHAIN} chain, plus the jumps into it\n"
     ));
-    out.push_str("# chains and policies are left alone.\n");
+    out.push_str("# from INPUT, FORWARD and DOCKER-USER. Existing rules in those chains,\n");
+    out.push_str("# all other chains, and every chain policy are left alone.\n");
     out.push_str("set -e\n\n");
 
     out.push_str(&format!(
@@ -99,6 +100,35 @@ pub fn render(rules: &[FirewallRule]) -> String {
         "if ! iptables -C INPUT -j {CHAIN} 2>/dev/null; then\n"
     ));
     out.push_str(&format!("    iptables -I INPUT -j {CHAIN}\n"));
+    out.push_str("fi\n");
+
+    // `INPUT` alone only covers services running on the host. Traffic for a
+    // published container port is DNAT'd and then *forwarded*, so it never
+    // reaches `INPUT` and an `INPUT`-only jump enforces nothing for it —
+    // see the module docs in `crate::nftables` for the same reasoning.
+    out.push_str(&format!(
+        "if ! iptables -C FORWARD -j {CHAIN} 2>/dev/null; then\n"
+    ));
+    out.push_str(&format!("    iptables -I FORWARD -j {CHAIN}\n"));
+    out.push_str("fi\n");
+
+    // And again from `DOCKER-USER`, which exists only when Docker does.
+    //
+    // The `FORWARD` jump above is inserted at the top, so on its own it
+    // would already run first. What it does not survive is another chain
+    // reaching a verdict before it: Docker puts its own `-j DOCKER-USER`
+    // at the head of `FORWARD` on every restart, and an `ACCEPT` an admin
+    // has put in there is terminal for the whole `FORWARD` traversal. That
+    // packet would then never reach our jump. `DOCKER-USER` is the hook
+    // Docker documents for exactly this, so we take both: the rules are
+    // idempotent and `DROP` is terminal, so being traversed twice costs a
+    // second pass over a short chain and changes no verdict.
+    out.push_str("if iptables -L DOCKER-USER -n >/dev/null 2>&1; then\n");
+    out.push_str(&format!(
+        "    if ! iptables -C DOCKER-USER -j {CHAIN} 2>/dev/null; then\n"
+    ));
+    out.push_str(&format!("        iptables -I DOCKER-USER -j {CHAIN}\n"));
+    out.push_str("    fi\n");
     out.push_str("fi\n");
 
     // Safety first: always accept established/related connections and loopback.
@@ -188,15 +218,75 @@ mod tests {
     #[test]
     fn render_never_touches_other_chains_or_policies() {
         let rendered = render(&[]);
+        // `-P` is the only way to change a policy, and a table-level
+        // restore is the only way to replace rules wholesale. Neither
+        // appears; `FORWARD` and `DOCKER-USER` now do, which is why this
+        // no longer just greps for their names — see the test below for
+        // what it is allowed to say about them.
         assert!(
-            !rendered.contains("INPUT DROP"),
+            !rendered.contains("iptables -P"),
             "rendered was:\n{rendered}"
         );
-        assert!(!rendered.contains("FORWARD"), "rendered was:\n{rendered}");
         assert!(!rendered.contains("OUTPUT"), "rendered was:\n{rendered}");
         assert!(!rendered.contains("*filter"), "rendered was:\n{rendered}");
         assert!(!rendered.contains("COMMIT"), "rendered was:\n{rendered}");
         assert!(!rendered.to_lowercase().contains("flush ruleset"));
+        // Ours is the only chain flushed. Flushing a chain we merely jump
+        // from would throw away an admin's own rules.
+        let flushed: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.contains("-F "))
+            .collect();
+        assert_eq!(
+            flushed,
+            vec![format!("iptables -F {CHAIN}")],
+            "only {CHAIN} may be flushed, but rendered was:\n{rendered}"
+        );
+    }
+
+    /// The change that made this backend reach containerised services, and
+    /// the bound on how far it reaches into chains it does not own.
+    ///
+    /// A packet for a published container port is DNAT'd and forwarded, so
+    /// an `INPUT`-only jump never sees it. Both other chains therefore get
+    /// a jump — and a jump is *all* they get: every line naming one is a
+    /// guarded `-C`/`-I` of our own chain, never a rule of its own.
+    #[test]
+    fn every_hop_into_our_chain_is_covered_and_nothing_else_is_added() {
+        let rendered = render(&[block("1.2.3.4")]);
+
+        for chain in ["INPUT", "FORWARD", "DOCKER-USER"] {
+            assert!(
+                rendered.contains(&format!("iptables -I {chain} -j {CHAIN}")),
+                "{chain} should jump to {CHAIN}, but rendered was:\n{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("iptables -C {chain} -j {CHAIN}")),
+                "the {chain} jump should be guarded, but rendered was:\n{rendered}"
+            );
+        }
+
+        // DOCKER-USER exists only where Docker does, so unlike the other
+        // two its jump is additionally guarded on the chain being there.
+        assert!(
+            rendered.contains("if iptables -L DOCKER-USER -n >/dev/null 2>&1; then"),
+            "the DOCKER-USER jump should be guarded on Docker being present, \
+             but rendered was:\n{rendered}"
+        );
+
+        // Nothing but jumps. A rule added to a chain we don't own would
+        // outlive our chain and could not be cleaned up by re-running.
+        for line in rendered.lines() {
+            let line = line.trim();
+            if (line.contains("FORWARD") || line.contains("DOCKER-USER") || line.contains("INPUT"))
+                && line.starts_with("iptables")
+            {
+                assert!(
+                    line.ends_with(&format!("-j {CHAIN}")),
+                    "a chain we do not own may only gain a jump to {CHAIN}, but got:\n{line}"
+                );
+            }
+        }
     }
 
     #[test]

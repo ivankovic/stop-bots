@@ -60,6 +60,34 @@ need.
 
 ### Fixed
 
+- **Firewall blocks did nothing for an NGINX in a container.** The
+  generated ruleset hooked `input` only. A packet for a published
+  container port is DNAT'd and then *forwarded*, so it never traverses
+  `input` — every Block rule was inert for anything containerised, which
+  includes the common case of running the NGINX this tool protects in
+  Docker with `ports: 80:80`. `block_web_scanners`, whose entire output is
+  firewall rules, therefore did nothing at all on such a host. Nothing
+  said so: the script applied cleanly, `nft list` showed the rules, and
+  the "Firewall rules are in the kernel" check went green.
+
+  `nftables::render` now emits a second base chain on `forward` beside the
+  one on `input`, with the rules in a shared, unhooked chain both jump to;
+  the iptables backend adds the matching guarded jumps from `FORWARD` and
+  from `DOCKER-USER` where Docker provides it. Both are validated against
+  a real kernel by the container suite.
+
+  The forward chain passes traffic from private source addresses before
+  reaching the rules, which matters most in geo **allowlist** mode: its
+  trailing `0.0.0.0/0 drop`, reached from `forward`, would otherwise have
+  cut every container on the host off from the network. Inbound traffic is
+  unaffected, since a DNAT'd packet still carries the client's own address.
+
+  A new `firewall-reaches-containers` check reports the case this fix
+  leaves behind — a ruleset rendered by an older version, still loaded,
+  still counting right, still enforcing nothing. It is Critical when NGINX
+  is containerised and the loaded ruleset has no forward coverage, and
+  silent where the answer would change nothing.
+
 - **The built-in bot list never reached a console-only host.**
   `register_all_sources` both registers the four sources and stores the
   one compiled into the binary, and it was called from the TUI's startup
