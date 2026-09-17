@@ -25,11 +25,19 @@
 //! returns 403 to the wrong requests. These tests run the generated
 //! output through the actual parsers and then send actual requests at it.
 //!
-//! **They do not run by default.** They need Docker, take tens of
-//! seconds, and would break `cargo test` on any machine without a
-//! container runtime. Set `STOP_BOTS_CONTAINER_TESTS=1` to enable them;
-//! `make integration-test` does that for you. CI runs them as their own
-//! job.
+//! **They do not run by default.** They need a container runtime, take
+//! tens of seconds, and would break `cargo test` on any machine without
+//! one. Set `STOP_BOTS_CONTAINER_TESTS=1` to enable them; `make
+//! integration-test` does that for you. CI runs them as their own job.
+//!
+//! ## Which runtime
+//!
+//! `docker` unless `STOP_BOTS_CONTAINER_RUNTIME` says otherwise, which is
+//! what CI uses. Setting it to `podman` runs the same suite rootless —
+//! see [`runtime()`] for why that option is here, and [`Host::boot`] for
+//! the one place the two need different flags. Both are exercised; the
+//! systemd assertions below were confirmed to still fail when their
+//! directive is removed under each.
 //!
 //! ## Two images, because faithfulness is not free
 //!
@@ -73,6 +81,32 @@ fn enabled() -> bool {
     false
 }
 
+/// The container runtime to drive, from `STOP_BOTS_CONTAINER_RUNTIME`.
+///
+/// Defaults to `docker`, which is what CI has and what this suite was
+/// written against. The override exists because the daemon Docker talks
+/// to runs as root: on a machine that also hosts unrelated root-owned
+/// containers, joining the `docker` group to run these tests hands over
+/// every one of those containers too, since the socket has no notion of
+/// per-container permission. Rootless Podman has no daemon and its own
+/// per-user storage, so the suite can run without that trade.
+///
+/// Anything CLI-compatible works; `podman` is the one that is actually
+/// exercised. Read once — a test run must not straddle two runtimes,
+/// which is the sort of thing an env var changed mid-run would do.
+fn runtime() -> &'static str {
+    static RUNTIME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        std::env::var("STOP_BOTS_CONTAINER_RUNTIME").unwrap_or_else(|_| "docker".to_string())
+    })
+}
+
+/// Whether the runtime is Podman, which needs different flags to boot
+/// systemd — see [`Host::boot`].
+fn runtime_is_podman() -> bool {
+    runtime().contains("podman")
+}
+
 const IMAGE: &str = "stop-bots-test:latest";
 
 /// The image with a real init — see `Dockerfile.host` and [`Host`].
@@ -97,7 +131,7 @@ fn build_host_image() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let ctx = stage_binary();
-        let out = Command::new("docker")
+        let out = Command::new(runtime())
             .args([
                 "build",
                 "-q",
@@ -108,10 +142,11 @@ fn build_host_image() {
                 &ctx,
             ])
             .output()
-            .expect("failed to run docker build");
+            .expect("failed to run the image build");
         assert!(
             out.status.success(),
-            "docker build (host image) failed:\n{}",
+            "{} build (host image) failed:\n{}",
+            runtime(),
             String::from_utf8_lossy(&out.stderr)
         );
     });
@@ -151,13 +186,14 @@ fn stage_binary() -> String {
 
 fn build_image_now() {
     let ctx = stage_binary();
-    let out = Command::new("docker")
+    let out = Command::new(runtime())
         .args(["build", "-q", "-t", IMAGE, &ctx])
         .output()
-        .expect("failed to run docker build");
+        .expect("failed to run the image build");
     assert!(
         out.status.success(),
-        "docker build failed:\n{}",
+        "{} build failed:\n{}",
+        runtime(),
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -175,7 +211,7 @@ struct Network {
 
 /// The subnet every test network is given.
 ///
-/// **Not Docker's default.** Docker hands out RFC1918 addresses, and every
+/// **Not the runtime's default.** Both hand out RFC1918 addresses, and every
 /// detector in this project deliberately skips those —
 /// `accesslog::is_local_or_private` is what stops a NAT gateway or a
 /// reverse proxy getting the whole office blocked. A client on
@@ -186,8 +222,8 @@ struct Network {
 /// so the detectors treat it as a real remote client, and it can never
 /// route anywhere outside the container network.
 ///
-/// Carved into /28s because tests run in parallel and Docker refuses two
-/// networks whose pools overlap. Sixteen is far more than the handful of
+/// Carved into /28s because tests run in parallel and both runtimes
+/// refuse two networks whose pools overlap. Sixteen is far more than the handful of
 /// networked tests here, and each gets thirteen usable addresses.
 fn test_subnet(index: usize) -> String {
     format!("198.51.100.{}/28", (index % 16) * 16)
@@ -195,7 +231,7 @@ fn test_subnet(index: usize) -> String {
 
 impl Network {
     fn create(name: &str) -> Network {
-        let _ = Command::new("docker")
+        let _ = Command::new(runtime())
             .args(["network", "rm", name])
             .output();
 
@@ -208,10 +244,10 @@ impl Network {
         for _ in 0..16 {
             let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let subnet = test_subnet(index);
-            let out = Command::new("docker")
+            let out = Command::new(runtime())
                 .args(["network", "create", "--subnet", &subnet, name])
                 .output()
-                .expect("failed to create a docker network");
+                .expect("failed to create a container network");
             if out.status.success() {
                 return Network {
                     name: name.to_string(),
@@ -219,7 +255,10 @@ impl Network {
             }
             last = String::from_utf8_lossy(&out.stderr).to_string();
         }
-        panic!("docker network create failed for every subnet slice:\n{last}");
+        panic!(
+            "{} network create failed for every subnet slice:\n{last}",
+            runtime()
+        );
     }
 }
 
@@ -227,10 +266,10 @@ impl Network {
 /// success, stdout, stderr). The one `docker exec` every assertion in this
 /// file flows through.
 fn exec_in(container: &str, cmd: &str) -> (bool, String, String) {
-    let out = Command::new("docker")
+    let out = Command::new(runtime())
         .args(["exec", container, "sh", "-c", cmd])
         .output()
-        .expect("failed to run docker exec");
+        .expect("failed to exec in the container");
     (
         out.status.success(),
         String::from_utf8_lossy(&out.stdout).to_string(),
@@ -251,12 +290,12 @@ fn sh_in(container: &str, cmd: &str) -> String {
 /// `docker rm -f`, for the `Drop` impls. Errors are ignored: a container
 /// that is already gone is the outcome wanted.
 fn remove_container(name: &str) {
-    let _ = Command::new("docker").args(["rm", "-f", name]).output();
+    let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
 }
 
 impl Drop for Network {
     fn drop(&mut self) {
-        let _ = Command::new("docker")
+        let _ = Command::new(runtime())
             .args(["network", "rm", &self.name])
             .output();
     }
@@ -271,14 +310,15 @@ struct Client {
 impl Client {
     fn start(name: &str, net: &Network) -> Client {
         build_image();
-        let _ = Command::new("docker").args(["rm", "-f", name]).output();
-        let out = Command::new("docker")
+        let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
+        let out = Command::new(runtime())
             .args(["run", "-d", "--name", name, "--network", &net.name, IMAGE])
             .output()
             .expect("failed to start the client container");
         assert!(
             out.status.success(),
-            "docker run (client) failed:\n{}",
+            "{} run (client) failed:\n{}",
+            runtime(),
             String::from_utf8_lossy(&out.stderr)
         );
         Client {
@@ -288,7 +328,7 @@ impl Client {
 
     /// This container's address on the network, as the server will see it.
     fn address(&self) -> String {
-        let out = Command::new("docker")
+        let out = Command::new(runtime())
             .args([
                 "inspect",
                 "-f",
@@ -302,7 +342,7 @@ impl Client {
 
     /// Fetches `path` from `host` and returns the status code.
     fn get_path(&self, host: &str, path: &str, extra: &str) -> String {
-        let out = Command::new("docker")
+        let out = Command::new(runtime())
             .args([
                 "exec",
                 &self.name,
@@ -320,7 +360,7 @@ impl Client {
     /// Fetches `/` from `host` and returns the status code, tolerating a
     /// curl failure the same way `Server::status` does.
     fn get(&self, host: &str, extra: &str) -> String {
-        let out = Command::new("docker")
+        let out = Command::new(runtime())
             .args([
                 "exec",
                 &self.name,
@@ -352,7 +392,7 @@ impl Server {
     fn spawn(name: &str, network: Option<&str>) -> Server {
         build_image();
         // Leftover from a previous aborted run.
-        let _ = Command::new("docker").args(["rm", "-f", name]).output();
+        let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
 
         let mut args = vec![
             "run".to_string(),
@@ -368,13 +408,14 @@ impl Server {
             args.push(network.to_string());
         }
         args.push(IMAGE.to_string());
-        let out = Command::new("docker")
+        let out = Command::new(runtime())
             .args(&args)
             .output()
-            .expect("failed to run docker run");
+            .expect("failed to start the container");
         assert!(
             out.status.success(),
-            "docker run failed:\n{}",
+            "{} run failed:\n{}",
+            runtime(),
             String::from_utf8_lossy(&out.stderr)
         );
         let server = Server {
@@ -524,47 +565,68 @@ impl Host {
     fn boot(name: &str) -> Host {
         build_host_image();
         // Leftover from a previous aborted run.
-        let _ = Command::new("docker").args(["rm", "-f", name]).output();
+        let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
 
-        let out = Command::new("docker")
-            .args([
-                "run",
-                "-d",
-                "--name",
-                name,
-                // systemd needs to mount things: every `Protect*` and
-                // `Private*` directive in the generated unit is a mount
-                // namespace, and without this they are silently not
-                // applied — which would make every assertion below pass
-                // for the wrong reason.
-                "--cap-add=SYS_ADMIN",
-                // `nft` and `iptables` manipulate the container's own
-                // netfilter tables, same as `Server`.
-                "--cap-add=NET_ADMIN",
-                // Docker's outer seccomp and AppArmor profiles block
-                // syscalls systemd needs to boot at all. Turning them off
-                // does *not* weaken what is under test: `RestrictAddress\
-                // Families` is enforced by a seccomp filter systemd
-                // installs itself, inside the unit, and it was verified to
-                // still refuse AF_NETLINK with these off.
-                "--security-opt",
-                "seccomp=unconfined",
-                "--security-opt",
-                "apparmor=unconfined",
-                "--cgroupns=host",
-                "-v",
-                "/sys/fs/cgroup:/sys/fs/cgroup:rw",
-                "--tmpfs",
-                "/run",
-                "--tmpfs",
-                "/run/lock",
-                HOST_IMAGE,
-            ])
+        let mut args = vec![
+            "run".to_string(),
+            "-d".to_string(),
+            "--name".to_string(),
+            name.to_string(),
+            // systemd needs to mount things: every `Protect*` and
+            // `Private*` directive in the generated unit is a mount
+            // namespace, and without this they are silently not
+            // applied — which would make every assertion below pass
+            // for the wrong reason.
+            "--cap-add=SYS_ADMIN".to_string(),
+            // `nft` and `iptables` manipulate the container's own
+            // netfilter tables, same as `Server`.
+            "--cap-add=NET_ADMIN".to_string(),
+            // The outer seccomp profile blocks syscalls systemd needs to
+            // boot at all. Turning it off does *not* weaken what is under
+            // test: `RestrictAddressFamilies` is enforced by a seccomp
+            // filter systemd installs itself, inside the unit, and it was
+            // verified to still refuse AF_NETLINK with this off — under
+            // both runtimes.
+            "--security-opt".to_string(),
+            "seccomp=unconfined".to_string(),
+        ];
+
+        // How the two runtimes are told to host an init, and the one
+        // place in this file where they genuinely differ.
+        //
+        // Podman knows what a systemd container needs and sets it up
+        // itself: `--systemd=always` gives the container a writable
+        // cgroup hierarchy of its own plus the tmpfs mounts on /run and
+        // /run/lock. Docker has no such flag, so the same conditions have
+        // to be assembled by hand — and bind-mounting the host's
+        // /sys/fs/cgroup read-write, which is what that takes, is
+        // precisely the kind of access rootless Podman exists to avoid.
+        // Asking for it there fails outright rather than degrading.
+        if runtime_is_podman() {
+            args.push("--systemd=always".to_string());
+        } else {
+            // AppArmor confines the Docker daemon's containers; there is
+            // no equivalent profile applied in the rootless case.
+            args.push("--security-opt".to_string());
+            args.push("apparmor=unconfined".to_string());
+            args.push("--cgroupns=host".to_string());
+            args.push("-v".to_string());
+            args.push("/sys/fs/cgroup:/sys/fs/cgroup:rw".to_string());
+            args.push("--tmpfs".to_string());
+            args.push("/run".to_string());
+            args.push("--tmpfs".to_string());
+            args.push("/run/lock".to_string());
+        }
+        args.push(HOST_IMAGE.to_string());
+
+        let out = Command::new(runtime())
+            .args(&args)
             .output()
-            .expect("failed to run docker run");
+            .expect("failed to start the host container");
         assert!(
             out.status.success(),
-            "docker run (host) failed:\n{}",
+            "{} run (host) failed:\n{}",
+            runtime(),
             String::from_utf8_lossy(&out.stderr)
         );
 
@@ -706,13 +768,14 @@ impl Host {
     /// shadows whatever `docker cp` wrote into the image's own `/tmp`.
     /// The copy reports success and the file is not there.
     fn put(&self, local: &str, remote: &str) {
-        let out = Command::new("docker")
+        let out = Command::new(runtime())
             .args(["cp", local, &format!("{}:{remote}", self.name)])
             .output()
-            .expect("failed to run docker cp");
+            .expect("failed to copy into the container");
         assert!(
             out.status.success(),
-            "docker cp {local} failed:\n{}",
+            "{} cp {local} failed:\n{}",
+            runtime(),
             String::from_utf8_lossy(&out.stderr)
         );
     }

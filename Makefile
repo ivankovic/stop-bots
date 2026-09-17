@@ -9,16 +9,33 @@
 # a green run here means the same thing as a green run there.
 RUNNER := $(shell command -v cargo-nextest >/dev/null 2>&1 && echo 'cargo nextest run' || echo 'cargo test')
 
+# Rootless Podman for `make integration-test`, not Docker.
+#
+# The two are interchangeable here -- tests/container.rs drives whichever
+# it is handed -- so this is a choice about the daemon, not the tests.
+# Docker's runs as root and its socket has no notion of per-container
+# permission, so the `docker` group is all-or-nothing: on a machine that
+# also hosts root-owned containers, granting it to run this suite grants
+# every one of those containers too. Podman has no daemon and keeps
+# per-user storage, so the suite needs no such grant.
+#
+# `?=`, so the environment still wins: `STOP_BOTS_CONTAINER_RUNTIME=docker
+# make integration-test` is how you check the runtime CI uses. CI itself
+# calls cargo directly and never reads this file; the default there comes
+# from `runtime()` in tests/container.rs, which is still `docker`.
+STOP_BOTS_CONTAINER_RUNTIME ?= podman
+
 help:
 	@echo 'unit-test         everything that needs only a compiler (~20s)'
-	@echo 'integration-test  the container suite: needs Docker and NET_ADMIN (~1min)'
+	@echo 'integration-test  the container suite: needs a runtime + NET_ADMIN (~1min)'
 	@echo 'test              both, unit first'
 	@echo 'hooks             install the pre-commit hook (fmt + clippy)'
 	@echo 'screenshots       regenerate docs/screenshots/ from seeded fiction'
 	@echo 'build             release binary, after unit-test'
 	@echo 'deploy            build, then install it on $$DEPLOY_HOST and restart the service'
 	@echo
-	@echo 'test runner: $(RUNNER)'
+	@echo 'test runner:       $(RUNNER)'
+	@echo 'container runtime: $(STOP_BOTS_CONTAINER_RUNTIME)'
 
 # The library's own test modules plus the end-to-end binaries in tests/.
 # Needs nothing but a compiler: no Docker, no network, no root. This is
@@ -29,14 +46,16 @@ unit-test:
 
 # The only place the generated NGINX and nftables output meets the real
 # parsers, and the only place a firewall rule is checked by sending
-# packets at it. Off by default because it needs Docker and NET_ADMIN,
-# which the unit suite must never require.
+# packets at it. Off by default because it needs a container runtime and
+# NET_ADMIN, which the unit suite must never require.
 #
 # Plain `cargo test` rather than $(RUNNER): these are long by design, and
 # `--nocapture` streaming their progress is the difference between
 # watching a container build and staring at nothing for twenty seconds.
 integration-test:
-	STOP_BOTS_CONTAINER_TESTS=1 cargo test --test container -- --nocapture
+	STOP_BOTS_CONTAINER_TESTS=1 \
+	STOP_BOTS_CONTAINER_RUNTIME=$(STOP_BOTS_CONTAINER_RUNTIME) \
+	cargo test --test container -- --nocapture
 
 # Unit first: it is the one that fails for a plain mistake, and there is
 # no sense building containers to find out the code doesn't compile.
