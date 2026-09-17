@@ -537,6 +537,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(database_size(db)?);
     checks.push(log_sources(probe));
     checks.push(access_log_clients(probe));
+    checks.push(ssh_login_allowlist(db)?);
     // Adds a line only on a host where NGINX really is in a container.
     if let Some(check) = nginx_deployment(db, probe)? {
         checks.push(check);
@@ -913,6 +914,43 @@ fn access_log_clients(probe: &Probe) -> Check {
         detail,
         fix,
     }
+}
+
+/// Which addresses currently cannot be blocked, and why.
+///
+/// This exists because the anti-lockout allowlist is otherwise invisible:
+/// it is computed at render time, stored in no rule table, and shown in no
+/// screen — yet it overrides every block this tool can produce. An
+/// allowlist nobody can see is how a host ends up with a hole in it that
+/// nobody remembers opening.
+///
+/// Never a warning. The entries are, by construction, addresses whose
+/// owner can already log into this machine over SSH; treating that as a
+/// problem to fix would be reporting the operator to themselves.
+fn ssh_login_allowlist(db: &Db) -> Result<Check> {
+    let addresses = db.recent_ssh_login_ips()?;
+    let days = crate::db::SSH_LOGIN_WINDOW_SECONDS / (24 * 60 * 60);
+    let detail = match addresses.len() {
+        // Not "no logins" — far more likely nothing has run yet, since the
+        // window is fed by the cron and a host that has just started has an
+        // empty table for a minute either way.
+        0 => format!("no successful SSH login recorded in the last {days} days"),
+        // Listed, not counted. The count answers "is it working"; the
+        // addresses answer "should that one still be on here", which is
+        // the question actually worth asking about an allowlist.
+        _ => format!(
+            "{} address(es) cannot be blocked, having logged in over SSH within {days} days: {}",
+            addresses.len(),
+            addresses.join(", ")
+        ),
+    };
+    Ok(Check {
+        id: "ssh-login-allowlist",
+        title: "Addresses kept un-blockable",
+        level: Level::Ok,
+        detail,
+        fix: None,
+    })
 }
 
 /// Where NGINX runs, and whether everything that has to agree with that
@@ -1423,6 +1461,43 @@ mod tests {
             "the fix should name the directive: {:?}",
             check.fix
         );
+    }
+
+    /// The allowlist has to name its entries, not count them. A count
+    /// tells an operator the mechanism works; only the addresses let them
+    /// notice one that should no longer be there.
+    #[test]
+    fn the_ssh_allowlist_check_names_the_addresses_it_protects() {
+        let db = db();
+        db.record_ssh_login_ips(&["203.0.113.5".to_string(), "198.51.100.2".to_string()])
+            .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+
+        let check = check2(&report, "ssh-login-allowlist");
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains("203.0.113.5"),
+            "was: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("198.51.100.2"),
+            "was: {}",
+            check.detail
+        );
+        assert!(check.detail.contains('7'), "was: {}", check.detail);
+    }
+
+    /// An empty allowlist is the ordinary state of a host that has just
+    /// started, so it must never read as a fault.
+    #[test]
+    fn an_empty_ssh_allowlist_is_not_a_warning() {
+        let report = assess(&db(), &healthy()).unwrap();
+
+        let check = check2(&report, "ssh-login-allowlist");
+        assert_eq!(check.level, Level::Ok);
+        assert!(check.fix.is_none());
     }
 
     /// A host that has served nothing yet is not misconfigured, and must

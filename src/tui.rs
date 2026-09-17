@@ -563,6 +563,7 @@ fn short_check_label(id: &str) -> String {
         "log-sources" => "logs",
         "access-log-clients" => "clients",
         "nginx-deployment" => "runtime",
+        "ssh-login-allowlist" => "ssh",
         other => other,
     }
     .to_string()

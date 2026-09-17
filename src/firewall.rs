@@ -232,9 +232,43 @@ pub struct BuiltFirewall {
 /// updating" staleness check ([`rules_signature`]) share one gathering
 /// implementation and can never drift out of sync with each other.
 pub fn all_rules(db: &Db) -> Result<Vec<FirewallRule>> {
-    let mut rules = db.list_firewall_rules()?;
+    let mut rules = ssh_allow_rules(db)?;
+    rules.extend(db.list_firewall_rules()?);
     rules.extend(derived_firewall_rules(db)?);
     Ok(rules)
+}
+
+/// An Allow rule for every address a successful SSH login has been seen
+/// from inside [`Db::recent_ssh_login_ips`]'s window. Synthetic, like
+/// [`derived_firewall_rules`]: `id: 0`, never persisted, recomputed on
+/// every render.
+///
+/// **These go strictly first, and that placement is the whole mechanism.**
+/// Both backends evaluate first-match-wins, so an Allow ahead of
+/// everything else means no later rule can block that address — not a
+/// derived reputation CIDR that happens to contain it, not an allowlist
+/// catch-all, not a Block rule an admin added by hand. Filtering blocks
+/// out instead would have covered only the first of those three: a /24
+/// from a reputation feed cannot be "removed" for one address inside it.
+///
+/// The consequence is worth stating plainly: whoever can authenticate over
+/// SSH gets a week of immunity from every detector this tool has. That is
+/// what "don't block that one under any circumstance" means, and it is the
+/// right trade for a tool that can otherwise wall its own operator out of
+/// the host, but it is a real hole and not an accident.
+pub fn ssh_allow_rules(db: &Db) -> Result<Vec<FirewallRule>> {
+    Ok(db
+        .recent_ssh_login_ips()?
+        .into_iter()
+        .map(|address| FirewallRule {
+            id: 0,
+            address,
+            port: None,
+            action: FirewallAction::Allow,
+            enabled: true,
+            expires_at: None,
+        })
+        .collect())
 }
 
 /// A stable, backend- and path-independent fingerprint of `rules` — used
@@ -517,6 +551,97 @@ mod tests {
         assert_eq!(rules[1].action, FirewallAction::Block);
         assert_eq!(rules[2].address, "::/0");
         assert_eq!(rules[2].action, FirewallAction::Block);
+    }
+
+    /// The guarantee, against the case that motivated it: the operator's
+    /// own address sits inside a reputation feed's /24. Nothing can remove
+    /// one address from that CIDR, so the Allow has to come *first* — and
+    /// first-match-wins is what makes that enough.
+    #[test]
+    fn all_rules_lets_a_recent_ssh_login_through_a_blocked_range_it_sits_inside() {
+        let db = Db::open_in_memory().unwrap();
+        db.register_ip_range_source(&crate::db::IpRangeSource {
+            id: "gptbot".to_string(),
+            name: "GPTBot IP ranges".to_string(),
+            url: "https://example.invalid/gptbot.json".to_string(),
+            category: crate::db::Category::Ai,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        db.replace_ip_ranges("gptbot", &["4.5.6.0/24".to_string()])
+            .unwrap();
+        db.record_ssh_login_ips(&["4.5.6.7".to_string()]).unwrap();
+
+        let rules = all_rules(&db).unwrap();
+
+        assert_eq!(rules[0].address, "4.5.6.7");
+        assert_eq!(rules[0].action, FirewallAction::Allow);
+        assert!(lockout_risks(&rules, &["4.5.6.7".to_string()]).is_empty());
+    }
+
+    /// "Under any circumstance" includes a rule an admin added by hand.
+    /// The rule stays in the table — this does not delete anyone's work —
+    /// it just never gets to match.
+    #[test]
+    fn all_rules_overrides_even_a_hand_added_block_for_a_recent_ssh_login() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "4.5.6.7".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+        db.record_ssh_login_ips(&["4.5.6.7".to_string()]).unwrap();
+
+        let rules = all_rules(&db).unwrap();
+
+        assert!(lockout_risks(&rules, &["4.5.6.7".to_string()]).is_empty());
+        // Still stored, still Block, still listed: neutralised, not removed.
+        let stored = db.list_firewall_rules().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].action, FirewallAction::Block);
+    }
+
+    /// An allowlist catch-all blocks everything it does not explicitly
+    /// permit, which is the other way an operator walls themselves out.
+    #[test]
+    fn all_rules_lets_a_recent_ssh_login_past_the_allowlist_catchall() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("nl", true).unwrap();
+        db.record_ssh_login_ips(&["9.9.9.9".to_string()]).unwrap();
+
+        let rules = all_rules(&db).unwrap();
+
+        assert!(lockout_risks(&rules, &["9.9.9.9".to_string()]).is_empty());
+    }
+
+    /// The window is what stops this being a permanent allowlist. Nothing
+    /// here reads a log, which is the point: a stored login still protects
+    /// its address on a host where the SSH log has since become unreadable.
+    #[test]
+    fn all_rules_stops_protecting_an_address_once_its_window_lapses() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["4.5.6.7".to_string()]).unwrap();
+        db.backdate_ssh_login_for_tests("4.5.6.7", crate::db::SSH_LOGIN_WINDOW_SECONDS + 60)
+            .unwrap();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "4.5.6.7".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+
+        let rules = all_rules(&db).unwrap();
+
+        assert!(!rules.iter().any(|r| r.action == FirewallAction::Allow));
+        assert_eq!(
+            lockout_risks(&rules, &["4.5.6.7".to_string()]),
+            vec![("4.5.6.7".to_string(), "4.5.6.7".to_string())]
+        );
     }
 
     #[test]

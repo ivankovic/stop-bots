@@ -372,6 +372,19 @@ pub fn run_log_job(
     firewall_out: Option<&std::path::Path>,
     apply_for_real: bool,
 ) -> Result<String> {
+    // Before the job itself, and for every SSH-log-backed job rather than
+    // one designated recorder: this is what keeps the anti-lockout window
+    // fed. Detectors run every minute, so an address the operator logs in
+    // from is recorded within a minute of the login and stays protected for
+    // a week afterwards — including across a log rotation that drops the
+    // line proving it. See the `ssh_login_ips` schema comment for why the
+    // stored time is when we looked, not when sshd says the login was.
+    if uses_ssh_log(job) {
+        if let Some(text) = log_text {
+            db.record_ssh_login_ips(&crate::sshlog::parse_accepted_ips(text))?;
+        }
+    }
+
     let summary = match job {
         // Every detector runs through one arm. What differs between them —
         // the log they read, the threshold, the function — is either on the
@@ -1126,6 +1139,53 @@ mod tests {
         );
 
         assert_eq!(text, None);
+    }
+
+    /// Recording happens on *every* SSH-log-backed job, not in one
+    /// designated place — that is what keeps the window fed minute by
+    /// minute, and what makes an address survive the rotation that drops
+    /// the log line proving the login.
+    #[test]
+    fn an_ssh_log_job_records_the_addresses_it_saw_logins_from() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("fw.nft");
+        let log = "Accepted publickey for m from 203.0.113.5 port 55000 ssh2\n";
+
+        run_log_job(
+            &db,
+            CronJob::Detect(Detector::SshScanners),
+            Some(log),
+            Some(&out),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(db.recent_ssh_login_ips().unwrap(), vec!["203.0.113.5"]);
+    }
+
+    /// A job that reads the *access* log must not touch this table: its
+    /// text has nothing to do with SSH, and parsing it as if it did would
+    /// be how a stray "Accepted " in a request path becomes an allowlist
+    /// entry.
+    #[test]
+    fn an_access_log_job_records_no_ssh_logins() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("fw.nft");
+        let log = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \
+                   \"GET /Accepted%20for%20x%20from%20y HTTP/1.1\" 200 1 \"-\" \"UA\"\n";
+
+        run_log_job(
+            &db,
+            CronJob::RecordAccessStats,
+            Some(log),
+            Some(&out),
+            false,
+        )
+        .unwrap();
+
+        assert!(db.recent_ssh_login_ips().unwrap().is_empty());
     }
 
     /// The summary is the whole point of the job: it is what the

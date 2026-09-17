@@ -566,6 +566,13 @@ fn reject_a_wholly_unusable_fetch(source: &str, addresses: &[String]) -> Result<
     Ok(())
 }
 
+/// How long a successful SSH login keeps its address un-blockable. Seven
+/// days: long enough to cover a week away from the host, which is the
+/// gap an operator is most likely to lock themselves out across, and
+/// short enough that an address stops being special once it stops being
+/// used.
+pub const SSH_LOGIN_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+
 fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -867,6 +874,32 @@ impl Db {
             CREATE TABLE IF NOT EXISTS blocked_user_agents (
                 user_agent TEXT PRIMARY KEY,
                 blocked_at INTEGER NOT NULL
+            );
+            -- Addresses a successful SSH login has been observed from, and
+            -- when we observed it. The anti-lockout guarantee is built on
+            -- this table: `firewall::all_rules` turns every row inside the
+            -- window into an Allow rule ahead of everything else, so an
+            -- address the operator actually logs in from cannot be blocked
+            -- by any rule, derived or hand-written.
+            --
+            -- `seen_at` is *observation* time, not login time, and that is
+            -- deliberate rather than a shortcut. sshd\'s own timestamps are
+            -- not usable for a window this long: the syslog file format
+            -- carries no year, and the `journalctl -o cat` fallback strips
+            -- timestamps entirely. Observation time needs neither. It is
+            -- also what survives log rotation — once a login is recorded
+            -- here it stays for the full window even after the line that
+            -- proved it is gone, which is the case that matters, since an
+            -- operator who has not logged in for six days is exactly the
+            -- one at risk of locking themselves out.
+            --
+            -- The trade is that a first run against an old log dates every
+            -- login in it to now, over-protecting for up to a week. That
+            -- errs in the safe direction for a table whose whole job is
+            -- keeping the operator\'s way back in open.
+            CREATE TABLE IF NOT EXISTS ssh_login_ips (
+                address TEXT PRIMARY KEY,
+                seen_at INTEGER NOT NULL
             );
             COMMIT;
             ",
@@ -2244,6 +2277,59 @@ impl Db {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to list firewall rules")
+    }
+
+    // ---- SSH login addresses (anti-lockout) ----
+
+    /// Records that a successful SSH login was just observed from each of
+    /// `addresses`, refreshing the window for one already stored.
+    ///
+    /// Called with whatever the current SSH log happens to contain, every
+    /// time a log-backed cron job runs — so the same addresses are
+    /// re-recorded constantly and this has to be an upsert, not an insert.
+    pub fn record_ssh_login_ips(&self, addresses: &[String]) -> Result<()> {
+        let seen_at = now();
+        for address in addresses {
+            self.conn.execute(
+                "INSERT INTO ssh_login_ips (address, seen_at) VALUES (?1, ?2)
+                 ON CONFLICT(address) DO UPDATE SET seen_at = ?2",
+                params![address, seen_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Every address with a successful SSH login inside
+    /// [`SSH_LOGIN_WINDOW_SECONDS`], pruning anything older first — so a
+    /// row cannot outlive the window even if nothing else ever cleans up.
+    ///
+    /// Sorted, because this feeds `firewall::all_rules` and so reaches
+    /// `firewall::rules_signature`: an unordered read would change the
+    /// fingerprint on nothing but SQLite's row order and report the
+    /// firewall as needing a re-render when it does not.
+    pub fn recent_ssh_login_ips(&self) -> Result<Vec<String>> {
+        self.conn.execute(
+            "DELETE FROM ssh_login_ips WHERE seen_at <= ?1",
+            params![now() - SSH_LOGIN_WINDOW_SECONDS],
+        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT address FROM ssh_login_ips ORDER BY address")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list recent SSH login addresses")
+    }
+
+    /// Moves a stored login `seconds` further into the past. Test-only —
+    /// the window is seven days, so the alternative is a test that cannot
+    /// run without waiting a week or injecting a clock everywhere.
+    #[cfg(test)]
+    pub fn backdate_ssh_login_for_tests(&self, address: &str, seconds: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE ssh_login_ips SET seen_at = seen_at - ?2 WHERE address = ?1",
+            params![address, seconds],
+        )?;
+        Ok(())
     }
 
     // ---- crawler IP-range sources ----
@@ -3707,6 +3793,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn recent_ssh_login_ips_returns_what_was_recorded_sorted() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["9.9.9.9".to_string(), "1.1.1.1".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            db.recent_ssh_login_ips().unwrap(),
+            vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()]
+        );
+    }
+
+    /// Every SSH-log-backed cron job re-records whatever the log holds, so
+    /// the same address arrives over and over. It has to refresh the row
+    /// rather than fail on the primary key or accumulate duplicates.
+    #[test]
+    fn record_ssh_login_ips_refreshes_an_address_instead_of_duplicating_it() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["1.1.1.1".to_string()]).unwrap();
+        db.backdate_ssh_login_for_tests("1.1.1.1", SSH_LOGIN_WINDOW_SECONDS - 60)
+            .unwrap();
+        // Six days and 23 hours old, then seen again: back to fresh.
+        db.record_ssh_login_ips(&["1.1.1.1".to_string()]).unwrap();
+        db.backdate_ssh_login_for_tests("1.1.1.1", SSH_LOGIN_WINDOW_SECONDS - 60)
+            .unwrap();
+
+        assert_eq!(db.recent_ssh_login_ips().unwrap(), vec!["1.1.1.1"]);
+    }
+
+    #[test]
+    fn recent_ssh_login_ips_drops_a_login_older_than_the_window() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["1.1.1.1".to_string()]).unwrap();
+        db.backdate_ssh_login_for_tests("1.1.1.1", SSH_LOGIN_WINDOW_SECONDS + 1)
+            .unwrap();
+
+        assert!(db.recent_ssh_login_ips().unwrap().is_empty());
+        // Pruned, not merely filtered out of the read.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM ssh_login_ips", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]

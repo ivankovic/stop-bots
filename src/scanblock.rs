@@ -84,6 +84,17 @@ pub struct ScanBlockOutcome {
     /// already covered by an existing firewall rule of the same exact
     /// address (any action) and so weren't re-added.
     pub already_covered: usize,
+    /// Of the candidates, how many were left alone because a successful
+    /// SSH login has been seen from them inside the anti-lockout window
+    /// (see [`crate::db::SSH_LOGIN_WINDOW_SECONDS`]).
+    ///
+    /// `firewall::all_rules` would have neutralised such a rule anyway, by
+    /// putting an Allow ahead of it — this is about not *writing* it.
+    /// A row saying Block against the operator's own address is alarming
+    /// whether or not it has any effect, and the Dynamic Protection screen
+    /// reads `firewall_rules` directly, so it would show that address as
+    /// blocked when it is not.
+    pub skipped_ssh_logins: usize,
     /// Addresses actually newly blocked — or, if `dry_run`, that would
     /// have been.
     pub newly_blocked: Vec<String>,
@@ -103,10 +114,11 @@ impl ScanBlockOutcome {
             return format!("no {noun}s found");
         }
         if self.newly_blocked.is_empty() {
-            return format!(
-                "found {} {noun}(s), all already covered",
-                self.candidates - self.skipped_known_crawlers
-            );
+            let surviving = self.candidates - self.skipped_known_crawlers;
+            if self.skipped_ssh_logins > 0 && self.already_covered == 0 {
+                return format!("found {surviving} {noun}(s), all recent SSH logins — left alone");
+            }
+            return format!("found {surviving} {noun}(s), all already covered");
         }
         let verb = if self.dry_run {
             "would block"
@@ -606,6 +618,15 @@ fn add_block_rules(
         .map(|rule| rule.address)
         .collect();
 
+    // Addresses the operator has actually logged in from recently. Parsed
+    // once, and kept as `IpAddr` rather than strings because the comparison
+    // below is containment, not equality.
+    let ssh_logins: Vec<std::net::IpAddr> = db
+        .recent_ssh_login_ips()?
+        .iter()
+        .filter_map(|ip| ip.parse().ok())
+        .collect();
+
     let kept = match crate::protection::subnet_escalation(db)? {
         Some(min) => escalate_subnets(kept, min),
         None => kept,
@@ -614,6 +635,7 @@ fn add_block_rules(
     let ttl_seconds = ttl_days * 24 * 60 * 60;
     let mut newly_blocked = Vec::new();
     let mut already_covered = 0;
+    let mut skipped_ssh_logins = 0;
     for observed in kept {
         // What gets stored is not always what was seen: an IPv6 address is
         // widened to its /64 (see `blockable_address`). Dedup happens on
@@ -625,6 +647,17 @@ fn add_block_rules(
         // can briefly exist. Harmless — the /128 is inside the /64, and it
         // expires on its own TTL.
         let ip = blockable_address(&observed);
+        // Containment rather than string equality, and checked against the
+        // *widened* address: an IPv6 candidate is stored as its /64, so an
+        // exact-match test would happily write a /64 Block covering the
+        // address the operator logs in from.
+        if ssh_logins
+            .iter()
+            .any(|login| crate::ipranges::cidr_contains(&ip, *login))
+        {
+            skipped_ssh_logins += 1;
+            continue;
+        }
         if existing.contains(&ip) {
             already_covered += 1;
             continue;
@@ -649,6 +682,7 @@ fn add_block_rules(
         skipped_known_crawlers,
         crawler_exclusion_active,
         already_covered,
+        skipped_ssh_logins,
         newly_blocked,
         ttl_days,
         dry_run,
@@ -763,6 +797,7 @@ mod tests {
             skipped_known_crawlers: 0,
             crawler_exclusion_active: true,
             already_covered: 0,
+            skipped_ssh_logins: 0,
             newly_blocked: vec![],
             ttl_days: 5,
             dry_run: false,
@@ -875,6 +910,41 @@ mod tests {
         assert!(db.list_firewall_rules().unwrap().is_empty());
     }
 
+    /// A detector must not even *write* a Block for an address the
+    /// operator logs in from. `firewall::all_rules` would neutralise it,
+    /// but the Dynamic Protection screen reads `firewall_rules` directly
+    /// and would show the operator's own address as blocked.
+    #[test]
+    fn block_ssh_scanners_leaves_an_address_with_a_recent_ssh_login_alone() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["198.51.100.9".to_string()])
+            .unwrap();
+        let log = ssh_failed_attempt("198.51.100.9", 25);
+
+        let outcome = block_ssh_scanners(&db, 20, 1, &log, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty());
+        assert_eq!(outcome.skipped_ssh_logins, 1);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// IPv6 candidates are widened to their /64 before being stored, so an
+    /// exact-string check would have written a /64 Block that contains the
+    /// very address the operator logs in from.
+    #[test]
+    fn block_ssh_scanners_leaves_the_whole_64_alone_when_a_login_sits_inside_it() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["2001:db8::5".to_string()])
+            .unwrap();
+        let log = ssh_failed_attempt("2001:db8::99", 25);
+
+        let outcome = block_ssh_scanners(&db, 20, 1, &log, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty());
+        assert_eq!(outcome.skipped_ssh_logins, 1);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
     #[test]
     fn block_spoofed_crawlers_skips_an_address_already_covered() {
         let db = Db::open_in_memory().unwrap();
@@ -902,6 +972,7 @@ mod tests {
             skipped_known_crawlers: 0,
             crawler_exclusion_active: true,
             already_covered: 0,
+            skipped_ssh_logins: 0,
             newly_blocked: vec![],
             ttl_days: 1,
             dry_run: false,
