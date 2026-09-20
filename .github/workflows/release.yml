@@ -261,13 +261,30 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           for arch in amd64 arm64; do
             index="dists/stable/main/binary-${arch}/Packages"
-            grep -q "^Version: ${version}$" "$index" \
-              || { echo "::error::${index} does not list ${version}"; exit 1; }
+            # `0.0.3-1`, not `0.0.3`: a Debian version carries a package
+            # revision after the upstream one, and cargo-deb defaults it to
+            # -1. Matching the bare version failed the first real release on
+            # a repository that was entirely correct.
+            if ! grep -qE "^Version: ${version}(-[0-9]+)?$" "$index"; then
+              echo "::error::${index} does not list ${version}; it has:"
+              grep '^Version: ' "$index" || echo "  (no Version: field at all)"
+              exit 1
+            fi
             # Every Filename: must resolve, or apt 404s at install time
             # having already told the user the package was available.
-            awk '/^Filename: /{print $2}' "$index" | while read -r f; do
-              [ -f "$f" ] || { echo "::error::${index} points at missing ${f}"; exit 1; }
+            #
+            # Collected in a loop rather than piped into `while read`: that
+            # runs the loop in a subshell, where `exit 1` leaves the subshell
+            # and the step carries on succeeding -- a check that cannot fail
+            # is worse than no check, because the log says it passed.
+            missing=""
+            for f in $(awk '/^Filename: /{print $2}' "$index"); do
+              [ -f "$f" ] || missing="${missing} ${f}"
             done
+            if [ -n "$missing" ]; then
+              echo "::error::${index} points at missing file(s):${missing}"
+              exit 1
+            fi
           done
           echo "Both indices carry ${version}, and every Filename: resolves."
 
