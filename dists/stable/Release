@@ -1,0 +1,32 @@
+Architectures: amd64 arm64
+Codename: stable
+Components: main
+Date: Sun, 20 Sep 2026 10:27:59 +0000
+Description: stop-bots -- stop bad bots without hiding behind a CDN
+Label: stop-bots
+Origin: stop-bots
+Suite: stable
+MD5Sum:
+ 3883420a335dfa4939101f15acd0e827              216 Release
+ a340da821fbbfe047595cf30219f6072             1092 main/binary-amd64/Packages
+ 0b2918444c9c027470f471a4ef429588              694 main/binary-amd64/Packages.gz
+ fedf009ca131277af68c9e13b6b5a7c4             1092 main/binary-arm64/Packages
+ 7c717bfe55d5fc1c8003aa3d058d01a6              697 main/binary-arm64/Packages.gz
+SHA1:
+ 5e12f3c47f7944e70b1172196f41e16f74589013              216 Release
+ 9d0fbfb2a0eab5512688645136f1c9a01a46895f             1092 main/binary-amd64/Packages
+ 9a30edd998adf50f50265f4a839998dd989926d3              694 main/binary-amd64/Packages.gz
+ 5d7eef7b9af48dca0435eb27a9fa0d4894050882             1092 main/binary-arm64/Packages
+ c43f4666141b4fe6c6a2fd3274775b728d19130c              697 main/binary-arm64/Packages.gz
+SHA256:
+ 3c43ca60d8b70e11d9b5dba5f3fa74b6c010f68ea0706642f76f575625c7b468              216 Release
+ e3fb70c56eeeceb9f6d4b37d53e10f7c4327fbe25f0687752fa1b77432120f49             1092 main/binary-amd64/Packages
+ c9a33cf7283eca6f182972a5f965fbfd2b4cf45b26299e282fcbc93d69f10024              694 main/binary-amd64/Packages.gz
+ 37b1a870eacd0191e7788e4776071d9d39b0bdb4e70f066a488f2a60a5eb0cd1             1092 main/binary-arm64/Packages
+ 2c041d1783a96e31901267afcd0ae67f8a8ff160d9a1a7749764ea6da1d4bffb              697 main/binary-arm64/Packages.gz
+SHA512:
+ 5f242543aee4d7a2b80ba00cfdb04963b62d2be5252d47ad7557535df92e126cd2f3ceb88761add1282a0bbb2c345064928e01958bddc5529b3affa4b2056288              216 Release
+ 3fbaa88c9aa767885846602d71f0503c0ca3ac447d20386a5255a453e918d8278a57ca3126442fe9a9f3f81226dfb4a6b11e097aa666f13e18b9096b5479dc19             1092 main/binary-amd64/Packages
+ 97147b57b8d6181130db55c92b01c93e9eec83086ec63a28ac2a3d76aa523db0df358f16b2321f7fcac28f55b742773cdb530c852b5965bedcb987f8c9326a43              694 main/binary-amd64/Packages.gz
+ 26c1eb44ffab609e19d93c90ac833631a6190fecf774d2d3c5ab01e0ea35ca81e4020ad03ad3055b6190ff8544db61564ca1b389fc3a069a05adbabcd36d2024             1092 main/binary-arm64/Packages
+ 86e8d4b56a82f922321eb95d095a29080837e5fcdd28ff519f6b0141caca3db34d2407f1af24e3205836a358ffde66eff28d5f7f08c3a6fa32baee405c5b3aa7              697 main/binary-arm64/Packages.gz
