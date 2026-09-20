@@ -4,7 +4,7 @@ name = "stop-bots"
 # is the honest signal for a crate whose library API is the whole of
 # `src/lib.rs` and is not yet designed to be depended on. The value here is the
 # binary; the lib is published because the integration tests use it.
-version = "0.0.2"
+version = "0.0.3"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Marko Ivankovic <marko@ivankovic.me>"]

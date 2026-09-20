@@ -5,7 +5,7 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking â
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
-## [Unreleased]
+## [0.0.3] â€” 2026-09-20
 
 ### Added
 
@@ -1024,6 +1024,7 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/ivankovic/stop-bots/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/ivankovic/stop-bots/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/ivankovic/stop-bots/releases/tag/v0.0.1
