@@ -68,6 +68,8 @@ aliases, step through them; `?` toggles a full key-binding reference at any time
 opens a command palette listing every action by name. Tab / Shift+Tab always move between
 the *panels* of the current screen, never between screens.
 
+![The four screens in sequence: Dashboard, Bot settings, Site settings and Dynamic Protection](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/tour.gif)
+
 The Dashboard owns everything that ends up in the **firewall script**; Site settings owns
 everything that ends up in **NGINX config**. That split decides where any given setting lives.
 

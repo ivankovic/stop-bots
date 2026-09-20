@@ -122,6 +122,14 @@ libc = "0.2"
 # testing; a real listener would only add a port to collide on.
 tower = { version = "0.5.3", features = ["util"] }
 
+# Rasterising the TUI's own SVG frames into the animated tour in
+# `docs/screenshots/`. Dev-only on purpose: the shipped binary draws to a
+# terminal and has no use for an SVG renderer, so `cargo install
+# stop-bots` never builds either of these. `resvg` re-exports the `usvg`
+# and `tiny-skia` it needs, so this is two entries rather than four.
+resvg = "0.48"
+gif = "0.14"
+
 # Argon2 is deliberately expensive, and an unoptimised build multiplies
 # that by roughly twenty: the same hash that costs ~50ms in the shipped
 # binary cost nearly two seconds under `cargo test`, which made every

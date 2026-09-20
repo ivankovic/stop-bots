@@ -42,6 +42,14 @@
 //! README references it by absolute `raw.githubusercontent.com` URL —
 //! relative image paths do not resolve on crates.io.
 //!
+//! `tour.gif` is the one exception, and it buys something the stills
+//! cannot show: that `1`-`4` are how you move between the screens. Its
+//! frames are the same [`svg`] output rasterised, so it cannot drift from
+//! the stills beside it. It gives up two of the three properties above —
+//! it is a binary blob in review, and it needs fonts on the generating
+//! machine — which is why it is one file rather than the format
+//! everything uses. See [`tour_gif`].
+//!
 //! The web console's pages come from the same seed, rendered through the
 //! real router in-process (the way `tests/web.rs` drives it) and written
 //! as HTML under `target/web-screenshots/`. A browser has to rasterise
@@ -53,6 +61,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::body::Body;
@@ -62,6 +71,8 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use ratatui::Terminal;
+use resvg::tiny_skia;
+use resvg::usvg;
 use tower::ServiceExt;
 
 use stop_bots::app::App;
@@ -183,6 +194,11 @@ async fn main() -> Result<()> {
         std::fs::write(&path, render_svg(&mut app, rows)?)?;
         println!("wrote {}", path.display());
     }
+
+    // The same four screens again, as one animation. The stills show what
+    // each screen contains; only this shows that `1`-`4` are how you get
+    // between them.
+    tour_gif(&mut app, &out.join("tour.gif"))?;
 
     // The console, from the same database. `App` keeps its own
     // connection open; SQLite is happy to hand out a second one.
@@ -394,6 +410,148 @@ fn render_svg(app: &mut App, rows: u16) -> Result<String> {
     Ok(svg(terminal.backend().buffer()))
 }
 
+// ---- the animated tour ----
+
+/// Rows every tour frame renders at.
+///
+/// One height for all of them, for two reasons. A GIF's frames are a
+/// single size, and a real terminal does not resize itself when you press
+/// `2`. It is the Dashboard's height because that screen needs all 38
+/// rows: a frame with its bottom panel cut off is worse than one where a
+/// shorter screen has room to spare, and the stills already show each
+/// screen at its own best height.
+const TOUR_ROWS: u16 = 38;
+
+/// How long each screen holds, in hundredths of a second — the unit GIF
+/// stores delays in. Long enough to read a panel, short enough that the
+/// whole loop is under ten seconds.
+const TOUR_DELAY_CS: u16 = 200;
+
+/// The four screens, in the order the number keys put them in.
+const TOUR: [Screen; 4] = [
+    Screen::Dashboard,
+    Screen::BotSettings,
+    Screen::SiteSettings,
+    Screen::DynamicProtection,
+];
+
+/// Renders the tour and writes it as an animated GIF.
+///
+/// Every frame is the ordinary [`svg`] output for a screen, rasterised —
+/// so the animation cannot drift from the stills beside it, and the whole
+/// thing stays a pure function of the same seed.
+fn tour_gif(app: &mut App, path: &Path) -> Result<()> {
+    let fonts = font_database()?;
+
+    let mut frames = Vec::with_capacity(TOUR.len());
+    for screen in TOUR {
+        app.screen = screen;
+        let markup = render_svg(app, TOUR_ROWS)?;
+        frames.push(rasterise(&markup, &fonts)?);
+    }
+
+    let (width, height, _) = frames[0];
+    let file = std::fs::File::create(path)?;
+    let mut encoder = gif::Encoder::new(
+        std::io::BufWriter::new(file),
+        u16::try_from(width)?,
+        u16::try_from(height)?,
+        &[],
+    )?;
+    encoder.set_repeat(gif::Repeat::Infinite)?;
+    for (w, h, pixels) in &mut frames {
+        // `from_rgba_speed` quantises to GIF's 256-entry palette and needs
+        // the buffer mutable to do it. Speed 10 of 30 — these frames are
+        // flat terminal colours, so there is little for a slower pass to
+        // find, and speed 1 costs seconds per frame for no visible gain.
+        let mut frame =
+            gif::Frame::from_rgba_speed(u16::try_from(*w)?, u16::try_from(*h)?, pixels, 10);
+        frame.delay = TOUR_DELAY_CS;
+        encoder.write_frame(&frame)?;
+    }
+    drop(encoder);
+
+    println!("wrote {}", path.display());
+    Ok(())
+}
+
+/// The fonts the frames are rasterised with.
+///
+/// The stills never need this: an SVG names a font stack and leaves the
+/// choice to whoever opens it. A GIF has to commit to actual glyphs, so
+/// something has to resolve that stack here.
+///
+/// System fonts rather than a copy committed to the repository. That does
+/// mean a machine with a different DejaVu build can produce slightly
+/// different bytes, which is the same bargain the web screenshots already
+/// make by rasterising through whichever browser is installed — and it is
+/// better than carrying 660 KB of font binaries for one example. Missing
+/// fonts are an error rather than a silent fallback: the grid only lines
+/// up if the glyphs are monospace, and a proportional fallback would
+/// produce a picture of a broken layout.
+fn font_database() -> Result<Arc<usvg::fontdb::Database>> {
+    let mut db = usvg::fontdb::Database::new();
+    db.load_system_fonts();
+
+    const WANTED: &str = "DejaVu Sans Mono";
+    let have = db
+        .faces()
+        .any(|face| face.families.iter().any(|(name, _)| name == WANTED));
+    anyhow::ensure!(
+        have,
+        "{WANTED} is not installed, and the tour GIF needs a monospace font to line its \
+         columns up (Debian/Ubuntu: apt install fonts-dejavu-core). The SVG screenshots \
+         do not need it and were still written."
+    );
+    db.set_monospace_family(WANTED);
+    Ok(Arc::new(db))
+}
+
+/// One SVG frame to straight RGBA.
+fn rasterise(markup: &str, fonts: &Arc<usvg::fontdb::Database>) -> Result<(u32, u32, Vec<u8>)> {
+    let options = usvg::Options {
+        fontdb: fonts.clone(),
+        ..Default::default()
+    };
+    let tree = usvg::Tree::from_str(markup, &options).context("the generated SVG did not parse")?;
+    let size = tree.size().to_int_size();
+    let (width, height) = (size.width(), size.height());
+
+    let mut pixmap =
+        tiny_skia::Pixmap::new(width, height).context("frame dimensions are not a valid pixmap")?;
+    // The SVG's background rect is rounded, so the pixels outside the
+    // corners are transparent. GIF transparency is one palette index
+    // rather than an alpha channel, and letting those corners through
+    // would put a hard-edged notch on whatever the README is displayed
+    // against. Filling first squares the corners off in the terminal's
+    // own background, which is the quieter of the two.
+    pixmap.fill(background());
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+
+    // tiny-skia stores premultiplied alpha; GIF wants it straight.
+    let pixels = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|px| {
+            let px = px.demultiply();
+            [px.red(), px.green(), px.blue(), px.alpha()]
+        })
+        .collect();
+    Ok((width, height, pixels))
+}
+
+/// [`BG_DEFAULT`] as a colour the rasteriser understands, so the two can
+/// never disagree about what "the terminal background" is.
+fn background() -> tiny_skia::Color {
+    let hex = BG_DEFAULT.trim_start_matches('#');
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0);
+    tiny_skia::Color::from_rgba8(byte(0), byte(2), byte(4), 255)
+}
+
 // ---- seeding ----
 
 fn seed(db: &Db) -> Result<()> {
@@ -497,6 +655,13 @@ fn seed_after_startup(db: &Db) -> Result<()> {
         db.upsert_site(host, &format!("/etc/nginx/sites-enabled/{host}"))?;
     }
 
+    // Offsets from now rather than fixed timestamps: the panels render
+    // "N minutes ago", which stays the same string across regenerations
+    // only if the offset is what's pinned.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+
     // Mark the bot lists fetched, with the counts they really do return, so
     // the Summary panel reads "up to date" instead of "3 need updating" —
     // a screenshot of a tool that has never run is a screenshot of nothing.
@@ -508,13 +673,24 @@ fn seed_after_startup(db: &Db) -> Result<()> {
         db.touch_source(id, bot_count)?;
     }
 
-    // A plausible run history, so the Scheduled tasks panel isn't nine
-    // rows of "last ran never". Offsets from now rather than fixed
-    // timestamps: the panel renders "N minutes ago", which stays the same
-    // string across regenerations only if the offset is what's pinned.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs() as i64;
+    // ...and then pin when they were fetched.
+    //
+    // `touch_source` stamps the moment it runs, and so does the
+    // `register_all_sources` that `App::new` performs on the built-in
+    // list. Bot settings renders that to the second, so it read "updated
+    // 0s ago" on a fast machine and "updated 2s ago" on a slow one — the
+    // one thing in these screenshots that changed by itself, and the
+    // reason regenerating them produced a diff with nothing behind it.
+    // Harmless while the output was SVG and somebody read the diff;
+    // `tour.gif` is a binary blob, where an unexplained change is
+    // unreviewable.
+    //
+    // 44 minutes because that is when "Update crawler IP ranges" below
+    // last ran, and that is the job that fetches these.
+    for mut source in db.list_sources()? {
+        source.last_fetched_at = Some(now - 44 * 60);
+        db.upsert_source(&source)?;
+    }
     for (job_id, minutes_ago, summary) in [
         ("update_ip_ranges", 44, "4 sources, 21,904 ranges"),
         ("record_access_stats", 3, "8 user agents"),
