@@ -7,13 +7,16 @@ pkgdesc="A TUI that helps you configure your server to stop bad bots and still a
 arch=('x86_64')
 url="https://github.com/ivankovic/stop-bots"
 license=('AGPL-3.0-or-later')
-depends=('gcc-libs')
+# None. The published binary is statically linked against musl, which is
+# what lets one build serve every distribution; there is no libc to depend
+# on. See .github/workflows/release.yml for why that target was chosen.
+depends=()
 provides=("$_pkgname=$pkgver")
 conflicts=("$_pkgname")
 optdepends=('nginx: to apply the generated site blocking rules'
             'nftables: to apply the generated firewall script'
             'iptables: alternative firewall backend')
-_tarball="$_pkgname-$pkgver-x86_64-unknown-linux-gnu"
+_tarball="$_pkgname-$pkgver-x86_64-unknown-linux-musl"
 source=("$_tarball.tar.gz::$url/releases/download/v$pkgver/$_tarball.tar.gz")
 # The release workflow publishes a .sha256 next to the tarball; paste its
 # digest here rather than trusting a fresh download.

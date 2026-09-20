@@ -5092,6 +5092,29 @@ cyan, seeds a health probe so the strip shows something, and pins the
 header's host name to `web-01` through `tui::override_hostname` — the
 first regeneration put the maintainer's real machine name in the README.
 
+It also writes `docs/screenshots/tour.gif`: the same four screens in
+sequence, as one animation, for the one thing four stills cannot show —
+that `1`-`4` are how you move between them. Every frame is the ordinary
+`svg()` output rasterised through `resvg`, so the animation cannot drift
+from the stills, and the whole run stays a pure function of the seed.
+Both crates are `dev-dependencies`, so `cargo install stop-bots` never
+builds an SVG renderer. All frames render at the Dashboard's 38 rows
+rather than each screen's own height, because a GIF's frames are one size
+and a terminal does not resize when you press `2`. Fonts come from the
+system rather than a copy in the repository — the same bargain the
+browser-rasterised console PNGs already make — and a missing monospace
+family is an error, since a proportional fallback would render the grid
+as a picture of a broken layout.
+
+Making that GIF worth committing meant fixing a determinism bug the SVGs
+had been hiding. `touch_source` stamps the moment it runs, as does the
+`register_all_sources` in `App::new`, and Bot settings renders that to
+the second — so the screenshots read "updated 0s ago" or "updated 2s ago"
+depending on how long the generator took, and regenerating them produced
+a diff with nothing behind it. Source timestamps are now pinned to a
+whole-minute offset like the cron history already was. The generator is
+byte-for-byte reproducible across runs.
+
 **The command palette (`src/tui/palette.rs`).** `:` on any screen opens
 a popup near the top with a query line and every action by name, fuzzy
 matched as you type (each query character in order; a hit at a word
@@ -5857,3 +5880,77 @@ is believed.
 distinguishes "the format doesn't log it" from "the client didn't send
 one" — both mean there is no agent string to count or match — so a third
 state there would be a distinction nothing reads.
+
+## Debian packages and the APT repository (`[package.metadata.deb]`, `scripts/build-apt-repo.sh`)
+
+Installation was `cargo install` (needs a Rust toolchain) or a tarball
+(no upgrades). Neither is how a server operator installs a thing that
+writes firewall rules. The release workflow now also builds `.deb`s and
+publishes them to a signed repository on GitHub Pages.
+
+**Static musl, and the evidence for it.** The first end-to-end test built
+the package natively on Ubuntu 24.04 and installed it in a `debian:bookworm`
+container. `apt` resolved and installed it without complaint, and then:
+
+```
+stop-bots: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.38' not found
+stop-bots: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found
+```
+
+`[package.metadata.deb]` declares `Depends:` empty because the shipped
+binary is static — so a glibc build produces a package that *claims* to
+need no libc while needing whatever built it. It installs cleanly and
+dies on first run, one glibc version back.
+
+Static musl removes the floor entirely rather than raising it. It is
+possible here only because the dependency tree has no C TLS in it —
+`reqwest` resolves to `rustls`, confirmed in `Cargo.lock` — leaving
+`musl-gcc` one thing to compile: the SQLite that `rusqlite`'s `bundled`
+feature carries. The CI `deb` job was rewritten to build musl for exactly
+this reason: built natively, it would have installed and run on the same
+runner and never caught it.
+
+**Native arm64 runners, not cross-compilation.** `bundled` means every
+release build compiles SQLite from C, and a cross-toolchain that has to
+keep satisfying that is a standing maintenance cost for something GitHub
+now gives away on public repositories.
+
+**The package ships no unit and no maintainer scripts.** `install web`
+writes the systemd unit, creates `/var/lib/stop-bots` 0700 and generates
+the console password, behind a `--dry-run` that prints the whole plan
+first — it is the one command in the project that starts a daemon. A
+package that shipped an enabled unit would start a root-run web console
+on `apt install`, which is the opposite of the rule everything else here
+keeps. `Recommends: nftables | iptables` and `Suggests: nginx` rather
+than `Depends`, the second deliberately weak: the hosts this tool is
+*for* very often run NGINX in a container and have no `nginx` package at
+all, and a hard dependency would install a second, idle NGINX on every
+one of them to satisfy a file the real one never reads.
+
+**The indices are rebuilt, never patched.** An APT index is a set of
+checksums over a set of files, so there is no correct way to add one
+package without recomputing the rest, and a half-updated index is not a
+repository missing a package — it is one `apt` refuses to use. This makes
+`gh-pages` the archive: every version ever published lives in its `pool/`,
+and the script regenerates `dists/` from whatever is there. It also makes
+a re-run after a failed publish a no-op rather than a second copy.
+
+**No `Valid-Until`.** It is right for a distribution that republishes
+daily, where a stale mirror is a real attack surface. This repository
+republishes only on release, so the field would mean `apt update` begins
+failing on every configured machine some weeks after the last one —
+turning a quiet period into an outage for people who did nothing.
+
+**Both signature forms.** `InRelease` (clearsigned, one round trip) is
+what modern apt asks for; older clients and some proxies fetch `Release`
+plus a detached `Release.gpg`. Publishing only the first silently
+excludes the clients that need the second. The passphrase reaches `gpg`
+on stdin rather than as `--passphrase <value>`, which would put it in the
+process's argv.
+
+**Verified before the push, not after.** The `apt` job checks both
+signatures, that both per-architecture indices list the version being
+released, and that every `Filename:` resolves to a file that exists. apt
+fails closed on a bad index, so the risk is not a bad install — it is an
+`apt update` error on every machine that configured the repository, and
+those people did nothing to earn it.

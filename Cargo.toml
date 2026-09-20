@@ -49,6 +49,57 @@ exclude = [
     "docs/",
 ]
 
+# Debian packaging, consumed by `cargo deb` in the release workflow. It lives
+# here rather than in a `debian/` directory because there is no native Debian
+# build to speak of: the package is one static binary plus its documentation,
+# and duplicating the version, description and licence into a second set of
+# files is how those go stale.
+[package.metadata.deb]
+maintainer = "Marko Ivankovic <marko@ivankovic.me>"
+license-file = ["LICENSE", "0"]
+section = "net"
+priority = "optional"
+extended-description = """\
+A TUI, a web UI and a CLI that help you configure your server to stop bad bots \
+without hiding behind a CDN. It classifies known bots by category and blocks \
+them in your NGINX config, and renders an nftables or iptables script that \
+blocks countries, datacenter ranges and addresses caught scanning your logs. \
+Nothing is applied without being asked."""
+
+# Empty, not "$auto". The release build targets musl and links statically, so
+# there is no libc6 to depend on -- which is the whole reason for that target:
+# one package that installs on any Debian or Ubuntu still receiving updates,
+# rather than one per glibc era.
+depends = ""
+
+# Neither belongs in `depends`, and the distinction is not pedantry.
+#
+# A firewall backend is `recommends`: the NGINX half of this tool is entirely
+# useful on a host that has neither `nft` nor `iptables`, and `recommends` is
+# installed by default anyway, so the only people who notice are the ones who
+# passed --no-install-recommends and meant it.
+#
+# NGINX is `suggests`, weaker still, because the host running this very often
+# does not have the package at all -- it has NGINX in a container, with the
+# config on a bind mount. `set-nginx-commands` exists for exactly that
+# arrangement, and a hard dependency would install a second, idle NGINX on
+# every such host to satisfy a file the real one never reads.
+recommends = "nftables | iptables"
+suggests = "nginx"
+
+# No maintainer scripts, and no unit file, on purpose. `stop-bots install web`
+# writes the systemd unit, creates /var/lib/stop-bots 0700 and generates the
+# console password -- with a --dry-run that prints the whole plan first,
+# because it is the one command in the project that starts a daemon. A package
+# that shipped an enabled unit would start a root-run web console on `apt
+# install`, which contradicts the rule the rest of the project is built on:
+# nothing happens without you.
+assets = [
+    ["target/release/stop-bots", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/stop-bots/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/stop-bots/CHANGELOG.md", "644"],
+]
+
 [dependencies]
 # For TUI
 ratatui = "0.30"

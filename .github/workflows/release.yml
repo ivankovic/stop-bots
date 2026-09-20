@@ -1,7 +1,7 @@
 name: Release
 
-# Tag-driven: pushing `v0.0.1` builds the binary and creates the matching
-# GitHub release.
+# Tag-driven: pushing `v0.0.1` builds the binaries, creates the matching
+# GitHub release, and republishes the APT repository on GitHub Pages.
 #
 # This workflow deliberately does NOT run `cargo publish`. A tag can be deleted
 # and re-pushed; a crates.io version cannot — it can only be yanked, and
@@ -39,35 +39,239 @@ jobs:
 
   build:
     needs: verify-version
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Both artifacts are wanted, and one architecture failing should still
+      # leave the other buildable and inspectable rather than cancelled.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            debarch: amd64
+            cc: CC_x86_64_unknown_linux_musl
+          # A native arm64 runner rather than cross-compilation. `rusqlite`
+          # is built with `bundled`, so every release build compiles SQLite
+          # from C, and a cross-toolchain that has to keep satisfying that is
+          # a standing maintenance cost for something GitHub now gives away.
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            debarch: arm64
+            cc: CC_aarch64_unknown_linux_musl
     steps:
       - uses: actions/checkout@v7
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
 
-      # x86_64 Linux only. The tool shells out to systemctl, nginx -t and
-      # nft/iptables; it compiles on macOS and Windows and is useless there, so
-      # shipping those artifacts would only invite questions.
+      # musl, and therefore one package that installs on every Debian and
+      # Ubuntu still receiving updates. Linking against glibc instead would
+      # inherit a version floor from whatever the runner ships, leaving the
+      # choice between a package that refuses to install on anything older
+      # and a container build per glibc era.
+      #
+      # Viable here only because the dependency tree has no C TLS in it —
+      # `reqwest` resolves to `rustls` — so `musl-gcc` has exactly one thing
+      # to compile: the SQLite that `rusqlite`'s `bundled` feature carries.
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+
+      - name: Install cargo-deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      # The target-specific `CC_*` rather than a bare `CC`: build scripts and
+      # proc macros are compiled for the *host*, and pointing their C compiler
+      # at musl too is how a build that looks cross-aware fails inside a
+      # dependency nobody here wrote.
       - name: Build
-        run: cargo build --release --locked
+        env:
+          ${{ matrix.cc }}: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
+      # `--no-build`, because the step above already built it — with
+      # `--locked`, which cargo-deb's own build would not have used.
+      # `--no-strip` because `[profile.release]` already sets `strip = true`,
+      # and cargo-deb's stripping step shells out to a `strip` that does not
+      # necessarily match the target.
+      - name: Build .deb
+        run: cargo deb --no-build --no-strip --target ${{ matrix.target }} --output dist/
+
+      # The tarball stays, for the AUR `-bin` package and for anyone who would
+      # rather not add a repository to their machine. Same binary as the .deb.
+      - name: Package tarball
         run: |
           version="${GITHUB_REF_NAME#v}"
-          name="stop-bots-${version}-x86_64-unknown-linux-gnu"
+          name="stop-bots-${version}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
-          cp target/release/stop-bots README.md LICENSE "dist/${name}/"
+          cp "target/${{ matrix.target }}/release/stop-bots" README.md LICENSE "dist/${name}/"
           tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          rm -rf "dist/${name}"
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      # A "static" binary that turns out not to be static is the single
+      # failure this target choice exists to prevent, and it would otherwise
+      # surface as a broken install on someone else's machine rather than
+      # here. `ldd` prints "not a dynamic executable" for a static binary, so
+      # the test is for any *other* output.
+      - name: Verify the binary is static and runs
+        run: |
+          binary="target/${{ matrix.target }}/release/stop-bots"
+          if ldd "$binary" 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "::error::$binary is dynamically linked:"
+            ldd "$binary"
+            exit 1
+          fi
+          file "$binary"
+          # And that it runs at all, which catches a build that produced the
+          # wrong machine type — the way a cross-build goes wrong quietly.
+          "$binary" --version
+
+      - name: Inspect the package
+        run: |
+          dpkg-deb --info dist/*.deb
+          dpkg-deb --contents dist/*.deb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.debarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
 
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
-          files: |
-            dist/*.tar.gz
-            dist/*.sha256
+          files: dist/*
           generate_release_notes: true
           # Marked as a pre-release while the version is 0.0.x: cargo treats
           # every 0.0.z bump as breaking, and the release page should say the
           # same thing the version number does.
           prerelease: ${{ startsWith(github.ref_name, 'v0.0.') }}
+
+  # Republishes the APT repository with this release added to it.
+  #
+  # After `release` rather than beside it, so that a failure here still leaves
+  # a complete GitHub release behind: the .debs are downloadable and the
+  # tarballs are where the AUR package expects them, and this job can be
+  # re-run on its own to fix the repository. The other order would leave a
+  # repository advertising a release that does not exist.
+  apt:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      # The tagged tree, for scripts/build-apt-repo.sh and the landing page.
+      - uses: actions/checkout@v7
+        with:
+          path: source
+
+      # And the published repository, which holds every previously released
+      # .deb — see build-apt-repo.sh for why that history is load-bearing.
+      # `gh-pages` does not exist before the first release, so a missing
+      # branch starts an orphan rather than failing.
+      - name: Check out gh-pages
+        run: |
+          if git clone --branch gh-pages --single-branch \
+               "https://github.com/${GITHUB_REPOSITORY}.git" pages 2>/dev/null; then
+            echo "Found gh-pages with $(find pages/pool -name '*.deb' 2>/dev/null | wc -l) package(s)."
+          else
+            echo "No gh-pages branch yet — starting one."
+            git clone "https://github.com/${GITHUB_REPOSITORY}.git" pages
+            cd pages
+            git checkout --orphan gh-pages
+            git rm -rfq --ignore-unmatch .
+          fi
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: debs
+
+      - name: Install apt-ftparchive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y apt-utils
+
+      # The key id is read back from what was imported rather than kept as a
+      # second secret, which cannot then disagree with the first.
+      - name: Import the signing key
+        id: gpg
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "${APT_GPG_PRIVATE_KEY}" ]; then
+            echo "::error::secret APT_GPG_PRIVATE_KEY is not set — see RELEASING.md"
+            exit 1
+          fi
+          printf '%s' "${APT_GPG_PRIVATE_KEY}" | gpg --batch --import
+          key="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+          echo "Imported ${key}"
+
+      - name: Build and sign the repository
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: source/scripts/build-apt-repo.sh pages debs "${{ steps.gpg.outputs.key }}"
+
+      - name: Add the landing page
+        run: |
+          cp source/packaging/apt/index.html pages/index.html
+          # Pages runs everything through Jekyll by default, which drops any
+          # path beginning with an underscore and rewrites what it takes for
+          # a template. An APT repository is a set of files whose checksums
+          # have been signed, so nothing may rewrite any part of it.
+          touch pages/.nojekyll
+
+      # apt verifies what it downloads against the signed index, so a
+      # repository published wrongly fails closed rather than installing
+      # something unexpected. Worth proving before the push all the same: a
+      # broken index is an `apt update` error on every machine configured for
+      # it, and those people did nothing to deserve it.
+      - name: Verify the signatures and the indices
+        run: |
+          cd pages
+          gpg --verify dists/stable/InRelease
+          gpg --verify dists/stable/Release.gpg dists/stable/Release
+          version="${GITHUB_REF_NAME#v}"
+          for arch in amd64 arm64; do
+            index="dists/stable/main/binary-${arch}/Packages"
+            grep -q "^Version: ${version}$" "$index" \
+              || { echo "::error::${index} does not list ${version}"; exit 1; }
+            # Every Filename: must resolve, or apt 404s at install time
+            # having already told the user the package was available.
+            awk '/^Filename: /{print $2}' "$index" | while read -r f; do
+              [ -f "$f" ] || { echo "::error::${index} points at missing ${f}"; exit 1; }
+            done
+          done
+          echo "Both indices carry ${version}, and every Filename: resolves."
+
+      - name: Publish
+        run: |
+          cd pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Repository unchanged — nothing to publish."
+            exit 0
+          fi
+          git commit -m "apt: publish ${GITHUB_REF_NAME}"
+          git push "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" gh-pages

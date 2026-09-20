@@ -172,6 +172,105 @@ jobs:
       - name: Coverage
         run: cargo llvm-cov --workspace --fail-under-lines 90 --summary-only
 
+  # The same idea as `package` below, for the other publication route.
+  # `[package.metadata.deb]` is only ever exercised at tag time otherwise, and
+  # everything it can get wrong -- an asset path that does not exist, a
+  # malformed dependency field, a licence file cargo-deb cannot parse -- fails
+  # the build rather than producing a bad package. Finding that on a pull
+  # request costs a minute; finding it from a tag means deleting a release.
+  #
+  # One architecture rather than the release's two -- this is checking the
+  # packaging, and a second architecture re-tests nothing about it -- but the
+  # same musl target, which is not optional.
+  #
+  # An earlier version of this job built for the host and installed on the
+  # host. It passed, and it would have gone on passing: `[package.metadata.deb]`
+  # declares `Depends:` empty because the shipped binary is static, so a
+  # glibc-linked build gets a package that claims to need no libc while
+  # needing whatever the runner had. That installs cleanly on the runner and
+  # dies on a machine a glibc version behind:
+  #
+  #     stop-bots: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39'
+  #     not found (required by stop-bots)
+  #
+  # The install step below is what catches it, and it can only catch it if the
+  # package under test is built the way the released one is.
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-deb
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build the package
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          cargo deb --no-build --no-strip \
+            --target x86_64-unknown-linux-musl --output dist/
+
+      - name: The binary must be static
+        run: |
+          binary=target/x86_64-unknown-linux-musl/release/stop-bots
+          if ldd "$binary" 2>&1 | grep -qv 'not a dynamic executable'; then
+            echo "::error::$binary is dynamically linked, so Depends: is a lie"
+            ldd "$binary"
+            exit 1
+          fi
+
+      # A package that builds but installs the binary somewhere nothing looks
+      # would pass the step above. These two assertions are the contract the
+      # rest of the project assumes: `install web` writes a unit whose
+      # ExecStart names an absolute path, and RELEASING.md and the landing
+      # page both tell people the binary is at /usr/bin/stop-bots.
+      - name: Check the contents
+        run: |
+          dpkg-deb --info dist/*.deb
+          contents="$(dpkg-deb --contents dist/*.deb)"
+          echo "$contents"
+          echo "$contents" | grep -q ' ./usr/bin/stop-bots$' \
+            || { echo "::error::the package does not install /usr/bin/stop-bots"; exit 1; }
+          echo "$contents" | grep -q ' ./usr/share/doc/stop-bots/' \
+            || { echo "::error::the package ships no documentation"; exit 1; }
+
+      # `lintian` is what Debian itself would say about the package. Not
+      # fatal: it flags things that are genuinely wrong for the archive and
+      # merely opinions for a third-party repository -- a missing man page,
+      # an unsigned changelog. Printed so a regression is visible, not
+      # enforced so an opinion can turn this red.
+      - name: Lintian
+        continue-on-error: true
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y lintian
+          lintian --info --display-info dist/*.deb || true
+
+      # The one end-to-end check: does it actually install, and does the
+      # installed binary run? Everything above inspects the file; this uses it.
+      - name: Install it
+        run: |
+          sudo apt-get install -y ./dist/*.deb
+          stop-bots --version
+          # `status` exits non-zero when a check is CRITICAL, which it will be
+          # on a runner with no nginx and no rules applied. That it *runs* and
+          # reports is the assertion here, not what it concludes.
+          stop-bots status --quiet || true
+          sudo apt-get remove -y stop-bots
+
   # Catches the class of mistake that only surfaces at publish time: a bad
   # category slug, a missing required field, or a crate that packages fine but
   # does not build from its own tarball.

@@ -1,0 +1,178 @@
+<!doctype html>
+<!--
+  The landing page for the APT repository, copied to the root of the
+  `gh-pages` branch by the `apt` job in .github/workflows/release.yml.
+
+  It is static and hand-written on purpose. This page's whole job is to be
+  the thing someone lands on when they paste the repository URL into a
+  browser to find out what it is, and the four commands below are the
+  answer. Anything that had to be generated would be one more thing that
+  can be wrong at release time.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>stop-bots APT repository</title>
+    <meta
+      name="description"
+      content="Debian and Ubuntu packages for stop-bots."
+    />
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fbfbfa;
+        --fg: #1a1a18;
+        --muted: #6b6b63;
+        --rule: #e2e2dd;
+        --code-bg: #f2f2ee;
+        --accent: #2f6f4f;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #16161a;
+          --fg: #e8e8e4;
+          --muted: #9a9a92;
+          --rule: #2c2c32;
+          --code-bg: #1e1e24;
+          --accent: #7fc4a0;
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        padding: 3rem 1rem 5rem;
+        background: var(--bg);
+        color: var(--fg);
+        font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI",
+          Roboto, sans-serif;
+      }
+      main {
+        max-width: 46rem;
+        margin: 0 auto;
+      }
+      h1 {
+        font-size: 1.9rem;
+        line-height: 1.2;
+        margin: 0 0 0.35rem;
+        letter-spacing: -0.02em;
+      }
+      .tagline {
+        color: var(--muted);
+        margin: 0 0 2.5rem;
+      }
+      h2 {
+        font-size: 1.05rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        color: var(--muted);
+        margin: 2.5rem 0 0.75rem;
+        padding-top: 1.25rem;
+        border-top: 1px solid var(--rule);
+      }
+      pre {
+        background: var(--code-bg);
+        border: 1px solid var(--rule);
+        border-radius: 8px;
+        padding: 1rem;
+        overflow-x: auto;
+        font: 13.5px/1.65 ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+          Consolas, monospace;
+        margin: 0 0 1rem;
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+          monospace;
+        font-size: 0.9em;
+      }
+      p code {
+        background: var(--code-bg);
+        border-radius: 4px;
+        padding: 0.1em 0.35em;
+      }
+      a {
+        color: var(--accent);
+      }
+      ul {
+        padding-left: 1.2rem;
+      }
+      li {
+        margin-bottom: 0.4rem;
+      }
+      footer {
+        margin-top: 3.5rem;
+        padding-top: 1.25rem;
+        border-top: 1px solid var(--rule);
+        color: var(--muted);
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>stop-bots APT repository</h1>
+      <p class="tagline">
+        Debian and Ubuntu packages for
+        <a href="https://github.com/ivankovic/stop-bots">stop-bots</a> &mdash; a
+        TUI, web UI and CLI that help you stop bad bots without hiding behind a
+        CDN.
+      </p>
+
+      <h2>Install</h2>
+      <pre><code>curl -fsSL https://ivankovic.github.io/stop-bots/key.gpg \
+  | sudo tee /usr/share/keyrings/stop-bots.gpg > /dev/null
+
+echo "deb [signed-by=/usr/share/keyrings/stop-bots.gpg] \
+https://ivankovic.github.io/stop-bots stable main" \
+  | sudo tee /etc/apt/sources.list.d/stop-bots.list
+
+sudo apt update
+sudo apt install stop-bots</code></pre>
+
+      <h2>What you get</h2>
+      <ul>
+        <li>
+          <code>/usr/bin/stop-bots</code> &mdash; statically linked against
+          musl, so it depends on no system library and installs on any Debian
+          or Ubuntu still receiving updates.
+        </li>
+        <li><code>amd64</code> and <code>arm64</code>.</li>
+        <li>
+          No service. Installing the package starts nothing: run
+          <code>sudo stop-bots install web --dry-run</code> when you want the
+          console, and it prints the whole plan before writing anything.
+        </li>
+      </ul>
+
+      <h2>Verifying it yourself</h2>
+      <p>
+        Every index is signed with the key above, and <code>apt</code> checks
+        that signature on each <code>update</code>. To look at the fingerprint
+        before trusting it:
+      </p>
+      <pre><code>curl -fsSL https://ivankovic.github.io/stop-bots/key.gpg | gpg --show-keys</code></pre>
+
+      <h2>Other ways to install</h2>
+      <ul>
+        <li><code>cargo install stop-bots</code> from crates.io.</li>
+        <li>
+          A static tarball on the
+          <a href="https://github.com/ivankovic/stop-bots/releases"
+            >releases page</a
+          >, for a machine you would rather not add a repository to.
+        </li>
+        <li>
+          Arch: <code>stop-bots</code> or <code>stop-bots-bin</code> on the AUR.
+        </li>
+      </ul>
+
+      <footer>
+        AGPL-3.0-or-later &middot;
+        <a href="https://github.com/ivankovic/stop-bots">Source</a> &middot;
+        <a href="https://github.com/ivankovic/stop-bots/issues">Issues</a>
+      </footer>
+    </main>
+  </body>
+</html>
