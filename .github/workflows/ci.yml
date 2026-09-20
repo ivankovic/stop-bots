@@ -226,9 +226,18 @@ jobs:
       - name: The binary must be static
         run: |
           binary=target/x86_64-unknown-linux-musl/release/stop-bots
-          if ldd "$binary" 2>&1 | grep -qv 'not a dynamic executable'; then
-            echo "::error::$binary is dynamically linked, so Depends: is a lie"
-            ldd "$binary"
+          # `readelf -d`, not `ldd`. A static binary makes ldd say either
+          # "statically linked" or "not a dynamic executable" depending on
+          # its libc and whether the binary is PIE, and an earlier version of
+          # this step grepped for one of those two strings and failed the
+          # build on a binary that was correctly static. What actually
+          # decides it is whether the ELF asks for any shared library at all:
+          # a static-pie binary still has a .dynamic section, but no
+          # DT_NEEDED entry in it.
+          needed="$(readelf -d "$binary" 2>/dev/null | grep 'NEEDED' || true)"
+          if [ -n "$needed" ]; then
+            echo "::error::$binary links shared libraries, so Depends: is a lie"
+            echo "$needed"
             exit 1
           fi
 
