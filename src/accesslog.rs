@@ -23,6 +23,17 @@
 //! firewall Block rules for them. This module never writes to, rotates or
 //! truncates any log — it only ever reads.
 //!
+//! ## Two log formats
+//!
+//! Both of NGINX's common layouts parse: the stock `combined` one, and a
+//! JSON object written by a `log_format ... escape=json` directive. A JSON
+//! format is not a niche choice — it is what anyone shipping logs to a
+//! collector configures — and every detector in this module is driven by
+//! [`parse_line`], so a format it could not read did not degrade them, it
+//! switched them off. Silently, and with no failure anywhere: the file is
+//! present and readable, every line simply parses to nothing, and the
+//! honest report is "no scanners found".
+//!
 //! Deliberately doesn't share `sshlog`'s "never flag an IP that also
 //! succeeded" exclusion: a scanner's own recon almost always includes at
 //! least one 200 (`/`, `/robots.txt`, ...), so requiring "never succeeded"
@@ -70,6 +81,25 @@ pub fn find_default_source() -> LogSource {
     read_log_file(Path::new(DEFAULT_LOG_PATH))
 }
 
+/// Parses one access-log line in whichever of the two supported formats
+/// it is written in. They are told apart by the first non-space character:
+/// `{` can only begin the JSON one, since the combined layout opens with
+/// the client address.
+///
+/// The choice is made per *line*, not per file, and that is the point
+/// rather than an accident of implementation. Changing a running server's
+/// `log_format` leaves one file holding both kinds until it rotates, and
+/// an admin who adds a JSON format in order to switch these detectors on
+/// should not have to wait out that rotation to see anything detected.
+fn parse_line(line: &str) -> Option<ParsedLine> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('{') {
+        parse_json_line(trimmed)
+    } else {
+        parse_combined_line(line)
+    }
+}
+
 /// Parses a single line of NGINX's default "combined" log format:
 /// `<ip> - <remote_user> [<time_local>] "<method> <path> <proto>" <status>
 /// <bytes> "<referer>" "<user_agent>"`. Returns `None` for anything that
@@ -84,7 +114,7 @@ pub fn find_default_source() -> LogSource {
 /// A line with no trailing quoted pair at all (a stripped-down custom log
 /// format) yields an empty `user_agent` rather than failing the whole
 /// parse — status/path are still useful to `scanning_ips` either way.
-fn parse_line(line: &str) -> Option<ParsedLine> {
+fn parse_combined_line(line: &str) -> Option<ParsedLine> {
     let ip: IpAddr = line.split_whitespace().next()?.parse().ok()?;
 
     let mut fields = line.splitn(3, '"');
@@ -106,7 +136,11 @@ fn parse_line(line: &str) -> Option<ParsedLine> {
     // the two quoted fields, user_agent, ""] — index 3 is the field we want.
     let quoted: Vec<&str> = after_request.split('"').collect();
     let status: u16 = quoted.first()?.split_whitespace().next()?.parse().ok()?;
-    let referer = quoted.get(1).copied().unwrap_or("").to_string();
+    // `Some`, always: reaching here means the line had the trailing
+    // quoted pair, so the format does record the header — `"-"` when the
+    // request carried none. See [`ParsedLine::referer`] for why that is
+    // not the same as `None`.
+    let referer = Some(quoted.get(1).copied().unwrap_or("").to_string());
     let user_agent = quoted.get(3).copied().unwrap_or("").to_string();
 
     Some(ParsedLine {
@@ -118,6 +152,72 @@ fn parse_line(line: &str) -> Option<ParsedLine> {
     })
 }
 
+/// Reads one field as text, whether the format quoted it or not.
+///
+/// `escape=json` writes every variable as a string, so `$status` arrives
+/// as `"404"`. A format built with `escape=none`, or a log written by
+/// something other than NGINX, can carry a bare `404` instead. Accepting
+/// only one of the two would be the same silent no-detections failure
+/// that JSON support exists to remove, so both are read.
+fn json_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    match obj.get(key)? {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        // A bool, array, object or null in one of these positions is not a
+        // value this knows how to read. `None` rather than a guess.
+        _ => None,
+    }
+}
+
+/// Parses a line written by a JSON `log_format`, keyed by the NGINX
+/// variable names such a format is built from.
+///
+/// There is no configuration for the key names, and that is a judgement
+/// rather than an omission: a JSON `log_format` is written by naming
+/// variables, and the overwhelming convention is to keep each variable's
+/// own name as its key — `$remote_addr` under `"remote_addr"`, `$status`
+/// under `"status"`. Asking every admin to describe their format would
+/// cost more configuration than it bought, and a wrong description fails
+/// the same silent way an unparsed format does. A format that renames its
+/// keys parses to `None` here, which is the same outcome it had before
+/// this function existed.
+fn parse_json_line(line: &str) -> Option<ParsedLine> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let obj = value.as_object()?;
+
+    let ip: IpAddr = json_field(obj, "remote_addr")?.parse().ok()?;
+    let status: u16 = json_field(obj, "status")?.parse().ok()?;
+
+    // Three variables can carry the request target, in descending order of
+    // faithfulness. `$request_uri` is the original target, query and all.
+    // `$request` is the combined format's triple, `GET /a?b=1 HTTP/1.1`,
+    // so the method and protocol come off it. `$uri` is the normalised
+    // path NGINX settled on, which has already lost the query and may have
+    // been rewritten — weaker evidence, but it still tells `/.env` apart
+    // from `/index.html`, which is what every caller here asks of it.
+    let target = json_field(obj, "request_uri")
+        .or_else(|| {
+            json_field(obj, "request")
+                .and_then(|request| request.split_whitespace().nth(1).map(str::to_string))
+        })
+        .or_else(|| json_field(obj, "uri"))?;
+    // Strip the query for the same reason as the combined parser: `/foo?a=1`
+    // and `/foo?a=2` are one path as far as "is this a real URL here" goes.
+    let path = target.split('?').next().unwrap_or(&target).to_string();
+
+    Some(ParsedLine {
+        ip,
+        status,
+        path,
+        referer: json_field(obj, "http_referer"),
+        // An absent user agent is an empty one for every caller here, so
+        // unlike the referer this needs no third state: nothing draws a
+        // conclusion from "the format doesn't log it" that differs from
+        // what it does with "the client didn't send one".
+        user_agent: json_field(obj, "http_user_agent").unwrap_or_default(),
+    })
+}
+
 /// One parsed access-log line. A struct rather than a tuple since it grew
 /// past three fields — `line.status` reads where `line.1` doesn't.
 #[derive(Debug, PartialEq, Eq)]
@@ -125,9 +225,20 @@ struct ParsedLine {
     ip: IpAddr,
     status: u16,
     path: String,
-    /// NGINX logs a missing `Referer` as `-`, which is what
-    /// [`refererless_crawl_ips`] treats as absent.
-    referer: String,
+    /// Three states, not two, because the format gets a say.
+    ///
+    /// `Some("-")` (combined) and `Some("")` (`escape=json`) are how NGINX
+    /// writes a request that carried no `Referer`, and are what
+    /// [`refererless_crawl_ips`] counts. `None` is the weaker and quite
+    /// different statement that this log format never records the header
+    /// at all — a JSON format with no `http_referer` key, which is easy to
+    /// write and common to find.
+    ///
+    /// Collapsing the two would turn every client on such a host into a
+    /// referer-less crawler, and that detector's whole output is firewall
+    /// blocks. So `None` means the question cannot be answered here, and
+    /// the detector skips the line rather than answering it wrongly.
+    referer: Option<String>,
     user_agent: String,
 }
 
@@ -478,8 +589,17 @@ pub fn refererless_crawl_ips(log_text: &str, min_paths: usize) -> Vec<String> {
         if is_local_or_private(&line.ip) || line.status >= 400 {
             continue;
         }
-        // NGINX logs a missing Referer as "-".
-        let has_referer = !line.referer.is_empty() && line.referer != "-";
+        // A format that never records the header cannot tell us whether
+        // this request carried one, and "cannot tell" is not "there was
+        // none" — see [`ParsedLine::referer`]. Skipping costs this
+        // detector nothing on a host whose log does record it, and is the
+        // difference between silence and a wrong block on one that
+        // doesn't.
+        let Some(referer) = line.referer.as_deref() else {
+            continue;
+        };
+        // NGINX logs a missing Referer as "-", and as "" under escape=json.
+        let has_referer = !referer.is_empty() && referer != "-";
         if has_referer {
             sent_referer.insert(line.ip);
         } else if line.path != "/" {
@@ -610,14 +730,14 @@ mod tests {
         assert_eq!(parsed.ip, "203.0.113.5".parse::<IpAddr>().unwrap());
         assert_eq!(parsed.status, 404);
         assert_eq!(parsed.path, "/wp-login.php");
-        assert_eq!(parsed.referer, "https://ref.example/from");
+        assert_eq!(parsed.referer.as_deref(), Some("https://ref.example/from"));
         assert_eq!(parsed.user_agent, "Mozilla/5.0");
     }
 
     #[test]
     fn parse_line_reads_a_missing_referer_as_nginx_writes_it() {
         let line = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"curl/8\"";
-        assert_eq!(parse_line(line).unwrap().referer, "-");
+        assert_eq!(parse_line(line).unwrap().referer.as_deref(), Some("-"));
     }
 
     #[test]
@@ -645,6 +765,172 @@ mod tests {
         assert_eq!(
             parse_line("not-an-ip - - [t] \"GET /x HTTP/1.1\" 404 1 \"-\" \"UA\""),
             None
+        );
+    }
+
+    /// Shaped after what `escape=json` actually emits: every value a
+    /// string, and the keys named after the NGINX variables they came
+    /// from.
+    fn json_line(ip: &str, path: &str, status: u16) -> String {
+        format!(
+            r#"{{"time_local": "10/Jul/2026:12:00:00 +0000", "remote_addr": "{ip}", "request_uri": "{path}", "status": "{status}", "http_referer": "-", "http_user_agent": "Mozilla/5.0"}}"#
+        ) + "\n"
+    }
+
+    #[test]
+    fn parse_line_reads_every_field_from_a_json_log_format() {
+        let line = r#"{"time_local": "10/Jul/2026:12:00:00 +0000", "remote_addr": "203.0.113.5", "request_uri": "/wp-login.php", "status": "404", "http_referer": "https://ref.example/from", "http_user_agent": "Mozilla/5.0"}"#;
+        let parsed = parse_line(line).expect("an escape=json line should parse");
+        let got = (
+            parsed.ip,
+            parsed.status,
+            parsed.path.as_str(),
+            parsed.referer.as_deref(),
+            parsed.user_agent.as_str(),
+        );
+        assert_eq!(
+            got,
+            (
+                "203.0.113.5".parse::<IpAddr>().unwrap(),
+                404,
+                "/wp-login.php",
+                Some("https://ref.example/from"),
+                "Mozilla/5.0",
+            ),
+            "parsed was: {parsed:?}"
+        );
+    }
+
+    /// `escape=json` quotes every value, but `escape=none` and non-NGINX
+    /// writers do not. Reading only the quoted form would leave those
+    /// logs parsing to nothing, which is the failure JSON support exists
+    /// to remove.
+    #[test]
+    fn parse_line_reads_a_json_status_written_as_a_bare_number() {
+        let line = r#"{"remote_addr": "203.0.113.5", "request_uri": "/x", "status": 404}"#;
+        assert_eq!(
+            parse_line(line).map(|l| l.status),
+            Some(404),
+            "a numeric status should parse the same as a quoted one"
+        );
+    }
+
+    #[test]
+    fn parse_line_takes_the_target_from_the_request_triple_when_there_is_no_request_uri() {
+        let line = r#"{"remote_addr": "203.0.113.5", "request": "GET /from-the-triple HTTP/1.1", "status": "404"}"#;
+        assert_eq!(
+            parse_line(line).map(|l| l.path),
+            Some("/from-the-triple".to_string()),
+            "the method and protocol should come off $request"
+        );
+    }
+
+    #[test]
+    fn parse_line_falls_back_to_uri_when_the_json_format_carries_no_other_target() {
+        let line = r#"{"remote_addr": "203.0.113.5", "uri": "/only-uri", "status": "404"}"#;
+        assert_eq!(
+            parse_line(line).map(|l| l.path),
+            Some("/only-uri".to_string()),
+            "$uri is weaker evidence but still names the path"
+        );
+    }
+
+    #[test]
+    fn parse_line_strips_the_query_string_from_a_json_line() {
+        let line =
+            r#"{"remote_addr": "203.0.113.5", "request_uri": "/foo?a=1&b=2", "status": "404"}"#;
+        assert_eq!(parse_line(line).map(|l| l.path), Some("/foo".to_string()));
+    }
+
+    #[test]
+    fn parse_line_handles_ipv6_in_a_json_line() {
+        let line = r#"{"remote_addr": "2001:db8::1", "request_uri": "/x", "status": "404"}"#;
+        assert_eq!(
+            parse_line(line).map(|l| l.ip),
+            Some("2001:db8::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_line_rejects_json_that_is_not_a_log_line() {
+        let cases = [
+            ("truncated mid-object", r#"{"remote_addr": "203.0.113.5", "#),
+            ("a JSON array", r#"["203.0.113.5", "/x", 404]"#),
+            (
+                "no remote_addr",
+                r#"{"request_uri": "/x", "status": "404"}"#,
+            ),
+            (
+                "a hostname where the address goes",
+                r#"{"remote_addr": "host.example", "request_uri": "/x", "status": "404"}"#,
+            ),
+            (
+                "no target of any kind",
+                r#"{"remote_addr": "203.0.113.5", "status": "404"}"#,
+            ),
+        ];
+        for (description, line) in cases {
+            assert_eq!(parse_line(line), None, "should not parse: {description}");
+        }
+    }
+
+    /// A `log_format` change leaves one file holding both until it
+    /// rotates, which is exactly when someone has just switched a JSON
+    /// format on to get these detectors working.
+    #[test]
+    fn scanning_ips_reads_a_file_holding_both_formats() {
+        let mut log = String::new();
+        for i in 0..6 {
+            log.push_str(&not_found_line("198.51.100.9", &format!("/combined-{i}")));
+            log.push_str(&json_line("198.51.100.9", &format!("/json-{i}"), 404));
+        }
+        assert_eq!(
+            scanning_ips(&log, 10),
+            vec!["198.51.100.9".to_string()],
+            "twelve distinct 404s across the two formats is one scanner, log was:\n{log}"
+        );
+    }
+
+    /// The trap three-state `referer` exists to avoid: this format does
+    /// not log the header, so every request in it *looks* referer-less.
+    /// Counting those would hand a firewall block to every ordinary
+    /// visitor on such a host.
+    #[test]
+    fn refererless_crawl_ips_skips_a_json_format_that_does_not_log_the_referer() {
+        let log: String = (0..40)
+            .map(|i| {
+                format!(
+                    r#"{{"remote_addr": "203.0.113.9", "request_uri": "/page-{i}", "status": "200"}}"#
+                ) + "\n"
+            })
+            .collect();
+        assert!(
+            refererless_crawl_ips(&log, 25).is_empty(),
+            "a format with no http_referer key cannot answer this, log was:\n{log}"
+        );
+    }
+
+    /// And the other half of that claim: once the format *does* record the
+    /// header, the same crawl is detected exactly as it is in a combined log.
+    #[test]
+    fn refererless_crawl_ips_flags_a_deep_crawl_in_a_json_log_that_records_the_referer() {
+        let log: String = (0..40)
+            .map(|i| json_line("203.0.113.9", &format!("/page-{i}"), 200))
+            .collect();
+        assert_eq!(
+            refererless_crawl_ips(&log, 25),
+            vec!["203.0.113.9".to_string()],
+            "log was:\n{log}"
+        );
+    }
+
+    #[test]
+    fn successful_user_agent_counts_reads_a_json_log() {
+        let log = json_line("203.0.113.5", "/a", 200) + &json_line("203.0.113.5", "/b", 200);
+        assert_eq!(
+            successful_user_agent_counts(&log).get("Mozilla/5.0"),
+            Some(&2),
+            "log was:\n{log}"
         );
     }
 

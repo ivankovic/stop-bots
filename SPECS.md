@@ -5791,3 +5791,69 @@ is a real Zimbra endpoint being exploited, so it is legitimate on a
 Zimbra host. `/1.php`, `/test.php` and `/login` could all be real files.
 The ≥7-distinct-404s detector catches those IPs anyway, with a threshold,
 which is the right tool for a path that is merely suspicious.
+
+## JSON access logs, and the detector that had to gain a third answer (`accesslog::parse_line`)
+
+`parse_line` read one format: NGINX's stock `combined`. Its first
+statement took the first whitespace-delimited token and parsed it as an
+`IpAddr`. On a host whose `log_format` is JSON, that token is
+`{"time_local":`, so every line returned `None` — and `None` is what the
+whole module is built on (`log_text.lines().filter_map(parse_line)`).
+
+So on such a host the 404 scanner, probe paths, the honeypot,
+forged-crawler detection, all three behavioural detectors and
+`record-access-stats` found nothing. Not less; nothing.
+
+**The failure mode is what made this worth fixing, not the parser.**
+Nothing errors. The log is present, readable and being written to.
+`batch` reports success. `stop-bots status` is green — its access-log
+check asks whether the file can be *read*, which it can. A detector that
+read 14 million lines and understood none of them reports "no scanners
+found", which is indistinguishable from a quiet week.
+
+Measured on a real server, on the 2,946 JSON lines of one day's log:
+
+| | scanners at threshold 3 | `record-access-stats` |
+| --- | --- | --- |
+| before | 0 | `no successful requests found` |
+| after | 1 | 2,736 hits, 13 user agents |
+
+**Per line, not per file.** The format is chosen by whether the first
+non-space character is `{`, which is decidable per line because the
+combined layout opens with an address. A file holds both formats for as
+long as it takes to rotate after a `log_format` change — which is
+precisely the window in which someone has just switched JSON on *because*
+they wanted these detectors working.
+
+**No configuration for the key names.** A JSON `log_format` is written by
+naming variables, and the convention is overwhelmingly to keep each
+variable's own name as its key, so `remote_addr`, `status`,
+`request_uri`, `http_user_agent` and `http_referer` are read directly.
+The target is taken from `request_uri`, else the `request` triple with
+the method and protocol removed, else `uri`. Asking every admin to
+describe their format would cost more configuration than it bought, and a
+*wrong* description fails the same silent way an unparsed format does.
+
+Values are read whether quoted or bare: `escape=json` writes `"404"`,
+`escape=none` writes `404`, and accepting only one of them would
+reintroduce the same class of silent failure for half the hosts.
+
+**`referer` became `Option<String>`, and that is the substantive part.**
+The real log this was tested against has no `http_referer` key at all —
+its `log_format` never names the variable. Had absent-key collapsed to
+"the request carried no referer", `refererless_crawl_ips` would have seen
+every visitor on that host as a referer-less crawler, and that detector's
+entire output is firewall blocks. The three states are now: present,
+present-and-empty (`"-"` in combined, `""` under `escape=json` — a
+request that carried none), and absent (the format does not record it).
+The detector skips the third.
+
+That is the same rule `stop-bots status` already follows for a check that
+could not run: report `UNKNOWN`, never `OK`. A conclusion drawn from a
+question the data cannot answer is worse than no conclusion, because it
+is believed.
+
+`user_agent` deliberately did *not* get the same treatment. No caller
+distinguishes "the format doesn't log it" from "the client didn't send
+one" — both mean there is no agent string to count or match — so a third
+state there would be a distinction nothing reads.

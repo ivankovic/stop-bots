@@ -9,6 +9,41 @@ need.
 
 ### Added
 
+- **The access-log detectors now read JSON logs.** Everything driven by
+  the NGINX access log — the 404 scanner, probe paths, the honeypot,
+  forged-crawler detection, the three behavioural detectors and
+  `record-access-stats` — parsed only the stock `combined` format. A
+  `log_format ... escape=json` directive is not a niche choice; it is what
+  anyone shipping logs to a collector configures. On such a host every
+  line parsed to nothing, so none of those detectors ever found anything.
+
+  There was no error, and that is the part worth fixing rather than the
+  parser: the log was present, readable and being written to, `batch`
+  reported success, and the honest report from a detector that read 14
+  million lines and understood none of them is "no scanners found".
+  Measured on a real server's log, 2,946 JSON lines yielded 0 scanners and
+  0 recorded user agents before, and 1 scanner and 2,736 hits across 13
+  user agents after.
+
+  Both formats parse, chosen per line rather than per file, because
+  changing a running server's `log_format` leaves one file holding both
+  until it rotates — which is exactly when someone has just switched JSON
+  on to get these detectors working. Keys are the NGINX variable names a
+  JSON format is built from (`remote_addr`, `status`, `request_uri` or
+  `request` or `uri`, `http_user_agent`, `http_referer`), which is what
+  makes it work with no configuration to get wrong. Values may be quoted
+  or bare, since `escape=json` writes `"404"` and `escape=none` writes
+  `404`.
+
+  One detector gained a third answer rather than a second format. A JSON
+  format that never names `$http_referer` cannot say whether a request
+  carried one, and counting "not recorded" as "there wasn't one" would
+  make every ordinary visitor on such a host look like a referer-less
+  crawler — a detector whose entire output is firewall blocks. So the
+  parsed referer is now absent, empty, or present, and
+  `refererless_crawl_ips` skips the lines it cannot answer for instead of
+  answering wrongly.
+
 - **A "Humans only" switch**, off by default. With it on, every
   catalogued bot is blocked whatever its category, the three category
   policies are forced to Blocked and cannot be edited, and any address
