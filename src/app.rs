@@ -973,8 +973,12 @@ impl App {
         }
         let sender = self.events.sender();
         let ssh_log = self.ssh_log.clone();
+        // Resolved here, on the main thread that owns the `Db`, and moved
+        // into the worker -- `read_log_for` deliberately cannot reach the
+        // database itself.
+        let log_paths = crate::logpaths::LogPaths::from_db(&self.db).unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let log_text = crate::cron::read_log_for(job, ssh_log.as_deref());
+            let log_text = crate::cron::read_log_for(job, &log_paths, ssh_log.as_deref());
             let _ = sender.send(Event::App(AppEvent::CronLogFetched { job, log_text }));
         });
     }
@@ -1576,8 +1580,9 @@ impl App {
         self.jobs_in_flight.insert(job);
         let ssh_log = self.ssh_log.clone();
         let sender = self.events.sender();
+        let paths = crate::logpaths::LogPaths::from_db(&self.db).unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let probe = crate::health::probe(backend, &db_path, ssh_log.as_deref());
+            let probe = crate::health::probe(backend, &db_path, ssh_log.as_deref(), &paths);
             let _ = sender.send(Event::App(AppEvent::HealthProbed {
                 probe: Box::new(probe),
             }));

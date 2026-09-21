@@ -171,6 +171,11 @@ pub struct Probe {
     /// Whether each log source could actually be read.
     pub ssh_log_readable: Option<bool>,
     pub access_log_readable: Option<bool>,
+    /// The access log that was actually tried, so a failure can name it.
+    /// "unreadable" without a path is the least actionable thing a check
+    /// can say: the operator's next question is always which file.
+    #[serde(default)]
+    pub access_log_path: Option<String>,
     /// Where the NGINX that serves this host's config actually runs.
     pub nginx_home: NginxHome,
     /// Whether [`crate::nginx::managed_dir`] resolves, at the same path,
@@ -257,7 +262,12 @@ const LARGE_DB_BYTES: u64 = 128 * 1024 * 1024;
 /// `None`, because "I could not check" is a result the report has to be
 /// able to show. An error here would mean no report at all, which is the
 /// least useful outcome available.
-pub fn probe(backend: FirewallBackend, db_path: &Path, ssh_log: Option<&Path>) -> Probe {
+pub fn probe(
+    backend: FirewallBackend,
+    db_path: &Path,
+    ssh_log: Option<&Path>,
+    paths: &crate::logpaths::LogPaths,
+) -> Probe {
     let live = live_firewall(backend);
     let (live_rules, live_backend) = match &live {
         Some(state) => (Some(state.rules), Some(backend.stored().to_string())),
@@ -266,7 +276,7 @@ pub fn probe(backend: FirewallBackend, db_path: &Path, ssh_log: Option<&Path>) -
     // Read once and answer both questions from it: two reads would be two
     // different moments, and this one shells out to nothing but the
     // filesystem.
-    let access_log = crate::accesslog::find_default_source();
+    let access_log = paths.access_source(None);
     let nginx_home = nginx_home();
     let container = match &nginx_home {
         NginxHome::Container { name } => Some(name.clone()),
@@ -281,13 +291,11 @@ pub fn probe(backend: FirewallBackend, db_path: &Path, ssh_log: Option<&Path>) -
         unit_binary: unit_binary(),
         db_free_bytes: free_bytes(db_path),
         ssh_log_readable: Some(matches!(
-            match ssh_log {
-                Some(path) => crate::sshlog::read_log_file(path),
-                None => crate::sshlog::find_default_source(),
-            },
+            paths.ssh_source(ssh_log),
             crate::sshlog::LogSource::Found(_)
         )),
         access_log_readable: Some(matches!(&access_log, crate::accesslog::LogSource::Found(_))),
+        access_log_path: Some(paths.access_description(None)),
         access_log_clients: match &access_log {
             crate::accesslog::LogSource::Found(text) => {
                 Some(crate::accesslog::client_address_mix(text))
@@ -1313,11 +1321,24 @@ fn log_sources(probe: &Probe) -> Check {
     } else {
         (
             Level::Warn,
-            format!(
-                "{} unreadable — those detectors find nothing",
-                missing.join(" and ")
+            match (&probe.access_log_path, probe.access_log_readable) {
+                (Some(path), Some(false)) => format!(
+                    "{} unreadable — those detectors find nothing (tried {path})",
+                    missing.join(" and ")
+                ),
+                _ => format!(
+                    "{} unreadable — those detectors find nothing",
+                    missing.join(" and ")
+                ),
+            },
+            // `set-log-paths` first, because it is the one that also fixes
+            // the console and the internal cron: they take no arguments, so
+            // a flag cannot reach them and only a stored path can.
+            Some(
+                "stop-bots set-log-paths --access-log <path> (or pass --ssh-log/--access-log \
+                 for a one-off run)"
+                    .to_string(),
             ),
-            Some("point --ssh-log/--access-log at the real files".to_string()),
         )
     };
     Check {
@@ -1422,6 +1443,7 @@ mod tests {
             db_free_bytes: Some(8 * 1024 * 1024 * 1024),
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
+            access_log_path: None,
             access_log_clients: Some((40, 41)),
             // The ordinary host: NGINX is a unit here, and the two
             // container fields have nothing to answer. Every

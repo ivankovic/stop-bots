@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
             db_free_bytes: Some(140 * 1024 * 1024 * 1024),
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
+            access_log_path: None,
             access_log_clients: Some((11_284, 11_310)),
             // The fiction is a host install, so the container checks have
             // nothing to say and add no line to the strip.

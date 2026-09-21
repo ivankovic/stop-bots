@@ -6137,3 +6137,69 @@ Two things `install web` does that this does not. It skips the
 `/usr/sbin/nft` and never runs stop-bots at all. And it takes no database,
 NGINX root or SSH log: one command against one file is what makes it safe to
 order after the world rather than ahead of it.
+
+
+## Where the logs are, remembered (`src/logpaths.rs`)
+
+`set-nginx-commands` exists because `nginx -t` and `systemctl reload nginx`
+are wrong when NGINX is in a container, so the right commands are stored and
+every caller reads them from the database. The logs move for exactly the same
+reason, on exactly the same hosts, and were not stored.
+
+A container that bind-mounts its log directory writes the access log
+somewhere that is not `/var/log/nginx/access.log` on the host. The only way
+to say so was `--access-log` per invocation. That covers the CLI and a
+crontab. It does not cover the two things that actually run the detectors:
+the web console and the TUI drive an internal cron that takes no arguments,
+and `install web` writes a unit with an `--ssh-log` flag and nothing for the
+access log at all.
+
+So on such a host the console ran every minute, read a path that did not
+exist, found nothing, and the health check could only say "unreadable"
+without naming what it had tried. The documented workaround was a symlink
+from `/var/log/nginx` into wherever the logs really were — making the
+filesystem lie so that a default became true.
+
+### Precedence, and why the flag still wins
+
+Flag, then stored setting, then the module's own search. An explicit
+`--access-log` beats the stored path because a one-off run against a rotated
+or copied file is a real thing to want, and it must not require changing the
+stored value and putting it back. The stored value is what the console and
+the internal cron get, since nothing can pass them a flag.
+
+The two fallbacks are deliberately asymmetric. With nothing stored, the
+access log has one conventional path to try; the SSH log tries two paths and
+then `journalctl`, so "nothing configured" is a real strategy there rather
+than a single guess.
+
+### `read_log_for` still cannot reach the database
+
+`cron::read_log_for` takes no `Db` on purpose — its doc says the signature is
+what keeps the read hoisted out of the lock. So it takes a resolved
+`LogPaths` by reference rather than a handle: the caller reads it while it
+holds the lock, and the worker gets a plain value. Same in `app.rs` and
+`web/cron.rs`.
+
+### The half-wired version, caught by running it
+
+The first pass wired the console, the internal cron and the health probe, and
+left the CLI detector commands on their own resolver. `set-log-paths` then
+stored a path, printed it back, and `record-access-stats` still read
+`/var/log/nginx/access.log` — a setting that existed and did nothing, which
+is worse than no setting. Found by running the real binary against this
+host's log rather than by reading the diff. `read_access_log` now takes the
+`Db` its callers had already opened.
+
+`record_access_stats` keys its persisted read-offset by the resolved path
+too, so a stored path and an explicit flag naming the same file do not each
+keep a separate offset.
+
+### The health check names the file
+
+`Probe` carries `access_log_path`, so the warning is now "unreadable — those
+detectors find nothing (tried /var/log/nginx/access.log)" rather than
+"unreadable". The operator's next question was always which file, and a
+warning that cannot answer it is one that gets muted. The suggested fix leads
+with `set-log-paths` rather than the flags, because the flags cannot reach
+the console.

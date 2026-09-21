@@ -35,6 +35,7 @@ pub mod install;
 pub mod ipdetail;
 pub mod ipranges;
 pub mod iptables;
+pub mod logpaths;
 pub mod nftables;
 pub mod nginx;
 pub mod protection;

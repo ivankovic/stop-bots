@@ -799,6 +799,30 @@ enum Command {
     /// that genuinely contains a space.
     ///
     /// Pass neither flag to print the commands currently in effect.
+    /// Remember where this host's logs actually are.
+    ///
+    /// The companion to `set-nginx-commands`, for the other half of a
+    /// containerised NGINX. A container that bind-mounts its log directory
+    /// writes the access log somewhere that is not
+    /// /var/log/nginx/access.log on the host, and `--access-log` on a
+    /// single command cannot reach the two things that actually run the
+    /// detectors: the web console and the TUI take no arguments for it, so
+    /// their internal cron reads the default and finds nothing.
+    ///
+    /// A path given here is used whenever no flag overrides it. Pass an
+    /// empty string to clear one.
+    SetLogPaths {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// The NGINX access log every web-side detector reads.
+        #[arg(long)]
+        access_log: Option<String>,
+        /// The SSH authentication log, feeding the SSH scanner detector
+        /// and the anti-lockout window.
+        #[arg(long)]
+        ssh_log: Option<String>,
+    },
+
     SetNginxCommands {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
@@ -1261,6 +1285,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Some(Command::SetLogPaths {
+            db,
+            access_log,
+            ssh_log,
+        }) => run_set_log_paths(db, access_log, ssh_log),
         Some(Command::SetNginxCommands {
             db,
             test,
@@ -1453,7 +1482,8 @@ fn run_status(
         let path = db
             .path()
             .unwrap_or_else(|| PathBuf::from("./stop-bots.sqlite3"));
-        let probe = health::probe(backend, &path, ssh_log.as_deref());
+        let paths = stop_bots::logpaths::LogPaths::from_db(&db).unwrap_or_default();
+        let probe = health::probe(backend, &path, ssh_log.as_deref(), &paths);
         health::store_probe(&db, &probe)?;
         (health::assess(&db, &probe)?, None)
     };
@@ -2047,6 +2077,38 @@ struct InstallWeb {
 /// no SSH log. The unit runs one command against one file, which is what
 /// makes it safe to order after Docker and ufw rather than ahead of the
 /// world.
+/// Stores the log paths, then prints what every future run will read.
+///
+/// Printing the resolved state rather than "saved" is the point: the
+/// failure this command exists to fix looked exactly like success, so the
+/// confirmation has to be the paths themselves.
+fn run_set_log_paths(
+    db_path: Option<PathBuf>,
+    access_log: Option<String>,
+    ssh_log: Option<String>,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    if access_log.is_none() && ssh_log.is_none() {
+        println!("Nothing to change. Current settings:");
+    } else {
+        stop_bots::logpaths::LogPaths::save(&db, access_log.as_deref(), ssh_log.as_deref())?;
+    }
+
+    let paths = stop_bots::logpaths::LogPaths::from_db(&db)?;
+    match &paths.access {
+        Some(path) => println!("  access log: {}", path.display()),
+        None => println!(
+            "  access log: {} (default — nothing stored)",
+            stop_bots::accesslog::DEFAULT_LOG_PATH
+        ),
+    }
+    match &paths.ssh {
+        Some(path) => println!("  ssh log:    {}", path.display()),
+        None => println!("  ssh log:    auto-detected (auth.log, secure, then journalctl)"),
+    }
+    Ok(())
+}
+
 fn run_install_firewall(
     binary: Option<PathBuf>,
     prefix: Option<PathBuf>,
@@ -2584,7 +2646,7 @@ fn block_web_scanners(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let log_text = read_access_log(access_log.as_deref())?;
+    let log_text = read_access_log(&db, access_log.as_deref())?;
 
     let outcome =
         stop_bots::scanblock::block_web_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
@@ -2622,7 +2684,7 @@ fn block_spoofed_crawlers(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let log_text = read_access_log(access_log.as_deref())?;
+    let log_text = read_access_log(&db, access_log.as_deref())?;
 
     let outcome = stop_bots::scanblock::block_spoofed_crawlers(&db, ttl_days, &log_text, dry_run)?;
 
@@ -2652,7 +2714,7 @@ fn block_probe_paths(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let log_text = read_access_log(access_log.as_deref())?;
+    let log_text = read_access_log(&db, access_log.as_deref())?;
 
     let outcome = stop_bots::scanblock::block_probe_paths(&db, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
@@ -2712,7 +2774,7 @@ fn block_honeypot(
 ) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let log_text = read_access_log(access_log.as_deref())?;
+    let log_text = read_access_log(&db, access_log.as_deref())?;
 
     let outcome = stop_bots::scanblock::block_honeypot(&db, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
@@ -2753,26 +2815,35 @@ fn set_honeypot_path(db_path: Option<PathBuf>, path: String) -> Result<()> {
 /// root, and naming both is what turns "couldn't read the log" from a dead
 /// end into something actionable. Shared so a sixth detector can't quietly
 /// ship a seventh wording of it.
-fn read_access_log(access_log: Option<&Path>) -> Result<String> {
-    let source = match access_log {
-        Some(path) => accesslog::read_log_file(path),
-        None => accesslog::find_default_source(),
-    };
-    match source {
+fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
+    // Through `LogPaths`, so a CLI run reads the same file the console and
+    // the internal cron do. Before this, `set-log-paths` could be set and a
+    // detector invoked by hand would still go to the default -- two answers
+    // to one question, which is the shape of bug this whole type removes.
+    let paths = stop_bots::logpaths::LogPaths::from_db(db).unwrap_or_default();
+    match paths.access_source(access_log) {
         accesslog::LogSource::Found(text) => Ok(text),
-        // Same distinction as `read_ssh_log`: name the path that was
-        // actually tried, not the one the reader might assume.
-        accesslog::LogSource::Unavailable => match access_log {
-            Some(path) => anyhow::bail!(
-                "couldn't read the NGINX access log at {} — pass a different --access-log, \
-                 or run as root, for this to work",
-                path.display()
-            ),
-            None => anyhow::bail!(
-                "couldn't read the NGINX access log (tried /var/log/nginx/access.log) — pass \
-                 --access-log, or run as root, for this to work"
-            ),
-        },
+        // Name the path that was actually tried, not the one the reader
+        // might assume -- and say where a stored one came from, since an
+        // operator who set it and still sees this needs to know it was used.
+        accesslog::LogSource::Unavailable => {
+            let tried = paths.access_description(access_log);
+            match (access_log, &paths.access) {
+                (Some(_), _) => anyhow::bail!(
+                    "couldn't read the NGINX access log at {tried} — pass a different \
+                     --access-log, or run as root, for this to work"
+                ),
+                (None, Some(_)) => anyhow::bail!(
+                    "couldn't read the NGINX access log at {tried}, the path stored by \
+                     `set-log-paths` — check it exists, or run as root"
+                ),
+                (None, None) => anyhow::bail!(
+                    "couldn't read the NGINX access log (tried {tried}) — set one with \
+                     `stop-bots set-log-paths --access-log <path>`, pass --access-log, \
+                     or run as root"
+                ),
+            }
+        }
     }
 }
 
@@ -2855,10 +2926,14 @@ fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
 fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
 
-    let log_path = access_log
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(accesslog::DEFAULT_LOG_PATH));
-    let log_text = read_access_log(access_log.as_deref())?;
+    // Keyed by the path actually read, so a stored path and an explicit
+    // flag do not each keep their own read offset for the same file.
+    let log_path = PathBuf::from(
+        stop_bots::logpaths::LogPaths::from_db(&db)
+            .unwrap_or_default()
+            .access_description(access_log.as_deref()),
+    );
+    let log_text = read_access_log(&db, access_log.as_deref())?;
 
     let outcome =
         stop_bots::accessstats::record_access_stats(&db, &log_path.to_string_lossy(), &log_text)?;
@@ -2981,7 +3056,8 @@ mod tests {
 
     #[test]
     fn an_unreadable_explicit_access_log_names_the_path_it_was_given() {
-        let err = read_access_log(Some(Path::new("/nonexistent/access.log")))
+        let db = Db::open_in_memory().unwrap();
+        let err = read_access_log(&db, Some(Path::new("/nonexistent/access.log")))
             .expect_err("a missing file should not read");
         let said = err.to_string();
 

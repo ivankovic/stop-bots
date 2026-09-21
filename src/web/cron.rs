@@ -157,9 +157,16 @@ async fn maintenance(state: &AppState) -> anyhow::Result<()> {
 /// database lock, then runs the job.
 async fn run_log_job(state: &AppState, job: CronJob) -> anyhow::Result<()> {
     let ssh_log = state.ssh_log.clone();
-    let log_text = tokio::task::spawn_blocking(move || cron::read_log_for(job, ssh_log.as_deref()))
-        .await
-        .map_err(|err| anyhow::anyhow!("the log-reading thread panicked: {err}"))?;
+    // Read under the lock and moved into the blocking task, for the same
+    // reason `read_log_for` takes no `Db`.
+    let log_paths = state
+        .with_db(|db| Ok(crate::logpaths::LogPaths::from_db(db).unwrap_or_default()))
+        .await?;
+    let log_text = tokio::task::spawn_blocking(move || {
+        cron::read_log_for(job, &log_paths, ssh_log.as_deref())
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("the log-reading thread panicked: {err}"))?;
 
     let out = state.firewall_out.clone();
     let apply = state.apply_for_real;
@@ -175,19 +182,20 @@ async fn run_log_job(state: &AppState, job: CronJob) -> anyhow::Result<()> {
 /// a large ruleset is megabytes of text — none of which has any business
 /// happening while the database lock is held, or on the async runtime.
 async fn health_check(state: &AppState) -> anyhow::Result<()> {
-    let (backend, db_path) = state
+    let (backend, db_path, paths) = state
         .with_db(|db| {
             Ok((
                 crate::firewall::stored_backend(db)?,
                 db.path()
                     .unwrap_or_else(|| PathBuf::from("./stop-bots.sqlite3")),
+                crate::logpaths::LogPaths::from_db(db).unwrap_or_default(),
             ))
         })
         .await?;
 
     let ssh_log = state.ssh_log.clone();
     let probe = tokio::task::spawn_blocking(move || {
-        crate::health::probe(backend, &db_path, ssh_log.as_deref())
+        crate::health::probe(backend, &db_path, ssh_log.as_deref(), &paths)
     })
     .await
     .map_err(|err| anyhow::anyhow!("the health-probe thread panicked: {err}"))?;

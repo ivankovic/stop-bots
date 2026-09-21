@@ -330,18 +330,21 @@ pub fn uses_ssh_log(job: CronJob) -> bool {
 /// Takes no `Db` for exactly that reason: this half can be hoisted out of
 /// the lock, and a signature that can't reach the database is what keeps
 /// it that way.
-pub fn read_log_for(job: CronJob, ssh_log: Option<&std::path::Path>) -> Option<String> {
+pub fn read_log_for(
+    job: CronJob,
+    paths: &crate::logpaths::LogPaths,
+    ssh_log: Option<&std::path::Path>,
+) -> Option<String> {
+    // `paths` by value rather than a `&Db`, so this keeps the property the
+    // doc above describes: resolved by the caller while it holds the lock,
+    // read here with no way to reach the database.
     if uses_ssh_log(job) {
-        let source = match ssh_log {
-            Some(path) => crate::sshlog::read_log_file(path),
-            None => crate::sshlog::find_default_source(),
-        };
-        match source {
+        match paths.ssh_source(ssh_log) {
             crate::sshlog::LogSource::Found(text) => Some(text),
             crate::sshlog::LogSource::Unavailable => None,
         }
     } else {
-        match crate::accesslog::find_default_source() {
+        match paths.access_source(None) {
             crate::accesslog::LogSource::Found(text) => Some(text),
             crate::accesslog::LogSource::Unavailable => None,
         }
@@ -599,7 +602,8 @@ pub fn health_check(db: &Db, ssh_log: Option<&std::path::Path>) -> String {
         .path()
         .unwrap_or_else(|| std::path::PathBuf::from("./stop-bots.sqlite3"));
 
-    let probe = crate::health::probe(backend, &db_path, ssh_log);
+    let paths = crate::logpaths::LogPaths::from_db(db).unwrap_or_default();
+    let probe = crate::health::probe(backend, &db_path, ssh_log, &paths);
     if let Err(err) = crate::health::store_probe(db, &probe) {
         return format!("error: {err}");
     }
@@ -1120,7 +1124,11 @@ mod tests {
         let path = dir.path().join("auth.log");
         std::fs::write(&path, "a line from the fixture\n").unwrap();
 
-        let text = read_log_for(CronJob::Detect(Detector::SshScanners), Some(&path));
+        let text = read_log_for(
+            CronJob::Detect(Detector::SshScanners),
+            &crate::logpaths::LogPaths::default(),
+            Some(&path),
+        );
 
         assert_eq!(text.as_deref(), Some("a line from the fixture\n"));
     }
@@ -1135,6 +1143,7 @@ mod tests {
 
         let text = read_log_for(
             CronJob::Detect(Detector::SshScanners),
+            &crate::logpaths::LogPaths::default(),
             Some(&dir.path().join("nope.log")),
         );
 

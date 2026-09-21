@@ -5,6 +5,36 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [0.0.6] — 2026-09-21
+
+### Added
+
+- **`stop-bots set-log-paths`**, the companion to `set-nginx-commands` for
+  the other half of a containerised NGINX. A container that bind-mounts its
+  log directory writes the access log somewhere that is not
+  `/var/log/nginx/access.log`, and until now the only way to say so was
+  `--access-log` on each invocation.
+
+  That covered the CLI and a crontab, and missed the two things that
+  actually run the detectors: the console and the TUI drive an internal
+  cron that takes no arguments, and the unit `install web` writes has an
+  `--ssh-log` flag and nothing for the access log. On such a host the
+  console ran every minute against a path that did not exist, found
+  nothing, and reported "the NGINX access log unreadable" without saying
+  which file it meant. The documented workaround was a symlink — making the
+  filesystem lie so a default became true.
+
+  A stored path is used whenever no flag overrides it. The flag still wins,
+  so a one-off run against a rotated copy needs no change to the setting and
+  no change back. Pass an empty string to clear one.
+
+### Changed
+
+- **The log-sources health check names the path it tried.** "unreadable" on
+  its own could not answer the operator's next question, which was always
+  which file. The fix it suggests now leads with `set-log-paths`, because
+  the flags it used to name cannot reach the console.
+
 ## [0.0.5] — 2026-09-21
 
 ### Fixed
@@ -1106,7 +1136,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/ivankovic/stop-bots/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/ivankovic/stop-bots/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/ivankovic/stop-bots/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/ivankovic/stop-bots/compare/v0.0.2...v0.0.3
