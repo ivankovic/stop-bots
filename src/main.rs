@@ -1002,6 +1002,11 @@ enum Command {
 enum InstallTarget {
     /// The web console, as a systemd service.
     Web,
+    /// A systemd unit that re-applies the rendered firewall script at
+    /// boot. Not `nftables.service`: that loads /etc/nftables.conf, which
+    /// is a different file, and on a stock Debian or Ubuntu it flushes
+    /// every other table on the host first.
+    Firewall,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1103,6 +1108,7 @@ async fn main() -> Result<()> {
                 expose,
                 allowed_hosts,
             }),
+            InstallTarget::Firewall => run_install_firewall(binary, prefix, dry_run, force),
         },
         Some(Command::Status {
             db,
@@ -2032,6 +2038,53 @@ struct InstallWeb {
     base_path: Option<String>,
     expose: bool,
     allowed_hosts: Option<String>,
+}
+
+/// Writes and enables the unit that re-applies the rendered firewall
+/// script at boot.
+///
+/// Deliberately narrow next to `install web`: no database, no NGINX root,
+/// no SSH log. The unit runs one command against one file, which is what
+/// makes it safe to order after Docker and ufw rather than ahead of the
+/// world.
+fn run_install_firewall(
+    binary: Option<PathBuf>,
+    prefix: Option<PathBuf>,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
+    let binary = match binary {
+        Some(path) => path,
+        None => std::env::current_exe().context("could not determine the running binary")?,
+    };
+    // No `hidden_from_unit` check, unlike `install web`. That guard exists
+    // because the web unit's ExecStart names the stop-bots binary and sets
+    // ProtectHome=yes, which makes a binary under /home invisible to the
+    // service. This unit's ExecStart is `/usr/sbin/nft`; it never runs
+    // stop-bots at all, so where stop-bots lives cannot break it. The
+    // binary is carried only to name it in the --dry-run hint.
+    let layout = match &prefix {
+        Some(prefix) => stop_bots::install::Layout::under(prefix, binary),
+        None => stop_bots::install::Layout::system(binary),
+    };
+    let options = stop_bots::install::Options {
+        dry_run,
+        force,
+        // Never started by the installer: the script it loads may not
+        // exist yet, and applying firewall rules is the one step an
+        // operator should take after reading what they say -- the same
+        // reason `render-firewall` does not apply what it writes.
+        start: false,
+    };
+
+    let steps = stop_bots::install::install_firewall(&layout, &options)?;
+    for step in steps.iter() {
+        println!("  {step}");
+    }
+    if dry_run {
+        println!("\nDry run — nothing was changed.");
+    }
+    Ok(())
 }
 
 fn run_install_web(options: InstallWeb) -> Result<()> {

@@ -5,6 +5,38 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [0.0.5] — 2026-09-21
+
+### Fixed
+
+- **"Rules survive a reboot" reported OK on nftables hosts where they did
+  not.** The check asked whether `nftables.service` was enabled. That unit
+  loads `/etc/nftables.conf`; this project writes
+  `/etc/stop-bots/firewall.nft`. The two are unrelated, so the check passed
+  on hosts that came back from a reboot with none of these rules loaded —
+  the same failure it exists to catch, arriving through the check itself.
+  The iptables half was always right: `netfilter-persistent` saves the live
+  ruleset, so it really does carry them.
+
+- **The suggested fix could take out the host's whole firewall.** It said
+  `systemctl enable nftables.service`. Debian's stock `/etc/nftables.conf`
+  opens with `flush ruleset`, so on a host where ufw, Docker or a
+  geo-blocker also manage tables, enabling that unit drops all of them once
+  per boot. The fix now names `stop-bots install firewall`, and when
+  `/etc/nftables.conf` is seen to flush it says explicitly not to enable
+  that service.
+
+### Added
+
+- **`stop-bots install firewall`**, a second install target beside `web`.
+  Writes a `Type=oneshot` unit that applies the rendered script at boot —
+  `ExecStart=/usr/sbin/nft -f /etc/stop-bots/firewall.nft`, ordered
+  `After=docker.service ufw.service`, with `ConditionPathExists` so a host
+  that has never rendered one stays quiet. Enabled but not started, for the
+  same reason `render-firewall` does not apply what it writes. Same
+  `--dry-run`, `--force` and refuse-to-replace-an-edited-unit behaviour as
+  `install web`.
+
 ## [0.0.4] — 2026-09-21
 
 ### Changed
@@ -1074,7 +1106,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/ivankovic/stop-bots/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/ivankovic/stop-bots/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/ivankovic/stop-bots/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/ivankovic/stop-bots/compare/v0.0.1...v0.0.2

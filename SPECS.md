@@ -6069,3 +6069,71 @@ Measured against the real feed after the change: `update-country-ranges ch`
 stores 3,550 ranges (2,680 v4 + 870 v6, matching IPdeny's published counts),
 and an allow-list render emits 3,552 rules — the ranges plus one catch-all
 per family.
+
+## "Rules survive a reboot" was answering the wrong question for nftables (`health::firewall_persists`, `install::install_firewall`)
+
+The check asked whether a distribution service was enabled:
+
+    Nftables => "nftables.service"
+    Iptables => "netfilter-persistent.service"
+
+For iptables that is the right question. `netfilter-persistent` saves and
+restores the **live** ruleset, so whatever this project loaded is inside
+what gets saved.
+
+For nftables it is not, and the difference is not a nuance. `nftables.service`
+loads a **static file**, `/etc/nftables.conf`. This project writes
+`/etc/stop-bots/firewall.nft`. The two have nothing to do with each other, so
+the check reported:
+
+    [OK] Rules survive a reboot — nftables.service will reload them
+
+on a host where a reboot came back with none of them. That is the same class
+of failure the check was written to catch — a ruleset on disk and nothing in
+the kernel — arriving through the check itself.
+
+### The fix advice was worse than the false OK
+
+`Some(false)` suggested `systemctl enable nftables.service`. On a host where
+nothing else manages nftables that is merely useless. On one where ufw,
+Docker or a geo-blocker do, Debian's stock `/etc/nftables.conf` opens with
+
+    flush ruleset
+
+so enabling that unit drops every table all of them loaded, once per boot,
+and replaces them with three empty chains. Found on a host running exactly
+that combination, where following the tool's own advice would have taken the
+firewall out at the next restart.
+
+### What it asks now
+
+Per backend, the question that actually decides the answer:
+
+- **iptables**: is `netfilter-persistent` enabled? (unchanged, and correct)
+- **nftables**: does anything re-apply *our* script — the unit
+  `stop-bots install firewall` writes, or an `include` of it in
+  `/etc/nftables.conf`?
+
+The fix names `stop-bots install firewall`, never `enable nftables.service`.
+When `/etc/nftables.conf` is detected to flush, the fix says so explicitly,
+because an operator who has read the old advice needs to know why it changed.
+A test asserts every mention of enabling that unit is negated by a preceding
+"do NOT".
+
+### `stop-bots install firewall`
+
+A second `InstallTarget` beside `web`, sharing its `--dry-run`, `--force` and
+refuse-to-overwrite-an-edited-unit behaviour. The unit is deliberately narrow:
+`Type=oneshot`, one `ExecStart=/usr/sbin/nft -f <script>`, `After=docker.service
+ufw.service`, and `ConditionPathExists` on the script so a host that has never
+rendered one does not log a failure every boot.
+
+It is enabled but **not started**, matching `render-firewall`: applying
+firewall rules is the step an operator takes after reading what they say.
+
+Two things `install web` does that this does not. It skips the
+`hidden_from_unit` guard, because that exists for the web unit's
+`ProtectHome=yes` hiding a binary under `/home` — this unit's `ExecStart` is
+`/usr/sbin/nft` and never runs stop-bots at all. And it takes no database,
+NGINX root or SSH log: one command against one file is what makes it safe to
+order after the world rather than ahead of it.

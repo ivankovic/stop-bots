@@ -56,6 +56,20 @@ use anyhow::{Context, Result};
 /// project, because a later `install tui`-shaped target would want its own.
 pub const WEB_UNIT: &str = "stop-bots-web.service";
 
+/// The unit that re-applies the rendered firewall script at boot.
+///
+/// A unit of this project's own rather than Debian's `nftables.service`,
+/// and the difference is the whole point. `nftables.service` loads
+/// `/etc/nftables.conf`; this project writes `/etc/stop-bots/firewall.nft`.
+/// Enabling the former restores a different file's rules and leaves these
+/// ones gone — and on a stock Debian or Ubuntu, where that file still opens
+/// with `flush ruleset`, enabling it also drops every table anything else
+/// on the host has loaded (ufw, Docker, a geo-blocker) once per boot.
+///
+/// This unit applies one script, touches one table, and orders itself after
+/// the services whose rules it must not race.
+pub const FIREWALL_UNIT: &str = "stop-bots-firewall.service";
+
 /// Where the installer writes, one field per path.
 ///
 /// `system()` is the real one; `under()` puts the same tree inside a
@@ -437,6 +451,90 @@ fn writable(dir: &Path) -> Result<()> {
 /// Does not run `systemctl` — that is [`activate`], kept separate so the
 /// filesystem half is testable without a service manager and so a
 /// `--dry-run` can describe both without a special case in either.
+/// The systemd unit that re-applies `script` at boot.
+///
+/// `After=` names the two services whose rules this must not race. Docker
+/// rewrites its chains on every start, and ufw loads its own tables; a
+/// script applied before either is still there afterwards, because it uses
+/// its own table and never flushes the ruleset, but ordering after them
+/// keeps the boot-time sequence the same as the one an operator sees by
+/// hand. `Wants=network-online.target` rather than `Requires=`: a ruleset
+/// is worth loading even on a host that came up without a network.
+pub fn firewall_unit(script: &Path) -> String {
+    format!(
+        "# Written by `stop-bots install firewall`. Re-running that command leaves\n\
+         # an edited copy of this file alone and tells you so; `--force` replaces it.\n\
+         #\n\
+         # Deliberately NOT nftables.service: that unit loads /etc/nftables.conf,\n\
+         # which is not this file, so it would restore a different ruleset entirely\n\
+         # -- and on a stock Debian or Ubuntu it would also `flush ruleset` at boot,\n\
+         # dropping whatever else manages tables on this host.\n\
+         [Unit]\n\
+         Description=Apply the stop-bots firewall ruleset\n\
+         Documentation=https://github.com/ivankovic/stop-bots\n\
+         After=docker.service ufw.service network-online.target\n\
+         Wants=network-online.target\n\
+         ConditionPathExists={script}\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         ExecStart=/usr/sbin/nft -f {script}\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        script = script.display()
+    )
+}
+
+/// Writes [`firewall_unit`] and enables it. Mirrors [`install_web`],
+/// including its refusal to overwrite a unit somebody has edited.
+pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
+    let script = crate::firewall::default_output_path(crate::firewall::FirewallBackend::Nftables);
+    let unit = firewall_unit(&script);
+    let unit_path = layout.unit_dir.join(FIREWALL_UNIT);
+    let existing = std::fs::read_to_string(&unit_path).ok();
+
+    if let Some(existing) = &existing {
+        if existing != &unit && !options.force {
+            anyhow::bail!(
+                "{} already exists and differs from what this would write.\n\n\
+                 If you edited it, that edit is why this stopped. Pass --force to \
+                 replace it, or diff it against:\n\n    \
+                 {} install firewall --dry-run",
+                unit_path.display(),
+                layout.binary.display()
+            );
+        }
+    }
+
+    let mut steps = Steps::new();
+    steps.push(format!("write {}", unit_path.display()));
+    if !options.dry_run {
+        if let Some(parent) = unit_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&unit_path, &unit)?;
+    }
+
+    // Not started. The script may not exist yet, and starting a unit that
+    // loads firewall rules is the one step an operator should take after
+    // reading what it would load -- the same reason `render-firewall` does
+    // not apply what it writes.
+    steps.push("systemctl daemon-reload".to_string());
+    steps.push(format!("systemctl enable {FIREWALL_UNIT}"));
+    if !options.dry_run {
+        systemctl(layout, &["daemon-reload"])?;
+        systemctl(layout, &["enable", FIREWALL_UNIT])?;
+    }
+    steps.push(format!(
+        "not started: run `nft -f {}` yourself once you have read it",
+        script.display()
+    ));
+
+    Ok(steps)
+}
+
 pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
     preflight(layout, options)?;
 

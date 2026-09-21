@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
             live_rules: Some(6_506),
             live_backend: Some("nftables".into()),
             firewall_persists: Some(false),
+            nftables_conf_flushes: None,
             unit_active: Some(true),
             unit_binary: None,
             db_free_bytes: Some(140 * 1024 * 1024 * 1024),

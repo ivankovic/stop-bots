@@ -153,9 +153,15 @@ pub struct Probe {
     /// name — a string rather than the enum so that a probe written by one
     /// version still parses in the next.
     pub live_backend: Option<String>,
-    /// Whether something will reload the ruleset after a reboot.
-    /// `None` when it could not be determined.
+    /// Whether something will re-apply *this project's* rules after a
+    /// reboot. `None` when it could not be determined. See
+    /// [`firewall_persists`] for why the two backends are asked different
+    /// questions.
     pub firewall_persists: Option<bool>,
+    /// Whether `/etc/nftables.conf` opens with `flush ruleset`, which
+    /// decides whether enabling `nftables.service` is safe to suggest on
+    /// this host. `None` when the file could not be read.
+    pub nftables_conf_flushes: Option<bool>,
     /// `systemctl is-active` for the console's unit, when there is one.
     pub unit_active: Option<bool>,
     /// The binary the unit's `ExecStart` names, if a unit exists.
@@ -270,6 +276,7 @@ pub fn probe(backend: FirewallBackend, db_path: &Path, ssh_log: Option<&Path>) -
         live_rules,
         live_backend,
         firewall_persists: firewall_persists(backend),
+        nftables_conf_flushes: nftables_conf_flushes(),
         unit_active: unit_is_active(),
         unit_binary: unit_binary(),
         db_free_bytes: free_bytes(db_path),
@@ -468,24 +475,84 @@ fn count_iptables_rules(output: &str) -> usize {
         .count()
 }
 
-/// Whether the ruleset will still be there after a reboot.
-///
-/// nftables rules live only in kernel memory. Debian's `nftables.service`
-/// is what reloads them at boot; without it, a host that was protected
-/// comes back up open and nothing says so.
-fn firewall_persists(backend: FirewallBackend) -> Option<bool> {
-    let unit = match backend {
-        FirewallBackend::Nftables => "nftables.service",
-        FirewallBackend::Iptables => "netfilter-persistent.service",
-    };
-    // `is-enabled` exits non-zero for a unit that is merely disabled, so
-    // the status cannot tell that apart from "no such unit" — the printed
-    // word can, and an empty answer is the one that means unknown.
+/// Whether a unit is enabled. `None` means the question could not be
+/// answered: `is-enabled` exits non-zero for a unit that is merely
+/// disabled, so the status cannot tell that apart from "no such unit" —
+/// the printed word can, and an empty answer is the one that means unknown.
+fn unit_enabled(unit: &str) -> Option<bool> {
     let state = run_allowing_failure("systemctl", &["is-enabled", unit])?;
     match state.trim() {
         "" => None,
         "enabled" | "enabled-runtime" => Some(true),
         _ => Some(false),
+    }
+}
+
+/// Debian's stock `/etc/nftables.conf`, which `nftables.service` loads.
+const NFTABLES_CONF: &str = "/etc/nftables.conf";
+
+/// Whether `/etc/nftables.conf` re-applies *this project's* script, by
+/// naming it in an `include`. `None` when the file could not be read.
+fn nftables_conf_includes_script() -> Option<bool> {
+    let script = crate::firewall::default_output_path(FirewallBackend::Nftables);
+    let conf = std::fs::read_to_string(NFTABLES_CONF).ok()?;
+    Some(
+        conf.lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with('#'))
+            .any(|l| l.starts_with("include") && l.contains(&script.display().to_string())),
+    )
+}
+
+/// Whether `/etc/nftables.conf` begins by flushing the whole ruleset —
+/// which Debian's stock file does. `None` when it could not be read.
+///
+/// This decides whether `systemctl enable nftables.service` is safe to
+/// suggest. On a host where nothing else manages nftables it is harmless.
+/// On one where ufw, Docker or a geo-blocker do, a boot-time `flush
+/// ruleset` takes all of them out and replaces them with whatever that
+/// file declares.
+fn nftables_conf_flushes() -> Option<bool> {
+    let conf = std::fs::read_to_string(NFTABLES_CONF).ok()?;
+    Some(
+        conf.lines()
+            .map(str::trim)
+            .any(|l| l.starts_with("flush ruleset")),
+    )
+}
+
+/// Whether *this project's* rules will still be there after a reboot.
+///
+/// The two backends need different questions asked, and asking the
+/// iptables one of nftables is how this check used to report OK on a host
+/// that came back up with nothing.
+///
+/// `netfilter-persistent` saves and restores the **live** ruleset, so
+/// whatever this project put in it is in what gets saved: the unit being
+/// enabled really does answer the question.
+///
+/// `nftables.service` does not. It loads a **static file**,
+/// `/etc/nftables.conf`, and this project writes
+/// `/etc/stop-bots/firewall.nft`. Enabling it reloads somebody else's
+/// ruleset and says nothing whatever about ours — so for nftables the
+/// question is whether anything re-applies *our* script: the unit
+/// `stop-bots install firewall` writes, or an `include` of it in
+/// `/etc/nftables.conf`.
+fn firewall_persists(backend: FirewallBackend) -> Option<bool> {
+    match backend {
+        FirewallBackend::Iptables => unit_enabled("netfilter-persistent.service"),
+        FirewallBackend::Nftables => {
+            if unit_enabled(crate::install::FIREWALL_UNIT) == Some(true) {
+                return Some(true);
+            }
+            // Falling back to the unit's answer when the file cannot be
+            // read keeps "could not tell" distinct from "no".
+            match nftables_conf_includes_script() {
+                Some(true) => Some(true),
+                Some(false) => Some(false),
+                None => unit_enabled(crate::install::FIREWALL_UNIT),
+            }
+        }
     }
 }
 
@@ -688,21 +755,49 @@ fn firewall_reaches_containers(probe: &Probe) -> Option<Check> {
 }
 
 fn firewall_persistence(probe: &Probe, backend: FirewallBackend) -> Check {
-    let unit = match backend {
-        FirewallBackend::Nftables => "nftables.service",
-        FirewallBackend::Iptables => "netfilter-persistent.service",
-    };
-    let (level, detail, fix) = match probe.firewall_persists {
-        None => (
+    let script = crate::firewall::default_output_path(backend);
+    let script = script.display();
+    let (level, detail, fix) = match (backend, probe.firewall_persists) {
+        (_, None) => (
             Level::Unknown,
-            format!("could not tell whether {unit} is enabled"),
+            "could not tell whether anything re-applies the rules at boot".to_string(),
             None,
         ),
-        Some(true) => (Level::Ok, format!("{unit} will reload them"), None),
-        Some(false) => (
+
+        // `netfilter-persistent` saves the live ruleset, so it carries ours.
+        (FirewallBackend::Iptables, Some(true)) => (
+            Level::Ok,
+            "netfilter-persistent.service will restore them".to_string(),
+            None,
+        ),
+        (FirewallBackend::Iptables, Some(false)) => (
             Level::Warn,
-            format!("{unit} is not enabled — a reboot comes back with no rules"),
-            Some(format!("systemctl enable {unit}")),
+            "netfilter-persistent.service is not enabled — a reboot comes back with no rules"
+                .to_string(),
+            Some("systemctl enable netfilter-persistent.service".to_string()),
+        ),
+
+        (FirewallBackend::Nftables, Some(true)) => {
+            (Level::Ok, format!("{script} is re-applied at boot"), None)
+        }
+        (FirewallBackend::Nftables, Some(false)) => (
+            Level::Warn,
+            format!("nothing re-applies {script} at boot — a reboot comes back with no rules"),
+            // Deliberately NOT `systemctl enable nftables.service`. That
+            // unit loads /etc/nftables.conf, which is a different file
+            // from the one this project writes, so enabling it would not
+            // restore these rules — and on a host where Debian's stock
+            // `flush ruleset` is still at the top of that file, it would
+            // take out whatever else manages the ruleset (ufw, Docker, a
+            // geo-blocker) on every boot.
+            Some(match probe.nftables_conf_flushes {
+                Some(true) => format!(
+                    "stop-bots install firewall  (do NOT enable nftables.service: \
+                     {NFTABLES_CONF} starts with `flush ruleset`, which would drop \
+                     every other table on this host at boot)"
+                ),
+                _ => "stop-bots install firewall".to_string(),
+            }),
         ),
     };
     Check {
@@ -1321,6 +1416,7 @@ mod tests {
             live_rules: Some(10),
             live_backend: Some(FirewallBackend::Nftables.stored().to_string()),
             firewall_persists: Some(true),
+            nftables_conf_flushes: None,
             unit_active: Some(true),
             unit_binary: None,
             db_free_bytes: Some(8 * 1024 * 1024 * 1024),
@@ -1819,8 +1915,55 @@ mod tests {
 
     /// nftables rules live in kernel memory only. A host that is protected
     /// now and comes back open after a reboot is worth a word.
+    /// The advice this check used to give, and why it no longer does.
+    ///
+    /// `nftables.service` loads /etc/nftables.conf, which is not the file
+    /// this project writes -- so recommending it was recommending
+    /// something that would not have restored these rules. On a stock
+    /// Debian or Ubuntu it is worse than useless: that file opens with
+    /// `flush ruleset`, so enabling it drops ufw's tables, Docker's chains
+    /// and any geo-blocker's rules once per boot.
     #[test]
-    fn rules_that_will_not_survive_a_reboot_warn_and_name_the_unit() {
+    fn the_nftables_fix_never_recommends_enabling_nftables_service() {
+        let report = assess(
+            &db(),
+            &Probe {
+                firewall_persists: Some(false),
+                nftables_conf_flushes: Some(true),
+                ..healthy()
+            },
+        )
+        .unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "firewall-persists")
+            .expect("the persistence check should be present");
+        let fix = check.fix.clone().unwrap_or_default();
+        assert!(
+            fix.starts_with("stop-bots install firewall"),
+            "the fix an operator reads first must be the one that applies *our* \
+             script; fix was: {fix}"
+        );
+        // It may *mention* nftables.service -- warning about it is the point
+        // -- but only to say not to. Any occurrence must be negated.
+        for (offset, _) in fix.match_indices("enable nftables.service") {
+            assert!(
+                fix[..offset].contains("do NOT"),
+                "every mention of enabling nftables.service must be a warning \
+                 against it, not a recommendation; fix was: {fix}"
+            );
+        }
+        assert!(
+            fix.contains("flush ruleset"),
+            "when /etc/nftables.conf flushes, the fix should say so; fix was: {fix}"
+        );
+    }
+
+    /// And the detail names the file that is actually not being restored,
+    /// rather than a service whose state says nothing about it.
+    #[test]
+    fn the_nftables_detail_names_the_script_that_is_not_re_applied() {
         let report = assess(
             &db(),
             &Probe {
@@ -1829,15 +1972,44 @@ mod tests {
             },
         )
         .unwrap();
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.id == "firewall-persists")
+            .expect("the persistence check should be present");
+        assert!(
+            check.detail.contains("firewall.nft"),
+            "detail was: {}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn rules_that_will_not_survive_a_reboot_warn_and_name_the_script() {
+        let report = assess(
+            &db(),
+            &Probe {
+                firewall_persists: Some(false),
+                nftables_conf_flushes: None,
+                ..healthy()
+            },
+        )
+        .unwrap();
 
         let check = check(&report, "firewall-persists");
         assert_eq!(check.level, Level::Warn);
+        // The script, not a service: naming `nftables.service` here was
+        // what made this check answer a question about a different file.
         assert!(
-            check.detail.contains("nftables.service"),
+            check.detail.contains("firewall.nft"),
             "was: {}",
             check.detail
         );
-        assert!(check.fix.as_deref().unwrap().contains("systemctl enable"));
+        assert!(
+            check.fix.as_deref().unwrap().contains("install firewall"),
+            "was: {:?}",
+            check.fix
+        );
     }
 
     /// The backend decides which unit is the one that matters, the same
@@ -1851,6 +2023,7 @@ mod tests {
             &db,
             &Probe {
                 firewall_persists: Some(false),
+                nftables_conf_flushes: None,
                 ..healthy()
             },
         )
@@ -2177,6 +2350,7 @@ mod tests {
         let probe = Probe {
             live_rules: Some(0),
             firewall_persists: Some(false),
+            nftables_conf_flushes: None,
             ..healthy()
         };
 
