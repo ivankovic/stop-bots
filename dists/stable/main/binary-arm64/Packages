@@ -34,11 +34,11 @@ Depends:
 Recommends: nftables | iptables
 Suggests: nginx
 Filename: pool/main/s/stop-bots/stop-bots_0.0.4-1_arm64.deb
-Size: 3429988
-MD5sum: e843395328cea225225e386612b0b929
-SHA1: 87f7373b765a4aa2d9b6c4d67a181f7bad1adcd4
-SHA256: b30cbc6f1bc0bc338894adda60a50571d3c85811b08e6bb2762408dd9e43f4f2
-SHA512: 69281f63af1009ba52854ea624e9159428dbb4d65fdac56ef1300ace5e0077d561cc18cb9c8edf1aa0f966ef5a878817416b82987c2a0943c0680bef94e46c89
+Size: 3429808
+MD5sum: 69ca2ffdd71b0ac7d35766d3b0d6c690
+SHA1: 4f2387b25babcea85e7eb01762b37a586098bfbf
+SHA256: 81341b397b0d3fc5ecb9b12c4703bdef3f2a3562e52d73f5855bdeffd3dababe
+SHA512: 18122526fe7f48c3b7d8a50a8c5d14deb2f3c6f958edf6eb950a520ed3e1ab811613f535a038c4e7c0de2d218d94160ac973fc6702aaffb36addba95f608a225
 Homepage: https://github.com/ivankovic/stop-bots
 Description: A TUI that helps you configure your server to stop bad bots and still allow
  good bots.
