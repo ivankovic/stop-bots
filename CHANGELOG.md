@@ -5,7 +5,7 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
-## Unreleased
+## [0.0.4] — 2026-09-21
 
 ### Changed
 
@@ -23,8 +23,6 @@ need.
   reader has to answer to find a setting. Naming the tabs after the two
   outputs answers it from the tab bar. The new order puts them in the
   order the Dashboard's "Apply everything" runs them.
-
-## [0.0.4] — 2026-09-21
 
 ### Fixed
 
