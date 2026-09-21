@@ -103,8 +103,8 @@ impl Ctx {
 pub enum Tab {
     Dashboard,
     Bots,
-    Sites,
-    Dynamic,
+    Firewall,
+    Nginx,
     Help,
 }
 
@@ -112,8 +112,8 @@ impl Tab {
     pub const ALL: [Tab; 5] = [
         Tab::Dashboard,
         Tab::Bots,
-        Tab::Sites,
-        Tab::Dynamic,
+        Tab::Firewall,
+        Tab::Nginx,
         Tab::Help,
     ];
 
@@ -121,22 +121,22 @@ impl Tab {
         match self {
             Tab::Dashboard => "/",
             Tab::Bots => "/bots",
-            Tab::Sites => "/sites",
-            Tab::Dynamic => "/dynamic",
+            Tab::Firewall => "/firewall",
+            Tab::Nginx => "/nginx",
             Tab::Help => "/help",
         }
     }
 
     /// The key that jumps to this tab — shown in the tab itself, which is
     /// what teaches the map without a manual. Digits rather than the
-    /// TUI's mnemonic letters because a digit can be printed next to
-    /// "Dynamic Protection" and `p` cannot; the letters work too.
+    /// TUI's mnemonic letters, because the digit is what both front-ends
+    /// print in the tab bar; the letters work here too.
     pub fn key(self) -> &'static str {
         match self {
             Tab::Dashboard => "1",
             Tab::Bots => "2",
-            Tab::Sites => "3",
-            Tab::Dynamic => "4",
+            Tab::Firewall => "3",
+            Tab::Nginx => "4",
             Tab::Help => "?",
         }
     }
@@ -145,8 +145,8 @@ impl Tab {
         match self {
             Tab::Dashboard => "Dashboard",
             Tab::Bots => "Bot settings",
-            Tab::Sites => "Site settings",
-            Tab::Dynamic => "Dynamic Protection",
+            Tab::Firewall => "Firewall",
+            Tab::Nginx => "NGINX",
             Tab::Help => "Help",
         }
     }
@@ -457,7 +457,7 @@ const THEME_BOOTSTRAP: &str = r#"
   // The TUI's key map, for the same product in a browser: digits and
   // their mnemonics jump to a tab, `/` reaches the search box, `t` is
   // the theme. Only while nothing is being typed into.
-  var tabKeys = { '1': 0, 'd': 0, '2': 1, 'b': 1, '3': 2, 's': 2, '4': 3, 'p': 3, '?': 4 };
+  var tabKeys = { '1': 0, 'd': 0, '2': 1, 'b': 1, '3': 2, 'f': 2, '4': 3, 'n': 3, '?': 4 };
   document.addEventListener('keydown', function (event) {
     if (event.altKey || event.ctrlKey || event.metaKey) return;
     var target = event.target;
@@ -589,7 +589,7 @@ mod tests {
     #[test]
     fn the_login_page_offers_no_way_into_the_app() {
         let rendered = login_page(&BasePath::default(), None).into_string();
-        for path in ["/bots", "/sites", "/dynamic", "/logout"] {
+        for path in ["/bots", "/firewall", "/nginx", "/logout"] {
             assert!(
                 !rendered.contains(path),
                 "the login page must not link to {path}"

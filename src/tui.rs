@@ -23,11 +23,11 @@
 
 pub mod bot_settings;
 pub mod dashboard;
-pub mod dynamic_protection;
+pub mod firewall;
 pub mod help;
+pub mod nginx;
 pub mod palette;
 pub mod site_detail;
-pub mod site_settings;
 
 use crate::app::App;
 use ratatui::{
@@ -202,7 +202,7 @@ pub fn select_in<'a>(list: List<'a>, focused: bool, theme: Theme) -> List<'a> {
 }
 
 /// The screens the TUI can show. Jumped to with the digit the tab bar
-/// shows (`1`–`4`, or the `d`/`b`/`s`/`p` aliases), stepped through with
+/// shows (`1`–`4`, or the `d`/`b`/`f`/`n` aliases), stepped through with
 /// Left/Right or their vim `h`/`l` aliases (see `App::handle_key_event`'s
 /// global fallback match — these only fire once the active screen itself
 /// has ignored the key), with Help reachable via `?` and the command
@@ -213,8 +213,8 @@ pub enum Screen {
     #[default]
     Dashboard,
     BotSettings,
-    SiteSettings,
-    DynamicProtection,
+    Firewall,
+    Nginx,
     Help,
 }
 
@@ -222,8 +222,8 @@ impl Screen {
     pub const TABS: [Screen; 4] = [
         Screen::Dashboard,
         Screen::BotSettings,
-        Screen::SiteSettings,
-        Screen::DynamicProtection,
+        Screen::Firewall,
+        Screen::Nginx,
     ];
 
     /// The key that jumps straight to this screen, shown in the tab bar.
@@ -231,8 +231,8 @@ impl Screen {
         match self {
             Screen::Dashboard => '1',
             Screen::BotSettings => '2',
-            Screen::SiteSettings => '3',
-            Screen::DynamicProtection => '4',
+            Screen::Firewall => '3',
+            Screen::Nginx => '4',
             Screen::Help => '?',
         }
     }
@@ -241,8 +241,8 @@ impl Screen {
         match self {
             Screen::Dashboard => "Dashboard",
             Screen::BotSettings => "Bot settings",
-            Screen::SiteSettings => "Site settings",
-            Screen::DynamicProtection => "Dynamic Protection",
+            Screen::Firewall => "Firewall",
+            Screen::Nginx => "NGINX",
             Screen::Help => "Help",
         }
     }
@@ -250,18 +250,18 @@ impl Screen {
     pub fn next(self) -> Self {
         match self {
             Screen::Dashboard => Screen::BotSettings,
-            Screen::BotSettings => Screen::SiteSettings,
-            Screen::SiteSettings => Screen::DynamicProtection,
-            Screen::DynamicProtection | Screen::Help => Screen::Dashboard,
+            Screen::BotSettings => Screen::Firewall,
+            Screen::Firewall => Screen::Nginx,
+            Screen::Nginx | Screen::Help => Screen::Dashboard,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            Screen::Dashboard => Screen::DynamicProtection,
+            Screen::Dashboard => Screen::Nginx,
             Screen::BotSettings => Screen::Dashboard,
-            Screen::SiteSettings => Screen::BotSettings,
-            Screen::DynamicProtection => Screen::SiteSettings,
+            Screen::Firewall => Screen::BotSettings,
+            Screen::Nginx => Screen::Firewall,
             Screen::Help => Screen::Dashboard,
         }
     }
@@ -284,7 +284,7 @@ pub enum KeyOutcome {
     Back,
     /// Not relevant to this screen; let the caller handle it.
     Ignored,
-    /// The Dynamic Protection screen wants the detail for one address.
+    /// The Firewall screen wants the detail for one address.
     /// `App` assembles it, because the failed-login usernames come from
     /// the SSH log text `App` read in the background and the screen does
     /// not keep a copy — see `ipdetail` for what goes into the answer.
@@ -323,7 +323,7 @@ pub enum KeyOutcome {
         force: bool,
         apply: bool,
     },
-    /// Site settings wrote at least one changed NGINX config file on disk
+    /// NGINX wrote at least one changed NGINX config file on disk
     /// (`apply now` / `apply all`). Reloading is a real side effect (shells
     /// out to `nginx -t` and `systemctl reload nginx`), so — same reasoning
     /// as `RenderFirewall`/`UpdateSource` — it stays with `App` rather than
@@ -331,13 +331,13 @@ pub enum KeyOutcome {
     /// free of real process execution so its tests stay fast and
     /// deterministic (see `crate::nginx::reload`).
     ReloadNginx,
-    /// Site settings confirmed one of its filesystem actions: a scan of
+    /// NGINX confirmed one of its filesystem actions: a scan of
     /// the NGINX config root, or an apply to one site or to all of them.
     /// All three walk or rewrite files under `/etc/nginx`, so — same
     /// reasoning as [`Self::ReloadNginx`] and [`Self::RenderFirewall`] —
     /// `App` performs them, off the event loop, rather than the screen's
     /// key handler doing it inline.
-    SiteAction(crate::tui::site_settings::SiteAction),
+    SiteAction(crate::tui::nginx::SiteAction),
     /// The Dashboard's `u` key: download every list this host uses. Eight
     /// or more network round-trips, so it goes to `App` for exactly the
     /// reason [`Self::UpdateSource`] does — the screen's key handler stays
@@ -353,7 +353,7 @@ pub enum KeyOutcome {
     /// three are things the screen's key handler must not do, same as
     /// [`Self::SiteAction`].
     SetWebAccess(crate::webaccess::Request),
-    /// Dynamic Protection's `R`: read the SSH log again now, rather than
+    /// Firewall's `R`: read the SSH log again now, rather than
     /// when the 30-second cache says so. `App` owns that read (see
     /// `App::start_ssh_log_read`), for the same reason it owns every
     /// other blocking one.
@@ -439,11 +439,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                 .render(frame, body, app.theme, &app.log, &app.jobs_in_flight)
         }
         Screen::BotSettings => app.bot_settings.render(frame, body, app.theme),
-        Screen::SiteSettings => app.site_settings.render(frame, body, app.theme),
-        Screen::DynamicProtection => {
-            app.dynamic_protection
-                .render(frame, body, app.theme, &app.jobs_in_flight)
-        }
+        Screen::Firewall => app
+            .firewall
+            .render(frame, body, app.theme, &app.jobs_in_flight),
+        Screen::Nginx => app.nginx.render(frame, body, app.theme),
         Screen::Help => help::render(frame, body, app.theme),
     }
 
@@ -579,8 +578,8 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         (Some(palette), _) => palette.hints(),
         (None, Screen::Dashboard) => app.dashboard.hints(),
         (None, Screen::BotSettings) => app.bot_settings.hints(),
-        (None, Screen::SiteSettings) => app.site_settings.hints(),
-        (None, Screen::DynamicProtection) => app.dynamic_protection.hints(),
+        (None, Screen::Firewall) => app.firewall.hints(),
+        (None, Screen::Nginx) => app.nginx.hints(),
         (None, Screen::Help) => ("Help", vec![("Esc", "back")]),
     };
     let mut spans: Vec<Span> = vec![panel.fg(theme.accent()).bold(), "  ".into()];
@@ -716,9 +715,9 @@ mod tests {
     #[test]
     fn screen_next_cycles_through_every_tab_back_to_dashboard() {
         assert_eq!(Screen::Dashboard.next(), Screen::BotSettings);
-        assert_eq!(Screen::BotSettings.next(), Screen::SiteSettings);
-        assert_eq!(Screen::SiteSettings.next(), Screen::DynamicProtection);
-        assert_eq!(Screen::DynamicProtection.next(), Screen::Dashboard);
+        assert_eq!(Screen::BotSettings.next(), Screen::Firewall);
+        assert_eq!(Screen::Firewall.next(), Screen::Nginx);
+        assert_eq!(Screen::Nginx.next(), Screen::Dashboard);
     }
 
     #[test]

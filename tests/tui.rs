@@ -220,7 +220,7 @@ fn spawn_tui(db_path: &Path) -> PtySession {
 }
 
 /// Like [`spawn_tui`], but also passes `--root <root>` — needed for tests
-/// that trigger a site scan from Site settings against a controlled fixture
+/// that trigger a site scan from NGINX against a controlled fixture
 /// directory rather than the real `/etc/nginx`.
 fn spawn_tui_with_root(db_path: &Path, root: &Path) -> PtySession {
     spawn_tui_with_args(db_path, &["--root", root.to_str().unwrap()])
@@ -294,7 +294,7 @@ fn spawn_tui_cmd(db_path: &Path, extra_args: &[&str], fakebin: Option<&Path>) ->
     // A fixture SSH log, for the same reason the CLI tests pass --ssh-log:
     // auto-detection reads whatever log the host machine has — or shells
     // out to `journalctl`, which costs upwards of half a second per
-    // Dynamic Protection refresh on some hosts and made every test in this
+    // Firewall refresh on some hosts and made every test in this
     // file carry that as fixed overhead.
     cmd.args(["--ssh-log", "tests/fixtures/logs/auth.log"]);
     cmd.args(extra_args);
@@ -388,7 +388,7 @@ fn the_ssh_panel_fills_in_from_the_background_log_read() {
     let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "p");
+    send_key(&mut session, "f");
     // Short needles on purpose. Switching screens redraws over the
     // Dashboard, and ratatui skips any cell that already holds the right
     // character — so a long literal arrives split around whatever the two
@@ -605,7 +605,7 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
 }
 
 #[test]
-fn site_settings_scan_now_discovers_sites_from_the_tui() {
+fn nginx_screen_scan_now_discovers_sites_from_the_tui() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
 
@@ -618,7 +618,7 @@ fn site_settings_scan_now_discovers_sites_from_the_tui() {
     let mut session = spawn_tui_with_root(&db_path, root);
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
     session.exp_string("Press").unwrap();
     session.exp_string("scan").unwrap();
@@ -727,7 +727,7 @@ fn wait_for_systemctl_calls(calls: &Path, want: usize) -> String {
     }
 }
 
-/// Applies the site currently selected in Site settings' list: `a`, then
+/// Applies the site currently selected in the NGINX screen's list: `a`, then
 /// Cancel -> Apply now. The list is sorted by server name and the
 /// selection starts at the top, so the caller picks the site with Down.
 fn apply_selected_site(session: &mut PtySession) {
@@ -751,7 +751,7 @@ fn applying_a_site_reloads_nginx_without_blocking_the_tui() {
     let (_tmp, mut session, calls, gate) = site_tui_with_a_holdable_reload();
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
     apply_selected_site(&mut session);
 
@@ -796,7 +796,7 @@ fn a_second_apply_during_a_reload_still_gets_its_own_reload() {
     let (_tmp, mut session, calls, gate) = site_tui_with_a_holdable_reload();
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
 
     // Both applies happen while the gate holds the first reload open, so
@@ -819,7 +819,7 @@ fn a_second_apply_during_a_reload_still_gets_its_own_reload() {
 }
 
 #[test]
-fn site_settings_apply_writes_the_selected_sites_rule_to_its_own_file() {
+fn nginx_screen_apply_writes_the_selected_sites_rule_to_its_own_file() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
     let nginx_root = writable_nginx_fixture(tmp.path());
@@ -833,7 +833,7 @@ fn site_settings_apply_writes_the_selected_sites_rule_to_its_own_file() {
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
     // Nothing's been applied to disk yet, but a rule is expected (the
     // global AI default blocks AISearchBot with no overrides needed).
@@ -877,7 +877,7 @@ fn site_settings_apply_writes_the_selected_sites_rule_to_its_own_file() {
 }
 
 #[test]
-fn site_settings_apply_all_writes_the_rule_to_every_sites_own_file() {
+fn nginx_screen_apply_all_writes_the_rule_to_every_sites_own_file() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
     let nginx_root = writable_nginx_fixture(tmp.path());
@@ -888,7 +888,7 @@ fn site_settings_apply_all_writes_the_rule_to_every_sites_own_file() {
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
     session.exp_string("STALE").unwrap();
 
@@ -925,7 +925,7 @@ fn site_settings_apply_all_writes_the_rule_to_every_sites_own_file() {
 }
 
 #[test]
-fn site_settings_apply_failure_shows_a_dismissible_alert_with_a_root_suggestion() {
+fn nginx_screen_apply_failure_shows_a_dismissible_alert_with_a_root_suggestion() {
     // Root bypasses file permission bits, so chmod-ing the file read-only
     // below wouldn't actually make the write fail there.
     if unsafe { libc::geteuid() } == 0 {
@@ -951,7 +951,7 @@ fn site_settings_apply_failure_shows_a_dismissible_alert_with_a_root_suggestion(
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
     session.exp_string("STALE").unwrap();
 
@@ -1006,7 +1006,7 @@ fn open_site_detail(tmp: &tempfile::TempDir) -> PtySession {
     let mut session = spawn_tui(&db_path);
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
     // "example.com" sorts before "localhost" and is selected by default.
     session.exp_string("example.com").unwrap();
@@ -1079,14 +1079,14 @@ fn help_screen_opens_and_returns_to_the_previous_screen() {
     let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
 
     send_key(&mut session, "?");
     session.exp_string("Navigation").unwrap();
     session.exp_string("light/dark").unwrap();
 
-    // Esc on Help goes back to Site settings, not the Dashboard.
+    // Esc on Help goes back to NGINX, not the Dashboard.
     send_key(&mut session, "\x1b");
     session.exp_string("Sites").unwrap();
 
@@ -1166,21 +1166,21 @@ fn dashboard_geo_blocking_add_and_remove_a_country() {
 
 /// The command palette end to end: `:` opens it over whatever screen is
 /// up, typing narrows the list, Enter runs the selected command — here
-/// "Re-read the SSH log", whose first effect is landing on Dynamic
-/// Protection, a screen change the pty can see.
+/// "Re-read the SSH log", whose first effect is landing on the
+/// Firewall screen, a screen change the pty can see.
 #[test]
 fn the_command_palette_runs_a_typed_command() {
     let tmp = tempfile::tempdir().unwrap();
     let mut session = spawn_tui(&tmp.path().join("db.sqlite3"));
     session.exp_string("Dashboard").unwrap();
 
-    send_key(&mut session, "s");
+    send_key(&mut session, "n");
     session.exp_string("Sites").unwrap();
 
     send_key(&mut session, ":");
     session.exp_string("Commands").unwrap();
-    // A word from the unfiltered list that is not on Site settings.
-    session.exp_string("Dynamic").unwrap();
+    // A word from the unfiltered list that is not on the NGINX screen.
+    session.exp_string("Update").unwrap();
 
     // Narrow to one row. Not checked on the query line: each keystroke
     // redraws one cell, so "re-read" never arrives contiguously. The

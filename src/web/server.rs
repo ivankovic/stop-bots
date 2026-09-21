@@ -70,13 +70,13 @@ pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route(&path("/"), get(crate::web::dashboard::page))
         .route(&path("/bots"), get(crate::web::bots::page))
-        .route(&path("/sites"), get(crate::web::sites::page))
-        .route(&path("/dynamic"), get(crate::web::dynamic::page))
+        .route(&path("/nginx"), get(crate::web::nginx::page))
+        .route(&path("/firewall"), get(crate::web::firewall::page))
         .route(&path("/help"), get(crate::web::help::page))
         .merge(crate::web::dashboard::actions(&state.base))
         .merge(crate::web::bots::actions(&state.base))
-        .merge(crate::web::sites::actions(&state.base))
-        .merge(crate::web::dynamic::actions(&state.base))
+        .merge(crate::web::nginx::actions(&state.base))
+        .merge(crate::web::firewall::actions(&state.base))
         .layer(middleware::from_fn_with_state(state.clone(), csrf_guard))
         .layer(middleware::from_fn_with_state(state.clone(), require_login));
 

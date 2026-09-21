@@ -3,14 +3,12 @@
 [![CI](https://github.com/ivankovic/stop-bots/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/ivankovic/stop-bots/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/stop-bots.svg)](https://crates.io/crates/stop-bots)
 [![Coverage](https://img.shields.io/badge/coverage-%E2%89%A590%25-brightgreen)](https://github.com/ivankovic/stop-bots/blob/main/CONTRIBUTING.md#coverage)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue)](https://github.com/ivankovic/stop-bots/blob/main/Cargo.toml)
 [![License: AGPL v3+](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](https://github.com/ivankovic/stop-bots/blob/main/LICENSE)
 
 A TUI, a web UI and a CLI that help you configure your server to stop bad bots without hiding
 behind a CDN.
 
-It works alongside NGINX and your existing firewall (iptables or nftables), on two separate
-planes:
+It works alongside NGINX and your existing firewall (iptables or nftables):
 
 - **NGINX config.** - It classifies known bots by category (scanners, search engines, AI
   crawlers) and blocks or allows them by injecting a rule into your site configs. It scans the NGINX
@@ -18,11 +16,11 @@ planes:
 - **A firewall script.** - Block entire countries, datacenter IP ranges, known bot IP ranges or any
   IP address that repeatedly tries to log into your server unsuccessfully.
 
-![The stop-bots dashboard: system-wide bot categories, geo-blocking, automatic detectors and the internal cron](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/dashboard.svg)
+![The four screens in sequence: Dashboard, Bot settings, Firewall and NGINX](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/tour.gif)
 
 The app tries its best to not lock you out of the server, but you use it on your own risk. And note
-that it is licensed under AGPL, so if you are using it commercially, make sure you obey the letter
-of the license.
+that it is licensed under AGPL, so if you are using it commercially, make sure you obey the
+license.
 
 # Installation
 
@@ -46,103 +44,20 @@ Requires Rust 1.88 or newer to build. Linux only in practice: it shells out to
 `systemctl`, `nginx -t` and `nft`/`iptables`, so while it compiles elsewhere it won't be
 much use there.
 
-# Usage
+# What it protects against
 
-Run the binary with no arguments to launch the TUI, `stop-bots web` for the same screens in
-a browser (see [The web UI](#the-web-ui)), or see `stop-bots --help` for the full list of
-CLI subcommands. The TUI and CLI can be used together. Configure everything in the TUI and
-then use the CLI in a crontab to keep the rules updated.
-
-You can exit the app, or back out of a popup/submenu, with 'q' or Escape.
-
-## Theme
-
-You can switch between the dark and light theme with 't'. The app will try to auto-detect the theme,
-but for some terminal and multiplexer combinations there isn't enough information available to make
-the correct choice.
-
-## Screens
-
-`1`–`4` (or `d`/`b`/`s`/`p`) jump straight to a screen; Left/Right, or their vim `h`/`l`
-aliases, step through them; `?` toggles a full key-binding reference at any time, and `:`
-opens a command palette listing every action by name. Tab / Shift+Tab always move between
-the *panels* of the current screen, never between screens.
-
-![The four screens in sequence: Dashboard, Bot settings, Site settings and Dynamic Protection](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/tour.gif)
-
-The Dashboard owns everything that ends up in the **firewall script**; Site settings owns
-everything that ends up in **NGINX config**. That split decides where any given setting lives.
-
-- **Dashboard** (the default screen): system-wide category defaults (Scanners / Search Bots /
-  AI Bots — Allowed or Blocked); host-wide geo-blocking (block or allow-list specific
-  countries); an "Automatic blocking" panel with an on/off switch for each detector and each
-  third-party blocklist; a "Firewall script" panel (how many rules a render would write,
-  whether the script on disk is stale, and the sites and bot lists it is rendered from); a
-  "Scheduled" panel showing the internal cron's jobs and when they last ran (with a spinner
-  next to any job currently running in the background); and a Log of what the app last
-  did. A status strip under the tabs shows the host's health checks on every screen.
-  `Up`/`Down` flow between the three lists; `m` switches geo mode. Press `F` to render the
-  current firewall rules to a script — the
-  popup also has an "apply after writing" toggle (Space) for actually enforcing it
-  immediately, instead of applying it by hand afterward. Three more keys act on the whole
-  host: `u` downloads every list, `a` applies both planes (NGINX, then the firewall), and
-  `w` puts this console behind NGINX — the same three the browser has as buttons and a
-  panel.
-- **Bot settings**: lists every known bot-list source (with an action to refresh it) and every
-  individual bot, searchable by name, with a per-bot override (Allowed / Blocked / follow the
-  category default).
-- **Site settings**: an "NGINX settings" panel (`Tab` to focus it) holding the host-wide
-  choices that shape generated config — what a blocked request gets back (see below),
-  whether to serve a generated `robots.txt`, and rate limiting — above every NGINX site
-  discovered on disk, each with a live "up to date / stale / not found" status and actions to
-  apply the current policy to one site or all of them. Changing any of those settings flips
-  every applied site to `STALE`, which is your cue to re-apply. Opening a site lets you
-  override its category/bot policy, switch on any of the six request-shape rules, and list
-  paths exempt from blocking.
-- **Dynamic Protection**: a live, actionable view of what's currently hitting the server — "Top
-  IPs attempting SSH connection" and "Top User Agents", each ranked by count and tagged
-  `NOT BLOCKED`/`BLOCKED` (shown in red). `Tab`/`Shift+Tab` switch which of the two panels
-  `Up`/`Down` apply to; `f` cycles a shared filter (all / not blocked only / blocked only);
-  `Enter` blocks the selected `NOT BLOCKED` row, or unblocks it if it's already `BLOCKED`.
-  `i` inspects the selected address: which of the reputation feeds list it, whether it is
-  inside a published crawler range (which is what separates a real Googlebot from a user
-  agent that merely says so), which country it belongs to, and which accounts it tried to
-  log in as. All of it from lists this host has already downloaded — there is no reverse
-  DNS or whois lookup here, because a PTR record is written by whoever holds the address
-  and would be attacker-supplied text that reads as authoritative.
-- **Help**: the full key-binding reference.
-
-Bot settings, where every list source and every individual bot lives:
-
-![Bot settings: the three bot-list sources with their counts, and a search matching five bots across categories](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/bot-settings.svg)
-
-Site settings, where the host-wide NGINX choices sit above every site found on disk:
-
-![Site settings: block response, robots.txt and rate limiting, above two sites tagged UP TO DATE and STALE](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/site-settings.svg)
-
-Dynamic Protection, the live view of what is hitting the server right now:
-
-![Dynamic Protection: failed SSH logins and top user agents, each row tagged BLOCKED, BLOCKLIST or NOT BLOCKED](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/dynamic-protection.svg)
-
-
-## What it actually protects against
-
-### Using the NGINX config
+## Using the NGINX config
 
 - **Known bots**, by category (scanner / search engine / AI crawler), sourced from
   [ArcJet's Well-Known Bots](https://github.com/arcjet/well-known-bots),
   [ai.robots.txt](https://github.com/ai-robots-txt/ai.robots.txt) and the
   [NGINX Ultimate Bad Bot Blocker](https://github.com/mitchellkrogza/nginx-ultimate-bad-bot-blocker)
   list. Blocking a category injects an `if ($http_user_agent ...)` rule into each site's NGINX
-  config (`apply-blocks` / Site settings' `a`/`A`).
-- **Too many requests**, via NGINX's own rate limiting. Unlike everything else here this is
-  enforced by NGINX at request time rather than by analysing a log afterwards. Off by default:
-  a limit tuned for the wrong site turns away real visitors.
-- **Politely, first** — an optional generated `robots.txt` listing every bot you're blocking,
-  for the crawlers that honour it, plus the honeypot path below. Off by default, because it
-  replaces whatever your site serves at `/robots.txt` today.
-- **Except where you say otherwise** — per-site path exemptions, so you can block AI crawlers
-  everywhere except `/blog`.
+  config.
+- **Too many requests**, via NGINX's own rate limiting.
+- **Politely, first** — a generated `robots.txt` listing every bot you're blocking, for the
+  crawlers that honour it, plus the honeypot path below.
+- **Except where you say otherwise** — per-site path exemptions.
 - **Requests that don't look like a browser**, per site. Six independent rules, each its own
   toggle and each off by default — one switch per rule so that if something of yours stops
   working, you can tell which rule did it:
@@ -156,21 +71,9 @@ Dynamic Protection, the live view of what is hitting the server right now:
   | `Host` is a bare IP | breaks reaching the site by IP |
   | TLS 1.0 / 1.1 | very old clients only |
 
-  Two safeguards apply to all of them, and are enforced rather than left to you:
-  - The two TLS-dependent rules are only written into **HTTPS** `server` blocks. Browsers
-    don't do HTTP/2 without TLS, so on a plain `listen 80` block every request is HTTP/1.1 —
-    including the redirect a browser makes on its way to HTTPS. Your port-80 and port-443
-    blocks usually share a `server_name`, so the setting reaches both; only the TLS one gets
-    those rules. The header-shape rules work over plain HTTP and are written to both.
-  - `/.well-known/` is always exempt as soon as any rule is on. That's where Let's Encrypt
-    fetches its HTTP-01 challenge, over HTTP/1.1 with no `Accept` and often no `User-Agent` —
-    without the exemption your certificate stops renewing weeks later.
+## What a blocked request actually gets
 
-### What a blocked request actually gets
-
-One host-wide choice, on Site settings. These aren't interchangeable status codes — each says
-something different, and the difference matters most for the clients you *didn't* mean to
-catch:
+There are seven choices:
 
 | Option | What it's for |
 |---|---|
@@ -183,13 +86,11 @@ catch:
 | `Tarpit` | answers 403 but trickles the body at one byte per second, so the client waits instead of moving on |
 
 The tarpit is the gentlest option for a false positive — a wrongly caught client is slowed,
-not refused — and the harshest on cost for a bot, whose connection sits idle. Two things to
+not refused — and the harshest on cost for a bot, whose connection sits idle. One thing to
 know before choosing it: it holds one of *your* worker connections for the duration too, so
-a flood of tarpitted clients competes with real visitors for `worker_connections`; and how
-long it actually lasts depends on how NGINX chooses to write a small error body, which is
-noted in TODO.md as needing a check against a real server.
+a flood of tarpitted clients competes with real visitors for `worker_connections`.
 
-### From your logs, automatically
+## From your logs, automatically
 
 Each of these is an independent switch on the Dashboard's "Automatic blocking" panel, and
 each adds a temporary firewall block that expires on its own and is re-added if the behaviour
@@ -233,7 +134,7 @@ exempt verified search-engine crawlers, which would otherwise match every one of
   `Referrer-Policy: no-referrer` and privacy tooling; the distinct-path threshold is what
   makes it usable at all.
 
-### By address
+## By address
 
 - **Whole countries**, via IPdeny's aggregated CIDR lists — block specific countries, or flip
   to allow-list mode and block everything else.
@@ -249,11 +150,11 @@ exempt verified search-engine crawlers, which would otherwise match every one of
   always blocks the `/64`, because a `/64` is one LAN, the same thing a single IPv4 address
   represents. Blocking the single address an IPv6 attacker happened to use would stop nothing
   — they have 2^64 more.)
-- **Anything else**, by hand — add an IP/CIDR allow or block rule directly, or use the Dynamic
-  Protection screen to permanently block a specific IP or user agent you've spotted before it
+- **Anything else**, by hand — add an IP/CIDR allow or block rule directly, or use the
+  Firewall screen to permanently block a specific IP or user agent you've spotted before it
   ever crosses an automatic threshold.
 
-### Is it actually working?
+## Is it actually working?
 
 Everything above is *generated*. Whether any of it is in effect is a separate
 question, and `stop-bots status` is the one that answers it:
@@ -288,10 +189,10 @@ The same report is on the Dashboard in both the console and the TUI, taken
 hourly by the internal cron rather than on every render: `nft list` on a large
 ruleset is megabytes of text.
 
-### Nothing happens without you
+## Nothing happens without you
 
 Every firewall decision above is *generated*, never applied automatically: `render-firewall`
-(or the Dashboard's `f` key) writes an iptables or nftables script for you to review and apply
+(or the Dashboard's `F` key) writes an iptables or nftables script for you to review and apply
 yourself, and refuses to write one that would lock out a currently-connected SSH session.
 
 Three things can apply it for you, and all three need you to ask: the TUI's render popup
@@ -301,15 +202,94 @@ writing") or its "Apply everything" button, and `batch --apply` from a crontab y
 automatic: the internal cron renders the script and never runs it.
 
 The same applies on the NGINX side: changing a setting only changes what *would* be written.
-Site settings shows each site as `STALE` until you apply.
+The NGINX screen shows each site as `STALE` until you apply.
 
 Switching a detector off never removes blocks it already added — those expire on their own.
 "Stop detecting" and "undo what was detected" are deliberately separate; the second is the
-Dynamic Protection screen or `remove-firewall-rule`.
+Firewall screen or `remove-firewall-rule`.
 
 There's also a plain access-log tally, independent of blocking: `record-access-stats` /
 `list-access-stats` count how often each user agent shows up in successful (non-error)
 requests, so you can see who's actually visiting on top of who's being blocked.
+
+# Usage
+
+Run the binary with no arguments to launch the TUI, `stop-bots web` for the same screens in
+a browser (see [The web UI](#the-web-ui)), or see `stop-bots --help` for the full list of
+CLI subcommands. All UIs can be used together. Configure everything in the TUI and then use
+the CLI in a crontab to keep the rules updated.
+
+## TUI
+
+`1`–`4` jump to a screen, `?` opens a full key-binding reference at any time, and `:`
+opens a command palette listing every action by name. You can exit the app, or back out of
+a popup or submenu, with `q` or Escape. The digits and `?` work in the web UI too; `:` is
+the TUI's own.
+
+### Theme
+
+You can switch between the dark and light theme with 't'. The app will try to auto-detect the theme,
+but for some terminal and multiplexer combinations there isn't enough information available to make
+the correct choice.
+
+### Screens
+
+The Dashboard and the Firewall screen own everything that ends up in the **firewall script**;
+the NGINX screen owns everything that ends up in **NGINX config**.
+
+- **Dashboard** (the default screen): system-wide category defaults (Scanners / Search Bots /
+  AI Bots — Allowed or Blocked); host-wide geo-blocking (block or allow-list specific
+  countries); an "Automatic blocking" panel with an on/off switch for each detector and each
+  third-party blocklist; a "Firewall script" panel (how many rules a render would write,
+  whether the script on disk is stale, and the sites and bot lists it is rendered from); a
+  "Scheduled" panel showing the internal cron's jobs and when they last ran (with a spinner
+  next to any job currently running in the background); and a Log of what the app last
+  did. A status strip under the tabs shows the host's health checks on every screen.
+  `Up`/`Down` flow between the three lists; `m` switches geo mode. Press `F` to render the
+  current firewall rules to a script — the popup also has an "apply after writing" toggle
+  (Space) for actually enforcing it immediately, instead of applying it by hand afterward.
+  Three more keys act on the whole host: `u` downloads every list, `a` applies both planes
+  (NGINX, then the firewall), and `w` puts this console behind NGINX — the same three the
+  browser has as buttons and a panel.
+- **Bot settings**: lists every known bot-list source (with an action to refresh it) and every
+  individual bot, searchable by name, with a per-bot override (Allowed / Blocked / follow the
+  category default).
+- **Firewall**: a live, actionable view of what's currently hitting the server — "Top
+  IPs attempting SSH connection" and "Top User Agents", each ranked by count and tagged
+  `NOT BLOCKED`/`BLOCKED` (shown in red). `Tab`/`Shift+Tab` switch which of the two panels
+  `Up`/`Down` apply to; `f` cycles a shared filter (all / not blocked only / blocked only);
+  `Enter` blocks the selected `NOT BLOCKED` row, or unblocks it if it's already `BLOCKED`.
+  `i` inspects the selected address: which of the reputation feeds list it, whether it is
+  inside a published crawler range (which is what separates a real Googlebot from a user
+  agent that merely says so), which country it belongs to, and which accounts it tried to
+  log in as. All of it from lists this host has already downloaded — there is no reverse
+  DNS or whois lookup here, because a PTR record is written by whoever holds the address
+  and would be attacker-supplied text that reads as authoritative.
+- **NGINX**: an "NGINX settings" panel (`Tab` to focus it) holding the host-wide
+  choices that shape generated config — what a blocked request gets back (see above),
+  whether to serve a generated `robots.txt`, and rate limiting — above every NGINX site
+  discovered on disk, each with a live "up to date / stale / not found" status and actions to
+  apply the current policy to one site or all of them. Changing any of those settings flips
+  every applied site to `STALE`, which is your cue to re-apply. Opening a site lets you
+  override its category/bot policy, switch on any of the six request-shape rules, and list
+  paths exempt from blocking.
+- **Help**: the full key-binding reference.
+
+The Dashboard, where the host-wide policy and the firewall script live:
+
+![The stop-bots dashboard: system-wide bot categories, geo-blocking, automatic detectors and the internal cron](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/dashboard.svg)
+
+Bot settings, where every list source and every individual bot lives:
+
+![Bot settings: the four bot-list sources with their counts, and a search matching six bots across categories](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/bot-settings.svg)
+
+Firewall, the live view of what is hitting the server right now:
+
+![Firewall: failed SSH logins and top user agents, each row tagged BLOCKED, BLOCKLIST or NOT BLOCKED](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/firewall.svg)
+
+NGINX, where the host-wide choices sit above every site found on disk:
+
+![NGINX: block response, robots.txt and rate limiting, above two sites tagged UP TO DATE and STALE](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/nginx.svg)
 
 ## Unattended, from cron
 
@@ -380,7 +360,7 @@ The console follows the operating system's light or dark setting, with a toggle 
 header; the TUI screenshots above are the dark theme, these the light one. The keys the
 TUI uses work here too: `1`–`4` switch screens, `/` focuses the search box, `?` opens Help.
 
-![The web console's Dynamic Protection page: failed SSH logins and top user agents, each with a count bar and a state tag, and a block or unblock button per row](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/web-dynamic-protection.png)
+![The web console's Firewall page: failed SSH logins and top user agents, each with a count bar and a state tag, and a block or unblock button per row](https://raw.githubusercontent.com/ivankovic/stop-bots/main/docs/screenshots/web-firewall.png)
 
 Three host-wide actions live in the header, in the browser as buttons and in the TUI
 as single keys:

@@ -22,8 +22,8 @@
 //! host-wide geo-blocking (see "Geo-blocking" below), the detectors and
 //! feeds that block on their own, and what the rules become. Top user
 //! agents seen in successful traffic used to be folded in here too, but
-//! that has its own "Dynamic Protection" screen
-//! (`crate::tui::dynamic_protection`), which also lets an admin act on
+//! that has its own "Firewall" screen
+//! (`crate::tui::firewall`), which also lets an admin act on
 //! them, not just look.
 //!
 //! ## Layout
@@ -62,7 +62,7 @@
 //!   the firewall render rather than preceding it: both are started from
 //!   `App::finish_site_apply`, and neither reads what the other writes.
 //! - `F` opens the render popup ([`Popup::RenderFirewall`]) — capital,
-//!   like `A` on Site settings, because it writes to the host.
+//!   like `A` on NGINX, because it writes to the host.
 //! - `w` opens the Web Access form ([`Popup::WebAccess`]), which puts this
 //!   console behind NGINX on a subdomain or a path prefix
 //!   ([`crate::webaccess`]).
@@ -96,7 +96,7 @@
 //! Enter on an existing country row removes it directly (no confirmation
 //! popup — unlike a category default, removing a country isn't "choose one
 //! of several options", it's a single reversible action, the same
-//! reasoning Site settings' apply/apply-all actions already use).
+//! reasoning the NGINX screen's apply/apply-all actions already use).
 //! Confirming the input popup with a code whose ranges are already fetched
 //! adds it immediately (`Mutated`); a not-yet-fetched code returns
 //! `KeyOutcome::SelectCountry` so `App` can fetch it first
@@ -143,9 +143,9 @@ enum Focus {
 
 /// The rows of the "Automatic blocking" list, in display order. Each is a
 /// detector that adds `firewall_rules` rows on its own — which is why they
-/// live on the Dashboard rather than Site settings: this project puts
+/// live on the Dashboard rather than NGINX: this project puts
 /// everything that ends up in the *firewall script* here, and everything
-/// that ends up in *NGINX config* on Site settings.
+/// that ends up in *NGINX config* on NGINX.
 /// A row in the "Automatic blocking" list: either a log-analysis detector
 /// or a third-party CIDR feed. They share one panel because they answer
 /// the same question — "what adds firewall blocks without me doing
@@ -169,7 +169,7 @@ enum ProtectionRow {
     /// firewall script, and this is the answer to what happens to that
     /// script afterwards — which is the question an admin has right after
     /// switching one of the others on. The NGINX half of the same
-    /// question lives on Site settings, beside the config it applies.
+    /// question lives on NGINX, beside the config it applies.
     AutoApplyFirewall,
 }
 
@@ -1087,8 +1087,8 @@ impl Dashboard {
         }
 
         // Tab always means "next panel" on this screen (BackTab the
-        // previous), so it means the same thing it does on Site settings
-        // and Dynamic Protection. Up/Down still flow across the panels
+        // previous), so it means the same thing it does on NGINX
+        // and Firewall. Up/Down still flow across the panels
         // too, for hands that never learned Tab.
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             let forward = key.code == KeyCode::Tab;
@@ -1711,7 +1711,7 @@ impl Dashboard {
             let on = !self.humans_only;
             db.set_humans_only(on)?;
             *message = Some(if on {
-                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on Site settings to enforce it.".to_string()
+                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on the NGINX screen to enforce it.".to_string()
             } else {
                 "Humans only is off. The category policies you had before are back in force."
                     .to_string()
@@ -1789,7 +1789,7 @@ impl Dashboard {
 /// ever uses.
 /// A popup that is a list of choices, one of them selected.
 ///
-/// Shared with Site settings rather than copied: there were two of these,
+/// Shared with NGINX rather than copied: there were two of these,
 /// and only one of them grew the "Esc cancel" hint.
 pub(crate) fn render_option_list(
     frame: &mut Frame,
@@ -1831,7 +1831,7 @@ pub(crate) fn render_option_list(
 /// The "Automatic blocking" popup's options: "Off", then one "On" row per
 /// [`PROTECTION_TTL_CHOICES`] entry. Built in one place so the renderer and
 /// the key handler can never disagree about how many rows there are or what
-/// index means what — the same reason Site settings has its own
+/// index means what — the same reason NGINX has its own
 /// `setting_options`.
 fn protection_options(is_detector: bool) -> Vec<String> {
     if !is_detector {

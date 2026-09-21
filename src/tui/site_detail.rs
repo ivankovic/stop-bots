@@ -16,7 +16,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! The per-site detail view, opened from Site settings (`Enter` on a site
+//! The per-site detail view, opened from NGINX (`Enter` on a site
 //! row) — a scoped-down mirror of Bot settings' shape (see that file), just
 //! editing one site's overrides instead of the global defaults. Two panels:
 //! "Category overrides" (top, 3 rows, mirrors the Dashboard's category
@@ -27,7 +27,7 @@
 //! Allowed"/"explicitly Blocked".
 //!
 //! `handle_key` returns the same [`crate::tui::KeyOutcome`] every screen
-//! uses; `SiteSettings` (the parent) translates a `Back` from here into
+//! uses; `Nginx` (the parent) translates a `Back` from here into
 //! closing this view rather than exiting to the Dashboard — the same
 //! nested-back-out shape `bot_settings.rs`'s `Focus::Search` already uses
 //! for its own Escape handling, one level deeper.
@@ -564,7 +564,7 @@ impl SiteDetail {
 
         match self.focus {
             Focus::Categories => match key.code {
-                // Backs out to the site list; `SiteSettings` intercepts
+                // Backs out to the site list; `Nginx` intercepts
                 // this `Back` rather than letting it exit to the Dashboard.
                 KeyCode::Esc => return Ok(KeyOutcome::Back),
                 KeyCode::Up | KeyCode::Char('k') => self.categories_state.select_previous(),

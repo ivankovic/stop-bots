@@ -822,7 +822,7 @@ fn nginx_applied(db: &Db) -> Result<Check> {
 
     let sites = db.list_sites()?;
     let total = sites.len();
-    // Reads each site's config file, the same way the Site settings screen
+    // Reads each site's config file, the same way the NGINX screen
     // does — this is the one check here that touches the filesystem from
     // `assess` rather than from `probe`, because it needs a per-site
     // `BlockConfig` that only the database can produce.

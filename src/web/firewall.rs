@@ -16,7 +16,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! Dynamic Protection: what is hitting the server right now, and one
+//! Firewall: what is hitting the server right now, and one
 //! click to block it.
 //!
 //! The model is [`crate::dynamic`], shared with the TUI screen of the same
@@ -149,7 +149,7 @@ pub async fn page(
 
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(
-        Tab::Dynamic,
+        Tab::Firewall,
         &ctx,
         params.flash.into_flash(),
         body(&live, filter, detail.as_ref(), ua_detail.as_ref(), &ctx),
@@ -313,9 +313,9 @@ fn filter_bar(current: Filter, ctx: &Ctx) -> Markup {
                     (Filter::BlockedOnly, "Blocked"),
                 ] {
                     @if filter == current {
-                        a .on href=(ctx.url(&format!("/dynamic?filter={}", filter_name(filter)))) aria-current="true" { (label) }
+                        a .on href=(ctx.url(&format!("/firewall?filter={}", filter_name(filter)))) aria-current="true" { (label) }
                     } @else {
-                        a href=(ctx.url(&format!("/dynamic?filter={}", filter_name(filter)))) { (label) }
+                        a href=(ctx.url(&format!("/firewall?filter={}", filter_name(filter)))) { (label) }
                     }
                 }
             }
@@ -352,7 +352,7 @@ fn meter(count: u64, max: u64) -> Markup {
 /// parameter.
 fn inspect_url(address: &str, filter: Filter, ctx: &Ctx) -> String {
     ctx.url(&format!(
-        "/dynamic?filter={}&inspect={}",
+        "/firewall?filter={}&inspect={}",
         filter_name(filter),
         percent_encode(address)
     ))
@@ -367,7 +367,7 @@ fn inspect_url(address: &str, filter: Filter, ctx: &Ctx) -> String {
 /// complement is a way to write a second query parameter.
 fn inspect_ua_url(user_agent: &str, filter: Filter, ctx: &Ctx) -> String {
     ctx.url(&format!(
-        "/dynamic?filter={}&inspect_ua={}",
+        "/firewall?filter={}&inspect_ua={}",
         filter_name(filter),
         percent_encode(user_agent)
     ))
@@ -416,7 +416,7 @@ fn status_pill(status: RowStatus) -> Markup {
 /// [`crate::ipdetail`] for why a console that can reach the network
 /// deliberately does not do a reverse DNS lookup here.
 fn detail_panel(detail: &IpDetail, filter: Filter, ctx: &Ctx) -> Markup {
-    let close = ctx.url(&format!("/dynamic?filter={}", filter_name(filter)));
+    let close = ctx.url(&format!("/firewall?filter={}", filter_name(filter)));
     layout::panel(
         &format!("About {}", detail.address),
         Some("From lists this host already downloads — nothing was looked up over the network"),
@@ -524,7 +524,7 @@ fn detail_panel(detail: &IpDetail, filter: Filter, ctx: &Ctx) -> Markup {
 /// phrased as what the lists on this host say, not as what the client is
 /// — see [`crate::uadetail`].
 fn ua_detail_panel(detail: &UaDetail, filter: Filter, ctx: &Ctx) -> Markup {
-    let close = ctx.url(&format!("/dynamic?filter={}", filter_name(filter)));
+    let close = ctx.url(&format!("/firewall?filter={}", filter_name(filter)));
     layout::panel(
         "About this user agent",
         Some("What the bot lists on this host say about this string — a client can claim anything"),
@@ -652,7 +652,7 @@ fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
     match row.status {
         RowStatus::Blocklist => html! { span .hint { "from a blocklist" } },
         RowStatus::Blocked { .. } => html! {
-            form .inline method="post" action=(ctx.url("/dynamic/unblock-address")) {
+            form .inline method="post" action=(ctx.url("/firewall/unblock-address")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="address" value=(row.address);
                 button type="submit" { "Unblock" }
@@ -663,7 +663,7 @@ fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
         // `Pending` rather than its own arm, which would be dead code
         // pretending to be a decision.
         RowStatus::Pending | RowStatus::Unknown => html! {
-            form .inline method="post" action=(ctx.url("/dynamic/block-address")) {
+            form .inline method="post" action=(ctx.url("/firewall/block-address")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="address" value=(row.address);
                 button .danger type="submit" { "Block" }
@@ -676,7 +676,7 @@ fn ua_action(row: &UaRow, ctx: &Ctx) -> Markup {
     match row.status {
         RowStatus::Blocklist => html! { span .hint { "from a bot list" } },
         RowStatus::Blocked { .. } => html! {
-            form .inline method="post" action=(ctx.url("/dynamic/unblock-ua")) {
+            form .inline method="post" action=(ctx.url("/firewall/unblock-ua")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="user_agent" value=(row.user_agent);
                 button type="submit" { "Unblock" }
@@ -685,7 +685,7 @@ fn ua_action(row: &UaRow, ctx: &Ctx) -> Markup {
         // Same action either way — the tag says why it is worth looking
         // at, the button does the same thing.
         RowStatus::Pending | RowStatus::Unknown => html! {
-            form .inline method="post" action=(ctx.url("/dynamic/block-ua")) {
+            form .inline method="post" action=(ctx.url("/firewall/block-ua")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="user_agent" value=(row.user_agent);
                 button .danger type="submit" { "Block" }
@@ -698,10 +698,13 @@ fn ua_action(row: &UaRow, ctx: &Ctx) -> Markup {
 
 pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
     Router::new()
-        .route(&base.url("/dynamic/block-address"), post(block_address))
-        .route(&base.url("/dynamic/unblock-address"), post(unblock_address))
-        .route(&base.url("/dynamic/block-ua"), post(block_ua))
-        .route(&base.url("/dynamic/unblock-ua"), post(unblock_ua))
+        .route(&base.url("/firewall/block-address"), post(block_address))
+        .route(
+            &base.url("/firewall/unblock-address"),
+            post(unblock_address),
+        )
+        .route(&base.url("/firewall/block-ua"), post(block_ua))
+        .route(&base.url("/firewall/unblock-ua"), post(unblock_ua))
 }
 
 #[derive(Deserialize)]
@@ -730,7 +733,7 @@ async fn block_address(
     let address = form.address;
 
     if let Some(reason) = would_lock_out(&client, &address) {
-        return back_with(&state.base, "/dynamic", &reason, false);
+        return back_with(&state.base, "/firewall", &reason, false);
     }
 
     let stored = address.clone();
@@ -740,13 +743,13 @@ async fn block_address(
     {
         Ok(()) => back_with(
             &state.base,
-            "/dynamic",
+            "/firewall",
             &format!("Blocked {address}."),
             true,
         ),
         Err(err) => back_with(
             &state.base,
-            "/dynamic",
+            "/firewall",
             &format!("Could not block {address}: {err}"),
             false,
         ),
@@ -785,13 +788,13 @@ async fn unblock_address(
     match state.with_db(move |db| db.unblock_address(&stored)).await {
         Ok(()) => back_with(
             &state.base,
-            "/dynamic",
+            "/firewall",
             &format!("Unblocked {address}."),
             true,
         ),
         Err(err) => back_with(
             &state.base,
-            "/dynamic",
+            "/firewall",
             &format!("Could not unblock {address}: {err}"),
             false,
         ),
@@ -806,10 +809,10 @@ async fn block_ua(
     let ua = form.user_agent;
     let stored = ua.clone();
     match state.with_db(move |db| db.block_user_agent(&stored)).await {
-        Ok(()) => back_with(&state.base, "/dynamic", "Blocked that user agent.", true),
+        Ok(()) => back_with(&state.base, "/firewall", "Blocked that user agent.", true),
         Err(err) => back_with(
             &state.base,
-            "/dynamic",
+            "/firewall",
             &format!("Could not block that user agent: {err}"),
             false,
         ),
@@ -827,10 +830,10 @@ async fn unblock_ua(
         .with_db(move |db| db.unblock_user_agent(&stored))
         .await
     {
-        Ok(()) => back_with(&state.base, "/dynamic", "Unblocked that user agent.", true),
+        Ok(()) => back_with(&state.base, "/firewall", "Unblocked that user agent.", true),
         Err(err) => back_with(
             &state.base,
-            "/dynamic",
+            "/firewall",
             &format!("Could not unblock that user agent: {err}"),
             false,
         ),
@@ -891,10 +894,10 @@ mod tests {
 
         assert!(address_action(&pending, &Ctx::for_tests())
             .into_string()
-            .contains("/dynamic/block-address"));
+            .contains("/firewall/block-address"));
         assert!(address_action(&blocked, &Ctx::for_tests())
             .into_string()
-            .contains("/dynamic/unblock-address"));
+            .contains("/firewall/unblock-address"));
     }
 
     #[test]

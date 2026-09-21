@@ -56,7 +56,7 @@ use crate::cron::CHECK_INTERVAL as CRON_CHECK_INTERVAL;
 pub enum Job {
     /// A scheduled job from [`crate::cron`].
     Cron(CronJob),
-    /// Reading the SSH log that Dynamic Protection's SSH panel is built
+    /// Reading the SSH log that Firewall's SSH panel is built
     /// from. See [`App::start_ssh_log_read`].
     ReadSshLog,
     /// `nginx -t` followed by `systemctl reload nginx`, after Site
@@ -129,13 +129,13 @@ pub struct App {
     pub db: Db,
     pub dashboard: tui::dashboard::Dashboard,
     pub bot_settings: tui::bot_settings::BotSettings,
-    pub site_settings: tui::site_settings::SiteSettings,
-    pub dynamic_protection: tui::dynamic_protection::DynamicProtection,
+    pub nginx: tui::nginx::Nginx,
+    pub firewall: tui::firewall::Firewall,
     /// When the internal cron last checked for due jobs — throttles the
     /// check against `Event::Tick`'s 30fps rate (see
     /// [`CRON_CHECK_INTERVAL`]).
     last_cron_check: std::time::Instant,
-    /// The SSH log as last read, and when. Dynamic Protection's SSH panel
+    /// The SSH log as last read, and when. Firewall's SSH panel
     /// is rebuilt from this rather than from a fresh read — see
     /// [`SSH_LOG_MAX_AGE`] and [`App::start_ssh_log_read`]. `None` means no read
     /// has come back yet.
@@ -164,7 +164,7 @@ pub struct App {
     pub jobs_in_flight: std::collections::HashSet<Job>,
     /// Whether `KeyOutcome::ReloadNginx` actually calls `nginx::reload()`.
     /// Always `true` for real usage; `false` only for the end-to-end TUI
-    /// tests in `tests/tui.rs`, which drive a real Site settings "apply"
+    /// tests in `tests/tui.rs`, which drive a real NGINX "apply"
     /// through a real spawned binary — without this, that would shell out
     /// to the real `nginx -t`/`systemctl reload nginx` on whatever machine
     /// runs the test suite (see `main.rs`'s `tui --no-reload` flag, the
@@ -173,7 +173,7 @@ pub struct App {
     /// SSH log override (`tui --ssh-log`). `None` auto-detects, which can
     /// mean shelling out to `journalctl` — on some hosts more than half a
     /// second per call, and this is consulted on every refresh of the
-    /// Dynamic Protection screen, every `BlockScanners` cron pass and every
+    /// Firewall screen, every `BlockScanners` cron pass and every
     /// firewall render's lockout check. The override makes all three
     /// deterministic (and fast) for tests, and usable on hosts with a
     /// non-standard log path.
@@ -276,7 +276,7 @@ pub struct RenderOutcome {
 /// Runs on the blocking pool, so it touches no `Db`. The lockout check
 /// reads the SSH log *live*, every time, and must keep doing so: it is the
 /// one guard standing between a keypress and a server that can no longer
-/// be reached. `App::ssh_log_text`, the cached copy Dynamic Protection
+/// be reached. `App::ssh_log_text`, the cached copy Firewall
 /// draws from, must never reach this.
 fn render_firewall_off_thread(
     request: RenderRequest,
@@ -355,7 +355,7 @@ fn render_firewall_off_thread(
 
 impl App {
     /// Constructs a new [`App`], loading initial state from `db`. `root` is
-    /// the NGINX config root Site settings scans when the user triggers a
+    /// the NGINX config root NGINX scans when the user triggers a
     /// rescan from the TUI. `reload_nginx_for_real` gates whether a successful Site
     /// settings apply actually reloads NGINX, and whether a firewall render
     /// popup confirmed with "apply after writing" actually applies it (see
@@ -380,8 +380,8 @@ impl App {
             db,
             dashboard: tui::dashboard::Dashboard::default(),
             bot_settings: tui::bot_settings::BotSettings::default(),
-            site_settings: tui::site_settings::SiteSettings::new(root),
-            dynamic_protection: tui::dynamic_protection::DynamicProtection::default(),
+            nginx: tui::nginx::Nginx::new(root),
+            firewall: tui::firewall::Firewall::default(),
             // Backdated by a full `CRON_CHECK_INTERVAL` so the very first
             // `Event::Tick` (a fraction of a second after startup, not up to
             // a minute later) already passes `check_cron`'s throttle check.
@@ -428,7 +428,7 @@ impl App {
     ///
     /// This used to reload all four eagerly, on every single mutation, and
     /// most of that work was then thrown away unlooked at: toggling one
-    /// category default on the Dashboard also made Dynamic Protection
+    /// category default on the Dashboard also made Firewall
     /// re-read the SSH log (a `journalctl` subprocess, on hosts without a
     /// readable `auth.log`) and Bot settings re-list every one of ~700
     /// bots. On a small server that was most of the pause after a
@@ -459,20 +459,20 @@ impl App {
         match screen {
             Screen::Dashboard => self.dashboard.refresh(&self.db),
             Screen::BotSettings => self.bot_settings.refresh(&self.db),
-            Screen::SiteSettings => {
-                self.site_settings.refresh(&self.db)?;
+            Screen::Nginx => {
+                self.nginx.refresh(&self.db)?;
                 // Same shape as the SSH log read above: `refresh` no
                 // longer reads every site's config file itself, so kick
                 // off the check that does.
                 self.start_site_status_check()
             }
-            Screen::DynamicProtection => {
+            Screen::Firewall => {
                 // Kicked off here rather than on entering the screen: this
                 // is the one place every route to a visible SSH panel goes
                 // through, and the freshness check makes repeating it
                 // harmless.
                 self.start_ssh_log_read();
-                self.dynamic_protection
+                self.firewall
                     .refresh(&self.db, self.ssh_log_text.as_deref())
             }
             Screen::Help => Ok(()),
@@ -607,7 +607,7 @@ impl App {
     /// `Db`'s connection isn't `Sync` — the spawned task only fetches and
     /// parses; storing the result happens back on the main thread in
     /// `finish_source_update`.
-    /// Assembles the per-address detail the Dynamic Protection screen
+    /// Assembles the per-address detail the Firewall screen
     /// asked for, and hands it back to that screen.
     ///
     /// Synchronous, unlike its `start_`/`finish_` neighbours, because it
@@ -623,9 +623,9 @@ impl App {
             .as_deref()
             .map(|text| crate::sshlog::failed_attempt_usernames_for(text, address))
             .unwrap_or_default();
-        let status = self.dynamic_protection.status_of(address);
+        let status = self.firewall.status_of(address);
         let detail = crate::ipdetail::IpDetail::load(&self.db, address, status, usernames)?;
-        self.dynamic_protection.show_detail(detail);
+        self.firewall.show_detail(detail);
         Ok(())
     }
 
@@ -891,7 +891,7 @@ impl App {
         }
 
         self.cron_apply_nginx = true;
-        self.start_site_action(crate::tui::site_settings::SiteAction::ApplyAll)?;
+        self.start_site_action(crate::tui::nginx::SiteAction::ApplyAll)?;
         if !self.jobs_in_flight.contains(&Job::ApplySites) {
             // Refused before it started — an apply already running, or a
             // plan that could not be built. No `SitesApplied` event is
@@ -982,7 +982,7 @@ impl App {
     /// Works out each site's UP TO DATE / STALE tag in the background.
     ///
     /// One config file read and one block re-render per site, which used
-    /// to happen inside `SiteSettings::refresh` — so every change to
+    /// to happen inside `Nginx::refresh` — so every change to
     /// anything on that screen paid for all of them before redrawing. The
     /// `Db` half (each site's resolved `BlockConfig`) stays here.
     fn start_site_status_check(&mut self) -> Result<()> {
@@ -990,18 +990,18 @@ impl App {
             self.site_statuses_pending = true;
             return Ok(());
         }
-        let plan = self.site_settings.plan_status_check(&self.db)?;
+        let plan = self.nginx.plan_status_check(&self.db)?;
         if plan.is_empty() {
             // No sites, so nothing to read and nothing to wait for. Said
             // explicitly because an empty check would otherwise leave the
             // tags reading "checking" forever.
-            self.site_settings.finish_status_check(Vec::new());
+            self.nginx.finish_status_check(Vec::new());
             return Ok(());
         }
         self.jobs_in_flight.insert(Job::CheckSiteStatuses);
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
-            let statuses = crate::tui::site_settings::run_status_check(&plan);
+            let statuses = crate::tui::nginx::run_status_check(&plan);
             let _ = sender.send(Event::App(AppEvent::SiteStatusesChecked { statuses }));
         });
         Ok(())
@@ -1014,14 +1014,14 @@ impl App {
         statuses: Vec<crate::nginx::SiteApplyStatus>,
     ) -> Result<()> {
         self.jobs_in_flight.remove(&Job::CheckSiteStatuses);
-        self.site_settings.finish_status_check(statuses);
+        self.nginx.finish_status_check(statuses);
         if std::mem::take(&mut self.site_statuses_pending) {
             self.start_site_status_check()?;
         }
         Ok(())
     }
 
-    /// Starts one of Site settings' filesystem actions in the background.
+    /// Starts one of the NGINX screen's filesystem actions in the background.
     ///
     /// The `Db` half happens here — a scan needs the root, an apply needs
     /// every affected site's resolved `BlockConfig` — and the filesystem
@@ -1033,8 +1033,8 @@ impl App {
     /// A second request while one is out is reported rather than dropped:
     /// like a firewall render, these are only reachable by confirming a
     /// popup, so someone is watching and can press it again.
-    fn start_site_action(&mut self, action: crate::tui::site_settings::SiteAction) -> Result<()> {
-        use crate::tui::site_settings::SiteAction;
+    fn start_site_action(&mut self, action: crate::tui::nginx::SiteAction) -> Result<()> {
+        use crate::tui::nginx::SiteAction;
 
         let job = match action {
             SiteAction::Scan => Job::ScanSites,
@@ -1049,14 +1049,14 @@ impl App {
         match action {
             SiteAction::Scan => {
                 self.jobs_in_flight.insert(job);
-                let root = self.site_settings.root().to_path_buf();
+                let root = self.nginx.root().to_path_buf();
                 tokio::task::spawn_blocking(move || {
                     let sites = nginx::discover_sites(&root).map_err(|err| err.to_string());
                     let _ = sender.send(Event::App(AppEvent::SitesScanned { sites }));
                 });
             }
             SiteAction::Apply(_) | SiteAction::ApplyAll => {
-                let plan = match self.site_settings.plan_apply(&self.db, action) {
+                let plan = match self.nginx.plan_apply(&self.db, action) {
                     Ok(plan) => plan,
                     Err(err) => {
                         self.message = Some(format!("Apply failed: {err}"));
@@ -1065,7 +1065,7 @@ impl App {
                 };
                 self.jobs_in_flight.insert(job);
                 tokio::task::spawn_blocking(move || {
-                    let outcome = crate::tui::site_settings::run_apply(plan);
+                    let outcome = crate::tui::nginx::run_apply(plan);
                     let _ = sender.send(Event::App(AppEvent::SitesApplied {
                         outcome: std::sync::Arc::new(outcome),
                     }));
@@ -1082,19 +1082,16 @@ impl App {
         sites: Result<Vec<nginx::DiscoveredSite>, String>,
     ) -> Result<()> {
         self.jobs_in_flight.remove(&Job::ScanSites);
-        self.message = Some(self.site_settings.finish_scan(&self.db, sites));
+        self.message = Some(self.nginx.finish_scan(&self.db, sites));
         self.refresh()
     }
 
     /// Records a finished background apply, and reloads NGINX if any file
     /// actually changed — the same condition the inline version used, just
     /// evaluated here rather than in the key handler.
-    fn finish_site_apply(
-        &mut self,
-        outcome: crate::tui::site_settings::ApplyOutcome,
-    ) -> Result<()> {
+    fn finish_site_apply(&mut self, outcome: crate::tui::nginx::ApplyOutcome) -> Result<()> {
         self.jobs_in_flight.remove(&Job::ApplySites);
-        let (message, changed_a_file) = self.site_settings.finish_apply(outcome);
+        let (message, changed_a_file) = self.nginx.finish_apply(outcome);
         if std::mem::take(&mut self.cron_apply_nginx) {
             crate::cron::record_run(&self.db, CronJob::ApplyNginx, &message);
         }
@@ -1111,7 +1108,7 @@ impl App {
         Ok(())
     }
 
-    /// Reloads NGINX in the background, after Site settings has written a
+    /// Reloads NGINX in the background, after NGINX has written a
     /// config file.
     ///
     /// `nginx -t` parses every file in the install and `systemctl reload
@@ -1176,7 +1173,7 @@ impl App {
     /// The read itself is what has to move off the event loop: with no
     /// `--ssh-log` override and no readable `auth.log`, resolving the log
     /// means a `journalctl` subprocess. Doing that inline, on every reload
-    /// of Dynamic Protection, is what made this screen the slowest in the
+    /// of Firewall, is what made this screen the slowest in the
     /// TUI. Parsing the text into rows stays on the main thread with every
     /// other `Db` access (`Db` isn't `Sync`) — it is an in-memory line
     /// scan, and moving it would buy nothing.
@@ -1211,11 +1208,11 @@ impl App {
         self.jobs_in_flight.remove(&Job::ReadSshLog);
         self.ssh_log_text = text;
         self.ssh_log_read_at = Some(std::time::Instant::now());
-        if self.screen == Screen::DynamicProtection {
-            self.dynamic_protection
+        if self.screen == Screen::Firewall {
+            self.firewall
                 .refresh(&self.db, self.ssh_log_text.as_deref())?;
         } else {
-            self.stale.insert(Screen::DynamicProtection);
+            self.stale.insert(Screen::Firewall);
         }
         Ok(())
     }
@@ -1470,7 +1467,7 @@ impl App {
         }
 
         self.apply_everything = true;
-        self.start_site_action(crate::tui::site_settings::SiteAction::ApplyAll)?;
+        self.start_site_action(crate::tui::nginx::SiteAction::ApplyAll)?;
         if !self.jobs_in_flight.contains(&Job::ApplySites) {
             // The NGINX half refused before it started, so no
             // `SitesApplied` event is coming to chain off. The firewall
@@ -1520,7 +1517,7 @@ impl App {
         };
 
         self.jobs_in_flight.insert(Job::ApplyWebAccess);
-        let root = self.site_settings.root().to_path_buf();
+        let root = self.nginx.root().to_path_buf();
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
             let result = crate::webaccess::apply(&plan, &root).map_err(|err| format!("{err:#}"));
@@ -1635,14 +1632,8 @@ impl App {
                 self.bot_settings
                     .handle_key(key, &self.db, &mut self.message)?
             }
-            Screen::SiteSettings => {
-                self.site_settings
-                    .handle_key(key, &self.db, &mut self.message)?
-            }
-            Screen::DynamicProtection => {
-                self.dynamic_protection
-                    .handle_key(key, &self.db, &mut self.message)?
-            }
+            Screen::Nginx => self.nginx.handle_key(key, &self.db, &mut self.message)?,
+            Screen::Firewall => self.firewall.handle_key(key, &self.db, &mut self.message)?,
             Screen::Help => unreachable!("handled above"),
         };
         match outcome {
@@ -1732,8 +1723,8 @@ impl App {
             // bar shows them; the mnemonic letters stay as aliases.
             KeyCode::Char('d' | '1') => self.screen = Screen::Dashboard,
             KeyCode::Char('b' | '2') => self.screen = Screen::BotSettings,
-            KeyCode::Char('s' | '3') => self.screen = Screen::SiteSettings,
-            KeyCode::Char('p' | '4') => self.screen = Screen::DynamicProtection,
+            KeyCode::Char('f' | '3') => self.screen = Screen::Firewall,
+            KeyCode::Char('n' | '4') => self.screen = Screen::Nginx,
             // Left/Right and their vim h/l aliases cycle screens. Tab is
             // *not* among them any more: it always means "next panel on
             // this screen", so that it means one thing everywhere (it used
@@ -1765,16 +1756,8 @@ impl App {
                 "2",
                 Action::Screen(Screen::BotSettings),
             ),
-            (
-                "Go to Site settings",
-                "3",
-                Action::Screen(Screen::SiteSettings),
-            ),
-            (
-                "Go to Dynamic Protection",
-                "4",
-                Action::Screen(Screen::DynamicProtection),
-            ),
+            ("Go to Firewall", "3", Action::Screen(Screen::Firewall)),
+            ("Go to NGINX", "4", Action::Screen(Screen::Nginx)),
             ("Help: the key map", "?", Action::Screen(Screen::Help)),
             (
                 "Update everything: download every list",
@@ -1802,21 +1785,9 @@ impl App {
                 key(Screen::Dashboard, 'm'),
             ),
             ("Search bots", "/", key(Screen::BotSettings, '/')),
-            (
-                "Rescan for NGINX sites",
-                "r",
-                key(Screen::SiteSettings, 'r'),
-            ),
-            (
-                "Apply blocking to every site",
-                "A",
-                key(Screen::SiteSettings, 'A'),
-            ),
-            (
-                "Re-read the SSH log",
-                "R",
-                key(Screen::DynamicProtection, 'R'),
-            ),
+            ("Re-read the SSH log", "R", key(Screen::Firewall, 'R')),
+            ("Rescan for NGINX sites", "r", key(Screen::Nginx, 'r')),
+            ("Apply blocking to every site", "A", key(Screen::Nginx, 'A')),
             ("Toggle light/dark theme", "t", Action::Theme),
             ("Quit", "q", Action::Quit),
         ]
@@ -1855,10 +1826,10 @@ impl App {
             Action::Screen(screen) => self.screen = screen,
             Action::Key(screen, code) => {
                 self.screen = screen;
-                if screen == Screen::SiteSettings {
+                if screen == Screen::Nginx {
                     // `r` and `A` are keys of the site list, not of the
                     // settings panel above it or of an open site's detail.
-                    self.site_settings.show_sites();
+                    self.nginx.show_sites();
                 }
                 self.handle_key_event(KeyEvent::from(code))?;
             }
@@ -1901,7 +1872,7 @@ mod tests {
     }
 
     fn test_app() -> App {
-        // `reload_nginx: false` — no test here drives a Site settings apply
+        // `reload_nginx: false` — no test here drives a NGINX apply
         // through `handle_key_event`, but this keeps it that way even if
         // one is added later, rather than relying on that staying true.
         App::new(
@@ -1944,8 +1915,8 @@ mod tests {
         run_palette(&mut app, "theme");
         assert_eq!(app.theme, before.toggle());
 
-        run_palette(&mut app, "dynamic");
-        assert_eq!(app.screen, Screen::DynamicProtection);
+        run_palette(&mut app, "go to fire");
+        assert_eq!(app.screen, Screen::Firewall);
     }
 
     /// A `Key` command is the key: it lands on the right screen and goes
@@ -2007,7 +1978,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Dashboard);
 
         app.handle_key_event(KeyEvent::from(KeyCode::Left)).unwrap();
-        assert_eq!(app.screen, Screen::DynamicProtection);
+        assert_eq!(app.screen, Screen::Nginx);
     }
 
     #[tokio::test]
@@ -2023,7 +1994,7 @@ mod tests {
         let mut app = test_app();
         app.handle_key_event(KeyEvent::from(KeyCode::Char('h')))
             .unwrap();
-        assert_eq!(app.screen, Screen::DynamicProtection);
+        assert_eq!(app.screen, Screen::Nginx);
     }
 
     // ---- the `finish_` half of every network fetch ----
@@ -2282,11 +2253,9 @@ mod tests {
 
         assert_eq!(
             app.stale,
-            std::collections::HashSet::from([
-                Screen::BotSettings,
-                Screen::SiteSettings,
-                Screen::DynamicProtection,
-            ]),
+            std::collections::HashSet::from(
+                [Screen::BotSettings, Screen::Nginx, Screen::Firewall,]
+            ),
             "every screen except the one being looked at"
         );
 
@@ -2298,7 +2267,7 @@ mod tests {
             "coming into view reloads it"
         );
         assert!(
-            app.stale.contains(&Screen::SiteSettings),
+            app.stale.contains(&Screen::Nginx),
             "and leaves the ones still off screen alone"
         );
     }

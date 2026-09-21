@@ -200,7 +200,7 @@ async fn login(app: &Router, password: &str) -> (String, String) {
     // act on, and these tests start from an empty database.
     let page = app
         .clone()
-        .oneshot(with_cookie(get("/dynamic"), &cookie))
+        .oneshot(with_cookie(get("/firewall"), &cookie))
         .await
         .unwrap();
     let html = body_string(page).await;
@@ -220,7 +220,7 @@ async fn login(app: &Router, password: &str) -> (String, String) {
 async fn an_unauthenticated_request_is_sent_to_the_login_page() {
     let (app, _password, _tmp) = app();
 
-    for path in ["/", "/bots", "/sites", "/dynamic", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
         let response = app.clone().oneshot(get(path)).await.unwrap();
         assert_eq!(
             response.status(),
@@ -271,7 +271,7 @@ async fn a_correct_password_opens_a_session_that_reaches_every_screen() {
     let (app, password, _tmp) = app();
     let (cookie, _csrf) = login(&app, &password).await;
 
-    for path in ["/", "/bots", "/sites", "/dynamic", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
         let response = app
             .clone()
             .oneshot(with_cookie(get(path), &cookie))
@@ -386,7 +386,7 @@ async fn a_post_without_a_csrf_token_is_refused() {
     let response = app
         .clone()
         .oneshot(with_cookie(
-            post("/dynamic/block-address", "address=192.0.2.1"),
+            post("/firewall/block-address", "address=192.0.2.1"),
             &cookie,
         ))
         .await
@@ -409,7 +409,7 @@ async fn a_post_with_another_sessions_csrf_token_is_refused() {
         .clone()
         .oneshot(with_cookie(
             post(
-                "/dynamic/block-address",
+                "/firewall/block-address",
                 &format!("csrf={second_csrf}&address=192.0.2.1"),
             ),
             &first_cookie,
@@ -433,7 +433,7 @@ async fn a_post_with_the_right_csrf_token_is_accepted() {
         .clone()
         .oneshot(with_cookie(
             post(
-                "/dynamic/block-address",
+                "/firewall/block-address",
                 &format!("csrf={csrf}&address=192.0.2.1"),
             ),
             &cookie,
@@ -519,7 +519,7 @@ async fn no_page_uses_an_inline_event_handler() {
     let (app, password, _tmp) = app();
     let (cookie, _csrf) = login(&app, &password).await;
 
-    for path in ["/", "/bots", "/sites", "/dynamic", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
         let response = app
             .clone()
             .oneshot(with_cookie(get(path), &cookie))
@@ -547,7 +547,7 @@ async fn every_screen_lays_its_panels_out_in_the_column_grid() {
     let (app, password, _tmp) = app();
     let (cookie, _csrf) = login(&app, &password).await;
 
-    for path in ["/", "/bots", "/sites", "/dynamic", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
         let response = app
             .clone()
             .oneshot(with_cookie(get(path), &cookie))
@@ -886,7 +886,7 @@ async fn scanning_finds_the_sites_on_disk() {
     write_site(&tmp, "example.com");
     write_site(&tmp, "shop.example.com");
 
-    let (_, flash) = act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    let (_, flash) = act(&app, &cookie, &csrf, "/nginx/scan", "").await;
     assert!(flash.contains("2 site"), "was: {flash}");
 
     let names: Vec<String> = Db::open(&db_path)
@@ -908,16 +908,16 @@ async fn the_nginx_settings_round_trip() {
         &app,
         &cookie,
         &csrf,
-        "/sites/block-response",
+        "/nginx/block-response",
         "response=444",
     )
     .await;
-    act(&app, &cookie, &csrf, "/sites/robots", "enabled=1").await;
+    act(&app, &cookie, &csrf, "/nginx/robots", "enabled=1").await;
     act(
         &app,
         &cookie,
         &csrf,
-        "/sites/rate-limit",
+        "/nginx/rate-limit",
         "enabled=1&rps=7&burst=21",
     )
     .await;
@@ -939,7 +939,7 @@ async fn a_rate_limit_of_zero_is_refused() {
         &app,
         &cookie,
         &csrf,
-        "/sites/rate-limit",
+        "/nginx/rate-limit",
         "enabled=1&rps=0&burst=5",
     )
     .await;
@@ -974,9 +974,9 @@ async fn applying_writes_the_rule_into_the_site_config() {
     db.set_bot_status("gptbot", BotStatus::Blocked).unwrap();
     drop(db);
 
-    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
     let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
-    let (_, flash) = act(&app, &cookie, &csrf, "/sites/apply", &format!("id={id}")).await;
+    let (_, flash) = act(&app, &cookie, &csrf, "/nginx/apply", &format!("id={id}")).await;
 
     assert!(flash.contains("Applied"), "was: {flash}");
     let written = std::fs::read_to_string(&path).unwrap();
@@ -1011,8 +1011,8 @@ async fn applying_to_every_site_touches_all_of_them() {
     db.set_bot_status("gptbot", BotStatus::Blocked).unwrap();
     drop(db);
 
-    act(&app, &cookie, &csrf, "/sites/scan", "").await;
-    act(&app, &cookie, &csrf, "/sites/apply-all", "").await;
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
+    act(&app, &cookie, &csrf, "/nginx/apply-all", "").await;
 
     for path in [first, second] {
         let written = std::fs::read_to_string(&path).unwrap();
@@ -1029,12 +1029,12 @@ async fn a_site_detail_page_renders_and_its_overrides_stick() {
     let (app, password, tmp, db_path) = app_with_db();
     let (cookie, csrf) = login(&app, &password).await;
     write_site(&tmp, "example.com");
-    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
     let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
 
     let page = app
         .clone()
-        .oneshot(with_cookie(get(&format!("/sites/{id}")), &cookie))
+        .oneshot(with_cookie(get(&format!("/nginx/{id}")), &cookie))
         .await
         .unwrap();
     assert_eq!(page.status(), StatusCode::OK);
@@ -1044,7 +1044,7 @@ async fn a_site_detail_page_renders_and_its_overrides_stick() {
         &app,
         &cookie,
         &csrf,
-        &format!("/sites/{id}/category"),
+        &format!("/nginx/{id}/category"),
         "category=ai&policy=blocked",
     )
     .await;
@@ -1052,7 +1052,7 @@ async fn a_site_detail_page_renders_and_its_overrides_stick() {
         &app,
         &cookie,
         &csrf,
-        &format!("/sites/{id}/exempt-add"),
+        &format!("/nginx/{id}/exempt-add"),
         "path=/blog",
     )
     .await;
@@ -1069,7 +1069,7 @@ async fn a_site_detail_page_renders_and_its_overrides_stick() {
         &app,
         &cookie,
         &csrf,
-        &format!("/sites/{id}/exempt-remove"),
+        &format!("/nginx/{id}/exempt-remove"),
         "path=/blog",
     )
     .await;
@@ -1085,14 +1085,14 @@ async fn an_exemption_that_is_not_a_path_is_refused() {
     let (app, password, tmp, db_path) = app_with_db();
     let (cookie, csrf) = login(&app, &password).await;
     write_site(&tmp, "example.com");
-    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
     let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
 
     let (_, flash) = act(
         &app,
         &cookie,
         &csrf,
-        &format!("/sites/{id}/exempt-add"),
+        &format!("/nginx/{id}/exempt-add"),
         "path=blog",
     )
     .await;
@@ -1109,7 +1109,7 @@ async fn a_request_shape_rule_can_be_switched_on_for_one_site() {
     let (app, password, tmp, db_path) = app_with_db();
     let (cookie, csrf) = login(&app, &password).await;
     write_site(&tmp, "example.com");
-    act(&app, &cookie, &csrf, "/sites/scan", "").await;
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
     let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
 
     let rule = stop_bots::nginx::RequestRule::ALL[1];
@@ -1117,7 +1117,7 @@ async fn a_request_shape_rule_can_be_switched_on_for_one_site() {
         &app,
         &cookie,
         &csrf,
-        &format!("/sites/{id}/rule"),
+        &format!("/nginx/{id}/rule"),
         &format!("rule={}&enabled=1", rule.id()),
     )
     .await;
@@ -1128,7 +1128,7 @@ async fn a_request_shape_rule_can_be_switched_on_for_one_site() {
     );
 }
 
-// ---- dynamic protection ----
+// ---- firewall ----
 
 #[tokio::test]
 async fn blocking_and_unblocking_an_address_round_trips() {
@@ -1139,7 +1139,7 @@ async fn blocking_and_unblocking_an_address_round_trips() {
         &app,
         &cookie,
         &csrf,
-        "/dynamic/block-address",
+        "/firewall/block-address",
         "address=192.0.2.55",
     )
     .await;
@@ -1157,7 +1157,7 @@ async fn blocking_and_unblocking_an_address_round_trips() {
         &app,
         &cookie,
         &csrf,
-        "/dynamic/unblock-address",
+        "/firewall/unblock-address",
         "address=192.0.2.55",
     )
     .await;
@@ -1177,7 +1177,7 @@ async fn blocking_and_unblocking_a_user_agent_round_trips() {
         &app,
         &cookie,
         &csrf,
-        "/dynamic/block-ua",
+        "/firewall/block-ua",
         "user_agent=curl%2F8.5.0",
     )
     .await;
@@ -1193,7 +1193,7 @@ async fn blocking_and_unblocking_a_user_agent_round_trips() {
         &app,
         &cookie,
         &csrf,
-        "/dynamic/unblock-ua",
+        "/firewall/unblock-ua",
         "user_agent=curl%2F8.5.0",
     )
     .await;
@@ -1213,7 +1213,7 @@ async fn the_dynamic_screen_filters_are_all_reachable() {
         let response = app
             .clone()
             .oneshot(with_cookie(
-                get(&format!("/dynamic?filter={filter}")),
+                get(&format!("/firewall?filter={filter}")),
                 &cookie,
             ))
             .await
@@ -1256,7 +1256,7 @@ async fn blocking_the_address_you_are_connected_from_is_refused() {
     let request = from_peer(
         with_cookie(
             post(
-                "/dynamic/block-address",
+                "/firewall/block-address",
                 &format!("csrf={csrf}&address=203.0.113.5"),
             ),
             &cookie,
@@ -1288,7 +1288,7 @@ async fn blocking_a_different_address_from_the_same_peer_still_works() {
     let request = from_peer(
         with_cookie(
             post(
-                "/dynamic/block-address",
+                "/firewall/block-address",
                 &format!("csrf={csrf}&address=198.51.100.9"),
             ),
             &cookie,
@@ -1320,7 +1320,7 @@ async fn a_forwarded_address_is_only_believed_when_configured() {
         let mut request = from_peer(
             with_cookie(
                 post(
-                    "/dynamic/block-address",
+                    "/firewall/block-address",
                     &format!("csrf={csrf}&address=203.0.113.77"),
                 ),
                 &cookie,
@@ -1408,7 +1408,7 @@ async fn under_a_prefix_the_screens_are_reachable_at_the_prefixed_paths() {
     );
     let cookie = session_cookie_from(&response);
 
-    for path in ["/", "/bots", "/sites", "/dynamic", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
         let response = app
             .clone()
             .oneshot(with_cookie(get_under(path), &cookie))
@@ -1473,7 +1473,7 @@ async fn no_url_on_any_page_escapes_the_prefix() {
 
     let csrf_page = app
         .clone()
-        .oneshot(with_cookie(get_under("/sites"), &cookie))
+        .oneshot(with_cookie(get_under("/nginx"), &cookie))
         .await
         .unwrap();
     let csrf = body_string(csrf_page)
@@ -1484,7 +1484,7 @@ async fn no_url_on_any_page_escapes_the_prefix() {
         .unwrap()
         .to_string();
 
-    let scan = format!("{PREFIX}/sites/scan");
+    let scan = format!("{PREFIX}/nginx/scan");
     app.clone()
         .oneshot(with_cookie(post(&scan, &format!("csrf={csrf}")), &cookie))
         .await
@@ -1495,9 +1495,9 @@ async fn no_url_on_any_page_escapes_the_prefix() {
         "/".to_string(),
         "/bots".to_string(),
         "/bots?q=gpt".to_string(),
-        "/sites".to_string(),
-        format!("/sites/{site_id}"),
-        "/dynamic".to_string(),
+        "/nginx".to_string(),
+        format!("/nginx/{site_id}"),
+        "/firewall".to_string(),
         "/help".to_string(),
     ];
 
@@ -1803,7 +1803,7 @@ async fn inspecting_an_address_renders_its_detail_panel() {
     let response = app
         .clone()
         .oneshot(with_cookie(
-            get("/dynamic?filter=all&inspect=185.220.101.7"),
+            get("/firewall?filter=all&inspect=185.220.101.7"),
             &cookie,
         ))
         .await
@@ -1823,7 +1823,10 @@ async fn inspecting_something_that_is_not_an_address_still_renders() {
 
     let response = app
         .clone()
-        .oneshot(with_cookie(get("/dynamic?inspect=not-an-address"), &cookie))
+        .oneshot(with_cookie(
+            get("/firewall?inspect=not-an-address"),
+            &cookie,
+        ))
         .await
         .unwrap();
     let body = body_string(response).await;
@@ -1872,7 +1875,7 @@ async fn inspecting_a_user_agent_renders_its_detail_panel() {
     let response = app
         .clone()
         .oneshot(with_cookie(
-            get(&format!("/dynamic?filter=all&inspect_ua={encoded}")),
+            get(&format!("/firewall?filter=all&inspect_ua={encoded}")),
             &cookie,
         ))
         .await
@@ -1896,7 +1899,7 @@ async fn inspecting_a_user_agent_no_list_knows_still_renders() {
     let response = app
         .clone()
         .oneshot(with_cookie(
-            get("/dynamic?inspect_ua=%3Cscript%3Ealert(1)%3C%2Fscript%3E"),
+            get("/firewall?inspect_ua=%3Cscript%3Ealert(1)%3C%2Fscript%3E"),
             &cookie,
         ))
         .await

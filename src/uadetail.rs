@@ -18,7 +18,7 @@
 
 //! Everything this host already knows about one user agent string — the
 //! model behind both front-ends' per-user-agent detail view on the
-//! Dynamic Protection screen, and the counterpart to [`crate::ipdetail`].
+//! Firewall screen, and the counterpart to [`crate::ipdetail`].
 //!
 //! The two views answer deliberately different questions, which is why
 //! they are two modules rather than one generic one. An address can be

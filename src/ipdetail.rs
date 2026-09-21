@@ -18,7 +18,7 @@
 
 //! Everything this host already knows about one address, with no network
 //! lookup at all — the model behind both front-ends' per-address detail
-//! view on the Dynamic Protection screen.
+//! view on the Firewall screen.
 //!
 //! The question a detail view exists to answer is "what *is* this thing",
 //! and the reflex answer is reverse DNS and whois. Both are outbound

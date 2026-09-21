@@ -164,14 +164,29 @@ pub async fn update(db: &Db, kind: IpRangeSourceKind) -> Result<usize> {
     store(db, kind, &cidrs)
 }
 
-/// The URL for a given country's aggregated (i.e. consolidated into fewer,
-/// larger CIDR blocks — IPdeny also publishes an unaggregated version with
-/// many more, smaller blocks) IPv4 zone file. Aggregated is used
+/// The two URLs for a country's aggregated zone files — IPv4 and IPv6, which
+/// IPdeny publishes under entirely different paths.
+///
+/// Both, because one is not enough for the thing these lists are used for. An
+/// allow-list has to say something about every address family the host
+/// answers on, and a v4-only list leaves `geo_firewall_rules` two bad
+/// options on a dual-stack host: block every IPv6 client, or leave IPv6
+/// unfiltered. Neither is "allow these countries". This is not hypothetical
+/// — it is what shipped until 0.0.4, and the consequence was the first
+/// option, silently.
+///
+/// Aggregated (i.e. consolidated into fewer, larger CIDR blocks — IPdeny
+/// also publishes an unaggregated version with many more, smaller blocks)
 /// deliberately: even aggregated, a large country's list can run into the
 /// tens of thousands of CIDRs (e.g. `us-aggregated.zone` has ~29,000 lines);
 /// the unaggregated version would be several times that.
-fn country_zone_url(country_code: &str) -> String {
-    format!("https://www.ipdeny.com/ipblocks/data/aggregated/{country_code}-aggregated.zone")
+fn country_zone_urls(country_code: &str) -> [String; 2] {
+    [
+        format!("https://www.ipdeny.com/ipblocks/data/aggregated/{country_code}-aggregated.zone"),
+        format!(
+            "https://www.ipdeny.com/ipv6/ipaddresses/aggregated/{country_code}-aggregated.zone"
+        ),
+    ]
 }
 
 /// Normalizes and validates a country code into IPdeny's expected lowercase
@@ -189,15 +204,33 @@ pub fn validate_country_code(country_code: &str) -> Result<String> {
     }
 }
 
-/// Downloads `country_code`'s aggregated zone file from IPdeny over HTTP.
+/// Downloads `country_code`'s aggregated zone files from IPdeny over HTTP,
+/// both families, concatenated into one zone-file-shaped string.
+///
+/// Concatenated rather than returned as a pair because every caller — the
+/// refresh plan, the TUI's fetch, `store_country` — wants the same thing
+/// from it: lines to parse. `parse_zone_file` is line-based and the store
+/// is keyed by `(country_code, cidr)`, so a v6 CIDR needs no separate
+/// column and no migration to sit beside a v4 one.
+///
+/// **Both fetches must succeed.** A half-fetched country is the failure this
+/// function exists to prevent, so it is better to keep yesterday's complete
+/// list — `replace_country_ranges` is transactional and only runs on success
+/// — than to store a v4-only one and let the caller draw conclusions from a
+/// family it has no data for. This costs nothing in reach: IPdeny's two
+/// paths agree about which countries exist, so a code with no v6 list has no
+/// v4 list either (`bv`, `hm`, `pn`, `gs` and `tf` all 404 on both), and
+/// those already failed before this function fetched twice.
 pub async fn fetch_country(country_code: &str) -> Result<String> {
     let cc = validate_country_code(country_code)?;
-    let url = country_zone_url(&cc);
-    crate::fetch::text(
-        &url,
-        &format!("the IP ranges for country {cc} (unknown code?)"),
+    let [v4_url, v6_url] = country_zone_urls(&cc);
+    let v4 = crate::fetch::text(
+        &v4_url,
+        &format!("the IPv4 ranges for country {cc} (unknown code?)"),
     )
-    .await
+    .await?;
+    let v6 = crate::fetch::text(&v6_url, &format!("the IPv6 ranges for country {cc}")).await?;
+    Ok(format!("{v4}\n{v6}"))
 }
 
 /// Parses an IPdeny zone file (one CIDR per line, blank lines allowed) into
@@ -378,9 +411,15 @@ mod tests {
     }
 
     #[test]
-    fn country_zone_url_is_the_aggregated_variant() {
+    fn country_zone_urls_cover_both_families_and_are_the_aggregated_variant() {
+        let [v4, v6] = country_zone_urls("nl");
         assert_eq!(
-            country_zone_url("nl"),
+            v6, "https://www.ipdeny.com/ipv6/ipaddresses/aggregated/nl-aggregated.zone",
+            "an allow-list with no v6 ranges either blocks every v6 client or leaves v6 \
+             unfiltered; neither is what the mode means"
+        );
+        assert_eq!(
+            v4,
             "https://www.ipdeny.com/ipblocks/data/aggregated/nl-aggregated.zone"
         );
     }

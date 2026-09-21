@@ -100,14 +100,14 @@ pub enum AppEvent {
         job: crate::cron::CronJob,
         log_text: Option<String>,
     },
-    /// A background read of the SSH log, for Dynamic Protection's SSH
+    /// A background read of the SSH log, for Firewall's SSH
     /// panel, has come back (see `App::start_ssh_log_read`). `None` means no log
     /// was readable. Only the read is backgrounded; parsing it into rows
     /// happens on the main thread, same as `CronLogFetched` above and for
     /// the same reason.
     SshLogRead { text: Option<String> },
     /// The background `nginx -t` + `systemctl reload nginx` that follows a
-    /// Site settings apply has finished (see `App::start_nginx_reload`). `Err`
+    /// NGINX apply has finished (see `App::start_nginx_reload`). `Err`
     /// carries the stringified failure, `anyhow::Error` not being `Clone`.
     NginxReloaded { result: Result<(), String> },
     /// A background firewall render has finished (see
@@ -131,7 +131,7 @@ pub enum AppEvent {
     /// `ApplyOutcome` isn't worth making so — it is unwrapped, not cloned,
     /// on the one delivery it gets.
     SitesApplied {
-        outcome: std::sync::Arc<crate::tui::site_settings::ApplyOutcome>,
+        outcome: std::sync::Arc<crate::tui::nginx::ApplyOutcome>,
     },
     /// One source of an "update everything" run has been downloaded (see
     /// `App::start_update_everything`). Carries the raw body, not parsed

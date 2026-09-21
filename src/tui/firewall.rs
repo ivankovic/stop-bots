@@ -16,7 +16,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! The Dynamic Protection screen: a live, actionable view of what's
+//! The Firewall screen: a live, actionable view of what's
 //! currently hitting the server, split into two panels — "Failed SSH
 //! logins" and "Top user agents" — each ranked by count with a bar, and
 //! tagged `NOT BLOCKED` (dim), `BLOCKED` (red) or `BLOCKLIST` (yellow).
@@ -33,7 +33,8 @@
 //! already guards against self-blocking a currently-connected SSH session,
 //! so this screen doesn't duplicate that guard); (un)blocking a user agent
 //! only adds or removes a row in `blocked_user_agents` (`apply-blocks`, or
-//! Site settings' `a`/`A`, is what injects/removes it in NGINX config).
+//! the NGINX screen's `a`/`A`, is what injects/removes it in NGINX
+//! config).
 //!
 //! Unlike the Dashboard's `cron_status`/`user_agent_stats` (both read
 //! straight from `Db`), the SSH panel is populated by re-parsing the live
@@ -95,7 +96,7 @@ enum Focus {
 /// answer different questions — see [`crate::uadetail`] for why an
 /// address and a user agent are not the same kind of thing with different
 /// text in it. Boxed: an `IpDetail` carrying a few hundred range hits
-/// would otherwise set the size of every `DynamicProtection`.
+/// would otherwise set the size of every `Firewall`.
 #[derive(Debug)]
 enum Detail {
     Address(Box<IpDetail>),
@@ -103,7 +104,7 @@ enum Detail {
 }
 
 #[derive(Debug, Default)]
-pub struct DynamicProtection {
+pub struct Firewall {
     ssh_rows: Vec<SshRow>,
     ua_rows: Vec<UaRow>,
     ssh_state: ListState,
@@ -116,7 +117,7 @@ pub struct DynamicProtection {
     detail: Option<Detail>,
 }
 
-impl DynamicProtection {
+impl Firewall {
     /// Reloads both panels. See the module doc comment for why the actual
     /// row-building logic lives in [`build_ssh_rows`]/[`build_ua_rows`]
     /// instead of here.
@@ -817,7 +818,7 @@ fn panel_title(name: &str, total: usize, filter: &str) -> String {
 ///
 /// An empty bordered box reads as "this is broken", not as "nothing to
 /// show" — and on this screen the second is the *good* outcome, so it is
-/// worth saying out loud. Site settings already does this for its own
+/// worth saying out loud. NGINX already does this for its own
 /// empty list; this is the same idea.
 fn empty_or(items: Vec<ListItem<'static>>, message: &str) -> Vec<ListItem<'static>> {
     if items.is_empty() {
@@ -967,7 +968,7 @@ mod tests {
         db.record_user_agent_hits(&counts, 1000).unwrap();
         db.block_user_agent("Mozilla/5.0").unwrap();
 
-        let mut screen = DynamicProtection::default();
+        let mut screen = Firewall::default();
         screen.refresh(&db, None).unwrap();
 
         assert_eq!(screen.ua_rows.len(), 1);
@@ -978,7 +979,7 @@ mod tests {
     #[test]
     fn tab_toggles_focus_between_panels() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection::default();
+        let mut screen = Firewall::default();
         let mut message = None;
         assert_eq!(screen.focus, Focus::Ssh);
 
@@ -996,7 +997,7 @@ mod tests {
     #[test]
     fn enter_permanently_blocks_the_selected_ssh_row() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ssh_rows: vec![SshRow {
                 address: "198.51.100.9".to_string(),
                 count: 3,
@@ -1022,7 +1023,7 @@ mod tests {
     #[test]
     fn enter_permanently_blocks_the_selected_user_agent() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ua_rows: vec![UaRow {
                 user_agent: "curl/8.0".to_string(),
                 count: 2,
@@ -1062,7 +1063,7 @@ mod tests {
             3600,
         )
         .unwrap();
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ssh_rows: vec![SshRow {
                 address: "198.51.100.9".to_string(),
                 count: 3,
@@ -1086,7 +1087,7 @@ mod tests {
     fn enter_unblocks_an_already_blocked_user_agent() {
         let db = Db::open_in_memory().unwrap();
         db.block_user_agent("curl/8.0").unwrap();
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ua_rows: vec![UaRow {
                 user_agent: "curl/8.0".to_string(),
                 count: 2,
@@ -1110,7 +1111,7 @@ mod tests {
     #[test]
     fn f_key_cycles_through_all_pending_and_blocked_filters() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection::default();
+        let mut screen = Firewall::default();
         assert_eq!(screen.filter, Filter::All);
 
         let mut message = None;
@@ -1151,7 +1152,7 @@ mod tests {
     #[test]
     fn every_row_starts_its_value_in_the_same_column() {
         let later = now_secs() + 86_400;
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ssh_rows: vec![
                 SshRow {
                     address: "203.0.113.5".to_string(),
@@ -1246,7 +1247,7 @@ mod tests {
     /// is unambiguously from that one row.
     #[test]
     fn blocked_rows_render_red_and_pending_rows_do_not() {
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ssh_rows: vec![
                 SshRow {
                     address: "1.1.1.1".to_string(),
@@ -1302,7 +1303,7 @@ mod tests {
 
     #[test]
     fn blocked_only_filter_hides_pending_rows_from_render() {
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ssh_rows: vec![
                 SshRow {
                     address: "198.51.100.9".to_string(),
@@ -1344,7 +1345,7 @@ mod tests {
     #[test]
     fn changing_the_filter_reclamps_the_selection_to_the_visible_rows() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ssh_rows: vec![
                 SshRow {
                     address: "198.51.100.9".to_string(),
@@ -1374,7 +1375,7 @@ mod tests {
     #[test]
     fn enter_on_an_empty_panel_is_a_no_op() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection::default();
+        let mut screen = Firewall::default();
 
         let mut message = None;
         let outcome = screen
@@ -1387,7 +1388,7 @@ mod tests {
 
     #[test]
     fn render_shows_both_panels() {
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ssh_rows: vec![SshRow {
                 address: "198.51.100.9".to_string(),
                 count: 3,
@@ -1430,7 +1431,7 @@ mod tests {
     #[test]
     fn enter_on_blocklist_row_is_a_no_op() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ssh_rows: vec![SshRow {
                 address: "192.168.1.5".to_string(),
                 count: 3,
@@ -1454,7 +1455,7 @@ mod tests {
     #[test]
     fn enter_on_blocklist_ua_row_is_a_no_op() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             ua_rows: vec![UaRow {
                 user_agent: "Googlebot".to_string(),
                 count: 2,
@@ -1492,8 +1493,8 @@ mod tests {
         assert!(!RowStatus::Pending.is_blocklist());
         assert!(!RowStatus::Blocked { until: None }.is_blocklist());
     }
-    fn screen_with_one_ssh_row(status: RowStatus) -> DynamicProtection {
-        let mut screen = DynamicProtection {
+    fn screen_with_one_ssh_row(status: RowStatus) -> Firewall {
+        let mut screen = Firewall {
             ssh_rows: vec![SshRow {
                 address: "185.220.101.7".to_string(),
                 count: 12,
@@ -1505,11 +1506,11 @@ mod tests {
         screen
     }
 
-    fn drawn(screen: &mut DynamicProtection) -> String {
+    fn drawn(screen: &mut Firewall) -> String {
         drawn_at(screen, 30)
     }
 
-    fn drawn_at(screen: &mut DynamicProtection, height: u16) -> String {
+    fn drawn_at(screen: &mut Firewall, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(80, height)).unwrap();
         terminal
             .draw(|frame| screen.render(frame, frame.area(), Theme::Dark, &HashSet::new()))
@@ -1526,7 +1527,7 @@ mod tests {
     /// Opening the popup is two steps on purpose: the screen asks, and
     /// `App` answers, because the usernames come from the SSH log text
     /// `App` holds. This stands in for that second step.
-    fn open_detail(screen: &mut DynamicProtection, db: &Db) {
+    fn open_detail(screen: &mut Firewall, db: &Db) {
         let mut message = None;
         let outcome = screen
             .handle_key(KeyEvent::from(KeyCode::Char('i')), db, &mut message)
@@ -1612,8 +1613,8 @@ mod tests {
         assert!(db.list_firewall_rules().unwrap().is_empty());
     }
 
-    fn screen_with_one_ua_row(user_agent: &str, status: RowStatus) -> DynamicProtection {
-        let mut screen = DynamicProtection {
+    fn screen_with_one_ua_row(user_agent: &str, status: RowStatus) -> Firewall {
+        let mut screen = Firewall {
             ua_rows: vec![UaRow {
                 user_agent: user_agent.to_string(),
                 count: 9,
@@ -1691,7 +1692,7 @@ mod tests {
     #[test]
     fn inspecting_an_empty_user_agent_panel_does_nothing() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = DynamicProtection {
+        let mut screen = Firewall {
             focus: Focus::UserAgents,
             ..Default::default()
         };

@@ -243,7 +243,7 @@ mod tests {
             Command {
                 label: "Apply blocking to every site".into(),
                 hint: "A",
-                action: Action::Key(Screen::SiteSettings, KeyCode::Char('A')),
+                action: Action::Key(Screen::Nginx, KeyCode::Char('A')),
             },
             Command {
                 label: "Quit".into(),

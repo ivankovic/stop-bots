@@ -836,7 +836,7 @@ impl Db {
             );
 
             -- Literal user agents an admin chose to permanently block from
-            -- the Dashboard's \"Dynamic Protection\" screen — distinct from
+            -- the Dashboard's \"Firewall\" screen — distinct from
             -- `bots`/`bot_source_entries`: those describe *known,
             -- publicly-catalogued* bots with category flags and a merge
             -- cascade across sources, which doesn't fit a one-off exact
@@ -1298,7 +1298,7 @@ impl Db {
     ///
     /// Forced here rather than at each reader, because there are sixteen
     /// readers — the NGINX render, the per-site detail, both dashboards,
-    /// `uadetail`'s verdicts and the `BLOCKLIST` tag on Dynamic Protection
+    /// `uadetail`'s verdicts and the `BLOCKLIST` tag on Firewall
     /// — and a mode that only some of them honoured would show one answer
     /// and enforce another. The stored value is left alone, so turning the
     /// switch off restores whatever the operator had chosen; the UIs grey
@@ -1938,7 +1938,7 @@ impl Db {
     /// Permanently blocks the literal user agent string `user_agent` —
     /// idempotent (blocking an already-blocked one is a no-op, not an
     /// error). Storage-only, same as every other table here: it has no
-    /// effect on NGINX until `apply-blocks` (or Site settings' `a`/`A`)
+    /// effect on NGINX until `apply-blocks` (or the NGINX screen's `a`/`A`)
     /// re-injects the config, since `blocked_user_agent_patterns`/
     /// `_for_site` (via `compute_blocked_patterns`) both fold this table's
     /// contents into the patterns they return.
@@ -1951,7 +1951,7 @@ impl Db {
     }
 
     /// Every manually-blocked literal user agent, sorted for deterministic
-    /// output. Used both to render the Dynamic Protection screen's blocked
+    /// output. Used both to render the Firewall screen's blocked
     /// state and, escaped, folded into `compute_blocked_patterns`.
     pub fn list_blocked_user_agents(&self) -> Result<Vec<String>> {
         let mut stmt = self
@@ -2135,7 +2135,7 @@ impl Db {
     }
 
     /// Ensures `address` ends up with a permanent (`expires_at = NULL`)
-    /// Block rule — the Dynamic Protection screen's "Enter" action, for
+    /// Block rule — the Firewall screen's "Enter" action, for
     /// both a not-yet-blocked IP and one already temporarily blocked by
     /// `block-scanners`/`block-web-scanners` (that TTL is upgraded to
     /// permanent, since pressing Enter on an already-blocked row is a
@@ -2617,14 +2617,49 @@ impl Db {
             GeoMode::Blocklist => FirewallAction::Block,
             GeoMode::Allowlist => FirewallAction::Allow,
         };
+        let mut have_v4 = false;
+        let mut have_v6 = false;
         for country_code in &selected {
             for cidr in self.country_ranges(country_code)? {
+                // A `:` cannot appear in an IPv4 CIDR and must appear in an
+                // IPv6 one, so this needs no parse.
+                if cidr.contains(':') {
+                    have_v6 = true;
+                } else {
+                    have_v4 = true;
+                }
                 rules.push((cidr, action));
             }
         }
         if mode == GeoMode::Allowlist {
-            rules.push(("0.0.0.0/0".to_string(), FirewallAction::Block));
-            rules.push(("::/0".to_string(), FirewallAction::Block));
+            // The catch-all goes in per family, and only for a family this
+            // host actually has ranges for.
+            //
+            // "Allow these countries" cannot be enforced against an address
+            // family whose ranges were never fetched: every address in it is
+            // outside every allowed range, so a blanket catch-all does not
+            // filter that family, it removes it. Until 0.0.4 the country
+            // fetch was IPv4-only while both catch-alls were always
+            // rendered, which on a dual-stack host silently black-holed
+            // every IPv6 client — and the SSH lockout guard did not catch it,
+            // because an operator connected over IPv4 is checked against the
+            // v4 rules and passes.
+            //
+            // So a family with no data gets no verdict, which is the same
+            // rule `status` follows in reporting UNKNOWN rather than OK for a
+            // check that could not run.
+            //
+            // No countries selected at all is the one case that keeps both:
+            // that is not missing data, it is an allow-list of nothing, and
+            // rendering the deny-all is what makes the lockout guard refuse
+            // and tell the operator immediately. Dropping it there would turn
+            // a loud misconfiguration into a mode that silently does nothing.
+            if selected.is_empty() || have_v4 {
+                rules.push(("0.0.0.0/0".to_string(), FirewallAction::Block));
+            }
+            if selected.is_empty() || have_v6 {
+                rules.push(("::/0".to_string(), FirewallAction::Block));
+            }
         }
         Ok(rules)
     }
@@ -4245,8 +4280,14 @@ mod tests {
     fn allowlist_mode_allows_selected_countries_then_blocks_everything_else() {
         let db = Db::open_in_memory().unwrap();
         db.set_geo_mode(GeoMode::Allowlist).unwrap();
-        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
-            .unwrap();
+        // Both families in the fixture: a catch-all is only rendered for a
+        // family the selection has ranges for, so a v4-only fixture would
+        // no longer reach the v6 half of this assertion.
+        db.replace_country_ranges(
+            "nl",
+            &["1.2.3.0/24".to_string(), "2001:db8::/32".to_string()],
+        )
+        .unwrap();
         db.set_country_selected("nl", true).unwrap();
 
         // Order matters: the allowed country's rule must come before the
@@ -4255,9 +4296,77 @@ mod tests {
             db.geo_firewall_rules().unwrap(),
             vec![
                 ("1.2.3.0/24".to_string(), FirewallAction::Allow),
+                ("2001:db8::/32".to_string(), FirewallAction::Allow),
                 ("0.0.0.0/0".to_string(), FirewallAction::Block),
                 ("::/0".to_string(), FirewallAction::Block),
             ]
+        );
+    }
+
+    /// The regression this guard exists for. Until 0.0.4 the country fetch
+    /// was IPv4-only and both catch-alls were rendered unconditionally, so
+    /// switching a dual-stack host to allow-list mode dropped every IPv6
+    /// client — web and SSH — while looking entirely correct.
+    #[test]
+    fn allowlist_mode_does_not_block_a_family_it_has_no_ranges_for() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.set_country_selected("ch", true).unwrap();
+        db.replace_country_ranges("ch", &["185.4.0.0/22".to_string()])
+            .unwrap();
+
+        let rules = db.geo_firewall_rules().unwrap();
+        assert!(
+            rules.contains(&("0.0.0.0/0".to_string(), FirewallAction::Block)),
+            "v4 has ranges, so its catch-all belongs; rules were: {rules:?}"
+        );
+        assert!(
+            !rules.contains(&("::/0".to_string(), FirewallAction::Block)),
+            "no v6 ranges were fetched, so blocking every v6 address is a \
+             verdict the data cannot support; rules were: {rules:?}"
+        );
+    }
+
+    /// And the other half: once both families are present, both catch-alls
+    /// are rendered, because now the mode can actually be enforced.
+    #[test]
+    fn allowlist_mode_blocks_both_families_once_both_have_ranges() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.set_country_selected("ch", true).unwrap();
+        db.replace_country_ranges(
+            "ch",
+            &["185.4.0.0/22".to_string(), "2001:618::/32".to_string()],
+        )
+        .unwrap();
+
+        let rules = db.geo_firewall_rules().unwrap();
+        for expected in ["0.0.0.0/0", "::/0"] {
+            assert!(
+                rules.contains(&(expected.to_string(), FirewallAction::Block)),
+                "{expected} should be blocked once both families have ranges; \
+                 rules were: {rules:?}"
+            );
+        }
+    }
+
+    /// A v6-only selection is the mirror image, and gets the mirror answer.
+    #[test]
+    fn allowlist_mode_does_not_block_v4_when_only_v6_ranges_are_known() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.set_country_selected("ch", true).unwrap();
+        db.replace_country_ranges("ch", &["2001:618::/32".to_string()])
+            .unwrap();
+
+        let rules = db.geo_firewall_rules().unwrap();
+        assert!(
+            !rules.contains(&("0.0.0.0/0".to_string(), FirewallAction::Block)),
+            "rules were: {rules:?}"
+        );
+        assert!(
+            rules.contains(&("::/0".to_string(), FirewallAction::Block)),
+            "rules were: {rules:?}"
         );
     }
 

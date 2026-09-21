@@ -5,6 +5,58 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## Unreleased
+
+### Changed
+
+- **Two screens were renamed and the tab order changed**: the third tab
+  is now **Firewall** (was "Dynamic Protection") and the fourth is
+  **NGINX** (was "Site settings"). `1`–`4` still jump to a screen, but
+  the mnemonic letters moved with the names — `f` and `n` where `s` and
+  `p` used to be. In the web console the paths moved too: `/dynamic` is
+  now `/firewall` and `/sites` is now `/nginx`.
+
+  The old names described the screens' provenance rather than what they
+  do. Everything on tab three ends up in the **firewall script** and
+  everything on tab four ends up in **NGINX config** — which is the split
+  the project has documented from the start, and the one question a new
+  reader has to answer to find a setting. Naming the tabs after the two
+  outputs answers it from the tab bar. The new order puts them in the
+  order the Dashboard's "Apply everything" runs them.
+
+## [0.0.4] — 2026-09-21
+
+### Fixed
+
+- **Allow-list geo blocking dropped every IPv6 client.** The country fetch
+  read only IPdeny's IPv4 list, while allow-list mode rendered a `::/0`
+  block regardless — so on a dual-stack host it allowed the selected
+  countries over IPv4 and black-holed IPv6 entirely: web, SSH, everything.
+  No IPv6 address can be inside a range that was never fetched.
+
+  The SSH lockout guard did not catch it. It checks the addresses of
+  connected SSH sessions, so an operator connected over IPv4 is checked
+  against the v4 rules, sits inside an allowed country, and passes — while
+  the ruleset about to be applied removes an address family. A safety net
+  that is silent about a failure it does not model is worse than none,
+  because the render reads as verified.
+
+  `fetch_country` now fetches both of IPdeny's paths and stores both
+  families; `country_ip_ranges` is keyed `(country_code, cidr)`, so this
+  needed no schema change. Both must succeed — a half-fetched country is
+  the failure being fixed, and the two paths agree about which countries
+  exist, so nothing loses coverage.
+
+  And a catch-all is now rendered **per family, only for a family the
+  selection has ranges for**. A blanket `::/0` does not filter IPv6 without
+  IPv6 data, it removes IPv6, and that is a verdict the data cannot
+  support. An allow-list with no countries selected at all still blocks
+  both, deliberately: that is a misconfiguration rather than missing data,
+  and the deny-all is what makes the lockout guard refuse and say so.
+
+  Measured against the live feed: `update-country-ranges ch` now stores
+  3,550 ranges (2,680 v4 + 870 v6) where it stored 2,680.
+
 ## [0.0.3] — 2026-09-20
 
 ### Added
@@ -1024,7 +1076,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/ivankovic/stop-bots/compare/v0.0.3...v0.0.4
 [0.0.3]: https://github.com/ivankovic/stop-bots/compare/v0.0.2...v0.0.3
 [0.0.2]: https://github.com/ivankovic/stop-bots/compare/v0.0.1...v0.0.2
 [0.0.1]: https://github.com/ivankovic/stop-bots/releases/tag/v0.0.1

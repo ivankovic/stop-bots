@@ -24,7 +24,7 @@
 //!
 //! **Why this exists rather than someone pressing a key and cropping a
 //! terminal.** This tool reads real SSH and NGINX logs. A hand-taken
-//! screenshot of the Dynamic Protection screen would publish the
+//! screenshot of the Firewall screen would publish the
 //! attacker addresses hitting the maintainer's server and the hostnames
 //! of every site on it. Everything below is seeded fiction: addresses
 //! from the documentation ranges reserved by RFC 5737 (192.0.2.0/24,
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/screenshots");
     std::fs::create_dir_all(&out)?;
 
-    // A tempdir, not the host: `SiteSettings` is handed this as its NGINX
+    // A tempdir, not the host: `Nginx` is handed this as its NGINX
     // root, and pointing it at /etc/nginx would put the maintainer's real
     // sites in the picture. It stays empty — the sites below are written
     // straight into the database, which is the only thing this screen
@@ -153,15 +153,14 @@ async fn main() -> Result<()> {
 
     app.dashboard.refresh(&app.db)?;
     app.bot_settings.refresh(&app.db)?;
-    app.site_settings.refresh(&app.db)?;
-    app.dynamic_protection
-        .refresh(&app.db, Some(SSH_LOG_FIXTURE))?;
+    app.nginx.refresh(&app.db)?;
+    app.firewall.refresh(&app.db, Some(SSH_LOG_FIXTURE))?;
 
     // The status tags are computed off the main thread and folded back
     // through an event; with no event loop running they would sit at
     // "CHECKING" forever. One of each, because the interesting thing about
     // this panel is that it tells them apart.
-    app.site_settings
+    app.nginx
         .finish_status_check(vec![SiteApplyStatus::UpToDate, SiteApplyStatus::Stale]);
 
     // Bot settings shows results only for a typed query — that is the
@@ -180,14 +179,14 @@ async fn main() -> Result<()> {
     }
 
     // Height per screen rather than one size for all: the Dashboard
-    // stacks five panels and needs every row, while Dynamic Protection at
+    // stacks five panels and needs every row, while the Firewall screen at
     // the same height is two lists floating in eighteen blank lines. The
     // numbers are the shortest terminal on which nothing is cut off.
     for (screen, name, rows) in [
         (Screen::Dashboard, "dashboard", 38),
         (Screen::BotSettings, "bot-settings", 19),
-        (Screen::SiteSettings, "site-settings", 16),
-        (Screen::DynamicProtection, "dynamic-protection", 27),
+        (Screen::Firewall, "firewall", 27),
+        (Screen::Nginx, "nginx", 16),
     ] {
         app.screen = screen;
         let path = out.join(format!("{name}.svg"));
@@ -216,7 +215,7 @@ async fn main() -> Result<()> {
 /// of each page — the README is not the place for a 3,000px scroll.
 const WEB_PAGES: [(&str, &str, u32, u32); 2] = [
     ("/", "web-dashboard", 1280, 1000),
-    ("/dynamic", "web-dynamic-protection", 1280, 640),
+    ("/firewall", "web-firewall", 1280, 640),
 ];
 
 /// Renders each console page through the real router, stamps the light
@@ -431,8 +430,8 @@ const TOUR_DELAY_CS: u16 = 200;
 const TOUR: [Screen; 4] = [
     Screen::Dashboard,
     Screen::BotSettings,
-    Screen::SiteSettings,
-    Screen::DynamicProtection,
+    Screen::Firewall,
+    Screen::Nginx,
 ];
 
 /// Renders the tour and writes it as an animated GIF.

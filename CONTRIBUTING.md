@@ -218,7 +218,7 @@ TUI is shown dark and the console light on purpose: one of each palette.
 
 Two reasons it works this way rather than someone pressing a key and cropping a
 terminal. The first is that this tool reads real SSH and NGINX logs: a hand-taken
-screenshot of Dynamic Protection publishes the addresses currently attacking the
+screenshot of the Firewall screen publishes the addresses currently attacking the
 maintainer's server and the hostname of every site on it. The second is that the
 output is a pure function of the seed, so a screenshot that has gone stale shows up
 as a diff in review rather than as a picture nobody thought to re-take.
@@ -269,7 +269,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- app.rs         <- The TUI app controller, responds to events and controls the UI
         |- event.rs       <- Terminal event plumbing (ticks, key events, app events)
         |- tui.rs         <- Outer TUI chrome (tab bar, footer) and screen dispatch
-        |- tui/           <- One file per TUI screen (Dashboard, Bot settings, Site settings, ...)
+        |- tui/           <- One file per TUI screen (Dashboard, Bot settings, Firewall, ...)
         |- db.rs          <- SQLite storage: bots, sites, firewall rules, settings, ...
         |- botlist/       <- One file per bot-list source parser
         |- nginx.rs       <- NGINX site discovery, config injection and generated files

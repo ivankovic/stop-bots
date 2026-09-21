@@ -2326,7 +2326,7 @@ fn batch_records_its_run_against_the_internal_crons_schedule() {
 /// That offset is how `Db` remembers what has already been tallied. With a
 /// key of its own, batch would re-count the whole log on its first run and
 /// then double-count every line for as long as anything else read it too —
-/// and the number it inflates is the hit count Dynamic Protection shows an
+/// and the number it inflates is the hit count Firewall shows an
 /// admin deciding whether to block a user agent.
 #[test]
 fn batch_shares_the_access_log_offset_with_record_access_stats() {

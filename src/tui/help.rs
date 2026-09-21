@@ -31,7 +31,7 @@ use ratatui::{layout::Rect, text::Line, widgets::Paragraph, Frame};
 /// block's two borders).
 ///
 /// It is a constant with a test behind it because the comment that used to
-/// say this was not enough: adding the Dynamic Protection inspect key
+/// say this was not enough: adding the Firewall screen's inspect key
 /// pushed the last line off, and the only thing that noticed was an
 /// end-to-end pty test failing 15 seconds later with a timeout. Adding an
 /// entry here still means merging or dropping another — now you find that
@@ -41,7 +41,7 @@ const MAX_LINES: usize = 26;
 pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
     let lines = vec![
         Line::from("Navigation"),
-        Line::from("  1 2 3 4, d b s p   jump to a screen (Left/Right and h/l step through them)"),
+        Line::from("  1 2 3 4, d b f n   jump to a screen (Left/Right and h/l step through them)"),
         Line::from("  :                  command palette: every action here by name, fuzzy-matched"),
         Line::from("  Tab, Shift+Tab     next / previous panel on this screen"),
         Line::from("  Up/Down, j/k       move selection (it also flows from one panel into the next)"),
@@ -54,14 +54,14 @@ pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
         Line::from(""),
         Line::from("Bot settings         /  searches the bots; type to filter, Enter opens, Esc leaves the box"),
         Line::from(""),
-        Line::from("Site settings"),
-        Line::from("  r / a / A          scan for sites / apply this site / apply every site"),
-        Line::from("  Enter              open the selected site's category, request-rule and bot overrides"),
-        Line::from(""),
-        Line::from("Dynamic Protection"),
+        Line::from("Firewall"),
         Line::from("  Enter              block the selected NOT BLOCKED row, or unblock a BLOCKED one"),
         Line::from("  i / y / R          inspect the selected row / copy it / re-read the log"),
         Line::from("  f                  cycle the display filter (all / not blocked / blocked)"),
+        Line::from(""),
+        Line::from("NGINX"),
+        Line::from("  r / a / A          scan for sites / apply this site / apply every site"),
+        Line::from("  Enter              open the selected site's category, request-rule and bot overrides"),
         Line::from(""),
         Line::from("Global"),
         Line::from("  q, Esc             quit (from a screen: go back; from a popup: close it)"),

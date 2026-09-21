@@ -341,7 +341,7 @@ async fn set_status(
             &state.base,
             "/bots",
             &format!(
-                "{slug} now: {}. Apply on Site settings to write it out.",
+                "{slug} now: {}. Apply on the NGINX screen to write it out.",
                 form.status
             ),
             true,

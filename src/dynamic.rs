@@ -17,10 +17,10 @@
  */
 
 //! What is hitting the server right now, and whether it is already
-//! blocked — the model behind the TUI's "Dynamic Protection" screen and
+//! blocked — the model behind the TUI's "Firewall" screen and
 //! the web UI's.
 //!
-//! Lifted out of `tui/dynamic_protection.rs` when the web UI needed the
+//! Lifted out of `tui/firewall.rs` when the web UI needed the
 //! same answers, for the reason `scanblock` and `accessstats` were lifted
 //! out before it: the *decision* about whether an address counts as
 //! blocked is product behaviour, not presentation, and two front-ends

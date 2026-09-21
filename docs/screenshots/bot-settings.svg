@@ -5,17 +5,17 @@
 <rect x="339.6" y="210.0" width="92.4" height="18.0" fill="#10262a"/>
 <rect x="432.0" y="210.0" width="478.8" height="18.0" fill="#10262a"/>
 <text x="12.0" y="25.5" fill="#2ee6d6" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">stop-bots</text>
-<text x="87.6" y="25.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 0.0.2  web-01</text>
+<text x="87.6" y="25.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 0.0.3  web-01</text>
 <text x="12.0" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1</text>
 <text x="28.8" y="43.5" fill="#6b7c8c" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dashboard</text>
 <text x="129.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">2</text>
 <text x="146.4" y="43.5" fill="#2ee6d6" textLength="100.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Bot settings</text>
 <text x="272.4" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">3</text>
-<text x="289.2" y="43.5" fill="#6b7c8c" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Site settings</text>
-<text x="423.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">4</text>
-<text x="440.4" y="43.5" fill="#6b7c8c" textLength="151.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dynamic Protection</text>
-<text x="616.8" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
-<text x="633.6" y="43.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Help</text>
+<text x="289.2" y="43.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Firewall</text>
+<text x="381.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">4</text>
+<text x="398.4" y="43.5" fill="#6b7c8c" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">NGINX</text>
+<text x="465.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
+<text x="482.4" y="43.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Help</text>
 <text x="12.0" y="61.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">status</text>
 <text x="79.2" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
 <text x="96.0" y="61.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">kernel</text>

@@ -24,7 +24,7 @@
 //!
 //! Everything here gates a detector that writes `firewall_rules` rows.
 //! That's what makes it Dashboard-side rather than Site-settings-side (see
-//! `tui/site_settings.rs`'s module doc for the other half of that split):
+//! `tui/nginx.rs`'s module doc for the other half of that split):
 //! these end up in the generated firewall script, never in NGINX config.
 //!
 //! **A disabled detector is skipped entirely, not run-and-discarded.** The
@@ -35,7 +35,7 @@
 //! Turning a detector *off* never removes rules it already added. They
 //! expire on their own TTL (and `list_firewall_rules` prunes lapsed rows on
 //! read), which keeps "stop detecting" distinct from "undo what was
-//! detected" — the latter is the admin's call, via the Dynamic Protection
+//! detected" — the latter is the admin's call, via the Firewall
 //! screen or `remove-firewall-rule`.
 
 use crate::db::Db;

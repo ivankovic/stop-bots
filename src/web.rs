@@ -50,11 +50,11 @@ pub mod auth;
 pub mod bots;
 pub mod cron;
 pub mod dashboard;
-pub mod dynamic;
+pub mod firewall;
 pub mod help;
 pub mod layout;
+pub mod nginx;
 pub mod server;
-pub mod sites;
 pub mod state;
 
 use std::net::{IpAddr, SocketAddr};
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn urls_at_the_root_are_left_alone() {
         let base = BasePath::default();
-        for path in ["/", "/bots", "/assets/style.css", "/sites/7/rule"] {
+        for path in ["/", "/bots", "/assets/style.css", "/nginx/7/rule"] {
             assert_eq!(base.url(path), path);
         }
     }
@@ -313,7 +313,7 @@ mod tests {
         let base = BasePath::parse("/stop-bots").unwrap();
         assert_eq!(base.url("/bots"), "/stop-bots/bots");
         assert_eq!(base.url("/assets/style.css"), "/stop-bots/assets/style.css");
-        assert_eq!(base.url("/sites/7/rule"), "/stop-bots/sites/7/rule");
+        assert_eq!(base.url("/nginx/7/rule"), "/stop-bots/nginx/7/rule");
     }
 
     #[test]

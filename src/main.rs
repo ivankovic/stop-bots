@@ -350,7 +350,7 @@ enum Command {
     /// accident.
     ///
     /// Does nothing until the path is actually published: turn on
-    /// robots.txt generation (Site settings, or the robots.txt setting on
+    /// robots.txt generation (NGINX, or the robots.txt setting on
     /// the CLI) and apply, or add the Disallow line yourself.
     BlockHoneypot {
         #[arg(long, help = DB_HELP)]
@@ -564,7 +564,7 @@ enum Command {
     /// Switch one request-shape rule on or off for a site.
     ///
     /// See the rule list below (see
-    /// SetBlockResponse's siblings in Site settings). Rules:
+    /// SetBlockResponse's siblings in NGINX). Rules:
     /// http-1x, no-accept, no-accept-language, no-user-agent,
     /// ip-literal-host, old-tls.
     SetSiteRule {
@@ -696,7 +696,7 @@ enum Command {
     ///
     /// Host-wide, and only changes what *would* be written: run ApplyBlocks
     /// afterwards to get the new response code into the site configs. Until
-    /// then Site settings shows every applied site as STALE.
+    /// then NGINX shows every applied site as STALE.
     /// Start the web UI.
     ///
     /// Binds 127.0.0.1:8787 by default, which is reachable only from this
@@ -721,7 +721,7 @@ enum Command {
         /// NGINX config root to scan for sites.
         #[arg(long, default_value = "/etc/nginx")]
         root: PathBuf,
-        /// SSH log to read for the Dynamic Protection screen.
+        /// SSH log to read for the Firewall screen.
         #[arg(long)]
         ssh_log: Option<PathBuf>,
         /// Where the console's "Write script" button and its internal cron
@@ -980,10 +980,10 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
         /// Root directory to scan for NGINX config files, when triggering a
-        /// site scan from Site settings
+        /// site scan from NGINX
         #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
         root: PathBuf,
-        /// Skip reloading NGINX after Site settings applies blocking rules
+        /// Skip reloading NGINX after NGINX applies blocking rules
         /// (e.g. for tests driving the TUI end to end against a throwaway
         /// fixture root, where there's no real NGINX install to reload)
         #[arg(long)]
@@ -992,7 +992,7 @@ enum Command {
         /// override every SSH-reading CLI subcommand already takes, and for
         /// the same two audiences: a host with a non-standard log location,
         /// and tests, where auto-detection would otherwise shell out to
-        /// `journalctl` on every refresh of the Dynamic Protection screen
+        /// `journalctl` on every refresh of the Firewall screen
         #[arg(long)]
         ssh_log: Option<PathBuf>,
     },
@@ -1963,7 +1963,7 @@ fn set_humans_only(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
              is off. Their stored values are kept."
         );
         println!(
-            "\nRun apply-blocks (or Site settings' `a`/`A`) to write it into the NGINX config."
+            "\nRun apply-blocks (or the NGINX screen's `a`/`A`) to write it into the NGINX config."
         );
     } else {
         println!("Humans only is OFF. The stored category policies are back in force.");

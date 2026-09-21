@@ -16,7 +16,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! The Site settings screen: the NGINX sites `scan-sites` has discovered.
+//! The NGINX screen: the NGINX sites `scan-sites` has discovered.
 //! `r` triggers a Cancel/Scan-now confirmation popup (mirrors Bot settings'
 //! source update popup, but runs inline rather than spawning a background
 //! task: `nginx::discover_sites` is a local filesystem walk, not network
@@ -134,7 +134,7 @@ fn setting_options(setting: NginxSetting) -> (&'static str, Vec<String>) {
 #[derive(Debug)]
 enum PopupAction {
     Scan,
-    /// Index into `SiteSettings::sites` of the site to apply.
+    /// Index into `Nginx::sites` of the site to apply.
     Apply(usize),
     /// Apply every known site's rule to its own config file.
     ApplyAll,
@@ -215,7 +215,7 @@ struct SettingPopup {
 }
 
 #[derive(Debug)]
-pub struct SiteSettings {
+pub struct Nginx {
     root: PathBuf,
     sites: Vec<Site>,
     /// Parallel to `sites`: whether each site's on-disk config currently
@@ -246,7 +246,7 @@ pub struct SiteSettings {
     rate_limit_burst: i64,
 }
 
-impl SiteSettings {
+impl Nginx {
     pub fn new(root: PathBuf) -> Self {
         Self {
             root,
@@ -564,7 +564,7 @@ impl SiteSettings {
         }
 
         // Tab moves focus between this screen's two lists rather than
-        // cycling screens — the same narrower override Dynamic Protection
+        // cycling screens — the same narrower override Firewall
         // already makes for its own two panels (see `App::handle_key_event`,
         // which only sees Tab when the active screen returns `Ignored`).
         // Screen cycling stays available here via Right/`l`/BackTab's
@@ -928,7 +928,7 @@ impl SiteSettings {
     /// Turns a finished background apply into the status message `App`
     /// shows and, when something went wrong, the alert this screen shows
     /// on top of it — a message on the Dashboard is no use to someone
-    /// looking at Site settings.
+    /// looking at NGINX.
     ///
     /// The returned bool is whether any file actually changed, which is
     /// what tells `App` whether NGINX needs reloading at all.
@@ -1059,7 +1059,7 @@ pub fn run_status_check(sites: &[PlannedSite]) -> Vec<SiteApplyStatus> {
         .collect()
 }
 
-/// Which filesystem action Site settings has asked `App` to carry out.
+/// Which filesystem action NGINX has asked `App` to carry out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteAction {
     /// Walk the NGINX config root and record what's there.
@@ -1111,7 +1111,7 @@ pub struct ApplyOutcome {
 
 /// Performs a planned apply. Runs on a background thread and touches no
 /// `Db`: everything it needs was resolved by
-/// [`SiteSettings::plan_apply`].
+/// [`Nginx::plan_apply`].
 ///
 /// A site's failure doesn't stop the others from being tried — a single
 /// process either has root or doesn't, so one permission failure usually
@@ -1192,7 +1192,7 @@ mod tests {
     /// back into the screen. The popup used to do all of that inline, so
     /// tests below could press Enter and then look at the files; this
     /// keeps them able to, without pretending the split isn't there.
-    fn perform(screen: &mut SiteSettings, db: &Db, action: SiteAction) -> (String, bool) {
+    fn perform(screen: &mut Nginx, db: &Db, action: SiteAction) -> (String, bool) {
         match action {
             SiteAction::Scan => {
                 let sites = nginx::discover_sites(screen.root()).map_err(|err| err.to_string());
@@ -1209,8 +1209,8 @@ mod tests {
 
     /// Reloads the screen *and* works out the status tags, the way `App`
     /// does across two turns of the event loop. `refresh` alone no longer
-    /// reads the config files — see `SiteSettings::refresh`.
-    fn refresh_with_statuses(screen: &mut SiteSettings, db: &Db) {
+    /// reads the config files — see `Nginx::refresh`.
+    fn refresh_with_statuses(screen: &mut Nginx, db: &Db) {
         screen.refresh(db).unwrap();
         let plan = screen.plan_status_check(db).unwrap();
         screen.finish_status_check(run_status_check(&plan));
@@ -1218,7 +1218,7 @@ mod tests {
 
     /// Presses Enter on an open confirm popup and carries out whatever it
     /// asked for, returning the status message.
-    fn confirm_popup(screen: &mut SiteSettings, db: &Db) -> String {
+    fn confirm_popup(screen: &mut Nginx, db: &Db) -> String {
         let outcome = screen
             .handle_key(KeyEvent::from(KeyCode::Enter), db, &mut None)
             .unwrap();
@@ -1235,7 +1235,7 @@ mod tests {
     /// searching rather than counting keypresses — the option list is
     /// `BlockResponse::ALL`, so adding an option would otherwise silently
     /// move these tests onto a different one and keep passing.
-    fn select_response(screen: &mut SiteSettings, db: &Db, response: BlockResponse) {
+    fn select_response(screen: &mut Nginx, db: &Db, response: BlockResponse) {
         let target = BlockResponse::ALL
             .iter()
             .position(|r| *r == response)
@@ -1254,8 +1254,8 @@ mod tests {
         }
     }
 
-    fn test_screen() -> SiteSettings {
-        SiteSettings::new(PathBuf::from("tests/fixtures/nginx"))
+    fn test_screen() -> Nginx {
+        Nginx::new(PathBuf::from("tests/fixtures/nginx"))
     }
 
     #[test]
@@ -1403,7 +1403,7 @@ mod tests {
     #[test]
     fn scanning_a_missing_root_reports_the_failure_rather_than_zero_sites() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = SiteSettings::new(PathBuf::from("/nonexistent/does-not-exist"));
+        let mut screen = Nginx::new(PathBuf::from("/nonexistent/does-not-exist"));
         let mut message = None;
 
         screen

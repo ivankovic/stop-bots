@@ -540,17 +540,30 @@ mod tests {
     fn derived_firewall_rules_in_allowlist_mode_ends_with_the_catchall() {
         let db = Db::open_in_memory().unwrap();
         db.set_geo_mode(GeoMode::Allowlist).unwrap();
-        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
-            .unwrap();
+        // Both families, so both catch-alls are rendered -- see
+        // `Db::geo_firewall_rules` for why a family with no ranges gets none.
+        db.replace_country_ranges(
+            "nl",
+            &["1.2.3.0/24".to_string(), "2001:db8::/32".to_string()],
+        )
+        .unwrap();
         db.set_country_selected("nl", true).unwrap();
 
         let rules = derived_firewall_rules(&db).unwrap();
-        assert_eq!(rules[0].address, "1.2.3.0/24");
-        assert_eq!(rules[0].action, FirewallAction::Allow);
-        assert_eq!(rules[1].address, "0.0.0.0/0");
-        assert_eq!(rules[1].action, FirewallAction::Block);
-        assert_eq!(rules[2].address, "::/0");
-        assert_eq!(rules[2].action, FirewallAction::Block);
+        let tail: Vec<(&str, FirewallAction)> = rules
+            .iter()
+            .map(|r| (r.address.as_str(), r.action))
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                ("1.2.3.0/24", FirewallAction::Allow),
+                ("2001:db8::/32", FirewallAction::Allow),
+                ("0.0.0.0/0", FirewallAction::Block),
+                ("::/0", FirewallAction::Block),
+            ],
+            "the catch-alls must come last, and one per family"
+        );
     }
 
     /// The guarantee, against the case that motivated it: the operator's

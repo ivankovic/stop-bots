@@ -259,7 +259,7 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
     // counted, so a key of its own would mean re-tallying the whole log on
     // the first run and then double-counting every line for as long as
     // anything else (the TUI, `record-access-stats`) also ran. The number
-    // being inflated is the one Dynamic Protection shows an admin when
+    // being inflated is the one Firewall shows an admin when
     // they decide whether to block a user agent.
     let log_path = options
         .access_log

@@ -364,14 +364,13 @@ fn body(view: &View) -> Markup {
                         "and the third-party IP feeds."
                     }
                     p {
-                        "Site settings owns everything that ends up in "
+                        "The NGINX screen owns everything that ends up in "
                         strong { "NGINX config" }
                         ": what a blocked request gets back, the generated robots.txt, rate limiting, "
                         "and each site's own overrides."
                     }
                     p .hint {
-                        "That is the same split the TUI makes, and it is what decides where any given "
-                        "setting lives."
+                        "That is the same split the TUI makes."
                     }
                 }
             },

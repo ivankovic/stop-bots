@@ -16,7 +16,7 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! Site settings: everything that ends up in **NGINX config**.
+//! NGINX: everything that ends up in **NGINX config**.
 //!
 //! The counterpart to the Dashboard, which owns the firewall script. A
 //! setting belongs here if applying it rewrites a `server { ... }` block.
@@ -88,7 +88,7 @@ pub async fn page(
         Err(err) => return internal_error(&err.to_string()),
     };
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
-    render(Tab::Sites, &ctx, flash.into_flash(), body(&view, &ctx))
+    render(Tab::Nginx, &ctx, flash.into_flash(), body(&view, &ctx))
 }
 
 fn body(view: &View, ctx: &Ctx) -> Markup {
@@ -136,7 +136,7 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
                     tr {
                         td { "Blocked requests get" }
                         td {
-                            form .row method="post" action=(ctx.url("/sites/block-response")) style="gap:8px" {
+                            form .row method="post" action=(ctx.url("/nginx/block-response")) style="gap:8px" {
                                 (layout::csrf_field(ctx))
                                 select name="response" {
                                     @for (response, label) in RESPONSES {
@@ -164,7 +164,7 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
                                 } @else {
                                     (layout::pill("OFF", PillKind::Neutral))
                                 }
-                                form .inline method="post" action=(ctx.url("/sites/robots")) {
+                                form .inline method="post" action=(ctx.url("/nginx/robots")) {
                                     (layout::csrf_field(ctx))
                                     input type="hidden" name="enabled" value=(if view.serve_robots { "0" } else { "1" });
                                     button type="submit" {
@@ -191,7 +191,7 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
                                 } @else {
                                     (layout::pill("OFF", PillKind::Neutral))
                                 }
-                                form .inline method="post" action=(ctx.url("/sites/auto-apply")) {
+                                form .inline method="post" action=(ctx.url("/nginx/auto-apply")) {
                                     (layout::csrf_field(ctx))
                                     input type="hidden" name="enabled" value=(if view.auto_apply { "0" } else { "1" });
                                     button type="submit" {
@@ -208,7 +208,7 @@ fn nginx_settings_panel(view: &View, ctx: &Ctx) -> Markup {
                             span .hint { "Enforced by NGINX at request time, unlike everything else here" }
                         }
                         td {
-                            form .row method="post" action=(ctx.url("/sites/rate-limit")) style="gap:8px" {
+                            form .row method="post" action=(ctx.url("/nginx/rate-limit")) style="gap:8px" {
                                 (layout::csrf_field(ctx))
                                 @if view.rate_limit {
                                     (layout::pill("ON", PillKind::Allowed))
@@ -252,11 +252,11 @@ fn sites_panel(view: &View, ctx: &Ctx) -> Markup {
         html! {
             .panel-body {
                 .row {
-                    form .inline method="post" action=(ctx.url("/sites/scan")) {
+                    form .inline method="post" action=(ctx.url("/nginx/scan")) {
                         (layout::csrf_field(ctx))
                         button type="submit" title=(format!("Look for server blocks under {}", view.root.display())) { "Rescan" }
                     }
-                    form .inline method="post" action=(ctx.url("/sites/apply-all")) {
+                    form .inline method="post" action=(ctx.url("/nginx/apply-all")) {
                         (layout::csrf_field(ctx))
                         button .primary type="submit" { "Apply to every site" }
                     }
@@ -275,13 +275,13 @@ fn sites_panel(view: &View, ctx: &Ctx) -> Markup {
                         @for (site, status) in &view.sites {
                             tr {
                                 td {
-                                    a href=(ctx.url(&format!("/sites/{}", site.id))) { (site.server_name) }
+                                    a href=(ctx.url(&format!("/nginx/{}", site.id))) { (site.server_name) }
                                     br;
                                     span .hint .mono { (site.config_path) }
                                 }
                                 td { (status_pill(*status)) }
                                 td .right {
-                                    form .inline method="post" action=(ctx.url("/sites/apply")) {
+                                    form .inline method="post" action=(ctx.url("/nginx/apply")) {
                                         (layout::csrf_field(ctx))
                                         input type="hidden" name="id" value=(site.id);
                                         button type="submit" { "Apply" }
@@ -353,7 +353,7 @@ pub async fn detail(
     };
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(
-        Tab::Sites,
+        Tab::Nginx,
         &ctx,
         flash.into_flash(),
         detail_body(&detail, &ctx),
@@ -363,7 +363,7 @@ pub async fn detail(
 fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
     let id = detail.site.id;
     html! {
-        p { a href=(ctx.url("/sites")) { "← All sites" } }
+        p { a href=(ctx.url("/nginx")) { "← All sites" } }
 
         .cols {
 
@@ -374,7 +374,7 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
                 .panel-body {
                     .row {
                         (status_pill(detail.status))
-                        form .inline method="post" action=(ctx.url("/sites/apply")) {
+                        form .inline method="post" action=(ctx.url("/nginx/apply")) {
                             (layout::csrf_field(ctx))
                             input type="hidden" name="id" value=(id);
                             button .primary type="submit" { "Apply to this site" }
@@ -404,7 +404,7 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
                                 }
                             }
                             td .right {
-                                form .inline method="post" action=(ctx.url(&format!("/sites/{id}/category"))) {
+                                form .inline method="post" action=(ctx.url(&format!("/nginx/{id}/category"))) {
                                     (layout::csrf_field(ctx))
                                     input type="hidden" name="category" value=(category_id(category));
                                     select name="policy" data-autosubmit {
@@ -453,7 +453,7 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
                                     }
                                 }
                                 td .right {
-                                    form .inline method="post" action=(ctx.url(&format!("/sites/{id}/rule"))) {
+                                    form .inline method="post" action=(ctx.url(&format!("/nginx/{id}/rule"))) {
                                         (layout::csrf_field(ctx))
                                         input type="hidden" name="rule" value=(rule.id());
                                         input type="hidden" name="enabled" value=(if *enabled { "0" } else { "1" });
@@ -481,7 +481,7 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
                             tr {
                                 td .mono { (path) }
                                 td .right {
-                                    form .inline method="post" action=(ctx.url(&format!("/sites/{id}/exempt-remove"))) {
+                                    form .inline method="post" action=(ctx.url(&format!("/nginx/{id}/exempt-remove"))) {
                                         (layout::csrf_field(ctx))
                                         input type="hidden" name="path" value=(path);
                                         button type="submit" { "Remove" }
@@ -492,7 +492,7 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
                     } }
                 }
                 .panel-body {
-                    form .row method="post" action=(ctx.url(&format!("/sites/{id}/exempt-add"))) {
+                    form .row method="post" action=(ctx.url(&format!("/nginx/{id}/exempt-add"))) {
                         (layout::csrf_field(ctx))
                         input type="text" name="path" placeholder="/blog" size="24" required;
                         button .primary type="submit" { "Add" }
@@ -543,19 +543,19 @@ fn override_from(id: &str) -> Option<Option<Policy>> {
 
 pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
     Router::new()
-        .route(&base.url("/sites/{id}"), axum::routing::get(detail))
-        .route(&base.url("/sites/block-response"), post(set_block_response))
-        .route(&base.url("/sites/robots"), post(set_robots))
-        .route(&base.url("/sites/auto-apply"), post(set_auto_apply))
-        .route(&base.url("/sites/rate-limit"), post(set_rate_limit))
-        .route(&base.url("/sites/scan"), post(scan))
-        .route(&base.url("/sites/apply"), post(apply_one))
-        .route(&base.url("/sites/apply-all"), post(apply_all))
-        .route(&base.url("/sites/{id}/category"), post(set_site_category))
-        .route(&base.url("/sites/{id}/rule"), post(set_site_rule))
-        .route(&base.url("/sites/{id}/exempt-add"), post(add_exemption))
+        .route(&base.url("/nginx/{id}"), axum::routing::get(detail))
+        .route(&base.url("/nginx/block-response"), post(set_block_response))
+        .route(&base.url("/nginx/robots"), post(set_robots))
+        .route(&base.url("/nginx/auto-apply"), post(set_auto_apply))
+        .route(&base.url("/nginx/rate-limit"), post(set_rate_limit))
+        .route(&base.url("/nginx/scan"), post(scan))
+        .route(&base.url("/nginx/apply"), post(apply_one))
+        .route(&base.url("/nginx/apply-all"), post(apply_all))
+        .route(&base.url("/nginx/{id}/category"), post(set_site_category))
+        .route(&base.url("/nginx/{id}/rule"), post(set_site_rule))
+        .route(&base.url("/nginx/{id}/exempt-add"), post(add_exemption))
         .route(
-            &base.url("/sites/{id}/exempt-remove"),
+            &base.url("/nginx/{id}/exempt-remove"),
             post(remove_exemption),
         )
 }
@@ -577,7 +577,7 @@ async fn set_block_response(
     {
         Ok(()) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!(
                 "Blocked requests now get {}. Apply to write it out.",
                 response.label()
@@ -586,7 +586,7 @@ async fn set_block_response(
         ),
         Err(err) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!("Could not save that: {err}"),
             false,
         ),
@@ -612,7 +612,7 @@ async fn set_auto_apply(
     match state.with_db(move |db| db.set_auto_apply(on)).await {
         Ok(()) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             if on {
                 "Auto-apply on. The internal cron will write these configs and reload NGINX \
                  within the hour, and after every change from now on."
@@ -623,7 +623,7 @@ async fn set_auto_apply(
         ),
         Err(err) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!("Could not save that: {err}"),
             false,
         ),
@@ -639,7 +639,7 @@ async fn set_robots(
     match state.with_db(move |db| db.set_serve_robots_txt(on)).await {
         Ok(()) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             if on {
                 "robots.txt will be generated. Apply to write it out."
             } else {
@@ -649,7 +649,7 @@ async fn set_robots(
         ),
         Err(err) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!("Could not save that: {err}"),
             false,
         ),
@@ -671,7 +671,7 @@ async fn set_rate_limit(
     if form.rps < 1 || form.burst < 1 {
         return back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             "Rate and burst both have to be at least 1.",
             false,
         );
@@ -688,7 +688,7 @@ async fn set_rate_limit(
     {
         Ok(()) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!(
                 "Rate limiting {} at {rps}/s with a burst of {burst}. Apply to write it out.",
                 if on { "on" } else { "off" }
@@ -697,7 +697,7 @@ async fn set_rate_limit(
         ),
         Err(err) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!("Could not save that: {err}"),
             false,
         ),
@@ -719,11 +719,11 @@ async fn scan(State(state): State<AppState>, _auth: Auth) -> Response {
     match found {
         Ok(count) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!("Found {count} site(s)."),
             true,
         ),
-        Err(err) => back_with(&state.base, "/sites", &format!("Scan failed: {err}"), false),
+        Err(err) => back_with(&state.base, "/nginx", &format!("Scan failed: {err}"), false),
     }
 }
 
@@ -763,11 +763,11 @@ async fn apply_one(
             } else {
                 format!("{name} was already up to date.")
             };
-            reload_then(&state, "/sites", message).await
+            reload_then(&state, "/nginx", message).await
         }
         Err(err) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!("Apply failed: {err}"),
             false,
         ),
@@ -784,14 +784,14 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
         Ok(outcome) => {
             reload_then(
                 &state,
-                "/sites",
+                "/nginx",
                 format!("Applied: {} file(s) changed.", outcome.changed),
             )
             .await
         }
         Err(err) => back_with(
             &state.base,
-            "/sites",
+            "/nginx",
             &format!("Apply failed: {err}"),
             false,
         ),
@@ -850,7 +850,7 @@ async fn set_site_category(
     UrlPath(id): UrlPath<i64>,
     Form(form): Form<SiteCategoryForm>,
 ) -> Response {
-    let back = format!("/sites/{id}");
+    let back = format!("/nginx/{id}");
     let (Some(category), Some(policy)) =
         (category_from(&form.category), override_from(&form.policy))
     else {
@@ -888,7 +888,7 @@ async fn set_site_rule(
     UrlPath(id): UrlPath<i64>,
     Form(form): Form<RuleForm>,
 ) -> Response {
-    let back = format!("/sites/{id}");
+    let back = format!("/nginx/{id}");
     let Some(rule) = RequestRule::from_id(&form.rule) else {
         return back_with(&state.base, &back, "Unknown request rule.", false);
     };
@@ -929,7 +929,7 @@ async fn add_exemption(
     UrlPath(id): UrlPath<i64>,
     Form(form): Form<PathForm>,
 ) -> Response {
-    let back = format!("/sites/{id}");
+    let back = format!("/nginx/{id}");
     let path = form.path.trim().to_string();
     if !path.starts_with('/') {
         return back_with(
@@ -965,7 +965,7 @@ async fn remove_exemption(
     UrlPath(id): UrlPath<i64>,
     Form(form): Form<PathForm>,
 ) -> Response {
-    let back = format!("/sites/{id}");
+    let back = format!("/nginx/{id}");
     let path = form.path;
     let stored = path.clone();
     match state

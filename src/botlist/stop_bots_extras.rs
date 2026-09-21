@@ -109,7 +109,7 @@ enum Kind {
 const EXTRAS: &[(&str, &str, Kind)] = &[
     // ---- known-good, carried so nothing proposes blocking them ----
     // Seen 68 times on the host this list came from, and in *no* bot list
-    // at all — which meant the Dynamic Protection screen showed it beside
+    // at all — which meant the Firewall screen showed it beside
     // the scanners with nothing to say it was different. Blocking it
     // breaks ACME HTTP-01 renewal, and the damage surfaces as an expired
     // certificate two months later, long after anyone would connect the

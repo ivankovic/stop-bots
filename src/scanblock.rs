@@ -91,7 +91,7 @@ pub struct ScanBlockOutcome {
     /// `firewall::all_rules` would have neutralised such a rule anyway, by
     /// putting an Allow ahead of it — this is about not *writing* it.
     /// A row saying Block against the operator's own address is alarming
-    /// whether or not it has any effect, and the Dynamic Protection screen
+    /// whether or not it has any effect, and the Firewall screen
     /// reads `firewall_rules` directly, so it would show that address as
     /// blocked when it is not.
     pub skipped_ssh_logins: usize,
@@ -912,7 +912,7 @@ mod tests {
 
     /// A detector must not even *write* a Block for an address the
     /// operator logs in from. `firewall::all_rules` would neutralise it,
-    /// but the Dynamic Protection screen reads `firewall_rules` directly
+    /// but the Firewall screen reads `firewall_rules` directly
     /// and would show the operator's own address as blocked.
     #[test]
     fn block_ssh_scanners_leaves_an_address_with_a_recent_ssh_login_alone() {

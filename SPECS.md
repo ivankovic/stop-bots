@@ -5954,3 +5954,118 @@ released, and that every `Filename:` resolves to a file that exists. apt
 fails closed on a bad index, so the risk is not a bad install — it is an
 `apt update` error on every machine that configured the repository, and
 those people did nothing to earn it.
+
+## The tabs are named after their output (`Screen`, `Tab`, `src/tui/`, `src/web/`)
+
+The third and fourth screens are now **Firewall** and **NGINX**, in that
+order. They were "Dynamic Protection" and "Site settings", in the other
+order.
+
+**Why the names changed.** The split this project has documented from the
+start is that the Dashboard and tab three own everything that ends up in
+the *firewall script*, and tab four owns everything that ends up in
+*NGINX config*. That is the one question a reader has to answer to find a
+setting, and the old names did not answer it: "Site settings" described
+where the rows came from, "Dynamic Protection" described how they were
+found. Both left the reader to learn the mapping from the README. The tab
+bar now carries it.
+
+**Why the order changed.** "Apply everything" writes NGINX first and the
+firewall second, but the *screens* read the other way: the Firewall
+screen is where a detection becomes a block, and the NGINX screen is the
+last stop before a config file is written. Left to right now ends where
+applying ends.
+
+**What moved with them.** `Screen::SiteSettings` is `Screen::Nginx` and
+`Screen::DynamicProtection` is `Screen::Firewall`;
+`src/tui/site_settings.rs` is `src/tui/nginx.rs` and
+`src/tui/dynamic_protection.rs` is `src/tui/firewall.rs`; the same two
+renames happened under `src/web/`. Historic entries above still use the
+old names, because they describe decisions taken when those were the
+names — this section is the mapping.
+
+**The mnemonic letters moved with the names, and that is a rebind.** `s`
+and `p` are now `f` and `n`. A letter that keeps working but lands
+somewhere else is worse than one that stops working, so neither old
+letter was left as an alias: `s` and `p` now do nothing, which is a key
+press that visibly did nothing rather than a screen change nobody asked
+for. The digits `1`–`4` are unchanged and are what both front-ends print
+in the tab bar.
+
+`f` collides with the Firewall screen's own display filter, and that is
+fine: the screen-jump letters are a *global fallback* that only runs once
+the active screen has ignored the key (see `KeyOutcome`), so `f` cycles
+the filter on the one screen where jumping to Firewall would be a no-op
+anyway.
+
+**The web console's paths moved too** — `/sites` is `/nginx`, `/dynamic`
+is `/firewall`. A bookmark from 0.0.2 breaks. That is worth one release's
+worth of 404s rather than a console whose URL bar and tab bar disagree
+forever; the alternative, redirects, would have to be carried for as long
+as anyone might still hold the old link, which is the same thing as
+forever.
+
+
+## IPv6 country ranges, and the family a catch-all may not speak for (`ipranges::fetch_country`, `Db::geo_firewall_rules`)
+
+`country_zone_url` fetched one file per country:
+`ipblocks/data/aggregated/{cc}-aggregated.zone`, which is IPdeny's **IPv4**
+list. There was no IPv6 fetch anywhere in the tree. Meanwhile
+`geo_firewall_rules` in Allowlist mode rendered, unconditionally:
+
+    ("0.0.0.0/0", Block)
+    ("::/0",      Block)
+
+So allow-list mode on a dual-stack host allowed the selected countries over
+IPv4 and dropped **every** IPv6 client — web, SSH, everything — because no
+IPv6 address could be inside a range that was never fetched.
+
+**The SSH lockout guard does not catch this, and that is the part worth
+recording.** `firewall::lockout_risks` checks the addresses of currently
+connected SSH sessions against the rules. An operator connected over IPv4 is
+checked against the v4 rules, sits inside an allowed country, and passes. The
+guard reports no risk while the ruleset is about to remove an entire address
+family. A safety net that is silent about the failure it does not model is
+worse than none, because the render reads as verified.
+
+Found while planning a migration off `geoip-shell` on a host with
+`2a01:4f9:3a:412c::2`, an `AAAA` on the apex, and nginx on `[::]:443`.
+
+### Both files, or neither
+
+`fetch_country` now fetches `ipblocks/data/aggregated/` and
+`ipv6/ipaddresses/aggregated/` and concatenates them. Nothing downstream
+changed: `parse_zone_file` is line-based, and `country_ip_ranges` is keyed
+`(country_code, cidr)`, so a v6 CIDR sits beside a v4 one with no column and
+no migration. `is_valid_address` already accepted v6 prefixes.
+
+Both fetches must succeed. A half-fetched country is the exact failure being
+fixed, so keeping yesterday's complete list beats storing a v4-only one —
+`replace_country_ranges` is transactional, so a failure leaves the previous
+ranges in place. This costs no reach: IPdeny's two paths agree about which
+countries exist. `bv`, `hm`, `pn`, `gs` and `tf` return 404 on **both**, so
+they already failed before this function fetched twice; `aq` returns 200 on
+both.
+
+### A catch-all per family, and only for a family with data
+
+The deeper fix is in `geo_firewall_rules`. A blanket `::/0` block does not
+*filter* IPv6 when no IPv6 ranges are known — it removes IPv6. That is a
+verdict the data cannot support, and the same rule `status` follows when it
+reports UNKNOWN rather than OK for a check that could not run.
+
+So each family's catch-all is rendered only when the selection contributed at
+least one range in that family. A `:` cannot appear in a v4 CIDR and must
+appear in a v6 one, so the test needs no parse.
+
+**One case keeps both, deliberately: no countries selected at all.** That is
+not missing data, it is an allow-list of nothing, and rendering the deny-all
+is what makes the lockout guard refuse and say so. Dropping it there would
+turn a loud misconfiguration into a mode that silently does nothing —
+trading a visible failure for an invisible one, which is the trade this whole
+section exists to refuse.
+
+Measured against the real feed after the change: `update-country-ranges ch`
+stores 3,550 ranges (2,680 v4 + 870 v6, matching IPdeny's published counts),
+and an allow-list render emits 3,552 rules — the ranges plus one catch-all
+per family.

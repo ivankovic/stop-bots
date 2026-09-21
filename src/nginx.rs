@@ -1368,7 +1368,7 @@ pub fn apply_blocks_to_file(
 
 /// Whether a site's on-disk config currently matches the blocking rule
 /// that would be computed for it right now — backs the TUI's per-site
-/// status tag in Site settings.
+/// status tag in NGINX.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SiteApplyStatus {
     /// Every `server` block for this name already carries the expected

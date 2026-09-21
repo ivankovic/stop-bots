@@ -18,7 +18,7 @@
 
 //! The Dashboard: everything that ends up in the **firewall script**.
 //!
-//! That split is the same one the TUI documents — Site settings owns what
+//! That split is the same one the TUI documents — NGINX owns what
 //! ends up in NGINX config, this owns the firewall — and it is what
 //! decides which screen a given setting belongs on.
 
@@ -1012,7 +1012,7 @@ async fn set_humans_only(
             &state.base,
             "/",
             if on {
-                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on Site settings to write it into the site configs."
+                "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on the NGINX screen to write it into the site configs."
             } else {
                 "Humans only is off. The category policies you had before are back in force."
             },
@@ -1056,7 +1056,7 @@ async fn set_category(
             &state.base,
             "/",
             &format!(
-                "{} are now {}. Apply on Site settings to write it into the site configs.",
+                "{} are now {}. Apply on the NGINX screen to write it into the site configs.",
                 category_label(category),
                 policy_id(policy)
             ),
