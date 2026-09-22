@@ -1974,26 +1974,41 @@ fn status_reports_generated_rules_that_never_reached_the_kernel() {
 /// nftables rules live in kernel memory. A host that is protected now and
 /// comes back open after a reboot is worth being told about, and the
 /// answer comes from systemd rather than from anything this tool wrote.
+///
+/// The question is whether anything re-applies *our* script. Enabling
+/// `nftables.service` used to satisfy this check, although that unit loads
+/// /etc/nftables.conf and never ours — so it must not change the answer,
+/// and `stop-bots install firewall` must.
 #[test]
 fn status_notices_that_the_ruleset_will_not_survive_a_reboot() {
     if !enabled() {
         return;
     }
     let host = Host::start("stop-bots-status-persist");
+    let not_reapplied = "nothing re-applies /etc/stop-bots/firewall.nft at boot";
 
     let (_, out, err) = host.run_uncontended(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
-        said.contains("nftables.service is not enabled"),
-        "a host with nftables.service disabled was not told:\n{said}"
+        said.contains(not_reapplied),
+        "a host with nothing re-applying the script was not told:\n{said}"
     );
 
     host.sh("systemctl enable nftables.service");
     let (_, out, err) = host.run_uncontended(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
-        !said.contains("is not enabled"),
-        "enabling the unit did not change the answer:\n{said}"
+        said.contains(not_reapplied),
+        "enabling nftables.service, which loads a different file, \
+         was taken as re-applying ours:\n{said}"
+    );
+
+    host.sh("stop-bots install firewall");
+    let (_, out, err) = host.run_uncontended(&format!("stop-bots status --db {HOST_DB}"));
+    let said = format!("{out}{err}");
+    assert!(
+        said.contains("/etc/stop-bots/firewall.nft is re-applied at boot"),
+        "`install firewall` did not change the answer:\n{said}"
     );
 }
 
