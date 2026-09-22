@@ -5,6 +5,39 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [0.0.7] — 2026-09-22
+
+### Added
+
+- **`set-nginx-commands --root`**, so the NGINX config root is remembered
+  like the commands and the log paths already are. It is the third thing a
+  containerised NGINX moves away from its default, and the only one still
+  passed by hand on every invocation.
+
+  `--root` defaulted to `/etc/nginx` on six subcommands, so the code could
+  not tell "not passed" from "passed the default". Forgetting it did not
+  error — it scanned an empty `/etc/nginx`, found no sites, and reported
+  success over nothing. Two cases could not be fixed by remembering: the
+  bare `stop-bots` invocation hardcoded the default and accepted no flags,
+  and the web unit baked the path into `ExecStart` at install time.
+
+  An explicit `--root` still wins, so a one-off run against a checkout needs
+  no change to the stored value.
+
+### Changed
+
+- **The web unit no longer names `--root` in `ExecStart`.** The service
+  reads the stored root itself, which is what the unit's own comment already
+  says about the bind address, host allowlist, path prefix and exposure
+  flag: a setting that lives in the database must not also live in a flag,
+  or they disagree on the next restart.
+
+- **`render-firewall --out` defaults to `/etc/stop-bots/firewall.nft`.**
+  That path already existed as `DEFAULT_OUTPUT_PATH`, the health check looks
+  for it, and `install firewall` hardcodes it — while the command that
+  writes the file made you type it, and any other path produced a script
+  nothing reads.
+
 ## [0.0.6] — 2026-09-21
 
 ### Added
@@ -1136,7 +1169,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.6...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/ivankovic/stop-bots/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/ivankovic/stop-bots/compare/v0.0.5...v0.0.6
 [0.0.5]: https://github.com/ivankovic/stop-bots/compare/v0.0.4...v0.0.5
 [0.0.4]: https://github.com/ivankovic/stop-bots/compare/v0.0.3...v0.0.4

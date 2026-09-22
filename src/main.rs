@@ -23,7 +23,6 @@ use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule};
 use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
-const DEFAULT_NGINX_ROOT: &str = "/etc/nginx";
 
 /// Rejects `--threshold 0` at the command line.
 ///
@@ -68,8 +67,10 @@ enum Command {
     #[command(alias = "scan")]
     ScanSites {
         /// Root directory to scan for NGINX config files
-        #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
-        root: PathBuf,
+        /// NGINX config root. Defaults to the path stored by
+        /// `set-nginx-commands --root`, else /etc/nginx.
+        #[arg(long)]
+        root: Option<PathBuf>,
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
@@ -89,8 +90,10 @@ enum Command {
     },
     /// Apply the current blocking policy to every discovered NGINX site
     ApplyBlocks {
-        #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
-        root: PathBuf,
+        /// NGINX config root. Defaults to the path stored by
+        /// `set-nginx-commands --root`, else /etc/nginx.
+        #[arg(long)]
+        root: Option<PathBuf>,
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
         /// Skip reloading NGINX after writing config changes (e.g. for
@@ -149,8 +152,11 @@ enum Command {
     RenderFirewall {
         #[arg(long)]
         backend: FirewallBackend,
-        /// Path to write the generated script to
-        #[arg(long)]
+        /// Path to write the generated script to. Defaults to
+        /// /etc/stop-bots/firewall.nft, which is what `stop-bots install
+        /// firewall` loads at boot and what the health check looks for --
+        /// writing anywhere else gives a script nothing reads.
+        #[arg(long, default_value = stop_bots::firewall::DEFAULT_OUTPUT_PATH)]
         out: PathBuf,
         /// Write the script even if it would block an IP with a recent
         /// successful SSH login
@@ -718,9 +724,10 @@ enum Command {
     Web {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
-        /// NGINX config root to scan for sites.
-        #[arg(long, default_value = "/etc/nginx")]
-        root: PathBuf,
+        /// NGINX config root to scan for sites. Defaults to the path
+        /// stored by `set-nginx-commands --root`, else /etc/nginx.
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// SSH log to read for the Firewall screen.
         #[arg(long)]
         ssh_log: Option<PathBuf>,
@@ -832,8 +839,16 @@ enum Command {
         /// The reload.
         #[arg(long)]
         reload: Option<String>,
-        /// Restore both to their defaults.
-        #[arg(long, conflicts_with_all = ["test", "reload"])]
+        /// Where this host's site configs live, when that is not
+        /// /etc/nginx — an NGINX in a container with its config on a bind
+        /// mount being the case this exists for. Stored, so it no longer
+        /// has to be repeated on scan-sites, apply-blocks, batch and tui,
+        /// where forgetting it scanned an empty /etc/nginx and reported
+        /// success.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Restore all three to their defaults.
+        #[arg(long, conflicts_with_all = ["test", "reload", "root"])]
         reset: bool,
     },
     SetBlockResponse {
@@ -896,8 +911,10 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
         /// Root directory to scan for NGINX config files
-        #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
-        root: PathBuf,
+        /// NGINX config root. Defaults to the path stored by
+        /// `set-nginx-commands --root`, else /etc/nginx.
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Reload NGINX and run the generated firewall script, rather than
         /// only writing both
         #[arg(long)]
@@ -969,8 +986,10 @@ enum Command {
         #[arg(long)]
         binary: Option<PathBuf>,
         /// NGINX config root the service will scan.
-        #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
-        root: PathBuf,
+        /// NGINX config root. Defaults to the path stored by
+        /// `set-nginx-commands --root`, else /etc/nginx.
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Pin the service to this SSH log instead of letting it find one.
         ///
         /// Leave it off unless the log is somewhere this would not look.
@@ -1005,8 +1024,10 @@ enum Command {
         db: Option<PathBuf>,
         /// Root directory to scan for NGINX config files, when triggering a
         /// site scan from NGINX
-        #[arg(long, default_value = DEFAULT_NGINX_ROOT)]
-        root: PathBuf,
+        /// NGINX config root. Defaults to the path stored by
+        /// `set-nginx-commands --root`, else /etc/nginx.
+        #[arg(long)]
+        root: Option<PathBuf>,
         /// Skip reloading NGINX after NGINX applies blocking rules
         /// (e.g. for tests driving the TUI end to end against a throwaway
         /// fixture root, where there's no real NGINX install to reload)
@@ -1096,7 +1117,9 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        None => run_tui(None, PathBuf::from(DEFAULT_NGINX_ROOT), false, None).await,
+        // No flags to pass, so the stored root is the only way this form
+        // can be right on a host whose config is not in /etc/nginx.
+        None => run_tui(None, None, false, None).await,
         Some(Command::Tui {
             db,
             root,
@@ -1168,7 +1191,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Command::ScanSites { root, db }) => scan_sites(&root, db),
+        Some(Command::ScanSites { root, db }) => scan_sites(root.as_deref(), db),
         Some(Command::UpdateBotLists {
             db,
             source_id,
@@ -1178,7 +1201,7 @@ async fn main() -> Result<()> {
             root,
             db,
             no_reload,
-        }) => apply_blocks(&root, db, no_reload),
+        }) => apply_blocks(root.as_deref(), db, no_reload),
         Some(Command::AddFirewallRule {
             address,
             port,
@@ -1294,8 +1317,9 @@ async fn main() -> Result<()> {
             db,
             test,
             reload,
+            root,
             reset,
-        }) => set_nginx_commands(db, test, reload, reset),
+        }) => set_nginx_commands(db, test, reload, root, reset),
         Some(Command::SetBlockResponse { db, response }) => set_block_response(db, response),
         Some(Command::SetRateLimit {
             db,
@@ -1427,11 +1451,12 @@ fn clear_screen() -> Result<()> {
 
 async fn run_tui(
     db_path: Option<PathBuf>,
-    root: PathBuf,
+    root: Option<PathBuf>,
     no_reload: bool,
     ssh_log: Option<PathBuf>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let root = nginx::root(&db, root.as_deref())?;
     let app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
     let terminal = ratatui::init();
     // Not `?`: bailing here would skip the `restore` below and leave the
@@ -1543,7 +1568,7 @@ fn format_age(taken_at: i64) -> String {
 /// whatever this host is set to, and the output path falls out of
 /// whichever backend that turns out to be.
 struct BatchRequest {
-    root: PathBuf,
+    root: Option<PathBuf>,
     out: Option<PathBuf>,
     backend: Option<FirewallBackend>,
     apply: bool,
@@ -1555,6 +1580,10 @@ struct BatchRequest {
 
 async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    let request = BatchRequest {
+        root: Some(nginx::root(&db, request.root.as_deref())?),
+        ..request
+    };
 
     // An explicit `--backend` wins; without one, the host's own setting
     // does. It used to be neither: the flag carried a `nftables` default,
@@ -1567,7 +1596,7 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
         None => stop_bots::firewall::stored_backend(&db)?,
     };
     let options = stop_bots::batch::BatchOptions {
-        root: request.root,
+        root: request.root.expect("resolved above"),
         out: request
             .out
             .unwrap_or_else(|| stop_bots::firewall::default_output_path(backend)),
@@ -1594,8 +1623,10 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
     Ok(())
 }
 
-fn scan_sites(root: &Path, db_path: Option<PathBuf>) -> Result<()> {
+fn scan_sites(root: Option<&Path>, db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
+    let root = nginx::root(&db, root)?;
+    let root = root.as_path();
     let sites = nginx::discover_sites(root)?;
     for site in &sites {
         db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
@@ -1628,9 +1659,10 @@ async fn update_bot_lists(
     Ok(())
 }
 
-fn apply_blocks(root: &Path, db_path: Option<PathBuf>, no_reload: bool) -> Result<()> {
+fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) -> Result<()> {
     let db = open_db(db_path)?;
-    let outcome = nginx::apply_all_sites(&db, root)?;
+    let root = nginx::root(&db, root)?;
+    let outcome = nginx::apply_all_sites(&db, &root)?;
     println!(
         "Applied blocking rules to {} site(s) across {} file(s), {} file(s) changed",
         outcome.sites, outcome.files, outcome.changed
@@ -2061,7 +2093,7 @@ struct InstallWeb {
     force: bool,
     start: bool,
     binary: Option<PathBuf>,
-    root: PathBuf,
+    root: Option<PathBuf>,
     ssh_log: Option<PathBuf>,
     prefix: Option<PathBuf>,
     bind: Option<String>,
@@ -2179,7 +2211,13 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     // prefix produced rather than being joined onto it. Under a prefix that
     // means the unit names the real path, which is right: a prefixed install
     // is for reading the output, not running it.
-    layout.nginx_root = options.root;
+    // Not resolved from the database here, and not named in ExecStart: the
+    // running service reads the stored root itself. Opening a database would
+    // also break `install web --dry-run`, which is documented to print the
+    // plan and touch nothing -- including a database that may not exist yet.
+    if let Some(root) = options.root {
+        layout.nginx_root = root;
+    }
     // Stays `None` unless the operator passed `--ssh-log`, which is what
     // keeps the flag out of `ExecStart` and leaves the service free to find
     // the log itself. See `install::Layout::ssh_log`.
@@ -2326,7 +2364,7 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 async fn run_web(
     db_path: Option<PathBuf>,
-    root: PathBuf,
+    root: Option<PathBuf>,
     ssh_log: Option<PathBuf>,
     firewall_out: Option<PathBuf>,
     bind: Option<String>,
@@ -2340,6 +2378,7 @@ async fn run_web(
     use stop_bots::web::{self, auth, server, state::AppState};
 
     let db = open_db(db_path)?;
+    let root = nginx::root(&db, root.as_deref())?;
 
     // The same registration the TUI does on startup, and for the same
     // reason: `SourceKind::StopBotsExtras` is a list compiled into this
@@ -2465,6 +2504,7 @@ fn set_nginx_commands(
     db_path: Option<PathBuf>,
     test: Option<String>,
     reload: Option<String>,
+    root: Option<PathBuf>,
     reset: bool,
 ) -> Result<()> {
     use stop_bots::nginx::NginxCommands;
@@ -2474,6 +2514,13 @@ fn set_nginx_commands(
     if reset {
         db.set_text_setting(NginxCommands::TEST_KEY, NginxCommands::DEFAULT_TEST)?;
         db.set_text_setting(NginxCommands::RELOAD_KEY, NginxCommands::DEFAULT_RELOAD)?;
+        db.set_text_setting(NginxCommands::ROOT_KEY, stop_bots::nginx::DEFAULT_ROOT)?;
+    }
+    if let Some(root) = &root {
+        // Stored as given, not canonicalised: the path has to mean the same
+        // thing later, and a symlink an operator chose deliberately is not
+        // this command's to resolve.
+        db.set_text_setting(NginxCommands::ROOT_KEY, &root.display().to_string())?;
     }
     for (key, value) in [
         (NginxCommands::TEST_KEY, &test),
@@ -2491,6 +2538,10 @@ fn set_nginx_commands(
     let commands = NginxCommands::from_db(&db)?;
     println!("Test command:   {}", commands.test.join(" "));
     println!("Reload command: {}", commands.reload.join(" "));
+    println!(
+        "Config root:    {}",
+        stop_bots::nginx::root(&db, None)?.display()
+    );
     Ok(())
 }
 

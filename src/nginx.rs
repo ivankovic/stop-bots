@@ -1593,6 +1593,8 @@ impl NginxCommands {
     /// `settings` keys, alongside the rest of the `nginx:` family.
     pub const TEST_KEY: &'static str = "nginx:test_command";
     pub const RELOAD_KEY: &'static str = "nginx:reload_command";
+    /// Where this host's site configs actually live.
+    pub const ROOT_KEY: &'static str = "nginx:root";
 
     /// Reads both from `db`, falling back to the defaults for either one
     /// that was never set. A stored command that no longer parses is an
@@ -1611,6 +1613,36 @@ impl NginxCommands {
             reload: stored(Self::RELOAD_KEY, Self::DEFAULT_RELOAD)?,
         })
     }
+}
+
+/// The stock location, and what every host had before this was configurable.
+pub const DEFAULT_ROOT: &str = "/etc/nginx";
+
+/// Where to look for site configs: the flag if one was given, else the
+/// stored setting, else the stock path.
+///
+/// The third member of the same family as `NginxCommands` and
+/// `LogPaths`. An NGINX in a container moves three things away from their
+/// defaults — the commands that drive it, the logs it writes, and the
+/// directory its config lives in — and the first two were already stored
+/// while this one had to be repeated on `scan-sites`, `apply-blocks`,
+/// `install web`, `batch` and `tui`. Forgetting it on any one of them did
+/// not error; it scanned `/etc/nginx`, found nothing, and reported
+/// success over an empty set.
+///
+/// Flag beats setting, for the same reason it does for the log paths: a
+/// one-off run against a checkout or a staging tree must not require the
+/// stored value to be changed and put back.
+pub fn root(db: &crate::db::Db, flag: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = flag {
+        return Ok(path.to_path_buf());
+    }
+    Ok(db
+        .get_text_setting(NginxCommands::ROOT_KEY)?
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT)))
 }
 
 impl Default for NginxCommands {
@@ -1720,6 +1752,55 @@ pub fn reload_with(commands: &NginxCommands) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The gap this closes. An NGINX in a container moves three things:
+    /// the commands that drive it, the logs it writes, and the directory
+    /// its config lives in. The first two were stored; this one had to be
+    /// repeated on five subcommands, and forgetting it anywhere scanned an
+    /// empty /etc/nginx and reported success over nothing.
+    #[test]
+    fn a_stored_root_is_used_when_no_flag_is_given() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_text_setting(NginxCommands::ROOT_KEY, "/srv/domaci/nginx")
+            .unwrap();
+        assert_eq!(
+            root(&db, None).unwrap(),
+            std::path::PathBuf::from("/srv/domaci/nginx")
+        );
+    }
+
+    #[test]
+    fn nothing_stored_falls_back_to_the_stock_path() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        assert_eq!(
+            root(&db, None).unwrap(),
+            std::path::PathBuf::from(DEFAULT_ROOT)
+        );
+    }
+
+    /// A one-off run against a checkout must not require the stored value
+    /// to be changed and put back -- the same precedence `LogPaths` uses.
+    #[test]
+    fn an_explicit_flag_beats_the_stored_root() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_text_setting(NginxCommands::ROOT_KEY, "/srv/domaci/nginx")
+            .unwrap();
+        assert_eq!(
+            root(&db, Some(std::path::Path::new("/tmp/fixture"))).unwrap(),
+            std::path::PathBuf::from("/tmp/fixture")
+        );
+    }
+
+    #[test]
+    fn an_empty_stored_root_reads_as_unset() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_text_setting(NginxCommands::ROOT_KEY, "   ").unwrap();
+        assert_eq!(
+            root(&db, None).unwrap(),
+            std::path::PathBuf::from(DEFAULT_ROOT),
+            "whitespace should not become a path that scans nothing"
+        );
+    }
+
     use super::*;
 
     // ---- configured test/reload commands ----

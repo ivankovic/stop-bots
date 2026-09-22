@@ -271,10 +271,9 @@ fn hidden_binary_error(binary: &Path, directive: &str) -> String {
 /// bytes an operator will actually get rather than a rendering of them.
 pub fn web_unit(layout: &Layout) -> String {
     let mut exec = format!(
-        "{} web --db {} --root {}",
+        "{} web --db {}",
         layout.binary.display(),
         layout.db_path.display(),
-        layout.nginx_root.display(),
     );
     // Only when the operator named one. Omitting the flag is what leaves
     // the service free to try the log files and then `journalctl`; naming
@@ -290,10 +289,11 @@ pub fn web_unit(layout: &Layout) -> String {
          # edited copy of this file alone and tells you so; `--force` replaces it.\n\
          #\n\
          # Settings deliberately absent from ExecStart: the bind address, the host\n\
-         # allowlist, the path prefix and whether exposure is permitted all live in\n\
-         # the `settings` table, because the running server re-reads them. Adding a\n\
-         # flag for one here gives it two sources of truth and the database wins on\n\
-         # the next restart. Change them with `stop-bots web --save ...` instead.\n\
+         # allowlist, the path prefix, whether exposure is permitted, and the NGINX\n\
+         # config root all live in the `settings` table, because the running server\n\
+         # re-reads them. Adding a flag for one here gives it two sources of truth\n\
+         # and the database wins on the next restart. Change them with\n\
+         # `stop-bots web --save ...` and `stop-bots set-nginx-commands --root ...`.\n\
          [Unit]\n\
          Description=stop-bots web console\n\
          Documentation=https://github.com/ivankovic/stop-bots\n\

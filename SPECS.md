@@ -6203,3 +6203,59 @@ detectors find nothing (tried /var/log/nginx/access.log)" rather than
 warning that cannot answer it is one that gets muted. The suggested fix leads
 with `set-log-paths` rather than the flags, because the flags cannot reach
 the console.
+
+
+## The third thing a containerised NGINX moves (`nginx::root`, `set-nginx-commands --root`)
+
+`set-nginx-commands` exists because `nginx -t` and `systemctl reload nginx`
+are wrong when NGINX is in a container. `set-log-paths` exists because the
+access log is wrong for the same reason. The config **root** is the third
+member of that set and was the only one still passed by hand.
+
+`--root` carried `default_value = "/etc/nginx"` on six subcommands —
+`scan-sites`, `apply-blocks`, `install web`, `web`, `batch` and `tui` — so
+the code could not tell "not passed" from "passed the default". Forgetting it
+on any one of them did not error: it scanned an empty `/etc/nginx`, found no
+sites, and reported success over nothing.
+
+Two of those six were worse than the rest. The **bare invocation**, `stop-bots`
+with no subcommand, hardcoded the default and accepted no flags at all, so on
+a host like this one it could only ever be wrong. And the **web unit** baked
+`--root` into `ExecStart`, so the console had whatever path was current when
+it was installed.
+
+### Resolution, and the sixth copy
+
+`nginx::root(db, flag)` resolves flag, then the `nginx:root` setting, then
+`DEFAULT_ROOT` — the same precedence and the same reasoning as `LogPaths`: an
+explicit flag must still win so a one-off run against a checkout needs no
+change to the stored value and no change back.
+
+A replace across `default_value = DEFAULT_NGINX_ROOT` caught five of the six.
+The `web` subcommand had `default_value = "/etc/nginx"` written as a literal
+and was missed until the compiler objected — which is why the constant is now
+deleted from `main.rs` entirely and `nginx::DEFAULT_ROOT` is the only copy.
+
+### The root left ExecStart, which is the consistent answer
+
+The web unit's own comment already stated the principle: the bind address,
+host allowlist, path prefix and exposure flag are *deliberately absent* from
+`ExecStart`, because the running server re-reads them and a flag would give
+them two sources of truth. Once the root became a setting, `--root` in
+`ExecStart` was exactly that mistake, so it was removed and the comment now
+names it.
+
+That also fixed a regression this change introduced. The first version
+resolved the root inside `run_install_web`, which meant opening a database —
+and `install web --dry-run` is documented to print the whole plan and touch
+nothing, including a database that may not exist yet. The test suite caught
+it. Not naming the root in the unit removes the need to resolve it there at
+all.
+
+### `render-firewall --out`
+
+Same family, smaller. `DEFAULT_OUTPUT_PATH` existed, the health check looked
+for it, and `stop-bots install firewall` hardcodes it in `ExecStart` — while
+the one command that writes the file made you type it, and typing anything
+else produced a script nothing reads. It now defaults to the path everything
+else assumes.
