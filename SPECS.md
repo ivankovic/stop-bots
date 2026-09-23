@@ -6522,3 +6522,15 @@ screen — so the failure surfaces as a pty timeout waiting for a word on a
 screen the test never reached. `tests/cli.rs`'s fixture had set both from
 the start; the pty helpers now do too, into one temp tree per binary, since
 nothing there asserts on a generated file.
+
+**Only a `conf.d` that is already there.** The first cut of this derived
+`<root>/conf.d` unconditionally, and the container suite caught what that
+misses: `root` is wherever site configs were scanned from, which is not
+always the NGINX prefix. That suite passes `--root /etc/nginx/sites-enabled`,
+so the derivation created `/etc/nginx/sites-enabled/conf.d` — a *directory*
+sitting where `include sites-enabled/*` globs. NGINX tried to `pread()` it
+and refused to start: `pread() "/etc/nginx/sites-enabled/conf.d" failed (21:
+Is a directory)`. The rule is now to use the root's own `conf.d` when it
+exists and the stock path otherwise, and never to create one. A `conf.d`
+that is already there is one NGINX was built around; one this code invents
+is a guess about a glob it cannot see.

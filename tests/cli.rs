@@ -7,7 +7,7 @@ use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
 mod common;
-use common::{copy_dir_all, path_with, scan_sites, seed_bots, stop_bots};
+use common::{copy_dir_all, path_with, scan_sites, seed_bots, stop_bots, stop_bots_bin};
 
 // Every end-to-end test below drives the real binary against a throwaway
 // database and NGINX root. The helpers here wrap the incantations that made
@@ -58,7 +58,7 @@ impl Fixture {
     /// The same, without asserting success — for the tests that expect a
     /// failure and check stderr.
     fn cmd(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::cargo_bin("stop-bots").unwrap();
+        let mut cmd = stop_bots_bin();
         cmd.env("STOP_BOTS_NGINX_DIR", &self.managed)
             .env("STOP_BOTS_NGINX_CONF_D", &self.conf_d)
             .args(args)
@@ -184,8 +184,7 @@ fn update_scan_and_apply_blocks_happy_path() {
     copy_dir_all(Path::new("tests/fixtures/nginx"), &nginx_root);
     let db_path = tmp.path().join("db.sqlite3");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "update-bot-lists",
             "--db",
@@ -204,8 +203,7 @@ fn update_scan_and_apply_blocks_happy_path() {
     // `systemctl reload nginx` to validate — and the CLI would otherwise
     // reload the machine's actual NGINX (if any) as a side effect of
     // running this test suite.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "apply-blocks",
             "--root",
@@ -235,8 +233,7 @@ fn update_scan_and_apply_blocks_happy_path() {
     );
 
     // Re-running apply-blocks should be a no-op.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "apply-blocks",
             "--root",
@@ -338,8 +335,7 @@ fn set_block_response_changes_the_generated_status_code_on_the_next_apply() {
     apply(&db_path, &nginx_root);
     assert!(fs::read_to_string(&site).unwrap().contains("return 403;"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-block-response",
             "--db",
@@ -377,8 +373,7 @@ fn block_spoofed_crawlers_is_inert_without_ranges_then_blocks_a_forged_googlebot
     .unwrap();
 
     let run = |db_path: &Path, log: &Path| {
-        Command::cargo_bin("stop-bots")
-            .unwrap()
+        stop_bots_bin()
             .args([
                 "block-spoofed-crawlers",
                 "--db",
@@ -440,8 +435,7 @@ fn block_probe_paths_blocks_a_dotenv_probe_but_not_a_wordpress_login() {
     )
     .unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-probe-paths",
             "--db",
@@ -475,8 +469,7 @@ fn set_probe_paths_adds_extras_and_reports_unanchored_entries() {
     )
     .unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-probe-paths",
             "--db",
@@ -489,16 +482,14 @@ fn set_probe_paths_adds_extras_and_reports_unanchored_entries() {
         .stdout(predicate::str::contains("1 accepted"))
         .stdout(predicate::str::contains("Ignored 1"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-probe-paths", "--db", db_path.to_str().unwrap()])
         .assert()
         .success()
         .stdout(predicate::str::contains("/.env"))
         .stdout(predicate::str::contains("/internal"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-probe-paths",
             "--db",
@@ -528,8 +519,7 @@ fn honeypot_path_is_configurable_and_blocks_whatever_fetches_it() {
 
     // A path with no leading slash can never match, so it's rejected
     // rather than stored.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-honeypot-path",
             "--db",
@@ -541,8 +531,7 @@ fn honeypot_path_is_configurable_and_blocks_whatever_fetches_it() {
         .failure()
         .stderr(predicate::str::contains("must start with"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-honeypot-path",
             "--db",
@@ -554,8 +543,7 @@ fn honeypot_path_is_configurable_and_blocks_whatever_fetches_it() {
         .success()
         .stdout(predicate::str::contains("published"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-honeypot",
             "--db",
@@ -582,8 +570,7 @@ fn a_reputation_feed_only_reaches_the_firewall_script_once_enabled() {
     let db_path = tmp.path().join("db.sqlite3");
     let out = tmp.path().join("firewall.nft");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-reputation-sources", "--db", db_path.to_str().unwrap()])
         .assert()
         .success()
@@ -597,8 +584,7 @@ fn a_reputation_feed_only_reaches_the_firewall_script_once_enabled() {
     }
 
     let render = |db_path: &Path, out: &Path| {
-        Command::cargo_bin("stop-bots")
-            .unwrap()
+        stop_bots_bin()
             .args([
                 "render-firewall",
                 "--backend",
@@ -618,8 +604,7 @@ fn a_reputation_feed_only_reaches_the_firewall_script_once_enabled() {
     render(&db_path, &out);
     assert!(!fs::read_to_string(&out).unwrap().contains("198.51.100.7"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-reputation-source",
             "--db",
@@ -637,8 +622,7 @@ fn a_reputation_feed_only_reaches_the_firewall_script_once_enabled() {
     assert!(fs::read_to_string(&out).unwrap().contains("198.51.100.7"));
 
     // And switching it back off removes it again, without losing the data.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-reputation-source",
             "--db",
@@ -653,8 +637,7 @@ fn a_reputation_feed_only_reaches_the_firewall_script_once_enabled() {
     render(&db_path, &out);
     assert!(!fs::read_to_string(&out).unwrap().contains("198.51.100.7"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-reputation-sources", "--db", db_path.to_str().unwrap()])
         .assert()
         .success()
@@ -667,8 +650,7 @@ fn enabling_a_provider_feed_warns_and_flags_that_nothing_is_fetched_yet() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-reputation-source",
             "--db",
@@ -689,8 +671,7 @@ fn an_unknown_reputation_source_is_rejected_with_the_known_ids() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-reputation-source",
             "--db",
@@ -993,8 +974,7 @@ fn apply_blocks_reloads_nginx_after_validating_the_config() {
     seed_bots(&db_path);
     scan_sites(&db_path, &nginx_root);
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .env("PATH", path_with(&bin))
         .args([
             "apply-blocks",
@@ -1034,8 +1014,7 @@ fn a_failing_nginx_config_check_stops_the_reload() {
     seed_bots(&db_path);
     scan_sites(&db_path, &nginx_root);
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .env("PATH", path_with(&bin))
         .args([
             "apply-blocks",
@@ -1082,8 +1061,7 @@ fn a_configured_reload_command_replaces_systemctl_entirely() {
         "docker exec web nginx -s reload",
     ]);
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .env("PATH", path_with(&bin))
         .args([
             "apply-blocks",
@@ -1136,8 +1114,7 @@ fn a_configured_test_command_that_fails_stops_the_reload() {
         "docker exec web nginx -s reload",
     ]);
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .env("PATH", path_with(&bin))
         .args([
             "apply-blocks",
@@ -1200,8 +1177,7 @@ fn set_nginx_commands_rejects_an_unparsable_command() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "set-nginx-commands",
             "--db",
@@ -1318,8 +1294,7 @@ fn firewall_add_list_render_remove_happy_path() {
     let db_path = tmp.path().join("db.sqlite3");
     let db_path = db_path.to_str().unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "add-firewall-rule",
             "--db",
@@ -1332,8 +1307,7 @@ fn firewall_add_list_render_remove_happy_path() {
         .assert()
         .success();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "add-firewall-rule",
             "--db",
@@ -1346,8 +1320,7 @@ fn firewall_add_list_render_remove_happy_path() {
         .assert()
         .success();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -1355,8 +1328,7 @@ fn firewall_add_list_render_remove_happy_path() {
         .stdout(predicate::str::contains("66.249.64.0/19"));
 
     let script_path = tmp.path().join("stop-bots.sh");
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "render-firewall",
             "--db",
@@ -1384,14 +1356,12 @@ fn firewall_add_list_render_remove_happy_path() {
     assert!(!script.contains("*filter"), "script was:\n{script}");
     assert!(!script.contains("COMMIT"), "script was:\n{script}");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["remove-firewall-rule", "--db", db_path, "--id", "1"])
         .assert()
         .success();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -1409,8 +1379,7 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
     let db_path = tmp.path().join("db.sqlite3");
     let db_path = db_path.to_str().unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "add-firewall-rule",
             "--db",
@@ -1433,8 +1402,7 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
     let script_path = tmp.path().join("stop-bots.sh");
 
     // Without --force: refuses, warns once, writes nothing.
-    let output = Command::cargo_bin("stop-bots")
-        .unwrap()
+    let output = stop_bots_bin()
         .args([
             "render-firewall",
             "--db",
@@ -1459,8 +1427,7 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
     assert!(!script_path.exists());
 
     // With --force: still warns (once), but writes the script.
-    let output = Command::cargo_bin("stop-bots")
-        .unwrap()
+    let output = stop_bots_bin()
         .args([
             "render-firewall",
             "--db",
@@ -1493,8 +1460,7 @@ fn render_firewall_proceeds_normally_when_no_connected_ip_is_at_risk() {
     let db_path = tmp.path().join("db.sqlite3");
     let db_path = db_path.to_str().unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "add-firewall-rule",
             "--db",
@@ -1515,8 +1481,7 @@ fn render_firewall_proceeds_normally_when_no_connected_ip_is_at_risk() {
     .unwrap();
 
     let script_path = tmp.path().join("stop-bots.sh");
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "render-firewall",
             "--db",
@@ -1557,8 +1522,7 @@ fn render_firewall_lockout_check_covers_derived_country_ranges_too() {
     .unwrap();
 
     let script_path = tmp.path().join("stop-bots.sh");
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "render-firewall",
             "--db",
@@ -1583,52 +1547,45 @@ fn geo_mode_and_country_selection_cli_happy_path() {
     let db_path = db_path.to_str().unwrap();
 
     // Defaults to Blocklist with nothing selected.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-selected-countries", "--db", db_path])
         .assert()
         .success()
         .stdout(predicate::str::contains("Blocklist"))
         .stdout(predicate::str::contains("No countries selected"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["add-country", "--db", db_path, "--country", "nl"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Added country nl"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-selected-countries", "--db", db_path])
         .assert()
         .success()
         .stdout(predicate::str::contains("nl"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["set-geo-mode", "--db", db_path, "--mode", "allowlist"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Allowlist"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-selected-countries", "--db", db_path])
         .assert()
         .success()
         .stdout(predicate::str::contains("Allowlist"))
         .stdout(predicate::str::contains("nl"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["remove-country", "--db", db_path, "--country", "nl"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Removed country nl"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-selected-countries", "--db", db_path])
         .assert()
         .success()
@@ -1645,15 +1602,13 @@ fn render_firewall_rejects_allowlist_mode_on_iptables_cli() {
     let db_path = tmp.path().join("db.sqlite3");
     let db_path = db_path.to_str().unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["set-geo-mode", "--db", db_path, "--mode", "allowlist"])
         .assert()
         .success();
 
     let script_path = tmp.path().join("stop-bots.sh");
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "render-firewall",
             "--db",
@@ -1681,13 +1636,11 @@ fn render_firewall_allowlist_mode_does_not_warn_when_an_earlier_allow_rule_cover
     let db_path = tmp.path().join("db.sqlite3");
     let db_path = db_path.to_str().unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["set-geo-mode", "--db", db_path, "--mode", "allowlist"])
         .assert()
         .success();
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "add-firewall-rule",
             "--db",
@@ -1708,8 +1661,7 @@ fn render_firewall_allowlist_mode_does_not_warn_when_an_earlier_allow_rule_cover
     .unwrap();
 
     let script_path = tmp.path().join("stop-bots.sh");
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "render-firewall",
             "--db",
@@ -1753,8 +1705,7 @@ fn block_scanners_adds_a_rule_for_an_ip_over_the_threshold_and_is_idempotent() {
     let log_path = tmp.path().join("auth.log");
     fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-scanners",
             "--db",
@@ -1768,16 +1719,14 @@ fn block_scanners_adds_a_rule_for_an_ip_over_the_threshold_and_is_idempotent() {
         .success()
         .stdout(predicate::str::contains("Added 1 new block rule"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
         .stdout(predicate::str::contains("198.51.100.9"));
 
     // Re-running against the same log must not add a duplicate rule.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-scanners",
             "--db",
@@ -1803,8 +1752,7 @@ fn block_scanners_ignores_an_ip_below_the_threshold() {
     let log_path = tmp.path().join("auth.log");
     fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 5)).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-scanners",
             "--db",
@@ -1818,8 +1766,7 @@ fn block_scanners_ignores_an_ip_below_the_threshold() {
         .success()
         .stdout(predicate::str::contains("No scanning IPs found"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -1846,8 +1793,7 @@ fn block_scanners_refuses_a_threshold_of_zero() {
     fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 1)).unwrap();
 
     for command in ["block-scanners", "block-web-scanners"] {
-        Command::cargo_bin("stop-bots")
-            .unwrap()
+        stop_bots_bin()
             .args([command, "--db", db_path, "--threshold", "0"])
             .assert()
             .failure()
@@ -1859,8 +1805,7 @@ fn block_scanners_refuses_a_threshold_of_zero() {
         "a rejected threshold still created a database"
     );
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-scanners",
             "--db",
@@ -1888,8 +1833,7 @@ fn block_scanners_never_blocks_an_ip_that_eventually_logged_in() {
     log.push_str("Accepted publickey for admin from 198.51.100.9 port 5555 ssh2\n");
     fs::write(&log_path, log).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-scanners",
             "--db",
@@ -1903,8 +1847,7 @@ fn block_scanners_never_blocks_an_ip_that_eventually_logged_in() {
         .success()
         .stdout(predicate::str::contains("No scanning IPs found"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -1920,8 +1863,7 @@ fn block_scanners_dry_run_reports_without_writing() {
     let log_path = tmp.path().join("auth.log");
     fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-scanners",
             "--db",
@@ -1936,8 +1878,7 @@ fn block_scanners_dry_run_reports_without_writing() {
         .success()
         .stdout(predicate::str::contains("Would add 1 new block rule"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -1962,8 +1903,7 @@ fn block_web_scanners_adds_a_rule_for_distinct_not_found_paths_and_is_idempotent
         .collect();
     fs::write(&log_path, log).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-web-scanners",
             "--db",
@@ -1977,16 +1917,14 @@ fn block_web_scanners_adds_a_rule_for_distinct_not_found_paths_and_is_idempotent
         .success()
         .stdout(predicate::str::contains("Added 1 new block rule"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
         .stdout(predicate::str::contains("198.51.100.9"));
 
     // Re-running against the same log must not add a duplicate rule.
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-web-scanners",
             "--db",
@@ -2018,8 +1956,7 @@ fn block_web_scanners_ignores_repeated_hits_on_a_single_dead_path() {
         .collect();
     fs::write(&log_path, log).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-web-scanners",
             "--db",
@@ -2033,8 +1970,7 @@ fn block_web_scanners_ignores_repeated_hits_on_a_single_dead_path() {
         .success()
         .stdout(predicate::str::contains("No scanning IPs found"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -2053,8 +1989,7 @@ fn block_web_scanners_dry_run_reports_without_writing() {
         .collect();
     fs::write(&log_path, log).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-web-scanners",
             "--db",
@@ -2069,8 +2004,7 @@ fn block_web_scanners_dry_run_reports_without_writing() {
         .success()
         .stdout(predicate::str::contains("Would add 1 new block rule"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -2091,8 +2025,7 @@ fn block_scanners_ttl_days_expires_the_rule_by_the_next_list() {
     let log_path = tmp.path().join("auth.log");
     fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-scanners",
             "--db",
@@ -2107,8 +2040,7 @@ fn block_scanners_ttl_days_expires_the_rule_by_the_next_list() {
         .success()
         .stdout(predicate::str::contains("expiring in -1 day"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -2129,8 +2061,7 @@ fn block_web_scanners_ttl_days_defaults_to_one_day() {
         .collect();
     fs::write(&log_path, log).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-web-scanners",
             "--db",
@@ -2144,8 +2075,7 @@ fn block_web_scanners_ttl_days_defaults_to_one_day() {
         .success()
         .stdout(predicate::str::contains("expiring after 1 day"));
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .assert()
         .success()
@@ -2161,8 +2091,7 @@ fn list_firewall_rules_shows_expiry_only_for_temporary_rules() {
     let db_path = tmp.path().join("db.sqlite3");
     let db_path = db_path.to_str().unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "add-firewall-rule",
             "--db",
@@ -2177,8 +2106,7 @@ fn list_firewall_rules_shows_expiry_only_for_temporary_rules() {
 
     let log_path = tmp.path().join("auth.log");
     fs::write(&log_path, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "block-scanners",
             "--db",
@@ -2191,8 +2119,7 @@ fn list_firewall_rules_shows_expiry_only_for_temporary_rules() {
         .assert()
         .success();
 
-    let output = Command::cargo_bin("stop-bots")
-        .unwrap()
+    let output = stop_bots_bin()
         .args(["list-firewall-rules", "--db", db_path])
         .output()
         .unwrap();
@@ -2669,8 +2596,7 @@ fn web_refuses_a_non_loopback_bind_without_expose_and_saves_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "web",
             "--db",
@@ -2773,8 +2699,7 @@ fn web_set_password_stores_only_a_hash() {
 #[test]
 fn web_rejects_a_bind_that_is_not_an_address_and_port() {
     let tmp = tempfile::tempdir().unwrap();
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "web",
             "--db",
@@ -2807,8 +2732,7 @@ fn fake_debian_root() -> (tempfile::TempDir, std::path::PathBuf) {
 fn install_web_writes_a_unit_and_a_password_under_a_prefix() {
     let (tmp, binary) = fake_debian_root();
 
-    let output = Command::cargo_bin("stop-bots")
-        .unwrap()
+    let output = stop_bots_bin()
         .args([
             "install",
             "web",
@@ -2862,17 +2786,9 @@ fn install_web_run_twice_keeps_the_first_password() {
         binary.to_str().unwrap(),
     ];
 
-    let first = Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args(args)
-        .assert()
-        .success();
+    let first = stop_bots_bin().args(args).assert().success();
     let first = String::from_utf8(first.get_output().stdout.clone()).unwrap();
-    let second = Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args(args)
-        .assert()
-        .success();
+    let second = stop_bots_bin().args(args).assert().success();
     let second = String::from_utf8(second.get_output().stdout.clone()).unwrap();
 
     assert!(first.contains("Console password"));
@@ -2890,8 +2806,7 @@ fn install_web_run_twice_keeps_the_first_password() {
 fn install_web_dry_run_changes_nothing() {
     let (tmp, binary) = fake_debian_root();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "install",
             "web",
@@ -2920,8 +2835,7 @@ fn install_web_refuses_a_host_that_is_not_debian() {
     let (tmp, binary) = fake_debian_root();
     fs::remove_file(tmp.path().join("etc/debian_version")).unwrap();
 
-    Command::cargo_bin("stop-bots")
-        .unwrap()
+    stop_bots_bin()
         .args([
             "install",
             "web",
@@ -3005,7 +2919,10 @@ fn auto_apply_rewrites_a_stale_site_config_and_then_leaves_it_alone() {
     let fixture = Fixture::new();
     fixture.seed_bots();
     let site = fixture.write_site("example.com");
+    // Both, for the same reason: this test drives `cron::apply_nginx`
+    // in-process, so there is no child to pass them to.
     unsafe { std::env::set_var("STOP_BOTS_NGINX_DIR", &fixture.managed) };
+    unsafe { std::env::set_var("STOP_BOTS_NGINX_CONF_D", &fixture.conf_d) };
 
     let db = stop_bots::db::Db::open(&fixture.db).unwrap();
     db.set_auto_apply(true).unwrap();
@@ -3108,10 +3025,11 @@ fn maintain_can_be_told_to_compact_regardless() {
         .stdout(predicate::str::contains("Compacted anyway"));
 }
 
-/// A plain `Command`, for the tests above that need one without the
-/// `Fixture`'s NGINX environment.
+/// A `Command` carrying `args`, for the tests above that need one without
+/// the `Fixture`'s own NGINX directories. Still not the host's: see
+/// [`common::stop_bots_bin`].
 fn stop_bots_cmd(args: &[&str]) -> Command {
-    let mut cmd = Command::cargo_bin("stop-bots").unwrap();
+    let mut cmd = stop_bots_bin();
     cmd.args(args);
     cmd
 }

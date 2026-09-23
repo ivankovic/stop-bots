@@ -32,14 +32,37 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+/// The two directories this project generates files into, pointed at a
+/// temp tree for the whole test binary.
+///
+/// Without this a spawned `stop-bots` writes to — and deletes from — the
+/// host's real `/etc/nginx/conf.d` and `/etc/stop-bots/nginx`. That is
+/// invisible in CI, where both are empty, and goes red on a developer
+/// machine that also *runs* stop-bots: a root-owned generated file there
+/// makes an apply fail with a permission error no test expected.
+///
+/// One tree per binary rather than one per test: the tests that assert on
+/// a generated file point these at their own fixture instead, which wins
+/// because it is set after.
+pub fn generated_dir(name: &str) -> PathBuf {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| tempfile::tempdir().expect("failed to create the generated-files dir"))
+        .path()
+        .join(name)
+}
+
+/// `stop-bots`, with those directories already pointed somewhere harmless.
+pub fn stop_bots_bin() -> Command {
+    let mut cmd = Command::cargo_bin("stop-bots").unwrap();
+    cmd.env("STOP_BOTS_NGINX_CONF_D", generated_dir("conf.d"))
+        .env("STOP_BOTS_NGINX_DIR", generated_dir("managed"));
+    cmd
+}
+
 /// Runs `stop-bots` with `args`, asserting it succeeded, and returns the
 /// assertion so a caller can go on to check stdout.
 pub fn stop_bots(args: &[&str]) -> assert_cmd::assert::Assert {
-    Command::cargo_bin("stop-bots")
-        .unwrap()
-        .args(args)
-        .assert()
-        .success()
+    stop_bots_bin().args(args).assert().success()
 }
 
 /// Seeds the bot list from the checked-in sample, so tests never touch the

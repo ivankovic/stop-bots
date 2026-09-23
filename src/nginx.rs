@@ -362,19 +362,31 @@ pub const CONF_D_DIR_ENV: &str = "STOP_BOTS_NGINX_CONF_D";
 /// such a config at all, so the *whole* server — every unrelated site
 /// included — was one restart away from not coming back.
 ///
+/// **Only a `conf.d` that already exists**, and never one this code
+/// creates. The root is wherever site configs were scanned from, which is
+/// not always the NGINX prefix: the container suite passes
+/// `--root /etc/nginx/sites-enabled`, and creating `conf.d` inside *that*
+/// puts a directory where `include sites-enabled/*` globs, so NGINX tries
+/// to `pread()` a directory and refuses to start. A `conf.d` that is
+/// already there is one NGINX was built around; one this code invents is a
+/// guess about a glob it cannot see.
+///
 /// Takes the root already resolved rather than reading it back out of the
 /// database, because [`root`] lets a `--root` flag win over the stored
-/// setting and the two must not disagree: `apply-blocks --root /tmp/x`
-/// discovering sites under `/tmp/x` while writing their `http`-context
-/// files under the stored root is the same bug wearing a different hat.
+/// setting and the two must not disagree.
 ///
 /// Unchanged for a normal host install: [`root`] falls back to
-/// [`DEFAULT_ROOT`], so this still resolves to [`CONF_D_DIR`].
+/// [`DEFAULT_ROOT`], whose `conf.d` exists, so this still resolves to
+/// [`CONF_D_DIR`].
 pub fn conf_d_dir(root: &Path) -> PathBuf {
-    match std::env::var_os(CONF_D_DIR_ENV) {
-        Some(dir) => PathBuf::from(dir),
-        None => root.join("conf.d"),
+    if let Some(dir) = std::env::var_os(CONF_D_DIR_ENV) {
+        return PathBuf::from(dir);
     }
+    let beside_the_sites = root.join("conf.d");
+    if beside_the_sites.is_dir() {
+        return beside_the_sites;
+    }
+    PathBuf::from(CONF_D_DIR)
 }
 
 /// The generated `limit_req_zone` file.
@@ -3637,6 +3649,16 @@ mod tests {
         assert_eq!(remove_planned_managed_files(&[path]).unwrap(), 0);
     }
 
+    /// A root whose `conf.d` exists: a temp tree standing in for the
+    /// containerised host this was found on, whose NGINX config lives
+    /// under `/srv/.../nginx` and whose `conf.d` is the directory NGINX
+    /// globs.
+    fn root_with_a_conf_d() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("conf.d")).unwrap();
+        dir
+    }
+
     /// The bug this family exists to prevent, and the one that actually
     /// happened on a host in September 2026: the `http`-context files went
     /// to a fixed `/etc/nginx/conf.d` while every site file was found and
@@ -3646,9 +3668,10 @@ mod tests {
     /// would have taken down every site on the box, not just the one
     /// setting had gone wrong.
     #[test]
-    fn the_generated_http_files_land_under_the_stored_nginx_root() {
+    fn the_generated_http_files_land_in_the_roots_own_conf_d() {
+        let dir = root_with_a_conf_d();
         let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::ROOT_KEY, "/srv/domaci/nginx")
+        db.set_text_setting(NginxCommands::ROOT_KEY, dir.path().to_str().unwrap())
             .unwrap();
         db.trust_user_agent("Nextcloud").unwrap();
         db.set_rate_limit_enabled(true).unwrap();
@@ -3664,7 +3687,7 @@ mod tests {
             "stop-bots-limits.conf",
             "stop-bots-limits-untrusted.conf",
         ] {
-            let expected = PathBuf::from("/srv/domaci/nginx/conf.d").join(name);
+            let expected = dir.path().join("conf.d").join(name);
             assert!(
                 planned.contains(&expected),
                 "{name} must be written where NGINX reads it; planned:\n{planned:#?}"
@@ -3677,18 +3700,30 @@ mod tests {
     /// behind while no site names it.
     #[test]
     fn the_removal_half_looks_in_the_same_directory() {
+        let dir = root_with_a_conf_d();
         let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::ROOT_KEY, "/srv/domaci/nginx")
+        db.set_text_setting(NginxCommands::ROOT_KEY, dir.path().to_str().unwrap())
             .unwrap();
 
         let unused = unused_managed_files(&db, &root(&db, None).unwrap()).unwrap();
         for name in ["stop-bots-trusted.conf", "stop-bots-limits.conf"] {
-            let expected = PathBuf::from("/srv/domaci/nginx/conf.d").join(name);
+            let expected = dir.path().join("conf.d").join(name);
             assert!(
                 unused.contains(&expected),
                 "{name} must be removed from where it was written; unused:\n{unused:#?}"
             );
         }
+    }
+
+    /// And a root with no `conf.d` of its own keeps the stock path rather
+    /// than inventing one. The container suite scans
+    /// `/etc/nginx/sites-enabled`, which `include sites-enabled/*` globs:
+    /// a `conf.d` directory created in there is something NGINX tries to
+    /// `pread()` as a config file, and it refuses to start.
+    #[test]
+    fn a_root_without_a_conf_d_is_not_given_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(conf_d_dir(dir.path()), PathBuf::from(CONF_D_DIR));
     }
 
     /// A normal host install must be exactly as it was. `root` falls back

@@ -24,14 +24,22 @@ need.
   reload had failed, leaving every site on the host, including ones this
   tool had never touched, one restart away from not coming back.
 
-  They now go in `conf.d` under the root actually in use, which means a
-  `--root` flag governs them too: `apply-blocks --root /tmp/x` no longer
+  They now go in the root's **own** `conf.d` when it has one, and a
+  `--root` flag governs them too, so `apply-blocks --root /tmp/x` no longer
   discovers sites under one root while writing their `http`-context files
-  under another. A host that never set a root is unaffected — the fallback
-  is `/etc/nginx`, so the path is unchanged. Anyone whose NGINX config
-  lives elsewhere should set it (`stop-bots set-nginx-commands --root
-  /srv/app/nginx`) and delete the stale copies the previous versions left
-  in `/etc/nginx/conf.d`; `status` now points at them by name.
+  under another. A `conf.d` that is not already there is never created: the
+  root can be a sites directory rather than the NGINX prefix, and a new
+  directory inside one that `include sites-enabled/*` globs is something
+  NGINX tries to read as a config file and refuses to start over. Such a
+  root keeps the stock path, and `status` names whichever directory is in
+  use.
+
+  A host that never set a root is unaffected — the fallback is
+  `/etc/nginx`, whose `conf.d` exists, so the path is unchanged. Anyone
+  whose NGINX config lives elsewhere should set it (`stop-bots
+  set-nginx-commands --root /srv/app/nginx`) and delete the stale copies
+  the previous versions left in `/etc/nginx/conf.d`; `status` points at
+  them by name.
 
 - **Sites could report `Stale` for ever on such a host.** The per-site apply
   status compares the trust file on disk against what the settings render

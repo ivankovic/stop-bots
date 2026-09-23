@@ -5,7 +5,7 @@
 //! source and opens its update-confirmation popup -> quit.
 
 mod common;
-use common::{path_with, scan_sites, seed_bots, writable_nginx_fixture};
+use common::{generated_dir, path_with, scan_sites, seed_bots, writable_nginx_fixture};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -279,27 +279,6 @@ fn spawn_tui_with_fake_tools_and_args(
 /// shelling out to the real `nginx -t`/`systemctl reload nginx` on
 /// whatever machine runs the test suite (see `main.rs`'s `apply-blocks
 /// --no-reload`, the same escape hatch for the CLI's own apply path).
-/// The two directories this project generates files into, pointed at a
-/// temp tree for the whole binary.
-///
-/// Without this the TUI under test writes to — and deletes from — the
-/// host's real `/etc/nginx/conf.d` and `/etc/stop-bots/nginx`. On a
-/// developer machine that also *runs* stop-bots, a root-owned file left
-/// in one of them makes an apply fail with a permission error no test
-/// expected, and the suite goes red for a reason that has nothing to do
-/// with the code. `tests/cli.rs`'s fixture has always set these; the pty
-/// helpers had not, so every test here inherited the host's.
-///
-/// One tree for the binary rather than one per test: nothing in this file
-/// asserts on a generated file, so they only need somewhere harmless to
-/// go.
-fn generated_dir(name: &str) -> PathBuf {
-    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    ROOT.get_or_init(|| tempfile::tempdir().expect("failed to create the generated-files dir"))
-        .path()
-        .join(name)
-}
-
 fn spawn_tui_cmd(db_path: &Path, extra_args: &[&str], fakebin: Option<&Path>) -> PtySession {
     seed_cron_state(db_path);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_stop-bots"));
