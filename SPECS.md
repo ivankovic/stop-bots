@@ -6400,3 +6400,41 @@ would undo it, but it does get Trust, which no refresh undoes.
 `status` gains a "Trusted by hand" check listing every entry and which planes
 it reaches. It is only present when something is trusted, and never a
 warning, for the reasons its SSH sibling gives.
+
+## Private sources on the input hook (`firewall::private_allow_rules`)
+
+**The bug.** On a real host, an NGINX container could no longer reach a
+service on the host. The capture showed SYNs from `172.22.0.5` to
+`172.17.0.1:8765` going unanswered, and ufw's counter for the rule allowing
+them stayed at zero. This table's input chain runs at `filter - 1`, ahead of
+ufw, and jumped straight to `bot_rules`. There, the allow-list catch-all
+(`0.0.0.0/0 drop`) and FireHOL level 1's `172.16.0.0/12` both matched. The
+forward chain never had the problem, because it accepts private sources
+before consulting any rule. The input chain had been left out on purpose,
+on the theory that allow-list mode might be meant for traffic to the host.
+That theory missed that a container reaching its own host arrives on input.
+
+**The fix, and its placement.** `all_rules` puts an Allow for every
+`PRIVATE_RANGES` entry *after* the admin's own rules and *before* the
+derived ones. An accept at the top of the input chain, mirroring the
+forward chain, would also have fixed it. But it would silently disable a
+block an operator wrote on purpose for a private range, which the input
+path, unlike forward, has reason to honour. With this placement, explicit
+intent still wins, and only what a list or a geo mode decided is kept off
+private sources. Those can know nothing about a private address: it has no
+country, and no public feed has an opinion about your LAN. Being ordinary
+rules, the accepts also reach the iptables backend and the lockout
+simulation, with no special case in either.
+
+They are emitted only when there are derived rules, since there is nothing
+else for them to shield against. That keeps a host with no rules at zero,
+which `health` reads as "nothing to enforce yet", rather than seven
+synthetic rules that "never reached the kernel".
+
+`nftables`' `PRIVATE_V4`/`PRIVATE_V6` literals and `PRIVATE_RANGES` are
+pinned together by a test. Two lists of what counts as private would
+otherwise drift, and the two hooks would disagree.
+
+The container suite's networks use `198.51.100.0/24` so that clients read
+as public. The regression test uses `Network::create_private`, a
+`172.31.255.0/24` slice, because being private is the whole point there.

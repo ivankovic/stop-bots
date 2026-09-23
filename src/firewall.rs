@@ -237,8 +237,67 @@ pub fn all_rules(db: &Db) -> Result<Vec<FirewallRule>> {
     let mut rules = ssh_allow_rules(db)?;
     rules.extend(trusted_allow_rules(db)?);
     rules.extend(db.list_firewall_rules()?);
-    rules.extend(derived_firewall_rules(db)?);
+    let derived = derived_firewall_rules(db)?;
+    if !derived.is_empty() {
+        rules.extend(private_allow_rules());
+    }
+    rules.extend(derived);
     Ok(rules)
+}
+
+/// Loopback, RFC1918, link-local and unique-local: the source addresses
+/// [`ipranges::is_local_or_private`] calls "this host or its own network,
+/// never an internet scanner". Shared with `nftables`, whose forward chain
+/// accepts the same set before any rule is consulted.
+pub const PRIVATE_RANGES: [&str; 7] = [
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "::1",
+    "fc00::/7",
+];
+
+/// An Allow for every [`PRIVATE_RANGES`] entry, placed after the admin's
+/// own rules and before the derived ones.
+///
+/// **Why.** A container talking to a service on its own host arrives on
+/// the *input* hook from a Docker bridge address (172.17.0.0/16 and
+/// friends), and so does every client on the LAN. Two kinds of derived
+/// rule dropped all of them the moment the script was applied: a
+/// reputation feed that lists private space as bogons (FireHOL level 1
+/// carries 172.16.0.0/12), and the allow-list catch-all, `0.0.0.0/0 drop`.
+/// Found on a real host whose NGINX container could no longer reach a
+/// service on the host — the SYNs were dropped before ufw ever saw them,
+/// because this table's input chain runs at `filter - 1`. The forward
+/// chain never had the problem: it accepts private sources outright.
+///
+/// **Why here, and not at the top of the input chain like forward.** An
+/// accept ahead of everything would also silence an operator who blocks a
+/// private range on purpose ("keep 10.0.5.0/24 off this host"). Placed
+/// after the admin rules, explicit intent still wins; only what a
+/// downloaded list or a geo mode decided — neither of which can know
+/// anything about a private address — is kept off them. Private addresses
+/// have no country, and no public feed has an opinion about your LAN.
+///
+/// **Why only when there are derived rules.** Nothing else comes after
+/// them to be shielded from, and a host with no rules at all must still
+/// render none: `health` reads "0 generated" as "nothing to enforce yet",
+/// and seven always-present rules would make every fresh host report
+/// generated rules that never reached the kernel.
+pub fn private_allow_rules() -> Vec<FirewallRule> {
+    PRIVATE_RANGES
+        .iter()
+        .map(|address| FirewallRule {
+            id: 0,
+            address: address.to_string(),
+            port: None,
+            action: FirewallAction::Allow,
+            enabled: true,
+            expires_at: None,
+        })
+        .collect()
 }
 
 /// An Allow rule for every address a successful SSH login has been seen
@@ -656,6 +715,61 @@ mod tests {
         assert!(lockout_risks(&rules, &["9.9.9.9".to_string()]).is_empty());
     }
 
+    /// The bug that took a real host's containers off its own services: the
+    /// allow-list catch-all and a feed listing private space both dropped a
+    /// Docker bridge address arriving on the input hook.
+    #[test]
+    fn a_private_source_gets_past_every_derived_rule() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("nl", true).unwrap();
+
+        let rules = all_rules(&db).unwrap();
+
+        for source in ["172.22.0.5", "192.168.1.10", "10.1.2.3", "fd00::5"] {
+            assert!(
+                lockout_risks(&rules, &[source.to_string()]).is_empty(),
+                "{source} was dropped by: {rules:?}"
+            );
+        }
+        assert_eq!(
+            lockout_risks(&rules, &["198.51.100.1".to_string()]).len(),
+            1,
+            "a public address outside the allow-list must still be dropped"
+        );
+    }
+
+    /// Explicit intent still wins: the accepts go after the admin's rules.
+    #[test]
+    fn an_admin_block_of_a_private_range_still_applies() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "10.0.5.0/24".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+
+        let rules = all_rules(&db).unwrap();
+
+        assert_eq!(
+            lockout_risks(&rules, &["10.0.5.9".to_string()]),
+            vec![("10.0.5.9".to_string(), "10.0.5.0/24".to_string())]
+        );
+    }
+
+    /// A host with nothing derived renders nothing extra, so `status` can
+    /// still say "no rules to enforce yet" rather than reporting seven
+    /// synthetic rules missing from the kernel.
+    #[test]
+    fn with_nothing_derived_no_private_accepts_are_written() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(all_rules(&db).unwrap().is_empty());
+    }
+
     /// The address-level half of "never block this": whatever else the
     /// rules say about a trusted address — a Block row, a derived range
     /// containing it, an allowlist catch-all — an Allow ahead of all of
@@ -864,9 +978,12 @@ mod tests {
         db.set_country_selected("us", true).unwrap();
 
         let rules = all_rules(&db).unwrap();
-        assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].address, "9.9.9.9");
-        assert_eq!(rules[1].address, "4.5.6.0/24");
+        let addresses: Vec<&str> = rules.iter().map(|r| r.address.as_str()).collect();
+        // Admin first, then the private-source accepts, then derived.
+        let mut expected = vec!["9.9.9.9"];
+        expected.extend(PRIVATE_RANGES);
+        expected.push("4.5.6.0/24");
+        assert_eq!(addresses, expected);
     }
 
     #[test]

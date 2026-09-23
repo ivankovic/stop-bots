@@ -173,10 +173,13 @@ pub fn render(rules: &[FirewallRule]) -> String {
     // published port still carries the remote client's address as its
     // source, so the rules below still see it.
     //
-    // The input chain deliberately does not get this: its semantics
-    // predate the forward chain, `iif lo accept` already covers the host
-    // itself, and a host whose operator has chosen allowlist mode may well
-    // mean it for traffic addressed to the host.
+    // The input chain gets the same protection a different way:
+    // `firewall::private_allow_rules` puts these ranges in the rules
+    // themselves, after the admin's own and before the derived ones. A
+    // container reaching a service on its own host arrives on *input*, and
+    // an accept at the top of this chain would work too — but it would
+    // also silence an operator who blocks a private range on purpose,
+    // which the forward path has no reason to honour and this one does.
     out.push_str(&format!(
         "add rule {TABLE} {FORWARD_CHAIN} ip saddr {{ {PRIVATE_V4} }} accept\n"
     ));
@@ -224,6 +227,18 @@ pub fn render(rules: &[FirewallRule]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The forward chain's literal set and the input path's synthetic
+    /// Allows (`firewall::PRIVATE_RANGES`) must protect the same sources,
+    /// or the two hooks disagree about what "private" means.
+    #[test]
+    fn the_forward_chain_and_the_rules_agree_on_what_is_private() {
+        let literal: Vec<&str> = PRIVATE_V4
+            .split(", ")
+            .chain(PRIVATE_V6.split(", "))
+            .collect();
+        assert_eq!(literal, crate::firewall::PRIVATE_RANGES);
+    }
     use crate::db::NewFirewallRule;
     use crate::testing::{allow, block, block_port, disabled};
     use serde::Deserialize;

@@ -26,6 +26,14 @@ need.
 
 ### Fixed
 
+- **Containers could not reach services on their own host.** A container
+  talking to the host arrives on the firewall's *input* hook from a private
+  bridge address. The allow-list catch-all, or a reputation feed that lists
+  private space (FireHOL level 1 carries `172.16.0.0/12`), dropped it there,
+  before ufw ever saw it. Only the forward hook accepted private sources.
+  Private sources now get past every derived rule on both hooks. A block
+  you add by hand for a private range still applies, because it comes first.
+
 - **An apply that changed only a generated file did not reload NGINX.**
   Changing only the rate-limit rate rewrote `stop-bots-limits.conf`, counted
   as "0 files changed", and was never reloaded. Generated files now count.

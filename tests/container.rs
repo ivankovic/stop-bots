@@ -229,8 +229,23 @@ fn test_subnet(index: usize) -> String {
     format!("198.51.100.{}/28", (index % 16) * 16)
 }
 
+/// The same slicing inside 172.31.255.0/24: RFC1918, like the address a
+/// Docker bridge hands a container. For the tests about a container
+/// reaching a service on its own host, where being private is the point.
+fn private_test_subnet(index: usize) -> String {
+    format!("172.31.255.{}/28", (index % 16) * 16)
+}
+
 impl Network {
     fn create(name: &str) -> Network {
+        Network::create_in(name, test_subnet)
+    }
+
+    fn create_private(name: &str) -> Network {
+        Network::create_in(name, private_test_subnet)
+    }
+
+    fn create_in(name: &str, subnet_for: fn(usize) -> String) -> Network {
         let _ = Command::new(runtime())
             .args(["network", "rm", name])
             .output();
@@ -243,7 +258,7 @@ impl Network {
         let mut last = String::new();
         for _ in 0..16 {
             let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let subnet = test_subnet(index);
+            let subnet = subnet_for(index);
             let out = Command::new(runtime())
                 .args(["network", "create", "--subnet", &subnet, name])
                 .output()
@@ -2288,6 +2303,48 @@ fn allowlist_mode_really_drops_everything_outside_the_selection() {
         server.status("/", ""),
         "200",
         "allowlist mode blocked loopback"
+    );
+}
+
+/// The bug from a real host: its NGINX container could no longer reach a
+/// service on the host. A container's source is a private bridge address
+/// arriving on the *input* hook, and the allow-list catch-all (like a feed
+/// listing private space as bogons) dropped it before ufw saw a packet.
+/// Private sources now get past everything derived — and an operator's own
+/// block of a private range still applies, because it comes first.
+#[test]
+fn a_container_on_a_private_bridge_still_reaches_the_host_in_allowlist_mode() {
+    if !enabled() {
+        return;
+    }
+    let net = Network::create_private("stop-bots-private-net");
+    let server = Server::start_on_network("stop-bots-private-host", &net);
+    let client = Client::start("stop-bots-private-client", &net);
+    let client_ip = client.address();
+
+    server.sh("printf '192.0.2.0/24\n' > /tmp/zone.zone");
+    server.stop_bots("update-country-ranges --country nl --source /tmp/zone.zone");
+    server.stop_bots("add-country --country nl");
+    server.stop_bots("set-geo-mode --mode allowlist");
+    server.stop_bots("render-firewall --backend nftables --out /tmp/fw.nft --force");
+    server.sh("nft -f /tmp/fw.nft");
+
+    assert_eq!(
+        client.get(&server.name, "--max-time 5"),
+        "200",
+        "the allow-list catch-all dropped {client_ip}, a private source. ruleset:\n{}",
+        server.sh("nft list ruleset")
+    );
+
+    server.stop_bots(&format!(
+        "add-firewall-rule --address {client_ip} --action block"
+    ));
+    server.stop_bots("render-firewall --backend nftables --out /tmp/fw.nft --force");
+    server.sh("nft -f /tmp/fw.nft");
+    assert_eq!(
+        client.get(&server.name, "--max-time 5"),
+        "000",
+        "an explicit block of {client_ip} must still apply"
     );
 }
 
