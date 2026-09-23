@@ -1,6 +1,6 @@
 # Maintainer: Marko Ivankovic <marko@ivankovic.me>
 pkgname=stop-bots
-pkgver=0.0.1
+pkgver=0.0.8
 pkgrel=1
 pkgdesc="A TUI that helps you configure your server to stop bad bots and still allow good bots"
 arch=('x86_64')
@@ -8,6 +8,11 @@ url="https://github.com/ivankovic/stop-bots"
 license=('AGPL-3.0-or-later')
 depends=('gcc-libs')
 makedepends=('cargo')
+# makepkg's default `lto` adds -flto to CFLAGS, so the C that rusqlite and
+# aws-lc-sys bundle is compiled to GCC LTO bitcode — which rustc's linker
+# (lld, since Rust 1.90) cannot read, and the build fails on undefined
+# sqlite3_* symbols. Rust's own LTO is Cargo.toml's business, not this.
+options=('!lto')
 # Not depends: the tool shells out to these only when you ask it to, and a
 # server running nftables should not be made to install iptables to try it.
 optdepends=('nginx: to apply the generated site blocking rules'
@@ -17,7 +22,7 @@ optdepends=('nginx: to apply the generated site blocking rules'
 # publish` produced, so what is built here is byte-for-byte what
 # `cargo install stop-bots` builds.
 source=("$pkgname-$pkgver.tar.gz::https://static.crates.io/crates/$pkgname/$pkgname-$pkgver.crate")
-sha256sums=('SKIP')  # replace before submitting: see packaging/README.md
+sha256sums=('19100e7e74f5c46c935d8dfdea35ce2388c93981b30b93a77fac0aac17026d7d')
 
 prepare() {
   cd "$pkgname-$pkgver"
