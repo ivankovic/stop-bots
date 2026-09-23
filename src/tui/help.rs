@@ -55,7 +55,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
         Line::from("Bot settings         /  searches the bots; type to filter, Enter opens, Esc leaves the box"),
         Line::from(""),
         Line::from("Firewall"),
-        Line::from("  Enter              block the selected NOT BLOCKED row, or unblock a BLOCKED one"),
+        Line::from("  Enter / T          block or unblock the selected row / trust it, never to be blocked"),
         Line::from("  i / y / R          inspect the selected row / copy it / re-read the log"),
         Line::from("  f                  cycle the display filter (all / not blocked / blocked)"),
         Line::from(""),

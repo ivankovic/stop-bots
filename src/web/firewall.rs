@@ -30,7 +30,7 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::db::Category;
-use crate::dynamic::{Filter, Live, RowStatus, SshRow, UaRow};
+use crate::dynamic::{Filter, Live, RowStatus, SshRow, TrustedEntry, UaRow};
 use crate::ipdetail::{AddressKind, IpDetail};
 use crate::uadetail::UaDetail;
 use crate::web::layout::{self, Ctx, PillKind, Tab};
@@ -138,12 +138,13 @@ pub async fn page(
                 }
                 None => None,
             };
-            anyhow::Ok((live, detail, ua_detail))
+            let trusted = crate::dynamic::trusted_entries(db)?;
+            anyhow::Ok((live, detail, ua_detail, trusted))
         })
         .await;
 
-    let (live, detail, ua_detail) = match live {
-        Ok(triple) => triple,
+    let (live, detail, ua_detail, trusted) = match live {
+        Ok(loaded) => loaded,
         Err(err) => return internal_error(&err.to_string()),
     };
 
@@ -152,7 +153,14 @@ pub async fn page(
         Tab::Firewall,
         &ctx,
         params.flash.into_flash(),
-        body(&live, filter, detail.as_ref(), ua_detail.as_ref(), &ctx),
+        body(
+            &live,
+            filter,
+            detail.as_ref(),
+            ua_detail.as_ref(),
+            &trusted,
+            &ctx,
+        ),
     )
 }
 
@@ -161,6 +169,7 @@ fn body(
     filter: Filter,
     detail: Option<&IpDetail>,
     ua_detail: Option<&UaDetail>,
+    trusted: &[TrustedEntry],
     ctx: &Ctx,
 ) -> Markup {
     let ssh: Vec<&SshRow> = live
@@ -295,6 +304,74 @@ fn body(
         ))
 
         }
+
+        (trusted_panel(trusted, ctx))
+    }
+}
+
+/// Everything trusted by hand, and a field to add to it.
+///
+/// A panel of its own rather than only a button on the rows above, because
+/// what an operator most wants to trust — a monitoring service, an office
+/// range — is exactly what never appears in a list of failed SSH logins,
+/// and may not have visited yet.
+fn trusted_panel(trusted: &[TrustedEntry], ctx: &Ctx) -> Markup {
+    layout::panel(
+        "Trusted",
+        Some("Never blocked. An address gets past the firewall and NGINX; a user agent gets past NGINX"),
+        html! {
+            @if trusted.is_empty() {
+                (layout::empty("Nothing is trusted."))
+            } @else {
+                table { tbody {
+                    @for entry in trusted {
+                        tr {
+                            td .hint { (entry.kind()) }
+                            td .mono title=(entry.value()) { (entry.value()) }
+                            td .right { (untrust_form(entry, ctx)) }
+                        }
+                    }
+                } }
+            }
+            .panel-body {
+                form .row method="post" action=(ctx.url("/firewall/trust")) {
+                    (layout::csrf_field(ctx))
+                    input type="text" name="value" aria-label="Address or user agent"
+                        placeholder="203.0.113.7, 198.51.100.0/24 or UptimeRobot" size="34" required;
+                    button .primary type="submit" { "Trust" }
+                    span .hint { "A user agent matches as a substring, ignoring case. Apply both planes to put it in effect." }
+                }
+            }
+        },
+    )
+}
+
+fn trust_form(entry: &TrustedEntry, ctx: &Ctx) -> Markup {
+    html! {
+        form .inline method="post" action=(ctx.url("/firewall/trust")) {
+            (layout::csrf_field(ctx))
+            input type="hidden" name="kind" value=(kind_field(entry));
+            input type="hidden" name="value" value=(entry.value());
+            button type="submit" { "Trust" }
+        }
+    }
+}
+
+fn untrust_form(entry: &TrustedEntry, ctx: &Ctx) -> Markup {
+    html! {
+        form .inline method="post" action=(ctx.url("/firewall/untrust")) {
+            (layout::csrf_field(ctx))
+            input type="hidden" name="kind" value=(kind_field(entry));
+            input type="hidden" name="value" value=(entry.value());
+            button type="submit" { "Untrust" }
+        }
+    }
+}
+
+fn kind_field(entry: &TrustedEntry) -> &'static str {
+    match entry {
+        TrustedEntry::Address(_) => "address",
+        TrustedEntry::UserAgent(_) => "user_agent",
     }
 }
 
@@ -401,6 +478,7 @@ fn status_pill(status: RowStatus) -> Markup {
         // it yet. `Neutral` would read as "allowed on purpose", which is
         // the one thing it is not.
         RowStatus::Unknown => PillKind::Warn,
+        RowStatus::Trusted => PillKind::Allowed,
     };
     layout::pill(&status.label(), kind)
 }
@@ -649,8 +727,16 @@ fn category_names(categories: &[Category]) -> String {
 }
 
 fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
+    let entry = TrustedEntry::Address(row.address.clone());
     match row.status {
-        RowStatus::Blocklist => html! { span .hint { "from a blocklist" } },
+        RowStatus::Trusted => untrust_form(&entry, ctx),
+        // Trust is offered even here, where unblocking is not: a list
+        // refresh undoes an unblock, but never a trust, which outranks it.
+        RowStatus::Blocklist => html! {
+            span .hint { "from a blocklist" }
+            " "
+            (trust_form(&entry, ctx))
+        },
         RowStatus::Blocked { .. } => html! {
             form .inline method="post" action=(ctx.url("/firewall/unblock-address")) {
                 (layout::csrf_field(ctx))
@@ -663,6 +749,8 @@ fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
         // `Pending` rather than its own arm, which would be dead code
         // pretending to be a decision.
         RowStatus::Pending | RowStatus::Unknown => html! {
+            (trust_form(&entry, ctx))
+            " "
             form .inline method="post" action=(ctx.url("/firewall/block-address")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="address" value=(row.address);
@@ -673,8 +761,14 @@ fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
 }
 
 fn ua_action(row: &UaRow, ctx: &Ctx) -> Markup {
+    let entry = TrustedEntry::UserAgent(row.user_agent.clone());
     match row.status {
-        RowStatus::Blocklist => html! { span .hint { "from a bot list" } },
+        RowStatus::Trusted => untrust_form(&entry, ctx),
+        RowStatus::Blocklist => html! {
+            span .hint { "from a bot list" }
+            " "
+            (trust_form(&entry, ctx))
+        },
         RowStatus::Blocked { .. } => html! {
             form .inline method="post" action=(ctx.url("/firewall/unblock-ua")) {
                 (layout::csrf_field(ctx))
@@ -685,6 +779,8 @@ fn ua_action(row: &UaRow, ctx: &Ctx) -> Markup {
         // Same action either way — the tag says why it is worth looking
         // at, the button does the same thing.
         RowStatus::Pending | RowStatus::Unknown => html! {
+            (trust_form(&entry, ctx))
+            " "
             form .inline method="post" action=(ctx.url("/firewall/block-ua")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="user_agent" value=(row.user_agent);
@@ -705,6 +801,106 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
         )
         .route(&base.url("/firewall/block-ua"), post(block_ua))
         .route(&base.url("/firewall/unblock-ua"), post(unblock_ua))
+        .route(&base.url("/firewall/trust"), post(trust))
+        .route(&base.url("/firewall/untrust"), post(untrust))
+}
+
+/// A trust or untrust request. `kind` is set by the row buttons, which
+/// know what they are trusting; the free-text field leaves it out and
+/// [`crate::dynamic::trust_typed`] decides.
+#[derive(Deserialize)]
+pub struct TrustForm {
+    pub kind: Option<String>,
+    pub value: String,
+}
+
+impl TrustForm {
+    fn entry(&self) -> Option<TrustedEntry> {
+        match self.kind.as_deref() {
+            Some("address") => Some(TrustedEntry::Address(self.value.clone())),
+            Some("user_agent") => Some(TrustedEntry::UserAgent(self.value.clone())),
+            _ => None,
+        }
+    }
+}
+
+async fn trust(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Form(form): Form<TrustForm>,
+) -> Response {
+    let trusted = state
+        .with_db(move |db| match form.entry() {
+            Some(TrustedEntry::Address(address)) => {
+                db.trust_address(&address).map(TrustedEntry::Address)
+            }
+            Some(TrustedEntry::UserAgent(ua)) => {
+                db.trust_user_agent(&ua).map(TrustedEntry::UserAgent)
+            }
+            None => crate::dynamic::trust_typed(db, &form.value),
+        })
+        .await;
+    match trusted {
+        Ok(entry) => back_with(
+            &state.base,
+            "/firewall",
+            &format!(
+                "Trusting {} {}. Apply everything to put it in effect.",
+                entry.kind(),
+                entry.value()
+            ),
+            true,
+        ),
+        Err(err) => back_with(
+            &state.base,
+            "/firewall",
+            &format!("Could not trust that: {err}"),
+            false,
+        ),
+    }
+}
+
+async fn untrust(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Form(form): Form<TrustForm>,
+) -> Response {
+    let Some(entry) = form.entry() else {
+        return back_with(&state.base, "/firewall", "Nothing to untrust.", false);
+    };
+    let removing = entry.clone();
+    match state
+        .with_db(move |db| crate::dynamic::untrust(db, &removing))
+        .await
+    {
+        Ok(true) => back_with(
+            &state.base,
+            "/firewall",
+            &format!(
+                "No longer trusting {} {}. Apply everything to put it in effect.",
+                entry.kind(),
+                entry.value()
+            ),
+            true,
+        ),
+        // The row said TRUSTED because a wider entry covers it; removing
+        // the exact value removed nothing, and saying "done" would be a lie.
+        Ok(false) => back_with(
+            &state.base,
+            "/firewall",
+            &format!(
+                "{} is trusted by a wider entry — remove that one from the Trusted panel.",
+                entry.value()
+            ),
+            false,
+        ),
+        Err(err) => back_with(
+            &state.base,
+            "/firewall",
+            &format!("Could not untrust that: {err}"),
+            false,
+        ),
+    }
 }
 
 #[derive(Deserialize)]
@@ -874,10 +1070,45 @@ mod tests {
         let rendered = address_action(&row, &Ctx::for_tests()).into_string();
 
         assert!(
-            !rendered.contains("<form"),
+            !rendered.contains("unblock"),
             "an unblock the next list refresh undoes must not be offered: {rendered}"
         );
         assert!(rendered.contains("from a blocklist"));
+        // Trust does stick — a list refresh never overrides it.
+        assert!(rendered.contains("/firewall/trust"), "{rendered}");
+    }
+
+    #[test]
+    fn a_trusted_row_offers_untrust_and_never_block() {
+        let row = SshRow {
+            address: "192.0.2.1".into(),
+            count: 3,
+            status: RowStatus::Trusted,
+        };
+        let rendered = address_action(&row, &Ctx::for_tests()).into_string();
+        assert!(rendered.contains("/firewall/untrust"), "{rendered}");
+        assert!(!rendered.contains("block-address"), "{rendered}");
+    }
+
+    #[test]
+    fn the_trusted_panel_lists_each_entry_with_its_kind_and_an_untrust_button() {
+        let rendered = trusted_panel(
+            &[
+                TrustedEntry::Address("203.0.113.7".into()),
+                TrustedEntry::UserAgent("UptimeRobot".into()),
+            ],
+            &Ctx::for_tests(),
+        )
+        .into_string();
+        for needle in [
+            "203.0.113.7",
+            "UptimeRobot",
+            r#"name="kind" value="address""#,
+            r#"name="kind" value="user_agent""#,
+            "/firewall/untrust",
+        ] {
+            assert!(rendered.contains(needle), "missing {needle}:\n{rendered}");
+        }
     }
 
     #[test]
@@ -956,6 +1187,7 @@ mod tests {
             Filter::All,
             None,
             None,
+            &[],
             &Ctx::for_tests(),
         )
         .into_string();
@@ -985,7 +1217,7 @@ mod tests {
             }],
         };
 
-        let rendered = body(&live, Filter::All, None, None, &Ctx::for_tests()).into_string();
+        let rendered = body(&live, Filter::All, None, None, &[], &Ctx::for_tests()).into_string();
 
         assert!(
             rendered.contains(&format!(r#"title="{long}""#)),
@@ -1006,7 +1238,7 @@ mod tests {
             }],
         };
 
-        let rendered = body(&live, Filter::All, None, None, &Ctx::for_tests()).into_string();
+        let rendered = body(&live, Filter::All, None, None, &[], &Ctx::for_tests()).into_string();
 
         assert!(
             !rendered.contains(r#"onfocus="alert(1)"#),
@@ -1079,7 +1311,7 @@ mod tests {
     fn the_user_agent_cell_links_to_its_own_detail_panel() {
         let live = live_with(0, 1);
 
-        let rendered = body(&live, Filter::All, None, None, &Ctx::for_tests()).into_string();
+        let rendered = body(&live, Filter::All, None, None, &[], &Ctx::for_tests()).into_string();
 
         assert!(
             rendered.contains("inspect_ua=SomeCrawler%2F0.0"),

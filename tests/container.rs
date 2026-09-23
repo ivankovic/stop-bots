@@ -2336,6 +2336,10 @@ fn every_generated_directive_form_parses() {
     // limiting, robots.txt, and every request-shape rule.
     server.stop_bots("set-robots-txt --enabled true");
     server.stop_bots("set-rate-limit --enabled true --rps 5 --burst 10");
+    // And trust, which adds a `geo`, two `map`s and a second zone in
+    // `conf.d`, and a clear to every block.
+    server.stop_bots("trust --address 2001:db8::/48");
+    server.stop_bots("trust --user-agent Pingdom.com_bot");
 
     server.apply_and_reload();
     let (ok, output) = server.nginx_t();
@@ -2367,6 +2371,127 @@ fn a_blocked_user_agent_is_refused_and_everyone_else_is_served() {
         server.status("/", "-A 'Mozilla/5.0'"),
         "200",
         "an ordinary visitor must still be served"
+    );
+}
+
+// ---- trust: what NGINX and the kernel actually let through ----
+
+/// A trusted user agent gets past a bot pattern that matches it and a
+/// request-shape rule it trips, while the bot it resembles is still
+/// refused. Checked against a live NGINX because every piece of the
+/// mechanism — the `map` in `conf.d`, the variable it defines, the clear
+/// in the sentinel block — only means anything once NGINX has parsed it.
+#[test]
+fn a_trusted_user_agent_is_served_past_every_block_it_trips() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-trust-ua");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.seed_bot("badbot", "BadBot");
+    server.stop_bots("set-site-rule --site test.example --rule no-accept-language --enabled true");
+    server.stop_bots("trust --user-agent badbot-monitor");
+    server.apply_and_reload();
+
+    assert_eq!(
+        server.status("/", "-A 'BadBot/1.0' -H 'Accept-Language: en'"),
+        "403",
+        "trusting one agent must not let the bot it resembles through"
+    );
+    assert_eq!(
+        server.status("/", "-A 'Mozilla/5.0 (compatible; BadBot-Monitor/2.0)'"),
+        "200",
+        "a trusted agent (matched without case, sending no Accept-Language) was refused"
+    );
+}
+
+/// A trusted range is served whatever its user agent, and never rate
+/// limited — the zone is keyed on a variable that is empty for it.
+#[test]
+fn a_trusted_address_is_served_past_blocks_and_never_rate_limited() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-trust-addr");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.seed_bot("badbot", "BadBot");
+    server.stop_bots("set-rate-limit --enabled true --rps 1 --burst 2");
+    let burst = "for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' \
+                 http://127.0.0.1:8080/; sleep 0.05; done";
+
+    // Rate limiting live *before* anything is trusted, then trust added,
+    // then taken away, reloading each time. That order is the one that
+    // broke: `nginx -t` passed every time, and NGINX rejected the reload
+    // for re-keying a zone it already had, leaving the old config serving
+    // with nothing but a line in the error log to say so.
+    server.apply_and_reload();
+    assert_eq!(server.status("/", "-A 'BadBot/1.0'"), "403");
+
+    // A range rather than the one address, so the `geo` lookup is doing
+    // CIDR matching rather than an exact comparison.
+    server.stop_bots("trust --address 127.0.0.0/8");
+    server.apply_and_reload();
+    assert_eq!(
+        server.status("/", "-A 'BadBot/1.0'"),
+        "200",
+        "a client from a trusted range was refused over its user agent"
+    );
+    let codes = server.sh(burst);
+    assert!(
+        !codes.contains("429"),
+        "a trusted client was rate limited: {codes}"
+    );
+
+    server.stop_bots("trust --remove --address 127.0.0.0/8");
+    server.apply_and_reload();
+    assert_eq!(server.status("/", "-A 'BadBot/1.0'"), "403");
+    let codes = server.sh(burst);
+    assert!(
+        codes.contains("429"),
+        "untrusted again, the burst should be limited: {codes}"
+    );
+
+    let (_, log, _) = server.run("cat /var/log/nginx/error.log");
+    assert!(
+        !log.contains("[emerg]"),
+        "NGINX rejected a reload that `nginx -t` passed:\n{log}"
+    );
+}
+
+/// The firewall half, with real packets: a client inside a blocked /24
+/// still reaches the server once its own address is trusted, because the
+/// accept is evaluated first.
+#[test]
+fn a_trusted_client_inside_a_blocked_range_still_reaches_the_server() {
+    if !enabled() {
+        return;
+    }
+    let net = Network::create("stop-bots-trust-net");
+    let server = Server::start_on_network("stop-bots-trust-target", &net);
+    let client = Client::start("stop-bots-trust-client", &net);
+    let client_ip = client.address();
+    let range = format!("{}.0/24", client_ip.rsplit_once('.').unwrap().0);
+
+    server.stop_bots(&format!(
+        "add-firewall-rule --address {range} --action block"
+    ));
+    server.stop_bots(&format!("trust --address {client_ip}"));
+    server.stop_bots("render-firewall --backend nftables --out /tmp/fw.nft --force");
+    server.sh("nft -f /tmp/fw.nft");
+
+    assert_eq!(
+        client.get(&server.name, "--max-time 5"),
+        "200",
+        "{client_ip} is trusted but was dropped by the block on {range}"
+    );
+
+    server.stop_bots(&format!("trust --remove --address {client_ip}"));
+    server.stop_bots("render-firewall --backend nftables --out /tmp/fw.nft --force");
+    server.sh("nft -f /tmp/fw.nft");
+    assert_eq!(
+        client.get(&server.name, "--max-time 5"),
+        "000",
+        "without the trust, the block on {range} should drop {client_ip}"
     );
 }
 

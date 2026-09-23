@@ -116,6 +116,43 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// Never block an address or a user agent, whatever else matches it.
+    ///
+    /// A trusted address (an IP or a CIDR range) becomes an allow rule
+    /// ahead of every other firewall rule — a detector's block, a
+    /// reputation feed, a country, the allow-list catch-all — clears every
+    /// NGINX block and rate limit, and is skipped by the detectors.
+    ///
+    /// A trusted user agent clears every NGINX block and rate limit for
+    /// any client whose user agent contains it, ignoring case. Only NGINX:
+    /// a client chooses its own user agent, so letting one past the log
+    /// detectors too would let any scanner past them by copying it. Trust
+    /// the address for that.
+    ///
+    /// Takes effect after `render-firewall` (addresses) and `apply-blocks`
+    /// (both), like every other change here.
+    Trust {
+        /// An IP address or CIDR range, e.g. 203.0.113.7 or 198.51.100.0/24
+        #[arg(
+            long,
+            required_unless_present = "user_agent",
+            conflicts_with = "user_agent"
+        )]
+        address: Option<String>,
+        /// Part of a user agent, e.g. UptimeRobot
+        #[arg(long)]
+        user_agent: Option<String>,
+        /// Stop trusting it instead
+        #[arg(long)]
+        remove: bool,
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+    },
+    /// List every trusted address and user agent
+    ListTrusted {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+    },
     /// List all stored firewall rules
     ListFirewallRules {
         #[arg(long, help = DB_HELP)]
@@ -1339,6 +1376,13 @@ async fn main() -> Result<()> {
             path,
             remove,
         }) => exempt_path(db, site, path, remove),
+        Some(Command::Trust {
+            address,
+            user_agent,
+            remove,
+            db,
+        }) => trust(db, address, user_agent, remove),
+        Some(Command::ListTrusted { db }) => list_trusted(db),
         Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
         Some(Command::SetAutoApply { db, enabled }) => set_auto_apply(db, enabled),
         Some(Command::SetAutoApplyFirewall { db, enabled }) => set_auto_apply_firewall(db, enabled),
@@ -1983,6 +2027,72 @@ fn exempt_path(db_path: Option<PathBuf>, site: String, path: String, remove: boo
         println!("{}: {trimmed} is exempt from blocking", site.server_name);
     }
     println!("Run `stop-bots apply-blocks` to write it into the site config.");
+    Ok(())
+}
+
+fn trust(
+    db_path: Option<PathBuf>,
+    address: Option<String>,
+    user_agent: Option<String>,
+    remove: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    match (address, user_agent, remove) {
+        (Some(address), _, false) => {
+            let stored = db.trust_address(&address)?;
+            println!("Trusting {stored}: never blocked by the firewall or NGINX.");
+            println!(
+                "Run `stop-bots render-firewall` and apply the script, and `stop-bots \
+                 apply-blocks`, to put it in effect."
+            );
+        }
+        (Some(address), _, true) => {
+            if !db.untrust_address(&address)? {
+                anyhow::bail!("{address} is not trusted (see `stop-bots list-trusted`)");
+            }
+            println!("No longer trusting {address}.");
+            println!(
+                "Run `stop-bots render-firewall` and apply the script, and `stop-bots \
+                 apply-blocks`, to put it in effect."
+            );
+        }
+        (None, Some(user_agent), false) => {
+            let stored = db.trust_user_agent(&user_agent)?;
+            println!(
+                "Trusting any user agent containing {stored:?}, ignoring case: never blocked \
+                 by NGINX."
+            );
+            // Said every time, because it is the part that surprises: the
+            // firewall and the detectors still treat this client by its
+            // address.
+            println!(
+                "The detectors and the firewall still judge it by its address — trust that \
+                 too with `stop-bots trust --address` if it must never be blocked at all."
+            );
+            println!("Run `stop-bots apply-blocks` to put it in effect.");
+        }
+        (None, Some(user_agent), true) => {
+            if !db.untrust_user_agent(&user_agent)? {
+                anyhow::bail!("{user_agent:?} is not trusted (see `stop-bots list-trusted`)");
+            }
+            println!("No longer trusting {user_agent:?}.");
+            println!("Run `stop-bots apply-blocks` to put it in effect.");
+        }
+        // clap requires one of the two.
+        (None, None, _) => unreachable!("clap requires --address or --user-agent"),
+    }
+    Ok(())
+}
+
+fn list_trusted(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+    let entries = stop_bots::dynamic::trusted_entries(&db)?;
+    if entries.is_empty() {
+        println!("Nothing is trusted.");
+    }
+    for entry in entries {
+        println!("{:<11} {}", entry.kind(), entry.value());
+    }
     Ok(())
 }
 

@@ -937,6 +937,7 @@ impl Nginx {
             results,
             cleanup_error,
             every_site,
+            managed_changed,
         } = outcome;
         let total = results.len();
         let mut applied = 0;
@@ -976,7 +977,7 @@ impl Nginx {
             ));
         }
 
-        let message = if every_site {
+        let mut message = if every_site {
             format!(
                 "Applied blocking rules to {applied} site(s), {unchanged} already up to date, {} failed",
                 failures.len()
@@ -992,7 +993,13 @@ impl Nginx {
                 _ => format!("Apply failed for {name}"),
             }
         };
-        (message, applied > 0)
+        // Otherwise a trust-only change reads "already up to date" while
+        // NGINX is reloaded for it — which is what an operator would take
+        // for the apply not having done anything.
+        if managed_changed > 0 {
+            message.push_str(&format!("; updated {managed_changed} generated file(s)"));
+        }
+        (message, applied > 0 || managed_changed > 0)
     }
 
     /// Stores freshly discovered sites and reports how many. Errors are
@@ -1107,6 +1114,11 @@ pub struct ApplyOutcome {
     pub results: Vec<SiteResult>,
     pub cleanup_error: Option<String>,
     pub every_site: bool,
+    /// Generated files (the trust file, the rate-limit zone) written or
+    /// removed because their contents changed. Counted apart from the
+    /// sites because it can be the only change there is — see
+    /// [`nginx::write_planned_managed_files`].
+    pub managed_changed: usize,
 }
 
 /// Performs a planned apply. Runs on a background thread and touches no
@@ -1125,7 +1137,7 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
         .sites
         .iter()
         .map(|site| {
-            let outcome = managed.as_ref().map_err(clone_error).and_then(|()| {
+            let outcome = managed.as_ref().map_err(clone_error).and_then(|_| {
                 nginx::apply_block_for_site(&site.config_path, &site.server_name, &site.config)
                     .map_err(|err| (is_permission_denied(&err), err.to_string()))
             });
@@ -1141,15 +1153,20 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
         .collect();
 
     let all_ok = results.iter().all(|r| r.changed.is_ok());
-    let cleanup_error = (all_ok && !plan.managed_removals.is_empty())
-        .then(|| nginx::remove_planned_managed_files(&plan.managed_removals).err())
-        .flatten()
-        .map(|err| err.to_string());
+    let mut managed_changed = managed.as_ref().copied().unwrap_or(0);
+    let mut cleanup_error = None;
+    if all_ok && !plan.managed_removals.is_empty() {
+        match nginx::remove_planned_managed_files(&plan.managed_removals) {
+            Ok(removed) => managed_changed += removed,
+            Err(err) => cleanup_error = Some(err.to_string()),
+        }
+    }
 
     ApplyOutcome {
         results,
         cleanup_error,
         every_site: plan.every_site,
+        managed_changed,
     }
 }
 

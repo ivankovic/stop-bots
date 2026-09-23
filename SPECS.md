@@ -6259,3 +6259,144 @@ for it, and `stop-bots install firewall` hardcodes it in `ExecStart` — while
 the one command that writes the file made you type it, and typing anything
 else produced a script nothing reads. It now defaults to the path everything
 else assumes.
+
+## Trusted addresses and user agents (`trusted_addresses`, `trusted_user_agents`, `nginx::trusted_conf_body`)
+
+**What it does.** An operator can say "never block this", by address (an IP or
+a CIDR) or by user agent. It is the hand-written counterpart of the SSH-login
+allowlist (`ssh_login_ips`): that one is inferred and expires after a week,
+this one is typed and never expires. CLI `trust --address|--user-agent
+[--remove]` and `list-trusted`; a "Trusted" panel on the Firewall screen in
+both front-ends, with `T` (TUI) or a Trust button (web) on the traffic rows.
+
+### What each kind reaches, and why they differ
+
+| | Firewall | NGINX blocks | Rate limit | Detectors |
+|---|---|---|---|---|
+| Address | Allow, first | cleared | not counted | skipped |
+| User agent | — | cleared | not counted | **not** skipped |
+
+A user agent cannot reach the firewall, which never sees one. It could have
+reached the detectors (skip every log line carrying it) and deliberately does
+not: a client chooses its own user agent, so a trusted one exempt from
+detection is a bypass anyone can use by copying one string, and it would
+defeat exactly the detectors that exist because user agents lie (forged
+crawlers). The CLI says so every time a user agent is trusted, and points at
+trusting the address instead.
+
+User agents match as a case-insensitive substring of an escaped literal,
+the same as a manual user-agent block, so `UptimeRobot` survives the
+monitor's next version bump. Exact matching was the alternative and was
+rejected for that reason.
+
+### The firewall: Allows first, beside the SSH ones
+
+`firewall::trusted_allow_rules` follows `ssh_allow_rules` at the head of
+`all_rules`, for the reason documented there: first-match-wins in both
+backends means one Allow ahead of everything overrides a reputation /24
+containing the address, the allowlist catch-all, and a Block row written
+before the address was trusted — none of which filtering could have
+handled. Because it goes through `all_rules`, trusting something changes the
+rule signature and the Dashboard says the script needs rendering.
+
+The detectors (`scanblock::add_block_rules`) also skip any candidate that
+*overlaps* a trusted range — not only one inside it, because an IPv6 /64 or
+an escalated /24 can contain a trusted address. The Allow would have won
+anyway; this is about not writing a Block row that makes the Firewall screen
+say BLOCKED about something that is not. `ScanBlockOutcome::skipped_trusted`
+counts them.
+
+### NGINX: an http-level file, because CIDRs need `geo`
+
+A server-level `if` can only compare `$remote_addr` as text, which cannot
+express a /28 or the many spellings of an IPv6 prefix. `geo` can, and is
+`http`-context, so trust lives in `conf.d/stop-bots-trusted.conf` alongside
+the rate-limit zone:
+
+    geo $stop_bots_trusted_address { default 0; 203.0.113.7 1; }
+    map $http_user_agent $stop_bots_trusted { default $stop_bots_trusted_address; "~*UptimeRobot" 1; }
+    map $stop_bots_trusted $stop_bots_limit_key { 1 ""; default $binary_remote_addr; }
+
+Each site block that blocks anything gets one more clear after every set —
+`if ($stop_bots_trusted) { set $stop_bots_block 0; }` — which forces the flag
+form, like an exemption. Trust with nothing to block writes no block.
+
+**Staleness.** Trusting a second user agent changes that file and no site's
+block, and staleness compares block text only. `BlockConfig::trust` carries
+the file's expected body, and `site_apply_status` also requires the file on
+disk to match (`trust_file_is_current`, pure so it can be tested without the
+env-resolved path). Without that, a site would read UP TO DATE while NGINX
+still trusted the old list.
+
+**Reloading.** For the same reason, an apply could change nothing but the
+trust file. `ApplyAllOutcome::changed` counted site files only, and zero
+meant "no reload", so the change never reached NGINX. The managed-file
+writes and removals now report how many files actually changed, and that
+counts. The TUI's `ApplyOutcome::managed_changed` does the same. This also
+fixes an older case of the same bug: changing only the rate-limit *rate*
+rewrote `stop-bots-limits.conf` and did not reload.
+
+### Rate limiting: a second zone, never a re-keyed one
+
+`limit_req` cannot go inside `if`, so the only way to exempt a client is a
+zone key that is empty for it. The first version re-keyed the existing
+`stop_bots` zone to `$stop_bots_limit_key` when anything was trusted. The
+container suite showed what that does on a host with rate limiting already
+on: NGINX keeps a zone's shared memory across a reload and **rejects a
+reload that changes the zone's key** (`limit_req "stop_bots" uses the
+"$binary_remote_addr" key while previously it used ...`). `nginx -t` cannot
+see this, because it never compares against the running config. So the
+test passes, the reload is refused, and NGINX keeps serving the old config.
+Every later apply silently does nothing, and the only record is one line in
+the error log.
+
+So trust never re-keys anything. `stop_bots` stays keyed on
+`$binary_remote_addr` forever (its golden is unchanged), and while anything
+is trusted a site's `limit_req` names `stop_bots_untrusted` instead. That
+second zone is declared in `conf.d/stop-bots-limits-untrusted.conf` and is
+only ever created with the one key. Switching which zone a site names is
+something NGINX handles on reload. The first zone stays declared while
+idle: removing it would be safe only once no site on disk names it, and an
+idle zone costs its shared memory and nothing else.
+
+Every generated file keeps the existing lifecycle: written before any config
+references it, removed after the last reference is gone. `unused_managed_files`
+removes the untrusted zone before the trust file, because the zone reads a
+variable the trust file defines.
+
+### Input, normalised and refused
+
+`normalize_trusted_address` clears host bits, drops a full-length prefix and
+canonicalises IPv6. The primary key dedupes on the stored form, NGINX's `geo`
+warns about `10.0.0.5/24`, and `trust --remove` has to find the row
+whatever spelling was typed. `/0` is refused: it means switching the tool
+off, and is likelier to be a typo.
+
+`validate_trusted_user_agent` refuses an empty string (it is a substring of
+everything, so it would fail open, silently), `"` (it ends the quoted `map`
+key), `\` (NGINX's string parser collapses it before PCRE sees it, so the
+escaping stops being literal there) and control characters.
+`trusted_conf_body` filters again rather than trusting its caller, because a
+bad `map` key does not break one site, it stops NGINX loading.
+
+The front-ends' single "address or user agent" field (`dynamic::trust_typed`)
+treats anything spelled only in address characters as an address and fails
+it as one. Otherwise a mistyped `10.0.0.1/33` would be trusted as a
+user-agent substring, trusting nothing the operator meant.
+
+### Front-ends
+
+The Firewall screen's traffic panels show `TRUSTED` (green), which outranks
+every other status because trust outranks every other rule. Enter refuses to
+block a trusted row and says why. A block there would be overridden, and the
+row would read BLOCKED while it is not. A third "Trusted" panel lists every
+entry with an add row, because what an operator most wants to trust (a
+monitoring service, an office range) is exactly what never appears in a list
+of failed SSH logins. The TUI key is `T`, not `t`, because `t` is the global
+theme toggle and a screen that claimed it would silently take that away. In
+the web UI, a list-blocked row still gets no Unblock, since a list refresh
+would undo it, but it does get Trust, which no refresh undoes.
+
+`status` gains a "Trusted by hand" check listing every entry and which planes
+it reaches. It is only present when something is trusted, and never a
+warning, for the reasons its SSH sibling gives.

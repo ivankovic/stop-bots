@@ -1204,6 +1204,77 @@ async fn blocking_and_unblocking_a_user_agent_round_trips() {
         .is_empty());
 }
 
+/// The free-text field decides what it was given; the row buttons say.
+/// Either way the database ends up with the stored form, and the flash
+/// echoes it — a /24 typed with host bits set is not what was stored.
+#[tokio::test]
+async fn trusting_and_untrusting_round_trips_through_the_console() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/firewall/trust",
+        "value=203.0.113.77%2F24",
+    )
+    .await;
+    assert!(flash.contains("203.0.113.0/24"), "flash was: {flash}");
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/firewall/trust",
+        "kind=user_agent&value=UptimeRobot%2F2.0",
+    )
+    .await;
+    let db = Db::open(&db_path).unwrap();
+    assert_eq!(db.list_trusted_addresses().unwrap(), ["203.0.113.0/24"]);
+    assert_eq!(db.list_trusted_user_agents().unwrap(), ["UptimeRobot/2.0"]);
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/firewall/untrust",
+        "kind=address&value=203.0.113.0%2F24",
+    )
+    .await;
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        "/firewall/untrust",
+        "kind=user_agent&value=UptimeRobot%2F2.0",
+    )
+    .await;
+    assert!(db.list_trusted_addresses().unwrap().is_empty());
+    assert!(db.list_trusted_user_agents().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_mistyped_address_is_refused_with_the_reason() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/firewall/trust",
+        "value=10.0.0.1%2F33",
+    )
+    .await;
+
+    assert!(flash.contains("Could not trust"), "flash was: {flash}");
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .list_trusted_user_agents()
+        .unwrap()
+        .is_empty());
+}
+
 #[tokio::test]
 async fn the_dynamic_screen_filters_are_all_reachable() {
     let (app, password, _tmp, _db) = app_with_db();

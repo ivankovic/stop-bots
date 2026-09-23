@@ -62,6 +62,11 @@ pub enum RowStatus {
     /// "allowed", which is what `Pending` means, but "nothing here has an
     /// opinion". See [`build_ua_rows`].
     Unknown,
+    /// Trusted by hand (see [`Db::trust_address`]/[`Db::trust_user_agent`]):
+    /// never blocked, whatever else matches. Outranks every other status,
+    /// because it outranks every other rule — a trusted address with a
+    /// Block row is not blocked, and a row saying `BLOCKED` would be wrong.
+    Trusted,
 }
 
 impl RowStatus {
@@ -74,6 +79,7 @@ impl RowStatus {
             } => format!("BLOCKED for {}", format_until(expires_at)),
             RowStatus::Blocklist => "BLOCKLIST".to_string(),
             RowStatus::Unknown => "UNKNOWN".to_string(),
+            RowStatus::Trusted => "TRUSTED".to_string(),
         }
     }
 
@@ -83,6 +89,10 @@ impl RowStatus {
 
     pub fn is_blocklist(self) -> bool {
         matches!(self, RowStatus::Blocklist)
+    }
+
+    pub fn is_trusted(self) -> bool {
+        matches!(self, RowStatus::Trusted)
     }
 }
 
@@ -367,6 +377,106 @@ pub fn ip_in_blocked_range(ip_str: &str, blocked_ranges: &[String]) -> bool {
     false
 }
 
+/// Whether `address` is inside anything in `trusted` (addresses and CIDRs,
+/// as [`Db::list_trusted_addresses`] returns them).
+pub fn address_is_trusted(address: &str, trusted: &[String]) -> bool {
+    trusted
+        .iter()
+        .any(|range| ipranges::cidrs_overlap(range, address) && range_covers(range, address))
+}
+
+/// Overlap alone would call a /24 row "trusted" because one address in it
+/// is. A row is trusted only when the whole of it is, i.e. when the trusted
+/// range contains the row's base address *and* is at least as wide.
+fn range_covers(range: &str, row: &str) -> bool {
+    fn prefix(cidr: &str) -> u32 {
+        match cidr.split_once('/') {
+            Some((_, len)) => len.parse().unwrap_or(0),
+            None if cidr.contains(':') => 128,
+            None => 32,
+        }
+    }
+    prefix(range) <= prefix(row)
+}
+
+/// Whether `user_agent` contains any of `trusted`, ignoring case — the
+/// same substring comparison NGINX makes against the trust file's escaped
+/// `~*` keys, so this tag and the enforcement agree.
+pub fn user_agent_is_trusted(user_agent: &str, trusted: &[String]) -> bool {
+    let lower = user_agent.to_lowercase();
+    trusted
+        .iter()
+        .any(|t| !t.is_empty() && lower.contains(&t.to_lowercase()))
+}
+
+/// One thing an operator has trusted by hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrustedEntry {
+    Address(String),
+    UserAgent(String),
+}
+
+impl TrustedEntry {
+    pub fn value(&self) -> &str {
+        match self {
+            TrustedEntry::Address(value) | TrustedEntry::UserAgent(value) => value,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            TrustedEntry::Address(_) => "address",
+            TrustedEntry::UserAgent(_) => "user agent",
+        }
+    }
+}
+
+/// Every trusted entry, addresses first — what the Trusted panels in both
+/// front-ends list.
+pub fn trusted_entries(db: &Db) -> Result<Vec<TrustedEntry>> {
+    let mut entries: Vec<TrustedEntry> = db
+        .list_trusted_addresses()?
+        .into_iter()
+        .map(TrustedEntry::Address)
+        .collect();
+    entries.extend(
+        db.list_trusted_user_agents()?
+            .into_iter()
+            .map(TrustedEntry::UserAgent),
+    );
+    Ok(entries)
+}
+
+/// Trusts whatever an operator typed into a single "address or user
+/// agent" field, and says which it was taken as.
+///
+/// The one field is a convenience that needs a guard. Taken naively —
+/// "an address if it parses, otherwise a user agent" — a mistyped
+/// `10.0.0.1/33` would be quietly trusted as a user-agent substring,
+/// which trusts nothing the operator meant and is never noticed. So
+/// anything spelled only in address characters is held to being an
+/// address, and fails as one.
+pub fn trust_typed(db: &Db, input: &str) -> Result<TrustedEntry> {
+    let input = input.trim();
+    let looks_like_address = (input.contains('.') || input.contains(':'))
+        && input
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || matches!(c, '.' | ':' | '/'));
+    if looks_like_address {
+        Ok(TrustedEntry::Address(db.trust_address(input)?))
+    } else {
+        Ok(TrustedEntry::UserAgent(db.trust_user_agent(input)?))
+    }
+}
+
+/// Removes a trusted entry. Returns whether it was there.
+pub fn untrust(db: &Db, entry: &TrustedEntry) -> Result<bool> {
+    match entry {
+        TrustedEntry::Address(address) => db.untrust_address(address),
+        TrustedEntry::UserAgent(user_agent) => db.untrust_user_agent(user_agent),
+    }
+}
+
 /// Formats a future Unix timestamp `expires_at` as a short "Nd"/"Nh"
 /// relative string for a `RowStatus::Blocked`'s "until" text — same
 /// rounding convention as `main.rs::format_expiry` (that one isn't
@@ -410,11 +520,17 @@ impl Live {
             Some(text) => sshlog::failed_attempt_counts(text),
             None => HashMap::new(),
         };
-        let ssh = build_ssh_rows(ssh_counts, &firewall_blocks, &blocked_ip_ranges);
+        let mut ssh = build_ssh_rows(ssh_counts, &firewall_blocks, &blocked_ip_ranges);
+        let trusted_addresses = db.list_trusted_addresses()?;
+        for row in &mut ssh {
+            if address_is_trusted(&row.address, &trusted_addresses) {
+                row.status = RowStatus::Trusted;
+            }
+        }
 
         let blocked_uas: HashSet<String> = db.list_blocked_user_agents()?.into_iter().collect();
         let bots = db.list_bots()?;
-        let user_agents = build_ua_rows(
+        let mut user_agents = build_ua_rows(
             db.list_user_agent_stats()?,
             &blocked_uas,
             &bots,
@@ -422,6 +538,12 @@ impl Live {
             db.get_category_default(Category::Search)?,
             db.get_category_default(Category::Scanner)?,
         );
+        let trusted_uas = db.list_trusted_user_agents()?;
+        for row in &mut user_agents {
+            if user_agent_is_trusted(&row.user_agent, &trusted_uas) {
+                row.status = RowStatus::Trusted;
+            }
+        }
 
         Ok(Self { ssh, user_agents })
     }
@@ -430,6 +552,75 @@ impl Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_typed_entry_is_an_address_only_if_it_is_spelled_like_one() {
+        let db = Db::open_in_memory().unwrap();
+        for (typed, expected) in [
+            ("203.0.113.7", TrustedEntry::Address("203.0.113.7".into())),
+            (
+                "2001:db8::/48",
+                TrustedEntry::Address("2001:db8::/48".into()),
+            ),
+            ("UptimeRobot", TrustedEntry::UserAgent("UptimeRobot".into())),
+            (
+                "Pingdom.com_bot",
+                TrustedEntry::UserAgent("Pingdom.com_bot".into()),
+            ),
+        ] {
+            assert_eq!(trust_typed(&db, typed).unwrap(), expected, "{typed}");
+        }
+    }
+
+    /// Otherwise a typo in an address is quietly trusted as a user-agent
+    /// substring, trusting nothing the operator meant.
+    #[test]
+    fn a_mistyped_address_is_refused_not_trusted_as_a_user_agent() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(trust_typed(&db, "10.0.0.1/33").is_err());
+        assert!(trust_typed(&db, "10.0.0.256").is_err());
+        assert!(trusted_entries(&db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_address_row_is_trusted_only_when_all_of_it_is() {
+        let trusted = vec!["198.51.100.0/24".to_string(), "2001:db8::5".to_string()];
+        for (row, expected) in [
+            ("198.51.100.9", true),
+            ("198.51.100.0/25", true),
+            ("198.51.0.0/16", false),
+            ("198.51.101.9", false),
+            ("2001:db8::5", true),
+            ("2001:db8::/64", false),
+        ] {
+            assert_eq!(address_is_trusted(row, &trusted), expected, "{row}");
+        }
+    }
+
+    #[test]
+    fn a_user_agent_is_trusted_by_substring_ignoring_case() {
+        let trusted = vec!["uptimerobot".to_string()];
+        assert!(user_agent_is_trusted(
+            "Mozilla/5.0+(compatible; UptimeRobot/2.0; http://www.uptimerobot.com/)",
+            &trusted
+        ));
+        assert!(!user_agent_is_trusted("curl/8.0", &trusted));
+    }
+
+    /// Trust outranks a manual block on the row, because it outranks the
+    /// rule: the Allow goes first. Showing BLOCKED would be wrong.
+    #[test]
+    fn a_trusted_address_with_a_block_row_shows_as_trusted() {
+        let db = Db::open_in_memory().unwrap();
+        db.block_address_permanently("198.51.100.9").unwrap();
+        db.trust_address("198.51.100.9").unwrap();
+        let log = "Failed password for root from 198.51.100.9 port 4444 ssh2\n";
+
+        let live = Live::load(&db, Some(log)).unwrap();
+
+        assert_eq!(live.ssh[0].status, RowStatus::Trusted);
+        assert!(!live.ssh[0].status.is_blocked());
+    }
 
     fn counts(pairs: &[(&str, u64)]) -> HashMap<String, u64> {
         pairs.iter().map(|(ip, n)| (ip.to_string(), *n)).collect()

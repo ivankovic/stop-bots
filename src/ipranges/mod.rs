@@ -295,6 +295,19 @@ pub fn cidr_contains(cidr: &str, ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Whether two addresses/CIDRs share any address.
+///
+/// Two prefixes either nest or are disjoint, so they overlap exactly when
+/// one contains the other's base address — which [`cidr_contains`] already
+/// answers, with the same "malformed or mixed-family is no match"
+/// leniency.
+pub fn cidrs_overlap(a: &str, b: &str) -> bool {
+    fn base(cidr: &str) -> Option<std::net::IpAddr> {
+        cidr.split('/').next()?.parse().ok()
+    }
+    base(b).is_some_and(|ip| cidr_contains(a, ip)) || base(a).is_some_and(|ip| cidr_contains(b, ip))
+}
+
 /// Whether `ip` is loopback, RFC1918 (IPv4 private) or IPv6 unique-local
 /// (`fc00::/7`) — never worth suggesting as a firewall block, since it's
 /// necessarily either this host talking to itself or a client on the same
@@ -435,6 +448,21 @@ mod tests {
                 "103.71.56.0/24".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn cidrs_overlap_either_way_round_and_not_when_disjoint() {
+        for (a, b, overlap) in [
+            ("10.0.0.0/24", "10.0.0.5", true),
+            ("10.0.0.5", "10.0.0.0/24", true),
+            ("10.0.0.0/28", "10.0.0.0/24", true),
+            ("10.0.0.0/24", "10.0.1.0/24", false),
+            ("2001:db8::/64", "2001:db8::1", true),
+            ("2001:db8::/64", "10.0.0.1", false),
+            ("not-an-address", "10.0.0.1", false),
+        ] {
+            assert_eq!(cidrs_overlap(a, b), overlap, "{a} vs {b}");
+        }
     }
 
     #[test]

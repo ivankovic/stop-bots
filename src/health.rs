@@ -660,6 +660,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(log_sources(probe));
     checks.push(access_log_clients(probe));
     checks.push(ssh_login_allowlist(db)?);
+    if let Some(check) = trusted_by_hand(db)? {
+        checks.push(check);
+    }
     // Adds a line only on a host where NGINX really is in a container.
     if let Some(check) = firewall_reaches_containers(probe) {
         checks.push(check);
@@ -1157,6 +1160,46 @@ fn ssh_login_allowlist(db: &Db) -> Result<Check> {
         detail,
         fix: None,
     })
+}
+
+/// What an operator has trusted by hand, listed — for the reason
+/// [`ssh_login_allowlist`] lists its addresses, and more so: those expire
+/// on their own after a week, and these never do.
+///
+/// Absent rather than "nothing trusted" when there is nothing: that is
+/// the ordinary state, and a line saying so on every host is noise on the
+/// one-line status strip the TUI shows these on.
+///
+/// Never a warning, for the same reason as the SSH list: trusting
+/// something is a decision, not a fault.
+fn trusted_by_hand(db: &Db) -> Result<Option<Check>> {
+    let addresses = db.list_trusted_addresses()?;
+    let user_agents = db.list_trusted_user_agents()?;
+    if addresses.is_empty() && user_agents.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    if !addresses.is_empty() {
+        parts.push(format!(
+            "{} address(es), past the firewall and NGINX: {}",
+            addresses.len(),
+            addresses.join(", ")
+        ));
+    }
+    if !user_agents.is_empty() {
+        parts.push(format!(
+            "{} user agent(s), past NGINX only: {}",
+            user_agents.len(),
+            user_agents.join(", ")
+        ));
+    }
+    Ok(Some(Check {
+        id: "trusted",
+        title: "Trusted by hand",
+        level: Level::Ok,
+        detail: parts.join("; "),
+        fix: None,
+    }))
 }
 
 /// Where NGINX runs, and whether everything that has to agree with that
@@ -1785,6 +1828,38 @@ mod tests {
             check.detail
         );
         assert!(check.detail.contains('7'), "was: {}", check.detail);
+    }
+
+    /// Trusted entries never expire, so the one place they are all visible
+    /// has to name every one of them — and say which plane each reaches.
+    #[test]
+    fn the_trusted_check_names_every_entry_and_how_far_it_reaches() {
+        let db = db();
+        db.trust_address("203.0.113.7").unwrap();
+        db.trust_user_agent("UptimeRobot").unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+
+        let check = check2(&report, "trusted");
+        assert_eq!(check.level, Level::Ok);
+        for needle in [
+            "203.0.113.7",
+            "firewall and NGINX",
+            "UptimeRobot",
+            "NGINX only",
+        ] {
+            assert!(
+                check.detail.contains(needle),
+                "missing {needle}: {}",
+                check.detail
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_trusted_adds_no_check() {
+        let report = assess(&db(), &healthy()).unwrap();
+        assert!(report.checks.iter().all(|c| c.id != "trusted"));
     }
 
     /// An empty allowlist is the ordinary state of a host that has just

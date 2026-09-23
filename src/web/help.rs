@@ -345,7 +345,9 @@ fn body(view: &View) -> Markup {
                             "Rows tagged " (layout::pill("BLOCKLIST", PillKind::Warn)) " come from a "
                             "downloaded list. An unblock here would be undone by the next refresh of "
                             "that list, so the button is not offered — change the bot's setting on "
-                            "Bot settings instead."
+                            "Bot settings instead, or "
+                            strong { "Trust" }
+                            " it: trust outranks every list, and no refresh undoes it."
                         },
                     ))
                 } }

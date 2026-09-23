@@ -66,7 +66,7 @@
 use crate::db::Db;
 // The row model and the "is this already blocked?" decision live in
 // `crate::dynamic`, shared with the web UI — see that module for why.
-use crate::dynamic::{Filter, Live, RowStatus, SshRow, UaRow};
+use crate::dynamic::{Filter, Live, RowStatus, SshRow, TrustedEntry, UaRow};
 use crate::ipdetail::{AddressKind, IpDetail};
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use crate::uadetail::UaDetail;
@@ -80,14 +80,48 @@ use ratatui::{
     Frame,
 };
 
-/// Which of the two panels `Up`/`Down`/`Enter` currently apply to. Switched
-/// with `Tab`/`Shift+Tab` (see the module doc comment for why that claims
-/// the key on this screen instead of cycling top-level screens).
+/// Which of the three panels `Up`/`Down`/`Enter` currently apply to.
+/// Switched with `Tab`/`Shift+Tab` (see the module doc comment for why
+/// that claims the key on this screen instead of cycling top-level
+/// screens).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Focus {
     #[default]
     Ssh,
     UserAgents,
+    /// Everything trusted by hand, with a row to add to it. Its own panel
+    /// rather than only a `T` key on the other two, because what an
+    /// operator most wants to trust — a monitoring service, an office
+    /// range — is exactly what never shows up in a list of failed SSH
+    /// logins, and may not have visited yet.
+    Trusted,
+}
+
+impl Focus {
+    fn next(self) -> Self {
+        match self {
+            Focus::Ssh => Focus::UserAgents,
+            Focus::UserAgents => Focus::Trusted,
+            Focus::Trusted => Focus::Ssh,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Focus::Ssh => Focus::Trusted,
+            Focus::UserAgents => Focus::Ssh,
+            Focus::Trusted => Focus::UserAgents,
+        }
+    }
+}
+
+/// The "trust an address or user agent" text field: what has been typed,
+/// and why the last Enter was refused. The same shape as Site detail's
+/// add-exempt-path popup.
+#[derive(Debug, Default)]
+struct TrustInput {
+    input: String,
+    error: Option<String>,
 }
 
 /// Which of the two detail popups is open.
@@ -111,6 +145,12 @@ pub struct Firewall {
     ua_state: ListState,
     focus: Focus,
     filter: Filter,
+    trusted: Vec<TrustedEntry>,
+    /// Row 0 is "+ Trust an address or user agent"; row `n` is
+    /// `trusted[n - 1]`.
+    trusted_state: ListState,
+    /// The open trust text field, if any. Owns the keyboard while open.
+    trust_input: Option<TrustInput>,
     /// The open detail popup, if any. `Some` also means `Esc`
     /// closes the popup rather than leaving the screen, the same
     /// nested-back-out shape `site_detail` uses one level deeper.
@@ -132,6 +172,7 @@ impl Firewall {
         let live = Live::load(db, ssh_log_text)?;
         self.ssh_rows = live.ssh;
         self.ua_rows = live.user_agents;
+        self.trusted = crate::dynamic::trusted_entries(db)?;
         self.clamp_selections();
         Ok(())
     }
@@ -164,6 +205,8 @@ impl Firewall {
         clamp_selection(&mut self.ssh_state, ssh_len);
         let ua_len = self.visible_ua_rows().len();
         clamp_selection(&mut self.ua_state, ua_len);
+        // The add row is always there, so this list is never empty.
+        clamp_selection(&mut self.trusted_state, self.trusted.len() + 1);
     }
 
     pub fn handle_key(
@@ -185,13 +228,19 @@ impl Firewall {
                 _ => KeyOutcome::Consumed,
             });
         }
+        // Text entry owns every printable key, so a `j` or an `f` typed
+        // into a user agent reaches the field instead of the screen.
+        if self.trust_input.is_some() {
+            return self.handle_trust_input_key(key, db, message);
+        }
 
         match key.code {
-            KeyCode::Tab | KeyCode::BackTab => {
-                self.focus = match self.focus {
-                    Focus::Ssh => Focus::UserAgents,
-                    Focus::UserAgents => Focus::Ssh,
-                };
+            KeyCode::Tab => {
+                self.focus = self.focus.next();
+                Ok(KeyOutcome::Consumed)
+            }
+            KeyCode::BackTab => {
+                self.focus = self.focus.previous();
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Char('f') => {
@@ -207,7 +256,11 @@ impl Firewall {
                 self.active_state().select_next();
                 Ok(KeyOutcome::Consumed)
             }
+            KeyCode::Enter if self.focus == Focus::Trusted => {
+                self.activate_trusted_row(db, message)
+            }
             KeyCode::Enter => self.toggle_block_selected(db, message),
+            KeyCode::Char('T') => self.toggle_trust_selected(db, message),
             KeyCode::Char('i') => self.inspect_selected(db, message),
             KeyCode::Char('y') => Ok(self.copy_selected(message)),
             KeyCode::Char('R') => Ok(KeyOutcome::RereadLogs),
@@ -231,6 +284,9 @@ impl Firewall {
                     .get(i)
                     .map(|row| row.user_agent.clone())
             }),
+            Focus::Trusted => self
+                .selected_trusted()
+                .map(|entry| entry.value().to_string()),
         };
         let Some(value) = value else {
             return KeyOutcome::Consumed;
@@ -245,15 +301,30 @@ impl Firewall {
         if self.detail.is_some() {
             return ("Inspect", vec![("Esc", "close")]);
         }
+        if self.trust_input.is_some() {
+            return ("Trust", vec![("Enter", "trust"), ("Esc", "cancel")]);
+        }
         let name = match self.focus {
             Focus::Ssh => "SSH",
             Focus::UserAgents => "User agents",
+            Focus::Trusted => {
+                return (
+                    "Trusted",
+                    vec![
+                        ("\u{2191}\u{2193}", "move"),
+                        ("Enter", "add/remove"),
+                        ("y", "copy"),
+                        ("Tab", "next panel"),
+                    ],
+                );
+            }
         };
         // Both panels inspect now, so the hint is unconditional rather
         // than something the SSH panel alone advertises.
         let mut hints = vec![
             ("\u{2191}\u{2193}", "move"),
             ("Enter", "block/unblock"),
+            ("T", "trust"),
             ("i", "inspect"),
         ];
         hints.extend([
@@ -269,7 +340,160 @@ impl Firewall {
         match self.focus {
             Focus::Ssh => &mut self.ssh_state,
             Focus::UserAgents => &mut self.ua_state,
+            Focus::Trusted => &mut self.trusted_state,
         }
+    }
+
+    /// The trusted entry under the cursor, `None` on the add row.
+    fn selected_trusted(&self) -> Option<&TrustedEntry> {
+        self.trusted_state
+            .selected()
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| self.trusted.get(i))
+    }
+
+    /// Enter on the Trusted panel: the add row opens the text field, any
+    /// other row stops trusting it. No confirmation, for the reason the
+    /// Dashboard's country list has none — it is one reversible change,
+    /// and the message says how to put it back.
+    fn activate_trusted_row(
+        &mut self,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(entry) = self.selected_trusted().cloned() else {
+            self.trust_input = Some(TrustInput::default());
+            return Ok(KeyOutcome::Consumed);
+        };
+        crate::dynamic::untrust(db, &entry)?;
+        *message = Some(format!(
+            "No longer trusting {} {} — {}",
+            entry.kind(),
+            entry.value(),
+            apply_hint(&entry)
+        ));
+        Ok(KeyOutcome::Mutated)
+    }
+
+    fn handle_trust_input_key(
+        &mut self,
+        key: KeyEvent,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(TrustInput { input, error }) = &mut self.trust_input else {
+            unreachable!("dispatched on this popup")
+        };
+        match key.code {
+            KeyCode::Esc => self.trust_input = None,
+            KeyCode::Backspace => {
+                input.pop();
+                *error = None;
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                *error = None;
+            }
+            KeyCode::Enter => match crate::dynamic::trust_typed(db, input) {
+                Ok(entry) => {
+                    self.trust_input = None;
+                    *message = Some(format!(
+                        "Trusting {} {} — {}",
+                        entry.kind(),
+                        entry.value(),
+                        apply_hint(&entry)
+                    ));
+                    return Ok(KeyOutcome::Mutated);
+                }
+                // Left open with the reason, rather than closed with a
+                // message: the operator is mid-typing, and the value is
+                // what they need to fix.
+                Err(err) => *error = Some(err.to_string()),
+            },
+            _ => {}
+        }
+        Ok(KeyOutcome::Consumed)
+    }
+
+    /// `T` on an SSH or user-agent row: trust it, or stop trusting it.
+    ///
+    /// Capital, because lower-case `t` is the global theme toggle, and a
+    /// screen that claimed it would quietly take that away here.
+    ///
+    /// A user-agent row trusts its *whole* string. That is narrower than
+    /// most operators want — a version bump makes it a different string —
+    /// which is what typing a shorter substring into the Trusted panel is
+    /// for.
+    fn toggle_trust_selected(
+        &mut self,
+        db: &Db,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let (entry, trusted) = match self.focus {
+            Focus::Ssh => {
+                let Some(row) = self
+                    .ssh_state
+                    .selected()
+                    .and_then(|i| self.visible_ssh_rows().get(i).copied())
+                else {
+                    return Ok(KeyOutcome::Consumed);
+                };
+                (
+                    TrustedEntry::Address(row.address.clone()),
+                    row.status.is_trusted(),
+                )
+            }
+            Focus::UserAgents => {
+                let Some(row) = self
+                    .ua_state
+                    .selected()
+                    .and_then(|i| self.visible_ua_rows().get(i).copied())
+                else {
+                    return Ok(KeyOutcome::Consumed);
+                };
+                (
+                    TrustedEntry::UserAgent(row.user_agent.clone()),
+                    row.status.is_trusted(),
+                )
+            }
+            Focus::Trusted => return Ok(KeyOutcome::Ignored),
+        };
+        if trusted {
+            // Only an exact entry can be removed from here. A row trusted
+            // because a wider range or a shorter substring covers it is
+            // left alone, and the message says where the entry lives.
+            if !crate::dynamic::untrust(db, &entry)? {
+                *message = Some(format!(
+                    "{} is trusted by a wider entry — remove that one from the Trusted panel.",
+                    entry.value()
+                ));
+                return Ok(KeyOutcome::Consumed);
+            }
+            *message = Some(format!(
+                "No longer trusting {} {} — {}",
+                entry.kind(),
+                entry.value(),
+                apply_hint(&entry)
+            ));
+        } else {
+            let stored = match &entry {
+                TrustedEntry::Address(address) => TrustedEntry::Address(db.trust_address(address)?),
+                TrustedEntry::UserAgent(ua) => match db.trust_user_agent(ua) {
+                    Ok(stored) => TrustedEntry::UserAgent(stored),
+                    Err(err) => {
+                        *message = Some(format!("Cannot trust that user agent: {err}"));
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                },
+            };
+            *message = Some(format!(
+                "Trusting {} {} — {}",
+                stored.kind(),
+                stored.value(),
+                apply_hint(&stored)
+            ));
+        }
+        Ok(KeyOutcome::Mutated)
     }
 
     /// Opens the detail popup for whichever row is selected.
@@ -311,6 +535,7 @@ impl Firewall {
                 self.detail = Some(Detail::UserAgent(Box::new(detail)));
                 Ok(KeyOutcome::Consumed)
             }
+            Focus::Trusted => Ok(KeyOutcome::Ignored),
         }
     }
 
@@ -356,6 +581,10 @@ impl Firewall {
                     // Blocklist items cannot be toggled
                     return Ok(KeyOutcome::Consumed);
                 }
+                if row.status.is_trusted() {
+                    *message = Some(trusted_refusal(&row.address));
+                    return Ok(KeyOutcome::Consumed);
+                }
                 if row.status.is_blocked() {
                     db.unblock_address(&row.address)?;
                     *message = Some(format!(
@@ -383,6 +612,10 @@ impl Firewall {
                     // Blocklist items cannot be toggled
                     return Ok(KeyOutcome::Consumed);
                 }
+                if row.status.is_trusted() {
+                    *message = Some(trusted_refusal(&row.user_agent));
+                    return Ok(KeyOutcome::Consumed);
+                }
                 if row.status.is_blocked() {
                     db.unblock_user_agent(&row.user_agent)?;
                     *message = Some(format!(
@@ -398,6 +631,7 @@ impl Firewall {
                 }
                 Ok(KeyOutcome::Mutated)
             }
+            Focus::Trusted => Ok(KeyOutcome::Ignored),
         }
     }
 
@@ -412,8 +646,16 @@ impl Firewall {
         theme: Theme,
         jobs: &std::collections::HashSet<crate::app::Job>,
     ) {
-        let [ssh_area, ua_area] =
-            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(area);
+        // The trusted list is short by nature — a handful of hand-typed
+        // entries — so it takes what it needs, up to a cap, and the two
+        // traffic panels share the rest as before.
+        let trusted_height = (self.trusted.len() as u16 + 1).clamp(1, 6) + 2;
+        let [ssh_area, ua_area, trusted_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(trusted_height),
+        ])
+        .areas(area);
 
         let reading = jobs.contains(&crate::app::Job::ReadSshLog);
         let ssh_rows = self.visible_ssh_rows();
@@ -486,6 +728,52 @@ impl Firewall {
             theme,
         );
         frame.render_stateful_widget(ua_list, ua_area, &mut self.ua_state);
+
+        let trusted_items: Vec<ListItem> = std::iter::once(ListItem::new(
+            Line::from("+ Trust an address or user agent").italic(),
+        ))
+        .chain(self.trusted.iter().map(|entry| {
+            ListItem::new(Line::from(vec![
+                format!("{:<11}", entry.kind()).fg(theme.dim()),
+                entry.value().to_string().into(),
+            ]))
+        }))
+        .collect();
+        let trusted_focused = self.focus == Focus::Trusted;
+        let trusted_list = crate::tui::select_in(
+            List::new(trusted_items).block(crate::tui::panel(
+                format!(
+                    "Trusted \u{00b7} {} \u{00b7} never blocked",
+                    self.trusted.len()
+                ),
+                trusted_focused,
+                theme,
+            )),
+            trusted_focused,
+            theme,
+        );
+        frame.render_stateful_widget(trusted_list, trusted_area, &mut self.trusted_state);
+
+        if let Some(TrustInput { input, error }) = &self.trust_input {
+            let title = "Trust an address or user agent";
+            let hint =
+                "An IP, a CIDR range, or part of a user agent — Enter to trust, Esc to cancel";
+            let mut lines = vec![
+                Line::from(format!("{input}\u{2588}")),
+                Line::from(hint).dim(),
+            ];
+            if let Some(error) = error {
+                lines.push(Line::from(error.clone()).red());
+            }
+            let popup = centered_rect(
+                widest_line(&lines).max(title.len() as u16) + 4,
+                lines.len() as u16 + 2,
+                area,
+            );
+            let paragraph = Paragraph::new(lines).block(crate::tui::popup(title, theme));
+            frame.render_widget(Clear, popup);
+            frame.render_widget(paragraph, popup);
+        }
 
         // Last, and over the whole screen rather than one panel: it
         // answers a question about a row, and reading it against half the
@@ -788,6 +1076,25 @@ fn wrapped(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// What makes a trust change take effect. An address reaches both the
+/// firewall and NGINX; a user agent only ever NGINX, which never sees a
+/// packet's user agent to begin with.
+fn apply_hint(entry: &TrustedEntry) -> &'static str {
+    match entry {
+        TrustedEntry::Address(_) => {
+            "apply everything (a on the Dashboard) to put it in the firewall and NGINX."
+        }
+        TrustedEntry::UserAgent(_) => "apply everything (a on the Dashboard) to put it in NGINX.",
+    }
+}
+
+/// Why Enter did nothing on a trusted row. Blocking something trusted
+/// would store a rule the trust overrides — a block that does nothing,
+/// and a row that would read `BLOCKED` while it is not.
+fn trusted_refusal(value: &str) -> String {
+    format!("{value} is trusted, so it cannot be blocked — press T to stop trusting it first.")
+}
+
 /// The widest line in `lines`, for sizing a popup to its content.
 fn widest_line(lines: &[Line<'_>]) -> u16 {
     lines
@@ -915,6 +1222,7 @@ fn row_line(
         // row is worth a look, and dimming it would bury it among the
         // browsers it sits between.
         RowStatus::Unknown => text.yellow(),
+        RowStatus::Trusted => text.green(),
     };
     Line::from(vec![
         format!("{count:>6} ").into(),
@@ -977,21 +1285,170 @@ mod tests {
     }
 
     #[test]
-    fn tab_toggles_focus_between_panels() {
+    fn tab_cycles_through_the_three_panels_and_shift_tab_goes_back() {
         let db = Db::open_in_memory().unwrap();
         let mut screen = Firewall::default();
         let mut message = None;
         assert_eq!(screen.focus, Focus::Ssh);
 
+        for expected in [Focus::UserAgents, Focus::Trusted, Focus::Ssh] {
+            screen
+                .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+                .unwrap();
+            assert_eq!(screen.focus, expected);
+        }
         screen
-            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+            .handle_key(KeyEvent::from(KeyCode::BackTab), &db, &mut message)
             .unwrap();
-        assert_eq!(screen.focus, Focus::UserAgents);
+        assert_eq!(screen.focus, Focus::Trusted);
+    }
 
-        screen
-            .handle_key(KeyEvent::from(KeyCode::Tab), &db, &mut message)
+    fn press(screen: &mut Firewall, db: &Db, code: KeyCode) -> (KeyOutcome, Option<String>) {
+        let mut message = None;
+        let outcome = screen
+            .handle_key(KeyEvent::from(code), db, &mut message)
             .unwrap();
-        assert_eq!(screen.focus, Focus::Ssh);
+        (outcome, message)
+    }
+
+    #[test]
+    fn shift_t_trusts_the_selected_address_and_again_stops_trusting_it() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ssh_row(RowStatus::Pending);
+
+        let (outcome, _) = press(&mut screen, &db, KeyCode::Char('T'));
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(db.list_trusted_addresses().unwrap(), vec!["185.220.101.7"]);
+
+        screen.ssh_rows[0].status = RowStatus::Trusted;
+        press(&mut screen, &db, KeyCode::Char('T'));
+        assert!(db.list_trusted_addresses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn shift_t_trusts_the_selected_user_agent() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ua_row("UptimeRobot/2.0", RowStatus::Blocklist);
+
+        press(&mut screen, &db, KeyCode::Char('T'));
+
+        assert_eq!(
+            db.list_trusted_user_agents().unwrap(),
+            vec!["UptimeRobot/2.0"]
+        );
+    }
+
+    /// A block on a trusted row would be a rule the trust overrides: a
+    /// block that does nothing, on a row that would then read BLOCKED.
+    #[test]
+    fn enter_refuses_to_block_a_trusted_row_and_says_why() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ssh_row(RowStatus::Trusted);
+
+        let (outcome, message) = press(&mut screen, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+        assert!(message.unwrap().contains("press T"));
+    }
+
+    /// A row trusted by a wider range is not removed by `T` on it — there
+    /// is no entry for that exact row — and saying it was would be a lie.
+    #[test]
+    fn shift_t_on_a_row_trusted_by_a_wider_range_says_where_the_entry_is() {
+        let db = Db::open_in_memory().unwrap();
+        db.trust_address("185.220.101.0/24").unwrap();
+        let mut screen = screen_with_one_ssh_row(RowStatus::Trusted);
+
+        let (outcome, message) = press(&mut screen, &db, KeyCode::Char('T'));
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert_eq!(
+            db.list_trusted_addresses().unwrap(),
+            vec!["185.220.101.0/24"]
+        );
+        assert!(message.unwrap().contains("wider entry"));
+    }
+
+    fn trusted_panel_screen(db: &Db) -> Firewall {
+        let mut screen = Firewall {
+            focus: Focus::Trusted,
+            ..Default::default()
+        };
+        screen.refresh(db, None).unwrap();
+        screen
+    }
+
+    fn type_into(screen: &mut Firewall, db: &Db, text: &str) {
+        for c in text.chars() {
+            press(screen, db, KeyCode::Char(c));
+        }
+    }
+
+    /// The field owns every printable key: `j`, `t` and `f` are all
+    /// letters a user agent can contain, and `t` would otherwise reach
+    /// the global theme toggle.
+    #[test]
+    fn the_add_row_takes_typed_text_including_screen_keys() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = trusted_panel_screen(&db);
+
+        press(&mut screen, &db, KeyCode::Enter);
+        type_into(&mut screen, &db, "jtf-monitor");
+        let (outcome, message) = press(&mut screen, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(db.list_trusted_user_agents().unwrap(), vec!["jtf-monitor"]);
+        assert!(screen.trust_input.is_none());
+        assert!(message.unwrap().contains("user agent"));
+    }
+
+    /// Left open with the reason, so the operator can fix what they typed.
+    #[test]
+    fn a_mistyped_address_keeps_the_field_open_with_the_reason() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = trusted_panel_screen(&db);
+
+        press(&mut screen, &db, KeyCode::Enter);
+        type_into(&mut screen, &db, "10.0.0.1/33");
+        let (outcome, _) = press(&mut screen, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        let error = screen.trust_input.as_ref().and_then(|i| i.error.clone());
+        assert!(error.is_some(), "no reason was shown");
+        assert!(db.list_trusted_user_agents().unwrap().is_empty());
+        assert!(drawn(&mut screen).contains("10.0.0.1/33"));
+    }
+
+    #[test]
+    fn enter_on_a_trusted_entry_stops_trusting_it() {
+        let db = Db::open_in_memory().unwrap();
+        db.trust_address("203.0.113.7").unwrap();
+        let mut screen = trusted_panel_screen(&db);
+        screen.trusted_state.select(Some(1));
+
+        let (outcome, _) = press(&mut screen, &db, KeyCode::Enter);
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(db.list_trusted_addresses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_trusted_panel_shows_each_entry_and_the_add_row() {
+        let db = Db::open_in_memory().unwrap();
+        db.trust_address("203.0.113.7").unwrap();
+        db.trust_user_agent("UptimeRobot").unwrap();
+        let mut screen = trusted_panel_screen(&db);
+
+        let content = drawn(&mut screen);
+
+        for needle in [
+            "Trust an address or user agent",
+            "203.0.113.7",
+            "UptimeRobot",
+        ] {
+            assert!(content.contains(needle), "missing {needle}:\n{content}");
+        }
     }
 
     #[test]

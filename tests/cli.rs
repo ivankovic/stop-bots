@@ -805,6 +805,126 @@ fn rate_limit_writes_the_zone_file_and_removes_it_only_after_the_directive_goes(
         .stdout(predicate::str::contains("7 req/s"));
 }
 
+/// Trust end to end: an address reaches the firewall script as an accept
+/// ahead of every drop and the NGINX trust file as a `geo` entry; a user
+/// agent reaches the trust file only; the block clears for both; and
+/// taking both away removes the file once nothing references it.
+#[test]
+fn trust_reaches_the_firewall_script_first_and_nginx_through_the_trust_file() {
+    let fx = Fixture::new();
+    fx.seed_bots();
+    let site = fx.write_site("a.example");
+    fx.scan_sites();
+    let trust_conf = fx.conf_d.join("stop-bots-trusted.conf");
+
+    // Typed with host bits set; stored, and echoed, as the network.
+    fx.run(&["trust", "--address", "203.0.113.77/24"])
+        .stdout(predicate::str::contains("Trusting 203.0.113.0/24"));
+    fx.run(&["trust", "--user-agent", "UptimeRobot"])
+        .stdout(predicate::str::contains("still judge it by its address"));
+    fx.run(&["add-firewall-rule", "--address", "203.0.113.9"]);
+    fx.run(&["list-trusted"])
+        .stdout(predicate::str::contains("address     203.0.113.0/24"))
+        .stdout(predicate::str::contains("user agent  UptimeRobot"));
+
+    let script_path = fx._tmp.path().join("firewall.nft");
+    let empty_log = fx._tmp.path().join("auth.log");
+    fs::write(&empty_log, "").unwrap();
+    fx.run(&[
+        "render-firewall",
+        "--backend",
+        "nftables",
+        "--out",
+        script_path.to_str().unwrap(),
+        "--ssh-log",
+        empty_log.to_str().unwrap(),
+    ]);
+    let script = fs::read_to_string(&script_path).unwrap();
+    let accept = script
+        .find("ip saddr 203.0.113.0/24 accept")
+        .unwrap_or_else(|| panic!("no accept for the trusted range:\n{script}"));
+    let drop = script
+        .find("ip saddr 203.0.113.9 drop")
+        .unwrap_or_else(|| panic!("the block rule went missing:\n{script}"));
+    assert!(accept < drop, "the accept must come first:\n{script}");
+
+    fx.apply_blocks();
+    let conf = fs::read_to_string(&trust_conf).expect("the trust file should exist");
+    assert!(conf.contains("    203.0.113.0/24 1;"), "conf was:\n{conf}");
+    assert!(conf.contains("\"~*UptimeRobot\" 1;"), "conf was:\n{conf}");
+    let written = fs::read_to_string(&site).unwrap();
+    assert!(
+        written.contains("if ($stop_bots_trusted) {"),
+        "the site block does not clear for trusted clients:\n{written}"
+    );
+
+    fx.run(&["trust", "--remove", "--address", "203.0.113.0/24"]);
+    fx.run(&["trust", "--remove", "--user-agent", "UptimeRobot"]);
+    // Still there until the block that reads it is rewritten: deleting it
+    // first would make `nginx -t` fail on an unknown variable.
+    assert!(trust_conf.exists());
+    fx.apply_blocks();
+    assert!(
+        !trust_conf.exists(),
+        "the trust file outlived its last entry"
+    );
+    assert!(!fs::read_to_string(&site)
+        .unwrap()
+        .contains("stop_bots_trusted"));
+}
+
+/// Trusting a second user agent changes the trust file and no site's
+/// block. An apply that counted only site files decided nothing changed
+/// and never reloaded NGINX, so the new entry never took effect.
+#[test]
+fn a_change_to_the_trust_file_alone_still_reloads_nginx() {
+    let fx = Fixture::new();
+    fx.seed_bots();
+    fx.write_site("a.example");
+    fx.scan_sites();
+    let (bin, calls) = fake_tools(fx._tmp.path());
+    let apply = |fx: &Fixture| {
+        fx.cmd(&["apply-blocks", "--root", fx.nginx_root.to_str().unwrap()])
+            .env("PATH", path_with(&bin))
+            .assert()
+            .success()
+    };
+
+    fx.run(&["trust", "--user-agent", "UptimeRobot"]);
+    apply(&fx);
+    fx.run(&["trust", "--user-agent", "Pingdom"]);
+    apply(&fx).stdout(predicate::str::contains("Reloaded NGINX"));
+
+    let log = fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.starts_with("systemctl reload"))
+            .count(),
+        2,
+        "the second apply did not reload; calls were:\n{log}"
+    );
+}
+
+#[test]
+fn trust_refuses_what_would_trust_more_than_it_says() {
+    let fx = Fixture::new();
+    for (args, why) in [
+        (vec!["trust", "--address", "0.0.0.0/0"], "every address"),
+        (vec!["trust", "--user-agent", " "], "every client"),
+        (
+            vec!["trust", "--remove", "--address", "203.0.113.7"],
+            "is not trusted",
+        ),
+    ] {
+        fx.cmd(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(why));
+    }
+    fx.run(&["list-trusted"])
+        .stdout(predicate::str::contains("Nothing is trusted."));
+}
+
 /// Per-site path exemptions end to end: the generated block switches to
 /// the flag form, and only the exempted path escapes the rule.
 #[test]

@@ -225,14 +225,17 @@ pub struct BuiltFirewall {
     pub written: usize,
 }
 
-/// Every rule currently in effect — admin-managed (from
-/// [`Db::list_firewall_rules`]) followed by derived crawler/geo rules (from
-/// [`derived_firewall_rules`]) — in the same order [`build_script`] renders
-/// them. Factored out so [`build_script`] and the Dashboard's "needs
-/// updating" staleness check ([`rules_signature`]) share one gathering
-/// implementation and can never drift out of sync with each other.
+/// Every rule currently in effect — the Allows that nothing may override
+/// ([`ssh_allow_rules`], then [`trusted_allow_rules`]), then admin-managed
+/// rules (from [`Db::list_firewall_rules`]), then derived crawler/geo rules
+/// (from [`derived_firewall_rules`]) — in the same order [`build_script`]
+/// renders them. Factored out so [`build_script`] and the Dashboard's
+/// "needs updating" staleness check ([`rules_signature`]) share one
+/// gathering implementation and can never drift out of sync with each
+/// other.
 pub fn all_rules(db: &Db) -> Result<Vec<FirewallRule>> {
     let mut rules = ssh_allow_rules(db)?;
+    rules.extend(trusted_allow_rules(db)?);
     rules.extend(db.list_firewall_rules()?);
     rules.extend(derived_firewall_rules(db)?);
     Ok(rules)
@@ -259,6 +262,27 @@ pub fn all_rules(db: &Db) -> Result<Vec<FirewallRule>> {
 pub fn ssh_allow_rules(db: &Db) -> Result<Vec<FirewallRule>> {
     Ok(db
         .recent_ssh_login_ips()?
+        .into_iter()
+        .map(|address| FirewallRule {
+            id: 0,
+            address,
+            port: None,
+            action: FirewallAction::Allow,
+            enabled: true,
+            expires_at: None,
+        })
+        .collect())
+}
+
+/// An Allow rule for every address an operator has trusted by hand (see
+/// [`Db::trust_address`]). Synthetic and first-placed for exactly the
+/// reasons [`ssh_allow_rules`] gives: a trusted address inside a
+/// reputation /24, a country an allowlist excludes, or a Block row a
+/// detector wrote before it was trusted is still let through, because the
+/// Allow is evaluated before any of them.
+pub fn trusted_allow_rules(db: &Db) -> Result<Vec<FirewallRule>> {
+    Ok(db
+        .list_trusted_addresses()?
         .into_iter()
         .map(|address| FirewallRule {
             id: 0,
@@ -630,6 +654,48 @@ mod tests {
         let rules = all_rules(&db).unwrap();
 
         assert!(lockout_risks(&rules, &["9.9.9.9".to_string()]).is_empty());
+    }
+
+    /// The address-level half of "never block this": whatever else the
+    /// rules say about a trusted address — a Block row, a derived range
+    /// containing it, an allowlist catch-all — an Allow ahead of all of
+    /// them wins.
+    #[test]
+    fn a_trusted_address_gets_past_every_kind_of_block() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_geo_mode(GeoMode::Allowlist).unwrap();
+        db.replace_country_ranges("nl", &["1.2.3.0/24".to_string()])
+            .unwrap();
+        db.set_country_selected("nl", true).unwrap();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.0/24".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+        db.trust_address("198.51.100.0/28").unwrap();
+
+        let rules = all_rules(&db).unwrap();
+
+        assert!(
+            lockout_risks(&rules, &["198.51.100.9".to_string()]).is_empty(),
+            "a trusted address was still blocked by: {rules:?}"
+        );
+        assert_eq!(
+            lockout_risks(&rules, &["198.51.100.99".to_string()]).len(),
+            1,
+            "trust leaked past the range that was trusted"
+        );
+    }
+
+    /// Trusting something is a change to the rules, so the Dashboard has
+    /// to say the script needs rendering again.
+    #[test]
+    fn trusting_an_address_changes_the_rules_signature() {
+        let db = Db::open_in_memory().unwrap();
+        let before = rules_signature(&all_rules(&db).unwrap());
+        db.trust_address("203.0.113.7").unwrap();
+        assert_ne!(before, rules_signature(&all_rules(&db).unwrap()));
     }
 
     /// The window is what stops this being a permanent allowlist. Nothing

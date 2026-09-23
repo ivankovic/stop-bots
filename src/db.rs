@@ -529,6 +529,81 @@ pub fn is_valid_address(address: &str) -> bool {
     }
 }
 
+/// `address` in the one form a trusted address is stored in, or why it
+/// cannot be trusted.
+///
+/// Normalised because the same range has many spellings, and every one of
+/// them ends up somewhere that cares: the table's primary key dedupes on
+/// the text, NGINX's `geo` warns about `10.0.0.5/24` ("low address bits
+/// are meaningless"), and `untrust-address` has to find the row a
+/// differently-typed `trust-address` wrote. So host bits are cleared, a
+/// full-length prefix becomes the bare address, and IPv6 takes its
+/// canonical compressed form.
+///
+/// A `/0` is refused rather than stored. Trusting every address is not a
+/// setting, it is switching this tool off — every firewall rule and every
+/// NGINX block would be overridden — and it is far likelier to be a typo
+/// for a real prefix than a decision.
+pub fn normalize_trusted_address(address: &str) -> Result<String> {
+    use std::net::IpAddr;
+
+    let address = address.trim();
+    if !is_valid_address(address) {
+        anyhow::bail!("not an IP address or CIDR range: {address:?}");
+    }
+    let Some((base, prefix)) = address.split_once('/') else {
+        // Validated above, so this parses.
+        return Ok(address.parse::<IpAddr>()?.to_string());
+    };
+    let prefix: u32 = prefix.parse()?;
+    if prefix == 0 {
+        anyhow::bail!(
+            "refusing to trust {address}: that is every address, which would switch off every \
+             block this tool writes"
+        );
+    }
+    Ok(match base.parse::<IpAddr>()? {
+        IpAddr::V4(ip) if prefix == 32 => ip.to_string(),
+        IpAddr::V6(ip) if prefix == 128 => ip.to_string(),
+        IpAddr::V4(ip) => {
+            let network = u32::from(ip) & (u32::MAX << (32 - prefix));
+            format!("{}/{prefix}", std::net::Ipv4Addr::from(network))
+        }
+        IpAddr::V6(ip) => {
+            let network = u128::from(ip) & (u128::MAX << (128 - prefix));
+            format!("{}/{prefix}", std::net::Ipv6Addr::from(network))
+        }
+    })
+}
+
+/// `user_agent` as it will be stored as trusted, or why it cannot be.
+///
+/// Matched as a case-insensitive substring, the same way a manually
+/// blocked user agent is, so each refusal here is about a string that
+/// would trust more than it says:
+///
+/// - **Empty.** An empty substring is contained in every user agent, so it
+///   would trust every client — and it fails *open*, silently.
+/// - **`"`, `\` or a control character.** The string is written into a
+///   quoted NGINX `map` key. A quote ends it early; a backslash is
+///   collapsed by NGINX's own string parser before the regex engine sees
+///   it, so the escaping that makes the rest literal stops being literal
+///   there. Neither is worth the risk for a real user agent, which has
+///   neither.
+pub fn validate_trusted_user_agent(user_agent: &str) -> Result<String> {
+    let user_agent = user_agent.trim();
+    if user_agent.is_empty() {
+        anyhow::bail!("an empty user agent would match every client");
+    }
+    if let Some(c) = user_agent
+        .chars()
+        .find(|c| *c == '"' || *c == '\\' || c.is_control())
+    {
+        anyhow::bail!("a trusted user agent cannot contain {c:?}");
+    }
+    Ok(user_agent.to_string())
+}
+
 /// The entries of `addresses` that may be stored and later rendered into a
 /// firewall script: valid (see [`is_valid_address`]) and trimmed.
 ///
@@ -900,6 +975,22 @@ impl Db {
             CREATE TABLE IF NOT EXISTS ssh_login_ips (
                 address TEXT PRIMARY KEY,
                 seen_at INTEGER NOT NULL
+            );
+            -- Clients an operator has said must never be blocked. The
+            -- hand-written counterpart of `ssh_login_ips`: an address here
+            -- becomes an Allow rule ahead of every other firewall rule and
+            -- clears the NGINX block, and a user agent here clears the
+            -- NGINX block (it cannot reach the firewall, which never sees
+            -- one). Stored normalised — see `normalize_trusted_address` —
+            -- so the primary key is what deduplicates `10.0.0.5/24` and
+            -- `10.0.0.0/24`.
+            CREATE TABLE IF NOT EXISTS trusted_addresses (
+                address TEXT PRIMARY KEY,
+                trusted_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS trusted_user_agents (
+                user_agent TEXT PRIMARY KEY,
+                trusted_at INTEGER NOT NULL
             );
             COMMIT;
             ",
@@ -1960,6 +2051,89 @@ impl Db {
         let rows = stmt.query_map([], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .context("failed to list blocked user agents")
+    }
+
+    // ---- trusted addresses and user agents ----
+
+    /// Trusts `address` (an IP or CIDR) — never blocked by anything this
+    /// tool writes. Returns the normalised form it was stored under (see
+    /// [`normalize_trusted_address`]), which is what callers should echo
+    /// back: it may differ from what was typed. Idempotent.
+    ///
+    /// Storage-only: `firewall::all_rules` turns it into an Allow ahead of
+    /// every other rule on the next render, and `apply-blocks` writes it
+    /// into NGINX's trust file.
+    pub fn trust_address(&self, address: &str) -> Result<String> {
+        let address = normalize_trusted_address(address)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO trusted_addresses (address, trusted_at) VALUES (?1, ?2)",
+            params![address, now()],
+        )?;
+        Ok(address)
+    }
+
+    /// Stops trusting `address`, however it was spelled when trusted.
+    /// Returns whether anything was removed, so a caller can say so rather
+    /// than report success over a typo.
+    pub fn untrust_address(&self, address: &str) -> Result<bool> {
+        // An unparseable value cannot have been stored, but deleting it
+        // verbatim costs nothing and keeps this from erroring over a row
+        // written by some future, laxer version.
+        let address = normalize_trusted_address(address).unwrap_or_else(|_| address.to_string());
+        let removed = self.conn.execute(
+            "DELETE FROM trusted_addresses WHERE address = ?1",
+            params![address],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Every trusted address, sorted. Sorted for the reason
+    /// [`Self::recent_ssh_login_ips`] is: this feeds
+    /// `firewall::rules_signature`, and SQLite's row order is not a thing
+    /// the firewall should appear to change over.
+    pub fn list_trusted_addresses(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT address FROM trusted_addresses ORDER BY address")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list trusted addresses")
+    }
+
+    /// Trusts every client whose user agent contains `user_agent`,
+    /// ignoring case. Returns the stored form. Idempotent.
+    ///
+    /// NGINX only, deliberately: a client chooses its own user agent, so
+    /// exempting one from the log detectors too would hand every scanner a
+    /// way past them for the price of copying a string. A client whose
+    /// *address* must never be blocked wants [`Self::trust_address`].
+    pub fn trust_user_agent(&self, user_agent: &str) -> Result<String> {
+        let user_agent = validate_trusted_user_agent(user_agent)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO trusted_user_agents (user_agent, trusted_at) VALUES (?1, ?2)",
+            params![user_agent, now()],
+        )?;
+        Ok(user_agent)
+    }
+
+    /// Stops trusting `user_agent`. Returns whether anything was removed.
+    pub fn untrust_user_agent(&self, user_agent: &str) -> Result<bool> {
+        let removed = self.conn.execute(
+            "DELETE FROM trusted_user_agents WHERE user_agent = ?1",
+            params![user_agent.trim()],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Every trusted user agent, sorted — the order the NGINX trust file
+    /// lists them in, which has to be stable or every site reads as stale.
+    pub fn list_trusted_user_agents(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT user_agent FROM trusted_user_agents ORDER BY user_agent")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list trusted user agents")
     }
 
     // ---- sites ----
@@ -3303,6 +3477,78 @@ mod tests {
         let db = test_db();
         db.unblock_user_agent("curl/8.0").unwrap();
         assert!(db.list_blocked_user_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_trusted_address_is_stored_in_one_spelling() {
+        for (typed, stored) in [
+            ("203.0.113.7", "203.0.113.7"),
+            (" 203.0.113.7\n", "203.0.113.7"),
+            ("203.0.113.7/32", "203.0.113.7"),
+            ("203.0.113.77/24", "203.0.113.0/24"),
+            ("2001:0db8:0000::1", "2001:db8::1"),
+            ("2001:db8::1/128", "2001:db8::1"),
+            ("2001:db8:1:2:3::/48", "2001:db8:1::/48"),
+        ] {
+            assert_eq!(
+                normalize_trusted_address(typed).unwrap(),
+                stored,
+                "{typed:?} was stored in the wrong form"
+            );
+        }
+    }
+
+    #[test]
+    fn trusting_every_address_or_a_non_address_is_refused() {
+        for bad in ["0.0.0.0/0", "::/0", "example.com", "10.0.0.0/33", ""] {
+            assert!(
+                normalize_trusted_address(bad).is_err(),
+                "{bad:?} should have been refused"
+            );
+        }
+    }
+
+    #[test]
+    fn untrust_finds_an_address_however_it_was_typed() {
+        let db = test_db();
+        db.trust_address("203.0.113.77/24").unwrap();
+        db.trust_address("203.0.113.0/24").unwrap();
+        assert_eq!(db.list_trusted_addresses().unwrap(), vec!["203.0.113.0/24"]);
+
+        assert!(db.untrust_address("203.0.113.1/24").unwrap());
+        assert!(db.list_trusted_addresses().unwrap().is_empty());
+        assert!(
+            !db.untrust_address("203.0.113.0/24").unwrap(),
+            "removing it twice should say nothing was removed"
+        );
+    }
+
+    /// Each of these would trust more than it says — see
+    /// `validate_trusted_user_agent`.
+    #[test]
+    fn a_user_agent_that_would_trust_more_than_it_says_is_refused() {
+        for (why, bad) in [
+            ("empty matches everything", "   "),
+            ("a quote ends the NGINX string", "Evil\"Bot"),
+            ("NGINX collapses a backslash", "Evil\\Bot"),
+            ("a newline splits the line", "Evil\nBot"),
+        ] {
+            assert!(validate_trusted_user_agent(bad).is_err(), "{why}: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn trusted_user_agents_are_trimmed_deduplicated_and_sorted() {
+        let db = test_db();
+        db.trust_user_agent(" UptimeRobot ").unwrap();
+        db.trust_user_agent("Pingdom").unwrap();
+        db.trust_user_agent("UptimeRobot").unwrap();
+        assert_eq!(
+            db.list_trusted_user_agents().unwrap(),
+            vec!["Pingdom", "UptimeRobot"]
+        );
+        assert!(db.untrust_user_agent("UptimeRobot").unwrap());
+        assert_eq!(db.list_trusted_user_agents().unwrap(), vec!["Pingdom"]);
     }
 
     #[test]

@@ -1791,6 +1791,11 @@ impl App {
             ),
             ("Search bots", "/", key(Screen::BotSettings, '/')),
             ("Re-read the SSH log", "R", key(Screen::Firewall, 'R')),
+            (
+                "Trust the selected row: never block it",
+                "T",
+                key(Screen::Firewall, 'T'),
+            ),
             ("Rescan for NGINX sites", "r", key(Screen::Nginx, 'r')),
             ("Apply blocking to every site", "A", key(Screen::Nginx, 'A')),
             ("Toggle light/dark theme", "t", Action::Theme),

@@ -376,7 +376,7 @@ td.wrap { word-break: break-all; }
    and these are the widths that leave the long value all the rest. */
 .table-scroll col.w-count { width: 148px; }
 .table-scroll col.w-state { width: 122px; }
-.table-scroll col.w-action { width: 128px; }
+.table-scroll col.w-action { width: 160px; }
 
 /* The bar beside a count: a 60px track, filled by one of twenty classes
    (an inline `style` would be dropped by the CSP). */

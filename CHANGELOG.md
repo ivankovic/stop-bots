@@ -5,6 +5,31 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking â
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## Unreleased
+
+### Added
+
+- **Trusted addresses and user agents: never blocked, whatever else matches.**
+  `stop-bots trust --address 198.51.100.0/24` or `--user-agent UptimeRobot`
+  (with `--remove`, and `list-trusted`), a Trusted panel on the Firewall
+  screen in both the TUI and the console, and `T` / a Trust button on the
+  traffic rows.
+
+  A trusted address becomes a firewall allow rule ahead of every other rule.
+  It overrides a detector's block, a reputation feed, a country and the
+  allow-list catch-all. It also clears every NGINX block and rate limit, and
+  the detectors leave it alone. A trusted user agent clears NGINX only, and
+  matches as a substring, ignoring case. It deliberately does not exempt a
+  client from the log detectors: anyone can send any user agent, so that
+  would be a bypass for the price of copying a string. `status` lists
+  everything trusted.
+
+### Fixed
+
+- **An apply that changed only a generated file did not reload NGINX.**
+  Changing only the rate-limit rate rewrote `stop-bots-limits.conf`, counted
+  as "0 files changed", and was never reloaded. Generated files now count.
+
 ## [0.0.7] â€” 2026-09-22
 
 ### Added

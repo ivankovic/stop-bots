@@ -95,6 +95,12 @@ pub struct ScanBlockOutcome {
     /// reads `firewall_rules` directly, so it would show that address as
     /// blocked when it is not.
     pub skipped_ssh_logins: usize,
+    /// Of the candidates, how many were left alone because they overlap an
+    /// address an operator trusted by hand (see [`Db::trust_address`]).
+    /// Not written for the reason [`Self::skipped_ssh_logins`] gives —
+    /// the Allow ahead of it would win anyway, and a Block row against a
+    /// trusted address would show it as blocked when it is not.
+    pub skipped_trusted: usize,
     /// Addresses actually newly blocked — or, if `dry_run`, that would
     /// have been.
     pub newly_blocked: Vec<String>,
@@ -115,8 +121,24 @@ impl ScanBlockOutcome {
         }
         if self.newly_blocked.is_empty() {
             let surviving = self.candidates - self.skipped_known_crawlers;
-            if self.skipped_ssh_logins > 0 && self.already_covered == 0 {
-                return format!("found {surviving} {noun}(s), all recent SSH logins — left alone");
+            if self.already_covered == 0 {
+                match (self.skipped_ssh_logins > 0, self.skipped_trusted > 0) {
+                    (true, false) => {
+                        return format!(
+                            "found {surviving} {noun}(s), all recent SSH logins — left alone"
+                        )
+                    }
+                    (false, true) => {
+                        return format!("found {surviving} {noun}(s), all trusted — left alone")
+                    }
+                    (true, true) => {
+                        return format!(
+                            "found {surviving} {noun}(s), all trusted or recent SSH logins — \
+                             left alone"
+                        )
+                    }
+                    (false, false) => {}
+                }
             }
             return format!("found {surviving} {noun}(s), all already covered");
         }
@@ -626,6 +648,7 @@ fn add_block_rules(
         .iter()
         .filter_map(|ip| ip.parse().ok())
         .collect();
+    let trusted = db.list_trusted_addresses()?;
 
     let kept = match crate::protection::subnet_escalation(db)? {
         Some(min) => escalate_subnets(kept, min),
@@ -636,6 +659,7 @@ fn add_block_rules(
     let mut newly_blocked = Vec::new();
     let mut already_covered = 0;
     let mut skipped_ssh_logins = 0;
+    let mut skipped_trusted = 0;
     for observed in kept {
         // What gets stored is not always what was seen: an IPv6 address is
         // widened to its /64 (see `blockable_address`). Dedup happens on
@@ -656,6 +680,16 @@ fn add_block_rules(
             .any(|login| crate::ipranges::cidr_contains(&ip, *login))
         {
             skipped_ssh_logins += 1;
+            continue;
+        }
+        // Overlap, not containment one way: a trusted /28 inside the /24
+        // an escalation just produced matters as much as a trusted /24
+        // around a single scanner.
+        if trusted
+            .iter()
+            .any(|range| crate::ipranges::cidrs_overlap(range, &ip))
+        {
+            skipped_trusted += 1;
             continue;
         }
         if existing.contains(&ip) {
@@ -683,6 +717,7 @@ fn add_block_rules(
         crawler_exclusion_active,
         already_covered,
         skipped_ssh_logins,
+        skipped_trusted,
         newly_blocked,
         ttl_days,
         dry_run,
@@ -798,6 +833,7 @@ mod tests {
             crawler_exclusion_active: true,
             already_covered: 0,
             skipped_ssh_logins: 0,
+            skipped_trusted: 0,
             newly_blocked: vec![],
             ttl_days: 5,
             dry_run: false,
@@ -945,6 +981,33 @@ mod tests {
         assert!(db.list_firewall_rules().unwrap().is_empty());
     }
 
+    /// The same rule for an address trusted by hand, and by overlap: a
+    /// trusted /24 covers the scanner inside it, and a trusted address
+    /// inside a /64 keeps the whole /64 from being written.
+    #[test]
+    fn a_detector_never_writes_a_block_that_overlaps_a_trusted_address() {
+        for (trusted, scanner) in [
+            ("198.51.100.0/24", "198.51.100.9"),
+            ("2001:db8::5", "2001:db8::99"),
+        ] {
+            let db = Db::open_in_memory().unwrap();
+            db.trust_address(trusted).unwrap();
+            let log = ssh_failed_attempt(scanner, 25);
+
+            let outcome = block_ssh_scanners(&db, 20, 1, &log, false).unwrap();
+
+            assert_eq!(
+                outcome.skipped_trusted, 1,
+                "{scanner} was not left alone for trusted {trusted}: {outcome:?}"
+            );
+            assert!(db.list_firewall_rules().unwrap().is_empty());
+            assert_eq!(
+                outcome.summary(),
+                "found 1 scanning IP(s), all trusted — left alone"
+            );
+        }
+    }
+
     #[test]
     fn block_spoofed_crawlers_skips_an_address_already_covered() {
         let db = Db::open_in_memory().unwrap();
@@ -973,6 +1036,7 @@ mod tests {
             crawler_exclusion_active: true,
             already_covered: 0,
             skipped_ssh_logins: 0,
+            skipped_trusted: 0,
             newly_blocked: vec![],
             ttl_days: 1,
             dry_run: false,
