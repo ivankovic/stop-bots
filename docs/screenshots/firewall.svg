@@ -6,7 +6,7 @@
 <rect x="188.4" y="84.0" width="92.4" height="18.0" fill="#10262a"/>
 <rect x="280.8" y="84.0" width="630.0" height="18.0" fill="#10262a"/>
 <text x="12.0" y="25.5" fill="#2ee6d6" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">stop-bots</text>
-<text x="87.6" y="25.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 0.0.3  web-01</text>
+<text x="87.6" y="25.5" fill="#6b7c8c" textLength="117.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 0.0.8  web-01</text>
 <text x="12.0" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">1</text>
 <text x="28.8" y="43.5" fill="#6b7c8c" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Dashboard</text>
 <text x="129.6" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">2</text>
@@ -79,61 +79,60 @@
 <text x="910.8" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="910.8" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="910.8" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="259.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="910.8" y="259.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="277.5" fill="#2ee6d6" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
-<text x="12.0" y="295.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Top user agents · 8 ─────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="241.5" fill="#2ee6d6" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="259.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Top user agents · 8 ─────────────────────────────────────────────────────────────────────────────────────┐</text>
+<text x="12.0" y="277.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="277.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   4812 </text>
+<text x="87.6" y="277.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██████████</text>
+<text x="188.4" y="277.5" fill="#d18f52" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ BLOCKLIST ]</text>
+<text x="297.6" y="277.5" fill="#c8d0da" textLength="613.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)     </text>
+<text x="910.8" y="277.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="295.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="295.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   3004 </text>
+<text x="87.6" y="295.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███████   </text>
+<text x="188.4" y="295.5" fill="#d18f52" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ BLOCKLIST ]</text>
+<text x="297.6" y="295.5" fill="#c8d0da" textLength="613.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    Mozilla/5.0 (compatible; ClaudeBot/1.0)                              </text>
+<text x="910.8" y="295.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="313.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="313.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   4812 </text>
-<text x="87.6" y="313.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██████████</text>
-<text x="188.4" y="313.5" fill="#d18f52" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ BLOCKLIST ]</text>
-<text x="297.6" y="313.5" fill="#c8d0da" textLength="613.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    Mozilla/5.0 (compatible; GPTBot/1.2; +https://openai.com/gptbot)     </text>
+<text x="20.4" y="313.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   2671 </text>
+<text x="87.6" y="313.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██████    </text>
+<text x="188.4" y="313.5" fill="#e05561" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ BLOCKED ]</text>
+<text x="280.8" y="313.5" fill="#c8d0da" textLength="630.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">      Mozilla/5.0 (compatible; Bytespider; spider-feedback@bytedance.com)  </text>
 <text x="910.8" y="313.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="331.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="331.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   3004 </text>
-<text x="87.6" y="331.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███████   </text>
-<text x="188.4" y="331.5" fill="#d18f52" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ BLOCKLIST ]</text>
-<text x="297.6" y="331.5" fill="#c8d0da" textLength="613.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    Mozilla/5.0 (compatible; ClaudeBot/1.0)                              </text>
+<text x="20.4" y="331.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   1988 </text>
+<text x="87.6" y="331.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█████     </text>
+<text x="188.4" y="331.5" fill="#6b7c8c" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ NOT BLOCKED ]</text>
+<text x="314.4" y="331.5" fill="#c8d0da" textLength="596.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0 Safar</text>
 <text x="910.8" y="331.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="349.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="349.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   2671 </text>
-<text x="87.6" y="349.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██████    </text>
-<text x="188.4" y="349.5" fill="#e05561" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ BLOCKED ]</text>
-<text x="280.8" y="349.5" fill="#c8d0da" textLength="630.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">      Mozilla/5.0 (compatible; Bytespider; spider-feedback@bytedance.com)  </text>
+<text x="20.4" y="349.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   1204 </text>
+<text x="87.6" y="349.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███       </text>
+<text x="188.4" y="349.5" fill="#6b7c8c" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ NOT BLOCKED ]</text>
+<text x="314.4" y="349.5" fill="#c8d0da" textLength="596.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.ht</text>
 <text x="910.8" y="349.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="367.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="367.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   1988 </text>
-<text x="87.6" y="367.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█████     </text>
+<text x="20.4" y="367.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    906 </text>
+<text x="87.6" y="367.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██        </text>
 <text x="188.4" y="367.5" fill="#6b7c8c" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ NOT BLOCKED ]</text>
-<text x="314.4" y="367.5" fill="#c8d0da" textLength="596.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128.0 Safar</text>
+<text x="314.4" y="367.5" fill="#c8d0da" textLength="596.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  python-requests/2.31.0                                               </text>
 <text x="910.8" y="367.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="385.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="385.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">   1204 </text>
-<text x="87.6" y="385.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">███       </text>
-<text x="188.4" y="385.5" fill="#6b7c8c" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ NOT BLOCKED ]</text>
-<text x="314.4" y="385.5" fill="#c8d0da" textLength="596.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.ht</text>
+<text x="20.4" y="385.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    742 </text>
+<text x="87.6" y="385.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██        </text>
+<text x="188.4" y="385.5" fill="#d18f52" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ BLOCKLIST ]</text>
+<text x="297.6" y="385.5" fill="#c8d0da" textLength="613.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    Mozilla/5.0 (compatible; CCBot/2.0; +https://commoncrawl.org/faq/)   </text>
 <text x="910.8" y="385.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="403.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="403.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    906 </text>
-<text x="87.6" y="403.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██        </text>
+<text x="20.4" y="403.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    318 </text>
+<text x="87.6" y="403.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█         </text>
 <text x="188.4" y="403.5" fill="#6b7c8c" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ NOT BLOCKED ]</text>
-<text x="314.4" y="403.5" fill="#c8d0da" textLength="596.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  python-requests/2.31.0                                               </text>
+<text x="314.4" y="403.5" fill="#c8d0da" textLength="596.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  curl/8.5.0                                                           </text>
 <text x="910.8" y="403.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="421.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="421.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    742 </text>
-<text x="87.6" y="421.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">██        </text>
-<text x="188.4" y="421.5" fill="#d18f52" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ BLOCKLIST ]</text>
-<text x="297.6" y="421.5" fill="#c8d0da" textLength="613.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    Mozilla/5.0 (compatible; CCBot/2.0; +https://commoncrawl.org/faq/)   </text>
-<text x="910.8" y="421.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="439.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="20.4" y="439.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">    318 </text>
-<text x="87.6" y="439.5" fill="#2ee6d6" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">█         </text>
-<text x="188.4" y="439.5" fill="#6b7c8c" textLength="126.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">[ NOT BLOCKED ]</text>
-<text x="314.4" y="439.5" fill="#c8d0da" textLength="596.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  curl/8.5.0                                                           </text>
-<text x="910.8" y="439.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="12.0" y="421.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
+<text x="12.0" y="439.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Trusted · 0 · never blocked ─────────────────────────────────────────────────────────────────────────────┐</text>
 <text x="12.0" y="457.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="457.5" fill="#c8d0da" textLength="890.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> + Trust an address or user agent                                                                         </text>
 <text x="910.8" y="457.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="475.5" fill="#6b7c8c" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>
 <text x="12.0" y="493.5" fill="#2ee6d6" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">SSH</text>
@@ -141,18 +140,18 @@
 <text x="79.2" y="493.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">move</text>
 <text x="129.6" y="493.5" fill="#2ee6d6" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Enter</text>
 <text x="180.0" y="493.5" fill="#6b7c8c" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">block/unblock</text>
-<text x="306.0" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">i</text>
-<text x="322.8" y="493.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">inspect</text>
-<text x="398.4" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">y</text>
-<text x="415.2" y="493.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">copy</text>
-<text x="465.6" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">f</text>
-<text x="482.4" y="493.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">filter</text>
-<text x="549.6" y="493.5" fill="#2ee6d6" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab</text>
-<text x="583.2" y="493.5" fill="#6b7c8c" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">next panel</text>
-<text x="684.0" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">R</text>
-<text x="700.8" y="493.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">re-read</text>
-<text x="776.4" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
-<text x="793.2" y="493.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">commands</text>
-<text x="877.2" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
-<text x="894.0" y="493.5" fill="#6b7c8c" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">hel</text>
+<text x="306.0" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">T</text>
+<text x="322.8" y="493.5" fill="#6b7c8c" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">trust</text>
+<text x="381.6" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">i</text>
+<text x="398.4" y="493.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">inspect</text>
+<text x="474.0" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">y</text>
+<text x="490.8" y="493.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">copy</text>
+<text x="541.2" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">f</text>
+<text x="558.0" y="493.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">filter</text>
+<text x="625.2" y="493.5" fill="#2ee6d6" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab</text>
+<text x="658.8" y="493.5" fill="#6b7c8c" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">next panel</text>
+<text x="759.6" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">R</text>
+<text x="776.4" y="493.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">re-read</text>
+<text x="852.0" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
+<text x="868.8" y="493.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">comman</text>
 </svg>
