@@ -57,11 +57,16 @@ struct View {
 
 fn load(db: &Db, root: &Path) -> anyhow::Result<View> {
     let sites = db.list_sites()?;
+    let conf_d = nginx::conf_d_dir(&nginx::root(db, None)?);
     let mut with_status = Vec::with_capacity(sites.len());
     for site in sites {
         let config = nginx::block_config_for_site(db, site.id)?;
-        let status =
-            nginx::site_apply_status(Path::new(&site.config_path), &site.server_name, &config);
+        let status = nginx::site_apply_status(
+            Path::new(&site.config_path),
+            &site.server_name,
+            &config,
+            &conf_d,
+        );
         with_status.push((site, status));
     }
 
@@ -324,7 +329,12 @@ fn load_detail(db: &Db, id: i64) -> anyhow::Result<Detail> {
         .ok_or_else(|| anyhow::anyhow!("no site with id {id}"))?;
 
     let config = nginx::block_config_for_site(db, site.id)?;
-    let status = nginx::site_apply_status(Path::new(&site.config_path), &site.server_name, &config);
+    let status = nginx::site_apply_status(
+        Path::new(&site.config_path),
+        &site.server_name,
+        &config,
+        &nginx::conf_d_dir(&nginx::root(db, None)?),
+    );
     let enabled = db.site_request_rules(site.id)?;
 
     Ok(Detail {
@@ -745,7 +755,7 @@ async fn apply_one(
                 .into_iter()
                 .find(|s| s.id == id)
                 .ok_or_else(|| anyhow::anyhow!("no site with id {id}"))?;
-            nginx::write_managed_files(db)?;
+            nginx::write_managed_files(db, &nginx::root(db, None)?)?;
             let config = nginx::block_config_for_site(db, site.id)?;
             let changed = nginx::apply_block_for_site(
                 Path::new(&site.config_path),

@@ -139,6 +139,11 @@ async fn main() -> Result<()> {
             nftables_conf_flushes: None,
             unit_active: Some(true),
             unit_binary: None,
+            // The fiction is a host install, so the generated files are in
+            // the stock place and nothing is stranded anywhere else.
+            conf_d_path: Some(stop_bots::nginx::CONF_D_DIR.to_string()),
+            conf_d_exists: Some(true),
+            stray_generated_files: Vec::new(),
             db_free_bytes: Some(140 * 1024 * 1024 * 1024),
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),

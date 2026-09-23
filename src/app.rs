@@ -1002,10 +1002,11 @@ impl App {
             self.nginx.finish_status_check(Vec::new());
             return Ok(());
         }
+        let conf_d = crate::nginx::conf_d_dir(self.nginx.root());
         self.jobs_in_flight.insert(Job::CheckSiteStatuses);
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
-            let statuses = crate::tui::nginx::run_status_check(&plan);
+            let statuses = crate::tui::nginx::run_status_check(&plan, &conf_d);
             let _ = sender.send(Event::App(AppEvent::SiteStatusesChecked { statuses }));
         });
         Ok(())
@@ -1581,8 +1582,13 @@ impl App {
         let ssh_log = self.ssh_log.clone();
         let sender = self.events.sender();
         let paths = crate::logpaths::LogPaths::from_db(&self.db).unwrap_or_default();
+        let conf_d = crate::nginx::conf_d_dir(
+            &crate::nginx::root(&self.db, None)
+                .unwrap_or_else(|_| std::path::PathBuf::from(crate::nginx::DEFAULT_ROOT)),
+        );
         tokio::task::spawn_blocking(move || {
-            let probe = crate::health::probe(backend, &db_path, ssh_log.as_deref(), &paths);
+            let probe =
+                crate::health::probe(backend, &db_path, ssh_log.as_deref(), &paths, &conf_d);
             let _ = sender.send(Event::App(AppEvent::HealthProbed {
                 probe: Box::new(probe),
             }));

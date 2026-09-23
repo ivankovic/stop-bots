@@ -603,7 +603,11 @@ pub fn health_check(db: &Db, ssh_log: Option<&std::path::Path>) -> String {
         .unwrap_or_else(|| std::path::PathBuf::from("./stop-bots.sqlite3"));
 
     let paths = crate::logpaths::LogPaths::from_db(db).unwrap_or_default();
-    let probe = crate::health::probe(backend, &db_path, ssh_log, &paths);
+    let conf_d = crate::nginx::conf_d_dir(
+        &crate::nginx::root(db, None)
+            .unwrap_or_else(|_| std::path::PathBuf::from(crate::nginx::DEFAULT_ROOT)),
+    );
+    let probe = crate::health::probe(backend, &db_path, ssh_log, &paths, &conf_d);
     if let Err(err) = crate::health::store_probe(db, &probe) {
         return format!("error: {err}");
     }

@@ -182,20 +182,24 @@ async fn run_log_job(state: &AppState, job: CronJob) -> anyhow::Result<()> {
 /// a large ruleset is megabytes of text — none of which has any business
 /// happening while the database lock is held, or on the async runtime.
 async fn health_check(state: &AppState) -> anyhow::Result<()> {
-    let (backend, db_path, paths) = state
+    let (backend, db_path, paths, conf_d) = state
         .with_db(|db| {
             Ok((
                 crate::firewall::stored_backend(db)?,
                 db.path()
                     .unwrap_or_else(|| PathBuf::from("./stop-bots.sqlite3")),
                 crate::logpaths::LogPaths::from_db(db).unwrap_or_default(),
+                crate::nginx::conf_d_dir(
+                    &crate::nginx::root(db, None)
+                        .unwrap_or_else(|_| PathBuf::from(crate::nginx::DEFAULT_ROOT)),
+                ),
             ))
         })
         .await?;
 
     let ssh_log = state.ssh_log.clone();
     let probe = tokio::task::spawn_blocking(move || {
-        crate::health::probe(backend, &db_path, ssh_log.as_deref(), &paths)
+        crate::health::probe(backend, &db_path, ssh_log.as_deref(), &paths, &conf_d)
     })
     .await
     .map_err(|err| anyhow::anyhow!("the health-probe thread panicked: {err}"))?;

@@ -1552,7 +1552,11 @@ fn run_status(
             .path()
             .unwrap_or_else(|| PathBuf::from("./stop-bots.sqlite3"));
         let paths = stop_bots::logpaths::LogPaths::from_db(&db).unwrap_or_default();
-        let probe = health::probe(backend, &path, ssh_log.as_deref(), &paths);
+        let conf_d = stop_bots::nginx::conf_d_dir(
+            &stop_bots::nginx::root(&db, None)
+                .unwrap_or_else(|_| PathBuf::from(stop_bots::nginx::DEFAULT_ROOT)),
+        );
+        let probe = health::probe(backend, &path, ssh_log.as_deref(), &paths, &conf_d);
         health::store_probe(&db, &probe)?;
         (health::assess(&db, &probe)?, None)
     };

@@ -556,6 +556,7 @@ fn short_check_label(id: &str) -> String {
         "firewall-persists" => "reboot",
         "script-fresh" => "script",
         "nginx-applied" => "nginx",
+        "generated-files-reachable" => "files",
         "service-health" => "console",
         "disk-room" => "disk",
         "database-size" => "database",

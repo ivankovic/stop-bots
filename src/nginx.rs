@@ -344,15 +344,42 @@ pub const CONF_D_DIR: &str = "/etc/nginx/conf.d";
 /// [`MANAGED_DIR_ENV`].
 pub const CONF_D_DIR_ENV: &str = "STOP_BOTS_NGINX_CONF_D";
 
-pub fn conf_d_dir() -> PathBuf {
-    std::env::var_os(CONF_D_DIR_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(CONF_D_DIR))
+/// Where this host's `conf.d` actually is: the environment override if
+/// one is set, else `conf.d` under the stored NGINX root.
+///
+/// Derived from [`root`] rather than fixed, and that is the whole point.
+/// An NGINX in a container keeps its config tree somewhere like
+/// `/srv/app/nginx`; `scan-sites` stores that as `nginx:root` and every
+/// site file is found and rewritten there. The `http`-context files this
+/// module also generates went to [`CONF_D_DIR`] regardless — a directory
+/// that on such a host does not exist until this code creates it, and
+/// that NGINX never reads.
+///
+/// The failure that produced was not a missing feature but a broken
+/// server: `write_managed_files` runs first and reported success, the
+/// site blocks were then rewritten to read `$stop_bots_trusted`, and only
+/// the reload found out that nothing defined it. NGINX refuses to load
+/// such a config at all, so the *whole* server — every unrelated site
+/// included — was one restart away from not coming back.
+///
+/// Takes the root already resolved rather than reading it back out of the
+/// database, because [`root`] lets a `--root` flag win over the stored
+/// setting and the two must not disagree: `apply-blocks --root /tmp/x`
+/// discovering sites under `/tmp/x` while writing their `http`-context
+/// files under the stored root is the same bug wearing a different hat.
+///
+/// Unchanged for a normal host install: [`root`] falls back to
+/// [`DEFAULT_ROOT`], so this still resolves to [`CONF_D_DIR`].
+pub fn conf_d_dir(root: &Path) -> PathBuf {
+    match std::env::var_os(CONF_D_DIR_ENV) {
+        Some(dir) => PathBuf::from(dir),
+        None => root.join("conf.d"),
+    }
 }
 
 /// The generated `limit_req_zone` file.
-pub fn rate_limit_conf_path() -> PathBuf {
-    conf_d_dir().join("stop-bots-limits.conf")
+pub fn rate_limit_conf_path(conf_d: &Path) -> PathBuf {
+    conf_d.join("stop-bots-limits.conf")
 }
 
 /// The generated trust file: which clients no block applies to.
@@ -362,8 +389,8 @@ pub fn rate_limit_conf_path() -> PathBuf {
 /// ask "is this address inside that CIDR" — a server-level `if` can only
 /// compare `$remote_addr` as text, which cannot express a /28, let alone
 /// the many spellings of an IPv6 prefix.
-pub fn trusted_conf_path() -> PathBuf {
-    conf_d_dir().join("stop-bots-trusted.conf")
+pub fn trusted_conf_path(conf_d: &Path) -> PathBuf {
+    conf_d.join("stop-bots-trusted.conf")
 }
 
 /// The variable the trust file defines: `1` for a trusted client, `0`
@@ -396,8 +423,8 @@ const UNTRUSTED_RATE_LIMIT_ZONE: &str = "stop_bots_untrusted";
 /// exist exactly when both rate limiting is on and something is trusted,
 /// and a file of its own gets the write-before, remove-after lifecycle
 /// every other generated file already has.
-pub fn untrusted_rate_limit_conf_path() -> PathBuf {
-    conf_d_dir().join("stop-bots-limits-untrusted.conf")
+pub fn untrusted_rate_limit_conf_path(conf_d: &Path) -> PathBuf {
+    conf_d.join("stop-bots-limits-untrusted.conf")
 }
 
 /// The shared memory zone name used by both the generated
@@ -806,8 +833,8 @@ fn trust_file_is_current(config: &BlockConfig, on_disk: Option<&str>) -> bool {
 ///
 /// Deliberately does not delete anything — see
 /// [`remove_unused_managed_files`] for why the two halves are separate.
-pub fn write_managed_files(db: &crate::db::Db) -> Result<usize> {
-    write_planned_managed_files(&planned_managed_files(db)?)
+pub fn write_managed_files(db: &crate::db::Db, root: &Path) -> Result<usize> {
+    write_planned_managed_files(&planned_managed_files(db, root)?)
 }
 
 /// The managed files the current settings call for, as `(path, body)`
@@ -818,7 +845,8 @@ pub fn write_managed_files(db: &crate::db::Db) -> Result<usize> {
 /// the main thread (`Db` isn't `Sync`) and writes it on a background
 /// thread, so an apply doesn't stall the event loop. The CLI still calls
 /// [`write_managed_files`], which does both in one go.
-pub fn planned_managed_files(db: &crate::db::Db) -> Result<Vec<(PathBuf, String)>> {
+pub fn planned_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let conf_d = conf_d_dir(root);
     let mut files = Vec::new();
     if db.get_serve_robots_txt()? {
         files.push((robots_txt_path(), robots_txt_body(db)?));
@@ -829,7 +857,7 @@ pub fn planned_managed_files(db: &crate::db::Db) -> Result<Vec<(PathBuf, String)
     // two should leave the definition behind, not the reference.
     let trust = trusted_conf(db)?;
     if let Some(body) = &trust {
-        files.push((trusted_conf_path(), body.clone()));
+        files.push((trusted_conf_path(&conf_d), body.clone()));
     }
     if db.get_rate_limit_enabled()? {
         let (rps, megabytes) = (db.get_rate_limit_rps()?, db.get_rate_limit_zone_mb()?);
@@ -838,10 +866,13 @@ pub fn planned_managed_files(db: &crate::db::Db) -> Result<Vec<(PathBuf, String)
         // is only safe once none does — which is `unused_managed_files`'s
         // job, and it would have to know which zone every site on disk
         // names. An idle zone costs its shared memory and nothing else.
-        files.push((rate_limit_conf_path(), rate_limit_conf_body(rps, megabytes)));
+        files.push((
+            rate_limit_conf_path(&conf_d),
+            rate_limit_conf_body(rps, megabytes),
+        ));
         if trust.is_some() {
             files.push((
-                untrusted_rate_limit_conf_path(),
+                untrusted_rate_limit_conf_path(&conf_d),
                 untrusted_rate_limit_conf_body(rps, megabytes),
             ));
         }
@@ -880,14 +911,15 @@ pub fn write_planned_managed_files(files: &[(PathBuf, String)]) -> Result<usize>
 /// leaves a working NGINX rather than one that won't reload at all.
 ///
 /// A missing file is success, not an error.
-pub fn remove_unused_managed_files(db: &crate::db::Db) -> Result<usize> {
-    remove_planned_managed_files(&unused_managed_files(db)?)
+pub fn remove_unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<usize> {
+    remove_planned_managed_files(&unused_managed_files(db, root)?)
 }
 
 /// The managed files the current settings no longer reference. Split from
 /// the removal for the same reason [`planned_managed_files`] is split from
 /// the write.
-pub fn unused_managed_files(db: &crate::db::Db) -> Result<Vec<PathBuf>> {
+pub fn unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<PathBuf>> {
+    let conf_d = conf_d_dir(root);
     let mut paths = Vec::new();
     if !db.get_serve_robots_txt()? {
         paths.push(robots_txt_path());
@@ -895,16 +927,16 @@ pub fn unused_managed_files(db: &crate::db::Db) -> Result<Vec<PathBuf>> {
     let rate_limited = db.get_rate_limit_enabled()?;
     let trusted = trusted_conf(db)?.is_some();
     if !rate_limited {
-        paths.push(rate_limit_conf_path());
+        paths.push(rate_limit_conf_path(&conf_d));
     }
     // Before the trust file: it reads a variable the trust file defines,
     // so for the moment between the two deletions it must be this one
     // that is already gone.
     if !(rate_limited && trusted) {
-        paths.push(untrusted_rate_limit_conf_path());
+        paths.push(untrusted_rate_limit_conf_path(&conf_d));
     }
     if !trusted {
-        paths.push(trusted_conf_path());
+        paths.push(trusted_conf_path(&conf_d));
     }
     Ok(paths)
 }
@@ -1647,6 +1679,7 @@ pub fn site_apply_status(
     config_path: &Path,
     server_name: &str,
     config: &BlockConfig,
+    conf_d: &Path,
 ) -> SiteApplyStatus {
     let Ok(content) = fs::read_to_string(config_path) else {
         return SiteApplyStatus::NotFound;
@@ -1662,7 +1695,7 @@ pub fn site_apply_status(
     let trust_on_disk = config
         .trust
         .as_ref()
-        .and_then(|_| fs::read_to_string(trusted_conf_path()).ok());
+        .and_then(|_| fs::read_to_string(trusted_conf_path(conf_d)).ok());
     if matching
         .iter()
         .all(|block| current_block_text(&content, block) == block_text(&for_block(config, block)))
@@ -1739,7 +1772,7 @@ pub struct ApplyAllOutcome {
 /// them, and unreferenced ones are deleted only *after* every config has
 /// been rewritten (see [`remove_unused_managed_files`]).
 pub fn apply_all_sites(db: &crate::db::Db, root: &Path) -> Result<ApplyAllOutcome> {
-    let mut changed = write_managed_files(db)?;
+    let mut changed = write_managed_files(db, root)?;
     let default_config = default_block_config(db)?;
     // Sites already known to the db (i.e. previously scanned) — the only
     // ones that can carry a per-site override at all.
@@ -1775,7 +1808,7 @@ pub fn apply_all_sites(db: &crate::db::Db, root: &Path) -> Result<ApplyAllOutcom
 
     // Only now that every config has been rewritten is it safe to delete a
     // generated file the new config no longer references.
-    changed += remove_unused_managed_files(db)?;
+    changed += remove_unused_managed_files(db, root)?;
 
     Ok(ApplyAllOutcome {
         sites: sites.len(),
@@ -2138,6 +2171,14 @@ mod tests {
 
     const FIXTURES_ROOT: &str = "tests/fixtures/nginx";
 
+    /// Every `site_apply_status` test here leaves `trust` unset, so the
+    /// trust file is never read and this path is never touched. Named
+    /// rather than repeated inline so that a test which *does* set
+    /// `trust` stands out by passing a real directory.
+    fn no_trust_file() -> &'static Path {
+        Path::new("/nonexistent/conf.d")
+    }
+
     /// A [`BlockConfig`] with the default 403 response, for the many tests
     /// that only care about which patterns end up in the file.
     fn cfg(patterns: &[&str]) -> BlockConfig {
@@ -2355,6 +2396,7 @@ mod tests {
             Path::new("/nonexistent/does-not-exist.conf"),
             "example.com",
             &cfg(&["BadBot"]),
+            no_trust_file(),
         );
         assert_eq!(status, SiteApplyStatus::NotFound);
     }
@@ -2365,7 +2407,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        let status = site_apply_status(&path, "b.example", &cfg(&["BadBot"]));
+        let status = site_apply_status(&path, "b.example", &cfg(&["BadBot"]), no_trust_file());
         assert_eq!(status, SiteApplyStatus::NotFound);
     }
 
@@ -2375,7 +2417,8 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        let status = site_apply_status(&path, "a.example", &BlockConfig::default());
+        let status =
+            site_apply_status(&path, "a.example", &BlockConfig::default(), no_trust_file());
         assert_eq!(status, SiteApplyStatus::UpToDate);
     }
 
@@ -2385,7 +2428,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        let status = site_apply_status(&path, "a.example", &cfg(&["BadBot"]));
+        let status = site_apply_status(&path, "a.example", &cfg(&["BadBot"]), no_trust_file());
         assert_eq!(status, SiteApplyStatus::Stale);
     }
 
@@ -2396,7 +2439,12 @@ mod tests {
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
         apply_block_for_site(&path, "a.example", &cfg(&["BadBot", "EvilBot"])).unwrap();
 
-        let status = site_apply_status(&path, "a.example", &cfg(&["BadBot", "EvilBot"]));
+        let status = site_apply_status(
+            &path,
+            "a.example",
+            &cfg(&["BadBot", "EvilBot"]),
+            no_trust_file(),
+        );
         assert_eq!(status, SiteApplyStatus::UpToDate);
     }
 
@@ -2414,7 +2462,7 @@ mod tests {
         .unwrap();
         apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
 
-        let status = site_apply_status(&path, "a.example", &cfg(&["BadBot"]));
+        let status = site_apply_status(&path, "a.example", &cfg(&["BadBot"]), no_trust_file());
         assert_eq!(status, SiteApplyStatus::UpToDate);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -2429,7 +2477,7 @@ mod tests {
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
         apply_block_for_site(&path, "a.example", &cfg(&["OldBot"])).unwrap();
 
-        let status = site_apply_status(&path, "a.example", &cfg(&["NewBot"]));
+        let status = site_apply_status(&path, "a.example", &cfg(&["NewBot"]), no_trust_file());
         assert_eq!(status, SiteApplyStatus::Stale);
     }
 
@@ -2631,7 +2679,7 @@ mod tests {
         let config = BlockConfig::new(patterns, BlockResponse::Forbidden);
         apply_block_for_site(&path, "a.example", &config).unwrap();
 
-        let status = site_apply_status(&path, "a.example", &config);
+        let status = site_apply_status(&path, "a.example", &config, no_trust_file());
         assert_eq!(status, SiteApplyStatus::UpToDate);
     }
 
@@ -2691,11 +2739,11 @@ mod tests {
         apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
 
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg(&["BadBot"])),
+            site_apply_status(&path, "a.example", &cfg(&["BadBot"]), no_trust_file()),
             SiteApplyStatus::UpToDate
         );
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_444(&["BadBot"])),
+            site_apply_status(&path, "a.example", &cfg_444(&["BadBot"]), no_trust_file()),
             SiteApplyStatus::Stale
         );
     }
@@ -2716,7 +2764,7 @@ mod tests {
         // Still exactly one sentinel block, not a second one appended.
         assert_eq!(written.matches(BLOCK_BEGIN).count(), 1);
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_444(&["BadBot"])),
+            site_apply_status(&path, "a.example", &cfg_444(&["BadBot"]), no_trust_file()),
             SiteApplyStatus::UpToDate
         );
     }
@@ -2778,7 +2826,12 @@ mod tests {
         apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
 
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_robots(&["BadBot"])),
+            site_apply_status(
+                &path,
+                "a.example",
+                &cfg_robots(&["BadBot"]),
+                no_trust_file()
+            ),
             SiteApplyStatus::Stale
         );
     }
@@ -2971,15 +3024,15 @@ mod tests {
         apply_block_for_site(&path, "a.example", &cfg_rate(20)).unwrap();
 
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_rate(20)),
+            site_apply_status(&path, "a.example", &cfg_rate(20), no_trust_file()),
             SiteApplyStatus::UpToDate
         );
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_rate(50)),
+            site_apply_status(&path, "a.example", &cfg_rate(50), no_trust_file()),
             SiteApplyStatus::Stale
         );
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg(&["BadBot"])),
+            site_apply_status(&path, "a.example", &cfg(&["BadBot"]), no_trust_file()),
             SiteApplyStatus::Stale
         );
     }
@@ -3159,13 +3212,23 @@ mod tests {
         apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
 
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_exempt(&["BadBot"], &["/blog"])),
+            site_apply_status(
+                &path,
+                "a.example",
+                &cfg_exempt(&["BadBot"], &["/blog"]),
+                no_trust_file()
+            ),
             SiteApplyStatus::Stale
         );
 
         apply_block_for_site(&path, "a.example", &cfg_exempt(&["BadBot"], &["/blog"])).unwrap();
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_exempt(&["BadBot"], &["/blog"])),
+            site_apply_status(
+                &path,
+                "a.example",
+                &cfg_exempt(&["BadBot"], &["/blog"]),
+                no_trust_file()
+            ),
             SiteApplyStatus::UpToDate
         );
     }
@@ -3357,7 +3420,7 @@ mod tests {
         let config = cfg_http1x(&["BadBot"]);
         apply_block_for_site(&path, "a.example", &config).unwrap();
         assert_eq!(
-            site_apply_status(&path, "a.example", &config),
+            site_apply_status(&path, "a.example", &config, no_trust_file()),
             SiteApplyStatus::UpToDate
         );
     }
@@ -3374,7 +3437,12 @@ mod tests {
         apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
 
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_http1x(&["BadBot"])),
+            site_apply_status(
+                &path,
+                "a.example",
+                &cfg_http1x(&["BadBot"]),
+                no_trust_file()
+            ),
             SiteApplyStatus::Stale
         );
     }
@@ -3567,6 +3635,101 @@ mod tests {
             1
         );
         assert_eq!(remove_planned_managed_files(&[path]).unwrap(), 0);
+    }
+
+    /// The bug this family exists to prevent, and the one that actually
+    /// happened on a host in September 2026: the `http`-context files went
+    /// to a fixed `/etc/nginx/conf.d` while every site file was found and
+    /// rewritten under the stored root. NGINX never read that directory,
+    /// so the blocks referenced `$stop_bots_trusted` with nothing defining
+    /// it — and NGINX refuses to load such a config at all, so one restart
+    /// would have taken down every site on the box, not just the one
+    /// setting had gone wrong.
+    #[test]
+    fn the_generated_http_files_land_under_the_stored_nginx_root() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_text_setting(NginxCommands::ROOT_KEY, "/srv/domaci/nginx")
+            .unwrap();
+        db.trust_user_agent("Nextcloud").unwrap();
+        db.set_rate_limit_enabled(true).unwrap();
+
+        let planned: Vec<PathBuf> = planned_managed_files(&db, &root(&db, None).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+
+        for name in [
+            "stop-bots-trusted.conf",
+            "stop-bots-limits.conf",
+            "stop-bots-limits-untrusted.conf",
+        ] {
+            let expected = PathBuf::from("/srv/domaci/nginx/conf.d").join(name);
+            assert!(
+                planned.contains(&expected),
+                "{name} must be written where NGINX reads it; planned:\n{planned:#?}"
+            );
+        }
+    }
+
+    /// The removal half has to look in the same place, or switching rate
+    /// limiting off deletes nothing and leaves a live `limit_req_zone`
+    /// behind while no site names it.
+    #[test]
+    fn the_removal_half_looks_in_the_same_directory() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.set_text_setting(NginxCommands::ROOT_KEY, "/srv/domaci/nginx")
+            .unwrap();
+
+        let unused = unused_managed_files(&db, &root(&db, None).unwrap()).unwrap();
+        for name in ["stop-bots-trusted.conf", "stop-bots-limits.conf"] {
+            let expected = PathBuf::from("/srv/domaci/nginx/conf.d").join(name);
+            assert!(
+                unused.contains(&expected),
+                "{name} must be removed from where it was written; unused:\n{unused:#?}"
+            );
+        }
+    }
+
+    /// A normal host install must be exactly as it was. `root` falls back
+    /// to `/etc/nginx`, so this resolves to the stock path without the
+    /// setting existing at all.
+    #[test]
+    fn conf_d_falls_back_to_the_stock_path_when_no_root_is_stored() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        assert_eq!(
+            conf_d_dir(&root(&db, None).unwrap()),
+            PathBuf::from(CONF_D_DIR)
+        );
+    }
+
+    /// The staleness check reads the trust file too, and has to read it
+    /// from the same directory it is written to. Reading the wrong one
+    /// finds nothing, which is indistinguishable from an out-of-date file:
+    /// every site would report `Stale` for ever, and an operator applying
+    /// again would change nothing and be told so.
+    #[test]
+    fn site_apply_status_reads_the_trust_file_from_the_given_conf_d() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf_d = dir.path().join("conf.d");
+        fs::create_dir_all(&conf_d).unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+        let config = cfg_trusted(&["BadBot"]);
+        apply_block_for_site(&path, "a.example", &config).unwrap();
+
+        assert_eq!(
+            site_apply_status(&path, "a.example", &config, &conf_d),
+            SiteApplyStatus::Stale,
+            "the block is applied but the trust file it reads is not there yet"
+        );
+
+        fs::write(conf_d.join("stop-bots-trusted.conf"), trust_body()).unwrap();
+        assert_eq!(
+            site_apply_status(&path, "a.example", &config, &conf_d),
+            SiteApplyStatus::UpToDate,
+            "with the file in place the site is applied"
+        );
     }
 
     // ---- request-shape rules ----
@@ -3777,11 +3940,21 @@ mod tests {
         apply_block_for_site(&path, "a.example", &cfg_response(BlockResponse::Gone)).unwrap();
 
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_response(BlockResponse::Gone)),
+            site_apply_status(
+                &path,
+                "a.example",
+                &cfg_response(BlockResponse::Gone),
+                no_trust_file()
+            ),
             SiteApplyStatus::UpToDate
         );
         assert_eq!(
-            site_apply_status(&path, "a.example", &cfg_response(BlockResponse::Tarpit)),
+            site_apply_status(
+                &path,
+                "a.example",
+                &cfg_response(BlockResponse::Tarpit),
+                no_trust_file()
+            ),
             SiteApplyStatus::Stale
         );
     }

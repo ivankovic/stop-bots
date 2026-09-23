@@ -915,9 +915,14 @@ impl Nginx {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(ApplyPlan {
-            managed_writes: nginx::planned_managed_files(db)?,
+            // `self.root`, not the stored setting: this screen was given
+            // a root (a `--root` flag beats it), and generating the
+            // `http`-context files under a different one than the site
+            // files are being written to is the bug `conf_d_dir` exists
+            // to prevent, one layer up.
+            managed_writes: nginx::planned_managed_files(db, &self.root)?,
             managed_removals: match action {
-                SiteAction::ApplyAll => nginx::unused_managed_files(db)?,
+                SiteAction::ApplyAll => nginx::unused_managed_files(db, &self.root)?,
                 _ => Vec::new(),
             },
             sites,
@@ -1059,10 +1064,17 @@ impl Nginx {
 /// Reads each planned site's config file and compares it against the block
 /// that site's settings currently render to. Runs on a background thread
 /// and touches no `Db`.
-pub fn run_status_check(sites: &[PlannedSite]) -> Vec<SiteApplyStatus> {
+///
+/// `conf_d` is resolved by the caller for that reason: the comparison also
+/// reads the trust file, which lives beside the site configs rather than
+/// in `/etc/nginx` (see [`nginx::conf_d_dir`]), and working that out needs
+/// the database this function deliberately cannot see.
+pub fn run_status_check(sites: &[PlannedSite], conf_d: &Path) -> Vec<SiteApplyStatus> {
     sites
         .iter()
-        .map(|site| nginx::site_apply_status(&site.config_path, &site.server_name, &site.config))
+        .map(|site| {
+            nginx::site_apply_status(&site.config_path, &site.server_name, &site.config, conf_d)
+        })
         .collect()
 }
 
@@ -1230,7 +1242,8 @@ mod tests {
     fn refresh_with_statuses(screen: &mut Nginx, db: &Db) {
         screen.refresh(db).unwrap();
         let plan = screen.plan_status_check(db).unwrap();
-        screen.finish_status_check(run_status_check(&plan));
+        let conf_d = nginx::conf_d_dir(screen.root());
+        screen.finish_status_check(run_status_check(&plan, &conf_d));
     }
 
     /// Presses Enter on an open confirm popup and carries out whatever it

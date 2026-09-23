@@ -6438,3 +6438,87 @@ otherwise drift, and the two hooks would disagree.
 The container suite's networks use `198.51.100.0/24` so that clients read
 as public. The regression test uses `Network::create_private`, a
 `172.31.255.0/24` slice, because being private is the whole point there.
+
+## The fourth thing a containerised NGINX moves (`nginx::conf_d_dir`, `health::stray_generated_files`)
+
+**The bug.** On a host whose NGINX runs in a container with its config on a
+bind mount, `apply-blocks` rewrote every site file under the stored root and
+then failed its reload with `nginx: [emerg] unknown "stop_bots_trusted"
+variable`. The `http`-context files this module generates — the trust file
+and the two `limit_req_zone` files — went to a fixed `/etc/nginx/conf.d`
+whatever `nginx:root` said. On that host `/etc/nginx` did not exist at all
+until this code created it, and the NGINX serving the sites never read it.
+
+`root` had already been introduced as "the third thing a containerised NGINX
+moves", after the commands that drive it and the logs it writes. The
+directory those generated files go in is the same thing again, and it was
+missed because `discover_sites` walks the root while these three paths were
+built from a constant.
+
+**Why it was worse than a missing feature.** `write_managed_files` runs
+before any site config is touched, precisely so a `limit_req` never names a
+zone that is not there yet, and it reported success — it had written the
+files, just nowhere useful. The site blocks were then rewritten to read
+`$stop_bots_trusted`. NGINX does not degrade when a referenced variable has
+no definition; it refuses to load the configuration at all. The running
+NGINX kept serving because the reload had failed, so nothing was visibly
+wrong — while every site on the host, including the ones this tool had never
+touched, was one container restart away from not coming back.
+
+**The fix.** `conf_d_dir` takes a `&Db` and returns `root(db, None)?.join("conf.d")`,
+with the environment override kept ahead of it for the end-to-end tests.
+Because `root` falls back to `DEFAULT_ROOT`, a normal host install still
+resolves to `/etc/nginx/conf.d` with no setting present — the default is
+unchanged, which is what makes this safe to ship as a patch release. The
+three path helpers take the directory as an argument rather than reaching
+for a constant, so there is no second place that can disagree about where
+the files are.
+
+`site_apply_status` takes the directory too. It reads the trust file to
+decide whether a site is current, and reading the wrong one finds nothing —
+indistinguishable from an out-of-date file. Every site would have reported
+`Stale` for ever, and applying again would have changed nothing and said so.
+That is why `run_status_check` grew a parameter instead of resolving it
+itself: it runs on a background thread and deliberately cannot see the `Db`.
+
+**The check.** `status` gains "Generated files are where NGINX reads them",
+which names the directory even when the answer is fine — for the reason the
+access-log check carries its path: an operator cannot act on "the generated
+files are fine" without knowing which directory that means. It warns when
+that directory does not exist, and, more usefully, when files this project
+generated are sitting in the stock `conf.d` while the active one is
+somewhere else. That is what upgrading such a host leaves behind:
+`unused_managed_files` now looks in the right place, so it will never
+collect them, and on a host that also runs an NGINX from the stock tree they
+are live configuration nobody meant to write. Only the three names this
+project generates are looked for — a directory listing would be the wrong
+instrument, since everything else in there belongs to someone else.
+
+The two directories are compared after resolving links. The quickest way out
+of this bug, before an upgrade is available, is to point the stock path at
+the real one; the check would then find the operator's own live trust file
+through that link and tell them to delete it. Falling back to a literal
+comparison keeps the question answerable on a host where neither path exists
+yet.
+
+**The flag, not just the setting.** `conf_d_dir` takes the root already
+resolved rather than reading it back from the database, because `root(db,
+flag)` lets `--root` win over the stored setting. `apply-blocks --root
+/tmp/x` discovering sites under `/tmp/x` while writing their
+`http`-context files under the stored root is the same bug wearing a
+different hat, and `tests/cli.rs` — which drives the binary exactly that
+way — is what found it. The TUI's NGINX screen passes its own `self.root`
+for the same reason: it was given one, and the site files it rewrites go
+there.
+
+**Test isolation, found the hard way.** The pty helpers in `tests/tui.rs`
+had never set `STOP_BOTS_NGINX_DIR` or `STOP_BOTS_NGINX_CONF_D`, so the
+TUI under test wrote to, and deleted from, the host's real `/etc/nginx/conf.d`.
+That is invisible in CI, where the directory is empty, and it goes red on a
+developer machine that also *runs* stop-bots: a root-owned generated file
+there makes an apply fail with a permission error, the screen raises an
+alert popup, and the next keypress dismisses the popup instead of changing
+screen — so the failure surfaces as a pty timeout waiting for a word on a
+screen the test never reached. `tests/cli.rs`'s fixture had set both from
+the start; the pty helpers now do too, into one temp tree per binary, since
+nothing there asserts on a generated file.

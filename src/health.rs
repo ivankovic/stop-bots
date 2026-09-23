@@ -176,6 +176,24 @@ pub struct Probe {
     /// can say: the operator's next question is always which file.
     #[serde(default)]
     pub access_log_path: Option<String>,
+    /// The `conf.d` the generated `http`-context files go into, named so
+    /// that a check can say which directory it means — for the reason
+    /// [`Self::access_log_path`] is carried.
+    #[serde(default)]
+    pub conf_d_path: Option<String>,
+    /// Whether that directory exists. `None` when it could not be asked.
+    #[serde(default)]
+    pub conf_d_exists: Option<bool>,
+    /// Generated files found in the *stock* `conf.d` while the active one
+    /// is somewhere else.
+    ///
+    /// Not tidiness. Before 0.0.9 these were written to a fixed
+    /// `/etc/nginx/conf.d` whatever `nginx:root` said, so upgrading a host
+    /// whose NGINX reads its config from elsewhere leaves a full set
+    /// behind — and `unused_managed_files` will never collect them, since
+    /// it now looks in the right place.
+    #[serde(default)]
+    pub stray_generated_files: Vec<String>,
     /// Where the NGINX that serves this host's config actually runs.
     pub nginx_home: NginxHome,
     /// Whether [`crate::nginx::managed_dir`] resolves, at the same path,
@@ -267,6 +285,7 @@ pub fn probe(
     db_path: &Path,
     ssh_log: Option<&Path>,
     paths: &crate::logpaths::LogPaths,
+    conf_d: &Path,
 ) -> Probe {
     let live = live_firewall(backend);
     let (live_rules, live_backend) = match &live {
@@ -285,6 +304,9 @@ pub fn probe(
     Probe {
         live_rules,
         live_backend,
+        conf_d_path: Some(conf_d.display().to_string()),
+        conf_d_exists: Some(conf_d.is_dir()),
+        stray_generated_files: stray_generated_files(conf_d, Path::new(crate::nginx::CONF_D_DIR)),
         firewall_persists: firewall_persists(backend),
         nftables_conf_flushes: nftables_conf_flushes(),
         unit_active: unit_is_active(),
@@ -329,6 +351,39 @@ pub fn probe(
             .is_some_and(|mode| mode.trim() == "host")
         }),
     }
+}
+
+/// Generated files sitting in the stock `conf.d` while the active one is
+/// elsewhere — see [`Probe::stray_generated_files`].
+///
+/// Only the three this project generates, by name. A directory listing
+/// would be the wrong instrument: on a host that really does run a second
+/// NGINX from the stock tree, everything else in there belongs to someone
+/// else.
+fn stray_generated_files(conf_d: &Path, stock: &Path) -> Vec<String> {
+    // Compared after resolving links, because the obvious workaround for
+    // the bug this catches is to point the stock path at the real one --
+    // and then the "stranded" file and the live one are the same file, and
+    // reporting it would send an operator to delete their own config.
+    // Falling back to a literal comparison keeps this answerable on a host
+    // where neither path exists yet.
+    let same = match (conf_d.canonicalize(), stock.canonicalize()) {
+        (Ok(active), Ok(stock)) => active == stock,
+        _ => conf_d == stock,
+    };
+    if same {
+        return Vec::new();
+    }
+    [
+        "stop-bots-trusted.conf",
+        "stop-bots-limits.conf",
+        "stop-bots-limits-untrusted.conf",
+    ]
+    .into_iter()
+    .map(|name| stock.join(name))
+    .filter(|path| path.exists())
+    .map(|path| path.display().to_string())
+    .collect()
 }
 
 /// Whether `program` ran and exited zero. A program that could not be
@@ -654,6 +709,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(firewall_persistence(probe, backend));
     checks.push(script_freshness(db, expected)?);
     checks.push(nginx_applied(db)?);
+    checks.push(generated_files_reachable(probe));
     checks.push(service_health(probe));
     checks.push(disk_room(probe));
     checks.push(database_size(db)?);
@@ -675,6 +731,63 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
         checks,
         checked_at: now_secs(),
     })
+}
+
+/// Whether the files NGINX has to read for the generated blocks to work
+/// are somewhere NGINX actually reads.
+///
+/// The blocks reference `$stop_bots_trusted` and `limit_req zone=...`;
+/// both are defined in `http`-context files in `conf.d`, and NGINX does
+/// not degrade when one is missing — it refuses to load the config at
+/// all, so a single wrong directory takes down every site on the host at
+/// the next reload or restart. That is not a hypothetical: it is what
+/// this check was written after.
+fn generated_files_reachable(probe: &Probe) -> Check {
+    let where_it_writes = probe
+        .conf_d_path
+        .as_deref()
+        .unwrap_or(crate::nginx::CONF_D_DIR);
+    let (level, detail, fix) = if !probe.stray_generated_files.is_empty() {
+        (
+            Level::Warn,
+            format!(
+                "writing to {where_it_writes}, but an older version left {} file(s) in {}: {}",
+                probe.stray_generated_files.len(),
+                crate::nginx::CONF_D_DIR,
+                probe.stray_generated_files.join(", ")
+            ),
+            Some(format!(
+                "delete them — nothing collects them now, and on a host that also runs an NGINX \
+                 from {} they are live config nobody meant to write",
+                crate::nginx::CONF_D_DIR
+            )),
+        )
+    } else {
+        match probe.conf_d_exists {
+            None => (
+                Level::Unknown,
+                format!("could not tell whether {where_it_writes} exists"),
+                None,
+            ),
+            Some(false) => (
+                Level::Warn,
+                format!("{where_it_writes} does not exist"),
+                Some(
+                    "check `nginx:root` — the generated files go in `conf.d` under it, and NGINX \
+                     has to be the one reading that directory"
+                        .to_string(),
+                ),
+            ),
+            Some(true) => (Level::Ok, format!("writing to {where_it_writes}"), None),
+        }
+    };
+    Check {
+        id: "generated-files-reachable",
+        title: "Generated files are where NGINX reads them",
+        level,
+        detail,
+        fix,
+    }
 }
 
 /// The check this module exists for.
@@ -933,10 +1046,15 @@ fn nginx_applied(db: &Db) -> Result<Check> {
     // `assess` rather than from `probe`, because it needs a per-site
     // `BlockConfig` that only the database can produce.
     let mut stale: Vec<String> = Vec::new();
+    let conf_d = nginx::conf_d_dir(&nginx::root(db, None)?);
     for site in sites {
         let config = nginx::block_config_for_site(db, site.id)?;
-        let status =
-            nginx::site_apply_status(Path::new(&site.config_path), &site.server_name, &config);
+        let status = nginx::site_apply_status(
+            Path::new(&site.config_path),
+            &site.server_name,
+            &config,
+            &conf_d,
+        );
         if status != SiteApplyStatus::UpToDate {
             stale.push(site.server_name);
         }
@@ -1483,6 +1601,9 @@ mod tests {
             nftables_conf_flushes: None,
             unit_active: Some(true),
             unit_binary: None,
+            conf_d_path: Some(crate::nginx::CONF_D_DIR.to_string()),
+            conf_d_exists: Some(true),
+            stray_generated_files: Vec::new(),
             db_free_bytes: Some(8 * 1024 * 1024 * 1024),
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
@@ -1564,6 +1685,118 @@ mod tests {
             check.detail.contains("systemctl reload nginx"),
             "it should name the command that reaches it: {}",
             check.detail
+        );
+    }
+
+    /// The ordinary answer, and it names the directory. "Generated files
+    /// are fine" is worth nothing to an operator who cannot tell which
+    /// directory the tool means — the same reason the access-log check
+    /// carries its path.
+    #[test]
+    fn the_generated_files_check_names_the_directory_it_writes_to() {
+        let report = assess(&db(), &healthy()).unwrap();
+
+        let check = check2(&report, "generated-files-reachable");
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check.detail.contains(crate::nginx::CONF_D_DIR),
+            "it should name the directory: {}",
+            check.detail
+        );
+    }
+
+    /// Upgrading a containerised host leaves the old copies behind:
+    /// before 0.0.9 they went to a fixed `/etc/nginx/conf.d` whatever
+    /// `nginx:root` said, and nothing collects them now that the removal
+    /// half looks in the right place.
+    #[test]
+    fn files_stranded_by_an_older_version_are_a_warning() {
+        let probe = Probe {
+            conf_d_path: Some("/srv/domaci/nginx/conf.d".to_string()),
+            stray_generated_files: vec!["/etc/nginx/conf.d/stop-bots-trusted.conf".to_string()],
+            ..healthy()
+        };
+        let report = assess(&db(), &probe).unwrap();
+
+        let check = check2(&report, "generated-files-reachable");
+        assert_eq!(check.level, Level::Warn);
+        for expected in ["/srv/domaci/nginx/conf.d", "stop-bots-trusted.conf"] {
+            assert!(
+                check.detail.contains(expected),
+                "the detail should name {expected}; it was: {}",
+                check.detail
+            );
+        }
+        assert!(check.fix.is_some(), "a stranded file is actionable");
+    }
+
+    /// A directory NGINX cannot read is the failure this check exists for.
+    /// It is only a warning because the check cannot prove NGINX globs
+    /// that path — but a directory that does not even exist is never the
+    /// one NGINX is reading.
+    #[test]
+    fn a_conf_d_that_does_not_exist_is_a_warning() {
+        let probe = Probe {
+            conf_d_path: Some("/srv/domaci/nginx/conf.d".to_string()),
+            conf_d_exists: Some(false),
+            ..healthy()
+        };
+        let report = assess(&db(), &probe).unwrap();
+
+        let check = check2(&report, "generated-files-reachable");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("does not exist"),
+            "was: {}",
+            check.detail
+        );
+    }
+
+    /// A generated file sitting in the stock directory while the active
+    /// one is elsewhere is what an upgrade leaves behind.
+    #[test]
+    fn a_generated_file_left_in_the_stock_directory_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let stock = dir.path().join("etc/nginx/conf.d");
+        let active = dir.path().join("srv/nginx/conf.d");
+        std::fs::create_dir_all(&stock).unwrap();
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(stock.join("stop-bots-trusted.conf"), "geo {}\n").unwrap();
+        std::fs::write(stock.join("unrelated.conf"), "server {}\n").unwrap();
+
+        assert_eq!(
+            stray_generated_files(&active, &stock),
+            vec![stock.join("stop-bots-trusted.conf").display().to_string()],
+            "only this project's own files, by name — the rest is someone else's"
+        );
+    }
+
+    /// Nothing is stranded when the stock directory *is* the active one —
+    /// on a normal host install the files there are the live ones.
+    #[test]
+    fn the_stock_directory_strands_nothing_when_it_is_the_active_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("stop-bots-trusted.conf"), "geo {}\n").unwrap();
+
+        assert!(stray_generated_files(dir.path(), dir.path()).is_empty());
+    }
+
+    /// Nor when the stock path has been *pointed at* the active one, which
+    /// is what an operator who hit this bug before 0.0.9 most likely did
+    /// to get their server back. Calling their live trust file stranded
+    /// would send them to delete it.
+    #[test]
+    fn a_link_from_the_stock_path_to_the_active_one_strands_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("srv/nginx/conf.d");
+        std::fs::create_dir_all(&active).unwrap();
+        std::fs::write(active.join("stop-bots-trusted.conf"), "geo {}\n").unwrap();
+        let stock = dir.path().join("etc-nginx-conf.d");
+        std::os::unix::fs::symlink(&active, &stock).unwrap();
+
+        assert!(
+            stray_generated_files(&active, &stock).is_empty(),
+            "the two paths resolve to one directory, so nothing is stranded"
         );
     }
 
