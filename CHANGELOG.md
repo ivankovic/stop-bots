@@ -5,6 +5,49 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [0.0.9] — 2026-09-23
+
+### Fixed
+
+- **Generated `http`-context files went to `/etc/nginx/conf.d` whatever
+  `nginx:root` said, which could stop NGINX loading at all.** On a host
+  whose NGINX runs in a container with its config on a bind mount,
+  `apply-blocks` rewrote every site file under the stored root and then
+  failed its reload with `unknown "stop_bots_trusted" variable`: the trust
+  file and the two `limit_req_zone` files had been written to a directory
+  that NGINX never reads, and on such a host frequently does not exist until
+  this code creates it.
+
+  This was not a cosmetic misplacement. NGINX refuses to load a
+  configuration that references an undefined variable, so the site blocks on
+  disk were unloadable — the running NGINX kept serving only because the
+  reload had failed, leaving every site on the host, including ones this
+  tool had never touched, one restart away from not coming back.
+
+  They now go in `conf.d` under the root actually in use, which means a
+  `--root` flag governs them too: `apply-blocks --root /tmp/x` no longer
+  discovers sites under one root while writing their `http`-context files
+  under another. A host that never set a root is unaffected — the fallback
+  is `/etc/nginx`, so the path is unchanged. Anyone whose NGINX config
+  lives elsewhere should set it (`stop-bots set-nginx-commands --root
+  /srv/app/nginx`) and delete the stale copies the previous versions left
+  in `/etc/nginx/conf.d`; `status` now points at them by name.
+
+- **Sites could report `Stale` for ever on such a host.** The per-site apply
+  status compares the trust file on disk against what the settings render
+  to, and it was reading it from the same wrong directory. Finding nothing
+  is indistinguishable from finding an out-of-date file, so applying again
+  changed nothing and said so.
+
+### Added
+
+- **`status` gains "Generated files are where NGINX reads them".** It names
+  the directory even when the answer is fine, warns when that directory does
+  not exist, and warns when files this project generated are stranded in
+  `/etc/nginx/conf.d` while the active directory is somewhere else — which
+  is what upgrading a containerised host leaves behind, and what nothing
+  collects now that the removal half looks in the right place.
+
 ## [0.0.8] — 2026-09-23
 
 ### Added
@@ -1202,7 +1245,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.9...HEAD
+[0.0.9]: https://github.com/ivankovic/stop-bots/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/ivankovic/stop-bots/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/ivankovic/stop-bots/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/ivankovic/stop-bots/compare/v0.0.5...v0.0.6
