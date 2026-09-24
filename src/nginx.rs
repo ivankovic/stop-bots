@@ -1382,7 +1382,8 @@ pub fn console_server_block(host: &str, upstream: &std::net::SocketAddr) -> Stri
          #\n\
          #     certbot --nginx -d {host}\n\
          #\n\
-         # then set `web:secure_cookie` so the cookie is HTTPS-only.\n\
+         # then pass `--secure-cookie true` to `stop-bots web` or\n\
+         # `stop-bots install web` so the cookie is HTTPS-only.\n\
          server {{\n    \
          listen 80;\n    \
          listen [::]:80;\n    \

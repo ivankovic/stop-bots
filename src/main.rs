@@ -835,6 +835,22 @@ enum Command {
         /// nowhere else for it to live.
         #[arg(long)]
         allowed_hosts: Option<String>,
+        /// Believe the last address in `X-Forwarded-For`, for when this
+        /// server sits behind a proxy on the same host. Without it every
+        /// proxied request comes from 127.0.0.1, so the login throttle and
+        /// the guard against blocking your own address cannot tell clients
+        /// apart. Leave it off unless there really is such a proxy.
+        ///
+        /// Always persisted, like --allowed-hosts.
+        #[arg(long, value_name = "true|false")]
+        trust_forwarded_for: Option<bool>,
+        /// Mark the session cookie `Secure`. Turn it on behind TLS, or a
+        /// browser will also send the session to an `http://` URL for the
+        /// same host. Off, a plain-HTTP console cannot keep you logged in.
+        ///
+        /// Always persisted, like --allowed-hosts.
+        #[arg(long, value_name = "true|false")]
+        secure_cookie: Option<bool>,
         /// Persist --bind and --expose, so a later plain `stop-bots web`
         /// starts the same way. Nothing is saved unless the address passes
         /// the exposure check first.
@@ -1077,6 +1093,12 @@ enum Command {
         /// Comma-separated host names the console will answer to.
         #[arg(long)]
         allowed_hosts: Option<String>,
+        /// Believe the last address in `X-Forwarded-For`. See `web`.
+        #[arg(long, value_name = "true|false")]
+        trust_forwarded_for: Option<bool>,
+        /// Mark the session cookie `Secure`. See `web`.
+        #[arg(long, value_name = "true|false")]
+        secure_cookie: Option<bool>,
     },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
@@ -1200,6 +1222,8 @@ async fn main() -> Result<()> {
             base_path,
             expose,
             allowed_hosts,
+            trust_forwarded_for,
+            secure_cookie,
         }) => match target {
             InstallTarget::Web => run_install_web(InstallWeb {
                 db,
@@ -1214,6 +1238,8 @@ async fn main() -> Result<()> {
                 base_path,
                 expose,
                 allowed_hosts,
+                trust_forwarded_for,
+                secure_cookie,
             }),
             InstallTarget::Firewall => run_install_firewall(binary, prefix, dry_run, force),
         },
@@ -1349,6 +1375,8 @@ async fn main() -> Result<()> {
             base_path,
             expose,
             allowed_hosts,
+            trust_forwarded_for,
+            secure_cookie,
             save,
             set_password,
             no_apply,
@@ -1362,6 +1390,10 @@ async fn main() -> Result<()> {
                 base_path,
                 expose,
                 allowed_hosts,
+                WebProxySettings {
+                    trust_forwarded_for,
+                    secure_cookie,
+                },
                 save,
                 set_password,
                 no_apply,
@@ -2284,6 +2316,28 @@ struct InstallWeb {
     base_path: Option<String>,
     expose: bool,
     allowed_hosts: Option<String>,
+    trust_forwarded_for: Option<bool>,
+    secure_cookie: Option<bool>,
+}
+
+/// The two console settings that only matter behind a proxy, as given on
+/// the command line: `None` leaves what is stored alone.
+struct WebProxySettings {
+    trust_forwarded_for: Option<bool>,
+    secure_cookie: Option<bool>,
+}
+
+impl WebProxySettings {
+    fn store(&self, db: &Db) -> Result<()> {
+        use stop_bots::web;
+        if let Some(on) = self.trust_forwarded_for {
+            db.set_bool_setting(web::TRUST_FORWARDED_KEY, on)?;
+        }
+        if let Some(on) = self.secure_cookie {
+            db.set_bool_setting(web::SECURE_COOKIE_KEY, on)?;
+        }
+        Ok(())
+    }
 }
 
 /// Writes and enables the unit that re-applies the rendered firewall
@@ -2455,6 +2509,11 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         if let Some(hosts) = &options.allowed_hosts {
             db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
         }
+        WebProxySettings {
+            trust_forwarded_for: options.trust_forwarded_for,
+            secure_cookie: options.secure_cookie,
+        }
+        .store(&db)?;
         steps.push(format!(
             "bind {addr} recorded in {}",
             layout.db_path.display()
@@ -2555,6 +2614,7 @@ async fn run_web(
     base_path: Option<String>,
     expose: bool,
     allowed_hosts: Option<String>,
+    proxy: WebProxySettings,
     save: bool,
     set_password: bool,
     no_apply: bool,
@@ -2603,10 +2663,12 @@ async fn run_web(
 
     // The host allowlist is read from the database on every request, so it
     // is stored whether or not --save was given — there is nowhere else for
-    // it to live. The flag's help says so.
+    // it to live. The flag's help says so. The same goes for the two proxy
+    // settings.
     if let Some(hosts) = &allowed_hosts {
         db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
     }
+    proxy.store(&db)?;
 
     if save {
         db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
@@ -2671,8 +2733,7 @@ async fn run_web(
             // proxy case that is otherwise fine.
             eprintln!(
                 "Note: the session cookie is not marked Secure, so a browser will also send \n\
-                 it to an http:// URL for this host. Behind TLS, set `{}` to true.",
-                web::SECURE_COOKIE_KEY
+                 it to an http:// URL for this host. Behind TLS, pass --secure-cookie true."
             );
         }
     }

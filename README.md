@@ -355,17 +355,19 @@ proxy sets `X-Forwarded-For`, tell the console it may believe that header, or it
 tell which address a request really came from:
 
 ```
-stop-bots web --bind 127.0.0.1:8787
+stop-bots web --bind 127.0.0.1:8787 --trust-forwarded-for true --secure-cookie true
 ```
 
-Behind TLS, also set `web:secure_cookie`. Without it a browser will send the session
-cookie to an `http://` URL for the same host as well.
+`--secure-cookie true` is for TLS. Without it a browser will send the session cookie to an
+`http://` URL for the same host as well. `stop-bots install web` takes both flags too, and
+for a service that is the place to set them. Both stay set until you pass `false`.
 
-`web:trust_forwarded_for` matters more than it looks. Without it every request behind a
+`--trust-forwarded-for` matters more than it looks. Without it every request behind a
 proxy arrives from `127.0.0.1`, so the console cannot tell one client from another — which
 means a flood of login attempts shares the same throttle bucket as you, and the guard that
 stops you blocking your own address has nothing to compare against. With it, both work
-per-client.
+per-client. The console believes only the last address in the header, the one the proxy
+itself added.
 
 ## Behind NGINX: a subdomain, or a path prefix
 

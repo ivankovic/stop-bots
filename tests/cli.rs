@@ -2714,6 +2714,39 @@ fn web_with_expose_and_save_persists_the_bind() {
     );
 }
 
+/// The two proxy settings are read from the database on every request, so
+/// like `--allowed-hosts` they are stored with or without `--save` — and
+/// `false` has to switch them back off, not just leave them alone.
+#[test]
+fn web_stores_the_proxy_settings_and_can_turn_them_off() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let run = |value: &str| {
+        stop_bots_cmd(&[
+            "web",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--trust-forwarded-for",
+            value,
+            "--secure-cookie",
+            value,
+            "--set-password",
+        ])
+        .assert()
+        .success();
+        let db = stop_bots::db::Db::open(&db_path).unwrap();
+        (
+            db.get_bool_setting(stop_bots::web::TRUST_FORWARDED_KEY, false)
+                .unwrap(),
+            db.get_bool_setting(stop_bots::web::SECURE_COOKIE_KEY, false)
+                .unwrap(),
+        )
+    };
+
+    assert_eq!(run("true"), (true, true));
+    assert_eq!(run("false"), (false, false));
+}
+
 /// `--set-password` stores a hash and prints the password once. The
 /// password itself must not survive anywhere this program can read it
 /// back.
@@ -2847,6 +2880,36 @@ fn install_web_run_twice_keeps_the_first_password() {
     );
     assert!(second.contains("already set"), "was: {second}");
     assert!(second.contains("already up to date"), "was: {second}");
+}
+
+/// A service is where the proxy settings are needed, and a second
+/// `stop-bots web` to set them would collide with the one systemd runs.
+#[test]
+fn install_web_stores_the_proxy_settings() {
+    let (tmp, binary) = fake_debian_root();
+    stop_bots_bin()
+        .args([
+            "install",
+            "web",
+            "--prefix",
+            tmp.path().to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+            "--trust-forwarded-for",
+            "true",
+            "--secure-cookie",
+            "true",
+        ])
+        .assert()
+        .success();
+
+    let db = stop_bots::db::Db::open(tmp.path().join("var/lib/stop-bots/db.sqlite3")).unwrap();
+    assert!(db
+        .get_bool_setting(stop_bots::web::TRUST_FORWARDED_KEY, false)
+        .unwrap());
+    assert!(db
+        .get_bool_setting(stop_bots::web::SECURE_COOKIE_KEY, false)
+        .unwrap());
 }
 
 /// `--dry-run` has to be trustworthy or nobody will use it on the one
