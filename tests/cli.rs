@@ -2367,6 +2367,55 @@ fn batch_records_its_run_against_the_internal_crons_schedule() {
     }
 }
 
+/// The report exists because nothing else in this tool answered "what is
+/// my own policy turning away" — which is how three first-party apps were
+/// blocked on a real host for days. Reading the log is the whole feature,
+/// so the end-to-end test reads a log.
+#[test]
+fn list_turned_away_names_the_refused_client_and_what_still_got_through() {
+    let fixture = Fixture::new();
+    let log = fixture.nginx_root.join("access.log");
+    let client = "Jellyfin Android TV/0.19.10 via jellyfin-sdk-kotlin (OkHttp/4.12.0)";
+    fs::write(
+        &log,
+        [
+            access_line("203.0.113.5", "/", 444, client),
+            access_line("203.0.113.5", "/", 444, client),
+            access_line("203.0.113.6", "/", 200, "Mozilla/5.0"),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    fixture.run(&["set-block-response", "--response", "close"]);
+
+    let out = fixture.run(&["list-turned-away", "--access-log", log.to_str().unwrap()]);
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+
+    assert!(
+        stdout.contains("Jellyfin Android TV"),
+        "the refused client must be named:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Mozilla/5.0"),
+        "a client that was never refused has nothing to report:\n{stdout}"
+    );
+}
+
+/// A host turning nobody away says so, rather than printing an empty
+/// table and leaving the reader to wonder whether it ran.
+#[test]
+fn list_turned_away_says_so_when_nothing_was_refused() {
+    let fixture = Fixture::new();
+    let log = fixture.nginx_root.join("access.log");
+    fs::write(&log, access_line("203.0.113.6", "/", 200, "Mozilla/5.0")).unwrap();
+
+    fixture
+        .run(&["list-turned-away", "--access-log", log.to_str().unwrap()])
+        .stdout(predicate::str::contains(
+            "Nothing in this log was turned away",
+        ));
+}
+
 /// Batch must share the access-log read offset with everything else that
 /// reads the same log, not keep one of its own.
 ///

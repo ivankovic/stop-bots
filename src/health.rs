@@ -176,6 +176,11 @@ pub struct Probe {
     /// can say: the operator's next question is always which file.
     #[serde(default)]
     pub access_log_path: Option<String>,
+    /// Which user agents the blocking policy turned away in the access
+    /// log this probe read, with how much each still had served. Empty
+    /// when the log could not be read.
+    #[serde(default)]
+    pub turned_away: Vec<crate::accesslog::TurnedAway>,
     /// The `conf.d` the generated `http`-context files go into, named so
     /// that a check can say which directory it means — for the reason
     /// [`Self::access_log_path`] is carried.
@@ -286,6 +291,7 @@ pub fn probe(
     ssh_log: Option<&Path>,
     paths: &crate::logpaths::LogPaths,
     conf_d: &Path,
+    block_status: u16,
 ) -> Probe {
     let live = live_firewall(backend);
     let (live_rules, live_backend) = match &live {
@@ -304,6 +310,15 @@ pub fn probe(
     Probe {
         live_rules,
         live_backend,
+        // From the same read as every other access-log answer below: the
+        // log can be tens of megabytes and reading it twice in one probe
+        // would be the only expensive thing here.
+        turned_away: match &access_log {
+            crate::accesslog::LogSource::Found(text) => {
+                crate::accesslog::turned_away_user_agents(text, block_status)
+            }
+            crate::accesslog::LogSource::Unavailable => Vec::new(),
+        },
         conf_d_path: Some(conf_d.display().to_string()),
         conf_d_exists: Some(conf_d.is_dir()),
         stray_generated_files: stray_generated_files(conf_d, Path::new(crate::nginx::CONF_D_DIR)),
@@ -719,6 +734,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     if let Some(check) = trusted_by_hand(db)? {
         checks.push(check);
     }
+    if let Some(check) = turned_away_clients(db, probe)? {
+        checks.push(check);
+    }
     // Adds a line only on a host where NGINX really is in a container.
     if let Some(check) = firewall_reaches_containers(probe) {
         checks.push(check);
@@ -731,6 +749,75 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
         checks,
         checked_at: now_secs(),
     })
+}
+
+/// How few refusals are worth a line. Low on purpose: a first-party app
+/// that cannot reach its server retries, so a real one clears this in
+/// minutes, and the cost of a false positive is one line naming a client
+/// the operator recognises.
+const TURNED_AWAY_MIN_REFUSALS: u64 = 5;
+
+/// Clients the blocking policy is turning away that this host has seen
+/// working before.
+///
+/// The check exists because of how the three real cases were found: not
+/// here, but by a person saying an app had stopped working. Nextcloud on
+/// iOS, Nextcloud on Android and Jellyfin on a Fire TV, over one week on
+/// one host, all three matching `okhttp` in a public bad-bot list. Every
+/// one of them was visible in the access log from the first minute.
+///
+/// **Only agents with recorded successful hits**, from
+/// [`Db::user_agent_stat`], rather than everything being refused. A
+/// blocking policy turning away bots is the policy working; a client that
+/// this host has previously served and is now refusing is a regression,
+/// and that is the distinction worth waking someone for. The cost of
+/// keying on the exact agent string is that a client which changed version
+/// between the last recorded hit and the block will not match -- it reads
+/// as a new agent, and goes unreported here while still appearing in
+/// `list-turned-away`.
+///
+/// Absent rather than "nothing to report" when there is nothing, like its
+/// neighbours: a line saying so on every healthy host is noise.
+fn turned_away_clients(db: &Db, probe: &Probe) -> Result<Option<Check>> {
+    let mut regressions: Vec<&crate::accesslog::TurnedAway> = Vec::new();
+    for entry in &probe.turned_away {
+        if entry.refused < TURNED_AWAY_MIN_REFUSALS {
+            continue;
+        }
+        if db.user_agent_stat(&entry.user_agent)?.is_some() {
+            regressions.push(entry);
+        }
+    }
+    if regressions.is_empty() {
+        return Ok(None);
+    }
+    let named: Vec<String> = regressions
+        .iter()
+        .take(3)
+        .map(|entry| format!("{} ({} refused)", entry.user_agent, entry.refused))
+        .collect();
+    let more = regressions.len().saturating_sub(named.len());
+    let suffix = if more > 0 {
+        format!(", and {more} more")
+    } else {
+        String::new()
+    };
+    Ok(Some(Check {
+        id: "turned-away-clients",
+        title: "Clients this host used to serve",
+        level: Level::Warn,
+        detail: format!(
+            "{} user agent(s) with successful requests on record are now being turned away: {}{}",
+            regressions.len(),
+            named.join(", "),
+            suffix
+        ),
+        fix: Some(
+            "see them all with `stop-bots list-turned-away`, and allow one with \
+             `stop-bots trust --user-agent \"<part of the agent>\"`"
+                .to_string(),
+        ),
+    }))
 }
 
 /// Whether the files NGINX has to read for the generated blocks to work
@@ -1601,6 +1688,7 @@ mod tests {
             nftables_conf_flushes: None,
             unit_active: Some(true),
             unit_binary: None,
+            turned_away: Vec::new(),
             conf_d_path: Some(crate::nginx::CONF_D_DIR.to_string()),
             conf_d_exists: Some(true),
             stray_generated_files: Vec::new(),
@@ -1686,6 +1774,99 @@ mod tests {
             "it should name the command that reaches it: {}",
             check.detail
         );
+    }
+
+    fn refused(user_agent: &str, refused: u64, served: u64) -> crate::accesslog::TurnedAway {
+        crate::accesslog::TurnedAway {
+            user_agent: user_agent.to_string(),
+            refused,
+            served,
+        }
+    }
+
+    /// Seeds the successful-hit history that separates "a client that used
+    /// to work" from "a bot doing what bots do".
+    fn seen_working(db: &Db, user_agent: &str) {
+        let mut counts = std::collections::HashMap::new();
+        counts.insert(user_agent.to_string(), 40);
+        db.record_user_agent_hits(&counts, 1_790_000_000).unwrap();
+    }
+
+    /// The case this check was written for, in the shape it actually
+    /// happened: a Jellyfin client that had been serving a household for
+    /// months started matching `okhttp` in a bad-bot list.
+    #[test]
+    fn a_client_this_host_used_to_serve_being_refused_is_a_warning() {
+        let db = db();
+        let agent = "Jellyfin Android TV/0.19.10 via jellyfin-sdk-kotlin (OkHttp/4.12.0)";
+        seen_working(&db, agent);
+        let probe = Probe {
+            turned_away: vec![refused(agent, 262, 0)],
+            ..healthy()
+        };
+
+        let report = assess(&db, &probe).unwrap();
+        let check = check2(&report, "turned-away-clients");
+
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("Jellyfin") && check.detail.contains("262"),
+            "it should name the client and the damage: {}",
+            check.detail
+        );
+        assert!(
+            check.fix.as_deref().is_some_and(|f| f.contains("trust")),
+            "and say how to allow it: {:?}",
+            check.fix
+        );
+    }
+
+    /// A blocking policy turning away bots is the policy working. Reporting
+    /// every one of them would bury the one line that matters.
+    #[test]
+    fn an_agent_this_host_never_served_is_not_reported() {
+        let probe = Probe {
+            turned_away: vec![refused("AhrefsBot/7.0", 4_000, 0)],
+            ..healthy()
+        };
+
+        assert!(
+            assess(&db(), &probe)
+                .unwrap()
+                .checks
+                .iter()
+                .all(|check| check.id != "turned-away-clients"),
+            "a bot with no history here is not a regression"
+        );
+    }
+
+    /// One stray refusal is not a broken client, and a check that fires on
+    /// it gets muted.
+    #[test]
+    fn a_couple_of_refusals_stays_below_the_threshold() {
+        let db = db();
+        seen_working(&db, "SomeApp/1.0");
+        let probe = Probe {
+            turned_away: vec![refused("SomeApp/1.0", 2, 900)],
+            ..healthy()
+        };
+
+        assert!(assess(&db, &probe)
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.id != "turned-away-clients"));
+    }
+
+    /// Nothing refused, nothing said — like its neighbours, this adds no
+    /// line to a healthy host.
+    #[test]
+    fn a_host_turning_nobody_away_gets_no_line() {
+        assert!(assess(&db(), &healthy())
+            .unwrap()
+            .checks
+            .iter()
+            .all(|check| check.id != "turned-away-clients"));
     }
 
     /// The ordinary answer, and it names the directory. "Generated files

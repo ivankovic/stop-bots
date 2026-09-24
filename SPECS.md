@@ -6534,3 +6534,52 @@ Is a directory)`. The rule is now to use the root's own `conf.d` when it
 exists and the stock path otherwise, and never to create one. A `conf.d`
 that is already there is one NGINX was built around; one this code invents
 is a guess about a glob it cannot see.
+
+## What the policy is turning away (`accesslog::turned_away_user_agents`, `health::turned_away_clients`, `list-turned-away`)
+
+**The gap.** Every report in this project answered "what is stop-bots
+doing": which rules exist, which are loaded, which sites are applied, which
+user agents got through. None answered "what is it doing *to my own
+clients*". Over one week on one host that cost three first-party
+applications — Nextcloud on iOS, Nextcloud on Android, and Jellyfin on a
+Fire TV — all three matching `okhttp`, which appears in a public bad-bot
+list because bots use it too. Each was found by a person saying an app had
+stopped working, days later. Each was in the access log from the first
+minute, at 262 refusals and nothing served.
+
+**Why the status code, and not the patterns.** The exact answer is to
+re-run the blocking regex over the log's user agents, reproducing NGINX's
+decision. That needs a regex engine: `regex` is in `Cargo.lock` but only as
+a dev-dependency of `assert_cmd`, so making it a real one would add about
+1.5 MB to a statically linked musl binary for a reporting feature. The
+status code is already in the log, needs nothing, and `BlockResponse::
+status_code` says which one to count. On `444` it is exact — NGINX invents
+that code and no application returns it. On `403` or `404` it over-counts,
+and the design answers that rather than hiding it.
+
+**Two columns, not one.** `served` is carried beside `refused` because
+refusals alone cannot distinguish a blocked client from an application
+saying no. 262 refused and 0 served is a client stopped at the door; 300
+served and 3 refused is an application refusing three requests. The sort is
+refusals descending then served ascending, so the clearest false positives
+rise to the top of a long list. The CLI prints the caveat *before* the
+table on any host not answering `444`, because a reader who learns it
+afterwards has already drawn conclusions.
+
+**The check is narrower than the command, on purpose.** `list-turned-away`
+shows everything, bots included — a bot in that list is the policy working.
+`health::turned_away_clients` warns only for agents with rows in
+`user_agent_stats`, the successful-hit history `record-access-stats`
+maintains. "This host used to serve this client and now refuses it" is a
+regression; "this host refuses AhrefsBot" is Tuesday. The cost of keying on
+the exact agent string is that a client which changed version between its
+last recorded hit and the block reads as a new agent and goes unreported by
+the check, while still appearing in the command. The threshold is five
+refusals: a first-party app that cannot reach its server retries, so a real
+case clears it in minutes.
+
+**The probe carries it** rather than `assess` reading the log again. `probe`
+already reads the access log once for `access_log_readable` and the
+client-address mix, and that log runs to tens of megabytes on a busy host.
+The block response is passed in as a `u16` for the same reason `conf_d` is
+passed in: `probe` takes no `Db`.

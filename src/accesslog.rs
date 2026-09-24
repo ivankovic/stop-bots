@@ -707,6 +707,77 @@ pub fn successful_user_agent_counts(log_text: &str) -> HashMap<String, u64> {
     counts
 }
 
+/// One user agent's split between requests the blocking policy turned
+/// away and requests that were served.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnedAway {
+    pub user_agent: String,
+    /// Requests answered with the configured block response.
+    pub refused: u64,
+    /// Requests that were served, in the same log.
+    pub served: u64,
+}
+
+/// Which user agents this host's blocking policy is turning away, and how
+/// much each of them still gets through.
+///
+/// The gap this fills: every other report here answers "what is this
+/// project doing", and none answered "what is it doing *to my own
+/// clients*". Three first-party apps were blocked on one host in a single
+/// week -- two Nextcloud clients and a Jellyfin TV app, all three matching
+/// `okhttp` in a public bad-bot list -- and each was found because someone
+/// complained that something had stopped working. The information was in
+/// the access log the whole time.
+///
+/// Inferred from the status code, because a block leaves no other trace in
+/// a log whose format this project does not own. `block_status` is
+/// [`crate::db::BlockResponse::status_code`], so on a host answering `444`
+/// -- which NGINX invents and no application returns -- the count is
+/// exact. On `403` or `404` it also catches the application's own
+/// refusals, which is why `served` is carried next to it rather than left
+/// for the reader to go and find: 262 refusals and nothing served is a
+/// client being stopped at the door, while 300 served and three refused is
+/// an application saying no to three requests, and the difference is the
+/// whole question.
+///
+/// Private and loopback sources are skipped, as everywhere else in this
+/// module, and so are requests with no user agent -- there is nothing to
+/// report or trust for those.
+///
+/// Sorted by refusals, most first.
+pub fn turned_away_user_agents(log_text: &str, block_status: u16) -> Vec<TurnedAway> {
+    let mut counts: HashMap<String, (u64, u64)> = HashMap::new();
+    for line in log_text.lines().filter_map(parse_line) {
+        if line.user_agent.is_empty() || line.user_agent == "-" || is_local_or_private(&line.ip) {
+            continue;
+        }
+        let entry = counts.entry(line.user_agent).or_insert((0, 0));
+        if line.status == block_status {
+            entry.0 += 1;
+        } else if line.status < 400 {
+            entry.1 += 1;
+        }
+    }
+    let mut turned_away: Vec<TurnedAway> = counts
+        .into_iter()
+        .filter(|(_, (refused, _))| *refused > 0)
+        .map(|(user_agent, (refused, served))| TurnedAway {
+            user_agent,
+            refused,
+            served,
+        })
+        .collect();
+    // Refusals first, then the ones with least getting through, so the
+    // clearest false positives sort to the top of a long list.
+    turned_away.sort_by(|a, b| {
+        b.refused
+            .cmp(&a.refused)
+            .then(a.served.cmp(&b.served))
+            .then(a.user_agent.cmp(&b.user_agent))
+    });
+    turned_away
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,6 +786,92 @@ mod tests {
         format!(
             "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0\"\n"
         )
+    }
+
+    /// The two columns are the whole point: refusals alone cannot tell a
+    /// blocked client from an application saying no.
+    #[test]
+    fn turned_away_user_agents_counts_refusals_beside_what_still_got_through() {
+        let log = [
+            line_with("203.0.113.5", 444, "BlockedApp/1.0"),
+            line_with("203.0.113.5", 444, "BlockedApp/1.0"),
+            line_with("203.0.113.6", 444, "PartlyBlocked/1.0"),
+            line_with("203.0.113.6", 200, "PartlyBlocked/1.0"),
+            line_with("203.0.113.6", 200, "PartlyBlocked/1.0"),
+        ]
+        .concat();
+
+        let turned_away = turned_away_user_agents(&log, 444);
+
+        assert_eq!(
+            turned_away,
+            vec![
+                TurnedAway {
+                    user_agent: "BlockedApp/1.0".to_string(),
+                    refused: 2,
+                    served: 0,
+                },
+                TurnedAway {
+                    user_agent: "PartlyBlocked/1.0".to_string(),
+                    refused: 1,
+                    served: 2,
+                },
+            ],
+            "stopped at the door sorts above told-no-once"
+        );
+    }
+
+    /// Only the configured response counts. A host answering 403 must not
+    /// have its 404s read as blocks, or the report is every missing
+    /// favicon on the server.
+    #[test]
+    fn turned_away_user_agents_counts_only_the_configured_response() {
+        let log = [
+            line_with("203.0.113.5", 404, "Wanderer/1.0"),
+            line_with("203.0.113.5", 500, "Wanderer/1.0"),
+            line_with("203.0.113.5", 403, "Wanderer/1.0"),
+        ]
+        .concat();
+
+        let turned_away = turned_away_user_agents(&log, 403);
+
+        assert_eq!(turned_away.len(), 1, "was: {turned_away:?}");
+        assert_eq!(turned_away[0].refused, 1);
+        assert_eq!(
+            turned_away[0].served, 0,
+            "a 404 and a 500 are neither refused by us nor served"
+        );
+    }
+
+    /// An agent that was never refused has nothing to report, however much
+    /// of the log it occupies.
+    #[test]
+    fn turned_away_user_agents_omits_an_agent_that_was_never_refused() {
+        let log = [
+            line_with("203.0.113.5", 200, "Browser/1.0"),
+            line_with("203.0.113.5", 200, "Browser/1.0"),
+        ]
+        .concat();
+
+        assert!(turned_away_user_agents(&log, 444).is_empty());
+    }
+
+    /// The same two exclusions every detector here applies: a private
+    /// source is this host talking to itself, and there is nothing to
+    /// trust for a request that sent no agent.
+    #[test]
+    fn turned_away_user_agents_skips_private_sources_and_missing_agents() {
+        let log = [
+            line_with("10.0.0.5", 444, "InternalProbe/1.0"),
+            line_with("127.0.0.1", 444, "LocalProbe/1.0"),
+            line_with("203.0.113.5", 444, "-"),
+        ]
+        .concat();
+
+        assert!(
+            turned_away_user_agents(&log, 444).is_empty(),
+            "nothing here is a client this host should report on"
+        );
     }
 
     fn ok_line(ip: &str, path: &str) -> String {

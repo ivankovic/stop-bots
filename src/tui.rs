@@ -557,6 +557,7 @@ fn short_check_label(id: &str) -> String {
         "script-fresh" => "script",
         "nginx-applied" => "nginx",
         "generated-files-reachable" => "files",
+        "turned-away-clients" => "refused",
         "service-health" => "console",
         "disk-room" => "disk",
         "database-size" => "database",

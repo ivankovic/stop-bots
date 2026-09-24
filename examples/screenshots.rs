@@ -141,6 +141,7 @@ async fn main() -> Result<()> {
             unit_binary: None,
             // The fiction is a host install, so the generated files are in
             // the stock place and nothing is stranded anywhere else.
+            turned_away: Vec::new(),
             conf_d_path: Some(stop_bots::nginx::CONF_D_DIR.to_string()),
             conf_d_exists: Some(true),
             stray_generated_files: Vec::new(),

@@ -607,7 +607,11 @@ pub fn health_check(db: &Db, ssh_log: Option<&std::path::Path>) -> String {
         &crate::nginx::root(db, None)
             .unwrap_or_else(|_| std::path::PathBuf::from(crate::nginx::DEFAULT_ROOT)),
     );
-    let probe = crate::health::probe(backend, &db_path, ssh_log, &paths, &conf_d);
+    let block_status = db
+        .get_block_response()
+        .map(|r| r.status_code())
+        .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
+    let probe = crate::health::probe(backend, &db_path, ssh_log, &paths, &conf_d, block_status);
     if let Err(err) = crate::health::store_probe(db, &probe) {
         return format!("error: {err}");
     }

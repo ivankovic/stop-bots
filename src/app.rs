@@ -1586,9 +1586,20 @@ impl App {
             &crate::nginx::root(&self.db, None)
                 .unwrap_or_else(|_| std::path::PathBuf::from(crate::nginx::DEFAULT_ROOT)),
         );
+        let block_status = self
+            .db
+            .get_block_response()
+            .map(|r| r.status_code())
+            .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
         tokio::task::spawn_blocking(move || {
-            let probe =
-                crate::health::probe(backend, &db_path, ssh_log.as_deref(), &paths, &conf_d);
+            let probe = crate::health::probe(
+                backend,
+                &db_path,
+                ssh_log.as_deref(),
+                &paths,
+                &conf_d,
+                block_status,
+            );
             let _ = sender.send(Event::App(AppEvent::HealthProbed {
                 probe: Box::new(probe),
             }));

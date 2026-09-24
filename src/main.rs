@@ -148,6 +148,29 @@ enum Command {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
     },
+    /// List the user agents this host's blocking policy is turning away
+    ///
+    /// Reads the NGINX access log and counts, per user agent, how many
+    /// requests came back with the configured block response and how many
+    /// were served. A client with refusals and nothing served is being
+    /// stopped at the door; one with plenty served and a few refused is
+    /// being told no by the application behind NGINX.
+    ///
+    /// Bots appearing here is the policy working. What this is for is the
+    /// other kind: a first-party app matching a pattern in a public bad-bot
+    /// list, which is how Nextcloud's and Jellyfin's mobile clients -- all
+    /// carrying `okhttp` -- were blocked on a real host for days before
+    /// anyone noticed.
+    ///
+    /// Allow one with `stop-bots trust --user-agent`.
+    ListTurnedAway {
+        #[arg(long, help = DB_HELP)]
+        db: Option<PathBuf>,
+        /// Check this NGINX access log file instead of the default
+        /// /var/log/nginx/access.log
+        #[arg(long)]
+        access_log: Option<PathBuf>,
+    },
     /// List every trusted address and user agent
     ListTrusted {
         #[arg(long, help = DB_HELP)]
@@ -1382,6 +1405,7 @@ async fn main() -> Result<()> {
             remove,
             db,
         }) => trust(db, address, user_agent, remove),
+        Some(Command::ListTurnedAway { db, access_log }) => list_turned_away(db, access_log),
         Some(Command::ListTrusted { db }) => list_trusted(db),
         Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
         Some(Command::SetAutoApply { db, enabled }) => set_auto_apply(db, enabled),
@@ -1556,7 +1580,15 @@ fn run_status(
             &stop_bots::nginx::root(&db, None)
                 .unwrap_or_else(|_| PathBuf::from(stop_bots::nginx::DEFAULT_ROOT)),
         );
-        let probe = health::probe(backend, &path, ssh_log.as_deref(), &paths, &conf_d);
+        let block_status = db.get_block_response()?.status_code();
+        let probe = health::probe(
+            backend,
+            &path,
+            ssh_log.as_deref(),
+            &paths,
+            &conf_d,
+            block_status,
+        );
         health::store_probe(&db, &probe)?;
         (health::assess(&db, &probe)?, None)
     };
@@ -2085,6 +2117,44 @@ fn trust(
         // clap requires one of the two.
         (None, None, _) => unreachable!("clap requires --address or --user-agent"),
     }
+    Ok(())
+}
+
+fn list_turned_away(db_path: Option<PathBuf>, access_log: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+    let response = db.get_block_response()?;
+    let log_text = read_access_log(&db, access_log.as_deref())?;
+    let turned_away =
+        stop_bots::accesslog::turned_away_user_agents(&log_text, response.status_code());
+
+    if turned_away.is_empty() {
+        println!("Nothing in this log was turned away.");
+        return Ok(());
+    }
+
+    // Said before the table, not after: on a host answering 403 the
+    // numbers include the application's own refusals, and a reader who
+    // learns that at the bottom has already drawn conclusions.
+    println!(
+        "Counting responses of {} \u{2014} this host's block response.",
+        response.label()
+    );
+    if response.status_code() != stop_bots::db::BlockResponse::Close.status_code() {
+        println!(
+            "That code is one an application can send too, so compare the columns: refusals \
+             with nothing served is a client being stopped at the door."
+        );
+    }
+    println!();
+    println!("{:>8}  {:>8}  USER AGENT", "REFUSED", "SERVED");
+    for entry in &turned_away {
+        println!(
+            "{:>8}  {:>8}  {}",
+            entry.refused, entry.served, entry.user_agent
+        );
+    }
+    println!();
+    println!("Allow one with: stop-bots trust --user-agent \"<part of the agent>\"");
     Ok(())
 }
 
