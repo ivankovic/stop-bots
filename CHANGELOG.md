@@ -5,6 +5,34 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [0.0.10] — 2026-09-24
+
+### Added
+
+- **`stop-bots list-turned-away`, and a `status` check to go with it.**
+  Reads the access log and reports, per user agent, how many requests came
+  back with your configured block response and how many were served.
+
+  Nothing in this tool previously answered *"what is my own policy turning
+  away?"*. On one host in a single week that cost three first-party
+  applications — Nextcloud's iOS client, Nextcloud's Android client, and
+  Jellyfin on a Fire TV — each matching `okhttp` in a public bad-bot list,
+  and each discovered only when somebody said an app had stopped working.
+  All three were visible in the access log from the first minute.
+
+  The two columns are the point. A client with 262 refusals and nothing
+  served is being stopped at the door; one with 300 served and three
+  refused is being told no by the application behind NGINX. On a host
+  answering `444` the count is exact, since NGINX invents that code and no
+  application returns it; on `403` or `404` the command says so before
+  printing the table.
+
+  The `status` check is deliberately quieter than the command: it reports
+  only agents that this host has **recorded successful requests for** and
+  is now refusing. A blocking policy turning away bots is the policy
+  working — a client it used to serve and no longer does is a regression,
+  and that is the one worth a warning.
+
 ## [0.0.9] — 2026-09-23
 
 ### Fixed
@@ -1253,7 +1281,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.9...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.10...HEAD
+[0.0.10]: https://github.com/ivankovic/stop-bots/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/ivankovic/stop-bots/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/ivankovic/stop-bots/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/ivankovic/stop-bots/compare/v0.0.6...v0.0.7
