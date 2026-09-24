@@ -25,6 +25,31 @@ Description: A TUI that helps you configure your server to stop bad bots and sti
 
 Package: stop-bots
 Architecture: arm64
+Version: 0.0.11-1
+Priority: optional
+Section: net
+Maintainer: Marko Ivankovic <marko@ivankovic.me>
+Installed-Size: 11366
+Depends:
+Recommends: nftables | iptables
+Suggests: nginx
+Filename: pool/main/s/stop-bots/stop-bots_0.0.11-1_arm64.deb
+Size: 3479392
+MD5sum: 1aacf3e9fda77e7b568a62401300fb2e
+SHA1: 32b422dc1a0c8c4d109818ac731055bbf3607ff1
+SHA256: 6f0fdc910bc7b61f7228b2791a1a01d12dc159c402113c78fafb8210dbbefe5e
+SHA512: 124ad934d84d2d07c6efffaac294df3bf6d414b093dae11b5d294571dedf8b89f81cc656392cbc8c5481d6ecca0c34e7638c1adef14ec542ea4b075768eb3787
+Homepage: https://github.com/ivankovic/stop-bots
+Description: A TUI that helps you configure your server to stop bad bots and still allow
+ good bots.
+ A TUI, a web UI and a CLI that help you configure your server to stop bad bots
+ without hiding behind a CDN. It classifies known bots by category and blocks
+ them in your NGINX config, and renders an nftables or iptables script that
+ blocks countries, datacenter ranges and addresses caught scanning your logs.
+ Nothing is applied without being asked.
+
+Package: stop-bots
+Architecture: arm64
 Version: 0.0.3-1
 Priority: optional
 Section: net
