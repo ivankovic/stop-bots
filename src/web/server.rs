@@ -148,12 +148,20 @@ pub struct ClientAddr(pub Option<String>);
 
 /// Resolves [`ClientAddr`] once per request.
 ///
-/// The peer address always; the leftmost `X-Forwarded-For` entry only when
-/// the peer is loopback *and* the operator has said this server sits
+/// The peer address always; the rightmost `X-Forwarded-For` entry only
+/// when the peer is loopback *and* the operator has said this server sits
 /// behind a proxy. Both conditions, not either: the setting says a proxy
 /// exists, and the loopback check says this particular request actually
 /// came through something local rather than straight off the network with
 /// a header someone typed.
+///
+/// Rightmost, because that is the one entry the proxy wrote. NGINX's
+/// `$proxy_add_x_forwarded_for` — what the Web Access panel generates —
+/// appends the address it saw to whatever the client sent, so everything
+/// to the left of it is text the client chose. Believing the leftmost
+/// entry would let anyone name any address, including the one they are
+/// about to block, and walk past the anti-lockout guard and the login
+/// throttle both.
 async fn client_address(
     State(state): State<AppState>,
     mut request: Request,
@@ -168,7 +176,7 @@ async fn client_address(
         .headers()
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
+        .and_then(|v| v.rsplit(',').next())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 

@@ -1428,6 +1428,57 @@ async fn a_forwarded_address_is_only_believed_when_configured() {
         .is_empty());
 }
 
+/// NGINX's `$proxy_add_x_forwarded_for` appends the address it saw to
+/// whatever the client sent. Only that last entry is the proxy's word;
+/// anything before it is the client's, and must not name the client.
+#[tokio::test]
+async fn only_the_address_the_proxy_appended_is_believed() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    Db::open(&db_path)
+        .unwrap()
+        .set_bool_setting(stop_bots::web::TRUST_FORWARDED_KEY, true)
+        .unwrap();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let attempt = |app: Router, forwarded: &'static str| {
+        let cookie = cookie.clone();
+        let csrf = csrf.clone();
+        async move {
+            let mut request = from_peer(
+                with_cookie(
+                    post(
+                        "/firewall/block-address",
+                        &format!("csrf={csrf}&address=203.0.113.77"),
+                    ),
+                    &cookie,
+                ),
+                "127.0.0.1:5000",
+            );
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", forwarded.parse().unwrap());
+            let response = app.oneshot(request).await.unwrap();
+            percent_decode(response.headers()[header::LOCATION].to_str().unwrap())
+        }
+    };
+
+    // The client typed the victim's address in; the proxy appended theirs.
+    let flash = attempt(app.clone(), "203.0.113.77, 198.51.100.4").await;
+    assert!(
+        flash.contains("Blocked"),
+        "a client-supplied entry must not be taken for the client: {flash}"
+    );
+
+    Db::open(&db_path)
+        .unwrap()
+        .unblock_address("203.0.113.77")
+        .unwrap();
+
+    // The proxy saw 203.0.113.77 itself, whatever came before it.
+    let flash = attempt(app, "198.51.100.4, 203.0.113.77").await;
+    assert!(flash.contains("lock you out"), "was: {flash}");
+}
+
 // ---- served under a path prefix ----
 //
 // The whole point of `--base-path` is that *nothing* the browser is told

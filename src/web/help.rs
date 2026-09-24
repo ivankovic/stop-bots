@@ -123,7 +123,7 @@ fn body(view: &View) -> Markup {
                         td colspan="2" {
                             @if view.trusts_forwarded {
                                 (layout::pill("YES", PillKind::Warn))
-                                span .hint { " Only safe if a proxy really does overwrite it." }
+                                span .hint { " Only safe behind a proxy on this host. The last address in the header is the one believed." }
                             } @else {
                                 (layout::pill("NO", PillKind::Neutral))
                             }
@@ -174,9 +174,9 @@ fn body(view: &View) -> Markup {
                             " block on port 80. Until you run "
                             code { "certbot --nginx -d <host>" }
                             " this console\u{2019}s password form and session cookie cross the network "
-                            "in the clear; the generated file says so too. Set "
-                            code { "web:secure_cookie" }
-                            " once the certificate is in place."
+                            "in the clear; the generated file says so too. Pass "
+                            code { "--secure-cookie true" }
+                            " to stop-bots web or stop-bots install web once the certificate is in place."
                         },
                     ))
                     (row(
