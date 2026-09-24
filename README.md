@@ -106,33 +106,30 @@ running. For a server with no stop-bots process on it at all, see
   paths. Never an IP with a recent successful SSH login, or one inside a known crawler's
   published IP range.
 - **Forged crawlers**: anything claiming to be Googlebot, Bingbot or GPTBot from an address
-  that crawler's own operator doesn't publish. The cheapest common disguise there is, and the
-  published CIDR lists settle it. Inert until those lists have actually been fetched.
+  that crawler's own operator doesn't publish. The cheapest common disguise there is. Inert
+  until those lists have actually been fetched.
 - **Probing for exposed secrets**: a single request for `/.env`, `/.git/config`,
-  `/wp-config.php` and similar is conclusive on its own, so this needs no threshold. The
-  built-in list deliberately leaves out paths that are legitimate somewhere — `/wp-login.php`,
-  `/wp-admin/`, `/xmlrpc.php`, `/phpmyadmin` — since locking out your own administrator would
-  be worse than missing a scanner the 404 detector catches anyway. Add your own with
-  `set-probe-paths`.
+  `/wp-config.php` and similar is an immediate ban. The built-in list deliberately leaves out
+  paths that are legitimate somewhere — `/wp-login.php`, `/wp-admin/`, `/xmlrpc.php`,
+  `/phpmyadmin` — since locking out your own administrator would be worse than missing a
+  scanner the 404 detector catches anyway. Add your own with `set-probe-paths`.
 - **Honeypot**: a path published only as `Disallow:` in the generated `robots.txt` and linked
-  nowhere. Reaching it means ignoring robots.txt, which nothing legitimate does by accident —
-  the strongest signal here, and the longest block. Needs robots.txt generation turned on to
-  work at all.
+  nowhere. Reaching it means ignoring robots.txt, which deserves a ban. Needs robots.txt
+  generation turned on to work at all.
 
 Three more look at how a client *behaves* rather than what it asks for. All three are off by
-default, because each has a false positive it cannot rule out on its own — and all three
-exempt verified search-engine crawlers, which would otherwise match every one of them:
+default, because each has false positives — and all three exempt verified search-engine
+crawlers, which would otherwise match every one of them:
 
 - **Fetches no assets**: many distinct pages and not one stylesheet, script or image. Browsers
   load what goes with a page. Won't catch an API client (it counts *distinct* paths, and an
   API client hits few) or a well-cached returning visitor (a `304` counts as a fetched asset).
-  Can't help you on a site that serves no assets at all — a pure JSON API.
-- **Rotating user agent**: several identities from one address. *Weakened considerably by
-  NAT*: a carrier, campus or office gateway presents many real browsers on one IP, and without
-  timestamp parsing there's no way to tell that apart from one scraper cycling agents.
+  Can't help you on a site that serves no assets at all.
+- **Rotating user agent**: several identities from one address. May block a carrier, campus or
+  office gateway that presents many real browsers on one IP.
 - **Crawls with no referer**: many distinct deep pages, never a `Referer`. Weakened by
-  `Referrer-Policy: no-referrer` and privacy tooling; the distinct-path threshold is what
-  makes it usable at all.
+  `Referrer-Policy: no-referrer` and privacy tooling; the distinct-path threshold makes it
+  usable.
 
 ## By address
 
@@ -141,9 +138,8 @@ exempt verified search-engine crawlers, which would otherwise match every one of
 - **Known-bad addresses**, via third-party lists: FireHOL level 1, Tor exit nodes and
   blocklist.de. All off by default.
 - **Whole hosting providers**: AWS, Google Cloud and DigitalOcean publish their address space,
-  and residential visitors don't browse from it. These are blunt instruments and labelled as
-  such — they block *every* visitor hosted there, including VPN endpoints, corporate egress
-  and API clients, not just bots. Off by default, with a warning when you switch one on.
+  and residential visitors don't browse from it. They block *every* visitor hosted there,
+  including VPN endpoints, corporate egress and API clients, not just bots. Off by default.
 - **Neighbouring addresses**, optionally: when several addresses in one IPv4 `/24` are flagged
   in the same pass, block the `/24`. Off by default — blocking 256 addresses because three
   misbehaved is collateral by design. (IPv6 is different and needs no switch: a detection
@@ -154,52 +150,14 @@ exempt verified search-engine crawlers, which would otherwise match every one of
   Firewall screen to permanently block a specific IP or user agent you've spotted before it
   ever crosses an automatic threshold.
 
-## Is it actually working?
-
-Everything above is *generated*. Whether any of it is in effect is a separate
-question, and `stop-bots status` is the one that answers it:
-
-```
-stop-bots status
-```
-
-Seven checks, and the first is the one worth having: are the generated rules
-actually in the kernel, or only on disk? A real host ran for three weeks with
-48,860 drop rules in `/etc/stop-bots/firewall.nft` and an empty ruleset,
-because writing the script and loading it are two steps and nothing had ever
-looked at the second.
-
-The rest: will the ruleset survive a reboot (`nftables.service` enabled?), does
-the script still match the rules, are the NGINX blocks applied, is the console
-service running the binary it names, is there room for the database, and can
-the detectors read their logs.
-
-It exits non-zero if anything is **CRITICAL**, so it works as a monitoring
-check. `--quiet` prints only what needs attention, which is the form for cron:
-
-```
-0 * * * * /usr/local/bin/stop-bots status --quiet
-```
-
-A check that could not run — `nft list` needs root — reports **UNKNOWN**, never
-OK. A health check that says everything is fine because it could not look is
-worse than none, because it is believed.
-
-The same report is on the Dashboard in both the console and the TUI, taken
-hourly by the internal cron rather than on every render: `nft list` on a large
-ruleset is megabytes of text.
-
 ## Nothing happens without you
 
-Every firewall decision above is *generated*, never applied automatically: `render-firewall`
-(or the Dashboard's `F` key) writes an iptables or nftables script for you to review and apply
-yourself, and refuses to write one that would lock out a currently-connected SSH session.
+Every decision is *generated*, never applied automatically.
 
-Three things can apply it for you, and all three need you to ask: the TUI's render popup
-("apply after writing") or its `a` key, the web console's firewall panel ("run it after
-writing") or its "Apply everything" button, and `batch --apply` from a crontab you wrote — see
-[Unattended, from cron](#unattended-from-cron). None of them is a side effect of anything
-automatic: the internal cron renders the script and never runs it.
+Three things can apply the firewall script for you, and all three need you to ask: the TUI's
+render popup ("apply after writing") or its `a` key, the web console's firewall panel ("run it
+after writing") or its "Apply everything" button, and `batch --apply` from a crontab you wrote
+— see [Unattended, from cron](#unattended-from-cron).
 
 The same applies on the NGINX side: changing a setting only changes what *would* be written.
 The NGINX screen shows each site as `STALE` until you apply.
@@ -208,16 +166,12 @@ Switching a detector off never removes blocks it already added — those expire 
 "Stop detecting" and "undo what was detected" are deliberately separate; the second is the
 Firewall screen or `remove-firewall-rule`.
 
-There's also a plain access-log tally, independent of blocking: `record-access-stats` /
-`list-access-stats` count how often each user agent shows up in successful (non-error)
-requests, so you can see who's actually visiting on top of who's being blocked.
-
 # Usage
 
 Run the binary with no arguments to launch the TUI, `stop-bots web` for the same screens in
 a browser (see [The web UI](#the-web-ui)), or see `stop-bots --help` for the full list of
-CLI subcommands. All UIs can be used together. Configure everything in the TUI and then use
-the CLI in a crontab to keep the rules updated.
+CLI subcommands. All UIs can be used together. Configure everything in the TUI or web UI and
+then use the CLI in a crontab to keep the rules updated.
 
 ## TUI
 
@@ -311,31 +265,19 @@ the easiest way to see what it is actually doing.
 
 **`--apply` is what makes it enforce anything.** Without it, `batch` writes the NGINX config
 and the firewall script and stops: config does nothing until a reload, a script does nothing
-until it is run. That is this project's default everywhere, and it stays the default here.
+until it is run.
 
 `batch` and a long-running front-end coexist safely. The TUI, the web UI and `batch` all
 record what they did through the same keys in the same database, so whichever gets to a job
-first does it and the others find it no longer due — you don't get two detection passes, and
-the Dashboard's "Scheduled tasks" panel shows what actually happened rather than claiming
-everything is overdue. If you already leave the web UI running, the nightly `batch` entry is
-belt and braces rather than a requirement; if you don't, it is the only thing keeping
-detection current.
+first does it and the others find it no longer due.
 
 **With `--apply`, the SSH lockout guard can refuse — and refusing means nothing is applied.**
 It refuses if the rules would block a client that is connected right now, *and* if no SSH log
-could be read at all, because then the check could not run. The interactive
-`render-firewall` only prints a note in that second case, on the reasoning that a human is
-watching the terminal; from cron nobody is. **Pass `--ssh-log` explicitly**: cron runs as
-root so `/var/log/auth.log` usually reads fine, but on a journald-only host `journalctl`
-under cron can come back empty, which is exactly the case it refuses on. `--force` overrides
+could be read at all, because then the check could not run. `--force` overrides
 the guard if you mean it.
 
 One step failing never stops the others, and the NGINX and firewall halves are independent —
 a failed NGINX reload still leaves the firewall applied, and the other way round.
-
-`batch` records each step against the same schedule the TUI's internal cron uses, so the two
-agree about what has already run instead of both doing it, and the Dashboard's "Scheduled
-tasks" panel shows what your real cron did.
 
 # The web UI
 
@@ -386,23 +328,12 @@ Writes `/etc/systemd/system/stop-bots-web.service`, creates `/var/lib/stop-bots`
 holds the console's password hash) and `/etc/stop-bots`, generates a password if there isn't
 one, and enables and starts the unit.
 
-**`--dry-run` prints the whole plan and changes nothing.** This is the one command in the
-project that starts a daemon, so start there. `--prefix <dir>` writes the same tree somewhere
-you can read it without root. If the unit already exists and you have edited it, the
+**`--dry-run` prints the whole plan and changes nothing.** `--prefix <dir>` writes the same tree
+somewhere you can read it without root. If the unit already exists and you have edited it, the
 installer stops and says so rather than replacing your edit; `--force` if you meant it.
 
 The service runs as **root**, because the console rewrites `/etc/nginx`, writes the firewall
-script, and runs `nginx -t` and `systemctl reload nginx`. There is no unprivileged split that
-leaves the feature set intact. The unit carries the hardening that survives that requirement
-and a comment saying which hardening was left off and why.
-
-The bind address, host allowlist and path prefix are deliberately *not* in the unit — the
-running server re-reads them from the database, so putting them in `ExecStart` would give
-them two sources of truth. Change them with `stop-bots web --save ...` and restart.
-
-One thing changes once this runs as root: the internal cron's daily `RenderFirewall` job can
-now write `/etc/stop-bots/firewall.nft`, which it could not when you ran the console by hand
-as yourself. Nothing applies that script — running it is still yours to do.
+script, and runs `nginx -t` and `systemctl reload nginx`.
 
 Only Debian is checked for, because that is what has been tested; the unit is very likely
 correct on any systemd distribution, but the SSH log path it assumes is Debian's.
@@ -417,15 +348,14 @@ stop-bots web --bind 0.0.0.0:8787 --expose --allowed-hosts admin.example.com --s
 ```
 
 `--allowed-hosts` is not optional in practice: a request carrying a host name that isn't
-listed is refused. That is what makes DNS rebinding against the console fail, and it is
-why an exposed server reached by name needs the name spelled out.
+listed is refused.
 
 Put it behind NGINX with TLS — the same NGINX this tool is protecting. If you do, and the
 proxy sets `X-Forwarded-For`, tell the console it may believe that header, or it cannot
 tell which address a request really came from:
 
 ```
-stop-bots web --bind 127.0.0.1:8787   # and set web:trust_forwarded_for
+stop-bots web --bind 127.0.0.1:8787
 ```
 
 Behind TLS, also set `web:secure_cookie`. Without it a browser will send the session
@@ -508,21 +438,11 @@ Two things are missing on purpose, and the Help screen says so with the reasons:
 It also refuses to block the address you are connected from, which would take away the
 console you'd use to undo it.
 
-**It used to be three.** Applying the firewall script was the third, on the grounds that
-running it is the one operation that can take the host off the network. That is now
-available — "Apply everything" on the Dashboard (`a` in the TUI), or the "run it after
-writing" box in the firewall panel — because the guard that makes it safe from cron makes it safe from a
-button: the rules are checked against the clients currently logged in over SSH, in the
-order the script itself will evaluate them, and a rule that would block one of them is a
-refusal rather than a warning. Start the console with `--no-apply` to get the old
-write-only behaviour back.
-
 Login attempts are throttled. Not because the password is guessable — it is generated,
 144 bits — but because verifying one runs Argon2id, and letting an unauthenticated caller
 drive that as fast as they can post is a denial of service against the host this tool is
 supposed to be protecting. Ten wrong attempts are free; past that a client backs off
-exponentially, and a global cap bounds the CPU regardless of how many addresses the
-attempts come from.
+exponentially.
 
 ## Running NGINX in a container
 
@@ -542,9 +462,7 @@ The command is split into words and run directly. It never goes through a shell,
 
 # Contributing
 
-How the code is laid out, how it is tested, and the rules it is written to are in
-[CONTRIBUTING.md](https://github.com/ivankovic/stop-bots/blob/main/CONTRIBUTING.md). The release process is in
-[RELEASING.md](https://github.com/ivankovic/stop-bots/blob/main/RELEASING.md).
+Contributions are not accepted at this time.
 
 # Contact
 
