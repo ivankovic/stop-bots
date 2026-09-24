@@ -5,6 +5,34 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [0.0.11] — 2026-09-25
+
+### Added
+
+- **`--trust-forwarded-for` and `--secure-cookie` on `stop-bots web` and
+  `stop-bots install web`.** The README, the console's Help page and the
+  NGINX file the Web Access panel writes all told you to set
+  `web:trust_forwarded_for` and `web:secure_cookie`, and nothing could.
+  Both take `true` or `false`, are stored whether or not `--save` is given
+  (like `--allowed-hosts`), and stay as set until changed.
+
+### Fixed
+
+- **With `web:trust_forwarded_for` on, a client could name its own
+  address.** The console believed the *first* entry in `X-Forwarded-For`,
+  but the proxy block the Web Access panel generates uses NGINX's
+  `$proxy_add_x_forwarded_for`, which appends the address NGINX saw to
+  whatever the client sent. A client that sent its own header could claim
+  any address, and so get its own login-throttle bucket per request and
+  get past the guard that stops you blocking the address you are
+  connected from. The console now believes the *last* entry, the one the
+  proxy wrote. Hosts with the setting off, the default, were not affected.
+
+### Changed
+
+- **README trimmed** after a review pass. The "Is it actually working?"
+  section is gone; `stop-bots status --help` covers the same ground. "Contributing" now says contributions are not accepted at this time.
+
 ## [0.0.10] — 2026-09-24
 
 ### Added
@@ -1281,7 +1309,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.10...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.11...HEAD
+[0.0.11]: https://github.com/ivankovic/stop-bots/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/ivankovic/stop-bots/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/ivankovic/stop-bots/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/ivankovic/stop-bots/compare/v0.0.7...v0.0.8
