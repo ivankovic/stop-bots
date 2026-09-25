@@ -5,6 +5,24 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [0.0.12] — 2026-09-25
+
+### Added
+
+- **Path exemptions scoped to one user agent.** `stop-bots exempt-path
+  --site <site> --path /remote.php/dav/ --user-agent okhttp` lets clients
+  whose user agent contains `okhttp` through on that site's path, and
+  nowhere else — for an app of your own that a bot list catches by its HTTP
+  library. The Boox reader's WebDAV client and the Jellyfin Android TV
+  player's stream requests both say only `okhttp/4.x`, which the NGINX
+  Ultimate Bad Bot Blocker list blocks. Trusting the user agent would let
+  every scraper built on the same library through on every site; this is
+  one site, some paths, one client. In Site detail, type the user agent
+  after the path (TUI) or in its own field (web). The generated clear
+  matches NGINX's resolved `$uri`, so `..` and `%2e%2e` cannot walk out of
+  the exempt prefix. Existing exemptions render exactly as before, so no
+  applied site reads `STALE` after upgrading.
+
 ## [0.0.11] — 2026-09-25
 
 ### Added
@@ -1309,7 +1327,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.11...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.12...HEAD
+[0.0.12]: https://github.com/ivankovic/stop-bots/compare/v0.0.11...v0.0.12
 [0.0.11]: https://github.com/ivankovic/stop-bots/compare/v0.0.10...v0.0.11
 [0.0.10]: https://github.com/ivankovic/stop-bots/compare/v0.0.9...v0.0.10
 [0.0.9]: https://github.com/ivankovic/stop-bots/compare/v0.0.8...v0.0.9
