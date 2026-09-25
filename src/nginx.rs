@@ -414,6 +414,11 @@ const TRUSTED_VAR: &str = "$stop_bots_trusted";
 /// address for everyone else.
 const LIMIT_KEY_VAR: &str = "$stop_bots_limit_key";
 
+/// Holds the request path while an agent exemption is being checked, and
+/// `""` otherwise — see [`agent_exemption_clears`]. Server-level, set
+/// before every read, so no `map` or `http`-level declaration is needed.
+const AGENT_EXEMPT_VAR: &str = "$stop_bots_exempt";
+
 /// The zone a site's `limit_req` uses while anything is trusted: keyed on
 /// [`LIMIT_KEY_VAR`], in a file of its own
 /// ([`untrusted_rate_limit_conf_path`]).
@@ -590,6 +595,11 @@ pub struct BlockConfig {
     /// `return`, because NGINX has no way to say "match this user agent
     /// unless the path is one of these" in a single condition.
     pub exempt_paths: Vec<String>,
+    /// Request-path prefixes exempt only for clients whose user agent
+    /// contains the given string, sorted by user agent (see
+    /// [`crate::db::AgentExemption`]). Rendered by
+    /// [`agent_exemption_clears`], after every set like the other clears.
+    pub agent_exemptions: Vec<crate::db::AgentExemption>,
     /// Per-site [`RequestRule`]s switched on for this site.
     ///
     /// These decide a request is unwanted from its shape rather than from
@@ -1004,6 +1014,7 @@ pub fn block_config_for_site(db: &crate::db::Db, site_id: i64) -> Result<BlockCo
         serve_robots_txt: db.get_serve_robots_txt()?,
         rate_limit_burst: rate_limit_burst(db)?,
         exempt_paths: db.site_path_exemptions(site_id)?,
+        agent_exemptions: db.site_agent_exemptions(site_id)?,
         request_rules: site_request_rules(db, site_id)?,
         trust: trusted_conf(db)?,
     })
@@ -1036,6 +1047,7 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
         // A block with no site row has no per-site settings by
         // definition — both are keyed on `sites.id`.
         exempt_paths: Vec::new(),
+        agent_exemptions: Vec::new(),
         request_rules: Vec::new(),
         trust: trusted_conf(db)?,
     })
@@ -1092,8 +1104,17 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     // `UNTRUSTED_RATE_LIMIT_ZONE`.)
     let blocks_something = pattern.is_some() || !config.request_rules.is_empty();
     let clears_trusted = config.trust.is_some() && blocks_something;
+    // Like trust, and unlike the plain exemptions, only where there is a
+    // block to clear: they are narrower than a plain exemption, so a site
+    // with nothing blocking already lets their clients through.
+    let agent_clears = if blocks_something {
+        agent_exemption_clears(&config.agent_exemptions)
+    } else {
+        String::new()
+    };
     let uses_flag = exemptions.is_some()
         || clears_trusted
+        || !agent_clears.is_empty()
         || (pattern.is_some() && !config.request_rules.is_empty());
 
     if uses_flag {
@@ -1139,6 +1160,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
             "    if ($request_uri ~* \"{exemptions}\") {{\n        set $stop_bots_block 0;\n    }}\n"
         ));
     }
+    out.push_str(&agent_clears);
     if clears_trusted {
         // After every set, like the exemption clear, and for the same
         // reason: order is the mechanism. A trusted client is let through
@@ -1268,6 +1290,55 @@ fn exemption_regex(paths: &[String]) -> Option<String> {
         .map(|p| crate::db::escape_for_nginx_regex(p))
         .collect();
     (!escaped.is_empty()).then(|| format!("^({})", escaped.join("|")))
+}
+
+/// The statements that clear the block flag for agent exemptions: one
+/// group per user agent, or `""` when none is usable.
+///
+/// NGINX's `if` takes one condition, and "this user agent *and* this path"
+/// is two. So each group puts the path into [`AGENT_EXEMPT_VAR`] only when
+/// the user agent matches, and then tests that variable against the paths:
+///
+/// ```nginx
+/// set $stop_bots_exempt "";
+/// if ($http_user_agent ~* "okhttp") { set $stop_bots_exempt $uri; }
+/// if ($stop_bots_exempt ~* "^(/remote\.php/dav/)") { set $stop_bots_block 0; }
+/// ```
+///
+/// The reset opens every group, not just the first: a variable left
+/// holding the path by one group's user agent would otherwise let the next
+/// group's paths through for a client that never matched it.
+///
+/// `$uri`, not the `$request_uri` the plain exemptions read. `$uri` has had
+/// `..` and `//` resolved and is decoded, so `/remote.php/dav/../../login`
+/// is `/login` and matches nothing here; `$request_uri` is the raw request
+/// line, where that same string starts with the exempt prefix while the
+/// application behind the proxy resolves it to somewhere else. For a clear
+/// scoped to one client that is the whole point, so it is not given the
+/// raw form.
+///
+/// The user agent is matched as an escaped, case-insensitive substring,
+/// the same as a trusted one, and filtered again here rather than trusting
+/// the caller, since one bad quoted string stops NGINX loading the file.
+fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
+    let mut out = String::new();
+    for group in exemptions.chunk_by(|a, b| a.user_agent == b.user_agent) {
+        let user_agent = crate::db::escape_for_nginx_regex(&group[0].user_agent);
+        if user_agent.is_empty()
+            || !is_embeddable(&user_agent)
+            || user_agent.chars().any(char::is_control)
+        {
+            continue;
+        }
+        let paths: Vec<String> = group.iter().map(|e| e.path.clone()).collect();
+        let Some(paths) = exemption_regex(&paths) else {
+            continue;
+        };
+        out.push_str(&format!(
+            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* \"{user_agent}\") {{\n        set {AGENT_EXEMPT_VAR} $uri;\n    }}\n    if ({AGENT_EXEMPT_VAR} ~* \"{paths}\") {{\n        set $stop_bots_block 0;\n    }}\n"
+        ));
+    }
+    out
 }
 
 /// Finds the byte range of an existing sentinel block's lines within
@@ -2791,6 +2862,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         }
@@ -2823,6 +2895,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         };
@@ -2970,6 +3043,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: Some(burst),
             exempt_paths: Vec::new(),
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         }
@@ -3021,6 +3095,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: Some(5),
             exempt_paths: Vec::new(),
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         };
@@ -3073,6 +3148,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: None,
             exempt_paths: paths.iter().map(|p| p.to_string()).collect(),
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         }
@@ -3142,6 +3218,183 @@ mod tests {
         assert_eq!(exemption_regex(&[]), None);
     }
 
+    // ---- agent exemptions ----
+
+    fn agent(user_agent: &str, path: &str) -> crate::db::AgentExemption {
+        crate::db::AgentExemption {
+            path: path.to_string(),
+            user_agent: user_agent.to_string(),
+        }
+    }
+
+    /// `patterns` blocked, with `exemptions` as the site's agent
+    /// exemptions — sorted by user agent, as the database returns them.
+    fn cfg_agent(patterns: &[&str], exemptions: &[(&str, &str)]) -> BlockConfig {
+        BlockConfig {
+            agent_exemptions: exemptions
+                .iter()
+                .map(|(ua, path)| agent(ua, path))
+                .collect(),
+            ..cfg(patterns)
+        }
+    }
+
+    /// The Boox reader and the Jellyfin player: two apps a bot list
+    /// catches by their HTTP library, each let through on its own paths,
+    /// beside a plain exemption.
+    #[test]
+    fn an_agent_exemption_block_matches_the_golden() {
+        let config = BlockConfig {
+            exempt_paths: vec!["/ocs/v2.php/cloud/capabilities".to_string()],
+            ..cfg_agent(
+                &["okhttp", "BadBot"],
+                &[
+                    ("Jellyfin Android", "/videos/"),
+                    ("okhttp", "/remote.php/dav/"),
+                    ("okhttp", "/remote.php/webdav/"),
+                ],
+            )
+        };
+        crate::golden::assert_golden(
+            "nginx-block-agent-exemptions.conf",
+            &block_text(&config).unwrap(),
+        );
+    }
+
+    #[test]
+    fn an_agent_exemption_forces_the_flag_form_and_clears_after_every_set() {
+        let text = block_text(&cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")])).unwrap();
+
+        let set_one = text.find("set $stop_bots_block 1;").unwrap();
+        let clear = text.rfind("set $stop_bots_block 0;").unwrap();
+        let act = text.find("if ($stop_bots_block) {").unwrap();
+        assert!(set_one < clear, "the clear must follow the match:\n{text}");
+        assert!(clear < act, "act last:\n{text}");
+    }
+
+    /// Without the reset, a variable left holding the path by one group's
+    /// user agent would let the next group's paths through for a client
+    /// that never matched that group.
+    #[test]
+    fn every_agent_group_starts_by_resetting_the_variable() {
+        let text = block_text(&cfg_agent(
+            &["BadBot"],
+            &[("Alpha", "/a/"), ("Beta", "/b/")],
+        ))
+        .unwrap();
+        let resets: Vec<usize> = text
+            .match_indices("set $stop_bots_exempt \"\";")
+            .map(|(i, _)| i)
+            .collect();
+        let alpha = text.find("~* \"Alpha\"").unwrap();
+        let beta = text.find("~* \"Beta\"").unwrap();
+        assert_eq!(resets.len(), 2, "one reset per user agent:\n{text}");
+        assert!(
+            resets[0] < alpha && alpha < resets[1] && resets[1] < beta,
+            "each group's reset must precede its own match:\n{text}"
+        );
+    }
+
+    /// `$request_uri` is the raw request line: `/remote.php/dav/../../x`
+    /// starts with the exempt prefix there, and the application resolves it
+    /// to `/x`. `$uri` has already been resolved by NGINX.
+    #[test]
+    fn an_agent_exemption_matches_the_resolved_path_not_the_raw_one() {
+        let text = block_text(&cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")])).unwrap();
+        assert!(
+            text.contains("set $stop_bots_exempt $uri;"),
+            "text was:\n{text}"
+        );
+        assert!(!text.contains("$request_uri"), "text was:\n{text}");
+    }
+
+    #[test]
+    fn an_agent_exemption_escapes_the_user_agent_and_the_paths() {
+        let text = block_text(&cfg_agent(
+            &["okhttp"],
+            &[("okhttp/4.10.0", "/remote.php/dav/")],
+        ))
+        .unwrap();
+        for expected in [
+            "if ($http_user_agent ~* \"okhttp/4\\.10\\.0\")",
+            "if ($stop_bots_exempt ~* \"^(/remote\\.php/dav/)\")",
+        ] {
+            assert!(
+                text.contains(expected),
+                "missing {expected}; text was:\n{text}"
+            );
+        }
+    }
+
+    /// Narrower than a plain exemption, so with nothing blocking there is
+    /// nothing for them to do — and, unlike a plain one, they don't even
+    /// force the flag form beside robots.txt.
+    #[test]
+    fn agent_exemptions_alone_write_nothing() {
+        let exemptions = &[("okhttp", "/remote.php/dav/")];
+        assert!(block_text(&cfg_agent(&[], exemptions)).is_none());
+
+        let robots_only = BlockConfig {
+            serve_robots_txt: true,
+            ..cfg_agent(&[], exemptions)
+        };
+        let text = block_text(&robots_only).unwrap();
+        assert!(!text.contains("stop_bots_exempt"), "text was:\n{text}");
+    }
+
+    /// Each would either break the quoted config string or never match —
+    /// and a group left with no usable path is dropped whole, so the block
+    /// falls back to the direct-`return` form rather than an empty clear.
+    #[test]
+    fn unusable_agent_exemptions_are_dropped() {
+        for (description, user_agent, path) in [
+            ("a quote in the user agent", "ok\"http", "/dav/"),
+            ("a control character", "ok\thttp", "/dav/"),
+            ("an empty user agent", "", "/dav/"),
+            ("a path with no leading slash", "okhttp", "dav/"),
+            ("a quote in the path", "okhttp", "/da\"v/"),
+        ] {
+            let text = block_text(&cfg_agent(&["okhttp"], &[(user_agent, path)])).unwrap();
+            assert!(
+                !text.contains("stop_bots_exempt") && text.contains("return 403;"),
+                "{description} should have been dropped; text was:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn site_apply_status_is_stale_when_only_an_agent_exemption_is_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
+        apply_block_for_site(&path, "a.example", &cfg(&["okhttp"])).unwrap();
+        let exempted = cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")]);
+
+        let before = site_apply_status(&path, "a.example", &exempted, no_trust_file());
+        apply_block_for_site(&path, "a.example", &exempted).unwrap();
+        let after = site_apply_status(&path, "a.example", &exempted, no_trust_file());
+
+        assert_eq!(
+            (before, after),
+            (SiteApplyStatus::Stale, SiteApplyStatus::UpToDate)
+        );
+    }
+
+    #[test]
+    fn a_sites_block_config_carries_its_agent_exemptions() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.upsert_site("a.example", "/etc/nginx/a.conf").unwrap();
+        let site_id = db.list_sites().unwrap()[0].id;
+        db.add_site_agent_exemption(site_id, "/remote.php/dav/", "okhttp")
+            .unwrap();
+
+        let config = block_config_for_site(&db, site_id).unwrap();
+        assert_eq!(
+            config.agent_exemptions,
+            vec![agent("okhttp", "/remote.php/dav/")]
+        );
+    }
+
     /// The bug this guards against: server-level `if`/`return` run before
     /// location selection, so without an implicit `/robots.txt` exemption
     /// the generated robots.txt would be 403'd for precisely the user
@@ -3154,6 +3407,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: Vec::new(),
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         };
@@ -3178,6 +3432,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: None,
             exempt_paths: vec!["/blog".to_string()],
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         };
@@ -3204,6 +3459,7 @@ mod tests {
             serve_robots_txt: false,
             rate_limit_burst: None,
             exempt_paths: vec!["/blog".to_string()],
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         };
@@ -3275,6 +3531,7 @@ mod tests {
             serve_robots_txt: true,
             rate_limit_burst: Some(20),
             exempt_paths: vec!["/blog".to_string(), "/feed.xml".to_string()],
+            agent_exemptions: Vec::new(),
             request_rules: Vec::new(),
             trust: None,
         };
@@ -3501,6 +3758,7 @@ mod tests {
         let config = BlockConfig {
             request_rules: vec![RequestRule::NoAcceptLanguage],
             exempt_paths: vec!["/blog".to_string()],
+            agent_exemptions: Vec::new(),
             ..cfg_trusted(&["BadBot"])
         };
         crate::golden::assert_golden("nginx-block-trusted.conf", &block_text(&config).unwrap());
@@ -3952,6 +4210,7 @@ mod tests {
         let flagged = block_text(&BlockConfig {
             response: BlockResponse::Tarpit,
             exempt_paths: vec!["/blog".to_string()],
+            agent_exemptions: Vec::new(),
             ..cfg(&["BadBot"])
         })
         .unwrap();

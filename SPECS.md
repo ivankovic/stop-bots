@@ -6583,3 +6583,86 @@ already reads the access log once for `access_log_readable` and the
 client-address mix, and that log runs to tens of megabytes on a busy host.
 The block response is passed in as a `u16` for the same reason `conf_d` is
 passed in: `probe` takes no `Db`.
+
+## Exemptions scoped to one user agent (`site_agent_exemptions`, `nginx::agent_exemption_clears`)
+
+**What it does.** A per-site path exemption that applies only to clients
+whose user agent contains a given string, ignoring case: "on the Nextcloud
+site, let `okhttp` reach `/remote.php/dav/`". CLI `exempt-path --site …
+--path … --user-agent …`; in Site detail, the add field takes the user
+agent after the path (TUI: `/remote.php/dav/ okhttp`) or in a field of its
+own (web), and a row reads "only for okhttp".
+
+**Why it exists.** The NGINX Ultimate Bad Bot Blocker list names `okhttp`,
+the HTTP library most Android apps are built on. Two first-party apps on
+the host this was written for say nothing else about themselves: the Boox
+reader's WebDAV client sends `okhttp/4.10.0`, and the Jellyfin Android TV
+player's stream requests send `okhttp/4.12.0` (its API calls say
+`Jellyfin Android TV`, which a trusted user agent already covered). Both
+were refused with 444. The two existing tools each gave away too much:
+
+| | Clients | Sites | Paths |
+|---|---|---|---|
+| Trusted user agent | one | every | every |
+| Path exemption | every | one | some |
+| Agent exemption | one | one | some |
+
+Trusting `okhttp` would let every scraper built on it through everywhere;
+exempting `/remote.php/dav/` would let every bot through on it.
+
+**A table of its own**, not a `user_agent` column on
+`site_path_exemptions`: that table's primary key is `(site_id, path)` and
+would have to grow, which SQLite can only do by rebuilding the table. A new
+`CREATE TABLE IF NOT EXISTS` needs no migration on either a fresh or an
+existing database. Plain exemptions render exactly as before, so no
+applied site reads `STALE` after the upgrade.
+
+**The generated clear.** `if` takes one condition, and this is two. Each
+user agent gets a group that puts the path into `$stop_bots_exempt` only
+when the agent matches, then tests the variable against that agent's
+paths:
+
+    set $stop_bots_exempt "";
+    if ($http_user_agent ~* "okhttp") { set $stop_bots_exempt $uri; }
+    if ($stop_bots_exempt ~* "^(/remote\.php/dav/|/remote\.php/webdav/)") { set $stop_bots_block 0; }
+
+The groups sit with the other clears, after every set and before the act,
+and force the flag form the way any exemption does. The reset opens every
+group rather than only the first: a variable left holding the path by one
+group's agent would let the next group's paths through for a client that
+never matched it. `every_agent_group_starts_by_resetting_the_variable`
+pins that. Grouping needs a stable order, so the rows come out of SQL
+sorted by user agent and then path.
+
+**`$uri`, not `$request_uri`.** Plain exemptions match `$request_uri`, the
+raw request line. There `/remote.php/dav/../../index.php` starts with the
+exempt prefix, and the application behind a `proxy_pass` with no URI part
+receives it raw and resolves it to `/index.php`. `$uri` has had `..`, `//`
+and percent-encoding resolved by NGINX, so the same request is `/index.php`
+and matches nothing. For a clear that exists to let exactly one client
+through on exactly these paths, that difference is the feature, so the new
+form does not inherit the old one's input. The container test
+`an_agent_exemption_serves_only_its_client_on_only_its_paths` sends both
+`..` and `%2e%2e` with `--path-as-is` and expects 403. Moving the plain
+exemptions to `$uri` too is open in TODO.md; it changes every site's block
+text, so it is its own change.
+
+**Narrower than a plain exemption, so written only where something is
+blocked.** Like trust and unlike the plain exemptions, a site with nothing
+blocking gets no groups at all, and robots.txt alone does not pull them in.
+Their clients already get through there.
+
+**What it does not reach.** Only the NGINX block, like every exemption.
+Rate limiting cannot be lifted from inside an `if` and stays as it is. The
+log detectors still see these clients, for the reason a trusted user agent
+does not get past them either: a client chooses its own user agent.
+
+**Input.** The user agent goes through `validate_exemption_user_agent`,
+which shares its refusals with `validate_trusted_user_agent`, since it is
+matched and quoted the same way: empty (which would be a plain exemption
+wearing a disguise, and should be added as one), `"`, `\` and control
+characters. `agent_exemption_clears` filters again, and drops a group left
+with no usable path whole, rather than trusting its caller. In the TUI's
+single field the first space ends the path. Paths may not contain spaces,
+so the split is unambiguous, and a user agent keeps its own spaces
+(`Jellyfin Android`).

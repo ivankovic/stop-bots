@@ -82,6 +82,38 @@ fn validate_exempt_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One row of the exemptions panel: a path, and the user agent it is
+/// limited to — `None` for a plain exemption, which covers every client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Exemption {
+    path: String,
+    user_agent: Option<String>,
+}
+
+/// Reads the add-exemption field: `/blog`, or `/remote.php/dav/ okhttp` to
+/// exempt only clients whose user agent contains `okhttp`.
+///
+/// The first space ends the path. A path can hold none (see
+/// [`validate_exempt_path`]), so the split is unambiguous, and the user
+/// agent after it may have spaces of its own (`Jellyfin Android`).
+fn parse_exemption(input: &str) -> Result<Exemption, String> {
+    let input = input.trim();
+    let (path, user_agent) = match input.split_once(char::is_whitespace) {
+        Some((path, rest)) => (path, Some(rest)),
+        None => (input, None),
+    };
+    validate_exempt_path(path)?;
+    let user_agent = user_agent
+        .map(|ua| {
+            crate::db::validate_exemption_user_agent(ua).map_err(|err| format!("User agent: {err}"))
+        })
+        .transpose()?;
+    Ok(Exemption {
+        path: path.to_string(),
+        user_agent,
+    })
+}
+
 /// Which panel keyboard input currently goes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Focus {
@@ -136,7 +168,7 @@ pub struct SiteDetail {
     /// Which request-shape rules are on for this site.
     request_rules: Vec<RequestRule>,
     options_state: ListState,
-    exempt_paths: Vec<String>,
+    exemptions: Vec<Exemption>,
     exemptions_state: ListState,
     query: String,
     results_state: ListState,
@@ -159,7 +191,7 @@ impl SiteDetail {
             bot_overrides: Vec::new(),
             request_rules: Vec::new(),
             options_state: ListState::default().with_selected(Some(0)),
-            exempt_paths: Vec::new(),
+            exemptions: Vec::new(),
             exemptions_state: ListState::default().with_selected(Some(0)),
             query: String::new(),
             results_state: ListState::default(),
@@ -179,11 +211,25 @@ impl SiteDetail {
         self.bots = db.list_bots()?;
         self.bot_overrides = db.site_bot_overrides(self.site.id)?;
         self.request_rules = crate::nginx::site_request_rules(db, self.site.id)?;
-        self.exempt_paths = db.site_path_exemptions(self.site.id)?;
+        let plain = db
+            .site_path_exemptions(self.site.id)?
+            .into_iter()
+            .map(|path| Exemption {
+                path,
+                user_agent: None,
+            });
+        let scoped = db
+            .site_agent_exemptions(self.site.id)?
+            .into_iter()
+            .map(|e| Exemption {
+                path: e.path,
+                user_agent: Some(e.user_agent),
+            });
+        self.exemptions = plain.chain(scoped).collect();
         // Removing a path shrinks the list; without this the selection
         // could be left pointing past the new last row until the next
         // arrow key re-clamped it.
-        let max_row = self.exempt_paths.len(); // +1 for the Add row, -1 for 0-indexing
+        let max_row = self.exemptions.len(); // +1 for the Add row, -1 for 0-indexing
         if self
             .exemptions_state
             .selected()
@@ -313,10 +359,14 @@ impl SiteDetail {
     fn render_exemptions(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         let items: Vec<ListItem> =
             std::iter::once(ListItem::new(Line::from("+ Add an exempt path").italic()))
-                .chain(self.exempt_paths.iter().map(|path| {
+                .chain(self.exemptions.iter().map(|exemption| {
+                    let scope = match &exemption.user_agent {
+                        None => "bots allowed here".to_string(),
+                        Some(user_agent) => format!("only for {user_agent}"),
+                    };
                     ListItem::new(Line::from(vec![
-                        Span::from(format!("{path:<24}")),
-                        Span::from("bots allowed here").dim(),
+                        Span::from(format!("{:<24}", exemption.path)),
+                        Span::from(scope).dim(),
                     ]))
                 }))
                 .collect();
@@ -463,14 +513,16 @@ impl SiteDetail {
 
         if let PopupTarget::AddExemption { input, error } = &popup.target {
             let hint = "Path prefix, e.g. /blog — Enter to add, Esc to cancel";
+            let scope_hint = "Follow it with a user agent to exempt only that client";
             let mut lines = vec![
                 Line::from(format!("{input}\u{2588}")),
                 Line::from(Span::from(hint).dim()),
+                Line::from(Span::from(scope_hint).dim()),
             ];
             if let Some(error) = error {
                 lines.push(Line::from(Span::from(error.clone()).red()));
             }
-            let width = hint.len().max(title.len()) as u16 + 4;
+            let width = hint.chars().count().max(scope_hint.len()).max(title.len()) as u16 + 4;
             let popup_area = centered_rect(width, lines.len() as u16 + 2, area);
             let paragraph = Paragraph::new(lines).block(crate::tui::popup(title, theme));
             frame.render_widget(Clear, popup_area);
@@ -615,7 +667,7 @@ impl SiteDetail {
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.exemptions_state.selected().unwrap_or(0) < self.exempt_paths.len() {
+                    if self.exemptions_state.selected().unwrap_or(0) < self.exemptions.len() {
                         self.exemptions_state.select_next();
                     }
                 }
@@ -681,17 +733,28 @@ impl SiteDetail {
                 Ok(KeyOutcome::Consumed)
             }
             KeyCode::Enter => {
-                let value = input.trim().to_string();
-                if let Err(err) = validate_exempt_path(&value) {
-                    *error = Some(err);
-                    return Ok(KeyOutcome::Consumed);
-                }
+                let exemption = match parse_exemption(input) {
+                    Ok(exemption) => exemption,
+                    Err(err) => {
+                        *error = Some(err);
+                        return Ok(KeyOutcome::Consumed);
+                    }
+                };
                 self.popup = None;
-                db.add_site_path_exemption(self.site.id, &value)?;
-                *message = Some(format!(
-                    "{value} exempted on {} — apply (a/A) to write it",
-                    self.site.server_name
-                ));
+                let path = &exemption.path;
+                let site = &self.site.server_name;
+                *message = Some(match &exemption.user_agent {
+                    None => {
+                        db.add_site_path_exemption(self.site.id, path)?;
+                        format!("{path} exempted on {site} — apply (a/A) to write it")
+                    }
+                    Some(user_agent) => {
+                        db.add_site_agent_exemption(self.site.id, path, user_agent)?;
+                        format!(
+                            "{path} exempted on {site} for {user_agent} — apply (a/A) to write it"
+                        )
+                    }
+                });
                 Ok(KeyOutcome::Mutated)
             }
             _ => Ok(KeyOutcome::Consumed),
@@ -787,14 +850,23 @@ impl SiteDetail {
             });
             return Ok(KeyOutcome::Consumed);
         }
-        let Some(path) = self.exempt_paths.get(selected - 1).cloned() else {
+        let Some(Exemption { path, user_agent }) = self.exemptions.get(selected - 1).cloned()
+        else {
             return Ok(KeyOutcome::Consumed);
         };
-        db.remove_site_path_exemption(self.site.id, &path)?;
-        *message = Some(format!(
-            "{path} no longer exempt on {} — apply (a/A) to write it",
-            self.site.server_name
-        ));
+        let site = &self.site.server_name;
+        *message = Some(match user_agent {
+            None => {
+                db.remove_site_path_exemption(self.site.id, &path)?;
+                format!("{path} no longer exempt on {site} — apply (a/A) to write it")
+            }
+            Some(user_agent) => {
+                db.remove_site_agent_exemption(self.site.id, &path, &user_agent)?;
+                format!(
+                    "{path} no longer exempt on {site} for {user_agent} — apply (a/A) to write it"
+                )
+            }
+        });
         Ok(KeyOutcome::Mutated)
     }
 
@@ -1255,6 +1327,103 @@ mod tests {
         assert!(db.site_path_exemptions(site_id).unwrap().is_empty());
     }
 
+    /// Adds whatever is typed into the add popup, from a freshly focused
+    /// exemptions panel.
+    fn add_exemption(detail: &mut SiteDetail, db: &Db, typed: &str) -> KeyOutcome {
+        detail.refresh(db).unwrap();
+        focus_exemptions(detail, db);
+        press(detail, db, KeyCode::Enter);
+        type_str(detail, db, typed);
+        press(detail, db, KeyCode::Enter)
+    }
+
+    fn agent_exemption(path: &str, user_agent: &str) -> crate::db::AgentExemption {
+        crate::db::AgentExemption {
+            path: path.to_string(),
+            user_agent: user_agent.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_user_agent_after_the_path_adds_an_agent_exemption_instead() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let mut detail = SiteDetail::new(site);
+
+        let outcome = add_exemption(&mut detail, &db, "/videos/ Jellyfin Android");
+
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert_eq!(
+            db.site_agent_exemptions(site_id).unwrap(),
+            vec![agent_exemption("/videos/", "Jellyfin Android")],
+            "the user agent keeps its own spaces"
+        );
+        assert!(db.site_path_exemptions(site_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_an_agent_exemption_row_leaves_the_plain_one_on_the_same_path() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        db.add_site_path_exemption(site_id, "/dav/").unwrap();
+        db.add_site_agent_exemption(site_id, "/dav/", "okhttp")
+            .unwrap();
+        let mut detail = SiteDetail::new(site);
+        detail.refresh(&db).unwrap();
+        focus_exemptions(&mut detail, &db);
+
+        press(&mut detail, &db, KeyCode::Down); // the plain row
+        press(&mut detail, &db, KeyCode::Down); // the okhttp row
+        press(&mut detail, &db, KeyCode::Enter);
+
+        assert!(db.site_agent_exemptions(site_id).unwrap().is_empty());
+        assert_eq!(db.site_path_exemptions(site_id).unwrap(), vec!["/dav/"]);
+    }
+
+    #[test]
+    fn a_user_agent_that_cannot_be_stored_is_refused_and_the_popup_stays_open() {
+        let (db, site) = exemption_fixture();
+        let site_id = site.id;
+        let mut detail = SiteDetail::new(site);
+
+        add_exemption(&mut detail, &db, "/dav/ ok\"http");
+
+        assert!(db.site_agent_exemptions(site_id).unwrap().is_empty());
+        match &detail.popup.as_ref().unwrap().target {
+            PopupTarget::AddExemption { error, .. } => {
+                let error = error.as_deref().unwrap_or_default();
+                assert!(error.contains("cannot contain"), "error was: {error}");
+            }
+            other => panic!("expected the add-exemption popup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_exemption_splits_at_the_first_space_only() {
+        let parsed = |input: &str| parse_exemption(input).map(|e| (e.path, e.user_agent));
+        for (input, expected) in [
+            ("/blog", Ok(("/blog".to_string(), None))),
+            ("  /blog  ", Ok(("/blog".to_string(), None))),
+            (
+                "/dav/ okhttp",
+                Ok(("/dav/".to_string(), Some("okhttp".to_string()))),
+            ),
+            (
+                "/videos/   Jellyfin  Android ",
+                Ok((
+                    "/videos/".to_string(),
+                    Some("Jellyfin  Android".to_string()),
+                )),
+            ),
+        ] {
+            assert_eq!(parsed(input), expected, "input was {input:?}");
+        }
+        assert!(
+            parsed("dav okhttp").is_err(),
+            "the path still has to start with /"
+        );
+    }
+
     /// A path that could never match is refused at entry, with the popup
     /// left open and the reason shown — storing it would leave a
     /// configured exemption that silently never fires.
@@ -1331,6 +1500,8 @@ mod tests {
 
         let (db, site) = exemption_fixture();
         db.add_site_path_exemption(site.id, "/blog").unwrap();
+        db.add_site_agent_exemption(site.id, "/dav/", "okhttp")
+            .unwrap();
         let mut detail = SiteDetail::new(site);
         detail.refresh(&db).unwrap();
 
@@ -1354,6 +1525,10 @@ mod tests {
         assert!(content.contains("/blog"), "content was:\n{content}");
         assert!(
             content.contains("Add an exempt path"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("only for okhttp"),
             "content was:\n{content}"
         );
     }

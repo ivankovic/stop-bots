@@ -319,6 +319,7 @@ struct Detail {
     ai: Option<Policy>,
     rules: Vec<(RequestRule, bool)>,
     exemptions: Vec<String>,
+    agent_exemptions: Vec<crate::db::AgentExemption>,
 }
 
 fn load_detail(db: &Db, id: i64) -> anyhow::Result<Detail> {
@@ -346,6 +347,7 @@ fn load_detail(db: &Db, id: i64) -> anyhow::Result<Detail> {
             .map(|rule| (rule, enabled.iter().any(|id| id == rule.id())))
             .collect(),
         exemptions: db.site_path_exemptions(site.id)?,
+        agent_exemptions: db.site_agent_exemptions(site.id)?,
         site,
         status,
     })
@@ -481,23 +483,17 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
 
         (layout::panel(
             "Path exemptions",
-            Some("Prefixes that are never blocked, so you can block AI crawlers everywhere except /blog"),
+            Some("Prefixes that are never blocked, so you can block AI crawlers everywhere except /blog. Give a user agent to exempt only that client there, e.g. okhttp for an app a bot list catches by its HTTP library"),
             html! {
-                @if detail.exemptions.is_empty() {
+                @if detail.exemptions.is_empty() && detail.agent_exemptions.is_empty() {
                     (layout::empty("No exemptions."))
                 } @else {
                     table { tbody {
                         @for path in &detail.exemptions {
-                            tr {
-                                td .mono { (path) }
-                                td .right {
-                                    form .inline method="post" action=(ctx.url(&format!("/nginx/{id}/exempt-remove"))) {
-                                        (layout::csrf_field(ctx))
-                                        input type="hidden" name="path" value=(path);
-                                        button type="submit" { "Remove" }
-                                    }
-                                }
-                            }
+                            (exemption_row(ctx, id, path, None))
+                        }
+                        @for exemption in &detail.agent_exemptions {
+                            (exemption_row(ctx, id, &exemption.path, Some(&exemption.user_agent)))
                         }
                     } }
                 }
@@ -505,6 +501,7 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
                     form .row method="post" action=(ctx.url(&format!("/nginx/{id}/exempt-add"))) {
                         (layout::csrf_field(ctx))
                         input type="text" name="path" placeholder="/blog" size="24" required;
+                        input type="text" name="user_agent" placeholder="every client" size="20" aria-label="Only for user agent";
                         button .primary type="submit" { "Add" }
                     }
                 }
@@ -928,9 +925,41 @@ async fn set_site_rule(
     }
 }
 
+/// One exemption in the Site detail table, with its Remove button.
+/// `user_agent` is `None` for a plain exemption, which covers every client.
+fn exemption_row(ctx: &Ctx, id: i64, path: &str, user_agent: Option<&str>) -> Markup {
+    html! {
+        tr {
+            td .mono { (path) }
+            td {
+                span .hint {
+                    @match user_agent {
+                        Some(user_agent) => { "only for " (user_agent) }
+                        None => { "every client" }
+                    }
+                }
+            }
+            td .right {
+                form .inline method="post" action=(ctx.url(&format!("/nginx/{id}/exempt-remove"))) {
+                    (layout::csrf_field(ctx))
+                    input type="hidden" name="path" value=(path);
+                    @if let Some(user_agent) = user_agent {
+                        input type="hidden" name="user_agent" value=(user_agent);
+                    }
+                    button type="submit" { "Remove" }
+                }
+            }
+        }
+    }
+}
+
+/// A path, and optionally the user agent it is limited to — empty (or
+/// absent, from an older page) for a plain exemption.
 #[derive(Deserialize)]
 struct PathForm {
     path: String,
+    #[serde(default)]
+    user_agent: String,
 }
 
 async fn add_exemption(
@@ -950,14 +979,23 @@ async fn add_exemption(
         );
     }
     let stored = path.clone();
-    match state
-        .with_db(move |db| db.add_site_path_exemption(id, &stored))
-        .await
-    {
-        Ok(()) => back_with(
+    let user_agent = form.user_agent.trim().to_string();
+    let result = state
+        .with_db(move |db| {
+            if user_agent.is_empty() {
+                db.add_site_path_exemption(id, &stored)?;
+                Ok(format!("{stored} is now exempt"))
+            } else {
+                let user_agent = db.add_site_agent_exemption(id, &stored, &user_agent)?;
+                Ok(format!("{stored} is now exempt for {user_agent}"))
+            }
+        })
+        .await;
+    match result {
+        Ok(done) => back_with(
             &state.base,
             &back,
-            &format!("{path} is now exempt. Apply to write it out."),
+            &format!("{done}. Apply to write it out."),
             true,
         ),
         Err(err) => back_with(
@@ -978,16 +1016,20 @@ async fn remove_exemption(
     let back = format!("/nginx/{id}");
     let path = form.path;
     let stored = path.clone();
-    match state
-        .with_db(move |db| db.remove_site_path_exemption(id, &stored))
-        .await
-    {
-        Ok(()) => back_with(
-            &state.base,
-            &back,
-            &format!("{path} is no longer exempt."),
-            true,
-        ),
+    let user_agent = form.user_agent;
+    let result = state
+        .with_db(move |db| {
+            if user_agent.is_empty() {
+                db.remove_site_path_exemption(id, &stored)?;
+                Ok(format!("{stored} is no longer exempt."))
+            } else {
+                db.remove_site_agent_exemption(id, &stored, &user_agent)?;
+                Ok(format!("{stored} is no longer exempt for {user_agent}."))
+            }
+        })
+        .await;
+    match result {
+        Ok(done) => back_with(&state.base, &back, &done, true),
         Err(err) => back_with(
             &state.base,
             &back,
@@ -1103,6 +1145,23 @@ mod tests {
 
         let rendered = detail_body(&detail, &Ctx::for_tests()).into_string();
         assert!(rendered.contains("/blog"));
+    }
+
+    #[test]
+    fn an_agent_exemption_row_names_its_user_agent_and_removes_only_itself() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = seeded(tmp.path());
+        let id = db.list_sites().unwrap()[0].id;
+        db.add_site_agent_exemption(id, "/remote.php/dav/", "okhttp")
+            .unwrap();
+
+        let rendered = detail_body(&load_detail(&db, id).unwrap(), &Ctx::for_tests()).into_string();
+        for expected in ["only for okhttp", r#"name="user_agent" value="okhttp""#] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected}; page was:\n{rendered}"
+            );
+        }
     }
 
     #[test]

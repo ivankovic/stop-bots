@@ -2397,6 +2397,10 @@ fn every_generated_directive_form_parses() {
     // `conf.d`, and a clear to every block.
     server.stop_bots("trust --address 2001:db8::/48");
     server.stop_bots("trust --user-agent Pingdom.com_bot");
+    // And an agent exemption, which sets and reads a variable of its own.
+    server.stop_bots(
+        "exempt-path --site test.example --path /remote.php/dav/ --user-agent okhttp/4.10",
+    );
 
     server.apply_and_reload();
     let (ok, output) = server.nginx_t();
@@ -2429,6 +2433,70 @@ fn a_blocked_user_agent_is_refused_and_everyone_else_is_served() {
         "200",
         "an ordinary visitor must still be served"
     );
+}
+
+/// An agent exemption lets its client through on its paths and nowhere
+/// else: not on another path, not by walking out of the prefix with `..`,
+/// and not for another bot on the same path. A client let through reaches
+/// the site's own `try_files`, so a missing file is its 404, where a
+/// refused one gets the block's 403.
+#[test]
+fn an_agent_exemption_serves_only_its_client_on_only_its_paths() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-agent-exempt");
+    server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    server.seed_bot("okhttp", "okhttp");
+    server.seed_bot("badbot", "BadBot");
+    server.stop_bots("exempt-path --site test.example --path /dav/ --user-agent okhttp");
+    server.apply_and_reload();
+
+    for (path, user_agent, expected, why) in [
+        (
+            "/dav/file",
+            "okhttp/4.10.0",
+            "404",
+            "the exempt client on its path",
+        ),
+        (
+            "/DAV/file",
+            "okhttp/4.10.0",
+            "404",
+            "the path, matched without case",
+        ),
+        (
+            "/",
+            "okhttp/4.10.0",
+            "403",
+            "the exempt client off its path",
+        ),
+        (
+            "/dav/../index.html",
+            "okhttp/4.10.0",
+            "403",
+            "walking out with ..",
+        ),
+        (
+            "/dav/%2e%2e/index.html",
+            "okhttp/4.10.0",
+            "403",
+            "walking out with %2e%2e",
+        ),
+        (
+            "/dav/file",
+            "BadBot/1.0",
+            "403",
+            "another bot on the exempt path",
+        ),
+        ("/", "Mozilla/5.0", "200", "an ordinary visitor"),
+    ] {
+        assert_eq!(
+            server.status(path, &format!("--path-as-is -A '{user_agent}'")),
+            expected,
+            "{why}: {user_agent} on {path}"
+        );
+    }
 }
 
 // ---- trust: what NGINX and the kernel actually let through ----

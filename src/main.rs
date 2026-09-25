@@ -655,6 +655,12 @@ enum Command {
         site: String,
         #[arg(long)]
         path: String,
+        /// Exempt only clients whose user agent contains this, ignoring
+        /// case — e.g. `okhttp` for an app whose HTTP library a bot list
+        /// blocks. Matched against the resolved path, so `..` cannot walk
+        /// out of the exempt prefix.
+        #[arg(long)]
+        user_agent: Option<String>,
         /// Remove the exemption instead of adding it
         #[arg(long)]
         remove: bool,
@@ -1429,8 +1435,9 @@ async fn main() -> Result<()> {
             db,
             site,
             path,
+            user_agent,
             remove,
-        }) => exempt_path(db, site, path, remove),
+        }) => exempt_path(db, site, path, user_agent, remove),
         Some(Command::Trust {
             address,
             user_agent,
@@ -2077,7 +2084,13 @@ fn set_site_rule(
     Ok(())
 }
 
-fn exempt_path(db_path: Option<PathBuf>, site: String, path: String, remove: bool) -> Result<()> {
+fn exempt_path(
+    db_path: Option<PathBuf>,
+    site: String,
+    path: String,
+    user_agent: Option<String>,
+    remove: bool,
+) -> Result<()> {
     let db = open_db(db_path)?;
     let site = find_site(&db, &site)?;
     let trimmed = path.trim();
@@ -2087,12 +2100,29 @@ fn exempt_path(db_path: Option<PathBuf>, site: String, path: String, remove: boo
     if !remove && !trimmed.starts_with('/') {
         anyhow::bail!("an exempt path must start with '/' (got {trimmed:?})");
     }
-    if remove {
-        db.remove_site_path_exemption(site.id, trimmed)?;
-        println!("{}: {trimmed} is no longer exempt", site.server_name);
-    } else {
-        db.add_site_path_exemption(site.id, trimmed)?;
-        println!("{}: {trimmed} is exempt from blocking", site.server_name);
+    let name = &site.server_name;
+    match (user_agent, remove) {
+        (None, true) => {
+            db.remove_site_path_exemption(site.id, trimmed)?;
+            println!("{name}: {trimmed} is no longer exempt");
+        }
+        (None, false) => {
+            db.add_site_path_exemption(site.id, trimmed)?;
+            println!("{name}: {trimmed} is exempt from blocking");
+        }
+        (Some(user_agent), true) => {
+            if !db.remove_site_agent_exemption(site.id, trimmed, &user_agent)? {
+                anyhow::bail!("{name}: {trimmed} was not exempt for {user_agent:?}");
+            }
+            println!("{name}: {trimmed} is no longer exempt for {user_agent:?}");
+        }
+        (Some(user_agent), false) => {
+            let stored = db.add_site_agent_exemption(site.id, trimmed, &user_agent)?;
+            println!(
+                "{name}: {trimmed} is exempt from blocking for clients whose user agent \
+                 contains {stored:?}"
+            );
+        }
     }
     println!("Run `stop-bots apply-blocks` to write it into the site config.");
     Ok(())

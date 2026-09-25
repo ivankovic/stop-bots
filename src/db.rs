@@ -576,6 +576,21 @@ pub fn normalize_trusted_address(address: &str) -> Result<String> {
     })
 }
 
+/// A path exemption that applies only to clients whose user agent contains
+/// `user_agent`, ignoring case.
+///
+/// For an app of your own that a bot list catches by its HTTP library —
+/// the Boox reader's WebDAV client says only `okhttp/4.10.0`, and `okhttp`
+/// is on the NGINX Ultimate Bad Bot Blocker list — where trusting the user
+/// agent host-wide would let every scraper using the same library through
+/// everywhere, and a plain path exemption would let every bot through on
+/// that path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentExemption {
+    pub path: String,
+    pub user_agent: String,
+}
+
 /// `user_agent` as it will be stored as trusted, or why it cannot be.
 ///
 /// Matched as a case-insensitive substring, the same way a manually
@@ -591,6 +606,22 @@ pub fn normalize_trusted_address(address: &str) -> Result<String> {
 ///   there. Neither is worth the risk for a real user agent, which has
 ///   neither.
 pub fn validate_trusted_user_agent(user_agent: &str) -> Result<String> {
+    validate_user_agent_fragment(user_agent, "a trusted user agent")
+}
+
+/// `user_agent` as it will be stored on an agent exemption (see
+/// [`AgentExemption`]), or why it cannot be.
+///
+/// The same refusals as [`validate_trusted_user_agent`], for the same
+/// reasons: it is matched the same way and written into a quoted NGINX
+/// string the same way. An empty one would turn the exemption into one for
+/// every client — which is a plain path exemption, and should be added as
+/// one so that it reads as what it is.
+pub fn validate_exemption_user_agent(user_agent: &str) -> Result<String> {
+    validate_user_agent_fragment(user_agent, "an exemption's user agent")
+}
+
+fn validate_user_agent_fragment(user_agent: &str, what: &str) -> Result<String> {
     let user_agent = user_agent.trim();
     if user_agent.is_empty() {
         anyhow::bail!("an empty user agent would match every client");
@@ -599,7 +630,7 @@ pub fn validate_trusted_user_agent(user_agent: &str) -> Result<String> {
         .chars()
         .find(|c| *c == '"' || *c == '\\' || c.is_control())
     {
-        anyhow::bail!("a trusted user agent cannot contain {c:?}");
+        anyhow::bail!("{what} cannot contain {c:?}");
     }
     Ok(user_agent.to_string())
 }
@@ -838,6 +869,18 @@ impl Db {
                 site_id INTEGER NOT NULL REFERENCES sites(id),
                 path TEXT NOT NULL,
                 PRIMARY KEY (site_id, path)
+            );
+            -- The same, but only for clients whose user agent contains
+            -- `user_agent`, ignoring case: 'let okhttp reach /remote.php/dav/
+            -- on this site', for an app whose HTTP library a bot list names.
+            -- A table of its own rather than a column on the one above,
+            -- whose primary key would have to grow, which SQLite can only do
+            -- by rebuilding the table.
+            CREATE TABLE IF NOT EXISTS site_agent_exemptions (
+                site_id INTEGER NOT NULL REFERENCES sites(id),
+                path TEXT NOT NULL,
+                user_agent TEXT NOT NULL,
+                PRIMARY KEY (site_id, path, user_agent)
             );
             -- One row per (site, enabled request-shape rule). Row presence
             -- is the flag, the shape `selected_countries` uses; a per-site
@@ -1573,6 +1616,57 @@ impl Db {
             params![site_id, path],
         )?;
         Ok(())
+    }
+
+    /// `site_id`'s agent exemptions, sorted by user agent and then path:
+    /// the generated block groups them by user agent, and an unstable
+    /// order would make it differ run to run.
+    pub fn site_agent_exemptions(&self, site_id: i64) -> Result<Vec<AgentExemption>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, user_agent FROM site_agent_exemptions WHERE site_id = ?1 \
+             ORDER BY user_agent, path",
+        )?;
+        let rows = stmt.query_map(params![site_id], |row| {
+            Ok(AgentExemption {
+                path: row.get(0)?,
+                user_agent: row.get(1)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list site agent exemptions")
+    }
+
+    /// Exempts `path` on `site_id` for clients whose user agent contains
+    /// `user_agent`. Returns the user agent as stored (trimmed), after
+    /// [`validate_exemption_user_agent`]. The path is the caller's to
+    /// check, as for [`Db::add_site_path_exemption`].
+    pub fn add_site_agent_exemption(
+        &self,
+        site_id: i64,
+        path: &str,
+        user_agent: &str,
+    ) -> Result<String> {
+        let user_agent = validate_exemption_user_agent(user_agent)?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO site_agent_exemptions (site_id, path, user_agent) \
+             VALUES (?1, ?2, ?3)",
+            params![site_id, path, user_agent],
+        )?;
+        Ok(user_agent)
+    }
+
+    /// Removes one agent exemption. Returns whether anything was removed.
+    pub fn remove_site_agent_exemption(
+        &self,
+        site_id: i64,
+        path: &str,
+        user_agent: &str,
+    ) -> Result<bool> {
+        let removed = self.conn.execute(
+            "DELETE FROM site_agent_exemptions WHERE site_id = ?1 AND path = ?2 AND user_agent = ?3",
+            params![site_id, path, user_agent.trim()],
+        )?;
+        Ok(removed > 0)
     }
 
     /// Every request-shape rule switched on for `site_id`, sorted so the
@@ -3535,6 +3629,64 @@ mod tests {
         ] {
             assert!(validate_trusted_user_agent(bad).is_err(), "{why}: {bad:?}");
         }
+    }
+
+    #[test]
+    fn agent_exemptions_are_trimmed_deduplicated_and_grouped_by_user_agent() {
+        let db = test_db();
+        db.upsert_site("a.example", "/etc/nginx/a.conf").unwrap();
+        let site = db.list_sites().unwrap()[0].id;
+        let add = |path: &str, user_agent: &str| {
+            db.add_site_agent_exemption(site, path, user_agent).unwrap()
+        };
+        assert_eq!(add("/remote.php/webdav/", " okhttp "), "okhttp");
+        add("/remote.php/dav/", "okhttp");
+        add("/videos/", "Jellyfin Android");
+        add("/remote.php/dav/", "okhttp");
+
+        let listed: Vec<(String, String)> = db
+            .site_agent_exemptions(site)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.user_agent, e.path))
+            .collect();
+        let expected = [
+            ("Jellyfin Android", "/videos/"),
+            ("okhttp", "/remote.php/dav/"),
+            ("okhttp", "/remote.php/webdav/"),
+        ]
+        .map(|(ua, path)| (ua.to_string(), path.to_string()));
+        assert_eq!(listed, expected);
+
+        assert!(db
+            .remove_site_agent_exemption(site, "/videos/", "Jellyfin Android")
+            .unwrap());
+        assert!(!db
+            .remove_site_agent_exemption(site, "/videos/", "Jellyfin Android")
+            .unwrap());
+        assert!(
+            db.site_path_exemptions(site).unwrap().is_empty(),
+            "an agent exemption is not a plain one"
+        );
+    }
+
+    #[test]
+    fn an_agent_exemption_refuses_a_user_agent_that_would_match_more_than_it_says() {
+        let db = test_db();
+        db.upsert_site("a.example", "/etc/nginx/a.conf").unwrap();
+        let site = db.list_sites().unwrap()[0].id;
+        for (user_agent, why) in [
+            ("  ", "every client"),
+            ("ok\"http", "cannot contain"),
+            ("ok\\http", "cannot contain"),
+            ("ok\nhttp", "cannot contain"),
+        ] {
+            let err = db
+                .add_site_agent_exemption(site, "/dav/", user_agent)
+                .unwrap_err();
+            assert!(err.to_string().contains(why), "{user_agent:?} gave: {err}");
+        }
+        assert!(db.site_agent_exemptions(site).unwrap().is_empty());
     }
 
     #[test]

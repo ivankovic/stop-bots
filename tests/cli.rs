@@ -958,6 +958,74 @@ fn a_site_path_exemption_switches_the_block_to_the_flag_form() {
     assert_eq!(exempted.matches("# BEGIN stop-bots").count(), 1);
 }
 
+/// An exemption scoped to one user agent, end to end through the CLI: it
+/// reaches the site's block as a clear of its own, beside the bot rule it
+/// narrows, and `--remove` takes it back out.
+#[test]
+fn exempt_path_with_a_user_agent_scopes_the_clear_to_that_client() {
+    let fx = Fixture::new();
+    let site_file = fx.write_site("a.example");
+    fx.seed_bots();
+    fx.scan_sites();
+    let exempt = |extra: &[&str]| {
+        let mut args = vec![
+            "exempt-path",
+            "--site",
+            "a.example",
+            "--path",
+            "/remote.php/dav/",
+            "--user-agent",
+            "okhttp",
+        ];
+        args.extend_from_slice(extra);
+        fx.run(&args)
+    };
+
+    exempt(&[]).stdout(predicate::str::contains("contains \"okhttp\""));
+    fx.apply_blocks();
+    let exempted = fs::read_to_string(&site_file).unwrap();
+    for expected in [
+        "if ($http_user_agent ~* \"okhttp\") {",
+        "set $stop_bots_exempt $uri;",
+        "if ($stop_bots_exempt ~* \"^(/remote\\.php/dav/)\") {",
+    ] {
+        assert!(
+            exempted.contains(expected),
+            "missing {expected}; the site was:\n{exempted}"
+        );
+    }
+
+    exempt(&["--remove"]);
+    fx.apply_blocks();
+    let removed = fs::read_to_string(&site_file).unwrap();
+    assert!(
+        !removed.contains("stop_bots_exempt"),
+        "the site was:\n{removed}"
+    );
+}
+
+#[test]
+fn exempt_path_refuses_a_user_agent_that_would_match_more_than_it_says() {
+    let fx = Fixture::new();
+    fx.write_site("a.example");
+    fx.scan_sites();
+    let base = ["exempt-path", "--site", "a.example", "--path", "/dav/"];
+    for (extra, why) in [
+        (vec!["--user-agent", " "], "every client"),
+        (vec!["--user-agent", "ok\"http"], "cannot contain"),
+        (
+            vec!["--user-agent", "okhttp", "--remove"],
+            "was not exempt for",
+        ),
+    ] {
+        let args: Vec<&str> = base.iter().copied().chain(extra).collect();
+        fx.cmd(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(why));
+    }
+}
+
 /// The reload path end to end, with no real NGINX anywhere: apply-blocks
 /// without --no-reload must run `nginx -t` and then `systemctl reload
 /// nginx`, in that order — validation before reload is the property, since

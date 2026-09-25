@@ -7,6 +7,15 @@ list — which meant the open items below were unfindable inside it.
 
 ## Worth doing next
 
+* **Plain path exemptions match `$request_uri`, which `..` walks out of.**
+  `if ($request_uri ~* "^(/blog)")` clears the block for
+  `/blog/../wp-login.php`, and an upstream reached by a `proxy_pass` with no
+  URI part receives the raw path and resolves it. So an exemption lets any
+  blocked client reach any path by prefixing it. Agent exemptions already
+  match `$uri` for this reason (SPECS.md, "Exemptions scoped to one user
+  agent"). Moving the plain ones changes every applied site's block text, so
+  every site reads `STALE` once, which is why it was not folded into that
+  change.
 * **Show `App::message` somewhere other than the Dashboard.** It is only passed
   to `Dashboard::render`, so a status line set by a Site settings apply or a Bot
   settings fetch is invisible unless you happen to be on the Dashboard tab. Site

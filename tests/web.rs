@@ -1105,6 +1105,77 @@ async fn an_exemption_that_is_not_a_path_is_refused() {
 }
 
 #[tokio::test]
+async fn an_exemption_with_a_user_agent_is_scoped_to_that_client() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
+    let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+    let form = "path=/remote.php/dav/&user_agent=+okhttp+";
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/nginx/{id}/exempt-add"),
+        form,
+    )
+    .await;
+    assert!(flash.contains("exempt for okhttp"), "was: {flash}");
+    let db = Db::open(&db_path).unwrap();
+    let stored: Vec<(String, String)> = db
+        .site_agent_exemptions(id)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.path, e.user_agent))
+        .collect();
+    assert_eq!(
+        stored,
+        [("/remote.php/dav/".to_string(), "okhttp".to_string())]
+    );
+    assert!(db.site_path_exemptions(id).unwrap().is_empty());
+    drop(db);
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/nginx/{id}/exempt-remove"),
+        "path=/remote.php/dav/&user_agent=okhttp",
+    )
+    .await;
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .site_agent_exemptions(id)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn an_exemption_user_agent_that_cannot_be_stored_is_refused() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
+    let id = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/nginx/{id}/exempt-add"),
+        "path=/dav/&user_agent=ok%22http",
+    )
+    .await;
+    assert!(flash.contains("cannot contain"), "was: {flash}");
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .site_agent_exemptions(id)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
 async fn a_request_shape_rule_can_be_switched_on_for_one_site() {
     let (app, password, tmp, db_path) = app_with_db();
     let (cookie, csrf) = login(&app, &password).await;
