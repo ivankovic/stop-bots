@@ -413,8 +413,14 @@ pub const ASSET_RATIO_MIN_PAGES_DEFAULT: i64 = 15;
 
 /// Threshold for the rotating-user-agent detector: distinct user agents
 /// from one address.
+///
+/// 20, not the 8 it started at. One household behind one router reached 8
+/// in a day without trying: a Fire TV, the Jellyfin TV and phone apps
+/// (each with a second user agent for its media player), a Chromebook and
+/// two phone browsers. The block landed on the TV. A scraper cycling
+/// agents to evade per-agent rules goes far past 20; a home rarely does.
 pub const ROTATING_UA_MIN: &str = "detect_rotating_ua_min";
-pub const ROTATING_UA_MIN_DEFAULT: i64 = 8;
+pub const ROTATING_UA_MIN_DEFAULT: i64 = 20;
 
 /// Threshold for the referer-less detector: distinct deep (non-root) URLs
 /// fetched with no `Referer`.

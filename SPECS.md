@@ -2926,7 +2926,11 @@ project's purpose.
   a carrier or campus presents hundreds of real browsers on one address,
   and with no timestamp parsing there is no window in which to distinguish
   that from one scraper cycling agents. A threshold is the only control
-  available and pretending otherwise would add false confidence.
+  available and pretending otherwise would add false confidence. It
+  defaults to 20 distinct agents. It started at 8, until one household
+  reached 8 in a day with a TV, a streaming stick, two apps that each send
+  a second agent for their media player, a Chromebook and two phones, and
+  the block cut off the TV.
 - **Referer-less crawling.** Weakened by `Referrer-Policy: no-referrer`
   and privacy tooling. The distinct-deep-path threshold does the work; one
   or two referer-less hits are ordinary, twenty-five are a crawl.
