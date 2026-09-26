@@ -28,3 +28,7 @@ tests/container/stop-bots
 # warns on every `cargo publish`; committed it would be someone else's
 # theme and a dead /tmp path.
 .codediff.toml
+
+# A personal overview of the codebase, kept locally and not part of the
+# project.
+OVERVIEW.md
