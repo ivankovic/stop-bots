@@ -142,3 +142,34 @@ pub(crate) fn blocked_bot(db: &Db, slug: &str, pattern: &str) {
     db.set_bot_status(slug, BotStatus::Blocked)
         .expect("failed to pin the seeded bot to Blocked");
 }
+
+/// Writes an executable `#!/bin/sh` script at `path`, for a test that then
+/// runs it in this same process.
+///
+/// Written by a short-lived `sh`, not with `fs::write`. Tests run on many
+/// threads, and a thread that forks while another holds a script open for
+/// writing hands that descriptor to its child until the child execs. For
+/// that moment the file is open for writing somewhere, and running it
+/// fails with `Text file busy` — a test that fails one run in five for a
+/// reason unrelated to what it tests. A descriptor opened in another
+/// process is never ours to leak.
+pub(crate) fn write_script(path: &std::path::Path, body: &str) {
+    use std::io::Write;
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+        .unwrap();
+    assert!(
+        child.wait().unwrap().success(),
+        "could not write {}",
+        path.display()
+    );
+}

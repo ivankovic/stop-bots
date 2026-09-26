@@ -799,10 +799,8 @@ mod tests {
     /// Injected through `Layout` rather than placed on `PATH`: `PATH` is
     /// process-global and a threaded test runner would race on it.
     fn with_fake_systemctl(layout: &mut Layout, dir: &Path, body: &str) {
-        use std::os::unix::fs::PermissionsExt;
         let script = dir.join("fake-systemctl");
-        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testing::write_script(&script, body);
         layout.systemctl = script;
     }
 
@@ -1001,15 +999,12 @@ mod tests {
     /// than hope. Written into the layout rather than onto `PATH`: `PATH`
     /// is process-global and would race a threaded test runner.
     fn recording_systemctl(dir: &Path) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let log = dir.join("systemctl.log");
         let script = dir.join("fake-systemctl");
-        std::fs::write(
+        crate::testing::write_script(
             &script,
-            format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("echo \"$@\" >> {}\nexit 0", log.display()),
+        );
         (script, log)
     }
 
