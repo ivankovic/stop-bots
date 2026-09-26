@@ -801,6 +801,118 @@ fn reject_an_oversized_fetch(source: &str, addresses: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The most of the IPv4 unicast space (everything below `224.0.0.0`) one
+/// fetched country zone may cover: half.
+///
+/// The US zone is the largest by far, at about 42%. Half leaves room for it
+/// to grow while still refusing a zone that has become "most of the
+/// internet".
+pub const COUNTRY_MAX_V4_SHARE: f64 = 0.5;
+
+/// The same for every other feed — crawler ranges, hosting providers,
+/// reputation lists: a tenth. AWS, the broadest, is about 2.7%.
+pub const FEED_MAX_V4_SHARE: f64 = 0.1;
+
+/// The most of IPv6 global unicast (`2000::/3`) any fetched source may
+/// cover: 5%. No country or provider holds even one `/12` of the 512 that
+/// make it up.
+pub const FEED_MAX_V6_SHARE: f64 = 0.05;
+
+/// How much address space the usable entries of `addresses` cover, as a
+/// share of IPv4 unicast and of IPv6 global unicast. Overlaps are merged,
+/// so a feed that lists a range and its halves is not counted twice, and
+/// IPv4 at or above `224.0.0.0` is left out: multicast and reserved space
+/// is what FireHOL level 1 lists as a bogon, and blocking it costs no one.
+fn feed_coverage(addresses: &[String]) -> (f64, f64) {
+    const V4_UNICAST_END: u64 = 224 << 24;
+    let mut v4: Vec<(u64, u64)> = Vec::new();
+    let mut v6: Vec<(u128, u128)> = Vec::new();
+    for address in usable_addresses(addresses) {
+        let (base, len) = match address.split_once('/') {
+            Some((base, len)) => (base, len.parse::<u32>().ok()),
+            None => (address, None),
+        };
+        match base.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                let len = len.unwrap_or(32).min(32);
+                let size = 1u64 << (32 - len);
+                let start = u64::from(u32::from(ip)) & !(size - 1);
+                let end = (start + size).min(V4_UNICAST_END);
+                if start < end {
+                    v4.push((start, end));
+                }
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                let len = len.unwrap_or(128).min(128);
+                // Only the part inside 2000::/3 counts, and at /3 or
+                // longer a range is either wholly inside it or outside.
+                let start = u128::from(ip);
+                if len < 3 || start >> 125 != 1 {
+                    continue;
+                }
+                let size = 1u128 << (128 - len);
+                let start = start & !(size - 1);
+                v6.push((start, start.saturating_add(size)));
+            }
+            Err(_) => {}
+        }
+    }
+    let v4_total = merged_len(v4) as f64 / V4_UNICAST_END as f64;
+    let v6_total = merged_len(v6) as f64 / (1u128 << 125) as f64;
+    (v4_total, v6_total)
+}
+
+/// The total length of `ranges` (half-open) once overlaps are merged.
+fn merged_len<T>(mut ranges: Vec<(T, T)>) -> T
+where
+    T: Copy + Ord + Default + std::ops::Sub<Output = T> + std::ops::AddAssign,
+{
+    ranges.sort_unstable();
+    let mut total = T::default();
+    let mut current: Option<(T, T)> = None;
+    for (start, end) in ranges {
+        match &mut current {
+            Some((_, cur_end)) if start <= *cur_end => *cur_end = (*cur_end).max(end),
+            _ => {
+                if let Some((s, e)) = current.replace((start, end)) {
+                    total += e - s;
+                }
+            }
+        }
+    }
+    if let Some((s, e)) = current {
+        total += e - s;
+    }
+    total
+}
+
+/// Refuses a fetch whose entries, each narrow enough to pass the floor,
+/// together cover more of the address space than any real source of its
+/// kind does — the case [`FEED_MIN_PREFIX_V4`] says it cannot see. Refused
+/// whole, before anything is deleted, so the previous ranges stay.
+fn reject_an_overbroad_fetch(source: &str, addresses: &[String], max_v4_share: f64) -> Result<()> {
+    let (v4, v6) = feed_coverage(addresses);
+    if v4 > max_v4_share {
+        anyhow::bail!(
+            "{source}: the fetched ranges cover {:.0}% of the IPv4 address space, over the \
+             limit of {:.0}% — keeping the ranges already stored, since no real source of \
+             this kind covers that much",
+            v4 * 100.0,
+            max_v4_share * 100.0
+        );
+    }
+    if v6 > FEED_MAX_V6_SHARE {
+        anyhow::bail!(
+            "{source}: the fetched ranges cover {:.0}% of the IPv6 address space, over the \
+             limit of {:.0}% — keeping the ranges already stored, since no real source \
+             covers that much",
+            v6 * 100.0,
+            FEED_MAX_V6_SHARE * 100.0
+        );
+    }
+    Ok(())
+}
+
 /// How long a successful SSH login keeps its address un-blockable. Seven
 /// days: long enough to cover a week away from the host, which is the
 /// gap an operator is most likely to lock themselves out across, and
@@ -2847,6 +2959,7 @@ impl Db {
     pub fn replace_ip_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
         self.batch(|| {
             reject_an_oversized_fetch(source_id, cidrs)?;
+            reject_an_overbroad_fetch(source_id, cidrs, FEED_MAX_V4_SHARE)?;
             reject_a_wholly_unusable_fetch(source_id, cidrs)?;
             self.conn.execute(
                 "DELETE FROM ip_ranges WHERE source_id = ?1",
@@ -2975,6 +3088,7 @@ impl Db {
         let fetched_at = now();
         self.batch(|| {
             reject_an_oversized_fetch(country_code, cidrs)?;
+            reject_an_overbroad_fetch(country_code, cidrs, COUNTRY_MAX_V4_SHARE)?;
             reject_a_wholly_unusable_fetch(country_code, cidrs)?;
             self.conn.execute(
                 "DELETE FROM country_ip_ranges WHERE country_code = ?1",
@@ -3214,6 +3328,7 @@ impl Db {
     pub fn replace_reputation_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
         self.batch(|| {
             reject_an_oversized_fetch(source_id, cidrs)?;
+            reject_an_overbroad_fetch(source_id, cidrs, FEED_MAX_V4_SHARE)?;
             reject_a_wholly_unusable_fetch(source_id, cidrs)?;
             self.conn.execute(
                 "DELETE FROM reputation_ranges WHERE source_id = ?1",
@@ -4852,6 +4967,82 @@ mod tests {
             db.country_ranges("xx").unwrap(),
             vec!["5.6.7.8".to_string()]
         );
+    }
+
+    /// An in-memory database with the `src` range source and every
+    /// built-in reputation source registered, for the coverage tests.
+    fn db_with_feed_sources() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.register_ip_range_source(&IpRangeSource {
+            id: "src".to_string(),
+            name: "src".to_string(),
+            url: "https://example.invalid/src.json".to_string(),
+            category: Category::Ai,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+        db
+    }
+
+    /// Eight `/3`s are each above the floor and together are the whole
+    /// IPv4 internet. The floor cannot see that; the coverage limit can.
+    #[test]
+    fn a_feed_that_covers_the_internet_in_allowed_pieces_is_refused() {
+        let db = db_with_feed_sources();
+        db.replace_ip_ranges("src", &["5.6.7.8".to_string()])
+            .unwrap();
+        let pieces: Vec<String> = (0..8).map(|i| format!("{}.0.0.0/3", i * 32)).collect();
+
+        let err = db.replace_ip_ranges("src", &pieces).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("of the IPv4 address space"),
+            "was: {err:#}"
+        );
+        assert_eq!(
+            db.ip_ranges_for_source("src").unwrap(),
+            vec!["5.6.7.8".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_ipv6_feed_that_covers_global_unicast_in_pieces_is_refused() {
+        let db = db_with_feed_sources();
+        let pieces: Vec<String> = (0..512u32)
+            .map(|i| format!("{:x}::/12", 0x2000 + (i << 4)))
+            .collect();
+
+        let err = db.replace_ip_ranges("src", &pieces).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("of the IPv6 address space"),
+            "was: {err:#}"
+        );
+    }
+
+    /// A country is allowed far more than a blocklist — the US zone is
+    /// about 42% of unicast IPv4 — and multicast/reserved space, which
+    /// FireHOL lists as a bogon, is not counted at all.
+    #[test]
+    fn real_sized_feeds_are_still_stored() {
+        let db = db_with_feed_sources();
+        // 1.6 billion addresses, about the size of the US zone.
+        let us_sized: Vec<String> = (0..95).map(|i| format!("{i}.0.0.0/8")).collect();
+        db.replace_country_ranges("us", &us_sized).unwrap();
+
+        let firehol_like = vec![
+            "224.0.0.0/3".to_string(),
+            "0.0.0.0/8".to_string(),
+            "10.0.0.0/8".to_string(),
+            "127.0.0.0/8".to_string(),
+        ];
+        db.replace_reputation_ranges("firehol-level1", &firehol_like)
+            .unwrap();
+        // More than AWS's share of IPv4 (about 2.7%), as one /5.
+        db.replace_ip_ranges("src", &["8.0.0.0/5".to_string()])
+            .unwrap();
     }
 
     /// `is_valid_address` parses the *trimmed* string, so storing the raw
