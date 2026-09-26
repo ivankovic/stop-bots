@@ -404,8 +404,8 @@ mod tests {
 
     /// End-to-end regression test for the actual bug this module's merge
     /// design fixes: the fixture lists for `ai_robots_txt` and
-    /// `nginx_bad_bots` both include "GPTBot" (real overlap this project
-    /// hit fetching the live sources — see SPECS.md). Storing both real
+    /// `nginx_bad_bots` both include "GPTBot" (a real overlap this project
+    /// hit fetching the live sources). Storing both real
     /// `SourceKind`s' parsed output, in either order, must land on one
     /// merged bot carrying *both* sources' flags — not whichever store()
     /// call happened to run last.

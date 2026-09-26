@@ -1132,8 +1132,7 @@ async fn add_country(
     // an aggregated zone file is hundreds of kilobytes from a third party,
     // and blocking a request handler on that makes the button feel broken
     // on a slow link; and this project keeps its test suite free of
-    // network access (see "Testing without nginx, iptables or the
-    // network" in SPECS.md) — a handler that downloads on POST made
+    // network access — a handler that downloads on POST made
     // `the_geo_mode_and_country_selection_round_trip` reach ipdeny.com.
     //
     // What this used to do instead was tell the operator to go and run

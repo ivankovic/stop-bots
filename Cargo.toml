@@ -31,7 +31,6 @@ categories = [
 exclude = [
     ".serena/",
     "AGENTS.md",
-    "SPECS.md",
     "TODO.md",
     "REVIEW.md",
     "Makefile",

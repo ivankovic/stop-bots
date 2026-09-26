@@ -1,8 +1,7 @@
 # TODO
 
-Open work only. Why each shipped thing was built the way it was lives in
-`SPECS.md`; what changed and when lives in `CHANGELOG.md` and the git log. This
-file used to carry all three, and its history section grew longer than its todo
+Open work only. What changed and when lives in `CHANGELOG.md` and the git log.
+This file used to carry both, and its history section grew longer than its todo
 list — which meant the open items below were unfindable inside it.
 
 ## Worth doing next

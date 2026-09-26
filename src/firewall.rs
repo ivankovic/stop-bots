@@ -460,7 +460,7 @@ pub fn build_script(db: &Db, backend: FirewallBackend) -> Result<BuiltFirewall> 
 
     let (script, written) = match backend {
         FirewallBackend::Iptables => {
-            // iptables is IPv4-only; render() skips IPv6 rules (see SPECS.md).
+            // iptables is IPv4-only; render() skips IPv6 rules.
             let written = rules
                 .iter()
                 .filter(|r| r.enabled && !r.address.contains(':'))

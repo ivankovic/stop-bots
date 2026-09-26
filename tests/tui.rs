@@ -558,8 +558,7 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
     // "jyxo" uniquely matches "Jyxo Crawler" among the seeded bots, and
     // isn't a substring of anything else already on screen (the source
     // name, "Bot list sources", etc.) — picked so the diffed terminal
-    // output can't skip retransmitting it by coincidence (see SPECS.md's
-    // note on that gotcha in this test file).
+    // output can't skip retransmitting it by coincidence.
     send_key(&mut session, "/");
     send_key(&mut session, "jyxo");
     session.exp_string("Jyxo Crawler").unwrap();
@@ -570,9 +569,8 @@ fn bot_details_search_filters_by_name_and_opens_a_bot_popup() {
     // is also on file, so the first keystroke of "jyxo" already narrows
     // to a list whose first row carries a "(system)" tag at exactly these
     // cells. The later keystrokes change the name beside it but not the
-    // tag, and unchanged cells are never retransmitted (see SPECS.md on
-    // what `exp_string` can actually prove) — so waiting on it here waits
-    // forever. The tag itself is covered by
+    // tag, and unchanged cells are never retransmitted — so waiting on it
+    // here waits forever. The tag itself is covered by
     // `bot_settings::tests::bot_row_is_tagged_system_or_override_depending_on_its_status`,
     // which reads the rendered line rather than the wire.
 
@@ -636,7 +634,7 @@ fn nginx_screen_scan_now_discovers_sites_from_the_tui() {
     // Checked as "now" alone, not the literal "Scan now": the popup title
     // ("Scan <root>?") already sent "Scan" moments earlier, so re-anchoring
     // on that exact word risks the terminal-output-diffing coincidence
-    // documented in SPECS.md/this file's other tests.
+    // documented in this file's other tests.
     session.exp_string("now").unwrap();
 
     send_key(&mut session, "\x1b[B"); // Cancel -> Scan now

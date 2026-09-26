@@ -4,8 +4,7 @@ Everything a contributor — human or otherwise — needs to know about how this
 built, tested and laid out. It used to live at the bottom of `README.md`; it was moved
 here so the README stays a description of the *tool* rather than of the workshop.
 
-The AI-only instructions are in [`AGENTS.md`](AGENTS.md); the decision log behind every
-shipped behaviour is in `SPECS.md`; open work is in `TODO.md`. Releasing is its own
+The AI-only instructions are in [`AGENTS.md`](AGENTS.md); open work is in `TODO.md`. Releasing is its own
 document, [`RELEASING.md`](RELEASING.md).
 
 ## Technology
@@ -293,16 +292,11 @@ Some directories don't exist yet but should be created if the need arises.
     |- RELEASING.md     <- The release process, and why it is split the way it is
     |- CHANGELOG.md     <- What changed, per release
     |- AGENTS.md        <- AI-only instructions
-    |- SPECS.md         <- Detailed specifications and all decisions that were taken
     |- REVIEW.md        <- Comments about the codebase that need to be improved uppon
     |- TODO.md          <- List of small to  mid size TODO items that need to be fixed in the future
 ```
 
-The SPECS.md and README.md files can exist in any subdirectory, and they always serve the same
-purpose:
-
-*  README.md - High level summary. Must be readable to humans.
-*  SPECS.md - Semi-structured collection of specifications and a decision log of every decision that
-   was taken during implementation.
+A README.md can exist in any subdirectory, and it always serves the same purpose: a high level
+summary, readable by humans.
 
 The TODO.md and REVIEW.md files are always only in the root of the repository.

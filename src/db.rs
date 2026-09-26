@@ -133,7 +133,7 @@ pub enum GeoMode {
     /// Selected countries are the *only* ones allowed; everything else is
     /// blocked host-wide via a trailing catch-all. Meaningfully more
     /// dangerous than Blocklist — see `main.rs::render_firewall`'s
-    /// nftables-only guard and SPECS.md.
+    /// nftables-only guard.
     Allowlist,
 }
 
@@ -217,7 +217,7 @@ pub enum BlockResponse {
     /// Two honest caveats. It holds one of *your* worker connections too,
     /// so a flood of tarpitted clients competes with real ones for
     /// `worker_connections`. And how long it actually lasts depends on how
-    /// NGINX chooses to write a small error body; see SPECS.md.
+    /// NGINX chooses to write a small error body.
     Tarpit,
 }
 
@@ -1230,8 +1230,8 @@ impl Db {
             );
 
             -- Row presence means \"this country is in the active geo
-            -- list\", host-wide (not per-site — see SPECS.md for why
-            -- per-site geo was dropped once real CIDR data, not just
+            -- list\", host-wide (not per-site: per-site geo was dropped
+            -- once real CIDR data, not just
             -- country codes, was in scope: some countries carry tens of
             -- thousands of CIDR blocks, which is impractical to enforce per
             -- NGINX vhost). What being \"in the list\" actually *means* —

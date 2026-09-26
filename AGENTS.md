@@ -7,7 +7,6 @@ that directory.
 ## Markdown files
 
 - Do NOT update the README.md files unless explicitly asked to do so.
-- Update SPECS.md files every time you do a big change.
 - Always clean up TODO.md and REVIEW.md files when you complete a task from those files.
 
 # Rust
