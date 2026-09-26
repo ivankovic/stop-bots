@@ -5,6 +5,111 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [Unreleased]
+
+### Security
+
+A security review of the whole codebase. Every item below has a regression
+test. Upgrade: several of these can be triggered remotely without a
+password.
+
+- **SSH log lines are read the way sshd writes them.** A client chooses its
+  own SSH username, and sshd logs it verbatim. The parser searched each line
+  for `Accepted`/`Failed` and took the first `from <address>`, so a crafted
+  username could make a failed login count as a successful one — a week of
+  immunity from every block — or credit failures to someone else's address.
+  One username crashed the TUI and stopped the web console until a restart.
+  The message must now begin where sshd's does (after an `sshd[pid]:` or
+  `sshd-session[pid]:` tag in a syslog file), and the address is the last
+  `from <ip> port <n>`, which sshd writes after everything the client sent.
+- **Bot-list patterns can no longer escape NGINX's quoting.** Long pattern
+  lists are split across several `if` lines, and the split could fall inside
+  an escaped `\|`, leaving a quote escaped and the rest of the pattern read as
+  config. Chunks now hold whole patterns only and are re-checked.
+- **Re-applying a site no longer corrupts it** when a pattern or user agent
+  contains `#`, `{` or `}`. The tool re-reads its own blocks with a parser
+  that now follows NGINX's quoting rules.
+- **Patterns that match every visitor are refused**: empty ones, empty
+  alternatives (`|`, `||`), ones with too few literal characters (`.*`), and
+  ones shaped for catastrophic backtracking. That covers the bot lists, the
+  console's "block this user agent" and the TUI. A list over 10,000 entries,
+  or with a pattern over 1 KiB, is refused whole.
+- **A console session can no longer write arbitrary NGINX config.** The
+  Web Access path prefix is limited to letters, digits and `._~-` per
+  segment, and is quoted in the generated `location`. A prefix stored by an
+  earlier version that no longer passes is refused at startup with the fix
+  to run.
+- **A failed `nginx -t` puts every file back.** Applying used to write site
+  files, test, and leave a config that failed the test on disk, where the
+  next NGINX restart would load it. Every apply path — CLI, `batch`, cron,
+  TUI, console — now restores what it changed and only reloads after the
+  test passes.
+- **Files are replaced, not written through symlinks.** Generated NGINX
+  files, the console's own config and the firewall script are written to a
+  temporary file and renamed into place. A site file that is a link is only
+  followed to a target inside the NGINX root. The firewall script is refused
+  in a directory other users can write to.
+- **A downloaded feed cannot block (or, in allowlist mode, admit) the
+  whole internet.** Fetched ranges broader than `/3` (IPv4) or `/12` (IPv6)
+  are dropped and named in the summary. A fetch whose ranges together cover
+  more than half of IPv4 (country zones) or a tenth (every other feed), or
+  5% of IPv6, is refused whole and the previous ranges kept, as is one with
+  more than 250,000 entries.
+- **The lockout guards compare addresses, not text.** The console refused
+  to block your own address only when the text matched exactly; a range
+  containing it, `/32`, a leading space, another IPv6 spelling or an
+  IPv4-mapped address got past. It now tests containment, and a manual
+  block of `0.0.0.0/0` or `::/0` is refused. The SSH guard no longer counts
+  an Allow limited to one port as protecting SSH.
+- **The console's "Apply everything" refuses when the SSH log cannot be
+  read**, as `batch --apply`, cron and the TUI already did. Writing the
+  script without applying it still works.
+- **`batch` now records SSH logins** for the lockout guard. A cron-only host
+  had an empty record, and relied on whatever the log still held after
+  rotation.
+- **Plain path exemptions match NGINX's resolved `$uri`**, so a blocked
+  client can no longer reach any path by prefixing it with an exempt one and
+  `..`. The `robots.txt` exemption is exact. Sites with exemptions read
+  `STALE` once after upgrading.
+- **Sessions end when the password changes**, and last at most 12 hours
+  however actively they are used.
+- **The database is created private**: its directory `0700` and the file
+  `0600`. An existing database readable by others is tightened when opened
+  by its owner.
+- **Downloads refuse plain HTTP**, including through a redirect.
+
+### Fixed
+
+- One invalid UTF-8 byte in a log no longer makes the whole log unreadable
+  until it rotates.
+- A JSON access-log line with a duplicated field is skipped rather than
+  attributed to whichever copy came last.
+- User agents printed by `list-turned-away` and `list-access-stats` have
+  control characters replaced, so a logged user agent cannot send escape
+  sequences to your terminal.
+- The detector block duration is limited to 3,650 days; larger values
+  overflowed and produced blocks that had already expired.
+- A correct console login clears that client's earlier failed attempts.
+- Logging out of a console under a path prefix lands on its own login page.
+- `install firewall --prefix` no longer runs the real `systemctl`.
+- Paths in generated systemd units are quoted and escaped.
+- The boot unit from `install firewall` follows the stored backend, so an
+  iptables host loads `firewall.sh`.
+- `nft`, `iptables` and friends are found in `/usr/sbin` and `/sbin` even
+  under cron's minimal `PATH`.
+- The honeypot path is limited to characters that keep it one `robots.txt`
+  line.
+- Every console response, including the refusal of an unknown host name and
+  error pages, carries the security headers.
+
+### Changed
+
+- **The rotating-user-agent detector's default threshold is 20 agents, not
+  8.** One household behind one router reached 8 in a day. Hosts that set
+  the threshold keep their value.
+- The Web Access panel, its TUI popup and the Help page say that path mode
+  shares an origin with everything else on that site.
+
 ## [0.0.12] — 2026-09-25
 
 ### Added

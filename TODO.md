@@ -7,15 +7,6 @@ list — which meant the open items below were unfindable inside it.
 
 ## Worth doing next
 
-* **Plain path exemptions match `$request_uri`, which `..` walks out of.**
-  `if ($request_uri ~* "^(/blog)")` clears the block for
-  `/blog/../wp-login.php`, and an upstream reached by a `proxy_pass` with no
-  URI part receives the raw path and resolves it. So an exemption lets any
-  blocked client reach any path by prefixing it. Agent exemptions already
-  match `$uri` for this reason (SPECS.md, "Exemptions scoped to one user
-  agent"). Moving the plain ones changes every applied site's block text, so
-  every site reads `STALE` once, which is why it was not folded into that
-  change.
 * **Show `App::message` somewhere other than the Dashboard.** It is only passed
   to `Dashboard::render`, so a status line set by a Site settings apply or a Bot
   settings fetch is invisible unless you happen to be on the Dashboard tab. Site
@@ -28,18 +19,6 @@ list — which meant the open items below were unfindable inside it.
   `~*` regex. The `BLOCKLIST` tag can therefore disagree with what actually gets
   blocked — and since the web UI arrived it says so on two screens rather than
   one, because both front-ends now read this from `crate::dynamic`.
-* **A username containing `" from "` hides the whole line** (`sshlog.rs`).
-  `ip_after` takes the *first* `" from "` after its marker, but sshd writes the
-  address last — so `Failed password for invalid user x from y from 1.2.3.4 port
-  22 ssh2` parses the username fragment as the address, fails, and the line is
-  dropped from every count in that module, `scanning_ips` included. A client that
-  names itself that way is invisible to SSH scan detection. Taking the *last*
-  `" from "` before `" port "` would close it, but it changes which lines
-  `scanning_ips` counts, so it wants its own change with its own test.
-  **This is attacker-selectable, not just a parse quirk**: the username is chosen
-  by whoever is connecting, so a scanner that offers `x from y` as its username
-  hides itself from detection for the cost of one string. Pinned as
-  current behaviour by `a_username_containing_from_defeats_the_whole_line`.
 * **`reinstalling_keeps_the_first_password` races the console's own cron.**
   This is the intermittent container-suite failure, now caught. It is not
   resource contention and not an assertion: the test's `sqlite3` read of

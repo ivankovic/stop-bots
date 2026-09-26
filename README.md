@@ -383,6 +383,10 @@ already have, so the console inherits that site's certificate. A subdomain needs
 and until `certbot --nginx -d <host>` has run, this console's password form and session
 cookie cross the network in the clear.
 
+**Path mode shares an origin with everything else on that site.** A script running on any
+other page of it can use your logged-in console. Use path mode only on a site that runs
+nothing you don't fully trust; otherwise, use a subdomain.
+
 The rest of this section is the same thing by hand, which is worth reading once even if you
 use the panel — the trailing-slash trap below is the mistake it exists to prevent.
 
@@ -394,6 +398,7 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8787;
         proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
 ```
@@ -414,6 +419,7 @@ stop-bots web --base-path /stop-bots --allowed-hosts example.com --save
 location /stop-bots/ {
     proxy_pass http://127.0.0.1:8787;   # NO trailing slash
     proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 }
 ```
 
