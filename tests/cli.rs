@@ -2330,11 +2330,17 @@ fn batch_apply_refuses_when_the_lockout_check_cannot_run() {
     );
 }
 
-/// The other half of the guard: rules that really would cut off the
-/// admin who is connected right now. The fixture log's Accepted line is
-/// for 192.0.2.10, which the rule below covers.
+/// The other half of the guard: rules that would cut off the admin who is
+/// connected right now. The fixture log's Accepted line is for 192.0.2.10,
+/// which the rule below covers.
+///
+/// Batch records that login before rendering, as the internal cron does,
+/// so the admin gets an Allow rule ahead of the block rather than a
+/// refusal. (This used to be the refusal case, because batch never fed the
+/// login window.) No `--apply`: with the admin protected nothing would stop
+/// it running the real `nft`.
 #[test]
-fn batch_apply_refuses_to_block_the_connected_admin() {
+fn batch_protects_the_connected_admin_ahead_of_a_block_covering_them() {
     let fixture = Fixture::new();
     fixture.seed_bots();
     fixture.write_site("example.com");
@@ -2346,13 +2352,15 @@ fn batch_apply_refuses_to_block_the_connected_admin() {
         "block",
     ]);
 
-    fixture
-        .batch(&["--apply"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("192.0.2.10"));
+    fixture.batch(&[]).assert().success();
 
-    assert!(!fixture.firewall_script().exists());
+    let script = fs::read_to_string(fixture.firewall_script()).unwrap();
+    let allow = script.find("ip saddr 192.0.2.10 accept");
+    let block = script.find("ip saddr 192.0.2.0/24 drop");
+    assert!(
+        matches!((allow, block), (Some(a), Some(b)) if a < b),
+        "the admin's address should be allowed ahead of the block:\n{script}"
+    );
 }
 
 /// Nothing is enforced without `--apply`, so the same rule set that is
@@ -2482,6 +2490,52 @@ fn list_turned_away_says_so_when_nothing_was_refused() {
         .stdout(predicate::str::contains(
             "Nothing in this log was turned away",
         ));
+}
+
+/// A user agent as `escape=json` writes one carrying an OSC 52 sequence,
+/// which would set the operator's clipboard. serde decodes the `\u001b`
+/// into a real ESC, so it reaches stdout unless the printing replaces it.
+fn json_line_with_hostile_agent(status: u16) -> String {
+    format!(
+        r#"{{"remote_addr":"203.0.113.5","request_uri":"/","status":"{status}","http_user_agent":"evil\u001b]52;c;aGk=\u0007"}}"#
+    ) + "\n"
+}
+
+/// Asserts `stdout` names the hostile agent from
+/// [`json_line_with_hostile_agent`] with its control characters replaced.
+fn assert_printed_defanged(stdout: &str) {
+    assert!(
+        !stdout.contains(['\u{1b}', '\u{7}']),
+        "a control character reached the terminal: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("evil\u{fffd}]52;c;aGk=\u{fffd}"),
+        "the agent should still be listed, defanged: {stdout:?}"
+    );
+}
+
+#[test]
+fn list_turned_away_replaces_control_characters_in_a_user_agent() {
+    let fixture = Fixture::new();
+    let log = fixture.nginx_root.join("access.log");
+    fs::write(&log, json_line_with_hostile_agent(444)).unwrap();
+    fixture.run(&["set-block-response", "--response", "close"]);
+
+    let out = fixture.run(&["list-turned-away", "--access-log", log.to_str().unwrap()]);
+
+    assert_printed_defanged(&String::from_utf8(out.get_output().stdout.clone()).unwrap());
+}
+
+#[test]
+fn list_access_stats_replaces_control_characters_in_a_user_agent() {
+    let fixture = Fixture::new();
+    let log = fixture.nginx_root.join("access.log");
+    fs::write(&log, json_line_with_hostile_agent(200)).unwrap();
+    fixture.run(&["record-access-stats", "--access-log", log.to_str().unwrap()]);
+
+    let out = fixture.run(&["list-access-stats"]);
+
+    assert_printed_defanged(&String::from_utf8(out.get_output().stdout.clone()).unwrap());
 }
 
 /// Batch must share the access-log read offset with everything else that

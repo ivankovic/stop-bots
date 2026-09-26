@@ -230,7 +230,8 @@ async fn update_lists(db: &Db) -> Vec<Step> {
         .collect()
 }
 
-/// Tallies the access log and runs every switched-on detector.
+/// Records recent SSH logins, tallies the access log and runs every
+/// switched-on detector.
 ///
 /// Both logs are read once and shared across the detectors that want them,
 /// rather than re-read per detector: on a busy server an access log is
@@ -253,6 +254,17 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
             crate::sshlog::LogSource::Unavailable => None,
         },
     );
+
+    // Before the detectors, as the internal cron does it, and through the
+    // same helper: on a host that runs stop-bots only from crontab this is
+    // the only thing feeding the anti-lockout window, and the firewall step
+    // below renders that window as Allow rules ahead of everything else.
+    let logins = match &ssh_log {
+        Some(text) => crate::cron::record_ssh_logins(db, text)
+            .map(|count| format!("{count} address(es) with a login in the log")),
+        None => Ok("skipped: no SSH log".to_string()),
+    };
+    steps.push(Step::new("ssh logins", logins));
 
     // Keyed by the log's real path, not by anything batch invents. That
     // key is where `Db` remembers how far into the log has already been
@@ -313,8 +325,13 @@ fn read_log(
     override_path: Option<&Path>,
     detect: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
+    // Lossy, as `sshlog::read_log_file` and `accesslog::read_log_file` are:
+    // both logs carry client-chosen bytes, and one that is not UTF-8 must
+    // not hide the whole file.
     match override_path {
-        Some(path) => std::fs::read_to_string(path).ok(),
+        Some(path) => std::fs::read(path)
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
         None => detect(),
     }
 }
@@ -401,5 +418,61 @@ fn lockout_verdict(rules: &[crate::db::FirewallRule], options: &BatchOptions) ->
             )
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Options for a `scan_logs` pass over the given SSH log, with an
+    /// access log that does not exist.
+    fn reading_ssh_log(dir: &Path, ssh_log: &Path) -> BatchOptions {
+        BatchOptions {
+            root: dir.to_path_buf(),
+            out: dir.join("fw.nft"),
+            backend: FirewallBackend::Nftables,
+            apply: false,
+            ssh_log: Some(ssh_log.to_path_buf()),
+            access_log: Some(dir.join("no-access.log")),
+            force: false,
+            no_fetch: true,
+        }
+    }
+
+    /// A host that runs stop-bots only from crontab has nothing else
+    /// feeding the anti-lockout window, so batch has to, or the guard is
+    /// left with only the Accepted lines logrotate has not yet taken.
+    #[test]
+    fn a_batch_run_records_the_addresses_it_saw_ssh_logins_from() {
+        let db = Db::open_in_memory().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let ssh_log = dir.path().join("auth.log");
+        std::fs::write(
+            &ssh_log,
+            "Accepted publickey for m from 203.0.113.5 port 55000 ssh2\n",
+        )
+        .unwrap();
+
+        scan_logs(&db, &reading_ssh_log(dir.path(), &ssh_log));
+
+        assert_eq!(db.recent_ssh_login_ips().unwrap(), vec!["203.0.113.5"]);
+    }
+
+    /// The same lossy read as every other log path: one byte that is not
+    /// UTF-8 must not hide the rest of the file.
+    #[test]
+    fn a_log_with_an_invalid_byte_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.log");
+        std::fs::write(&path, b"Invalid user \xff from 198.51.100.4 port 1\n").unwrap();
+
+        let text = read_log(Some(&path), || None);
+
+        assert!(
+            text.as_deref()
+                .is_some_and(|text| text.contains("198.51.100.4")),
+            "text was: {text:?}"
+        );
     }
 }

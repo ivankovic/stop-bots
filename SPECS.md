@@ -1092,11 +1092,26 @@ or a family mismatch as simply "no match", since this check only ever adds
 a warning, never a hard failure over unrelated data). Read-only throughout:
 this module never writes to, rotates, or truncates any log.
 
-**Why parsing is keyed on the literal `"Accepted "` prefix, not just
-`" from "`.** sshd logs failed attempts and disconnects with their own
-`from <ip>` text too (`Failed password for ... from ...`, `Received
-disconnect from ...`) — those must never count as a currently-reachable
-session. Requiring `"Accepted "` to appear first excludes both.
+**Why parsing is anchored at the start of sshd's message.** sshd logs
+failed attempts and disconnects with their own `from <ip>` text too, and
+the username is client-chosen and logged verbatim, spaces included. The
+parser used to *search* each line for `"Accepted "`, so a failed login as
+the user `Accepted` read as a successful one (a week-long Allow rule), and
+a username like `x from 198.51.100.50 port 22` credited its failures to an
+uninvolved address. `sshlog::parse_auth_line` now requires the message to
+*begin* with `Accepted `/`Failed `/`Invalid user ` — either the whole line
+(`journalctl -o cat`) or right after a syslog prefix whose program tag is
+`sshd[<pid>]` or `sshd-session[<pid>]` — and takes the address from the
+*last* `from <ip> port <n>`, since everything the client controls is to
+its left. rsyslog's `message repeated N times: [ ... ]` is unwrapped. A
+local user can still forge a line with `logger -t 'sshd[1]'`; nothing
+reading a text file can prevent that, and the tag check does not claim to.
+
+Both log files are read as bytes and decoded lossily: one byte that is not
+UTF-8 in a client-chosen username or header used to make the whole file
+"unavailable" until it rotated. `batch` records `Accepted` addresses into
+the `ssh_login_ips` window through the same `cron::record_ssh_logins` the
+internal cron uses, so a crontab-only host's window is not empty.
 
 **Warn twice, refuse; `--force` warns once, proceeds.** If any connected
 IP would be blocked, the warning (which IP, which CIDR) prints twice and
@@ -5884,6 +5899,19 @@ is believed.
 distinguishes "the format doesn't log it" from "the client didn't send
 one" — both mean there is no agent string to count or match — so a third
 state there would be a distinction nothing reads.
+
+**A line naming a read field twice is skipped.** Under `escape=none` a user
+agent of `","remote_addr":"8.8.4.4` adds a second `remote_addr`, and serde's
+map keeps the last — which pinned a request on an address that never sent
+it, and the probe-path detector blocks on one request. Taking the *first*
+instead only moves the hole to formats that log the agent before the
+address, so `accesslog::LogObject` refuses the line when any key the parser
+reads appears twice; other duplicated keys are left alone. What it cannot
+catch is an injected key the format does not carry at all, which is why
+`escape=json` is the only safe choice for a JSON format. Values under
+`escape=json` are decoded, so an ESC arrives as a real ESC: the CLI's
+`list-turned-away` and `list-access-stats` print user agents through
+`uadetail::printable`, which replaces control characters with U+FFFD.
 
 ## Debian packages and the APT repository (`[package.metadata.deb]`, `scripts/build-apt-repo.sh`)
 

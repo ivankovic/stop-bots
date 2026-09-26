@@ -351,6 +351,22 @@ pub fn read_log_for(
     }
 }
 
+/// Records every address `ssh_log_text` shows a successful login from, so
+/// the anti-lockout window holds it for a week — including across a log
+/// rotation that drops the line proving it. See the `ssh_login_ips`
+/// schema comment for why the stored time is when we looked, not when
+/// sshd says the login was.
+///
+/// Shared by this module's jobs and by `batch`, which is the whole of the
+/// schedule on a host that runs stop-bots only from crontab. Without it
+/// there, such a host's window stayed empty and the guard had only the
+/// Accepted lines logrotate had not yet taken.
+pub fn record_ssh_logins(db: &Db, ssh_log_text: &str) -> Result<usize> {
+    let ips = crate::sshlog::parse_accepted_ips(ssh_log_text);
+    db.record_ssh_login_ips(&ips)?;
+    Ok(ips.len())
+}
+
 /// Runs one log-backed job against already-read log text and records what
 /// happened, returning the summary the Dashboard's "Scheduled tasks" panel
 /// will show.
@@ -379,12 +395,10 @@ pub fn run_log_job(
     // one designated recorder: this is what keeps the anti-lockout window
     // fed. Detectors run every minute, so an address the operator logs in
     // from is recorded within a minute of the login and stays protected for
-    // a week afterwards — including across a log rotation that drops the
-    // line proving it. See the `ssh_login_ips` schema comment for why the
-    // stored time is when we looked, not when sshd says the login was.
+    // a week afterwards.
     if uses_ssh_log(job) {
         if let Some(text) = log_text {
-            db.record_ssh_login_ips(&crate::sshlog::parse_accepted_ips(text))?;
+            record_ssh_logins(db, text)?;
         }
     }
 

@@ -2210,9 +2210,12 @@ fn list_turned_away(db_path: Option<PathBuf>, access_log: Option<PathBuf>) -> Re
     println!();
     println!("{:>8}  {:>8}  USER AGENT", "REFUSED", "SERVED");
     for entry in &turned_away {
+        // Client-chosen text on its way to a terminal; see `printable`.
         println!(
             "{:>8}  {:>8}  {}",
-            entry.refused, entry.served, entry.user_agent
+            entry.refused,
+            entry.served,
+            stop_bots::uadetail::printable(&entry.user_agent)
         );
     }
     println!();
@@ -3277,7 +3280,11 @@ fn list_access_stats(db_path: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
     for stat in stats {
-        println!("{:>8}  {}", stat.hit_count, stat.user_agent);
+        println!(
+            "{:>8}  {}",
+            stat.hit_count,
+            stop_bots::uadetail::printable(&stat.user_agent)
+        );
     }
     Ok(())
 }

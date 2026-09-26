@@ -57,9 +57,15 @@ pub enum LogSource {
 /// CLI's `--ssh-log` override, for containers/non-standard log locations
 /// and for deterministic tests that can't rely on whatever happens to be in
 /// the real system logs.
+///
+/// Read as bytes and decoded lossily, the same as the `journalctl` path
+/// below. The username is client-chosen, so one invalid UTF-8 byte in it
+/// is enough to make a strict read fail — and "unavailable" switches off
+/// both the lockout guard's evidence and the scanner detector until the
+/// log rotates.
 pub fn read_log_file(path: &Path) -> LogSource {
-    match std::fs::read_to_string(path) {
-        Ok(content) => LogSource::Found(content),
+    match std::fs::read(path) {
+        Ok(bytes) => LogSource::Found(String::from_utf8_lossy(&bytes).into_owned()),
         Err(_) => LogSource::Unavailable,
     }
 }
@@ -88,23 +94,147 @@ pub fn find_default_source() -> LogSource {
     LogSource::Unavailable
 }
 
-/// Finds `marker` in `line`, then extracts the address between the next
-/// `" from "` and `" port "` after it — the shape sshd uses for both
-/// successful and failed auth lines alike (`Accepted ... from <ip> port
-/// ...`, `Failed ... for ... from <ip> port ...`, `Invalid user ... from
-/// <ip> port ...`). Requires `marker` to appear *before* `" from "` so e.g.
-/// a `"Failed "` search never matches straight past an unrelated later
-/// occurrence in the same line. Parses the extracted token as an actual
-/// [`IpAddr`] (not just "non-empty") so callers that go on to store this as
-/// a firewall rule address never hand a malformed value to
-/// [`crate::db::Db::add_firewall_rule`].
-fn ip_after(line: &str, marker: &str) -> Option<IpAddr> {
-    let marker_at = line.find(marker)?;
-    let rest = &line[marker_at..];
-    let from_at = rest.find(" from ")? + " from ".len();
-    let after_from = &rest[from_at..];
-    let end = after_from.find(" port ")?;
-    after_from[..end].trim().parse().ok()
+/// The three sshd messages this module reads, by the word they open with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthKind {
+    /// `Accepted <method> for <user> from <ip> port <n> ssh2[: <key>]`
+    Accepted,
+    /// `Failed <method> for [invalid user ]<user> from <ip> port <n> ssh2`
+    Failed,
+    /// `Invalid user <user> from <ip> port <n>`, logged before any auth
+    /// method is tried.
+    InvalidUser,
+}
+
+/// One authentication line, read the way sshd wrote it.
+struct AuthLine<'a> {
+    kind: AuthKind,
+    /// As the client sent it: unbounded, and possibly empty. See
+    /// [`display_username`] before showing it to anyone.
+    user: &'a str,
+    ip: IpAddr,
+}
+
+/// Parses one line as an sshd authentication message, or `None` for any
+/// other line.
+///
+/// **The username is attacker-chosen and sshd logs it verbatim, spaces
+/// included**, so this reads the line from where sshd's message begins
+/// rather than searching it for markers. A search is what this used to do,
+/// and it let a failed login as the user `Accepted` read as a successful
+/// login — a week-long Allow rule ahead of every other firewall rule — and
+/// a username like `x from 198.51.100.50 port 22` credit its failures to
+/// an uninvolved address for the scanner detector to block.
+///
+/// Two anchors do the work. The message must *begin* with its marker (see
+/// [`sshd_message`] for where a message begins), and the address is the
+/// *last* `from <ip> port <n>`: everything the client controls is to its
+/// left, and what follows the port is sshd's own. The one exception is a
+/// certificate ID in an `Accepted` line's key info, which is to the right
+/// and is chosen by whoever the admin's own CA signed it for.
+///
+/// The address is parsed as a real [`IpAddr`] (not just "non-empty") so
+/// callers that go on to store it as a firewall rule never hand a
+/// malformed value to [`crate::db::Db::add_firewall_rule`]. Nothing here
+/// indexes the line directly: it is attacker-shaped text, and a panic here
+/// under the web console's database lock poisons it.
+fn parse_auth_line(line: &str) -> Option<AuthLine<'_>> {
+    let message = sshd_message(line)?;
+    let (kind, rest) = if let Some(rest) = message.strip_prefix("Accepted ") {
+        (AuthKind::Accepted, rest)
+    } else if let Some(rest) = message.strip_prefix("Failed ") {
+        (AuthKind::Failed, rest)
+    } else {
+        (
+            AuthKind::InvalidUser,
+            message.strip_prefix("Invalid user ")?,
+        )
+    };
+
+    let (head, ip) = split_address(rest)?;
+    let user = match kind {
+        AuthKind::InvalidUser => head,
+        AuthKind::Accepted | AuthKind::Failed => {
+            // `<method> for <user>`. The method is sshd's own and has no
+            // spaces (`password`, `keyboard-interactive/pam`), so the first
+            // space ends it whatever the username holds.
+            let (method, after) = head.split_once(' ')?;
+            let user = after.strip_prefix("for ")?;
+            if method.is_empty() {
+                return None;
+            }
+            match kind {
+                AuthKind::Failed => user.strip_prefix("invalid user ").unwrap_or(user),
+                _ => user,
+            }
+        }
+    };
+    Some(AuthLine { kind, user, ip })
+}
+
+/// Splits `<head> from <ip> port <n>[ <tail>]` at its *last* ` from `,
+/// returning the head and the address.
+///
+/// Only the last one is tried. sshd's own is always last and always parses,
+/// so falling back to an earlier candidate could only ever find one the
+/// client wrote.
+fn split_address(rest: &str) -> Option<(&str, IpAddr)> {
+    let at = rest.rfind(" from ")?;
+    let after = rest.get(at + " from ".len()..)?;
+    let (address, after_address) = after.split_once(" port ")?;
+    let port_len = after_address
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after_address.len());
+    let tail = after_address.get(port_len..)?;
+    if port_len == 0 || !(tail.is_empty() || tail.starts_with(' ')) {
+        return None;
+    }
+    Some((rest.get(..at)?, address.parse().ok()?))
+}
+
+/// Where sshd's own message begins in `line`, if `line` came from sshd.
+///
+/// Two shapes. `journalctl -u ssh -o cat` prints the message alone, so a
+/// line that opens with one of the markers is taken whole; the unit filter
+/// already made sure it was sshd's. A syslog line (`auth.log`, `secure`)
+/// carries a prefix — `Jun 12 01:02:03 host sshd[123]: `, or an RFC 3339
+/// timestamp in place of the first three fields — and the message starts
+/// right after the first `": "`. Nothing before that is client-controlled,
+/// and neither timestamp form contains `": "`, so the first one is the end
+/// of the program tag, which must be `sshd[<pid>]` or, on newer OpenSSH,
+/// `sshd-session[<pid>]`.
+///
+/// **Requiring the tag raises the bar; it does not make these lines
+/// trustworthy.** Any local user can write to the auth log with `logger`,
+/// and `logger -t 'sshd[1]'` produces a line this cannot tell from sshd's
+/// own. Nothing reading a text file can. The tag keeps out the plain
+/// `logger "Accepted ..."`, and lines other programs log about SSH.
+///
+/// rsyslog's `message repeated N times: [ ... ]` is unwrapped, so a burst
+/// of identical failures still counts (once, as it did before this parser
+/// read lines from their start).
+fn sshd_message(line: &str) -> Option<&str> {
+    const MARKERS: [&str; 3] = ["Accepted ", "Failed ", "Invalid user "];
+    if MARKERS.iter().any(|marker| line.starts_with(marker)) {
+        return Some(line);
+    }
+
+    let (prefix, message) = line.split_once(": ")?;
+    let tag = prefix.rsplit(' ').next()?;
+    let pid = tag
+        .strip_prefix("sshd[")
+        .or_else(|| tag.strip_prefix("sshd-session["))?
+        .strip_suffix(']')?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    let repeated = message
+        .strip_prefix("message repeated ")
+        .and_then(|rest| rest.split_once(" times: [ "))
+        .filter(|(count, _)| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|(_, inner)| inner.strip_suffix(']'));
+    Some(repeated.unwrap_or(message))
 }
 
 /// Extracts the client IP from every successful-login line in `log_text`,
@@ -114,16 +244,18 @@ fn ip_after(line: &str, marker: &str) -> Option<IpAddr> {
 /// timestamp/hostname/pid prefix, as in `/var/log/auth.log` or
 /// `/var/log/secure`) or `journalctl -o cat` (which strips that prefix),
 /// since both just carry sshd's own message text verbatim; one parser
-/// covers both. Deliberately keyed on the literal `"Accepted "` prefix, not
-/// just `" from "` — sshd also logs *failed* attempts and disconnects with
-/// their own `from <ip>` text (`Failed password for ... from ...`,
-/// `Received disconnect from ...`), which must never count as a successful,
-/// currently-reachable session.
+/// covers both. Deliberately keyed on a message that *opens with*
+/// `"Accepted "` (see [`parse_auth_line`]), not on `" from "` or on the word
+/// appearing anywhere — sshd also logs failed attempts and disconnects
+/// with their own `from <ip>` text, and a client picks its own username,
+/// and none of those must ever count as a successful, currently-reachable
+/// session.
 pub fn parse_accepted_ips(log_text: &str) -> Vec<String> {
     let mut ips: Vec<String> = log_text
         .lines()
-        .filter_map(|line| ip_after(line, "Accepted "))
-        .map(|ip| ip.to_string())
+        .filter_map(parse_auth_line)
+        .filter(|auth| auth.kind == AuthKind::Accepted)
+        .map(|auth| auth.ip.to_string())
         .collect();
     ips.sort();
     ips.dedup();
@@ -145,7 +277,9 @@ pub fn parse_accepted_ips(log_text: &str) -> Vec<String> {
 fn failed_attempt_ips(log_text: &str) -> Vec<IpAddr> {
     log_text
         .lines()
-        .filter_map(|line| ip_after(line, "Failed ").or_else(|| ip_after(line, "Invalid user ")))
+        .filter_map(parse_auth_line)
+        .filter(|auth| auth.kind != AuthKind::Accepted)
+        .map(|auth| auth.ip)
         .collect()
 }
 
@@ -159,34 +293,18 @@ fn failed_attempt_ips(log_text: &str) -> Vec<IpAddr> {
 /// screen is a defacement even when it is correctly escaped.
 const MAX_USERNAME_CHARS: usize = 48;
 
-/// The username offered on a failed-auth line, as the client sent it.
+/// A failed-auth line's username as it is safe to show: capped, and with
+/// control characters replaced. `None` for an empty one.
 ///
-/// Deliberately bounded by the *same* `" from "` [`ip_after`] uses, so a
-/// line the IP parse rejects is rejected here too and the pair can never
-/// come from two different readings of one line. (That boundary is the
-/// first `" from "` after `marker`, which means a username containing the
-/// literal `" from "` defeats both — see the note on
-/// [`failed_attempt_usernames`].)
+/// Takes the username [`parse_auth_line`] split out, so the address and
+/// the name always come from one reading of the line.
 ///
 /// Control characters are replaced rather than passed through. sshd
 /// escapes non-printables in modern versions, but this parser is pointed
 /// at whatever file the admin names, and an escape sequence that reaches
 /// the TUI's alternate screen is a corrupted display at best.
-fn username_after<'a>(line: &'a str, marker: &str) -> Option<std::borrow::Cow<'a, str>> {
-    let marker_at = line.find(marker)?;
-    let rest = &line[marker_at..];
-    let from_at = rest.find(" from ")?;
-    let head = &rest[marker.len()..from_at];
-
-    // `Invalid user <user> from ...` puts the name straight after the
-    // marker; `Failed <method> for [invalid user] <user> from ...` puts it
-    // after a ` for `, optionally behind sshd's own "invalid user" note.
-    let raw = match head.find(" for ") {
-        Some(at) => &head[at + " for ".len()..],
-        None => head,
-    };
+fn display_username(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
     let raw = raw.trim();
-    let raw = raw.strip_prefix("invalid user ").unwrap_or(raw).trim();
     if raw.is_empty() {
         return None;
     }
@@ -230,12 +348,9 @@ fn username_after<'a>(line: &'a str, marker: &str) -> Option<std::borrow::Cow<'a
 /// can never produce a breakdown for a row the panel itself would not
 /// list. An address that fails them comes back empty.
 ///
-/// A username containing the literal `" from "` makes [`ip_after`] fail to
-/// find an address at all, so such a line is dropped from *every* count in
-/// this module, not merely from this breakdown. That is pre-existing and
-/// is a detection weakness rather than a display one — it is recorded in
-/// TODO.md rather than worked around here, because narrowing it means
-/// changing which lines `scanning_ips` counts.
+/// A username containing the literal `" from "` is listed whole: the
+/// address is the *last* `from <ip> port <n>` on the line (see
+/// [`parse_auth_line`]), so nothing the client typed can move it.
 pub fn failed_attempt_usernames_for(log_text: &str, address: &str) -> Vec<(String, u64)> {
     let Ok(wanted) = address.parse::<IpAddr>() else {
         return Vec::new();
@@ -267,25 +382,20 @@ pub fn failed_attempt_usernames_for(log_text: &str, address: &str) -> Vec<(Strin
     users
 }
 
-/// One failed-auth line's `(address, username)` pair, trying the two
-/// markers in the same order [`failed_attempt_ips`] does.
+/// One failed-auth line's username, if its address is `wanted`.
 ///
-/// `wanted` is applied to the address before the username is extracted, so
-/// a line for an address the caller is not interested in costs a parse and
-/// no allocation.
+/// `wanted` is applied to the address before the username is cleaned up,
+/// so a line for an address the caller is not interested in costs a parse
+/// and no allocation.
 fn failed_attempt_with_user<'a>(
     line: &'a str,
     wanted: impl Fn(&IpAddr) -> bool,
 ) -> Option<std::borrow::Cow<'a, str>> {
-    for marker in ["Failed ", "Invalid user "] {
-        if let Some(ip) = ip_after(line, marker) {
-            if !wanted(&ip) {
-                return None;
-            }
-            return username_after(line, marker);
-        }
+    let auth = parse_auth_line(line)?;
+    if auth.kind == AuthKind::Accepted || !wanted(&auth.ip) {
+        return None;
     }
-    None
+    display_username(auth.user)
 }
 
 /// The `String` form of [`failed_attempt_ips`], for callers outside this
@@ -596,16 +706,195 @@ Jun 12 01:00:01 h sshd[2]: Accepted publickey for marko from 198.51.100.1 port 2
         );
     }
 
-    /// sshd puts the address last, but the boundary is the *first*
-    /// `" from "`, so a username containing it defeats the address parse —
-    /// and therefore drops the line from every count in this module, not
-    /// just from the breakdown. Pinned as the current behaviour so a later
-    /// change to `ip_after` has to decide about it deliberately.
+    /// sshd puts the address last, so a username containing `" from "` is
+    /// read whole and the line still counts against the real address.
     #[test]
-    fn a_username_containing_from_defeats_the_whole_line() {
+    fn a_username_containing_from_is_read_whole() {
         let log = "Failed password for invalid user x from y from 198.51.100.1 port 1 ssh2\n";
 
-        assert!(failed_attempt_usernames_for(log, "198.51.100.1").is_empty());
+        assert_eq!(
+            failed_attempt_usernames_for(log, "198.51.100.1"),
+            vec![("x from y".to_string(), 1)]
+        );
+        assert_eq!(parse_failed_attempt_ips(log), vec!["198.51.100.1"]);
+    }
+
+    // ---- hostile usernames ----
+    //
+    // The username is the one field of these lines the client chooses, and
+    // sshd logs it verbatim, spaces and all. Each case below is a username
+    // shaped like the text around it, so that a parser that searches for
+    // its markers rather than reading the line from the start credits the
+    // wrong address — or, for `Accepted`, hands an attacker a week-long
+    // Allow rule ahead of every other firewall rule.
+
+    /// Where the line was logged from: bare (`journalctl -o cat`), classic
+    /// syslog, and the RFC 3339 syslog Debian writes, with the
+    /// `sshd-session` tag newer OpenSSH logs under.
+    const PREFIXES: &[&str] = &[
+        "",
+        "Jun 12 01:00:00 host sshd[4242]: ",
+        "2026-06-12T01:00:00.123456+00:00 host sshd-session[4242]: ",
+    ];
+
+    const HOSTILE_USERNAMES: &[&str] = &[
+        "Accepted",
+        "Failed",
+        "Invalid user",
+        "x from 198.51.100.50 port 22",
+        "Accepted x from 203.0.113.66 port 1",
+        "Accepted x for y from 203.0.113.66 port 1 ssh2",
+    ];
+
+    /// The address the connection really came from in every hostile case.
+    const REAL: &str = "192.0.2.77";
+
+    #[test]
+    fn a_hostile_username_on_a_failed_line_is_credited_to_the_real_address() {
+        for prefix in PREFIXES {
+            for user in HOSTILE_USERNAMES {
+                for line in [
+                    format!("{prefix}Invalid user {user} from {REAL} port 5555"),
+                    format!(
+                        "{prefix}Failed password for invalid user {user} from {REAL} port 5555 ssh2"
+                    ),
+                    format!("{prefix}Failed password for {user} from {REAL} port 5555 ssh2"),
+                ] {
+                    assert_eq!(
+                        parse_failed_attempt_ips(&line),
+                        vec![REAL],
+                        "line was: {line}"
+                    );
+                    assert!(
+                        parse_accepted_ips(&line).is_empty(),
+                        "a failed login read as a successful one: {line}"
+                    );
+                    assert_eq!(
+                        failed_attempt_usernames_for(&line, REAL),
+                        vec![(user.to_string(), 1)],
+                        "line was: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_hostile_username_on_an_accepted_line_still_names_the_real_address() {
+        for prefix in PREFIXES {
+            for user in HOSTILE_USERNAMES {
+                let line =
+                    format!("{prefix}Accepted password for {user} from {REAL} port 5555 ssh2");
+                assert_eq!(parse_accepted_ips(&line), vec![REAL], "line was: {line}");
+                assert!(
+                    parse_failed_attempt_ips(&line).is_empty(),
+                    "a successful login counted as a failure: {line}"
+                );
+            }
+        }
+    }
+
+    /// The marker has to *begin* sshd's message. sshd logs plenty of other
+    /// messages that carry the username too, and one of them spelling
+    /// `Accepted ... from <ip> port <n>` is not a login.
+    #[test]
+    fn a_marker_that_does_not_begin_the_message_does_not_count() {
+        let user = "Accepted publickey for x from 203.0.113.66 port 1 ssh2";
+        for prefix in PREFIXES {
+            let line =
+                format!("{prefix}Disconnected from invalid user {user} {REAL} port 5555 [preauth]");
+            assert!(parse_accepted_ips(&line).is_empty(), "line was: {line}");
+            assert!(
+                parse_failed_attempt_ips(&line).is_empty(),
+                "line was: {line}"
+            );
+        }
+    }
+
+    /// Any local user can write to auth.log through `logger`. Requiring
+    /// sshd's own program tag keeps a plain `logger "Accepted ..."` out;
+    /// see [`sshd_message`] for what it cannot keep out.
+    #[test]
+    fn a_line_from_another_program_does_not_count() {
+        for line in [
+            "Jun 12 01:00:00 host marko: Accepted password for x from 203.0.113.66 port 1 ssh2",
+            "Jun 12 01:00:00 host sudo[77]: Failed password for x from 203.0.113.66 port 1 ssh2",
+            "Jun 12 01:00:00 host notsshd[77]: Invalid user x from 203.0.113.66 port 1",
+            "Jun 12 01:00:00 host sshd[]: Invalid user x from 203.0.113.66 port 1",
+        ] {
+            assert!(parse_accepted_ips(line).is_empty(), "line was: {line}");
+            assert!(
+                parse_failed_attempt_ips(line).is_empty(),
+                "line was: {line}"
+            );
+        }
+    }
+
+    /// rsyslog folds a burst of identical lines into one of these. The
+    /// wrapped message still begins at a fixed place, so reading it keeps
+    /// the anchor rather than loosening it.
+    #[test]
+    fn a_repeated_message_summary_is_read_as_the_message_it_repeats() {
+        let log = "Jun 12 01:00:00 host sshd[1]: message repeated 5 times: \
+                   [ Failed password for root from 198.51.100.8 port 22 ssh2]";
+
+        assert_eq!(parse_failed_attempt_ips(log), vec!["198.51.100.8"]);
+    }
+
+    /// Slicing between the marker and the first `" from "` used to panic
+    /// here, and a panic under the web console's database lock poisons it.
+    #[test]
+    fn a_username_that_is_itself_a_marker_does_not_panic() {
+        let log = "Invalid user Failed from 203.0.113.9 port 5555\n\
+                   Invalid user Invalid from 203.0.113.9 port 5555\n\
+                   Invalid user  from 203.0.113.9 port 5555\n\
+                   Failed none for invalid user  from 203.0.113.9 port 5555 ssh2\n\
+                   Failed  from 203.0.113.9 port 5555\n\
+                   Invalid user from 203.0.113.9 port 5555\n\
+                   Invalid user\n\
+                   Failed\n";
+
+        let users = failed_attempt_usernames_for(log, "203.0.113.9");
+
+        assert_eq!(
+            users,
+            vec![("Failed".to_string(), 1), ("Invalid".to_string(), 1)],
+            "users was: {users:?}"
+        );
+    }
+
+    /// An empty username is still a failed attempt from that address; it
+    /// just has no name to list.
+    #[test]
+    fn an_empty_username_still_counts_the_attempt() {
+        let log = "Invalid user  from 203.0.113.9 port 5555\n\
+                   Failed none for invalid user  from 203.0.113.9 port 5555 ssh2\n";
+
+        assert_eq!(parse_failed_attempt_ips(log).len(), 2);
+    }
+
+    /// A port that is not all digits is not sshd's `port <n>`, so that
+    /// occurrence is not the address.
+    #[test]
+    fn the_address_must_be_followed_by_a_numeric_port() {
+        let log = "Invalid user x from 203.0.113.9 port 22x";
         assert!(parse_failed_attempt_ips(log).is_empty());
+    }
+
+    /// One byte that is not UTF-8 — a client can put one in a username —
+    /// must not make the whole log unreadable until it rotates.
+    #[test]
+    fn read_log_file_survives_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.log");
+        let mut bytes = b"Invalid user \xff\xfe from 198.51.100.4 port 1\n".to_vec();
+        bytes.extend_from_slice(b"Accepted publickey for a from 192.0.2.4 port 1 ssh2\n");
+        std::fs::write(&path, bytes).unwrap();
+
+        let LogSource::Found(text) = read_log_file(&path) else {
+            panic!("a log with one invalid byte was reported unavailable");
+        };
+        assert_eq!(parse_accepted_ips(&text), vec!["192.0.2.4"]);
+        assert_eq!(parse_failed_attempt_ips(&text), vec!["198.51.100.4"]);
     }
 }

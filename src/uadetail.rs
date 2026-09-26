@@ -250,6 +250,34 @@ fn verdict_for(bot: &Bot, policies: Policies) -> BotVerdict {
     }
 }
 
+/// `text` with every control character replaced by U+FFFD, for printing a
+/// client-chosen string — a user agent, a path, a username — to a terminal.
+///
+/// Uncapped, unlike [`for_display`]: the CLI's `list-*` commands print
+/// the whole string so an operator can copy it into `trust`. The
+/// replacement is the part that cannot be skipped. A JSON `log_format`
+/// with `escape=json` writes an ESC as `\u001b`, which the parser decodes
+/// back into a real one, so a user agent can carry an OSC 52 clipboard
+/// write or a title change straight into the operator's shell. C1 controls
+/// count too, since some terminals act on a lone `0x9b` as a CSI.
+///
+/// Borrowed when there is nothing to replace, which is every real browser.
+pub fn printable(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(char::is_control) {
+        std::borrow::Cow::Owned(text.chars().map(printable_char).collect())
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+fn printable_char(c: char) -> char {
+    if c.is_control() {
+        '\u{fffd}'
+    } else {
+        c
+    }
+}
+
 /// The string as it is safe to draw: capped, and with control characters
 /// replaced.
 ///
@@ -263,7 +291,7 @@ fn for_display(user_agent: &str) -> (String, bool) {
     let mut out: String = user_agent
         .chars()
         .take(MAX_USER_AGENT_CHARS)
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .map(printable_char)
         .collect();
     let truncated = user_agent.chars().count() > MAX_USER_AGENT_CHARS;
     if truncated {
@@ -481,6 +509,31 @@ mod tests {
             "a control character survived: {:?}",
             detail.user_agent
         );
+    }
+
+    /// C1 controls as well as C0: some terminals act on a lone U+009B as a
+    /// CSI, which is as good as an ESC `[`.
+    #[test]
+    fn printable_replaces_every_control_character_and_nothing_else() {
+        let cases = [
+            (
+                "Mozilla/5.0 (X11; Linux) Gecko/20100101 Firefox/128.0",
+                None,
+            ),
+            ("a\u{1b}]0;title\u{7}b", Some("a\u{fffd}]0;title\u{fffd}b")),
+            ("a\u{9b}2Jb", Some("a\u{fffd}2Jb")),
+            ("tab\there", Some("tab\u{fffd}here")),
+        ];
+        for (input, replaced) in cases {
+            let out = printable(input);
+            match replaced {
+                None => assert!(
+                    matches!(out, std::borrow::Cow::Borrowed(s) if s == input),
+                    "a clean string should come back untouched: {out:?}"
+                ),
+                Some(expected) => assert_eq!(out, expected, "input was {input:?}"),
+            }
+        }
     }
 
     /// The cap is for display only — the lookups still use the string the

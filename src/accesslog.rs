@@ -68,9 +68,15 @@ pub enum LogSource {
 /// Reads `path` directly, bypassing auto-detection — backs the CLI's
 /// `--access-log` override, for non-default log locations and for
 /// deterministic tests.
+///
+/// Read as bytes and decoded lossily, because the bytes are the client's:
+/// a JSON `log_format` with `escape=json` writes a header's non-ASCII
+/// bytes through untouched, so one request with a lone `0xFF` in its
+/// user agent would otherwise make the whole file "unavailable" — every
+/// access-log detector off — until it rotates.
 pub fn read_log_file(path: &Path) -> LogSource {
-    match std::fs::read_to_string(path) {
-        Ok(content) => LogSource::Found(content),
+    match std::fs::read(path) {
+        Ok(bytes) => LogSource::Found(String::from_utf8_lossy(&bytes).into_owned()),
         Err(_) => LogSource::Unavailable,
     }
 }
@@ -182,8 +188,8 @@ fn json_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Op
 /// keys parses to `None` here, which is the same outcome it had before
 /// this function existed.
 fn parse_json_line(line: &str) -> Option<ParsedLine> {
-    let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let obj = value.as_object()?;
+    let LogObject(fields) = serde_json::from_str(line).ok()?;
+    let obj = &fields;
 
     let ip: IpAddr = json_field(obj, "remote_addr")?.parse().ok()?;
     let status: u16 = json_field(obj, "status")?.parse().ok()?;
@@ -216,6 +222,66 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
         // what it does with "the client didn't send one".
         user_agent: json_field(obj, "http_user_agent").unwrap_or_default(),
     })
+}
+
+/// Every key [`parse_json_line`] reads.
+const JSON_FIELDS: [&str; 7] = [
+    "remote_addr",
+    "status",
+    "request_uri",
+    "request",
+    "uri",
+    "http_referer",
+    "http_user_agent",
+];
+
+/// A JSON log line's top-level object, refused if it names any of
+/// [`JSON_FIELDS`] twice.
+///
+/// A `log_format` built with `escape=none` writes a header verbatim, so a
+/// user agent of `","remote_addr":"8.8.4.4` closes its own string and adds
+/// a second `remote_addr`. serde's map keeps the last one, which pinned a
+/// request on an address that never sent it — and the probe-path detector
+/// blocks on a single request. Keeping the *first* instead is no fix: it
+/// is just as wrong for a format that logs the user agent before the
+/// address. Two values for one field means one of them was written by the
+/// client, with no way to tell which, so the line is not read at all.
+///
+/// That costs nothing a client could not already do: under `escape=none`
+/// it can make its own lines unparseable with a lone `"`. What this cannot
+/// catch is a client adding a field the format does not log — `escape=none`
+/// is not safe for a JSON format, and `escape=json` is what to use.
+struct LogObject(serde_json::Map<String, serde_json::Value>);
+
+impl<'de> serde::Deserialize<'de> for LogObject {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ObjectVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ObjectVisitor {
+            type Value = LogObject;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<LogObject, A::Error> {
+                let mut fields = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value()?;
+                    if JSON_FIELDS.contains(&key.as_str()) && fields.contains_key(&key) {
+                        return Err(serde::de::Error::custom(format!("duplicate field {key}")));
+                    }
+                    fields.insert(key, value);
+                }
+                Ok(LogObject(fields))
+            }
+        }
+
+        deserializer.deserialize_map(ObjectVisitor)
+    }
 }
 
 /// One parsed access-log line. A struct rather than a tuple since it grew
@@ -1222,6 +1288,70 @@ mod tests {
             LogSource::Found(content) => assert!(content.contains("1.2.3.4")),
             LogSource::Unavailable => panic!("expected the file to be readable"),
         }
+    }
+
+    /// A client puts whatever bytes it likes in a header, and one that is
+    /// not UTF-8 must not make the log unreadable until it rotates —
+    /// "unavailable" switches every access-log detector off.
+    #[test]
+    fn read_log_file_survives_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        let mut bytes = b"198.51.100.1 - - [10/Jul/2026:12:00:00 +0000] \"GET /a HTTP/1.1\" 404 1 \"-\" \"\xff\"\n".to_vec();
+        bytes.extend_from_slice(not_found_line("198.51.100.2", "/b").as_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let LogSource::Found(text) = read_log_file(&path) else {
+            panic!("a log with one invalid byte was reported unavailable");
+        };
+        assert_eq!(
+            scanning_ips(&text, 1),
+            vec!["198.51.100.1".to_string(), "198.51.100.2".to_string()],
+            "text was:\n{text}"
+        );
+    }
+
+    // ---- JSON duplicate keys ----
+
+    /// Under `escape=none` a client can close the string it is in and write
+    /// keys of its own. serde keeps the *last* of a duplicated key, and
+    /// taking the first instead only moves the problem to formats that log
+    /// the header before `remote_addr`. Either way the line is someone
+    /// else's claim about who sent it, so it is not read at all.
+    #[test]
+    fn a_json_line_with_a_duplicated_field_is_skipped() {
+        let cases = [
+            (
+                "remote_addr injected after the real one",
+                r#"{"remote_addr":"203.0.113.5","request_uri":"/.env","status":"404","http_user_agent":"","remote_addr":"8.8.4.4"}"#,
+            ),
+            (
+                "remote_addr injected before the real one",
+                r#"{"http_user_agent":"","remote_addr":"8.8.4.4","remote_addr":"203.0.113.5","request_uri":"/.env","status":"404"}"#,
+            ),
+            (
+                "status injected",
+                r#"{"remote_addr":"203.0.113.5","request_uri":"/.env","status":"200","http_referer":"","status":"404"}"#,
+            ),
+            (
+                "the target injected",
+                r#"{"remote_addr":"203.0.113.5","request_uri":"/","http_user_agent":"","request_uri":"/.env","status":"404"}"#,
+            ),
+        ];
+        for (description, line) in cases {
+            assert_eq!(parse_line(line), None, "should not parse: {description}");
+        }
+    }
+
+    /// Only the fields this reads are held to it: a format that happens to
+    /// log some other variable twice is not a forgery of anything read here.
+    #[test]
+    fn a_json_line_duplicating_a_field_nobody_reads_still_parses() {
+        let line = r#"{"time_local":"a","remote_addr":"203.0.113.5","request_uri":"/x","status":"404","time_local":"b"}"#;
+        assert_eq!(
+            parse_line(line).map(|l| l.ip),
+            Some("203.0.113.5".parse().unwrap())
+        );
     }
 
     // ---- spoofed crawler detection ----
