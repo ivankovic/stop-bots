@@ -405,7 +405,7 @@ fn stray_generated_files(conf_d: &Path, stock: &Path) -> Vec<String> {
 /// spawned at all is a `false`, not a panic: on a host with no Docker
 /// this is the ordinary path.
 fn run_ok(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
+    Command::new(crate::host::program(program))
         .args(args)
         .output()
         .map(|out| out.status.success())
@@ -616,9 +616,17 @@ fn nftables_conf_flushes() -> Option<bool> {
 /// question is whether anything re-applies *our* script: the unit
 /// `stop-bots install firewall` writes, or an `include` of it in
 /// `/etc/nftables.conf`.
+///
+/// For iptables, the unit `install firewall` writes is an answer too now
+/// that it follows the backend and re-runs the iptables script at boot.
 fn firewall_persists(backend: FirewallBackend) -> Option<bool> {
     match backend {
-        FirewallBackend::Iptables => unit_enabled("netfilter-persistent.service"),
+        FirewallBackend::Iptables => {
+            if unit_enabled(crate::install::FIREWALL_UNIT) == Some(true) {
+                return Some(true);
+            }
+            unit_enabled("netfilter-persistent.service")
+        }
         FirewallBackend::Nftables => {
             if unit_enabled(crate::install::FIREWALL_UNIT) == Some(true) {
                 return Some(true);
@@ -690,12 +698,26 @@ fn free_bytes(path: &Path) -> Option<u64> {
     } else {
         dir
     };
-    let out = run("df", &["--output=avail", "-B1", &dir.to_string_lossy()])?;
+    let out = run("df", &df_args(&dir.to_string_lossy()))?;
     out.lines().nth(1)?.trim().parse().ok()
 }
 
+/// `df`'s arguments for `dir`, with `--` before it so a path beginning
+/// with `-` is a path and not an option.
+fn df_args(dir: &str) -> [&str; 4] {
+    ["--output=avail", "-B1", "--", dir]
+}
+
+/// Runs `program`, found by [`crate::host::program`] — the health check is
+/// what cron runs hourly, and cron's `PATH` has no `/usr/sbin`, where `nft`
+/// and `iptables` live. Asking a program that cannot be found reads as
+/// "could not tell", which is how every firewall check on such a host
+/// ended up.
 fn run(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).output().ok()?;
+    let out = Command::new(crate::host::program(program))
+        .args(args)
+        .output()
+        .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).to_string())
@@ -705,7 +727,10 @@ fn run(program: &str, args: &[&str]) -> Option<String> {
 /// `systemctl is-active` reports the state on stdout *and* exits non-zero
 /// when that state is not "active".
 fn run_allowing_failure(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).output().ok()?;
+    let out = Command::new(crate::host::program(program))
+        .args(args)
+        .output()
+        .ok()?;
     Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
@@ -2922,6 +2947,14 @@ mod tests {
     fn a_unit_with_no_exec_start_yields_no_binary() {
         assert_eq!(parse_exec_start("ExecStart="), None);
         assert_eq!(parse_exec_start(""), None);
+    }
+
+    /// A database directory whose name starts with `-` is still a path.
+    #[test]
+    fn df_is_told_where_the_options_end() {
+        let args = df_args("-weird");
+
+        assert_eq!(args[args.len() - 2..], ["--", "-weird"], "args: {args:?}");
     }
 
     /// The size check reports rather than judges on an ordinary database,

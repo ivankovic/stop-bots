@@ -130,7 +130,8 @@ pub struct Layout {
     /// so the checks that are about what *this host's* systemd would do —
     /// see [`hidden_from_unit`] — have nothing to be true or false about
     /// there. Applying them anyway would refuse every `--prefix` run whose
-    /// staging tree sits under `/tmp`, which is all of them.
+    /// staging tree sits under `/tmp`, which is all of them. For the same
+    /// reason [`install_firewall`] runs no `systemctl` unless this is set.
     real: bool,
 }
 
@@ -272,15 +273,15 @@ fn hidden_binary_error(binary: &Path, directive: &str) -> String {
 pub fn web_unit(layout: &Layout) -> String {
     let mut exec = format!(
         "{} web --db {}",
-        layout.binary.display(),
-        layout.db_path.display(),
+        systemd_arg(&layout.binary),
+        systemd_arg(&layout.db_path),
     );
     // Only when the operator named one. Omitting the flag is what leaves
     // the service free to try the log files and then `journalctl`; naming
     // a path here would pin it to that path forever, including on the
     // hosts that do not have it. See `Layout::ssh_log`.
     if let Some(path) = &layout.ssh_log {
-        exec.push_str(&format!(" --ssh-log {}", path.display()));
+        exec.push_str(&format!(" --ssh-log {}", systemd_arg(path)));
     }
     exec.push('\n');
 
@@ -351,6 +352,54 @@ pub fn web_unit(layout: &Layout) -> String {
          [Install]\n\
          WantedBy=multi-user.target\n"
     )
+}
+
+/// `path` as one argument of an `ExecStart=` line.
+///
+/// systemd does not hand `ExecStart` to a shell; it splits it itself, by
+/// the rules in systemd.syntax(7) and systemd.service(5), and they differ
+/// from a shell's in the two places that matter here:
+///
+/// - `%` starts a specifier (`%h`, `%n`, ...) and is expanded everywhere,
+///   quoted or not, so a literal one is `%%`. `$` likewise starts a
+///   variable, and a literal one is `$$`.
+/// - An argument is split on whitespace unless double-quoted, and inside
+///   the quotes `\` and `"` are C-style escapes.
+///
+/// So a path with a space used to become two arguments — the binary
+/// named `/opt/stop` — and one with `%` had part of it replaced. An
+/// ordinary path comes back unchanged, which keeps the golden unit the
+/// bytes it always was.
+fn systemd_arg(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let needs_quotes = raw
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '\\'));
+    let mut out = String::with_capacity(raw.len() + 2);
+    if needs_quotes {
+        out.push('"');
+    }
+    for c in raw.chars() {
+        match c {
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let mut bytes = [0u8; 4];
+                for byte in c.encode_utf8(&mut bytes).bytes() {
+                    out.push_str(&format!("\\x{byte:02x}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    if needs_quotes {
+        out.push('"');
+    }
+    out
 }
 
 /// One thing the installer did, or would do under `--dry-run`.
@@ -460,7 +509,19 @@ fn writable(dir: &Path) -> Result<()> {
 /// keeps the boot-time sequence the same as the one an operator sees by
 /// hand. `Wants=network-online.target` rather than `Requires=`: a ruleset
 /// is worth loading even on a host that came up without a network.
-pub fn firewall_unit(script: &Path) -> String {
+///
+/// `backend` decides both the script and what runs it, for the reason
+/// `firewall::output_path` gives: the backend is the one source of truth,
+/// and a host rendering iptables has a `firewall.nft` that is stale or
+/// absent. A boot unit that always loaded that file restored the wrong
+/// rules, or none.
+pub fn firewall_unit(backend: crate::firewall::FirewallBackend, script: &Path) -> String {
+    let exec = match backend {
+        crate::firewall::FirewallBackend::Nftables => {
+            format!("/usr/sbin/nft -f {}", systemd_arg(script))
+        }
+        crate::firewall::FirewallBackend::Iptables => format!("/bin/sh {}", systemd_arg(script)),
+    };
     format!(
         "# Written by `stop-bots install firewall`. Re-running that command leaves\n\
          # an edited copy of this file alone and tells you so; `--force` replaces it.\n\
@@ -479,19 +540,41 @@ pub fn firewall_unit(script: &Path) -> String {
          [Service]\n\
          Type=oneshot\n\
          RemainAfterExit=yes\n\
-         ExecStart=/usr/sbin/nft -f {script}\n\
+         ExecStart={exec}\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
-        script = script.display()
+        // A condition takes the rest of the line as the path, so it is not
+        // quoted; it does expand specifiers, so `%` still has to be `%%`.
+        script = script.display().to_string().replace('%', "%%")
     )
+}
+
+/// The backend the database at `db_path` renders for, without creating a
+/// database that is not there: an install, and above all a `--dry-run`,
+/// has no business leaving one behind. No database means nothing has
+/// chosen a backend yet, which is the default's case in
+/// `firewall::stored_backend` too.
+fn stored_backend_at(db_path: &Path) -> Result<crate::firewall::FirewallBackend> {
+    if !db_path.is_file() {
+        return Ok(crate::firewall::FirewallBackend::Nftables);
+    }
+    let db = crate::db::Db::open(db_path)
+        .with_context(|| format!("reading the firewall backend from {}", db_path.display()))?;
+    crate::firewall::stored_backend(&db)
 }
 
 /// Writes [`firewall_unit`] and enables it. Mirrors [`install_web`],
 /// including its refusal to overwrite a unit somebody has edited.
+///
+/// Under `--prefix` it writes the unit and stops, as `install web` does:
+/// the unit is somewhere systemd never looks, and running the real
+/// `systemctl daemon-reload`/`enable` would either claim a unit took
+/// effect that did not, or enable a stale one of the same name.
 pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
-    let script = crate::firewall::default_output_path(crate::firewall::FirewallBackend::Nftables);
-    let unit = firewall_unit(&script);
+    let backend = stored_backend_at(&layout.db_path)?;
+    let script = crate::firewall::default_output_path(backend);
+    let unit = firewall_unit(backend, &script);
     let unit_path = layout.unit_dir.join(FIREWALL_UNIT);
     let existing = std::fs::read_to_string(&unit_path).ok();
 
@@ -521,14 +604,22 @@ pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
     // loads firewall rules is the one step an operator should take after
     // reading what it would load -- the same reason `render-firewall` does
     // not apply what it writes.
-    steps.push("systemctl daemon-reload".to_string());
-    steps.push(format!("systemctl enable {FIREWALL_UNIT}"));
-    if !options.dry_run {
-        systemctl(layout, &["daemon-reload"])?;
-        systemctl(layout, &["enable", FIREWALL_UNIT])?;
+    if layout.real {
+        steps.push("systemctl daemon-reload".to_string());
+        steps.push(format!("systemctl enable {FIREWALL_UNIT}"));
+        if !options.dry_run {
+            systemctl(layout, &["daemon-reload"])?;
+            systemctl(layout, &["enable", FIREWALL_UNIT])?;
+        }
+    } else {
+        steps.push(format!(
+            "skipping systemctl: {} is not a path systemd reads",
+            layout.unit_dir.display()
+        ));
     }
     steps.push(format!(
-        "not started: run `nft -f {}` yourself once you have read it",
+        "not started: run `{} {}` yourself once you have read it",
+        backend.apply_command(),
         script.display()
     ));
 
@@ -1168,6 +1259,132 @@ mod tests {
             message.contains(&format!("systemctl disable --now {WEB_UNIT}")),
             "message was: {message}"
         );
+    }
+
+    // ---- install firewall ----
+
+    /// `--prefix` writes a unit systemd will never read, so telling the
+    /// real systemd to reload and enable it is at best a lie about what
+    /// happened and at worst enables a stale unit of the same name.
+    #[test]
+    fn install_firewall_under_a_prefix_does_not_run_systemctl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        let (script, log) = recording_systemctl(dir.path());
+        layout.systemctl = script;
+
+        let steps = install_firewall(&layout, &Options::default()).unwrap();
+
+        assert!(!log.exists(), "systemctl ran for a prefixed install");
+        assert!(
+            layout.unit_dir.join(FIREWALL_UNIT).is_file(),
+            "the unit should still be written"
+        );
+        assert!(
+            steps.iter().any(|s| s.contains("skipping systemctl")),
+            "steps: {steps:?}"
+        );
+    }
+
+    /// And on the real host, it does.
+    #[test]
+    fn install_firewall_on_the_host_reloads_and_enables_the_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        layout.real = true;
+        let (script, log) = recording_systemctl(dir.path());
+        layout.systemctl = script;
+
+        install_firewall(&layout, &Options::default()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!("daemon-reload\nenable {FIREWALL_UNIT}\n")
+        );
+    }
+
+    /// The boot unit loads the script the stored backend writes. On an
+    /// iptables host `firewall.nft` is stale or absent, and loading it at
+    /// boot restores the wrong rules or none.
+    #[test]
+    fn the_boot_unit_follows_the_stored_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        layout.systemctl = recording_systemctl(dir.path()).0;
+        {
+            let db = crate::db::Db::open(&layout.db_path).unwrap();
+            crate::firewall::store_backend(&db, crate::firewall::FirewallBackend::Iptables)
+                .unwrap();
+        }
+
+        install_firewall(&layout, &Options::default()).unwrap();
+
+        let unit = std::fs::read_to_string(layout.unit_dir.join(FIREWALL_UNIT)).unwrap();
+        for line in [
+            "ExecStart=/bin/sh /etc/stop-bots/firewall.sh",
+            "ConditionPathExists=/etc/stop-bots/firewall.sh",
+        ] {
+            assert!(unit.contains(line), "missing {line:?} in:\n{unit}");
+        }
+        assert!(!unit.contains("firewall.nft"), "unit was:\n{unit}");
+    }
+
+    /// With no database yet, the default backend is the answer — the same
+    /// one `firewall::stored_backend` gives.
+    #[test]
+    fn the_boot_unit_defaults_to_nftables() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        layout.systemctl = recording_systemctl(dir.path()).0;
+
+        install_firewall(&layout, &Options::default()).unwrap();
+
+        let unit = std::fs::read_to_string(layout.unit_dir.join(FIREWALL_UNIT)).unwrap();
+        assert!(
+            unit.contains("ExecStart=/usr/sbin/nft -f /etc/stop-bots/firewall.nft"),
+            "unit was:\n{unit}"
+        );
+        assert!(
+            !layout.db_path.exists(),
+            "reading the backend created a database"
+        );
+    }
+
+    // ---- quoting in the unit ----
+
+    /// systemd splits `ExecStart` on whitespace and expands `%` specifiers
+    /// in it, so a path with either has to be quoted and escaped or the
+    /// unit runs something else.
+    #[test]
+    fn exec_start_quotes_and_escapes_paths_systemd_would_misread() {
+        let mut layout = system_layout();
+        layout.binary = PathBuf::from("/opt/stop bots/stop-bots");
+        layout.db_path = PathBuf::from("/var/lib/100%/db.sqlite3");
+        layout.ssh_log = Some(PathBuf::from("/srv/a \"b\"\\c.log"));
+
+        let unit = web_unit(&layout);
+
+        let exec = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
+        assert_eq!(
+            exec,
+            r#"ExecStart="/opt/stop bots/stop-bots" web --db /var/lib/100%%/db.sqlite3 --ssh-log "/srv/a \"b\"\\c.log""#
+        );
+    }
+
+    #[test]
+    fn systemd_arg_leaves_an_ordinary_path_alone_and_quotes_the_rest() {
+        for (raw, quoted) in [
+            ("/usr/local/bin/stop-bots", "/usr/local/bin/stop-bots"),
+            ("/a b", "\"/a b\""),
+            ("/a\tb", "\"/a\\tb\""),
+            ("/a$b", "/a$$b"),
+            ("/100%", "/100%%"),
+            ("/a\"b", "\"/a\\\"b\""),
+            ("/a\\b", "\"/a\\\\b\""),
+            ("/a'b", "\"/a'b\""),
+        ] {
+            assert_eq!(systemd_arg(Path::new(raw)), quoted, "{raw:?}");
+        }
     }
 
     /// systemd rejects a relative `ExecStart` when it *loads* the unit,

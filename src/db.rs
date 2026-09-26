@@ -636,7 +636,8 @@ fn validate_user_agent_fragment(user_agent: &str, what: &str) -> Result<String> 
 }
 
 /// The entries of `addresses` that may be stored and later rendered into a
-/// firewall script: valid (see [`is_valid_address`]) and trimmed.
+/// firewall script: valid (see [`is_valid_address`]), trimmed, and not
+/// [too broad](is_too_broad_for_a_feed) to have come from a real feed.
 ///
 /// Dropping rather than erroring, unlike the admin-entry paths. These lists
 /// are fetched unattended from six different upstreams in four different
@@ -644,11 +645,85 @@ fn validate_user_agent_fragment(user_agent: &str, what: &str) -> Result<String> 
 /// line, not the country. Rejecting the whole fetch would also be the more
 /// dangerous failure: it leaves the *previous* ranges in place while
 /// reporting an error nobody is awake to read.
+///
+/// Only fetched ranges come through here. An admin's own rules and trusted
+/// addresses are typed by a person and have their own validation, which
+/// refuses a `/0` for its own reasons.
 fn usable_addresses(addresses: &[String]) -> impl Iterator<Item = &str> {
     addresses
         .iter()
         .map(|a| a.trim())
-        .filter(|a| is_valid_address(a))
+        .filter(|a| is_valid_address(a) && !is_too_broad_for_a_feed(a))
+}
+
+/// The shortest IPv4 prefix a fetched range may have: `/3`.
+///
+/// A floor, so that a feed which starts carrying `0.0.0.0/0` — or the
+/// `0.0.0.0/1` + `128.0.0.0/1` pair that spells the same thing — cannot
+/// turn one line into a rule for the whole internet. In a blocked
+/// country's zone file that drops every client; in an allowed one's, under
+/// allowlist mode, it lets every client through; and either is applied by
+/// cron with nobody looking.
+///
+/// Set by what real feeds carry, not by what feels like "a lot of
+/// addresses". FireHOL level 1 lists `224.0.0.0/3` (multicast and
+/// reserved, as a bogon), and IPdeny's aggregated US zone has `/6`s and
+/// `/7`s where adjacent legacy `/8`s merged (`16.0.0.0/6`, `6.0.0.0/7`).
+/// A `/8` floor, the obvious number, would have dropped real entries from
+/// both on every fetch.
+///
+/// A floor is not a coverage limit: a hostile feed can still list many
+/// ranges that are each allowed. What it stops is the single entry that
+/// quietly means "everything".
+pub const FEED_MIN_PREFIX_V4: u32 = 3;
+
+/// The shortest IPv6 prefix a fetched range may have: `/12`.
+///
+/// `/12` is the size of a regional registry's allocation from IANA, which
+/// no country and no provider holds whole. The broadest entry in any feed
+/// this project reads is IPdeny's US zone's `2630::/16`; the cloud feeds
+/// start at `/32`. `2000::/3` — all of global unicast, and IPv6's version of
+/// `0.0.0.0/0` in practice — is well outside it.
+pub const FEED_MIN_PREFIX_V6: u32 = 12;
+
+/// The most entries one fetched source may have: 250,000.
+///
+/// About six times the largest real one. A country is stored as its IPv4
+/// and IPv6 zones together, and the US's come to roughly 40,000 lines;
+/// blocklist.de runs to about 24,000 and AWS to about 17,500. A feed far
+/// past that has been replaced by something else, and would turn into a
+/// script `nft` takes minutes to load. Refused whole, not truncated — see
+/// [`reject_an_oversized_fetch`].
+pub const FEED_MAX_ENTRIES: usize = 250_000;
+
+/// Whether a fetched `address` covers more than any real feed entry does —
+/// see [`FEED_MIN_PREFIX_V4`] and [`FEED_MIN_PREFIX_V6`]. A bare address is
+/// a single host and never too broad; an unparseable one is left to
+/// [`is_valid_address`] to refuse.
+pub fn is_too_broad_for_a_feed(address: &str) -> bool {
+    let Some((base, len)) = address.trim().split_once('/') else {
+        return false;
+    };
+    let Ok(len) = len.parse::<u32>() else {
+        return false;
+    };
+    match base.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => len < FEED_MIN_PREFIX_V4,
+        Ok(std::net::IpAddr::V6(_)) => len < FEED_MIN_PREFIX_V6,
+        Err(_) => false,
+    }
+}
+
+/// Every entry of `addresses` that storing it will drop for being too
+/// broad, trimmed, in order — so that whoever reports on a fetch can say
+/// what was dropped rather than letting a tampered feed pass as a clean
+/// one.
+pub fn too_broad_feed_entries(addresses: &[String]) -> Vec<&str> {
+    addresses
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| is_valid_address(a) && is_too_broad_for_a_feed(a))
+        .collect()
 }
 
 /// Refuses a fetch in which *nothing* was usable.
@@ -663,9 +738,28 @@ fn usable_addresses(addresses: &[String]) -> impl Iterator<Item = &str> {
 fn reject_a_wholly_unusable_fetch(source: &str, addresses: &[String]) -> Result<()> {
     if !addresses.is_empty() && usable_addresses(addresses).next().is_none() {
         anyhow::bail!(
-            "{source}: none of the {} entries fetched is an IP address or CIDR range — \
-             keeping the ranges already stored, since a whole list of bad entries is a \
-             changed or broken feed rather than a bad line",
+            "{source}: none of the {} entries fetched is an IP address or CIDR range \
+             narrow enough to store ({} too broad) — keeping the ranges already stored, \
+             since a whole list of bad entries is a changed or broken feed rather than a \
+             bad line",
+            addresses.len(),
+            too_broad_feed_entries(addresses).len()
+        );
+    }
+    Ok(())
+}
+
+/// Refuses a fetch with more than [`FEED_MAX_ENTRIES`] entries, before
+/// anything is deleted, so the previous ranges stay.
+///
+/// Refused rather than truncated for the reason `fetch::MAX_BODY_BYTES`
+/// gives: a truncated blocklist has entries silently missing, which is
+/// worse than yesterday's complete one.
+fn reject_an_oversized_fetch(source: &str, addresses: &[String]) -> Result<()> {
+    if addresses.len() > FEED_MAX_ENTRIES {
+        anyhow::bail!(
+            "{source}: {} entries fetched, over the limit of {FEED_MAX_ENTRIES} — keeping \
+             the ranges already stored, since no real feed is anywhere near that size",
             addresses.len()
         );
     }
@@ -708,6 +802,59 @@ pub struct Db {
 /// an error rather than a hang.
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// `create_dir_all`, except that every directory it creates is 0700.
+///
+/// `pub` because `main.rs` creates the default database's directory itself,
+/// before opening it, to decide whether to fall back to a per-user path —
+/// and whichever call gets there first decides the mode. A directory that
+/// already exists is left exactly as it is: it belongs to whoever made it.
+pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+}
+
+/// Creates the database file 0600 if it does not exist yet; if it does,
+/// tightens it and its SQLite companions to 0600 when anyone but the owner
+/// can read them and they belong to this user.
+///
+/// Created here rather than left to SQLite, because SQLite creates it with
+/// the umask's idea of a mode. An empty file is a valid empty database.
+///
+/// Existing files are tightened because the installs this was written for
+/// already have a 0644 database. Only this user's own, though: root opening
+/// someone else's database with `--db` has no business changing who else
+/// may read it.
+fn make_private(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(_) => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err),
+    }
+    // SAFETY: no preconditions; reads the process's own credentials.
+    let euid = unsafe { libc::geteuid() };
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let Ok(meta) = std::fs::metadata(&file) else {
+            continue;
+        };
+        if meta.is_file() && meta.uid() == euid && meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
 /// `settings` key for [`Db::get_humans_only`].
 pub const HUMANS_ONLY_KEY: &str = "humans_only";
 
@@ -716,14 +863,25 @@ impl Db {
     /// directories as needed, and ensures the schema is up to date.
     ///
     /// Sets [`BUSY_TIMEOUT`], which SQLite does not do for you.
+    ///
+    /// **Private by default.** This file holds the console's Argon2 hash
+    /// and everything the host has learned about who attacks it, and it
+    /// used to be created by SQLite with the process's umask — 0644 in a
+    /// 0755 directory, for any root CLI run that happened before
+    /// `install web` tightened things. So a directory this call creates is
+    /// 0700 ([`create_private_dir_all`]), and the file is created 0600
+    /// before SQLite opens it ([`make_private`]). SQLite gives its `-wal`,
+    /// `-shm` and `-journal` files the main file's mode, so those follow.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
+                create_private_dir_all(parent)
                     .with_context(|| format!("failed to create directory: {}", parent.display()))?;
             }
         }
+        make_private(path)
+            .with_context(|| format!("failed to secure database: {}", path.display()))?;
         let conn = Connection::open(path)
             .with_context(|| format!("failed to open database: {}", path.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
@@ -2648,6 +2806,7 @@ impl Db {
     /// upstream list on a later fetch doesn't linger here forever.
     pub fn replace_ip_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
         self.batch(|| {
+            reject_an_oversized_fetch(source_id, cidrs)?;
             reject_a_wholly_unusable_fetch(source_id, cidrs)?;
             self.conn.execute(
                 "DELETE FROM ip_ranges WHERE source_id = ?1",
@@ -2775,6 +2934,7 @@ impl Db {
     pub fn replace_country_ranges(&self, country_code: &str, cidrs: &[String]) -> Result<usize> {
         let fetched_at = now();
         self.batch(|| {
+            reject_an_oversized_fetch(country_code, cidrs)?;
             reject_a_wholly_unusable_fetch(country_code, cidrs)?;
             self.conn.execute(
                 "DELETE FROM country_ip_ranges WHERE country_code = ?1",
@@ -3013,6 +3173,7 @@ impl Db {
     /// later fetch stops being blocked, rather than accumulating forever.
     pub fn replace_reputation_ranges(&self, source_id: &str, cidrs: &[String]) -> Result<usize> {
         self.batch(|| {
+            reject_an_oversized_fetch(source_id, cidrs)?;
             reject_a_wholly_unusable_fetch(source_id, cidrs)?;
             self.conn.execute(
                 "DELETE FROM reputation_ranges WHERE source_id = ?1",
@@ -3247,6 +3408,76 @@ mod tests {
              process holds the database"
         );
         assert!(millis > 0, "zero is SQLite's default: do not wait at all");
+    }
+
+    // ---- who can read the database ----
+
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// The database holds the console's Argon2 hash, and any root CLI run
+    /// before `install web` used to create it 0644 in a 0755 directory.
+    #[test]
+    fn a_new_database_and_the_directory_made_for_it_are_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stop-bots/db.sqlite3");
+
+        Db::open(&path).unwrap();
+
+        assert_eq!(mode_of(path.parent().unwrap()), 0o700, "directory");
+        assert_eq!(mode_of(&path), 0o600, "database");
+    }
+
+    /// Existing installs are the ones already exposed, so an existing
+    /// readable file is tightened too.
+    #[test]
+    fn an_existing_readable_database_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        drop(Db::open(&path).unwrap());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        Db::open(&path).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// Only a directory this call creates is made private: one that
+    /// already exists belongs to whoever made it, with whatever mode they
+    /// chose.
+    #[test]
+    fn an_existing_directory_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("shared");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        Db::open(parent.join("db.sqlite3")).unwrap();
+
+        assert_eq!(mode_of(&parent), 0o755);
+    }
+
+    /// SQLite gives its write-ahead log and shared-memory index the main
+    /// file's mode, so making the main file private covers them too.
+    #[test]
+    fn the_wal_and_shm_files_are_as_private_as_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let db = Db::open(&path).unwrap();
+        db.conn
+            .query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
+            .unwrap();
+        db.set_text_setting("probe", "x").unwrap();
+
+        for suffix in ["-wal", "-shm"] {
+            let side = dir.path().join(format!("db.sqlite3{suffix}"));
+            assert!(side.exists(), "{} was not created", side.display());
+            assert_eq!(mode_of(&side), 0o600, "{suffix}");
+        }
     }
 
     /// Storing a real-sized feed must not autocommit per row.
@@ -4458,6 +4689,107 @@ mod tests {
 
         assert_eq!(db.replace_country_ranges("xx", &[]).unwrap(), 0);
         assert!(db.country_ranges("xx").unwrap().is_empty());
+    }
+
+    /// The whole internet, in the three spellings a hostile or broken feed
+    /// would use for it. In a blocked country's zone file this drops every
+    /// client; in an allowed one's, under allowlist mode, it lets every
+    /// client through — and either is applied by cron with nobody looking.
+    const CATCH_ALLS: [&str; 5] = ["0.0.0.0/0", "::/0", "0.0.0.0/1", "128.0.0.0/1", "2000::/3"];
+
+    #[test]
+    fn a_fetched_catch_all_is_never_stored_from_any_kind_of_feed() {
+        let db = Db::open_in_memory().unwrap();
+        let mut hostile: Vec<String> = CATCH_ALLS.iter().map(|s| s.to_string()).collect();
+        hostile.push("5.6.7.8".to_string());
+        db.register_ip_range_source(&IpRangeSource {
+            id: "src".to_string(),
+            name: "src".to_string(),
+            url: "https://example.invalid/src.json".to_string(),
+            category: Category::Ai,
+            last_fetched_at: None,
+            range_count: 0,
+        })
+        .unwrap();
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+        db.set_reputation_source_enabled("tor-exits", true).unwrap();
+
+        db.replace_country_ranges("xx", &hostile).unwrap();
+        db.replace_ip_ranges("src", &hostile).unwrap();
+        db.replace_reputation_ranges("tor-exits", &hostile).unwrap();
+
+        let only_the_real_one = vec!["5.6.7.8".to_string()];
+        for (feed, stored) in [
+            ("a country", db.country_ranges("xx").unwrap()),
+            ("a crawler list", db.ip_ranges_for_source("src").unwrap()),
+            ("a reputation feed", db.enabled_reputation_ranges().unwrap()),
+        ] {
+            assert_eq!(stored, only_the_real_one, "{feed} stored a catch-all");
+        }
+    }
+
+    /// The floor is set below the broadest entries real feeds carry, and
+    /// these are those entries: FireHOL level 1's multicast-and-reserved
+    /// bogon, IPdeny's US zone's shortest v4 aggregate, and its shortest
+    /// v6 one. Dropping any of them would be the floor misfiring on data
+    /// it exists to let through.
+    #[test]
+    fn the_broadest_ranges_real_feeds_publish_are_still_stored() {
+        let db = Db::open_in_memory().unwrap();
+        let real = ["224.0.0.0/3", "16.0.0.0/6", "2630::/16"].map(String::from);
+
+        assert_eq!(db.replace_country_ranges("xx", &real).unwrap(), real.len());
+    }
+
+    /// A list that is nothing *but* catch-alls has nothing usable in it,
+    /// so it is refused like any other broken fetch — and yesterday's
+    /// ranges stay.
+    #[test]
+    fn a_fetch_of_only_catch_alls_leaves_the_previous_ranges_alone() {
+        let db = Db::open_in_memory().unwrap();
+        db.replace_country_ranges("xx", &["5.6.7.8".to_string()])
+            .unwrap();
+
+        let err = db
+            .replace_country_ranges("xx", &["0.0.0.0/0".to_string(), "::/0".into()])
+            .unwrap_err();
+
+        assert!(err.to_string().contains("too broad"), "was: {err:#}");
+        assert_eq!(
+            db.country_ranges("xx").unwrap(),
+            vec!["5.6.7.8".to_string()]
+        );
+    }
+
+    #[test]
+    fn too_broad_feed_entries_names_exactly_what_was_dropped() {
+        let fetched: Vec<String> = ["0.0.0.0/0", "5.6.7.0/24", "::/0", "nonsense", "2001:db8::1"]
+            .map(String::from)
+            .to_vec();
+
+        assert_eq!(too_broad_feed_entries(&fetched), vec!["0.0.0.0/0", "::/0"]);
+    }
+
+    /// A feed many times the size of anything real is refused whole, not
+    /// truncated: a truncated blocklist is one with entries silently
+    /// missing, and the previous complete one is the better thing to keep.
+    #[test]
+    fn a_fetch_over_the_entry_cap_is_refused_and_the_previous_ranges_kept() {
+        let db = Db::open_in_memory().unwrap();
+        db.replace_country_ranges("xx", &["5.6.7.8".to_string()])
+            .unwrap();
+        let flood = vec!["9.9.9.9".to_string(); FEED_MAX_ENTRIES + 1];
+
+        let err = db.replace_country_ranges("xx", &flood).unwrap_err();
+
+        assert!(
+            err.to_string().contains(&FEED_MAX_ENTRIES.to_string()),
+            "the refusal should name the cap, was: {err:#}"
+        );
+        assert_eq!(
+            db.country_ranges("xx").unwrap(),
+            vec!["5.6.7.8".to_string()]
+        );
     }
 
     /// `is_valid_address` parses the *trimmed* string, so storing the raw

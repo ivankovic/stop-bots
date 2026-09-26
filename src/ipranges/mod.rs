@@ -138,6 +138,27 @@ pub(crate) fn parse_prefixes_json(raw: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// What to add to a fetch's one-line summary when storing `cidrs` will
+/// drop entries for being too broad for any real feed (see
+/// [`crate::db::FEED_MIN_PREFIX_V4`]), or `None` when it drops none.
+///
+/// A feed that suddenly carries `0.0.0.0/0` has been tampered with or has
+/// broken, and dropping the line quietly would let it pass as a clean
+/// fetch. Names the first few, which is what tells the two apart.
+pub fn too_broad_note(cidrs: &[String]) -> Option<String> {
+    const SHOWN: usize = 3;
+    let dropped = crate::db::too_broad_feed_entries(cidrs);
+    if dropped.is_empty() {
+        return None;
+    }
+    let more = if dropped.len() > SHOWN { ", …" } else { "" };
+    Some(format!(
+        "dropped {} range(s) too broad for any real feed: {}{more}",
+        dropped.len(),
+        dropped[..dropped.len().min(SHOWN)].join(", ")
+    ))
+}
+
 /// Registers every known IP-range source in `db` that isn't there yet, same
 /// never-clobber convention as `botlist::register_all_sources`.
 pub fn register_all_ip_range_sources(db: &Db) -> Result<()> {

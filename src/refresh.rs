@@ -131,17 +131,28 @@ pub fn store(db: &Db, source: &Source, raw: &str) -> Result<String> {
         Source::CrawlerRanges(kind) => {
             let cidrs = kind.parse(raw)?;
             let count = ipranges::store(db, *kind, &cidrs)?;
-            Ok(format!("{count} range(s)"))
+            Ok(ranges_summary(count, &cidrs))
         }
         Source::Reputation(kind) => {
             let cidrs = kind.parse(raw)?;
             let count = ipranges::reputation::store(db, *kind, &cidrs)?;
-            Ok(format!("{count} range(s)"))
+            Ok(ranges_summary(count, &cidrs))
         }
         Source::Country(code) => {
             let count = ipranges::store_country(db, code, raw)?;
-            Ok(format!("{count} range(s)"))
+            Ok(ranges_summary(count, &ipranges::parse_zone_file(raw)))
         }
+    }
+}
+
+/// "N range(s)", plus what storing `cidrs` dropped as too broad, if it
+/// dropped anything — this summary is what `batch` prints to a cron log and
+/// the console shows after "Update everything", so it is where a tampered
+/// feed has to show up.
+fn ranges_summary(count: usize, cidrs: &[String]) -> String {
+    match ipranges::too_broad_note(cidrs) {
+        Some(note) => format!("{count} range(s); {note}"),
+        None => format!("{count} range(s)"),
     }
 }
 
@@ -227,6 +238,40 @@ mod tests {
             !labels.iter().any(|l| l == "country nl"),
             "having ranges is not the same as being selected: {labels:?}"
         );
+    }
+
+    /// A catch-all in a feed is dropped, and the one-line summary a cron
+    /// log or the console shows says so — a feed that suddenly carries
+    /// `0.0.0.0/0` has been tampered with or broken, and that is news.
+    #[test]
+    fn a_dropped_catch_all_is_named_in_the_summary() {
+        let db = Db::open_in_memory().unwrap();
+        crate::ipranges::reputation::register_all_reputation_sources(&db).unwrap();
+
+        for source in [
+            Source::Country("xx".to_string()),
+            Source::Reputation(ReputationSourceKind::FireholLevel1),
+        ] {
+            let summary = store(&db, &source, "0.0.0.0/0\n5.6.7.0/24\n").unwrap();
+
+            assert!(
+                summary.starts_with("1 range(s)")
+                    && summary.contains("dropped 1")
+                    && summary.contains("0.0.0.0/0"),
+                "{} summary was: {summary}",
+                source.label()
+            );
+        }
+    }
+
+    /// And a clean feed's summary is unchanged.
+    #[test]
+    fn a_clean_feed_summary_mentions_no_drops() {
+        let db = Db::open_in_memory().unwrap();
+
+        let summary = store(&db, &Source::Country("xx".to_string()), "5.6.7.0/24\n").unwrap();
+
+        assert_eq!(summary, "1 range(s)");
     }
 
     /// A row whose id this version no longer knows can only come from a

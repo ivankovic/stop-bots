@@ -1493,7 +1493,9 @@ fn open_or_fallback(primary: &Path, fallback: impl FnOnce() -> Result<PathBuf>) 
     let parent = primary
         .parent()
         .with_context(|| format!("{} has no parent directory", primary.display()))?;
-    if let Err(dir_err) = std::fs::create_dir_all(parent) {
+    // 0700 if this creates it: whichever call makes the directory decides
+    // its mode, and this one runs before `Db::open` gets the chance.
+    if let Err(dir_err) = stop_bots::db::create_private_dir_all(parent) {
         let fallback = fallback()?;
         eprintln!(
             "Note: couldn't create {} ({dir_err}); using {} instead.",
@@ -2425,7 +2427,7 @@ fn run_install_firewall(
     // No `hidden_from_unit` check, unlike `install web`. That guard exists
     // because the web unit's ExecStart names the stop-bots binary and sets
     // ProtectHome=yes, which makes a binary under /home invisible to the
-    // service. This unit's ExecStart is `/usr/sbin/nft`; it never runs
+    // service. This unit runs `nft` or `sh` on the script; it never runs
     // stop-bots at all, so where stop-bots lives cannot break it. The
     // binary is carried only to name it in the --dry-run hint.
     let layout = match &prefix {

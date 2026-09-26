@@ -160,17 +160,20 @@ pub fn render(rules: &[FirewallRule]) -> String {
             ));
             continue;
         }
-        if is_ipv6(&rule.address) {
+        // What was validated is the trimmed form, so that is what goes in
+        // the script: a trailing newline would end the command early and
+        // make `-j DROP` a command of its own.
+        let address = rule.address.trim();
+        if is_ipv6(address) {
             out.push_str(&format!(
-                "# skipped (IPv6, not supported by iptables): {} — use nftables instead\n",
-                rule.address
+                "# skipped (IPv6, not supported by iptables): {address} — use nftables instead\n"
             ));
             continue;
         }
         out.push_str("iptables -A ");
         out.push_str(CHAIN);
         out.push_str(" -s ");
-        out.push_str(&rule.address);
+        out.push_str(address);
         if let Some(port) = rule.port {
             out.push_str(&format!(" -p tcp --dport {port}"));
         }
@@ -441,6 +444,24 @@ mod tests {
         );
         assert!(
             rendered.contains("skipped (not an IP address or CIDR range)"),
+            "rendered was:\n{rendered}"
+        );
+    }
+
+    /// Validation trims, so an address with whitespace around it is valid
+    /// — and must be rendered as what was validated. Untrimmed, a trailing
+    /// newline ended the command early and made `-j DROP` a command of its
+    /// own, which under `set -e` aborts the script partway through.
+    #[test]
+    fn an_address_is_rendered_trimmed() {
+        let rendered = render(&[block(" 1.2.3.4\n"), block(" 2001:db8::1 ")]);
+
+        assert!(
+            rendered.contains(&format!("iptables -A {CHAIN} -s 1.2.3.4 -j DROP\n")),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("# skipped (IPv6, not supported by iptables): 2001:db8::1 —"),
             "rendered was:\n{rendered}"
         );
     }

@@ -40,22 +40,42 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// updating at all.
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-fn client() -> &'static reqwest::Client {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
-            .user_agent(concat!("stop-bots/", env!("CARGO_PKG_VERSION")))
-            // A redirect is normal for these feeds (several are served from
-            // a CDN), but an unbounded chain is a way to keep a connection
-            // open indefinitely without ever exceeding a per-request limit.
-            .redirect(reqwest::redirect::Policy::limited(5))
-            .build()
-            // Only fails if the TLS backend cannot be initialised, which is
-            // a broken build rather than a runtime condition.
-            .unwrap_or_default()
-    })
+/// The client every fetch shares, or why one could not be built.
+///
+/// Built once; a failure is remembered rather than retried, because the
+/// only way `build` fails is a TLS backend that cannot initialise, which
+/// the next call will not fix. It used to be swallowed with
+/// `unwrap_or_default()`, which replaced this configuration with reqwest's
+/// defaults — no timeouts, plain http allowed — so the one failure nobody
+/// would see also removed every protection in this file.
+fn client() -> Result<&'static reqwest::Client> {
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| build_client(true).map_err(|err| format!("{err:#}")))
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!("could not set up the HTTP client: {err}"))
+}
+
+/// The shared client's configuration. `https_only` is a parameter only so
+/// the tests can talk to a plain-http server on loopback; everything else
+/// they exercise is the real thing.
+fn build_client(https_only: bool) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .user_agent(concat!("stop-bots/", env!("CARGO_PKG_VERSION")))
+        // A redirect is normal for these feeds (several are served from
+        // a CDN), but an unbounded chain is a way to keep a connection
+        // open indefinitely without ever exceeding a per-request limit.
+        .redirect(reqwest::redirect::Policy::limited(5))
+        // Every feed URL is https, and so is every hop they redirect
+        // through today. reqwest applies this to redirects too, which is
+        // the point: without it an https feed could be bounced to http,
+        // and anyone on the path could then write the ranges this host
+        // blocks — or, in allowlist mode, lets through.
+        .https_only(https_only)
+        .build()
+        .context("could not build the HTTP client")
 }
 
 /// Fetches `url` as text, with [`TIMEOUT`] and [`MAX_BODY_BYTES`] applied.
@@ -63,13 +83,18 @@ fn client() -> &'static reqwest::Client {
 /// `what` names the source for error messages — "GPTBot IP ranges", not the
 /// URL, because that is what the admin recognises in a cron log.
 pub async fn text(url: &str, what: &str) -> Result<String> {
-    capped_text(url, what, MAX_BODY_BYTES).await
+    capped_text(client()?, url, what, MAX_BODY_BYTES).await
 }
 
 /// [`text`] with the limit as a parameter, so the refusal paths can be
 /// tested against a few bytes rather than by actually serving 32MB.
-async fn capped_text(url: &str, what: &str, max_bytes: usize) -> Result<String> {
-    let response = client()
+async fn capped_text(
+    client: &reqwest::Client,
+    url: &str,
+    what: &str,
+    max_bytes: usize,
+) -> Result<String> {
+    let response = client
         .get(url)
         .send()
         .await
@@ -107,6 +132,14 @@ async fn capped_text(url: &str, what: &str, max_bytes: usize) -> Result<String> 
 mod tests {
     use super::*;
 
+    /// The real configuration with `https_only` off, because [`serve`] is
+    /// plain http — and shared across tests the way [`client`] is shared
+    /// across fetches, which is what the last test below depends on.
+    fn plain_http() -> &'static reqwest::Client {
+        static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        CLIENT.get_or_init(|| build_client(false).unwrap())
+    }
+
     /// Serves one canned response on a loopback port and returns its URL.
     ///
     /// A real server rather than a mocked client: the thing under test is
@@ -133,7 +166,10 @@ mod tests {
     async fn a_body_within_the_limit_comes_back_as_text() {
         let url = serve(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n1.2.3.4\n");
 
-        assert_eq!(capped_text(&url, "a feed", 64).await.unwrap(), "1.2.3.4\n");
+        assert_eq!(
+            capped_text(plain_http(), &url, "a feed", 64).await.unwrap(),
+            "1.2.3.4\n"
+        );
     }
 
     /// The declared length is checked first so an oversized body is refused
@@ -142,7 +178,9 @@ mod tests {
     async fn a_declared_length_over_the_limit_is_refused() {
         let url = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 9999\r\n\r\nxxxx");
 
-        let err = capped_text(&url, "a feed", 8).await.unwrap_err();
+        let err = capped_text(plain_http(), &url, "a feed", 8)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("9999 bytes, over the 8-byte limit"),
@@ -156,7 +194,9 @@ mod tests {
     async fn an_undeclared_body_over_the_limit_is_refused_while_reading() {
         let url = serve(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nfar too many bytes for this");
 
-        let err = capped_text(&url, "a feed", 8).await.unwrap_err();
+        let err = capped_text(plain_http(), &url, "a feed", 8)
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("exceeded the 8-byte limit"),
             "was: {err:#}"
@@ -169,7 +209,7 @@ mod tests {
     async fn a_failing_status_is_reported_against_the_source_name() {
         let url = serve(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
 
-        let err = capped_text(&url, "the ai.robots.txt list", 64)
+        let err = capped_text(plain_http(), &url, "the ai.robots.txt list", 64)
             .await
             .unwrap_err();
         assert!(
@@ -177,6 +217,25 @@ mod tests {
             "was: {err:#}"
         );
     }
+    /// Every feed URL is `https`, so a plain-http one — whether asked for
+    /// directly or reached by a redirect — can only be a downgrade someone
+    /// arranged. The shared client refuses it before connecting.
+    ///
+    /// The redirect half is reqwest's own check under the same flag, and
+    /// is not exercised here: it would need a TLS server with a trusted
+    /// certificate to redirect *from*.
+    #[tokio::test]
+    async fn the_shared_client_refuses_plain_http() {
+        let url = serve(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n1.2.3.4\n");
+
+        let err = text(&url, "a feed").await.unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("scheme"),
+            "should be refused for its scheme, was: {err:#}"
+        );
+    }
+
     /// The six call sites now share one `Client`, where each used to build
     /// its own. Bailing on an over-cap response drops the `Response`
     /// mid-body, so this checks that doing so leaves the shared connection
@@ -186,9 +245,14 @@ mod tests {
         let big = serve(
             b"HTTP/1.1 200 OK\r\nContent-Length: 9999\r\nConnection: close\r\n\r\nxxxxxxxxxxxxxxxx",
         );
-        assert!(capped_text(&big, "a feed", 8).await.is_err());
+        assert!(capped_text(plain_http(), &big, "a feed", 8).await.is_err());
 
         let good = serve(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n1.2.3.4\n");
-        assert_eq!(capped_text(&good, "a feed", 64).await.unwrap(), "1.2.3.4\n");
+        assert_eq!(
+            capped_text(plain_http(), &good, "a feed", 64)
+                .await
+                .unwrap(),
+            "1.2.3.4\n"
+        );
     }
 }

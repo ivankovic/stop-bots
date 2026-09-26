@@ -161,14 +161,28 @@ pub fn derived_firewall_rules(db: &Db) -> Result<Vec<FirewallRule>> {
 /// entry is simply skipped rather than erroring: this check exists to *add*
 /// a warning on top of firewall rendering, never to block it over
 /// something unrelated to that rendering.
+///
+/// **Ports.** Both renderers turn a rule's port into `tcp dport <port>`
+/// (`-p tcp --dport` for iptables), so a port-scoped rule only matches
+/// traffic to that port — and nothing in this project knows which port
+/// sshd listens on. The two directions are therefore resolved the way
+/// that errs towards a warning: a port-scoped **Allow** is skipped, as if
+/// absent, because it cannot be shown to cover SSH (not even on 22 — sshd
+/// may be elsewhere); a port-scoped **Block** still counts, because it
+/// may be on exactly the port sshd uses. Counting the Allow was how
+/// `allow 203.0.113.0/24 port 443` ahead of a catch-all passed as safe
+/// while the real script dropped every SSH packet from that range.
 pub fn lockout_risks(rules: &[FirewallRule], connected_ips: &[String]) -> Vec<(String, String)> {
     let mut risks = Vec::new();
     for ip_str in connected_ips {
         let Ok(ip) = ip_str.parse::<std::net::IpAddr>() else {
             continue;
         };
-        for rule in rules.iter().filter(|r| r.enabled) {
-            if ipranges::cidr_contains(&rule.address, ip) {
+        let could_decide_ssh = |rule: &&FirewallRule| {
+            rule.enabled && (rule.port.is_none() || rule.action != FirewallAction::Allow)
+        };
+        for rule in rules.iter().filter(could_decide_ssh) {
+            if ipranges::cidr_contains(rule.address.trim(), ip) {
                 if rule.action != FirewallAction::Allow {
                     risks.push((ip_str.clone(), rule.address.clone()));
                 }
@@ -474,13 +488,136 @@ pub fn build_script(db: &Db, backend: FirewallBackend) -> Result<BuiltFirewall> 
 /// path fails with "No such file or directory" on any host where an admin
 /// hasn't already `mkdir`ed it, including the internal cron's unattended
 /// `RenderFirewall` job, which has no human present to react to the error.
+///
+/// **Written aside and renamed into place, never written in place.** The
+/// file this produces is run as root by [`apply_script`], so the write is
+/// the step an attacker with a foothold would aim at. `fs::write` followed
+/// a symlink planted at `out` and truncated whatever it pointed to — a
+/// root-owned file of the attacker's choosing. Now the script goes to a
+/// freshly created (`O_EXCL`, random name) file in the same directory, is
+/// flushed to disk, and is renamed over `out`, which replaces a link rather
+/// than following it and means nothing ever sees half a script. The mode an
+/// existing script had is kept; a new one gets the mode `fs::write` gave
+/// it.
+///
+/// **And not at all into a directory someone else could write** — see
+/// [`unsafe_script_directory`]. Whoever can write the directory can swap
+/// the script between this write and root running it, and no care taken
+/// over the write itself can prevent that.
 pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    use std::io::Write as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let dir = match out.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(dir)?;
+    let meta = std::fs::metadata(dir)?;
+    // SAFETY: neither call has preconditions; both only read the
+    // process's own credentials.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if let Some(why) = unsafe_script_directory(meta.uid(), meta.gid(), meta.mode(), euid, egid) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to write the firewall script into {}: it is {why}, who could \
+                 replace the script before it is applied as root. Write it somewhere only \
+                 root can change (the default is {}), or fix the directory's owner and mode",
+                dir.display(),
+                DEFAULT_OUTPUT_PATH
+            ),
+        ));
     }
-    std::fs::write(out, script)
+
+    // The existing script's mode, not its link's target's: a planted
+    // symlink should not get to choose the mode either.
+    let mode = std::fs::symlink_metadata(out)
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.permissions().mode() & 0o7777);
+    let name = out
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let (tmp_path, mut tmp) = create_exclusive(dir, &name)?;
+    let written = (|| {
+        if let Some(mode) = mode {
+            tmp.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        tmp.write_all(script.as_bytes())?;
+        tmp.sync_all()?;
+        std::fs::rename(&tmp_path, out)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    written?;
+    // The rename itself is only durable once the directory is flushed. A
+    // failure here costs durability across a crash, not correctness, so it
+    // is not worth failing a write that has already happened.
+    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+
+    /// A new file beside the script, created with `O_EXCL` under a random
+    /// name so nothing already there — a planted link included — can be
+    /// opened in its place. 0666 before the umask, as `fs::write` would.
+    fn create_exclusive(
+        dir: &Path,
+        name: &str,
+    ) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+        use rand::TryRng;
+        let mut last = None;
+        for _ in 0..8 {
+            let mut suffix = [0u8; 8];
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut suffix)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let hex: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+            let path = dir.join(format!(".{name}.{hex}.tmp"));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o666)
+                .open(&path)
+            {
+                Ok(file) => return Ok((path, file)),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => last = Some(err),
+                Err(err) => return Err(err),
+            }
+        }
+        Err(last.unwrap_or_else(|| std::io::Error::other("no free temporary name")))
+    }
+    Ok(())
+}
+
+/// Why a directory owned by `uid`:`gid` with `mode` is not a safe place for
+/// a script root will run, or `None` if it is.
+///
+/// Anyone who can write the directory can rename a different file over
+/// the script after it is written. So the owner must be root or this
+/// process — nobody else — and nobody else may be able to write it either:
+/// not other users, and not a group this process is not the primary group
+/// of. The sticky bit (`/tmp`) is the exception, because it stops anyone
+/// but a file's owner from renaming over it.
+///
+/// The group rule is what lets an ordinary user's own `0775` directory
+/// through — the default under `umask 002`, where the group is the user's
+/// own — while still refusing `root:adm 0775`.
+fn unsafe_script_directory(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) -> Option<String> {
+    const STICKY: u32 = 0o1000;
+    if uid != 0 && uid != euid {
+        return Some(format!("owned by uid {uid}"));
+    }
+    if mode & STICKY != 0 {
+        return None;
+    }
+    if mode & 0o002 != 0 {
+        return Some("writable by every user".to_string());
+    }
+    if mode & 0o020 != 0 && gid != egid {
+        return Some(format!("writable by group {gid}"));
+    }
+    None
 }
 
 /// Actually enforces a just-written script by running `backend`'s apply
@@ -514,18 +651,30 @@ pub fn write_script(out: &Path, script: &str) -> std::io::Result<()> {
 /// sense that matters: nothing applies a script without an operator having
 /// asked for it, whether by pressing a key or by putting `--apply` in a
 /// crontab. It does not hold in the sense of "a human is looking".
+///
+/// Both programs are found through [`crate::host::program`], and the
+/// child gets [`crate::host::path_with_sbin`]: under an `/etc/cron.d`
+/// entry `PATH` is `/usr/bin:/bin`, which has neither `nft` nor the
+/// `iptables` every line of the iptables script runs.
 pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
-    let output = match backend {
-        FirewallBackend::Iptables => std::process::Command::new("sh")
-            .arg(out_path)
-            .output()
-            .context("failed to run `sh` on the generated iptables script")?,
-        FirewallBackend::Nftables => std::process::Command::new("nft")
-            .arg("-f")
-            .arg(out_path)
-            .output()
-            .context("failed to run `nft -f` on the generated nftables script")?,
+    let (program, args, what): (_, &[&str], _) = match backend {
+        FirewallBackend::Iptables => (
+            "sh",
+            &[],
+            "failed to run `sh` on the generated iptables script",
+        ),
+        FirewallBackend::Nftables => (
+            "nft",
+            &["-f"],
+            "failed to run `nft -f` on the generated nftables script",
+        ),
     };
+    let output = std::process::Command::new(crate::host::program(program))
+        .args(args)
+        .arg(out_path)
+        .env("PATH", crate::host::path_with_sbin())
+        .output()
+        .context(what)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -890,6 +1039,55 @@ mod tests {
         );
     }
 
+    /// The reviewer's probe. The Allow renders as `tcp dport 443 accept`,
+    /// which an SSH packet does not match, so it falls through to the
+    /// catch-all and is dropped — and the guard has to say so.
+    #[test]
+    fn a_port_scoped_allow_does_not_protect_ssh() {
+        let rules = vec![
+            FirewallRule {
+                port: Some(443),
+                ..rule("203.0.113.0/24", FirewallAction::Allow)
+            },
+            rule("0.0.0.0/0", FirewallAction::Block),
+        ];
+
+        assert_eq!(
+            lockout_risks(&rules, &["203.0.113.5".to_string()]),
+            vec![("203.0.113.5".to_string(), "0.0.0.0/0".to_string())]
+        );
+    }
+
+    /// Not even on 22: nothing here knows which port sshd listens on, and
+    /// an Allow only counts if it provably covers SSH. Wrongly warning
+    /// costs an operator a second look; wrongly passing costs them the
+    /// host.
+    #[test]
+    fn an_allow_on_port_22_is_not_taken_as_protecting_ssh_either() {
+        let rules = vec![
+            FirewallRule {
+                port: Some(22),
+                ..rule("203.0.113.0/24", FirewallAction::Allow)
+            },
+            rule("0.0.0.0/0", FirewallAction::Block),
+        ];
+
+        assert_eq!(lockout_risks(&rules, &["203.0.113.5".to_string()]).len(), 1);
+    }
+
+    /// The conservative direction for a Block is the opposite one: a
+    /// port-scoped Block may be on exactly the port sshd uses, so it
+    /// still counts.
+    #[test]
+    fn a_port_scoped_block_still_counts_as_a_risk() {
+        let rules = vec![crate::testing::block_port("203.0.113.0/24", 2222)];
+
+        assert_eq!(
+            lockout_risks(&rules, &["203.0.113.5".to_string()]),
+            vec![("203.0.113.5".to_string(), "203.0.113.0/24".to_string())]
+        );
+    }
+
     #[test]
     fn assess_lockout_risk_reports_risks_from_the_log() {
         let dir = tempfile::tempdir().unwrap();
@@ -943,6 +1141,124 @@ mod tests {
         write_script(&out, "new content").unwrap();
 
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "new content");
+    }
+
+    /// The attack: a symlink planted where the script goes, pointing at
+    /// something root would not otherwise write. `fs::write` followed it
+    /// and truncated the target in place. The link is replaced instead,
+    /// and what it pointed at is untouched.
+    #[test]
+    fn write_script_replaces_a_planted_symlink_rather_than_writing_through_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious").unwrap();
+        let out = dir.path().join("firewall.nft");
+        std::os::unix::fs::symlink(&victim, &out).unwrap();
+
+        write_script(&out, "table inet stop_bots {}\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "precious");
+        let meta = std::fs::symlink_metadata(&out).unwrap();
+        assert!(meta.is_file(), "{} is still a link", out.display());
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "table inet stop_bots {}\n"
+        );
+    }
+
+    /// Written aside and renamed into place, so nothing ever sees half a
+    /// script — and nothing is left beside it afterwards.
+    #[test]
+    fn write_script_leaves_nothing_but_the_script_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        write_script(&dir.path().join("firewall.nft"), "x").unwrap();
+
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["firewall.nft".to_string()]);
+    }
+
+    /// Replacing the file must not quietly change who may read it.
+    #[test]
+    fn write_script_keeps_an_existing_scripts_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("firewall.nft");
+        std::fs::write(&out, "old").unwrap();
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        write_script(&out, "new").unwrap();
+
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640, "mode became {mode:04o}");
+    }
+
+    /// Anyone who can write the directory can swap the script between
+    /// this write and root running it.
+    #[test]
+    fn write_script_refuses_a_directory_anyone_can_write_to() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let open = dir.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = write_script(&open.join("firewall.nft"), "x").unwrap_err();
+
+        assert!(
+            err.to_string().contains("writable by"),
+            "the refusal should say why, was: {err}"
+        );
+        assert!(!open.join("firewall.nft").exists());
+    }
+
+    /// Who could replace the script after it is written, decided from the
+    /// directory's owner and mode. Pure, because a test cannot `chown` a
+    /// directory to somebody else without being root.
+    #[test]
+    fn which_directories_are_safe_to_write_a_script_into() {
+        const ROOT: u32 = 0;
+        const ME: u32 = 1000;
+        const ALICE: u32 = 1001;
+        const ADM: u32 = 4;
+        for (what, (uid, gid, mode), (euid, egid), safe) in [
+            (
+                "/etc/stop-bots as root",
+                (ROOT, ROOT, 0o755),
+                (ROOT, ROOT),
+                true,
+            ),
+            ("/tmp: sticky", (ROOT, ROOT, 0o1777), (ROOT, ROOT), true),
+            ("my own directory", (ME, ME, 0o755), (ME, ME), true),
+            ("mine, umask 002", (ME, ME, 0o775), (ME, ME), true),
+            (
+                "root writing into alice's",
+                (ALICE, ALICE, 0o755),
+                (ROOT, ROOT),
+                false,
+            ),
+            (
+                "world-writable, no sticky",
+                (ROOT, ROOT, 0o777),
+                (ROOT, ROOT),
+                false,
+            ),
+            (
+                "group adm may write",
+                (ROOT, ADM, 0o775),
+                (ROOT, ROOT),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                unsafe_script_directory(uid, gid, mode, euid, egid).is_none(),
+                safe,
+                "{what}: {:?}",
+                unsafe_script_directory(uid, gid, mode, euid, egid)
+            );
+        }
     }
 
     #[test]

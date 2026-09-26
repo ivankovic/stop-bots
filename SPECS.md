@@ -6698,3 +6698,65 @@ with no usable path whole, rather than trusting its caller. In the TUI's
 single field the first space ends the path. Paths may not contain spaces,
 so the split is unambiguous, and a user agent keeps its own spaces
 (`Jellyfin Android`).
+
+## Security pass: feeds, the lockout guard, the script write, the database's mode, the units (`src/db.rs`, `src/firewall.rs`, `src/fetch.rs`, `src/install.rs`, `src/host.rs`)
+
+### A feed cannot say "everything"
+
+Fetched ranges were validated only as syntax, so a feed carrying `0.0.0.0/0`
+became a drop rule for the whole internet — or, in an allowed country's zone
+under allowlist mode, an accept for it — and cron applied it. `usable_addresses`
+now also drops prefixes shorter than `FEED_MIN_PREFIX_V4` (`/3`) and
+`FEED_MIN_PREFIX_V6` (`/12`). Only fetched ranges pass through it; admin rules
+and trusted addresses have their own validation.
+
+The numbers come from real data, not from "a lot of addresses". FireHOL level 1
+carries `224.0.0.0/3`; IPdeny's aggregated US zone has `/6`s and `/7`s
+(`16.0.0.0/6`, `6.0.0.0/7`) and `2630::/16`. A `/8` floor, the obvious number,
+would drop real entries from both on every fetch. It is a floor, not a coverage
+limit: it stops the single line that means "everything", not a feed that lists
+many allowed ranges.
+
+What was dropped is named in `refresh::store`'s summary (what `batch` logs and
+"Update everything" shows). A fetch that is *only* catch-alls has nothing
+usable and is refused like any broken fetch. A fetch over `FEED_MAX_ENTRIES`
+(250,000, about six times the US's ~40,000 v4+v6 lines) is refused whole and
+the previous ranges kept, for the reason `MAX_BODY_BYTES` refuses rather than
+truncates.
+
+### The lockout guard and ports
+
+Both renderers turn a port into `tcp dport`, so `allow X port 443` does not
+match SSH. `lockout_risks` counted it as protection. Nothing here knows sshd's
+port, so both directions err towards a warning: a port-scoped Allow is skipped
+(even on 22), and a port-scoped Block still counts.
+
+### The script write
+
+`write_script` followed a planted symlink with `fs::write` and truncated its
+target, and the file is then run as root. It now writes a new `O_EXCL` file
+with a random name beside the target, fsyncs it, and renames it over the target
+(keeping an existing script's mode). It refuses a directory owned by anyone but
+root or this user, writable by all without the sticky bit, or group-writable by
+a group that is not this process's own. The last rule lets an ordinary user's
+`0775` directory (`umask 002`) through and refuses `root:adm 0775`.
+
+### Smaller ones
+
+- `fetch`: `https_only`, which reqwest also applies to redirects. A builder
+  failure is now an error rather than `unwrap_or_default()`, which silently
+  dropped every timeout.
+- `Db::open` creates the database 0600 and any directory it makes 0700
+  (`main.rs::open_or_fallback` makes the directory first, so it uses the same
+  helper). An existing file owned by this user and readable by others is
+  tightened. SQLite gives `-wal`/`-shm` the main file's mode.
+- `install firewall --prefix` no longer runs the real `systemctl`. Its unit
+  follows the stored backend (`/bin/sh firewall.sh` for iptables), and
+  `health` accepts that unit for iptables too.
+- `ExecStart` arguments are quoted and escaped per systemd.syntax (`%%`, `$$`,
+  `\"`, `\\`).
+- The renderers print the trimmed address that validation checked.
+- `host::program` resolves `nft`, `iptables`, `sh`, `df` and friends through
+  `PATH`, then `/usr/sbin`, `/sbin` and `/usr/local/sbin`. `apply_script` also
+  hands its child that extended `PATH`, because the iptables script runs
+  `iptables` by name. Under `/etc/cron.d`, `PATH` is `/usr/bin:/bin`.

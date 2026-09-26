@@ -210,10 +210,12 @@ pub fn render(rules: &[FirewallRule]) -> String {
             ));
             continue;
         }
-        let family = if is_ipv6(&rule.address) { "ip6" } else { "ip" };
+        // What was validated is the trimmed form, so that is what goes in
+        // the script: a trailing newline would split the rule in two.
+        let address = rule.address.trim();
+        let family = if is_ipv6(address) { "ip6" } else { "ip" };
         out.push_str(&format!(
-            "add rule {TABLE} {RULES_CHAIN} {family} saddr {}",
-            rule.address
+            "add rule {TABLE} {RULES_CHAIN} {family} saddr {address}"
         ));
         if let Some(port) = rule.port {
             out.push_str(&format!(" tcp dport {port}"));
@@ -494,6 +496,21 @@ mod tests {
         );
         assert!(
             rendered.contains("skipped (not an IP address or CIDR range)"),
+            "rendered was:\n{rendered}"
+        );
+    }
+
+    /// Validation trims, so an address with whitespace around it is valid
+    /// — and must be rendered as what was validated. Untrimmed, a trailing
+    /// newline split the rule across two lines, leaving a bare `drop`.
+    #[test]
+    fn an_address_is_rendered_trimmed() {
+        let rendered = render(&[block(" 1.2.3.4\n")]);
+
+        assert!(
+            rendered.contains(&format!(
+                "add rule {TABLE} {RULES_CHAIN} ip saddr 1.2.3.4 drop\n"
+            )),
             "rendered was:\n{rendered}"
         );
     }

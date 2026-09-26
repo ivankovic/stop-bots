@@ -158,16 +158,21 @@ rand = "0.10"
 subtle = { version = "2", default-features = false }
 sha2 = "0.11.0"
 
+# `geteuid`/`getegid`, which std does not expose: deciding whether a
+# directory someone else could write is safe to put a root-applied firewall
+# script in, and whether a database file is this user's to tighten. Already
+# in the tree through tokio; this makes it direct.
+libc = "0.2"
+
 [dev-dependencies]
 # For testing
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
 
-# For driving the TUI through a real pty in e2e tests — the pty harness
-# itself is in tests/tui.rs, on raw libc, see the comment there for why
-# it isn't a crate.
-libc = "0.2"
+# The pty harness that drives the TUI in e2e tests (tests/tui.rs) is on
+# raw libc, which is now a normal dependency — see the comment there for
+# why it isn't a crate.
 # `ServiceExt::oneshot`, to drive the web router in tests without binding
 # a port. The whole middleware stack runs, which is the part worth
 # testing; a real listener would only add a port to collide on.
