@@ -871,9 +871,14 @@ impl Host {
 
     /// The stored console password hash, read with the tool's own
     /// database rather than by poking at SQLite's file format.
+    ///
+    /// With a lock timeout, like every `sqlite3` read here: the console
+    /// this installed is registering sources and running due cron jobs in
+    /// the same moment, and without one the CLI gives up at once with
+    /// "database is locked" instead of waiting its turn.
     fn password_hash(&self) -> String {
         self.sh(&format!(
-            "sqlite3 {HOST_DB} \"select value from settings where key like 'web:password%'\""
+            "sqlite3 -cmd '.timeout 5000' {HOST_DB} \"select value from settings where key like 'web:password%'\""
         ))
         .trim()
         .to_string()
@@ -1262,7 +1267,7 @@ fn the_console_stores_the_built_in_bot_list_on_startup() {
     host.wait_for_console();
 
     let entries = host.sh(&format!(
-        "sqlite3 {HOST_DB} \"select count(*) from bot_source_entries where source_id = 'stop-bots-extras'\""
+        "sqlite3 -cmd '.timeout 5000' {HOST_DB} \"select count(*) from bot_source_entries where source_id = 'stop-bots-extras'\""
     ));
     let entries: i64 = entries.trim().parse().unwrap_or(0);
     assert!(
@@ -1275,7 +1280,7 @@ fn the_console_stores_the_built_in_bot_list_on_startup() {
     // them, by pattern rather than by slug: the slug is this project's own
     // naming, the pattern is what actually has to match a request.
     let le = host.sh(&format!(
-        "sqlite3 {HOST_DB} \"select count(*) from bots where user_agent_pattern like '%Let%Encrypt%'\""
+        "sqlite3 -cmd '.timeout 5000' {HOST_DB} \"select count(*) from bots where user_agent_pattern like '%Let%Encrypt%'\""
     ));
     assert_eq!(
         le.trim(),
@@ -1548,8 +1553,19 @@ fn apply_everything_from_the_console_enforces_on_both_planes() {
         "the firewall half did not reach the kernel. console said:\n{flash}\nruleset:\n{ruleset}"
     );
 
-    let blocked =
-        host.sh("curl -s -o /dev/null -w '%{http_code}' -A 'BadBot/1.0' http://127.0.0.1:8080/");
+    // A reload is asynchronous: `systemctl reload nginx` returns once the
+    // master has the signal, and an old worker can still answer the next
+    // request. Polled rather than slept on, so a slow runner waits longer
+    // and a fast one not at all.
+    let mut blocked = String::new();
+    for _ in 0..50 {
+        blocked = host
+            .sh("curl -s -o /dev/null -w '%{http_code}' -A 'BadBot/1.0' http://127.0.0.1:8080/");
+        if blocked.trim() == "403" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     assert_eq!(
         blocked.trim(),
         "403",

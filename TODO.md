@@ -18,22 +18,6 @@ list — which meant the open items below were unfindable inside it.
   `~*` regex. The `BLOCKLIST` tag can therefore disagree with what actually gets
   blocked — and since the web UI arrived it says so on two screens rather than
   one, because both front-ends now read this from `crate::dynamic`.
-* **`reinstalling_keeps_the_first_password` races the console's own cron.**
-  This is the intermittent container-suite failure, now caught. It is not
-  resource contention and not an assertion: the test's `sqlite3` read of
-  `settings` fails with `Error: in prepare, database is locked (5)` while
-  the console it just installed is still registering sources and running
-  due cron jobs. `Db::open` sets no `busy_timeout`, so the second process
-  gets an immediate refusal instead of waiting — the same rough edge
-  `Host::wait_for_console` exists to step around, in a test that reads the
-  database without going through it.
-
-  Run alone it fails every time (3/3, and 1/1 on the commit before the
-  forward-hook change, so it is not new); in the full suite it fails
-  roughly one run in five, because whatever ran before it happened to give
-  the console time to settle. A `busy_timeout` on `Db::open` is the real
-  fix and would retire the `wait_for_console` poll with it; making this one
-  test wait is the cheap one.
 * **`accesslog::read_log_file` reads the whole log into memory.** It is
   `std::fs::read_to_string`, and the persisted offset in
   `accessstats::record_access_stats` slices the already-seen prefix off
