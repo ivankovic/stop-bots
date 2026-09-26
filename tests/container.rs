@@ -845,7 +845,8 @@ impl Host {
     /// anti-lockout check could not run. The container runs no sshd, so the
     /// log is empty — readable, with nobody connected.
     fn console(&self) -> Console {
-        let out = self.sh("touch /var/log/auth.log && stop-bots install web --ssh-log /var/log/auth.log");
+        let out =
+            self.sh("touch /var/log/auth.log && stop-bots install web --ssh-log /var/log/auth.log");
         let password = out
             .lines()
             .map(str::trim)
