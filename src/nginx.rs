@@ -2062,20 +2062,26 @@ fn locate_console_block(content: &str, block: &ServerBlock) -> Option<(usize, us
 /// unloadable, and nothing looks wrong because the running NGINX keeps
 /// serving from memory. The next reload is then somebody else's problem,
 /// most likely certbot's renewal hook at 3am.
-fn write_validated(path: &Path, content: &str, commands: &NginxCommands) -> Result<()> {
+///
+/// `write` does the writing, both of `content` and of the restore, so the
+/// console's own file is replaced rather than written through
+/// ([`write_managed`]) and an operator's site file is written only where
+/// it really lives inside the root ([`write_site_file`]).
+fn write_validated(
+    path: &Path,
+    content: &str,
+    commands: &NginxCommands,
+    write: impl Fn(&Path, &str) -> Result<()>,
+) -> Result<()> {
     let previous = fs::read_to_string(path).ok();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
+    write(path, content)?;
 
     if let Err(err) = test_config(commands) {
         // Put it back before reporting, so the operator is not left with a
         // config that cannot be loaded.
         let restored = match &previous {
-            Some(text) => fs::write(path, text),
-            None => fs::remove_file(path),
+            Some(text) => write(path, text),
+            None => fs::remove_file(path).map_err(Into::into),
         };
         let note = if restored.is_ok() {
             "the previous config was restored"
@@ -2104,7 +2110,12 @@ pub fn apply_console_access(
     match access {
         ConsoleAccess::Subdomain { host } => {
             let path = console_site_path(root);
-            write_validated(&path, &console_server_block(host, upstream), commands)?;
+            write_validated(
+                &path,
+                &console_server_block(host, upstream),
+                commands,
+                write_managed,
+            )?;
             Ok(path)
         }
         ConsoleAccess::Path {
@@ -2121,7 +2132,9 @@ pub fn apply_console_access(
                         config_path.display()
                     )
                 })?;
-            write_validated(config_path, &updated, commands)?;
+            write_validated(config_path, &updated, commands, |path, text| {
+                write_site_file(path, root, text)
+            })?;
             Ok(config_path.clone())
         }
     }
@@ -5518,6 +5531,66 @@ server {
         );
     }
 
+    /// The console's own file is one this tool owns outright, so a link
+    /// planted at its name is replaced, never written through.
+    #[test]
+    fn subdomain_mode_replaces_a_planted_link_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("nginx");
+        fs::create_dir_all(root.join("conf.d")).unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "precious\n").unwrap();
+        std::os::unix::fs::symlink(&victim, console_site_path(&root)).unwrap();
+
+        apply_console_access(
+            &root,
+            &ConsoleAccess::Subdomain {
+                host: "console.example.com".to_string(),
+            },
+            &upstream(),
+            &commands_that(true),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
+        let written = console_site_path(&root);
+        assert!(fs::symlink_metadata(&written).unwrap().is_file());
+        assert!(fs::read_to_string(&written)
+            .unwrap()
+            .contains("console.example.com"));
+    }
+
+    /// Path mode edits an operator's site file, which may be a link — but
+    /// not one that leads out of the NGINX root.
+    #[test]
+    fn path_mode_does_not_write_a_site_file_linking_outside_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("nginx");
+        fs::create_dir(&root).unwrap();
+        let victim = dir.path().join("elsewhere.conf");
+        fs::write(&victim, TWO_BLOCK_SITE).unwrap();
+        let link = root.join("example.com");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = apply_console_access(
+            &root,
+            &ConsoleAccess::Path {
+                prefix: "/stop-bots/".to_string(),
+                config_path: link,
+                server_name: "example.com".to_string(),
+            },
+            &upstream(),
+            &commands_that(true),
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("outside the NGINX root"),
+            "error was: {err:#}"
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), TWO_BLOCK_SITE);
+    }
+
     #[test]
     fn path_mode_is_idempotent() {
         let once = with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
@@ -5582,7 +5655,13 @@ server {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("conf.d/stop-bots-console.conf");
 
-        let err = write_validated(&path, "server { broken", &commands_that(false)).unwrap_err();
+        let err = write_validated(
+            &path,
+            "server { broken",
+            &commands_that(false),
+            write_managed,
+        )
+        .unwrap_err();
 
         assert!(
             format!("{err:#}").contains("restored"),
@@ -5602,7 +5681,12 @@ server {
         let path = dir.path().join("example.com");
         fs::write(&path, TWO_BLOCK_SITE).unwrap();
 
-        let _ = write_validated(&path, "server { broken", &commands_that(false));
+        let _ = write_validated(
+            &path,
+            "server { broken",
+            &commands_that(false),
+            write_managed,
+        );
 
         assert_eq!(fs::read_to_string(&path).unwrap(), TWO_BLOCK_SITE);
     }
@@ -5613,7 +5697,7 @@ server {
         let path = dir.path().join("conf.d/stop-bots-console.conf");
         let block = console_server_block("console.example.com", &upstream());
 
-        write_validated(&path, &block, &commands_that(true)).unwrap();
+        write_validated(&path, &block, &commands_that(true), write_managed).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), block);
     }
