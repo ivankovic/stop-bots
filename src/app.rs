@@ -1061,9 +1061,16 @@ impl App {
                 });
             }
             SiteAction::Apply(_) | SiteAction::ApplyAll => {
-                let plan = match self.nginx.plan_apply(&self.db, action) {
-                    Ok(plan) => plan,
-                    Err(err) => {
+                // The test runs inside the apply, so a config NGINX rejects
+                // is put back before anything can reload it — resolved
+                // here, like every other `Db` read the apply needs.
+                let validate = self
+                    .reload_nginx_for_real
+                    .then(|| nginx::NginxCommands::from_db(&self.db))
+                    .transpose();
+                let plan = match (self.nginx.plan_apply(&self.db, action), validate) {
+                    (Ok(plan), Ok(validate)) => crate::tui::nginx::ApplyPlan { validate, ..plan },
+                    (Err(err), _) | (_, Err(err)) => {
                         self.message = Some(format!("Apply failed: {err}"));
                         return Ok(());
                     }

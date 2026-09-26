@@ -1387,20 +1387,22 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
     let mut ok = true;
 
     let root = state.nginx_root.clone();
+    let for_real = state.apply_for_real;
     match state
-        .with_db(move |db| crate::nginx::apply_all_sites(db, &root))
+        .with_db(move |db| {
+            let commands = for_real
+                .then(|| crate::nginx::NginxCommands::from_db(db))
+                .transpose()?;
+            crate::nginx::apply_all_sites_and_reload(db, &root, commands.as_ref())
+        })
         .await
     {
         Ok(outcome) => {
             parts.push(format!("NGINX: {} file(s) changed", outcome.changed));
-            if outcome.changed > 0 {
-                match reload_nginx(&state).await {
-                    Ok(note) => parts.push(note),
-                    Err(err) => {
-                        ok = false;
-                        parts.push(format!("reload failed: {err}"));
-                    }
-                }
+            if outcome.reloaded {
+                parts.push("reloaded".to_string());
+            } else if outcome.changed > 0 {
+                parts.push("not reloaded (--no-apply)".to_string());
             }
         }
         Err(err) => {

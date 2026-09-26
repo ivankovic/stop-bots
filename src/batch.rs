@@ -338,16 +338,19 @@ fn read_log(
 
 fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
     let outcome = (|| -> Result<String> {
-        let applied = nginx::apply_all_sites(db, &options.root)?;
+        // Tested, and reloaded only when something changed on disk; a
+        // config the test rejects is put back rather than left for the
+        // next reload to find.
+        let commands = options
+            .apply
+            .then(|| nginx::NginxCommands::from_db(db))
+            .transpose()?;
+        let applied = nginx::apply_all_sites_and_reload(db, &options.root, commands.as_ref())?;
         let mut summary = format!(
             "{} site(s), {} file(s) changed",
             applied.sites, applied.changed
         );
-        // Writing the sentinel block does nothing until NGINX re-reads it,
-        // so there is nothing to reload when nothing changed on disk.
-        if applied.changed > 0 && options.apply {
-            let commands = nginx::NginxCommands::from_db(db)?;
-            nginx::reload_with(&commands).context("config was written, but the reload failed")?;
+        if applied.reloaded {
             summary.push_str(", reloaded");
         }
         Ok(summary)

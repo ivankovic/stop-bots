@@ -637,6 +637,25 @@ pub fn validate_exemption_user_agent(user_agent: &str) -> Result<String> {
     validate_user_agent_fragment(user_agent, "an exemption's user agent")
 }
 
+/// Why `user_agent` cannot be blocked, if it cannot.
+///
+/// It is written as an escaped, case-insensitive substring into the same
+/// quoted regex as every bot pattern, so it gets the same check
+/// (`nginx::pattern_problem`) at the point an operator can still be told,
+/// instead of only at write time, where the block silently leaves it out.
+/// The one that mattered: an empty string, which is in every user agent —
+/// the console's block form posting `user_agent=` blocked every visitor of
+/// every site.
+pub fn validate_blocked_user_agent(user_agent: &str) -> Result<()> {
+    if user_agent.trim().is_empty() {
+        anyhow::bail!("an empty user agent would match every client");
+    }
+    if let Some(problem) = crate::nginx::pattern_problem(&escape_for_nginx_regex(user_agent)) {
+        anyhow::bail!("refusing to block {user_agent:?}: {problem}");
+    }
+    Ok(())
+}
+
 fn validate_user_agent_fragment(user_agent: &str, what: &str) -> Result<String> {
     let user_agent = user_agent.trim();
     if user_agent.is_empty() {
@@ -2301,7 +2320,12 @@ impl Db {
     /// re-injects the config, since `blocked_user_agent_patterns`/
     /// `_for_site` (via `compute_blocked_patterns`) both fold this table's
     /// contents into the patterns they return.
+    ///
+    /// Refuses one that could not be written as it was meant (see
+    /// [`validate_blocked_user_agent`]) rather than storing it for
+    /// `nginx::block_text` to drop later without a word.
     pub fn block_user_agent(&self, user_agent: &str) -> Result<()> {
+        validate_blocked_user_agent(user_agent)?;
         self.conn.execute(
             "INSERT OR IGNORE INTO blocked_user_agents (user_agent, blocked_at) VALUES (?1, ?2)",
             params![user_agent, now()],
@@ -3801,6 +3825,28 @@ mod tests {
             db.list_blocked_user_agents().unwrap(),
             vec!["curl/8.0".to_string()]
         );
+    }
+
+    /// Matched as a substring, so an empty one is in every user agent: the
+    /// console's block form posting `user_agent=` turned every visitor of
+    /// every site away at the next apply.
+    #[test]
+    fn a_user_agent_that_would_block_everyone_is_refused() {
+        let db = test_db();
+        for (user_agent, why) in [
+            ("", "empty"),
+            ("   ", "whitespace only"),
+            ("ab", "too short to mean one client"),
+            ("curl\n/8.0", "a control character"),
+            ("curl\"8", "a quote"),
+            ("curl\\", "a trailing backslash"),
+        ] {
+            assert!(
+                db.block_user_agent(user_agent).is_err(),
+                "{user_agent:?} ({why}) must be refused"
+            );
+        }
+        assert!(db.list_blocked_user_agents().unwrap().is_empty());
     }
 
     #[test]

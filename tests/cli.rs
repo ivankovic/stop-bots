@@ -857,6 +857,40 @@ fn trust_reaches_the_firewall_script_first_and_nginx_through_the_trust_file() {
 /// Trusting a second user agent changes the trust file and no site's
 /// block. An apply that counted only site files decided nothing changed
 /// and never reloaded NGINX, so the new entry never took effect.
+/// A config the test rejects is put back exactly as it was, and a
+/// generated file the apply created is removed again. Left in place, the
+/// running NGINX would carry on serving the old config from memory and the
+/// broken one would surface at the next restart — every site at once.
+#[test]
+fn a_config_that_fails_the_test_is_put_back_byte_for_byte() {
+    let fx = Fixture::new();
+    fx.seed_bots();
+    let site = fx.write_site("a.example");
+    fx.scan_sites();
+    fx.run(&["set-robots-txt", "--enabled", "true"]);
+    fx.run(&["set-rate-limit", "--enabled", "true"]);
+    let before = fs::read(&site).unwrap();
+    let (bin, calls) = fake_tools(fx._tmp.path());
+    fs::write(
+        fx._tmp.path().join("fail-nginx"),
+        "nginx: [emerg] unknown directive\n",
+    )
+    .unwrap();
+
+    fx.cmd(&["apply-blocks", "--root", fx.nginx_root.to_str().unwrap()])
+        .env("PATH", path_with(&bin))
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown directive"))
+        .stderr(predicate::str::contains("put back"));
+
+    assert_eq!(fs::read(&site).unwrap(), before, "the site file changed");
+    assert!(!fx.robots_txt().exists(), "the new robots.txt was left");
+    assert!(!fx.rate_limit_conf().exists(), "the new zone was left");
+    let log = fs::read_to_string(&calls).unwrap();
+    assert!(!log.contains("systemctl"), "log was: {log}");
+}
+
 #[test]
 fn a_change_to_the_trust_file_alone_still_reloads_nginx() {
     let fx = Fixture::new();
@@ -971,7 +1005,7 @@ fn a_site_path_exemption_switches_the_block_to_the_flag_form() {
         "exempted was:\n{exempted}"
     );
     assert!(
-        exempted.contains("if ($request_uri ~* \"^(/blog)\")"),
+        exempted.contains("if ($uri ~* \"^(/blog)\")"),
         "exempted was:\n{exempted}"
     );
     assert!(

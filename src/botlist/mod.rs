@@ -87,13 +87,42 @@ impl SourceKind {
         Self::ALL.into_iter().find(|kind| kind.id() == id)
     }
 
+    /// Parses a downloaded list, and refuses one past [`MAX_SOURCE_ENTRIES`]
+    /// or with a pattern past `nginx::MAX_PATTERN_LEN`.
+    ///
+    /// Refused whole rather than truncated, for the reason `fetch` refuses
+    /// an oversized body: a list stored in part is one with entries
+    /// silently missing, and the previous list stays in place while the
+    /// error says why.
     pub fn parse(self, raw: &str) -> Result<Vec<NewBot>> {
-        match self {
+        let bots = match self {
             SourceKind::WellKnownBots => well_known_bots::parse(raw),
             SourceKind::AiRobotsTxt => ai_robots_txt::parse(raw),
             SourceKind::NginxBadBots => nginx_bad_bots::parse(raw),
             SourceKind::StopBotsExtras => stop_bots_extras::parse(raw),
+        }?;
+        if bots.len() > MAX_SOURCE_ENTRIES {
+            anyhow::bail!(
+                "the {} list has {} entries, more than the {MAX_SOURCE_ENTRIES} accepted from \
+                 one source; refusing it rather than storing part of it",
+                self.name(),
+                bots.len()
+            );
         }
+        if let Some(bot) = bots
+            .iter()
+            .find(|b| b.user_agent_pattern.len() > crate::nginx::MAX_PATTERN_LEN)
+        {
+            anyhow::bail!(
+                "the {} list has a {}-byte pattern for {:?}, more than the {} bytes accepted; \
+                 refusing it rather than storing part of it",
+                self.name(),
+                bot.user_agent_pattern.len(),
+                bot.name,
+                crate::nginx::MAX_PATTERN_LEN
+            );
+        }
+        Ok(bots)
     }
 
     pub async fn fetch(self) -> Result<String> {
@@ -114,6 +143,25 @@ impl SourceKind {
             bot_count: 0,
         }
     }
+}
+
+/// The most entries one source may deliver. The largest real list is under
+/// 800 (well-known-bots, September 2026); this is over ten times that.
+pub const MAX_SOURCE_ENTRIES: usize = 10_000;
+
+/// Whether a parser keeps `pattern`: everything `nginx::pattern_problem`
+/// accepts, and one that is only too long, so that [`SourceKind::parse`]
+/// can refuse the whole list over it instead of quietly dropping a line.
+///
+/// Every parser filters through this, which keeps a pattern that would
+/// match every visitor (an empty key, `accepted: [""]`, a lone `|` line)
+/// out of the database. `nginx::block_text` checks the same thing again
+/// for anything that reached the database some other way.
+pub(crate) fn keeps_pattern(pattern: &str) -> bool {
+    matches!(
+        crate::nginx::pattern_problem(pattern),
+        None | Some(crate::nginx::PatternProblem::TooLong)
+    )
 }
 
 /// Turns an arbitrary bot-name string into a lowercase, hyphen-separated
@@ -220,6 +268,36 @@ pub async fn update(db: &Db, kind: SourceKind) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::db::BotStatus;
+
+    /// Far beyond any real list, so a source that crosses it has changed
+    /// into something else, and storing part of it would be a list with
+    /// entries silently missing.
+    #[test]
+    fn a_source_with_too_many_entries_is_refused_whole() {
+        let list: String = (0..=MAX_SOURCE_ENTRIES)
+            .map(|i| format!("Bot{i}Agent\n"))
+            .collect();
+        let err = SourceKind::NginxBadBots.parse(&list).unwrap_err();
+        assert!(err.to_string().contains("entries"), "error was: {err}");
+    }
+
+    #[test]
+    fn a_source_with_an_over_long_pattern_is_refused_whole() {
+        let list = format!(
+            "GoodBot\n{}\n",
+            "E".repeat(crate::nginx::MAX_PATTERN_LEN + 1)
+        );
+        let err = SourceKind::NginxBadBots.parse(&list).unwrap_err();
+        assert!(err.to_string().contains("bytes"), "error was: {err}");
+    }
+
+    #[test]
+    fn a_source_within_the_limits_parses() {
+        let bots = SourceKind::NginxBadBots
+            .parse("GoodBot\nEvilBot\n")
+            .unwrap();
+        assert_eq!(bots.len(), 2);
+    }
 
     #[test]
     fn slugify_lowercases_and_hyphenates() {

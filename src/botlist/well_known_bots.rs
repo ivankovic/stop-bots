@@ -72,7 +72,10 @@ fn humanize(slug: &str) -> String {
 /// untrusted pattern with a quote in it could break out and inject
 /// directives into a config loaded as root, and one ending in a backslash
 /// can escape NGINX's own closing quote instead (see `nginx::is_embeddable`
-/// for the mechanics — confirmed against a real `nginx -t`).
+/// for the mechanics — confirmed against a real `nginx -t`). So is one that
+/// would match every visitor, such as `""` — see `botlist::keeps_pattern`.
+/// Each accepted pattern is checked on its own, before they are joined, so
+/// one bad entry costs that entry rather than the bot.
 pub fn parse(json: &str) -> Result<Vec<NewBot>> {
     let raw: Vec<RawBot> = serde_json::from_str(json).context("failed to parse bot list JSON")?;
 
@@ -83,7 +86,7 @@ pub fn parse(json: &str) -> Result<Vec<NewBot>> {
                 .pattern
                 .accepted
                 .into_iter()
-                .filter(|p| !p.contains('"') && !p.ends_with('\\'))
+                .filter(|p| crate::botlist::keeps_pattern(p))
                 .collect();
             if patterns.is_empty() {
                 return None;
@@ -155,6 +158,22 @@ mod tests {
     fn parse_drops_a_pattern_ending_in_a_backslash() {
         let bots = parse(SAMPLE).unwrap();
         assert!(!bots.iter().any(|b| b.slug == "trailing-backslash-bot"));
+    }
+
+    /// `accepted: [""]` joined into the block is an empty alternative:
+    /// every visitor of every site turned away.
+    #[test]
+    fn parse_drops_a_pattern_that_would_match_everyone() {
+        let json = r#"[
+            {"id": "empty-bot", "categories": [], "pattern": {"accepted": [""]}},
+            {"id": "wild-bot", "categories": [], "pattern": {"accepted": [".*", "WildBot"]}}
+        ]"#;
+        let bots = parse(json).unwrap();
+        let patterns: Vec<(&str, &str)> = bots
+            .iter()
+            .map(|b| (b.slug.as_str(), b.user_agent_pattern.as_str()))
+            .collect();
+        assert_eq!(patterns, [("wild-bot", "WildBot")]);
     }
 
     #[test]

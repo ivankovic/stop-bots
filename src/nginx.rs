@@ -68,74 +68,97 @@ pub struct DiscoveredSite {
     pub config_path: PathBuf,
 }
 
-/// Marks which bytes of `content` are outside of a `#`-comment, so that
-/// brace/token scanning can ignore commented-out directives (NGINX configs
-/// commonly comment out whole blocks line by line).
-fn comment_mask(content: &str) -> Vec<bool> {
-    let bytes = content.as_bytes();
-    let mut mask = vec![true; bytes.len()];
-    let mut in_comment = false;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            in_comment = false;
-            continue;
-        }
-        if in_comment {
-            mask[i] = false;
-            continue;
-        }
-        if b == b'#' {
-            in_comment = true;
-            mask[i] = false;
-        }
-    }
-    mask
+/// A config file split the way NGINX's own reader (`ngx_conf_read_token`)
+/// splits it: `{`, `}`, `;` and words, each with the byte offset it starts
+/// at, plus the byte span of every `#` comment.
+///
+/// **Quote-aware, because what this tool writes is.** A sentinel block
+/// embeds upstream bot patterns inside double quotes, and a pattern may
+/// legitimately contain `#`, `{` or `}` — or, from a hostile list, the
+/// marker text itself. A reader that took every `#` for a comment and
+/// every brace for structure re-parsed its own output differently from
+/// NGINX: a second run duplicated the whole block, left a stray
+/// `return 403; }` outside it, or inserted the new block *inside* the
+/// quoted string, which is a way to write directives.
+///
+/// The rules, each checked against a real `nginx -T`:
+///
+/// - A `"` or `'` opens a quoted word only where a word starts; inside,
+///   a backslash escapes the next character. A quote in the middle of a
+///   bare word is an ordinary character.
+/// - `#` starts a comment only where a word could start. `a#b` is a word.
+/// - A bare word ends at whitespace, `;` or `{` (not `${`, a variable).
+///   A `}` inside one is an ordinary character (`add_header X a}b;` is
+///   valid); only at the start of a token is it a block end.
+/// - A backslash escapes the next character in a bare word too: `a\;b`
+///   is one word.
+struct Lexed {
+    /// Quoted words carry their contents without the quotes (escapes are
+    /// left as written; nothing here needs them undone).
+    tokens: Vec<(String, usize)>,
+    comments: Vec<(usize, usize)>,
 }
 
-/// Splits `content` into tokens (`{`, `}`, `;` and bare words), skipping
-/// commented-out bytes, alongside the byte offset each token starts at.
-fn tokenize(content: &str, mask: &[bool]) -> Vec<(String, usize)> {
+fn lex(content: &str) -> Lexed {
     let bytes = content.as_bytes();
+    let len = bytes.len();
     let mut tokens = Vec::new();
-    let mut word = String::new();
-    let mut word_start = 0;
-    for (i, &b) in bytes.iter().enumerate() {
-        if !mask[i] {
-            if !word.is_empty() {
-                tokens.push((std::mem::take(&mut word), word_start));
+    let mut comments = Vec::new();
+    let mut i = 0;
+    while i < len {
+        match bytes[i] {
+            b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+            b @ (b';' | b'{' | b'}') => {
+                tokens.push(((b as char).to_string(), i));
+                i += 1;
             }
-            continue;
-        }
-        let c = b as char;
-        if c == '{' || c == '}' || c == ';' {
-            if !word.is_empty() {
-                tokens.push((std::mem::take(&mut word), word_start));
+            b'#' => {
+                let end = content[i..].find('\n').map_or(len, |n| i + n);
+                comments.push((i, end));
+                i = end;
             }
-            tokens.push((c.to_string(), i));
-            continue;
-        }
-        if c.is_whitespace() {
-            if !word.is_empty() {
-                tokens.push((std::mem::take(&mut word), word_start));
+            quote @ (b'"' | b'\'') => {
+                let start = i;
+                i += 1;
+                let body_start = i;
+                while i < len && bytes[i] != quote {
+                    // Skipping the escaped byte is enough even when it
+                    // starts a multi-byte character: its continuation bytes
+                    // can never equal an ASCII quote.
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                let body_end = i.min(len);
+                tokens.push((
+                    String::from_utf8_lossy(&bytes[body_start..body_end]).into_owned(),
+                    start,
+                ));
+                i = (i + 1).min(len);
             }
-            continue;
+            _ => {
+                let start = i;
+                while i < len {
+                    match bytes[i] {
+                        b' ' | b'\t' | b'\r' | b'\n' | b';' | b'{' => break,
+                        b'\\' => i += 2,
+                        b'$' if bytes.get(i + 1) == Some(&b'{') => i += 2,
+                        _ => i += 1,
+                    }
+                }
+                i = i.min(len);
+                tokens.push((
+                    String::from_utf8_lossy(&bytes[start..i]).into_owned(),
+                    start,
+                ));
+            }
         }
-        if word.is_empty() {
-            word_start = i;
-        }
-        word.push(c);
     }
-    if !word.is_empty() {
-        tokens.push((word, word_start));
-    }
-    tokens
+    Lexed { tokens, comments }
 }
 
 /// Finds every top-level `server { ... }` block in `content`, along with the
 /// `server_name` values declared directly inside it.
 fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
-    let mask = comment_mask(content);
-    let tokens = tokenize(content, &mask);
+    let tokens = lex(content).tokens;
 
     let mut stack: Vec<(usize, bool)> = Vec::new();
     let mut names_stack: Vec<Vec<String>> = Vec::new();
@@ -241,21 +264,342 @@ fn is_embeddable(pattern: &str) -> bool {
     !pattern.contains('"') && !pattern.ends_with('\\')
 }
 
-/// Joins the patterns in `patterns` that are safe to embed (see
-/// [`is_embeddable`]) into a single `|`-separated NGINX regex, or `None` if
-/// none remain — the same "nothing to block" case as an empty pattern list,
-/// which removes any existing sentinel block instead of writing an empty
-/// one.
-fn join_patterns(patterns: &[String]) -> Option<String> {
-    let safe: Vec<&str> = patterns
-        .iter()
-        .map(String::as_str)
-        .filter(|p| is_embeddable(p))
-        .collect();
-    (!safe.is_empty()).then(|| safe.join("|"))
+/// The fewest literal characters every match of a user-agent pattern must
+/// contain for it to be written at all.
+///
+/// Nothing in NGINX refuses a regex that matches every request, and the
+/// block turns away whatever it matches on every site at once. An empty
+/// key in ai.robots.txt, `accepted: [""]` in well-known-bots, a lone `|`
+/// line in the bad-bot list or `.*` from any of them all pass `nginx -t`
+/// and 403 every visitor. Three is below every real upstream entry (the
+/// shortest are tokens like `FDM` and `Y!J`) and above anything that
+/// cannot help matching half the web.
+const MIN_PATTERN_LITERALS: usize = 3;
+
+/// The longest single pattern this tool writes, in bytes. The longest in
+/// any upstream list is under 60; this is far above it and still well
+/// inside one [`MAX_PATTERN_CHUNK_LEN`] chunk, so no pattern ever needs a
+/// chunk of its own that NGINX's parameter limit could refuse.
+pub const MAX_PATTERN_LEN: usize = 1024;
+
+/// Why a user-agent pattern will not be written, if it will not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternProblem {
+    /// Empty, or only whitespace.
+    Empty,
+    /// A newline, tab or other control character — no real user agent has
+    /// one, and NGINX turns `\n`-style escapes into them anyway.
+    ControlCharacter,
+    /// See [`is_embeddable`].
+    NotEmbeddable,
+    /// Longer than [`MAX_PATTERN_LEN`].
+    TooLong,
+    /// Some way of matching it needs fewer than [`MIN_PATTERN_LITERALS`]
+    /// literal characters, or it has an empty alternative — it matches
+    /// (nearly) every user agent.
+    MatchesTooMuch,
+    /// A repeated group that itself repeats something, `(a+)+`: the shape
+    /// that makes a backtracking engine take exponential time per request.
+    Backtracks,
+    /// Unbalanced, or a construct (lookaround, `\x`, `\Q`, inline flags)
+    /// this check does not understand. Refused rather than guessed at.
+    Unchecked,
 }
 
-/// Maximum byte length of a single chunk [`chunk_pattern`] produces.
+impl std::fmt::Display for PatternProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PatternProblem::Empty => "it is empty",
+            PatternProblem::ControlCharacter => "it contains a control character",
+            PatternProblem::NotEmbeddable => "it contains a double quote or ends in a backslash",
+            PatternProblem::TooLong => "it is too long",
+            PatternProblem::MatchesTooMuch => "it would match (nearly) every user agent",
+            PatternProblem::Backtracks => "it nests one repetition inside another",
+            PatternProblem::Unchecked => "it is not a regex this tool can check",
+        })
+    }
+}
+
+/// Why `pattern` must not be joined into a sentinel block, or `None` when
+/// it is safe to.
+///
+/// **A structural check, not a regex engine.** Deciding whether a PCRE
+/// pattern matches every string needs one, and the `regex` crate would add
+/// about 1.5MB to a static musl binary for this one question. What is
+/// decidable by walking the pattern is enough: the fewest literal
+/// characters any match must contain. A pattern that can match with fewer
+/// than [`MIN_PATTERN_LITERALS`] is refused, and that covers the empty
+/// pattern, `.*`, `^`, `a?b?c?`, `(abc)?` and `Bot|.*` alike, because each
+/// has a way to match nearly nothing. It errs towards refusing: anything it
+/// does not understand is [`PatternProblem::Unchecked`].
+pub fn pattern_problem(pattern: &str) -> Option<PatternProblem> {
+    if pattern.trim().is_empty() {
+        return Some(PatternProblem::Empty);
+    }
+    if pattern.chars().any(char::is_control) {
+        return Some(PatternProblem::ControlCharacter);
+    }
+    if !is_embeddable(pattern) {
+        return Some(PatternProblem::NotEmbeddable);
+    }
+    if pattern.len() > MAX_PATTERN_LEN {
+        return Some(PatternProblem::TooLong);
+    }
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut shape = Shape {
+        chars: &chars,
+        pos: 0,
+    };
+    match shape.alternation(0) {
+        Err(problem) => Some(problem),
+        Ok(_) if shape.pos != chars.len() => Some(PatternProblem::Unchecked),
+        Ok(group) if group.min_literals < MIN_PATTERN_LITERALS => {
+            Some(PatternProblem::MatchesTooMuch)
+        }
+        Ok(_) => None,
+    }
+}
+
+/// Whether `pattern` may be joined into a sentinel block.
+pub fn is_usable_pattern(pattern: &str) -> bool {
+    pattern_problem(pattern).is_none()
+}
+
+/// What [`Shape`] learns about a stretch of pattern.
+struct Measured {
+    /// The fewest literal characters any match of it contains.
+    min_literals: usize,
+    /// Whether it contains a quantifier anywhere.
+    quantified: bool,
+}
+
+/// A recursive walk over a PCRE pattern, just deep enough for
+/// [`pattern_problem`].
+struct Shape<'a> {
+    chars: &'a [char],
+    pos: usize,
+}
+
+impl Shape<'_> {
+    /// Deep enough for any real pattern; a limit so a hostile one cannot
+    /// recurse without bound.
+    const MAX_DEPTH: usize = 16;
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    /// `a|b|c`, up to an unopened `)` or the end: the fewest literals of
+    /// any alternative, since a match only needs one.
+    fn alternation(&mut self, depth: usize) -> Result<Measured, PatternProblem> {
+        if depth > Self::MAX_DEPTH {
+            return Err(PatternProblem::Unchecked);
+        }
+        let mut min_literals = usize::MAX;
+        let mut quantified = false;
+        loop {
+            let branch = self.sequence(depth)?;
+            min_literals = min_literals.min(branch.min_literals);
+            quantified |= branch.quantified;
+            if self.peek() != Some('|') {
+                return Ok(Measured {
+                    min_literals,
+                    quantified,
+                });
+            }
+            self.pos += 1;
+        }
+    }
+
+    /// Atoms one after another, each with its quantifier. An empty one is
+    /// an empty alternative, which matches everything wherever it is.
+    fn sequence(&mut self, depth: usize) -> Result<Measured, PatternProblem> {
+        let start = self.pos;
+        let mut min_literals = 0usize;
+        let mut quantified = false;
+        while let Some(c) = self.peek() {
+            if c == '|' || c == ')' {
+                break;
+            }
+            let atom = self.atom(depth)?;
+            match self.quantifier() {
+                Some((min, repeats)) => {
+                    if repeats && atom.quantified {
+                        return Err(PatternProblem::Backtracks);
+                    }
+                    min_literals =
+                        min_literals.saturating_add(atom.min_literals.saturating_mul(min));
+                    quantified = true;
+                }
+                None => {
+                    min_literals = min_literals.saturating_add(atom.min_literals);
+                    quantified |= atom.quantified;
+                }
+            }
+        }
+        if self.pos == start {
+            return Err(PatternProblem::MatchesTooMuch);
+        }
+        Ok(Measured {
+            min_literals,
+            quantified,
+        })
+    }
+
+    fn atom(&mut self, depth: usize) -> Result<Measured, PatternProblem> {
+        let literal = |n| Measured {
+            min_literals: n,
+            quantified: false,
+        };
+        let c = self.peek().ok_or(PatternProblem::Unchecked)?;
+        self.pos += 1;
+        match c {
+            '(' => {
+                // `(?:` is the only `(?` form upstream lists use; the rest
+                // (lookaround, flags, named groups) are refused.
+                if self.peek() == Some('?') {
+                    if self.chars.get(self.pos + 1) != Some(&':') {
+                        return Err(PatternProblem::Unchecked);
+                    }
+                    self.pos += 2;
+                }
+                let inner = self.alternation(depth + 1)?;
+                if self.peek() != Some(')') {
+                    return Err(PatternProblem::Unchecked);
+                }
+                self.pos += 1;
+                Ok(inner)
+            }
+            '[' => {
+                let start = self.pos;
+                self.class()?;
+                // `[Tt]` is how upstream spells one letter in either case
+                // (`i[Tt][Mm][Ss]`), and the match is case-insensitive
+                // anyway, so it counts as the literal it is.
+                let members = &self.chars[start..self.pos - 1];
+                let one_letter = matches!(members, [a, b] if a.is_alphabetic() && a.to_lowercase().eq(b.to_lowercase()));
+                Ok(literal(usize::from(one_letter)))
+            }
+            '\\' => {
+                let escaped = self.peek().ok_or(PatternProblem::Unchecked)?;
+                self.pos += 1;
+                match escaped {
+                    // Anchors and character types: they match, but not a
+                    // literal character.
+                    'b' | 'B' | 'A' | 'z' | 'Z' | 'G' | 'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'h'
+                    | 'H' | 'v' | 'V' => Ok(literal(0)),
+                    // `\x41`, `\p{..}`, `\Q..\E`, back-references: each
+                    // would need its own parsing to count honestly.
+                    c if c.is_ascii_alphanumeric() => Err(PatternProblem::Unchecked),
+                    _ => Ok(literal(1)),
+                }
+            }
+            '.' | '^' | '$' => Ok(literal(0)),
+            // A quantifier with nothing to repeat.
+            '*' | '+' | '?' => Err(PatternProblem::Unchecked),
+            // A `{` is a literal unless it reads as a quantifier, which
+            // here would have nothing to repeat.
+            '{' => {
+                self.pos -= 1;
+                if self.braces().is_some() {
+                    return Err(PatternProblem::Unchecked);
+                }
+                self.pos += 1;
+                Ok(literal(1))
+            }
+            _ => Ok(literal(1)),
+        }
+    }
+
+    /// Skips a `[...]` class, already past its `[`.
+    fn class(&mut self) -> Result<(), PatternProblem> {
+        if self.peek() == Some('^') {
+            self.pos += 1;
+        }
+        // A `]` straight after the opening is a literal member.
+        if self.peek() == Some(']') {
+            self.pos += 1;
+        }
+        loop {
+            match self.peek().ok_or(PatternProblem::Unchecked)? {
+                ']' => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                '\\' => self.pos += 2,
+                '[' if self.chars.get(self.pos + 1) == Some(&':') => {
+                    // `[:alpha:]`: its `]` does not close the class.
+                    let rest = &self.chars[self.pos..];
+                    let close = rest
+                        .windows(2)
+                        .position(|w| w == [':', ']'])
+                        .ok_or(PatternProblem::Unchecked)?;
+                    self.pos += close + 2;
+                }
+                _ => self.pos += 1,
+            }
+        }
+    }
+
+    /// A quantifier at the current position, as `(minimum count, whether
+    /// it can repeat)`, consuming it and any lazy or possessive suffix. A
+    /// `{` that is not a valid quantifier is a literal in PCRE, and `None`.
+    fn quantifier(&mut self) -> Option<(usize, bool)> {
+        let found = match self.peek()? {
+            '{' => self.braces()?,
+            symbol => {
+                let found = match symbol {
+                    '?' => (0, false),
+                    '*' => (0, true),
+                    '+' => (1, true),
+                    _ => return None,
+                };
+                self.pos += 1;
+                found
+            }
+        };
+        if matches!(self.peek(), Some('?' | '+')) {
+            self.pos += 1;
+        }
+        Some(found)
+    }
+
+    /// `{n}`, `{n,}` or `{n,m}` at the current position, consumed. Leaves
+    /// the position alone if what is there is not one.
+    fn braces(&mut self) -> Option<(usize, bool)> {
+        let rest: String = self.chars[self.pos..].iter().take(16).collect();
+        let body = rest.strip_prefix('{')?.split('}').next()?;
+        if body.len() + 2 > rest.len() {
+            return None;
+        }
+        let (min, max) = match body.split_once(',') {
+            None => (body, Some(body)),
+            Some((min, "")) => (min, None),
+            Some((min, max)) => (min, Some(max)),
+        };
+        let min: usize = min.parse().ok()?;
+        let max: Option<usize> = match max {
+            Some(max) => Some(max.parse().ok()?),
+            None => None,
+        };
+        self.pos += body.chars().count() + 2;
+        Some((min, max.is_none_or(|max| max > 1)))
+    }
+}
+
+/// The patterns in `patterns` that are safe to write (see
+/// [`pattern_problem`]), in order. Empty is the same "nothing to block" case
+/// as an empty list, which removes any existing sentinel block instead of
+/// writing an empty one.
+fn usable_patterns(patterns: &[String]) -> Vec<&str> {
+    patterns
+        .iter()
+        .map(String::as_str)
+        .filter(|p| is_usable_pattern(p))
+        .collect()
+}
+
+/// Maximum byte length of a single chunk [`chunk_patterns`] produces.
 ///
 /// NGINX's config-file parser has a hard ceiling on the length of a single
 /// quoted parameter — confirmed empirically against a real `nginx -t`:
@@ -273,23 +617,33 @@ fn join_patterns(patterns: &[String]) -> Option<String> {
 /// preceding file content).
 const MAX_PATTERN_CHUNK_LEN: usize = 2000;
 
-/// Splits `full` (a `|`-joined NGINX regex, as produced by [`join_patterns`])
-/// into pieces of at most `max_len` bytes each, splitting only on `|`
-/// boundaries so no individual alternative is ever cut in half. A single
-/// alternative longer than `max_len` on its own still becomes its own
-/// (oversized) chunk rather than being dropped or truncated — better to
-/// risk that rare case than silently stop blocking a legitimate pattern.
-fn chunk_pattern(full: &str, max_len: usize) -> Vec<String> {
+/// Joins `patterns` with `|` into pieces of at most `max_len` bytes each,
+/// **never splitting a pattern**. A single pattern longer than `max_len`
+/// becomes its own oversized chunk rather than being dropped or cut.
+///
+/// This used to join everything first and then split the result on every
+/// `|` — including the `|` of an escaped `\|` and the ones inside a
+/// `(a|b)` group. A chunk could then end in the backslash of `\|`, which
+/// escapes the closing quote of `if ($http_user_agent ~* "...")`, and NGINX
+/// read the start of the next chunk as directives. Verified with a real
+/// `nginx -t`: a line in a downloaded bot list could put an `include` into
+/// a config that root loads, unattended, from cron.
+///
+/// Every chunk is checked again as it is built, and a pattern that would
+/// make one unsafe is left out rather than written: the only safe failure
+/// for a string that is about to become config is to not write it.
+fn chunk_patterns(patterns: &[&str], max_len: usize) -> Vec<String> {
     let mut chunks: Vec<String> = Vec::new();
-    for part in full.split('|') {
+    for pattern in patterns.iter().filter(|p| is_embeddable(p)) {
         match chunks.last_mut() {
-            Some(last) if last.len() + 1 + part.len() <= max_len => {
+            Some(last) if last.len() + 1 + pattern.len() <= max_len => {
                 last.push('|');
-                last.push_str(part);
+                last.push_str(pattern);
             }
-            _ => chunks.push(part.to_string()),
+            _ => chunks.push(pattern.to_string()),
         }
     }
+    chunks.retain(|chunk| is_embeddable(chunk));
     chunks
 }
 
@@ -976,12 +1330,145 @@ pub fn remove_planned_managed_files(paths: &[PathBuf]) -> Result<usize> {
     Ok(removed)
 }
 
+/// Writes a file this project owns outright. Replaced, never written
+/// through — see [`write_atomically`].
 fn write_managed(path: &Path, body: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
-    fs::write(path, body).with_context(|| format!("failed to write {}", path.display()))
+    write_atomically(path, body.as_bytes(), 0o644, None)
+}
+
+/// Replaces `path` with `content`: a new file beside it, then a rename
+/// over it.
+///
+/// **A rename replaces a symlink; a write follows it.** Everything here
+/// runs as root, and on a host whose NGINX tree is a bind mount an
+/// unprivileged user may be able to create files in it. `fs::write` on a
+/// `conf.d/stop-bots-trusted.conf` they had made a link to `/etc/shadow`
+/// would have written our text there. The temporary file is created with
+/// `O_EXCL` under a random name, so a link planted at a guessed name makes
+/// the create fail rather than be followed. It is also what makes the
+/// write atomic: NGINX, or a reload that races us, sees the old file or
+/// the new one, never half of one.
+///
+/// A leading dot keeps the temporary file out of NGINX's own globs
+/// (`include sites-enabled/*`), which, like the shell's, skip dot files.
+fn write_atomically(
+    path: &Path,
+    content: &[u8],
+    mode: u32,
+    owner: Option<(u32, u32)>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let name = path
+        .file_name()
+        .with_context(|| format!("{} has no file name", path.display()))?
+        .to_string_lossy();
+    for _ in 0..8 {
+        let temp = path.with_file_name(format!(".{name}.stop-bots-{:016x}", random_u64()));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to write {}", path.display()))
+            }
+        };
+        let written = (|| -> std::io::Result<()> {
+            file.write_all(content)?;
+            if let Some((uid, gid)) = owner {
+                // Best effort: only root can give a file away, and a
+                // non-root run that got this far owns what it replaces.
+                let _ = std::os::unix::fs::fchown(&file, Some(uid), Some(gid));
+            }
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+            file.sync_all()?;
+            fs::rename(&temp, path)
+        })();
+        if let Err(err) = written {
+            let _ = fs::remove_file(&temp);
+            return Err(err).with_context(|| format!("failed to write {}", path.display()));
+        }
+        return Ok(());
+    }
+    anyhow::bail!(
+        "failed to write {}: could not create a temporary file beside it",
+        path.display()
+    )
+}
+
+/// Unpredictable enough for a temporary file name, without a dependency:
+/// std seeds every `RandomState` from the OS.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    hasher.finish()
+}
+
+/// Where an operator's site file really is: `path` itself, or, when a
+/// symlink is involved, its target — which must be inside `root`.
+///
+/// Site files are legitimately links (`sites-enabled/x` to
+/// `../sites-available/x`), so a link is followed rather than replaced.
+/// But the same writable-tree case [`write_atomically`] is about applies:
+/// a link to a file outside the NGINX config is not one this tool was
+/// pointed at, and root rewriting whatever `server {` block it finds there
+/// is exactly what the link was planted for.
+fn resolve_site_file(path: &Path, root: &Path) -> Result<PathBuf> {
+    let resolved =
+        fs::canonicalize(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let as_given = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if resolved == as_given {
+        return Ok(resolved);
+    }
+    let root = fs::canonicalize(root)
+        .with_context(|| format!("failed to read the NGINX root {}", root.display()))?;
+    if !resolved.starts_with(&root) {
+        anyhow::bail!(
+            "refusing to write {}: it links to {}, outside the NGINX root {}",
+            path.display(),
+            resolved.display(),
+            root.display()
+        );
+    }
+    Ok(resolved)
+}
+
+/// Writes an operator's site file in place of `path`, following a link to
+/// it (see [`resolve_site_file`]) and keeping its mode and owner.
+///
+/// A file the operator made read-only stays unwritten: a rename would
+/// replace it regardless of its permission bits, which is not what
+/// `chmod 444` was asking for — and running without root is reported as
+/// the permission error it is.
+fn write_site_file(path: &Path, root: &Path, content: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let resolved = resolve_site_file(path, root)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&resolved)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    let meta = fs::metadata(&resolved)
+        .with_context(|| format!("failed to read {}", resolved.display()))?;
+    write_atomically(
+        &resolved,
+        content.as_bytes(),
+        meta.mode() & 0o7777,
+        Some((meta.uid(), meta.gid())),
+    )
 }
 
 /// Removes a generated file, treating "already gone" as success.
@@ -1055,11 +1542,11 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
 
 /// Renders the sentinel block content (without surrounding blank lines) for
 /// `config`, or `None` when there's nothing to block — an empty pattern
-/// list, or one whose every entry [`is_embeddable`] rejects. `None` is what
+/// list, or one whose every entry [`pattern_problem`] rejects. `None` is what
 /// makes [`apply_block`] *remove* an existing block rather than write an
 /// empty one.
 ///
-/// The pattern is split (via [`chunk_pattern`]) into one `if` statement per
+/// The patterns are split (via [`chunk_patterns`]) into one `if` statement per
 /// chunk when it's long enough to need it. Multiple sequential
 /// `if ($http_user_agent ~* "...") { return <code>; }` statements are
 /// equivalent to one big alternation — whichever fires first returns — so
@@ -1067,7 +1554,8 @@ pub fn default_block_config(db: &crate::db::Db) -> Result<BlockConfig> {
 /// written, and a pattern short enough for one chunk renders as a single
 /// `if`.
 fn block_text(config: &BlockConfig) -> Option<String> {
-    let pattern = join_patterns(&config.patterns);
+    let chunks = chunk_patterns(&usable_patterns(&config.patterns), MAX_PATTERN_CHUNK_LEN);
+    let pattern = (!chunks.is_empty()).then_some(chunks);
     // Nothing to block and nothing to serve means no block at all, which
     // is what makes `apply_block` *remove* an existing one. Note this is
     // not "no patterns" alone: robots.txt, rate limiting and HTTP/1.x
@@ -1082,7 +1570,8 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         return None;
     }
     let code = config.response.status_code();
-    let exemptions = exemption_regex(&effective_exempt_paths(config));
+    let (prefixes, exact) = effective_exempt_paths(config);
+    let exemptions = exemption_regex(&prefixes, exact);
 
     let mut out = format!("    {BLOCK_BEGIN}\n");
 
@@ -1142,8 +1631,8 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         format!("{throttle}return {code};\n    }}\n")
     };
 
-    if let Some(pattern) = &pattern {
-        for chunk in chunk_pattern(pattern, MAX_PATTERN_CHUNK_LEN) {
+    if let Some(chunks) = &pattern {
+        for chunk in chunks {
             out.push_str(&format!(
                 "    if ($http_user_agent ~* \"{chunk}\") {{\n        {set_blocked}"
             ));
@@ -1157,7 +1646,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     }
     if let Some(exemptions) = &exemptions {
         out.push_str(&format!(
-            "    if ($request_uri ~* \"{exemptions}\") {{\n        set $stop_bots_block 0;\n    }}\n"
+            "    if ($uri ~* \"{exemptions}\") {{\n        set $stop_bots_block 0;\n    }}\n"
         ));
     }
     out.push_str(&agent_clears);
@@ -1209,8 +1698,9 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     Some(out)
 }
 
-/// The exemptions actually applied: the site's configured ones, plus
-/// `/robots.txt` itself whenever this block serves it.
+/// The exemptions actually applied, as `(prefixes, exact paths)`: the
+/// site's configured prefixes, plus `/robots.txt` itself — exactly that
+/// file, not everything under it — whenever this block serves it.
 ///
 /// That addition is not a convenience, it's what makes robots.txt work at
 /// all. Server-level `if`/`return` run in NGINX's **server rewrite
@@ -1224,11 +1714,13 @@ fn block_text(config: &BlockConfig) -> Option<String> {
 /// wanting on its own: a bot that can fetch the file can learn to stop
 /// asking, whereas one that gets a bare 403 on everything learns nothing
 /// and keeps coming back. Serving it costs a single small static file.
-fn effective_exempt_paths(config: &BlockConfig) -> Vec<String> {
+fn effective_exempt_paths(config: &BlockConfig) -> (Vec<String>, &'static [&'static str]) {
     let mut paths = config.exempt_paths.clone();
-    if config.serve_robots_txt {
-        paths.push("/robots.txt".to_string());
-    }
+    let exact: &[&str] = if config.serve_robots_txt {
+        &["/robots.txt"]
+    } else {
+        &[]
+    };
     if !config.request_rules.is_empty() {
         // Never optional, and never surfaced as a setting to switch off.
         // `/.well-known/` is where ACME HTTP-01 validation is fetched
@@ -1240,7 +1732,7 @@ fn effective_exempt_paths(config: &BlockConfig) -> Vec<String> {
         // negotiate HTTP/2 either.
         paths.push("/.well-known/".to_string());
     }
-    paths
+    (paths, exact)
 }
 
 /// Narrows a site's config to what is actually safe to emit into *this*
@@ -1273,21 +1765,35 @@ fn for_block(config: &BlockConfig, block: &ServerBlock) -> BlockConfig {
     }
 }
 
-/// Builds the `$request_uri` regex that clears the block flag, or `None`
-/// when there are no usable exemptions.
+/// Builds the `$uri` regex that clears the block flag, or `None` when
+/// there are no usable exemptions: `prefixes` match anything under them,
+/// `exact` only themselves.
 ///
-/// Anchored with `^` and alternated, so `/blog` exempts `/blog`,
-/// `/blog/post` and `/blog?x=1` but not `/notablog`. Each path is
-/// regex-escaped: these are literal URL prefixes typed by an admin, not
-/// hand-written regex, and an unescaped `.` or `?` in one would quietly
-/// widen the exemption far beyond what was asked for — which, unlike a
-/// too-narrow pattern, fails *open*.
-fn exemption_regex(paths: &[String]) -> Option<String> {
-    let escaped: Vec<String> = paths
+/// Anchored with `^` and alternated, so `/blog` exempts `/blog` and
+/// `/blog/post` but not `/notablog`. Each path is regex-escaped: these are
+/// literal URL prefixes typed by an admin, not hand-written regex, and an
+/// unescaped `.` or `?` in one would quietly widen the exemption far
+/// beyond what was asked for — which, unlike a too-narrow pattern, fails
+/// *open*.
+///
+/// Matched against `$uri`, never `$request_uri`, for the reason
+/// [`agent_exemption_clears`] gives: the raw request line is not the path
+/// NGINX serves, and `/robots.txt/../wp-login.php` begins with an exempt
+/// prefix while resolving to a blocked one.
+fn exemption_regex(prefixes: &[String], exact: &[&str]) -> Option<String> {
+    let usable = |p: &&str| p.starts_with('/') && is_embeddable(p);
+    let escaped: Vec<String> = prefixes
         .iter()
-        .filter(|p| p.starts_with('/'))
-        .filter(|p| is_embeddable(p))
-        .map(|p| crate::db::escape_for_nginx_regex(p))
+        .map(String::as_str)
+        .filter(usable)
+        .map(crate::db::escape_for_nginx_regex)
+        .chain(
+            exact
+                .iter()
+                .copied()
+                .filter(usable)
+                .map(|p| format!("{}$", crate::db::escape_for_nginx_regex(p))),
+        )
         .collect();
     (!escaped.is_empty()).then(|| format!("^({})", escaped.join("|")))
 }
@@ -1309,13 +1815,13 @@ fn exemption_regex(paths: &[String]) -> Option<String> {
 /// holding the path by one group's user agent would otherwise let the next
 /// group's paths through for a client that never matched it.
 ///
-/// `$uri`, not the `$request_uri` the plain exemptions read. `$uri` has had
+/// `$uri`, not `$request_uri`, like the plain exemptions. `$uri` has had
 /// `..` and `//` resolved and is decoded, so `/remote.php/dav/../../login`
 /// is `/login` and matches nothing here; `$request_uri` is the raw request
 /// line, where that same string starts with the exempt prefix while the
-/// application behind the proxy resolves it to somewhere else. For a clear
-/// scoped to one client that is the whole point, so it is not given the
-/// raw form.
+/// application behind the proxy resolves it to somewhere else. The plain
+/// exemptions read `$request_uri` too until the same bypass was found
+/// there.
 ///
 /// The user agent is matched as an escaped, case-insensitive substring,
 /// the same as a trusted one, and filtered again here rather than trusting
@@ -1331,7 +1837,7 @@ fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
             continue;
         }
         let paths: Vec<String> = group.iter().map(|e| e.path.clone()).collect();
-        let Some(paths) = exemption_regex(&paths) else {
+        let Some(paths) = exemption_regex(&paths, &[]) else {
             continue;
         };
         out.push_str(&format!(
@@ -1344,18 +1850,36 @@ fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
 /// Finds the byte range of an existing sentinel block's lines within
 /// `block`, if one is already present.
 fn locate_existing_block(content: &str, block: &ServerBlock) -> Option<(usize, usize)> {
-    let region = &content[block.open..block.close];
-    let begin_rel = region.find(BLOCK_BEGIN)?;
-    let begin_abs = block.open + begin_rel;
-    let line_start = content[..begin_abs].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    locate_marked(content, block, BLOCK_BEGIN, BLOCK_END)
+}
 
-    let end_rel = region[begin_rel..].find(BLOCK_END)?;
-    let end_marker_abs = begin_abs + end_rel + BLOCK_END.len();
-    let line_end = content[end_marker_abs..]
+/// The whole lines from a `begin` marker comment to the next `end` marker
+/// comment inside `block`.
+///
+/// Markers are matched only as real comments, as [`lex`] finds them, and
+/// only when the comment is exactly the marker. A text search found them
+/// anywhere, including inside a quoted bot pattern: `# END stop-bots` in a
+/// hand-blocked user agent ended the block half way through its first
+/// `if`, and every later run left another copy behind.
+fn locate_marked(
+    content: &str,
+    block: &ServerBlock,
+    begin: &str,
+    end: &str,
+) -> Option<(usize, usize)> {
+    let comments: Vec<(usize, usize)> = lex(content)
+        .comments
+        .into_iter()
+        .filter(|&(start, _)| start > block.open && start < block.close)
+        .collect();
+    let is =
+        |&(start, stop): &(usize, usize), marker: &str| content[start..stop].trim_end() == marker;
+    let begin_at = comments.iter().find(|c| is(c, begin))?.0;
+    let end_at = comments.iter().find(|c| c.0 > begin_at && is(c, end))?.1;
+    let line_start = content[..begin_at].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = content[end_at..]
         .find('\n')
-        .map(|i| end_marker_abs + i + 1)
-        .unwrap_or(content.len());
-
+        .map_or(content.len(), |i| end_at + i + 1);
     Some((line_start, line_end))
 }
 
@@ -1526,18 +2050,7 @@ fn with_console_location(
 
 /// [`locate_existing_block`] for the console markers.
 fn locate_console_block(content: &str, block: &ServerBlock) -> Option<(usize, usize)> {
-    let region = &content[block.open..block.close];
-    let begin_rel = region.find(CONSOLE_BEGIN)?;
-    let begin_abs = block.open + begin_rel;
-    let line_start = content[..begin_abs].rfind('\n').map(|i| i + 1).unwrap_or(0);
-
-    let end_rel = region[begin_rel..].find(CONSOLE_END)?;
-    let end_marker_abs = begin_abs + end_rel + CONSOLE_END.len();
-    let line_end = content[end_marker_abs..]
-        .find('\n')
-        .map(|i| end_marker_abs + i + 1)
-        .unwrap_or(content.len());
-    Some((line_start, line_end))
+    locate_marked(content, block, CONSOLE_BEGIN, CONSOLE_END)
 }
 
 /// Writes `content` to `path`, validates the whole NGINX config, and puts
@@ -1662,8 +2175,12 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
 /// plus the real port-443 block for the same site) resolve to the same
 /// `site_configs` entry and so still get the same rule; two blocks with
 /// *different* names in the same file now correctly get independent rules.
+///
+/// `root` is the NGINX config root: a `config_path` that is a symlink is
+/// written through only to a target inside it (see [`write_site_file`]).
 pub fn apply_blocks_to_file(
     config_path: &Path,
+    root: &Path,
     site_configs: &[(String, BlockConfig)],
     default_config: &BlockConfig,
 ) -> Result<bool> {
@@ -1682,7 +2199,7 @@ pub fn apply_blocks_to_file(
     let mut changed = false;
     for i in 0..block_count {
         let blocks = parse_server_blocks(&content);
-        let block = &blocks[i];
+        let block = nth_block(&blocks, i, block_count, config_path)?;
         let config = block
             .names
             .first()
@@ -1699,9 +2216,31 @@ pub fn apply_blocks_to_file(
     if !changed {
         return Ok(false);
     }
-    fs::write(config_path, &content)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    write_site_file(config_path, root, &content)?;
     Ok(true)
+}
+
+/// Block `i` of `blocks`, which must still number `expected`.
+///
+/// Re-parsing between edits relies on an edit never adding or removing a
+/// `server` block. The sentinel block only holds quoted text and
+/// `location`s, so it cannot, unless the reader and NGINX disagree about
+/// where a quoted string ends — which is how a bot pattern once turned
+/// into a second `server` block. Refusing is the safe answer if they ever
+/// disagree again.
+fn nth_block<'a>(
+    blocks: &'a [ServerBlock],
+    i: usize,
+    expected: usize,
+    config_path: &Path,
+) -> Result<&'a ServerBlock> {
+    if blocks.len() != expected {
+        anyhow::bail!(
+            "refusing to write {}: editing it changed how many server blocks it has",
+            config_path.display()
+        );
+    }
+    Ok(&blocks[i])
 }
 
 /// Whether a site's on-disk config currently matches the blocking rule
@@ -1805,9 +2344,10 @@ pub fn site_apply_status(
 /// `default_config`. This backs the TUI's per-site "Apply now" action:
 /// applying one site's overrides must never silently rewrite an unrelated
 /// site sharing the same file. Returns whether the file was actually
-/// changed on disk.
+/// changed on disk. `root` is as for [`apply_blocks_to_file`].
 pub fn apply_block_for_site(
     config_path: &Path,
+    root: &Path,
     server_name: &str,
     config: &BlockConfig,
 ) -> Result<bool> {
@@ -1821,7 +2361,7 @@ pub fn apply_block_for_site(
     let mut changed = false;
     for i in 0..block_count {
         let blocks = parse_server_blocks(&content);
-        let block = &blocks[i];
+        let block = nth_block(&blocks, i, block_count, config_path)?;
         if block.names.first().map(String::as_str) != Some(server_name) {
             continue;
         }
@@ -1835,12 +2375,11 @@ pub fn apply_block_for_site(
     if !changed {
         return Ok(false);
     }
-    fs::write(config_path, &content)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    write_site_file(config_path, root, &content)?;
     Ok(true)
 }
 
-/// What [`apply_all_sites`] did.
+/// What [`apply_all_sites_and_reload`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyAllOutcome {
     pub sites: usize,
@@ -1849,26 +2388,73 @@ pub struct ApplyAllOutcome {
     /// file, the rate-limit zone) included. Zero means NGINX has nothing
     /// new to read, so there is no point reloading it.
     pub changed: usize,
+    /// Whether the new config passed the test and NGINX was reloaded.
+    pub reloaded: bool,
 }
 
 /// Applies the current blocking policy to every site discovered under
-/// `root`, writing the generated files it needs and cleaning up the ones it
-/// no longer does. Does **not** reload NGINX — the caller decides that,
-/// since it is the step with a side effect outside this project's files.
+/// `root`, and — given `commands` — tests the result and reloads NGINX.
+/// The one way every front-end applies everything.
 ///
-/// Lives here rather than in `main.rs` because both the `apply-blocks`
-/// subcommand and `crate::batch` need it, and the ordering below is
-/// load-bearing enough that a second copy would be a bug waiting to
-/// happen: generated files are written *before* any config that aliases
-/// them, and unreferenced ones are deleted only *after* every config has
-/// been rewritten (see [`remove_unused_managed_files`]).
-pub fn apply_all_sites(db: &crate::db::Db, root: &Path) -> Result<ApplyAllOutcome> {
+/// **A config that fails the test is put back.** Every file the apply may
+/// touch is read first ([`Snapshot`]); if the test then fails, each is
+/// restored byte for byte and each generated file this apply created is
+/// removed, before the error is returned. Writing and leaving it was
+/// survivable only in appearance: the running NGINX keeps serving the old
+/// config from memory, and the broken one is loaded by whatever reloads
+/// next — certbot's renewal hook at 3am, or a reboot — taking every site
+/// down together. A write that fails half way is put back the same way.
+///
+/// `None` writes without testing or reloading: `--no-reload` and
+/// `--no-apply`, for a host whose NGINX this process must not touch.
+pub fn apply_all_sites_and_reload(
+    db: &crate::db::Db,
+    root: &Path,
+    commands: Option<&NginxCommands>,
+) -> Result<ApplyAllOutcome> {
+    let sites = discover_sites(root)?;
+    let generated = planned_managed_files(db, root)?
+        .into_iter()
+        .map(|(path, _)| path)
+        .chain(unused_managed_files(db, root)?);
+    let snapshot = Snapshot::of_apply(
+        root,
+        generated,
+        sites.iter().map(|site| site.config_path.as_path()),
+    )?;
+
+    let outcome = match apply_all_sites(db, root, &sites) {
+        Ok(outcome) => outcome,
+        Err(err) => return Err(snapshot.restore_after(err)),
+    };
+    let Some(commands) = commands.filter(|_| outcome.changed > 0) else {
+        return Ok(outcome);
+    };
+    test_or_restore(&snapshot, commands)?;
+    run(&commands.reload, "the NGINX reload")
+        .context("the new config passed the test, but the reload failed")?;
+    Ok(ApplyAllOutcome {
+        reloaded: true,
+        ..outcome
+    })
+}
+
+/// The writing half of [`apply_all_sites_and_reload`].
+///
+/// The ordering below is load-bearing: generated files are written
+/// *before* any config that aliases them, and unreferenced ones are
+/// deleted only *after* every config has been rewritten (see
+/// [`remove_unused_managed_files`]).
+fn apply_all_sites(
+    db: &crate::db::Db,
+    root: &Path,
+    sites: &[DiscoveredSite],
+) -> Result<ApplyAllOutcome> {
     let mut changed = write_managed_files(db, root)?;
     let default_config = default_block_config(db)?;
     // Sites already known to the db (i.e. previously scanned) — the only
     // ones that can carry a per-site override at all.
     let known_sites = db.list_sites()?;
-    let sites = discover_sites(root)?;
 
     // A single config file commonly holds multiple `server` blocks for the
     // same site (e.g. an HTTP redirect block plus the HTTPS one), so dedupe
@@ -1892,7 +2478,7 @@ pub fn apply_all_sites(db: &crate::db::Db, root: &Path) -> Result<ApplyAllOutcom
             .filter(|s| Path::new(&s.config_path) == path.as_path())
             .map(|s| Ok((s.server_name.clone(), block_config_for_site(db, s.id)?)))
             .collect::<Result<_>>()?;
-        if apply_blocks_to_file(path, &site_configs, &default_config)? {
+        if apply_blocks_to_file(path, root, &site_configs, &default_config)? {
             changed += 1;
         }
     }
@@ -1905,7 +2491,149 @@ pub fn apply_all_sites(db: &crate::db::Db, root: &Path) -> Result<ApplyAllOutcom
         sites: sites.len(),
         files: config_paths.len(),
         changed,
+        reloaded: false,
     })
+}
+
+/// Applies one site's policy — its file and the generated files it reads —
+/// and, given `commands`, tests and reloads the way
+/// [`apply_all_sites_and_reload`] does. Returns the site's name and
+/// whether anything changed.
+pub fn apply_site_and_reload(
+    db: &crate::db::Db,
+    root: &Path,
+    site: &crate::db::Site,
+    commands: Option<&NginxCommands>,
+) -> Result<(bool, bool)> {
+    let managed = planned_managed_files(db, root)?;
+    let config_path = Path::new(&site.config_path);
+    let snapshot = Snapshot::of_apply(
+        root,
+        managed.iter().map(|(path, _)| path.clone()),
+        [config_path],
+    )?;
+
+    let written = (|| -> Result<bool> {
+        let managed_changed = write_planned_managed_files(&managed)?;
+        let config = block_config_for_site(db, site.id)?;
+        let site_changed = apply_block_for_site(config_path, root, &site.server_name, &config)?;
+        Ok(managed_changed > 0 || site_changed)
+    })();
+    let changed = match written {
+        Ok(changed) => changed,
+        Err(err) => return Err(snapshot.restore_after(err)),
+    };
+    let Some(commands) = commands.filter(|_| changed) else {
+        return Ok((changed, false));
+    };
+    test_or_restore(&snapshot, commands)?;
+    run(&commands.reload, "the NGINX reload")
+        .context("the new config passed the test, but the reload failed")?;
+    Ok((changed, true))
+}
+
+/// Every file an apply may touch, as it was before the apply began, so
+/// that a config NGINX rejects can be taken back.
+///
+/// Holds the bytes and the mode of each regular file, and "absent" for
+/// anything else — so restoring removes a file the apply created. A
+/// symlink counts as absent: the writes here replace a link rather than
+/// following it (see [`write_atomically`]), and putting a planted one back
+/// would put back the thing that was planted.
+pub struct Snapshot {
+    files: Vec<(PathBuf, Option<Held>)>,
+}
+
+/// A regular file's contents and permission bits, as [`Snapshot`] found
+/// them: `(bytes, mode)`.
+type Held = (Vec<u8>, u32);
+
+impl Snapshot {
+    /// Reads every file in `paths`. Fails if one exists and cannot be
+    /// read, because an apply that could not be undone should not start.
+    pub fn take(paths: impl IntoIterator<Item = PathBuf>) -> Result<Snapshot> {
+        use std::os::unix::fs::PermissionsExt;
+        let mut files = Vec::new();
+        for path in paths {
+            if files.iter().any(|(seen, _)| seen == &path) {
+                continue;
+            }
+            let before = match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() => {
+                    let bytes = fs::read(&path)
+                        .with_context(|| format!("failed to read {}", path.display()))?;
+                    Some((bytes, meta.permissions().mode() & 0o7777))
+                }
+                Ok(_) => None,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("failed to read {}", path.display()))
+                }
+            };
+            files.push((path, before));
+        }
+        Ok(Snapshot { files })
+    }
+
+    /// A snapshot of what an apply under `root` may touch: `generated`
+    /// files at their own paths, and each of `site_files` where it really
+    /// is, which is where [`write_site_file`] will write it. A site file
+    /// that cannot be resolved is left out; its write will fail with the
+    /// same error, and that failure is what undoes the apply.
+    pub fn of_apply<'a>(
+        root: &Path,
+        generated: impl IntoIterator<Item = PathBuf>,
+        site_files: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<Snapshot> {
+        Snapshot::take(
+            generated.into_iter().chain(
+                site_files
+                    .into_iter()
+                    .filter_map(|path| resolve_site_file(path, root).ok()),
+            ),
+        )
+    }
+
+    /// Puts every file back as it was. Carries on past a failure, so one
+    /// stuck file does not leave the rest half restored, and names each
+    /// one that could not be.
+    pub fn restore(&self) -> Result<()> {
+        let mut failed = Vec::new();
+        for (path, before) in &self.files {
+            let restored = match before {
+                Some((bytes, _)) if fs::read(path).ok().as_ref() == Some(bytes) => Ok(()),
+                Some((bytes, mode)) => write_atomically(path, bytes, *mode, None),
+                None => match fs::symlink_metadata(path) {
+                    Ok(meta) if meta.is_file() => fs::remove_file(path)
+                        .with_context(|| format!("failed to remove {}", path.display())),
+                    _ => Ok(()),
+                },
+            };
+            if let Err(err) = restored {
+                failed.push(format!("{err:#}"));
+            }
+        }
+        if !failed.is_empty() {
+            anyhow::bail!("{}", failed.join("; "));
+        }
+        Ok(())
+    }
+
+    /// `err`, with whether the restore that follows it worked.
+    fn restore_after(&self, err: anyhow::Error) -> anyhow::Error {
+        match self.restore() {
+            Ok(()) => err.context("nothing was applied: every file it changed was put back"),
+            Err(restore) => err.context(format!(
+                "AND PUTTING THE PREVIOUS FILES BACK FAILED, fix these by hand: {restore:#}"
+            )),
+        }
+    }
+}
+
+/// Runs the configured test against what was just written, and on a
+/// failure puts back everything `snapshot` holds before reporting.
+pub fn test_or_restore(snapshot: &Snapshot, commands: &NginxCommands) -> Result<()> {
+    test_config(commands).map_err(|err| snapshot.restore_after(err))
 }
 
 /// How to test and reload NGINX.
@@ -2378,7 +3106,7 @@ mod tests {
         .unwrap();
 
         let config = cfg(&["BadBot", "EvilCrawler"]);
-        let changed = apply_blocks_to_file(&path, &[], &config).unwrap();
+        let changed = apply_blocks_to_file(&path, dir.path(), &[], &config).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -2388,7 +3116,7 @@ mod tests {
             "written was:\n{written}"
         );
 
-        let changed_again = apply_blocks_to_file(&path, &[], &config).unwrap();
+        let changed_again = apply_blocks_to_file(&path, dir.path(), &[], &config).unwrap();
         assert!(!changed_again);
     }
 
@@ -2398,7 +3126,7 @@ mod tests {
         let path = dir.path().join("nginx.conf");
         fs::write(&path, "events {}\nhttp {\n    include conf.d/*.conf;\n}\n").unwrap();
 
-        let changed = apply_blocks_to_file(&path, &[], &cfg(&["BadBot"])).unwrap();
+        let changed = apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
         assert!(!changed);
         assert!(!fs::read_to_string(&path).unwrap().contains(BLOCK_BEGIN));
     }
@@ -2417,7 +3145,7 @@ mod tests {
         )
         .unwrap();
 
-        let changed = apply_blocks_to_file(&path, &[], &cfg(&["BadBot"])).unwrap();
+        let changed = apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -2446,7 +3174,9 @@ mod tests {
             ("a.example".to_string(), cfg(&["OnlyOnA"])),
             ("b.example".to_string(), cfg(&["OnlyOnB"])),
         ];
-        let changed = apply_blocks_to_file(&path, &site_configs, &BlockConfig::default()).unwrap();
+        let changed =
+            apply_blocks_to_file(&path, dir.path(), &site_configs, &BlockConfig::default())
+                .unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -2471,7 +3201,8 @@ mod tests {
 
         // No entry for "unscanned.example" in site_patterns at all (as if
         // it was just discovered on disk but never scanned into the db).
-        let changed = apply_blocks_to_file(&path, &[], &cfg(&["GlobalDefaultBot"])).unwrap();
+        let changed =
+            apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["GlobalDefaultBot"])).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -2528,7 +3259,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &cfg(&["BadBot", "EvilBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot", "EvilBot"])).unwrap();
 
         let status = site_apply_status(
             &path,
@@ -2551,7 +3282,7 @@ mod tests {
             "server {\n    server_name a.example;\n    if ($http_user_agent ~* \"AdminBot\") { return 403; }\n}\n",
         )
         .unwrap();
-        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
 
         let status = site_apply_status(&path, "a.example", &cfg(&["BadBot"]), no_trust_file());
         assert_eq!(status, SiteApplyStatus::UpToDate);
@@ -2566,7 +3297,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &cfg(&["OldBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["OldBot"])).unwrap();
 
         let status = site_apply_status(&path, "a.example", &cfg(&["NewBot"]), no_trust_file());
         assert_eq!(status, SiteApplyStatus::Stale);
@@ -2583,7 +3314,8 @@ mod tests {
         )
         .unwrap();
 
-        let changed = apply_block_for_site(&path, "a.example", &cfg(&["OnlyOnA"])).unwrap();
+        let changed =
+            apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["OnlyOnA"])).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -2600,8 +3332,8 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        assert!(apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap());
-        assert!(!apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap());
+        assert!(apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap());
+        assert!(!apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap());
     }
 
     #[test]
@@ -2611,7 +3343,8 @@ mod tests {
         let original = "server {\n    server_name a.example;\n}\n";
         fs::write(&path, original).unwrap();
 
-        let changed = apply_block_for_site(&path, "unknown.example", &cfg(&["BadBot"])).unwrap();
+        let changed =
+            apply_block_for_site(&path, dir.path(), "unknown.example", &cfg(&["BadBot"])).unwrap();
         assert!(!changed);
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
@@ -2634,22 +3367,19 @@ mod tests {
     }
 
     #[test]
-    fn join_patterns_drops_only_the_unsafe_entries() {
+    fn usable_patterns_drops_only_the_unsafe_entries() {
         let patterns = vec![
             "GoodBot".to_string(),
             "Trailing\\".to_string(),
             "1h4x\\.com".to_string(),
         ];
-        assert_eq!(
-            join_patterns(&patterns).as_deref(),
-            Some("GoodBot|1h4x\\.com")
-        );
+        assert_eq!(usable_patterns(&patterns), ["GoodBot", "1h4x\\.com"]);
     }
 
     #[test]
-    fn join_patterns_is_none_when_every_pattern_is_unsafe() {
+    fn usable_patterns_is_empty_when_every_pattern_is_unsafe() {
         let patterns = vec!["Trailing\\".to_string(), "Quoted\"Bot".to_string()];
-        assert_eq!(join_patterns(&patterns), None);
+        assert!(usable_patterns(&patterns).is_empty());
     }
 
     /// Regression test for a real bug: a bot pattern ending in a backslash,
@@ -2669,7 +3399,7 @@ mod tests {
         .unwrap();
 
         let config = cfg(&["GoodBot", "TrailingBackslash\\"]);
-        apply_blocks_to_file(&path, &[], &config).unwrap();
+        apply_blocks_to_file(&path, dir.path(), &[], &config).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("GoodBot"), "written was:\n{written}");
@@ -2687,33 +3417,37 @@ mod tests {
     }
 
     #[test]
-    fn chunk_pattern_keeps_everything_in_one_chunk_when_it_fits() {
-        let chunks = chunk_pattern("A|B|C", 2000);
-        assert_eq!(chunks, vec!["A|B|C".to_string()]);
+    fn chunk_patterns_keeps_everything_in_one_chunk_when_it_fits() {
+        let chunks = chunk_patterns(&["AAA", "BBB", "CCC"], 2000);
+        assert_eq!(chunks, vec!["AAA|BBB|CCC".to_string()]);
     }
 
     #[test]
-    fn chunk_pattern_splits_only_on_pipe_boundaries_once_the_limit_is_hit() {
-        // Each part is 5 bytes ("AAAAA" etc, 4 chars + digit); a limit of 11
-        // fits exactly two parts plus their separator (5 + 1 + 5 = 11) but
-        // not three.
-        let full = "AAAA0|AAAA1|AAAA2|AAAA3";
-        let chunks = chunk_pattern(full, 11);
+    fn chunk_patterns_splits_only_between_patterns_once_the_limit_is_hit() {
+        // Each pattern is 5 bytes; a limit of 11 fits exactly two plus
+        // their separator (5 + 1 + 5 = 11) but not three.
+        let patterns = ["AAAA0", "AAAA1", "AAAA2", "AAAA3"];
+        let chunks = chunk_patterns(&patterns, 11);
         assert_eq!(
             chunks,
             vec!["AAAA0|AAAA1".to_string(), "AAAA2|AAAA3".to_string()]
         );
         // Rejoining every chunk with `|` must reconstruct the original,
-        // order preserved — this is the property `current_block_pattern`
-        // relies on to read a chunked block back correctly.
-        assert_eq!(chunks.join("|"), full);
+        // order preserved.
+        assert_eq!(chunks.join("|"), patterns.join("|"));
     }
 
     #[test]
-    fn chunk_pattern_gives_an_oversized_single_part_its_own_chunk_rather_than_dropping_it() {
+    fn chunk_patterns_gives_an_oversized_pattern_its_own_chunk_rather_than_dropping_it() {
         let huge = "x".repeat(50);
-        let chunks = chunk_pattern(&huge, 10);
-        assert_eq!(chunks, vec![huge]);
+        let chunks = chunk_patterns(&["AAA", &huge, "BBB"], 10);
+        assert_eq!(chunks, ["AAA", huge.as_str(), "BBB"]);
+    }
+
+    #[test]
+    fn chunk_patterns_never_emits_an_unsafe_chunk() {
+        let chunks = chunk_patterns(&["AAA", "Evil\\", "Evil\"Bot", "BBB"], 2000);
+        assert_eq!(chunks, ["AAA|BBB"]);
     }
 
     /// Regression test for the real bug: NGINX's config parser rejects any
@@ -2736,7 +3470,7 @@ mod tests {
         // Comfortably more than MAX_PATTERN_CHUNK_LEN once joined with `|`.
         let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
         let config = BlockConfig::new(patterns, BlockResponse::Forbidden);
-        apply_blocks_to_file(&path, &[], &config).unwrap();
+        apply_blocks_to_file(&path, dir.path(), &[], &config).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         let if_count = written.matches("if ($http_user_agent").count();
@@ -2768,10 +3502,382 @@ mod tests {
 
         let patterns: Vec<String> = (0..500).map(|i| format!("BadBot{i}Agent")).collect();
         let config = BlockConfig::new(patterns, BlockResponse::Forbidden);
-        apply_block_for_site(&path, "a.example", &config).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &config).unwrap();
 
         let status = site_apply_status(&path, "a.example", &config, no_trust_file());
         assert_eq!(status, SiteApplyStatus::UpToDate);
+    }
+
+    // ---- writing through links ----
+
+    /// A link planted where a generated file goes is replaced, not written
+    /// through: root would otherwise put our text wherever it pointed.
+    #[test]
+    fn a_generated_file_replaces_a_planted_link_instead_of_following_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "precious\n").unwrap();
+        let path = dir.path().join("stop-bots-trusted.conf");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        write_planned_managed_files(&[(path.clone(), "ours\n".to_string())]).unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
+        assert!(fs::symlink_metadata(&path).unwrap().is_file());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "ours\n");
+    }
+
+    fn one_site() -> &'static str {
+        "server {\n    server_name a.example;\n}\n"
+    }
+
+    #[test]
+    fn a_site_file_linking_outside_the_root_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("nginx");
+        fs::create_dir(&root).unwrap();
+        let victim = dir.path().join("elsewhere.conf");
+        fs::write(&victim, one_site()).unwrap();
+        let link = root.join("a.conf");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = apply_blocks_to_file(&link, &root, &[], &cfg(&["BadBot"])).unwrap_err();
+
+        assert!(
+            err.to_string().contains("outside the NGINX root"),
+            "error was: {err}"
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), one_site());
+    }
+
+    /// `sites-enabled/x` linking to `../sites-available/x` is the normal
+    /// Debian layout: written through, and still a link afterwards.
+    #[test]
+    fn a_site_file_linking_inside_the_root_is_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("sites-available")).unwrap();
+        fs::create_dir(root.join("sites-enabled")).unwrap();
+        let target = root.join("sites-available/a.conf");
+        fs::write(&target, one_site()).unwrap();
+        let link = root.join("sites-enabled/a.conf");
+        std::os::unix::fs::symlink("../sites-available/a.conf", &link).unwrap();
+
+        assert!(apply_blocks_to_file(&link, root, &[], &cfg(&["BadBot"])).unwrap());
+
+        assert!(fs::read_to_string(&target).unwrap().contains("BadBot"));
+        assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
+    }
+
+    #[test]
+    fn a_rewritten_site_file_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.conf");
+        fs::write(&path, one_site()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
+    }
+
+    // ---- taking an apply back ----
+
+    #[test]
+    fn a_snapshot_puts_back_changed_files_and_removes_created_ones() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("a.conf");
+        let created = dir.path().join("stop-bots-limits.conf");
+        fs::write(&existing, one_site()).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let snapshot = Snapshot::take([existing.clone(), created.clone()]).unwrap();
+        fs::write(&existing, "broken").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(&created, "new").unwrap();
+        snapshot.restore().unwrap();
+
+        assert_eq!(fs::read_to_string(&existing).unwrap(), one_site());
+        assert_eq!(
+            fs::metadata(&existing).unwrap().permissions().mode() & 0o7777,
+            0o640
+        );
+        assert!(!created.exists());
+    }
+
+    #[test]
+    fn a_failed_test_puts_the_site_back_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.conf");
+        fs::write(&path, one_site()).unwrap();
+        let snapshot = Snapshot::of_apply(dir.path(), [], [path.as_path()]).unwrap();
+        apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
+
+        let err = test_or_restore(&snapshot, &commands_that(false)).unwrap_err();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), one_site());
+        assert!(
+            format!("{err:#}").contains("put back"),
+            "error was: {err:#}"
+        );
+    }
+
+    // ---- chunking never splits a pattern ----
+
+    /// Patterns whose `|`-join is exactly `len` bytes, so a test can put the
+    /// next pattern right on a chunk boundary.
+    fn filler(len: usize) -> Vec<String> {
+        let mut patterns = Vec::new();
+        let mut used = 0;
+        while used + 14 + 20 < len {
+            used += usize::from(!patterns.is_empty()) + 13;
+            patterns.push(format!("FillerBot{:04}", patterns.len()));
+        }
+        patterns.push("P".repeat(len - used - 1));
+        patterns
+    }
+
+    /// The quoted regex of every `$http_user_agent` test in `text`.
+    fn user_agent_regexes(text: &str) -> Vec<&str> {
+        text.split("if ($http_user_agent ~* \"")
+            .skip(1)
+            .map(|rest| &rest[..rest.find("\") {\n").expect("closing quote")])
+            .collect()
+    }
+
+    /// The injection: a chunk that ended in the backslash of `\|` escaped
+    /// NGINX's closing quote, and the next chunk was read as directives.
+    #[test]
+    fn a_chunk_boundary_never_lands_inside_an_escaped_pipe() {
+        let mut patterns = filler(1994);
+        patterns.push(r"Evil\|Bot".to_string());
+        let text = block_text(&BlockConfig::new(patterns, BlockResponse::Forbidden)).unwrap();
+
+        let regexes = user_agent_regexes(&text);
+        assert!(regexes.len() > 1, "the test needs two chunks:\n{text}");
+        for regex in &regexes {
+            assert!(
+                is_embeddable(regex),
+                "unsafe chunk ends {:?}",
+                &regex[regex.len() - 12..]
+            );
+        }
+        assert!(
+            regexes.iter().any(|r| r.contains(r"Evil\|Bot")),
+            "the pattern must be written whole:\n{text}"
+        );
+    }
+
+    /// Not an injection, but the same cut: a group split across two `if`s
+    /// is two regexes NGINX refuses to compile.
+    #[test]
+    fn a_chunk_boundary_never_lands_inside_a_group() {
+        let mut patterns = filler(1990);
+        patterns.push("(Alpha|Beta)Bot".to_string());
+        let text = block_text(&BlockConfig::new(patterns, BlockResponse::Forbidden)).unwrap();
+
+        let regexes = user_agent_regexes(&text);
+        assert!(regexes.len() > 1, "the test needs two chunks:\n{text}");
+        assert!(
+            regexes.iter().any(|r| r.contains("(Alpha|Beta)Bot")),
+            "the group must be written whole:\n{text}"
+        );
+    }
+
+    #[test]
+    fn chunks_hold_whole_patterns() {
+        let patterns = ["AAAA0", r"A\|A1", "AAAA2"];
+        assert_eq!(chunk_patterns(&patterns, 11), ["AAAA0|A\\|A1", "AAAA2"]);
+    }
+
+    // ---- patterns that match every visitor ----
+
+    /// Each of these, joined into the block, turns every visitor of every
+    /// site away — and `nginx -t` accepts every one of them.
+    #[test]
+    fn a_pattern_that_matches_everyone_is_never_written() {
+        for (pattern, why) in [
+            ("", "empty"),
+            ("   ", "whitespace only"),
+            ("|", "two empty alternatives"),
+            ("|EvilBot", "a leading empty alternative"),
+            ("EvilBot|", "a trailing empty alternative"),
+            ("Evil||Bot", "an empty alternative in the middle"),
+            ("(|Evil)Bot", "an empty alternative opening a group"),
+            ("Evil(Bot|)", "an empty alternative closing a group"),
+            (".*", "a wildcard"),
+            (".", "any one character"),
+            (".+", "one or more of anything"),
+            ("^", "an anchor"),
+            ("^.*$", "anchors and a wildcard"),
+            ("ab", "two literal characters"),
+            ("a.b", "two literal characters and a wildcard"),
+            ("a?b?c?", "every literal optional"),
+            ("(abc)?", "an optional group"),
+            ("(abc)*", "a starred group"),
+            ("[a-z]{3}", "classes are not literals"),
+            ("Bot|.*", "one match-all alternative is enough"),
+        ] {
+            assert!(
+                !is_usable_pattern(pattern),
+                "{pattern:?} ({why}) must be dropped"
+            );
+            assert!(
+                block_text(&cfg(&[pattern])).is_none(),
+                "{pattern:?} ({why}) must not produce a block"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pattern_that_can_backtrack_catastrophically_is_never_written() {
+        for pattern in [
+            "EvilBot(a+)+",
+            "EvilBot(.*)*",
+            "EvilBot(x?){2,}",
+            "Evil(Bot(a*))+",
+        ] {
+            assert!(!is_usable_pattern(pattern), "{pattern:?} must be dropped");
+        }
+    }
+
+    #[test]
+    fn a_pattern_this_tool_cannot_check_is_never_written() {
+        for pattern in [
+            "Evil(Bot",
+            "EvilBot)",
+            "[EvilBot",
+            "(?=Evil)Bot",
+            r"Evil\x41Bot",
+            "*EvilBot",
+            "Evil\nBot",
+            "Evil\tBot",
+        ] {
+            assert!(!is_usable_pattern(pattern), "{pattern:?} must be dropped");
+        }
+        assert!(!is_usable_pattern(&"E".repeat(MAX_PATTERN_LEN + 1)));
+    }
+
+    /// Shapes the real upstream lists use, which must all survive. Checked
+    /// once by hand against all 1,675 entries of the three live lists
+    /// (September 2026): none is dropped.
+    #[test]
+    fn real_upstream_pattern_shapes_are_kept() {
+        for pattern in [
+            "FDM",
+            "Y!J",
+            r"Googlebot\/",
+            r"1h4x\.com",
+            r"ALittle\ Client",
+            "Qwant(?:ify|bot)",
+            "[cC]laude(?:[bB]ot|-[Ww]eb)",
+            "i[Tt][Mm][Ss]",
+            r"Datadog(?:\/{0,1}Synthetics| Synthetic)",
+            r"^Mozilla\/5\.0 \(compatible; Evil\)$",
+            r"Chrome\/\d+ Evil",
+            "ChatGPT Agent",
+            "EvilBot(ab)+",
+            "x server {",
+        ] {
+            assert!(is_usable_pattern(pattern), "{pattern:?} must be kept");
+        }
+    }
+
+    // ---- re-reading what this tool wrote: quotes, comments, braces ----
+
+    /// Patterns NGINX reads as plain text inside the quoted regex, but
+    /// that a quote-blind reader takes for a comment, a brace, a new
+    /// `server` block or one of this tool's own markers.
+    fn awkward_patterns() -> Vec<String> {
+        vec![
+            "Evil#Bot".to_string(),
+            "Evil}Bot".to_string(),
+            "x server {".to_string(),
+            crate::db::escape_for_nginx_regex("x # END stop-bots"),
+            crate::db::escape_for_nginx_regex(BLOCK_BEGIN),
+        ]
+    }
+
+    /// Applies `config` to a one-site file three times and returns what
+    /// each run left on disk.
+    fn apply_three_times(original: &str, config: &BlockConfig) -> [String; 3] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, original).unwrap();
+        std::array::from_fn(|_| {
+            apply_blocks_to_file(&path, dir.path(), &[], config).unwrap();
+            fs::read_to_string(&path).unwrap()
+        })
+    }
+
+    #[test]
+    fn reapplying_is_idempotent_whatever_a_pattern_contains() {
+        let site = "server {\n    listen 80;\n    server_name a.example;\n}\n";
+        for pattern in awkward_patterns() {
+            let [first, second, third] = apply_three_times(site, &cfg(&["GoodBot", &pattern]));
+            assert_eq!(
+                second, first,
+                "a second run changed the file for {pattern:?}"
+            );
+            assert_eq!(third, first, "a third run changed the file for {pattern:?}");
+            assert_eq!(
+                first.matches(&pattern).count(),
+                1,
+                "{pattern:?} must be written exactly once:\n{first}"
+            );
+            assert_eq!(
+                parse_server_blocks(&first).len(),
+                1,
+                "{pattern:?} must not read as a second server block:\n{first}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_awkward_pattern_at_once_is_still_idempotent() {
+        let site = "server {\n    listen 80;\n    server_name a.example;\n}\n";
+        let patterns = awkward_patterns();
+        let config = BlockConfig::new(patterns.clone(), BlockResponse::Forbidden);
+        let [first, second, third] = apply_three_times(site, &config);
+        assert_eq!(second, first);
+        assert_eq!(third, first);
+        assert_eq!(first.matches("return 403;").count(), 1, "was:\n{first}");
+    }
+
+    /// An operator's own quoted `#` and braces are no more a comment or a
+    /// block than ours are.
+    #[test]
+    fn an_operators_quoted_hash_and_braces_survive_reapplying() {
+        let site = "server {\n    listen 80;\n    server_name a.example;\n    \
+                    add_header X-Note \"see #docs {here}\";\n    \
+                    add_header X-Other 'it''s #fine';\n}\n";
+        let [first, second, _] = apply_three_times(site, &cfg(&["BadBot"]));
+        assert_eq!(second, first);
+        assert!(
+            first.contains("add_header X-Note \"see #docs {here}\";"),
+            "was:\n{first}"
+        );
+        assert_eq!(parse_server_blocks(&first)[0].names, ["a.example"]);
+    }
+
+    #[test]
+    fn a_hash_inside_a_bare_word_is_not_a_comment() {
+        let blocks = parse_server_blocks("server {\n    server_name a#b.example;\n}\n");
+        assert_eq!(blocks[0].names, ["a#b.example"]);
+    }
+
+    #[test]
+    fn a_brace_inside_a_quoted_word_is_not_structure() {
+        let content = "server {\n    server_name a.example;\n    add_header X \"}\";\n}\n\
+                       server {\n    server_name b.example;\n}\n";
+        let names: Vec<_> = parse_server_blocks(content)
+            .into_iter()
+            .map(|b| b.names)
+            .collect();
+        assert_eq!(names, [["a.example"], ["b.example"]]);
     }
 
     // ---- BlockResponse (403 vs 444) ----
@@ -2827,7 +3933,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
 
         assert_eq!(
             site_apply_status(&path, "a.example", &cfg(&["BadBot"]), no_trust_file()),
@@ -2845,8 +3951,9 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
 
-        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
-        let changed = apply_block_for_site(&path, "a.example", &cfg_444(&["BadBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
+        let changed =
+            apply_block_for_site(&path, dir.path(), "a.example", &cfg_444(&["BadBot"])).unwrap();
         assert!(changed);
 
         let written = fs::read_to_string(&path).unwrap();
@@ -2916,7 +4023,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
 
         assert_eq!(
             site_apply_status(
@@ -3116,7 +4223,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &cfg_rate(20)).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg_rate(20)).unwrap();
 
         assert_eq!(
             site_apply_status(&path, "a.example", &cfg_rate(20), no_trust_file()),
@@ -3192,16 +4299,45 @@ mod tests {
         );
         assert!(clear < act, "act last");
         assert!(
-            text.contains("if ($request_uri ~* \"^(/blog)\")"),
+            text.contains("if ($uri ~* \"^(/blog)\")"),
             "text was:\n{text}"
         );
         assert!(text.contains("return 403;"), "text was:\n{text}");
     }
 
+    /// `$request_uri` is the raw request line. `GET
+    /// /blog/../wp-login.php` starts with `/blog` there, while NGINX and the
+    /// application behind it serve `/wp-login.php` — a blocked bot reaching
+    /// any path by prefixing an exempt one. `$uri` is already resolved.
+    #[test]
+    fn a_plain_exemption_matches_the_resolved_path_not_the_raw_one() {
+        let text = block_text(&cfg_exempt(&["BadBot"], &["/blog"])).unwrap();
+        assert!(
+            text.contains("if ($uri ~* \"^(/blog)\")"),
+            "text was:\n{text}"
+        );
+        assert!(!text.contains("$request_uri"), "text was:\n{text}");
+    }
+
+    /// `/robots.txt` is one file, not a prefix: `/robots.txt/../x` and
+    /// `/robots.txtanything` are not it.
+    #[test]
+    fn the_robots_txt_exemption_is_exact() {
+        let config = BlockConfig {
+            serve_robots_txt: true,
+            ..cfg_exempt(&["BadBot"], &["/blog"])
+        };
+        let text = block_text(&config).unwrap();
+        assert!(
+            text.contains("if ($uri ~* \"^(/blog|/robots\\.txt$)\")"),
+            "text was:\n{text}"
+        );
+    }
+
     #[test]
     fn the_exemption_regex_is_anchored_and_alternated() {
         assert_eq!(
-            exemption_regex(&["/blog".to_string(), "/feed".to_string()]),
+            exemption_regex(&["/blog".to_string(), "/feed".to_string()], &[]),
             Some("^(/blog|/feed)".to_string())
         );
     }
@@ -3210,7 +4346,7 @@ mod tests {
     /// the exemption — which fails *open*, unlike a too-narrow pattern.
     #[test]
     fn the_exemption_regex_escapes_metacharacters() {
-        let regex = exemption_regex(&["/a.b?c".to_string()]).unwrap();
+        let regex = exemption_regex(&["/a.b?c".to_string()], &[]).unwrap();
         assert!(regex.contains("\\."), "regex was: {regex}");
         assert!(regex.contains("\\?"), "regex was: {regex}");
     }
@@ -3219,10 +4355,10 @@ mod tests {
     fn the_exemption_regex_drops_unusable_paths() {
         // Not anchored at the start: could never match, so it's dropped
         // rather than silently widening or narrowing anything.
-        assert_eq!(exemption_regex(&["blog".to_string()]), None);
+        assert_eq!(exemption_regex(&["blog".to_string()], &[]), None);
         // Would terminate the quoted config string.
-        assert_eq!(exemption_regex(&["/a\"b".to_string()]), None);
-        assert_eq!(exemption_regex(&[]), None);
+        assert_eq!(exemption_regex(&["/a\"b".to_string()], &[]), None);
+        assert_eq!(exemption_regex(&[], &[]), None);
     }
 
     // ---- agent exemptions ----
@@ -3374,11 +4510,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &cfg(&["okhttp"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["okhttp"])).unwrap();
         let exempted = cfg_agent(&["okhttp"], &[("okhttp", "/remote.php/dav/")]);
 
         let before = site_apply_status(&path, "a.example", &exempted, no_trust_file());
-        apply_block_for_site(&path, "a.example", &exempted).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &exempted).unwrap();
         let after = site_apply_status(&path, "a.example", &exempted, no_trust_file());
 
         assert_eq!(
@@ -3476,7 +4612,7 @@ mod tests {
         assert!(ifs > 1, "expected chunking, got {ifs}");
         // Every chunk sets the flag; exactly one clears it and one acts.
         assert_eq!(text.matches("set $stop_bots_block 1;").count(), ifs);
-        assert_eq!(text.matches("if ($request_uri").count(), 1);
+        assert_eq!(text.matches("if ($uri ").count(), 1);
         assert_eq!(text.matches("if ($stop_bots_block) {").count(), 1);
     }
 
@@ -3485,7 +4621,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
 
         assert_eq!(
             site_apply_status(
@@ -3497,7 +4633,13 @@ mod tests {
             SiteApplyStatus::Stale
         );
 
-        apply_block_for_site(&path, "a.example", &cfg_exempt(&["BadBot"], &["/blog"])).unwrap();
+        apply_block_for_site(
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg_exempt(&["BadBot"], &["/blog"]),
+        )
+        .unwrap();
         assert_eq!(
             site_apply_status(
                 &path,
@@ -3661,7 +4803,7 @@ mod tests {
         )
         .unwrap();
 
-        apply_block_for_site(&path, "a.example", &cfg_http1x(&["BadBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg_http1x(&["BadBot"])).unwrap();
 
         let written = fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -3695,7 +4837,7 @@ mod tests {
         .unwrap();
 
         let config = cfg_http1x(&["BadBot"]);
-        apply_block_for_site(&path, "a.example", &config).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &config).unwrap();
         assert_eq!(
             site_apply_status(&path, "a.example", &config, no_trust_file()),
             SiteApplyStatus::UpToDate
@@ -3711,7 +4853,7 @@ mod tests {
             "server {\n    listen 443 ssl;\n    server_name a.example;\n}\n",
         )
         .unwrap();
-        apply_block_for_site(&path, "a.example", &cfg(&["BadBot"])).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &cfg(&["BadBot"])).unwrap();
 
         assert_eq!(
             site_apply_status(
@@ -4017,7 +5159,7 @@ mod tests {
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
         let config = cfg_trusted(&["BadBot"]);
-        apply_block_for_site(&path, "a.example", &config).unwrap();
+        apply_block_for_site(&path, dir.path(), "a.example", &config).unwrap();
 
         assert_eq!(
             site_apply_status(&path, "a.example", &config, &conf_d),
@@ -4239,7 +5381,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("site.conf");
         fs::write(&path, "server {\n    server_name a.example;\n}\n").unwrap();
-        apply_block_for_site(&path, "a.example", &cfg_response(BlockResponse::Gone)).unwrap();
+        apply_block_for_site(
+            &path,
+            dir.path(),
+            "a.example",
+            &cfg_response(BlockResponse::Gone),
+        )
+        .unwrap();
 
         assert_eq!(
             site_apply_status(

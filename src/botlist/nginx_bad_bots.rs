@@ -66,11 +66,13 @@ fn unescape(line: &str) -> String {
 /// ends up embedded in. A trailing backslash here means a raw, unpaired one
 /// at the end of the line itself — routine mid-pattern escapes like
 /// `1h4x\.com` are untouched, since the backslash there isn't at the end.
+/// A line that would match every visitor (`|`, `.*`) is dropped too — see
+/// `botlist::keeps_pattern`.
 pub fn parse(text: &str) -> Result<Vec<NewBot>> {
     let bots = text
         .lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.contains('"') && !line.ends_with('\\'))
+        .filter(|line| crate::botlist::keeps_pattern(line))
         .map(|line| {
             let name = unescape(line);
             NewBot {
@@ -152,5 +154,13 @@ mod tests {
     fn parse_keeps_a_mid_pattern_escape_that_does_not_end_in_a_backslash() {
         let bots = parse(SAMPLE).unwrap();
         assert!(bots.iter().any(|b| b.user_agent_pattern == "1h4x\\.com"));
+    }
+
+    /// A lone `|` line joins into `...||...`, which matches every visitor.
+    #[test]
+    fn parse_drops_a_line_that_would_match_everyone() {
+        let bots = parse("GoodBot\n|\n.*\n^\nab\nEvil\x07Bot\n").unwrap();
+        let patterns: Vec<&str> = bots.iter().map(|b| b.user_agent_pattern.as_str()).collect();
+        assert_eq!(patterns, ["GoodBot"]);
     }
 }

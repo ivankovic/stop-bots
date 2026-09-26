@@ -745,6 +745,7 @@ async fn apply_one(
     Form(form): Form<IdForm>,
 ) -> Response {
     let id = form.id;
+    let for_real = state.apply_for_real;
     let applied = state
         .with_db(move |db| {
             let site = db
@@ -752,30 +753,32 @@ async fn apply_one(
                 .into_iter()
                 .find(|s| s.id == id)
                 .ok_or_else(|| anyhow::anyhow!("no site with id {id}"))?;
-            nginx::write_managed_files(db, &nginx::root(db, None)?)?;
-            let config = nginx::block_config_for_site(db, site.id)?;
-            let changed = nginx::apply_block_for_site(
-                Path::new(&site.config_path),
-                &site.server_name,
-                &config,
+            let commands = for_real
+                .then(|| nginx::NginxCommands::from_db(db))
+                .transpose()?;
+            let (changed, reloaded) = nginx::apply_site_and_reload(
+                db,
+                &nginx::root(db, None)?,
+                &site,
+                commands.as_ref(),
             )?;
-            Ok((site.server_name, changed))
+            Ok((site.server_name, changed, reloaded))
         })
         .await;
 
     match applied {
-        Ok((name, changed)) => {
+        Ok((name, changed, reloaded)) => {
             let message = if changed {
                 format!("Applied to {name}.")
             } else {
                 format!("{name} was already up to date.")
             };
-            reload_then(&state, "/nginx", message).await
+            applied_message(&state, "/nginx", message, changed, reloaded)
         }
         Err(err) => back_with(
             &state.base,
             "/nginx",
-            &format!("Apply failed: {err}"),
+            &format!("Apply failed: {err:#}"),
             false,
         ),
     }
@@ -783,66 +786,53 @@ async fn apply_one(
 
 async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
     let root = state.nginx_root.clone();
+    let for_real = state.apply_for_real;
     let applied = state
-        .with_db(move |db| nginx::apply_all_sites(db, &root))
+        .with_db(move |db| {
+            let commands = for_real
+                .then(|| nginx::NginxCommands::from_db(db))
+                .transpose()?;
+            nginx::apply_all_sites_and_reload(db, &root, commands.as_ref())
+        })
         .await;
 
     match applied {
-        Ok(outcome) => {
-            reload_then(
-                &state,
-                "/nginx",
-                format!("Applied: {} file(s) changed.", outcome.changed),
-            )
-            .await
-        }
+        Ok(outcome) => applied_message(
+            &state,
+            "/nginx",
+            format!("Applied: {} file(s) changed.", outcome.changed),
+            outcome.changed > 0,
+            outcome.reloaded,
+        ),
         Err(err) => back_with(
             &state.base,
             "/nginx",
-            &format!("Apply failed: {err}"),
+            &format!("Apply failed: {err:#}"),
             false,
         ),
     }
 }
 
-/// Reloads NGINX after a successful apply, and folds the outcome into the
-/// message.
-///
-/// A failed reload is appended rather than replacing what the apply said,
-/// for the same reason `App::finish_nginx_reload` does it: the files
-/// really were written, and that is worth knowing alongside the news that
-/// NGINX is still serving the old ones.
-async fn reload_then(state: &AppState, back: &str, message: String) -> Response {
-    if !state.apply_for_real {
-        return back_with(
-            &state.base,
-            back,
-            &format!("{message} (NGINX not reloaded: --no-apply)"),
-            true,
-        );
-    }
-
-    let reloaded = state
-        .with_db(|db| {
-            let commands = nginx::NginxCommands::from_db(db)?;
-            nginx::reload_with(&commands)
-        })
-        .await;
-
-    match reloaded {
-        Ok(()) => back_with(
-            &state.base,
-            back,
-            &format!("{message} NGINX reloaded."),
-            true,
-        ),
-        Err(err) => back_with(
-            &state.base,
-            back,
-            &format!("{message} Reload failed: {err}"),
-            false,
-        ),
-    }
+/// The flash for a finished apply. The reload itself happened inside the
+/// apply (see `nginx::apply_all_sites_and_reload`), and only after the new
+/// config passed the test, so all that is left is to say which it was.
+fn applied_message(
+    state: &AppState,
+    back: &str,
+    message: String,
+    changed: bool,
+    reloaded: bool,
+) -> Response {
+    let note = if reloaded {
+        " NGINX reloaded."
+    } else if !state.apply_for_real {
+        " (NGINX not reloaded: --no-apply)"
+    } else if changed {
+        ""
+    } else {
+        " Nothing changed, so NGINX was not reloaded."
+    };
+    back_with(&state.base, back, &format!("{message}{note}"), true)
 }
 
 #[derive(Deserialize)]

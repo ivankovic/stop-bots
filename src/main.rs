@@ -1801,17 +1801,17 @@ async fn update_bot_lists(
 fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) -> Result<()> {
     let db = open_db(db_path)?;
     let root = nginx::root(&db, root)?;
-    let outcome = nginx::apply_all_sites(&db, &root)?;
+    // Tested, put back if the test fails, and reloaded only when something
+    // actually changed on disk.
+    let commands = (!no_reload)
+        .then(|| nginx::NginxCommands::from_db(&db))
+        .transpose()?;
+    let outcome = nginx::apply_all_sites_and_reload(&db, &root, commands.as_ref())?;
     println!(
         "Applied blocking rules to {} site(s) across {} file(s), {} file(s) changed",
         outcome.sites, outcome.files, outcome.changed
     );
-
-    // Writing the sentinel block does nothing until NGINX re-reads it — no
-    // point reloading when nothing actually changed on disk.
-    if outcome.changed > 0 && !no_reload {
-        let commands = nginx::NginxCommands::from_db(&db)?;
-        nginx::reload_with(&commands).context("nginx config was applied, but reload failed")?;
+    if outcome.reloaded {
         println!("Reloaded NGINX");
     }
     Ok(())
@@ -3156,14 +3156,9 @@ fn block_honeypot(
 
 fn set_honeypot_path(db_path: Option<PathBuf>, path: String) -> Result<()> {
     let db = open_db(db_path)?;
-    let trimmed = path.trim();
-    // Rejected loudly rather than stored and silently ignored: matching is
-    // anchored at the start of the request path, so a path without a
-    // leading slash could never fire, leaving an apparently-enabled
-    // detector that does nothing.
-    if !trimmed.starts_with('/') {
-        anyhow::bail!("the honeypot path must start with '/' (got {trimmed:?})");
-    }
+    // Rejected loudly rather than stored and silently ignored — see
+    // `validate_honeypot_path` for what each refusal protects.
+    let trimmed = &stop_bots::protection::validate_honeypot_path(&path)?;
     db.set_text_setting(stop_bots::protection::HONEYPOT_PATH, trimmed)?;
     println!("Honeypot path set to {trimmed}");
     println!(

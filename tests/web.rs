@@ -48,6 +48,10 @@ fn app_under(base: &str) -> (Router, String, tempfile::TempDir, std::path::PathB
 
     let nginx_root = tmp.path().join("nginx");
     std::fs::create_dir_all(nginx_root.join("sites-enabled")).unwrap();
+    // A `conf.d` of its own, so the generated http-context files resolve
+    // here rather than to the host's `/etc/nginx/conf.d` (see
+    // `nginx::conf_d_dir`), which an apply would otherwise read and clean.
+    std::fs::create_dir_all(nginx_root.join("conf.d")).unwrap();
 
     // An SSH log that exists and names nobody. Without one the lockout
     // guard goes looking for the host's own, which a test must never read,
@@ -1367,6 +1371,23 @@ async fn blocking_and_unblocking_a_user_agent_round_trips() {
         "user_agent=curl%2F8.5.0",
     )
     .await;
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .list_blocked_user_agents()
+        .unwrap()
+        .is_empty());
+}
+
+/// An empty user agent is a substring of every one: stored, it blocked
+/// every visitor of every site at the next apply.
+#[tokio::test]
+async fn blocking_an_empty_user_agent_is_refused_with_a_reason() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/firewall/block-ua", "user_agent=").await;
+
+    assert!(flash.contains("Could not block"), "flash was: {flash}");
     assert!(Db::open(&db_path)
         .unwrap()
         .list_blocked_user_agents()

@@ -145,17 +145,38 @@ pub const HONEYPOT_TTL_DAYS_DEFAULT: i64 = 30;
 /// robots.txt that forbids it.
 pub const HONEYPOT_PATH_DEFAULT: &str = "/stop-bots-trap/";
 
-/// The configured trap path, falling back to [`HONEYPOT_PATH_DEFAULT`].
-/// A stored value that doesn't start with `/`, or is blank, falls back
-/// too: matching is anchored at the start of the request path, so such a
-/// value could never fire and would leave the detector looking switched on
-/// while doing nothing.
+/// The configured trap path, falling back to [`HONEYPOT_PATH_DEFAULT`]
+/// for a stored value [`validate_honeypot_path`] would refuse — one
+/// written by hand or by an older version, which never checked more than
+/// the leading `/`.
 pub fn honeypot_path(db: &Db) -> Result<String> {
     Ok(db
         .get_text_setting(HONEYPOT_PATH)?
-        .map(|p| p.trim().to_string())
-        .filter(|p| p.starts_with('/'))
+        .and_then(|p| validate_honeypot_path(&p).ok())
         .unwrap_or_else(|| HONEYPOT_PATH_DEFAULT.to_string()))
+}
+
+/// `path` trimmed, if it is usable as the trap path, or why not.
+///
+/// - **It must start with `/`.** Matching is anchored at the start of the
+///   request path, so anything else could never fire and would leave the
+///   detector looking switched on while doing nothing.
+/// - **Only characters a URL path spells literally.** The path is
+///   published as one `Disallow:` line of the generated robots.txt. Trim
+///   only reached the ends, so a newline in the middle ended that line and
+///   whatever followed became robots.txt of its own; `#` starts a comment
+///   there, and `*` and `$` are wildcards to the crawlers that read it.
+pub fn validate_honeypot_path(path: &str) -> Result<String> {
+    let path = path.trim();
+    if !path.starts_with('/') {
+        anyhow::bail!("the honeypot path must start with '/' (got {path:?})");
+    }
+    if let Some(c) = path.chars().find(|c| {
+        !(c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '_' | '~' | '%' | '+' | '@'))
+    }) {
+        anyhow::bail!("the honeypot path cannot contain {c:?} (got {path:?})");
+    }
+    Ok(path.to_string())
 }
 
 /// One switchable log-analysis detector, described rather than
@@ -629,5 +650,40 @@ mod tests {
 
         db.set_text_setting(HONEYPOT_PATH, "  /my-trap/  ").unwrap();
         assert_eq!(honeypot_path(&db).unwrap(), "/my-trap/");
+    }
+
+    /// The path is published in robots.txt, one line of it. A newline ends
+    /// that line and starts whatever the rest says — `Allow: /` for every
+    /// agent, say — and `#`, `*` and `$` change what the line means.
+    #[test]
+    fn a_honeypot_path_that_would_not_stay_one_robots_txt_line_is_refused() {
+        let db = Db::open_in_memory().unwrap();
+        for bad in [
+            "/trap\nUser-agent: *\nAllow: /",
+            "/tr\rap",
+            "/tr ap/",
+            "/tr\tap/",
+            "/trap#x",
+            "/trap/*",
+            "/trap$",
+        ] {
+            assert!(
+                validate_honeypot_path(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+            db.set_text_setting(HONEYPOT_PATH, bad).unwrap();
+            assert_eq!(
+                honeypot_path(&db).unwrap(),
+                HONEYPOT_PATH_DEFAULT,
+                "{bad:?} must not be used even if it was stored"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_honeypot_path_is_accepted() {
+        for good in ["/my-trap/", "/a/b.c_d~e/", "/%7Etrap"] {
+            assert_eq!(validate_honeypot_path(good).unwrap(), good);
+        }
     }
 }

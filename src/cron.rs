@@ -569,9 +569,15 @@ pub fn apply_nginx(db: &Db, root: &std::path::Path, reload: bool) -> String {
         Err(err) => return format!("error: {err}"),
     }
 
-    let applied = match crate::nginx::apply_all_sites(db, root) {
+    let commands = match reload.then(|| NginxCommands::from_db(db)).transpose() {
+        Ok(commands) => commands,
+        Err(err) => return format!("error: {err:#}"),
+    };
+    // Tested before the reload, and put back if the test fails — see
+    // `apply_all_sites_and_reload`. Unattended is where that matters most.
+    let applied = match crate::nginx::apply_all_sites_and_reload(db, root, commands.as_ref()) {
         Ok(applied) => applied,
-        Err(err) => return format!("error: {err}"),
+        Err(err) => return format!("error: {err:#}"),
     };
 
     // Writing the sentinel block does nothing until NGINX re-reads it, so
@@ -587,14 +593,11 @@ pub fn apply_nginx(db: &Db, root: &std::path::Path, reload: bool) -> String {
         "applied {} site(s), {} file(s) changed",
         applied.sites, applied.changed
     );
-    if !reload {
-        summary.push_str(", not reloaded");
-        return summary;
-    }
-    match NginxCommands::from_db(db).and_then(|commands| crate::nginx::reload_with(&commands)) {
-        Ok(()) => summary.push_str(", reloaded"),
-        Err(err) => summary.push_str(&format!(", but the reload failed: {err:#}")),
-    }
+    summary.push_str(if applied.reloaded {
+        ", reloaded"
+    } else {
+        ", not reloaded"
+    });
     summary
 }
 

@@ -6760,3 +6760,68 @@ a group that is not this process's own. The last rule lets an ordinary user's
   `PATH`, then `/usr/sbin`, `/sbin` and `/usr/local/sbin`. `apply_script` also
   hands its child that extended `PATH`, because the iptables script runs
   `iptables` by name. Under `/etc/cron.d`, `PATH` is `/usr/bin:/bin`.
+
+## Security pass: what NGINX reads back (`src/nginx.rs`, `src/botlist/`, `Db::block_user_agent`)
+
+Seven findings, one theme: text from a feed or a form becomes config that
+root loads, and the tool then re-reads that config itself. Each was
+reproduced against a real `nginx -t` in `nginx:alpine` before the fix and
+checked the same way after.
+
+**Chunks hold whole patterns.** `chunk_pattern` joined every pattern with
+`|` and split the result on every `|`, including the `|` of an escaped `\|`
+and the ones inside a `(a|b)` group. A chunk ending in the backslash of
+`\|` escaped the closing quote of `if ($http_user_agent ~* "...")`; with
+`\Q` in front so the regex still compiled, a single line in the bad-bot
+list put an `include` into the config — `nginx -t` read it. `chunk_patterns`
+now packs whole patterns, and re-checks every chunk with `is_embeddable`
+before it is written.
+
+**The reader lexes like NGINX.** `comment_mask`/`tokenize` took every `#`
+for a comment and every brace for structure, inside quotes too, so
+`Evil#Bot`, `Evil}Bot`, `x server {` or a hand-blocked `x # END stop-bots`
+made each run duplicate the block, strand a `return 403; }`, or insert the
+next block inside the quoted string. `lex` follows `ngx_conf_read_token`,
+checked rule by rule with `nginx -T`: quotes open only where a word starts
+and take backslash escapes; `#` is a comment only where a word could start;
+a bare word ends at whitespace, `;` or `{`, and a `}` inside one is text.
+Markers are matched only as whole comments (`locate_marked`), and an edit
+that would change the number of `server` blocks is refused (`nth_block`).
+
+**Patterns that match everyone are not written.** Without a regex engine
+(the `regex` crate is ~1.5MB of static binary), `pattern_problem` walks the
+pattern and computes the fewest literal characters any match needs; under
+three is refused, which covers `""`, `.*`, `^`, `|x`, `a?b?c?` and `Bot|.*`
+at once. It also refuses empty alternatives, a repeated group that repeats
+inside (`(a+)+`), control characters, anything over 1024 bytes, and
+constructs it cannot count (`\x`, lookaround, unbalanced). All 1,675
+entries of the three live lists pass it. It runs in every parser (dropping
+the entry), in `Db::block_user_agent` (refusing with a reason — an empty
+`user_agent=` posted to the console had blocked every visitor), and again
+at write time. A source past 10,000 entries or with a pattern past 1024
+bytes is refused whole in `SourceKind::parse` rather than truncated.
+
+**Plain exemptions read `$uri`.** `$request_uri` is the raw request line,
+so `/robots.txt/../wp-login.php` was exempt while NGINX served
+`/wp-login.php`. The agent exemptions already read `$uri`; the plain ones
+and the automatic `/.well-known/` now do too, and `/robots.txt` is exact
+(`/robots\.txt$`). Every site with an exemption reads STALE until applied.
+
+**An apply the test rejects is put back.** `apply_all_sites_and_reload`
+(CLI, batch, cron, console) and `apply_site_and_reload` (console, one site)
+take a `Snapshot` of every file they may touch, write, run the configured
+test, and on failure restore each file byte for byte and remove the ones
+they created; only then reload. The TUI's `run_apply` does the same with
+`ApplyPlan::validate`. `None` (`--no-reload`, `--no-apply`) still writes
+without testing, as before.
+
+**Writes replace; they do not follow.** Generated files are written to an
+`O_EXCL` temporary beside the target and renamed over it, so a symlink
+planted in a writable NGINX tree is replaced, not written through. Site
+files are legitimately links, so one is followed — but only to a target
+inside the NGINX root — and rewritten the same way with its mode and owner
+kept. A file the operator made read-only is still refused.
+
+**The honeypot path is one robots.txt line.** `validate_honeypot_path`
+allows only characters a URL path spells literally; a newline in the middle
+used to end the `Disallow:` line and start robots.txt of its own.

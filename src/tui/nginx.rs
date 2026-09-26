@@ -927,6 +927,8 @@ impl Nginx {
             },
             sites,
             every_site: action == SiteAction::ApplyAll,
+            root: self.root.clone(),
+            validate: None,
         })
     }
 
@@ -943,7 +945,17 @@ impl Nginx {
             cleanup_error,
             every_site,
             managed_changed,
+            rolled_back,
         } = outcome;
+        if let Some(err) = rolled_back {
+            self.alert = Some(format!(
+                "The NGINX config test failed, so nothing was applied:\n{err}"
+            ));
+            return (
+                "Nothing applied: the NGINX config test failed".to_string(),
+                false,
+            );
+        }
         let total = results.len();
         let mut applied = 0;
         let mut unchanged = 0;
@@ -1107,6 +1119,13 @@ pub struct ApplyPlan {
     pub managed_removals: Vec<PathBuf>,
     pub sites: Vec<PlannedSite>,
     pub every_site: bool,
+    /// The NGINX root, which a symlinked site file may only point into.
+    pub root: PathBuf,
+    /// The test to run once everything is written, and to undo the apply
+    /// on failure (see `nginx::test_or_restore`). `None` under
+    /// `--no-reload`, which leaves NGINX alone entirely; `App` fills it
+    /// in, since the plan is built by a screen that does not know.
+    pub validate: Option<nginx::NginxCommands>,
 }
 
 /// What one site's write did.
@@ -1131,6 +1150,9 @@ pub struct ApplyOutcome {
     /// sites because it can be the only change there is — see
     /// [`nginx::write_planned_managed_files`].
     pub managed_changed: usize,
+    /// Set when the config test failed and every file was put back: why,
+    /// or why putting them back failed too.
+    pub rolled_back: Option<String>,
 }
 
 /// Performs a planned apply. Runs on a background thread and touches no
@@ -1142,16 +1164,32 @@ pub struct ApplyOutcome {
 /// means they all will, and reporting them together is more use than
 /// stopping at the first.
 pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
+    let snapshot = nginx::Snapshot::of_apply(
+        &plan.root,
+        plan.managed_writes
+            .iter()
+            .map(|(path, _)| path.clone())
+            .chain(plan.managed_removals.iter().cloned()),
+        plan.sites.iter().map(|site| site.config_path.as_path()),
+    );
     // Same ordering as the CLI's apply: a managed file has to exist before
     // a config that aliases it is reloaded.
-    let managed = nginx::write_planned_managed_files(&plan.managed_writes);
+    let managed = match &snapshot {
+        Ok(_) => nginx::write_planned_managed_files(&plan.managed_writes),
+        Err(err) => Err(anyhow::anyhow!("{err:#}")),
+    };
     let results: Vec<SiteResult> = plan
         .sites
         .iter()
         .map(|site| {
             let outcome = managed.as_ref().map_err(clone_error).and_then(|_| {
-                nginx::apply_block_for_site(&site.config_path, &site.server_name, &site.config)
-                    .map_err(|err| (is_permission_denied(&err), err.to_string()))
+                nginx::apply_block_for_site(
+                    &site.config_path,
+                    &plan.root,
+                    &site.server_name,
+                    &site.config,
+                )
+                .map_err(|err| (is_permission_denied(&err), err.to_string()))
             });
             SiteResult {
                 server_name: site.server_name.clone(),
@@ -1174,11 +1212,23 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
         }
     }
 
+    // Tested over whatever was written, even if some sites failed: those
+    // are reported either way, and what did land must not be left for the
+    // next reload to find broken.
+    let changed_any = managed_changed > 0 || results.iter().any(|r| r.changed == Ok(true));
+    let rolled_back = match (&plan.validate, &snapshot) {
+        (Some(commands), Ok(snapshot)) if changed_any => nginx::test_or_restore(snapshot, commands)
+            .err()
+            .map(|err| format!("{err:#}")),
+        _ => None,
+    };
+
     ApplyOutcome {
         results,
         cleanup_error,
         every_site: plan.every_site,
         managed_changed,
+        rolled_back,
     }
 }
 
@@ -1598,6 +1648,42 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(content.contains("NOT FOUND"), "content was:\n{content}");
+    }
+
+    /// A config NGINX rejects is put back before anything reloads it, and
+    /// the screen says nothing was applied rather than that it was.
+    #[test]
+    fn an_apply_the_config_test_rejects_is_taken_back() {
+        let db = Db::open_in_memory().unwrap();
+        blocked_bot(&db, "badbot", "BadBot-UA");
+        let dir = tempfile::tempdir().unwrap();
+        // Its own conf.d, so nothing resolves to the host's /etc/nginx.
+        std::fs::create_dir(dir.path().join("conf.d")).unwrap();
+        let path = dir.path().join("a.conf");
+        let original = "server {\n    server_name example.com;\n}\n";
+        std::fs::write(&path, original).unwrap();
+        db.upsert_site("example.com", path.to_str().unwrap())
+            .unwrap();
+        let mut screen = Nginx::new(dir.path().to_path_buf());
+        screen.refresh(&db).unwrap();
+
+        let plan = ApplyPlan {
+            validate: Some(nginx::NginxCommands {
+                test: vec!["false".to_string()],
+                reload: vec!["true".to_string()],
+            }),
+            ..screen.plan_apply(&db, SiteAction::ApplyAll).unwrap()
+        };
+        let (message, changed) = screen.finish_apply(run_apply(plan));
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        assert!(!changed, "there must be nothing left to reload");
+        assert!(
+            message.contains("Nothing applied"),
+            "message was: {message}"
+        );
+        let alert = screen.alert.as_deref().unwrap_or_default();
+        assert!(alert.contains("put back"), "alert was: {alert}");
     }
 
     #[test]

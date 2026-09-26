@@ -623,7 +623,10 @@ impl Firewall {
                         row.user_agent
                     ));
                 } else {
-                    db.block_user_agent(&row.user_agent)?;
+                    if let Err(err) = db.block_user_agent(&row.user_agent) {
+                        *message = Some(format!("Not blocked: {err}"));
+                        return Ok(KeyOutcome::Consumed);
+                    }
                     *message = Some(format!(
                         "Permanently blocked user agent \"{}\" — run apply-blocks to enforce it.",
                         row.user_agent
@@ -1502,6 +1505,25 @@ mod tests {
             vec!["curl/8.0".to_string()]
         );
         assert!(message.unwrap().contains("curl/8.0"));
+    }
+
+    /// A user agent too short to mean one client (an access log records
+    /// `-` for none) is refused with a reason on screen, not an error that
+    /// ends the key handler.
+    #[test]
+    fn enter_on_a_user_agent_that_would_block_everyone_says_why_not() {
+        let db = Db::open_in_memory().unwrap();
+        let mut screen = screen_with_one_ua_row("-", RowStatus::Pending);
+
+        let mut message = None;
+        let outcome = screen
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+
+        assert_eq!(outcome, KeyOutcome::Consumed);
+        assert!(db.list_blocked_user_agents().unwrap().is_empty());
+        let message = message.unwrap_or_default();
+        assert!(message.contains("Not blocked"), "message was: {message}");
     }
 
     /// Enter is a toggle, not just "ensure blocked": pressing it on a row

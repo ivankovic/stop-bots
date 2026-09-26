@@ -47,13 +47,15 @@ pub const SOURCE_URL: &str =
 /// `nginx::apply_blocks_to_file`), so an untrusted one with a quote in it
 /// could break out and inject directives into a config loaded as root, and
 /// one ending in a backslash can escape NGINX's own closing quote instead.
+/// So is one that would match every visitor, such as an empty key — see
+/// `botlist::keeps_pattern`.
 pub fn parse(json: &str) -> Result<Vec<NewBot>> {
     let raw: BTreeMap<String, serde::de::IgnoredAny> =
         serde_json::from_str(json).context("failed to parse ai.robots.txt JSON")?;
 
     let bots = raw
         .into_keys()
-        .filter(|name| !name.contains('"') && !name.ends_with('\\'))
+        .filter(|name| crate::botlist::keeps_pattern(name))
         .map(|name| NewBot {
             slug: slugify(&name),
             user_agent_pattern: name.clone(),
@@ -107,5 +109,13 @@ mod tests {
     fn parse_drops_a_name_ending_in_a_backslash() {
         let bots = parse(SAMPLE).unwrap();
         assert!(!bots.iter().any(|b| b.name.ends_with('\\')));
+    }
+
+    /// The key is the pattern, so an empty key would block every visitor.
+    #[test]
+    fn parse_drops_a_name_that_would_match_everyone() {
+        let bots = parse(r#"{"": {}, "  ": {}, ".*": {}, "|": {}, "GPTBot": {}}"#).unwrap();
+        let names: Vec<&str> = bots.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(names, ["GPTBot"]);
     }
 }
