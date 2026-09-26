@@ -44,6 +44,24 @@ fn min_threshold(raw: &str) -> Result<usize, String> {
     Ok(value)
 }
 
+/// Parses a detector subcommand's `--ttl-days`, refusing anything past
+/// `MAX_TTL_DAYS` either way. Past the ceiling, the arithmetic that dates
+/// the block wraps.
+///
+/// Only the magnitude is bounded, unlike the console and the TUI, which
+/// refuse anything under a day: a zero or negative TTL here writes a block
+/// that is born expired, which the CLI tests use to prove expiry end to
+/// end, and an operator typing one has asked for exactly that.
+fn ttl_days_arg(raw: &str) -> Result<i64, String> {
+    let max = stop_bots::protection::MAX_TTL_DAYS;
+    match raw.parse::<i64>() {
+        Ok(days) if (-max..=max).contains(&days) => Ok(days),
+        _ => Err(format!(
+            "a block lasts a whole number of days, at most {max}"
+        )),
+    }
+}
+
 /// Help text shared by every subcommand's `--db` flag.
 const DB_HELP: &str = "Database path (defaults to /var/lib/stop-bots/db.sqlite3, falling back to a per-user location if that's not writable)";
 
@@ -262,7 +280,7 @@ enum Command {
         /// How many days an added block rule lasts before it's
         /// automatically dropped (re-added on a later run if the IP is
         /// still scanning by then)
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 5, value_parser = ttl_days_arg)]
         ttl_days: i64,
         /// Check this SSH log file instead of auto-detecting one
         #[arg(long)]
@@ -301,7 +319,7 @@ enum Command {
         /// How many days an added block rule lasts before it's
         /// automatically dropped (re-added on a later run if the IP is
         /// still scanning by then)
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = ttl_days_arg)]
         ttl_days: i64,
         /// Check this NGINX access log file instead of the default
         /// /var/log/nginx/access.log
@@ -340,7 +358,7 @@ enum Command {
         /// range refresh picks it up, this bounds how long a real crawler
         /// address stays blocked. A genuine impersonator is re-flagged on
         /// its next request anyway.
-        #[arg(long, default_value_t = stop_bots::protection::SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT)]
+        #[arg(long, default_value_t = stop_bots::protection::SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT, value_parser = ttl_days_arg)]
         ttl_days: i64,
         /// Check this NGINX access log file instead of the default
         /// /var/log/nginx/access.log
@@ -372,7 +390,7 @@ enum Command {
     BlockProbePaths {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
-        #[arg(long, default_value_t = stop_bots::protection::PROBE_PATHS_TTL_DAYS_DEFAULT)]
+        #[arg(long, default_value_t = stop_bots::protection::PROBE_PATHS_TTL_DAYS_DEFAULT, value_parser = ttl_days_arg)]
         ttl_days: i64,
         /// Check this NGINX access log file instead of the default
         /// /var/log/nginx/access.log
@@ -421,7 +439,7 @@ enum Command {
     BlockHoneypot {
         #[arg(long, help = DB_HELP)]
         db: Option<PathBuf>,
-        #[arg(long, default_value_t = stop_bots::protection::HONEYPOT_TTL_DAYS_DEFAULT)]
+        #[arg(long, default_value_t = stop_bots::protection::HONEYPOT_TTL_DAYS_DEFAULT, value_parser = ttl_days_arg)]
         ttl_days: i64,
         /// Check this NGINX access log file instead of the default
         /// /var/log/nginx/access.log
@@ -1805,11 +1823,26 @@ fn add_firewall_rule(
     port: Option<u16>,
     action: &str,
 ) -> Result<()> {
+    let action = FirewallAction::parse(action)?;
+    // The same line `trust` draws at `/0`, and for the same reason: a
+    // block of every address with no port is the host off the network,
+    // far likelier a typo for a real prefix than a decision. With a port
+    // it is an ordinary rule — closing that port to everyone — and stays.
+    if action == FirewallAction::Block
+        && port.is_none()
+        && stop_bots::db::is_every_address(&address)
+    {
+        anyhow::bail!(
+            "refusing to block {}: that is every address, which would take this host off the \
+             network. Pass --port to close a single port to everyone.",
+            address.trim()
+        );
+    }
     let db = open_db(db_path)?;
     let id = db.add_firewall_rule(&NewFirewallRule {
         address,
         port,
-        action: FirewallAction::parse(action)?,
+        action,
     })?;
     println!("Added firewall rule #{id}");
     Ok(())
@@ -2739,14 +2772,16 @@ async fn run_web(
 
     let hosts = web::configured_hosts(&db)?;
     if !web::is_loopback(&addr) && hosts.is_empty() {
-        // Not fatal: an exposed console reached by bare IP is a real, if
-        // unusual, deployment. Loud, because the usual reason to get here
-        // is putting it behind NGINX on a hostname and then finding every
-        // request refused.
+        // Not fatal: reaching it through an SSH tunnel as `localhost`
+        // still works. Loud, because the usual reason to get here is
+        // putting it behind NGINX on a hostname and then finding every
+        // request refused. It used to say a bare address would be
+        // accepted, which is only true of a loopback one.
         eprintln!(
-            "Warning: bound to {addr} with no --allowed-hosts set. Requests carrying a \n\
-             host name rather than an address will be refused. This is the DNS-rebinding \n\
-             guard doing its job; list the name you will use."
+            "Warning: bound to {addr} with no --allowed-hosts set. Only requests for \n\
+             localhost or a loopback address will be answered; a host name, or this \n\
+             machine's own network address, is refused. This is the DNS-rebinding guard \n\
+             doing its job; list the name or address you will use."
         );
     }
 

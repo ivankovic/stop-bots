@@ -90,29 +90,56 @@ impl BasePath {
     /// `/stop-bots/` all become `/stop-bots`, and anything empty becomes
     /// the root.
     ///
-    /// Rejects a prefix containing `..` or a query/fragment marker. Those
-    /// cannot arrive from anywhere but a hand-edited setting, but this
-    /// value is concatenated into every URL and every `Location` header on
-    /// the site, and a prefix that can climb out of itself is not
-    /// something to discover later.
+    /// An allowlist, not a blocklist: every segment is URL-unreserved
+    /// characters only (`A-Z a-z 0-9 . _ ~ -`), non-empty, and not `.` or
+    /// `..`.
+    ///
+    /// It used to refuse `..`, `?`, `#` and a space and take everything
+    /// else, and "everything else" was the problem. This value goes three
+    /// places that each have their own syntax: unquoted into a `location`
+    /// line of a site config that a root NGINX loads (a `;`, a brace or a
+    /// newline there writes directives of the caller's choosing), into
+    /// every `Location` header (`\evil.com` is read by browsers as
+    /// `//evil.com`), and into axum's route table (`:id`, `*rest` and
+    /// `{id}` are captures there). Enumerating what each of those treats
+    /// as special is how the first version missed most of it; the
+    /// unreserved set is special to none of them.
     pub fn parse(raw: &str) -> Result<Self> {
         let trimmed = raw.trim().trim_matches('/');
         if trimmed.is_empty() {
             return Ok(Self::default());
         }
-        if trimmed.split('/').any(|segment| segment == "..") {
-            anyhow::bail!("a base path may not contain `..`: {raw}");
-        }
-        if trimmed.contains(['?', '#', ' ']) {
-            anyhow::bail!("a base path may not contain `?`, `#` or a space: {raw}");
+        for segment in trimmed.split('/') {
+            if segment.is_empty() || segment == "." || segment == ".." {
+                anyhow::bail!("a base path may not have an empty, `.` or `..` segment: {raw:?}");
+            }
+            if !segment
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '-'))
+            {
+                anyhow::bail!(
+                    "a base path may only contain letters, digits, `.`, `_`, `~`, `-` and `/`: \
+                     {raw:?}"
+                );
+            }
         }
         Ok(Self(format!("/{trimmed}")))
     }
 
     /// Reads it from `db`, falling back to the root.
+    ///
+    /// Re-parsed rather than trusted, so a value stored before
+    /// [`Self::parse`] tightened stops the server instead of being served.
+    /// The error names the way out, because the only other one is editing
+    /// SQLite by hand.
     pub fn from_db(db: &crate::db::Db) -> Result<Self> {
         match db.get_text_setting(BASE_PATH_KEY)? {
-            Some(raw) => Self::parse(&raw),
+            Some(raw) => Self::parse(&raw).with_context(|| {
+                format!(
+                    "the stored `{BASE_PATH_KEY}` setting is not a usable path prefix; \
+                     replace it with `stop-bots web --base-path /stop-bots --save`"
+                )
+            }),
             None => Ok(Self::default()),
         }
     }
@@ -298,6 +325,68 @@ mod tests {
         for raw in ["/stop bots", "/stop-bots?x=1", "/stop-bots#top"] {
             assert!(BasePath::parse(raw).is_err(), "{raw} must not parse");
         }
+    }
+
+    /// The prefix is written into a root-owned NGINX config as a
+    /// `location`, and NGINX's own syntax is what these would smuggle in:
+    /// a tab or a newline ends the token, `;` ends the directive, a brace
+    /// opens or closes a block, `$` interpolates, a quote or `\` escapes.
+    /// Every one of them used to get through, and the config they
+    /// produced passed `nginx -t`.
+    #[test]
+    fn a_base_path_carrying_nginx_syntax_is_refused() {
+        for raw in [
+            "/stop-bots\tx",
+            "/stop-bots\nerror_log /tmp/x",
+            "/a;b",
+            "/a{b",
+            "/a}b",
+            "/a$host",
+            "/a\"b",
+            "/a'b",
+            "/a\\b",
+            "/a%2fb",
+        ] {
+            assert!(BasePath::parse(raw).is_err(), "{raw:?} must not parse");
+        }
+    }
+
+    /// `\evil.com` became `Location: /\evil.com/login`, which browsers
+    /// read as the protocol-relative `//evil.com/login`.
+    #[test]
+    fn a_base_path_that_would_redirect_off_site_is_refused() {
+        for raw in ["\\evil.com", "/\\evil.com", "/stop-bots/\\\\evil.com"] {
+            assert!(BasePath::parse(raw).is_err(), "{raw:?} must not parse");
+        }
+    }
+
+    /// Axum reads `:name`, `*name` and `{name}` in a route as captures,
+    /// so a prefix carrying one would register a wildcard route.
+    #[test]
+    fn a_base_path_carrying_route_syntax_is_refused() {
+        for raw in ["/:id", "/{id}", "/*rest", "/a//b", "/./a"] {
+            assert!(BasePath::parse(raw).is_err(), "{raw:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn an_ordinary_base_path_still_parses() {
+        for raw in ["/stop-bots", "/admin/stop-bots", "/a.b_c~d-1"] {
+            assert!(BasePath::parse(raw).is_ok(), "{raw:?} must parse");
+        }
+    }
+
+    /// A value stored before the allowlist existed is re-parsed on every
+    /// start. It must stop the server with an error that names the setting
+    /// and the way out, not be served.
+    #[test]
+    fn a_stored_base_path_that_is_no_longer_accepted_fails_closed() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_text_setting(BASE_PATH_KEY, "/x;\n}").unwrap();
+
+        let err = format!("{:#}", BasePath::from_db(&db).unwrap_err());
+        assert!(err.contains(BASE_PATH_KEY), "error was: {err}");
+        assert!(err.contains("--base-path"), "error was: {err}");
     }
 
     #[test]

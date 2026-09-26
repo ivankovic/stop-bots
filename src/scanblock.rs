@@ -655,6 +655,16 @@ fn add_block_rules(
         None => kept,
     };
 
+    // Clamped here as well as refused at every input, because this is the
+    // one place the arithmetic happens and not every caller is an input: a
+    // TTL stored before the ceiling existed arrives through `ttl_days(db)`.
+    // Shadowed, so the outcome reports the TTL that was actually written.
+    // Symmetric rather than from 1: the inputs already refuse anything
+    // under a day, and a negative TTL is how the expiry tests make a rule
+    // that is born expired. What matters here is only that the product
+    // cannot overflow in either direction.
+    let max = crate::protection::MAX_TTL_DAYS;
+    let ttl_days = ttl_days.clamp(-max, max);
     let ttl_seconds = ttl_days * 24 * 60 * 60;
     let mut newly_blocked = Vec::new();
     let mut already_covered = 0;
@@ -748,6 +758,30 @@ mod tests {
         assert_eq!(outcome.newly_blocked, vec!["198.51.100.9".to_string()]);
         assert_eq!(outcome.already_covered, 0);
         assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+    }
+
+    /// A TTL stored before the ceiling existed, or passed on the command
+    /// line, must not overflow into a block that is born expired — that
+    /// is a detector failing open without a word. Debug builds panicked
+    /// instead.
+    #[test]
+    fn a_ttl_too_large_to_represent_still_blocks() {
+        let db = Db::open_in_memory().unwrap();
+        let log = ssh_failed_attempt("198.51.100.9", 25);
+        block_ssh_scanners(&db, 20, i64::MAX, &log, false).unwrap();
+
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1, "the block was pruned as already expired");
+        let expires = rules[0].expires_at.expect("a detector block expires");
+        let ceiling = crate::protection::MAX_TTL_DAYS * 24 * 60 * 60;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            expires - now <= ceiling,
+            "expires {expires}, more than the ceiling from now"
+        );
     }
 
     #[test]

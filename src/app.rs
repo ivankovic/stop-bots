@@ -2486,7 +2486,7 @@ mod tests {
 
         let written = std::fs::read_to_string(&site).unwrap();
         assert!(
-            written.contains("location /stop-bots/"),
+            written.contains(r#"location "/stop-bots/""#),
             "the console location never landed:\n{written}"
         );
         assert_eq!(

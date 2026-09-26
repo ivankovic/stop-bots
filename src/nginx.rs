@@ -1431,10 +1431,17 @@ pub enum ConsoleAccess {
 /// it would leave every link pointing outside the location block. See
 /// `--base-path` in `main.rs` for the same warning aimed at whoever writes
 /// this by hand.
+///
+/// The prefix is quoted, with any `"` or `\` inside it escaped. It has
+/// already passed `BasePath::parse`, which admits nothing NGINX treats as
+/// syntax; the quotes are what keep that true if a prefix ever reaches
+/// here some other way. This file is loaded by a root NGINX, and an
+/// unquoted `;` or `}` in it is a directive of the caller's choosing.
 fn console_location(prefix: &str, upstream: &std::net::SocketAddr) -> String {
+    let prefix = prefix.replace('\\', r"\\").replace('"', r#"\""#);
     format!(
         "    {CONSOLE_BEGIN}\n    \
-         location {prefix} {{\n        \
+         location \"{prefix}\" {{\n        \
          proxy_pass http://{upstream};\n        \
          proxy_set_header Host $host;\n        \
          proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        \
@@ -4323,12 +4330,43 @@ server {
         let block = console_location("/stop-bots/", &upstream());
 
         assert!(
-            block.contains("location /stop-bots/ {"),
+            block.contains(r#"location "/stop-bots/" {"#),
             "block was:\n{block}"
         );
         assert!(
             block.contains("proxy_pass http://127.0.0.1:8787;"),
             "a trailing slash here strips the prefix:\n{block}"
+        );
+    }
+
+    /// The whole site file after path mode edits it — the exact bytes to
+    /// hand `nginx -t`, and the pin on the quoted `location` prefix.
+    #[test]
+    fn the_path_mode_console_block_matches_the_golden() {
+        let updated =
+            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
+                .unwrap();
+        crate::golden::assert_golden("nginx-console-path.conf", &updated);
+    }
+
+    #[test]
+    fn the_subdomain_console_block_matches_the_golden() {
+        let block = console_server_block("console.example.com", &upstream());
+        crate::golden::assert_golden("nginx-console-subdomain.conf", &block);
+    }
+
+    /// Quoting is the second line behind `BasePath::parse`, not a
+    /// substitute for it: `ConsoleAccess::Path` is a public type, and a
+    /// prefix that reaches it some other way must still be one token. A
+    /// quote or backslash inside it is escaped, so it cannot close the
+    /// string early.
+    #[test]
+    fn the_console_location_keeps_a_hostile_prefix_inside_its_quotes() {
+        let block = console_location(r#"/a\" { } ;"#, &upstream());
+
+        assert!(
+            block.contains(r#"location "/a\\\" { } ;" {"#),
+            "block was:\n{block}"
         );
     }
 
@@ -4354,8 +4392,11 @@ server {
             with_console_location(&first, "example.com", "/console/", &upstream()).unwrap();
 
         assert_eq!(second.matches(CONSOLE_BEGIN).count(), 1);
-        assert!(second.contains("location /console/ {"), "was:\n{second}");
-        assert!(!second.contains("location /stop-bots/ {"), "was:\n{second}");
+        assert!(
+            second.contains(r#"location "/console/" {"#),
+            "was:\n{second}"
+        );
+        assert!(!second.contains("/stop-bots/"), "was:\n{second}");
     }
 
     /// The console markers must not collide with the bot-blocking ones:
@@ -4374,7 +4415,7 @@ server {
 
         assert!(both.contains(CONSOLE_BEGIN), "console block lost:\n{both}");
         assert!(both.contains(BLOCK_BEGIN), "blocking block lost:\n{both}");
-        assert!(both.contains("location /stop-bots/ {"), "was:\n{both}");
+        assert!(both.contains(r#"location "/stop-bots/" {"#), "was:\n{both}");
     }
 
     #[test]

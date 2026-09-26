@@ -51,6 +51,15 @@ use anyhow::Result;
 /// anything on a fresh install before there's data to check against.
 pub const SPOOFED_CRAWLERS_ENABLED_DEFAULT: bool = true;
 
+/// The longest a detector's block may last: ten years.
+///
+/// Not a policy anyone is expected to reach — the TUI offers a month at
+/// most — but the TTL becomes `days * 86_400` seconds added to now, and
+/// without a ceiling a large enough number wrapped in release builds
+/// (a block born already expired, so a detector that silently blocks
+/// nothing) and panicked in debug ones.
+pub const MAX_TTL_DAYS: i64 = 3650;
+
 /// One day, matching `block-web-scanners` rather than `block-scanners`'
 /// five. The failure mode worth designing against is a crawler operator
 /// adding a range faster than the daily `UpdateIpRanges` job picks it up:
@@ -338,7 +347,12 @@ impl Detector {
         db.set_bool_setting(&self.enabled_key(), enabled)
     }
 
+    /// Refuses anything outside one day to [`MAX_TTL_DAYS`], so no front-end
+    /// can store a TTL the block arithmetic cannot carry.
     pub fn set_ttl_days(self, db: &Db, days: i64) -> Result<()> {
+        if !(1..=MAX_TTL_DAYS).contains(&days) {
+            anyhow::bail!("a block lasts from 1 to {MAX_TTL_DAYS} days, not {days}");
+        }
         db.set_int_setting(&self.ttl_key(), days)
     }
 }
@@ -522,6 +536,19 @@ mod tests {
             assert_eq!(d.is_enabled(&db).unwrap(), d.spec().enabled_default);
             assert_eq!(d.ttl_days(&db).unwrap(), d.spec().ttl_days_default);
         }
+    }
+
+    #[test]
+    fn a_ttl_outside_one_day_to_ten_years_is_not_stored() {
+        let db = Db::open_in_memory().unwrap();
+        for days in [0, -1, MAX_TTL_DAYS + 1, i64::MAX] {
+            assert!(
+                Detector::Honeypot.set_ttl_days(&db, days).is_err(),
+                "{days} day(s) was accepted"
+            );
+        }
+        Detector::Honeypot.set_ttl_days(&db, MAX_TTL_DAYS).unwrap();
+        assert_eq!(Detector::Honeypot.ttl_days(&db).unwrap(), MAX_TTL_DAYS);
     }
 
     #[test]

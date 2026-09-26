@@ -913,13 +913,17 @@ pub struct UserAgentForm {
     pub user_agent: String,
 }
 
-/// Blocks an address, unless it is the one asking.
+/// Blocks an address, unless it covers the one asking, or every address.
 ///
 /// The anti-lockout guard, and the web equivalent of
 /// `firewall::assess_lockout_risk`. Blocking the address your own browser
 /// is connecting from takes away the console you would use to undo it —
 /// and unlike the SSH case there is no second way in that this tool is not
 /// also managing.
+///
+/// A `/0` is refused first, whoever is asking: it takes every client off
+/// the network, not just this one, and the guard cannot see the
+/// operator's other ways in.
 async fn block_address(
     State(state): State<AppState>,
     axum::Extension(client): axum::Extension<ClientAddr>,
@@ -928,6 +932,18 @@ async fn block_address(
 ) -> Response {
     let address = form.address;
 
+    if crate::db::is_every_address(&address) {
+        return back_with(
+            &state.base,
+            "/firewall",
+            &format!(
+                "Refusing to block {}: that is every address, which would take this host off \
+                 the network.",
+                address.trim()
+            ),
+            false,
+        );
+    }
     if let Some(reason) = would_lock_out(&client, &address) {
         return back_with(&state.base, "/firewall", &reason, false);
     }
@@ -959,19 +975,27 @@ async fn block_address(
 /// sharper reason than the SSH one: blocking the address your own browser
 /// is connected from takes away the console you would use to undo it.
 ///
+/// Containment, not equality. It used to compare the two as text, and a
+/// block is stored trimmed and may be a range, so ` 203.0.113.5`,
+/// `203.0.113.5/32`, `203.0.113.0/24` and `2001:DB8::1` (for a client
+/// seen as `2001:db8::1`) all walked past it. `cidr_contains` is the
+/// check the SSH guard already makes, and treats a bare address as its
+/// own `/32` or `/128`.
+///
 /// A `None` client address means this server could not tell where the
 /// request came from, and the block goes ahead. That is the honest
 /// behaviour — refusing every block because the address is unknown would
 /// make the tool useless in exactly the deployment (behind a proxy, header
 /// untrusted) where it is most wanted.
 fn would_lock_out(client: &ClientAddr, address: &str) -> Option<String> {
-    match client.0.as_deref() {
-        Some(client) if client == address => Some(format!(
-            "Refusing to block {address} — that is where this request came from, and blocking \
-             it would lock you out of this console."
-        )),
-        _ => None,
-    }
+    let client = client.0?;
+    let address = address.trim();
+    crate::ipranges::cidr_contains(address, client).then(|| {
+        format!(
+            "Refusing to block {address} — it covers {client}, where this request came from, \
+             and blocking it would lock you out of this console."
+        )
+    })
 }
 
 async fn unblock_address(

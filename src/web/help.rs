@@ -163,7 +163,10 @@ fn body(view: &View) -> Markup {
                             "certificate. It goes in the site\u{2019}s TLS "
                             code { "server" }
                             " block, not its port-80 redirect \u{2014} a login form does not belong on "
-                            "the cleartext half of a site that has a certificate."
+                            "the cleartext half of a site that has a certificate. "
+                            "It also shares the site\u{2019}s origin, so a flaw in any other app on "
+                            "that site can drive this console as you: use it only on a site that "
+                            "runs nothing you do not fully trust, and otherwise use a subdomain."
                         },
                     ))
                     (row(
@@ -520,6 +523,17 @@ mod tests {
             rendered.contains("certbot --nginx -d &lt;host&gt;"),
             "the fix for it has to be there too"
         );
+    }
+
+    #[test]
+    fn the_help_says_path_mode_shares_the_site_s_origin() {
+        let rendered = body(&view(true)).into_string();
+
+        assert!(
+            rendered.contains("shares the site\u{2019}s origin"),
+            "the same-origin trade of path mode must be on the page"
+        );
+        assert!(rendered.contains("use a subdomain"), "and the alternative");
     }
 
     #[test]

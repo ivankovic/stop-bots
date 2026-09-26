@@ -1009,6 +1009,15 @@ impl Dashboard {
                     lines.push(Line::from("Site:").bold());
                     lines.push(Line::from(site_label));
                     lines.push(Line::from(format!("Prefix: {prefix}_")));
+                    // The same caveat the console's panel states: any
+                    // other app on the site is same-origin with this one.
+                    lines.push(
+                        Line::from(
+                            "Shares the site's origin: only if you fully trust its other apps;",
+                        )
+                        .dim(),
+                    );
+                    lines.push(Line::from("otherwise use a subdomain.").dim());
                 }
                 if let Some(err) = &error {
                     lines.push(Line::from(err.as_str()).red());
@@ -2793,6 +2802,48 @@ mod tests {
                 "content was:\n{content}"
             );
         }
+    }
+
+    /// Path mode is chosen here as often as in the console, so the
+    /// same-origin trade has to be stated here too.
+    #[test]
+    fn the_web_access_popup_says_path_mode_shares_the_site_s_origin() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('w')), &db, &mut message)
+            .unwrap();
+
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &[],
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+        let content = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+
+        assert!(
+            content.contains("Shares the site's origin"),
+            "content was:\n{content}"
+        );
+        assert!(
+            content.contains("use a subdomain"),
+            "content was:\n{content}"
+        );
     }
 
     /// The Web Access popup in path mode hands back the site it is

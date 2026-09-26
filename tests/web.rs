@@ -49,12 +49,18 @@ fn app_under(base: &str) -> (Router, String, tempfile::TempDir, std::path::PathB
     let nginx_root = tmp.path().join("nginx");
     std::fs::create_dir_all(nginx_root.join("sites-enabled")).unwrap();
 
+    // An SSH log that exists and names nobody. Without one the lockout
+    // guard goes looking for the host's own, which a test must never read,
+    // and on a host where it cannot, every apply is (rightly) refused.
+    let ssh_log = tmp.path().join("auth.log");
+    std::fs::write(&ssh_log, "").unwrap();
+
     // `apply_for_real: false` throughout — a test must never reload the
     // developer's NGINX or run a firewall script at them.
     let mut state = AppState::with_base(
         Db::open(&db_path).unwrap(),
         nginx_root,
-        None,
+        Some(ssh_log),
         false,
         stop_bots::web::BasePath::parse(base).unwrap(),
     );
@@ -319,6 +325,49 @@ async fn logging_out_ends_the_session_server_side() {
     );
 }
 
+/// `stop-bots web --set-password` runs as a separate process and can only
+/// change the stored hash. That has to be enough to end a session this
+/// server is holding in memory — rotating the password is what an
+/// operator does when they think a session has leaked.
+#[tokio::test]
+async fn a_new_password_ends_the_sessions_opened_under_the_old_one() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let rotated = stop_bots::web::auth::generate_password().unwrap();
+    stop_bots::web::auth::set_password(&Db::open(&db_path).unwrap(), &rotated).unwrap();
+
+    let response = app.oneshot(with_cookie(get("/"), &cookie)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION],
+        "/login",
+        "a session from before the rotation must not still open the app"
+    );
+}
+
+/// Under a prefix `/login` is the host site's own page, or a 404 — not
+/// this console's.
+#[tokio::test]
+async fn logging_out_under_a_prefix_lands_on_the_prefixed_login() {
+    let (app, password, _tmp, _db) = app_under(PREFIX);
+    let response = app
+        .clone()
+        .oneshot(post(
+            &format!("{PREFIX}/login"),
+            &format!("password={password}"),
+        ))
+        .await
+        .unwrap();
+    let cookie = session_cookie_from(&response);
+
+    let response = app
+        .oneshot(with_cookie(post(&format!("{PREFIX}/logout"), ""), &cookie))
+        .await
+        .unwrap();
+    assert_eq!(response.headers()[header::LOCATION], "/stop-bots/login");
+}
+
 // ---- DNS rebinding ----
 
 #[tokio::test]
@@ -337,6 +386,30 @@ async fn a_request_carrying_an_unlisted_host_is_refused() {
         StatusCode::MISDIRECTED_REQUEST,
         "this is the DNS-rebinding guard; a rebound request arrives under the attacker's name"
     );
+}
+
+/// The refusal is the one response an attacker's page can provoke, so it
+/// gets the same headers as everything else rather than none.
+#[tokio::test]
+async fn the_host_refusal_carries_the_security_headers_too() {
+    let (app, _password, _tmp) = app();
+
+    let request = Request::builder()
+        .uri("/login")
+        .header(header::HOST, "evil.example")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::MISDIRECTED_REQUEST);
+    let headers = response.headers();
+    for name in [
+        "content-security-policy",
+        "x-content-type-options",
+        "x-frame-options",
+    ] {
+        assert!(headers.contains_key(name), "{name} missing from the 421");
+    }
 }
 
 #[tokio::test]
@@ -733,6 +806,32 @@ async fn a_zero_day_ttl_is_refused() {
     )
     .await;
     assert!(flash.contains("at least a day"), "was: {flash}");
+    assert_eq!(
+        detector.ttl_days(&Db::open(&db_path).unwrap()).unwrap(),
+        before
+    );
+}
+
+/// Days times 86,400 plus now overflowed for a large enough number, and a
+/// block born already expired is a detector that silently does nothing.
+#[tokio::test]
+async fn a_ttl_past_ten_years_is_refused() {
+    use stop_bots::protection::Detector;
+
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let detector = Detector::ALL[0];
+    let before = detector.ttl_days(&Db::open(&db_path).unwrap()).unwrap();
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/detector-ttl",
+        &format!("detector={}&days=106751991167301", detector.id()),
+    )
+    .await;
+    assert!(flash.contains("at most"), "was: {flash}");
     assert_eq!(
         detector.ttl_days(&Db::open(&db_path).unwrap()).unwrap(),
         before
@@ -1450,6 +1549,98 @@ async fn blocking_a_different_address_from_the_same_peer_still_works() {
     );
 }
 
+/// Posts a block from `peer` and returns the flash plus whether anything
+/// was stored.
+async fn block_from(peer: &str, address: &str) -> (String, usize) {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let body = format!("csrf={csrf}&address={}", address.replace('/', "%2F"));
+    let request = from_peer(
+        with_cookie(post("/firewall/block-address", &body), &cookie),
+        peer,
+    );
+    let response = app.oneshot(request).await.unwrap();
+    let flash = percent_decode(response.headers()[header::LOCATION].to_str().unwrap());
+    let stored = Db::open(&db_path)
+        .unwrap()
+        .list_firewall_rules()
+        .unwrap()
+        .len();
+    (flash, stored)
+}
+
+/// The guard used to be `client == address`, text against text. Every
+/// other way of writing a block that covers the caller walked past it.
+#[tokio::test]
+async fn any_block_that_covers_the_caller_is_refused() {
+    for target in [
+        "203.0.113.0/24",
+        "203.0.113.5/32",
+        "%20203.0.113.5",
+        "203.0.0.0/8",
+    ] {
+        let (flash, stored) = block_from("203.0.113.5:44321", target).await;
+        assert!(
+            flash.contains("lock you out"),
+            "{target}: flash was {flash}"
+        );
+        assert_eq!(stored, 0, "{target} was stored");
+    }
+}
+
+#[tokio::test]
+async fn an_ipv6_block_is_compared_as_an_address_not_as_text() {
+    for target in ["2001:DB8::1", "2001:db8:0:0::1", "2001:db8::/32"] {
+        let (flash, stored) = block_from("[2001:db8::1]:44321", target).await;
+        assert!(
+            flash.contains("lock you out"),
+            "{target}: flash was {flash}"
+        );
+        assert_eq!(stored, 0, "{target} was stored");
+    }
+}
+
+/// A dual-stack bind reports an IPv4 client as `::ffff:a.b.c.d`.
+#[tokio::test]
+async fn an_ipv4_client_on_a_dual_stack_bind_is_still_recognised() {
+    let (flash, stored) = block_from("[::ffff:203.0.113.5]:44321", "203.0.113.5").await;
+    assert!(flash.contains("lock you out"), "flash was {flash}");
+    assert_eq!(stored, 0);
+}
+
+/// Every address, whoever is asking — and whether or not this server can
+/// tell who that is.
+#[tokio::test]
+async fn a_manual_block_of_every_address_is_refused() {
+    for target in ["0.0.0.0/0", "::/0"] {
+        let (app, password, _tmp, db_path) = app_with_db();
+        let (cookie, csrf) = login(&app, &password).await;
+
+        let (_, flash) = act(
+            &app,
+            &cookie,
+            &csrf,
+            "/firewall/block-address",
+            &format!("address={}", target.replace('/', "%2F")),
+        )
+        .await;
+
+        assert!(
+            flash.contains("every address"),
+            "{target}: flash was {flash}"
+        );
+        assert!(
+            Db::open(&db_path)
+                .unwrap()
+                .list_firewall_rules()
+                .unwrap()
+                .is_empty(),
+            "{target} was stored"
+        );
+    }
+}
+
 /// With a proxy in front, the peer is the proxy. The guard follows
 /// `X-Forwarded-For` — but only once the operator has said a proxy exists,
 /// because otherwise the header is just text anyone can send.
@@ -1877,7 +2068,10 @@ async fn a_correct_password_still_works_after_a_few_typos() {
 async fn logging_in_successfully_resets_the_throttle() {
     let (app, password, _tmp, _db) = app_with_db();
 
-    for _ in 0..4 {
+    // Every free attempt, so the next failure without a reset would start
+    // the backoff. Fewer than that would pass with no reset at all.
+    let free = stop_bots::web::auth::ThrottleConfig::default().free_attempts;
+    for _ in 0..free {
         app.clone()
             .oneshot(post("/login", "password=wrong"))
             .await
@@ -1888,9 +2082,20 @@ async fn logging_in_successfully_resets_the_throttle() {
         .await
         .unwrap();
 
-    // Back to a plain 401 rather than a 429 carried over from before.
-    let response = app.oneshot(post("/login", "password=wrong")).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    // Two more typos: the first would set a delay if the history had
+    // survived, and the second would be refused by it.
+    for attempt in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(post("/login", "password=wrong"))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "typo {attempt} after a good login should be a plain refusal, not a carried-over 429"
+        );
+    }
 }
 
 /// The 429 page is still the login page, so the operator sees why and can
@@ -2418,7 +2623,7 @@ async fn setting_up_path_access_writes_the_config_and_both_settings() {
     assert!(flash.contains("Wrote"), "was: {flash}");
     let written = std::fs::read_to_string(&site).unwrap();
     assert!(
-        written.contains("location /stop-bots/ {"),
+        written.contains(r#"location "/stop-bots/" {"#),
         "config was:\n{written}"
     );
     assert!(

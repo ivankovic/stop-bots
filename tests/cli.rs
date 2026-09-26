@@ -906,6 +906,30 @@ fn trust_refuses_what_would_trust_more_than_it_says() {
         .stdout(predicate::str::contains("Nothing is trusted."));
 }
 
+/// The mirror of trust's `/0` refusal: blocking every address is the host
+/// off the network, not a rule.
+#[test]
+fn add_firewall_rule_refuses_a_block_of_every_address() {
+    let fx = Fixture::new();
+    for address in ["0.0.0.0/0", "::/0", " 0.0.0.0/0"] {
+        fx.cmd(&["add-firewall-rule", "--address", address])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("every address"));
+    }
+    fx.run(&["list-firewall-rules"])
+        .stdout(predicate::str::contains("No firewall rules stored."));
+
+    // Closing one port to everyone is an ordinary rule.
+    fx.run(&[
+        "add-firewall-rule",
+        "--address",
+        "0.0.0.0/0",
+        "--port",
+        "23",
+    ]);
+}
+
 /// Per-site path exemptions end to end: the generated block switches to
 /// the flag form, and only the exempted path escapes the rule.
 #[test]
@@ -1762,6 +1786,29 @@ fn render_firewall_allowlist_mode_does_not_warn_when_an_earlier_allow_rule_cover
 
 fn repeat_failed_attempt(ip: &str, times: usize) -> String {
     format!("Failed password for root from {ip} port 4444 ssh2\n").repeat(times)
+}
+
+/// Every detector subcommand's `--ttl-days` has the ceiling the console
+/// and the TUI have; past it the arithmetic that dates the block wraps.
+/// `=` so clap does not read the negative one as a flag.
+#[test]
+fn a_ttl_past_ten_years_is_refused_on_the_command_line() {
+    let fx = Fixture::new();
+    for command in [
+        "block-scanners",
+        "block-web-scanners",
+        "block-spoofed-crawlers",
+        "block-probe-paths",
+        "block-honeypot",
+    ] {
+        for days in ["3651", "106751991167301", "-106751991167301"] {
+            let flag = format!("--ttl-days={days}");
+            fx.cmd(&[command, "--dry-run", &flag])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("--ttl-days"));
+        }
+    }
 }
 
 #[test]

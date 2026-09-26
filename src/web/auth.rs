@@ -67,9 +67,17 @@ pub const SESSION_COOKIE: &str = "stop_bots_session";
 /// Eight hours rather than a token minute: this is an admin console, and
 /// the realistic failure of a short expiry is someone leaving the page
 /// open on a wall display and finding it logged out, not an attacker
-/// waiting one out. Idle time, not absolute age — `Sessions::validate`
-/// pushes it forward on every request.
+/// waiting one out. Idle time — `Sessions::validate` pushes it forward on
+/// every request, which is why [`SESSION_MAX_AGE`] exists as well.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(8 * 60 * 60);
+
+/// How long a session lasts however busy it is.
+///
+/// The idle timeout alone slides forever: a session used once every few
+/// hours — or a stolen cookie replayed on a timer — never ends. Twelve
+/// hours is a working day with room to spare, so the operator logs in
+/// about once a day and a leaked cookie is worth half of one.
+const SESSION_MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Bytes of randomness in a session id and in a CSRF token. 32 bytes is
 /// well past what is guessable and costs nothing.
@@ -83,6 +91,19 @@ struct Session {
     csrf: String,
     /// When it was last used, for the idle timeout.
     last_seen: Instant,
+    /// When it was created, for [`SESSION_MAX_AGE`].
+    created: Instant,
+    /// The stored password hash this session logged in under.
+    ///
+    /// Sessions live in this process's memory, but the password is changed
+    /// by another one — `stop-bots web --set-password` only rewrites the
+    /// hash in the database. Binding each session to the hash it was
+    /// created under is what lets that rotation end them: a new password
+    /// is a new salt and so a new hash, and every older session stops
+    /// matching. The hash rather than a separate generation counter
+    /// because it is already the thing that changes, and there is no
+    /// second setting to forget to bump.
+    credential: String,
 }
 
 /// Every live session, keyed by session id.
@@ -106,10 +127,13 @@ pub struct Authenticated {
 }
 
 impl Sessions {
-    /// Creates a session and returns `(session_id, csrf_token)`.
-    pub fn create(&self) -> Result<(String, String)> {
+    /// Creates a session bound to `credential` — the stored password hash
+    /// the login was just verified against — and returns
+    /// `(session_id, csrf_token)`.
+    pub fn create(&self, credential: &str) -> Result<(String, String)> {
         let id = random_token()?;
         let csrf = random_token()?;
+        let now = Instant::now();
         self.inner
             .lock()
             .expect("the session map is never held across a panic")
@@ -117,15 +141,32 @@ impl Sessions {
                 id.clone(),
                 Session {
                     csrf: csrf.clone(),
-                    last_seen: Instant::now(),
+                    last_seen: now,
+                    created: now,
+                    credential: credential.to_string(),
                 },
             );
         Ok((id, csrf))
     }
 
     /// Looks `id` up, refreshing its idle timer. `None` if it does not
-    /// exist or has gone idle for too long.
-    pub fn validate(&self, id: &str) -> Option<Authenticated> {
+    /// exist, has gone idle for too long, has outlived
+    /// [`SESSION_MAX_AGE`], or was created under a password hash other
+    /// than `credential` — the one stored now, read by the caller. `None`
+    /// for `credential` means no password is stored, and nothing
+    /// validates.
+    pub fn validate(&self, id: &str, credential: Option<&str>) -> Option<Authenticated> {
+        self.validate_at(id, credential, Instant::now())
+    }
+
+    /// [`Self::validate`] at a given moment, so the timeouts can be tested
+    /// without sleeping through them.
+    fn validate_at(
+        &self,
+        id: &str,
+        credential: Option<&str>,
+        now: Instant,
+    ) -> Option<Authenticated> {
         let mut sessions = self
             .inner
             .lock()
@@ -134,10 +175,19 @@ impl Sessions {
         // Sweep here rather than on a timer: sessions are few, this runs
         // on every request anyway, and a background task to expire a
         // handful of map entries is machinery for its own sake.
-        let now = Instant::now();
-        sessions.retain(|_, s| now.duration_since(s.last_seen) < SESSION_IDLE_TIMEOUT);
+        sessions.retain(|_, s| {
+            now.saturating_duration_since(s.last_seen) < SESSION_IDLE_TIMEOUT
+                && now.saturating_duration_since(s.created) < SESSION_MAX_AGE
+        });
 
         let session = sessions.get_mut(id)?;
+        // Not a secret comparison: both sides are the stored hash, which
+        // the requester never sees. Dropped rather than just refused, so
+        // a session from before a rotation cannot come back.
+        if credential != Some(session.credential.as_str()) {
+            sessions.remove(id);
+            return None;
+        }
         session.last_seen = now;
         Some(Authenticated {
             csrf: session.csrf.clone(),
@@ -451,6 +501,12 @@ pub fn set_password(db: &Db, password: &str) -> Result<()> {
         .to_string();
     db.set_text_setting(PASSWORD_HASH_KEY, &hash)
         .context("failed to store the password hash")
+}
+
+/// The stored password hash, which is what a session is bound to (see
+/// [`Sessions::validate`]). `None` if no password has been set.
+pub fn current_credential(db: &Db) -> Result<Option<String>> {
+    db.get_text_setting(PASSWORD_HASH_KEY)
 }
 
 /// Whether a password has been set at all. The web server refuses to bind
@@ -814,24 +870,34 @@ mod tests {
         assert!(!verify_password(&db, "anything").unwrap());
     }
 
+    /// What a session is bound to: the stored password hash it was
+    /// created under. Any string will do for tests of the map itself.
+    const CREDENTIAL: Option<&str> = Some("hash-at-login");
+
+    fn session_under(sessions: &Sessions) -> (String, String) {
+        sessions.create(CREDENTIAL.unwrap()).unwrap()
+    }
+
     #[test]
     fn a_created_session_validates_once_and_not_under_another_id() {
         let sessions = Sessions::default();
-        let (id, csrf) = sessions.create().unwrap();
+        let (id, csrf) = session_under(&sessions);
 
-        let authenticated = sessions.validate(&id).expect("the session just created");
+        let authenticated = sessions
+            .validate(&id, CREDENTIAL)
+            .expect("the session just created");
         assert_eq!(authenticated.csrf, csrf);
-        assert!(sessions.validate("not-a-session-id").is_none());
+        assert!(sessions.validate("not-a-session-id", CREDENTIAL).is_none());
     }
 
     #[test]
     fn a_removed_session_stops_validating() {
         let sessions = Sessions::default();
-        let (id, _) = sessions.create().unwrap();
+        let (id, _) = session_under(&sessions);
         sessions.remove(&id);
 
         assert!(
-            sessions.validate(&id).is_none(),
+            sessions.validate(&id, CREDENTIAL).is_none(),
             "logout has to actually end the session, not just clear the cookie"
         );
         assert!(sessions.is_empty());
@@ -840,12 +906,68 @@ mod tests {
     #[test]
     fn two_sessions_get_distinct_ids_and_tokens() {
         let sessions = Sessions::default();
-        let (first_id, first_csrf) = sessions.create().unwrap();
-        let (second_id, second_csrf) = sessions.create().unwrap();
+        let (first_id, first_csrf) = session_under(&sessions);
+        let (second_id, second_csrf) = session_under(&sessions);
 
         assert_ne!(first_id, second_id);
         assert_ne!(first_csrf, second_csrf);
         assert_eq!(sessions.len(), 2);
+    }
+
+    /// `stop-bots web --set-password` is another process: all it can
+    /// change is the stored hash. A session from before it — including
+    /// one somebody stole, which is the usual reason to rotate — has to
+    /// stop working on its next request.
+    #[test]
+    fn a_new_password_ends_every_session_from_before_it() {
+        let sessions = Sessions::default();
+        let (id, _) = session_under(&sessions);
+
+        assert!(sessions
+            .validate(&id, Some("hash-after-rotation"))
+            .is_none());
+        assert!(
+            sessions.validate(&id, CREDENTIAL).is_none(),
+            "a rejected session is dropped, not merely refused this once"
+        );
+    }
+
+    #[test]
+    fn with_no_password_stored_no_session_validates() {
+        let sessions = Sessions::default();
+        let (id, _) = session_under(&sessions);
+
+        assert!(sessions.validate(&id, None).is_none());
+    }
+
+    #[test]
+    fn a_session_in_steady_use_still_ends_at_its_absolute_lifetime() {
+        let sessions = Sessions::default();
+        let (id, _) = session_under(&sessions);
+        let start = Instant::now();
+
+        // Used every hour, so the idle timeout never fires.
+        for hour in 1..SESSION_MAX_AGE.as_secs() / 3600 {
+            let at = start + Duration::from_secs(hour * 3600);
+            assert!(
+                sessions.validate_at(&id, CREDENTIAL, at).is_some(),
+                "a session in use for {hour}h should still be valid"
+            );
+        }
+        let past = start + SESSION_MAX_AGE + Duration::from_secs(60);
+        assert!(
+            sessions.validate_at(&id, CREDENTIAL, past).is_none(),
+            "the idle timer slides; the absolute lifetime must not"
+        );
+    }
+
+    #[test]
+    fn an_idle_session_still_expires_on_the_idle_timeout() {
+        let sessions = Sessions::default();
+        let (id, _) = session_under(&sessions);
+        let later = Instant::now() + SESSION_IDLE_TIMEOUT + Duration::from_secs(1);
+
+        assert!(sessions.validate_at(&id, CREDENTIAL, later).is_none());
     }
 
     #[test]

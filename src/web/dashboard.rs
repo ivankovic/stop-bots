@@ -553,7 +553,7 @@ fn detectors_panel(view: &View, ctx: &Ctx) -> Markup {
                                 form .row.tight method="post" action=(ctx.url("/detector-ttl")) {
                                     (layout::csrf_field(ctx))
                                     input type="hidden" name="detector" value=(detector.id());
-                                    input .short type="number" name="days" min="1" max="3650"
+                                    input .short type="number" name="days" min="1" max=(crate::protection::MAX_TTL_DAYS)
                                         value=(ttl_days) size="4";
                                     button type="submit" { "Set" }
                                 }
@@ -830,6 +830,15 @@ fn web_access_panel(view: &View, ctx: &Ctx) -> Markup {
                     "certificate. It also records the prefix and the host name, because this "
                     "server matches the full path including the prefix and refuses a request "
                     "carrying a host it was not told about."
+                }
+                // Said where the choice is made. Path mode stays the
+                // default for the certificate, but a script running in
+                // any other app on that site is same-origin with this
+                // console and can read its CSRF token.
+                p .hint {
+                    "Path mode also shares the site\u{2019}s origin: a flaw in any other app on "
+                    "that site can drive this console as you. Use it only on a site that runs "
+                    "nothing you do not fully trust; otherwise use a subdomain."
                 }
                 p .hint {
                     "Subdomain mode writes a new "
@@ -1235,6 +1244,17 @@ async fn set_detector_ttl(
             false,
         );
     }
+    if form.days > crate::protection::MAX_TTL_DAYS {
+        return back_with(
+            &state.base,
+            "/",
+            &format!(
+                "A block can last at most {} days.",
+                crate::protection::MAX_TTL_DAYS
+            ),
+            false,
+        );
+    }
     let days = form.days;
     match state
         .with_db(move |db| detector.set_ttl_days(db, days))
@@ -1407,8 +1427,11 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
 /// place it happens, and the guards are what make it defensible:
 ///
 /// - `assess_lockout_risk` runs against the rules in the order the script
-///   will evaluate them, before anything is written — the same guard
-///   `batch --apply` runs, and a risk is a refusal, not a warning.
+///   will evaluate them, before anything is written, and a risk is a
+///   refusal, not a warning. A guard that *could not run* — no readable
+///   SSH log — refuses the apply but not the write, which is where
+///   `batch --apply`, the TUI and the internal cron all draw the line. It
+///   used to count as a pass here.
 /// - `apply_for_real` gates the run itself, so `stop-bots web --no-apply`
 ///   keeps the old write-only behaviour.
 /// - The script that runs is the one just written to `firewall_out`, not a
@@ -1427,7 +1450,7 @@ async fn write_and_apply_firewall(state: &AppState) -> anyhow::Result<String> {
 async fn write_firewall(state: &AppState, apply: bool) -> anyhow::Result<String> {
     let out_override = state.firewall_out.clone();
     let ssh_log = state.ssh_log.clone();
-    let (path, count, backend) = state
+    let (path, count, backend, guard_ran) = state
         .with_db(move |db| {
             let backend = crate::firewall::stored_backend(db)?;
             // Derived from the backend inside the same closure that chose
@@ -1435,23 +1458,28 @@ async fn write_firewall(state: &AppState, apply: bool) -> anyhow::Result<String>
             // `.nft` file is what happens when they are decided apart.
             let out = crate::firewall::output_path(out_override.as_deref(), backend);
             let built = crate::firewall::build_script(db, backend)?;
-            match crate::firewall::assess_lockout_risk(&built.rules, ssh_log.as_deref()) {
-                LockoutStatus::Risks(risks) if !risks.is_empty() => {
-                    let names: Vec<String> = risks
-                        .into_iter()
-                        .map(|(ip, rule)| format!("{ip} (by rule {rule})"))
-                        .collect();
-                    anyhow::bail!(
-                        "refusing to write: these rules would block a currently-connected SSH \
+            // Whether the guard actually looked. An unreadable log is not a
+            // pass: writing still goes ahead, because a written script is
+            // inert, but running it is refused below.
+            let guard_ran =
+                match crate::firewall::assess_lockout_risk(&built.rules, ssh_log.as_deref()) {
+                    LockoutStatus::Risks(risks) if !risks.is_empty() => {
+                        let names: Vec<String> = risks
+                            .into_iter()
+                            .map(|(ip, rule)| format!("{ip} (by rule {rule})"))
+                            .collect();
+                        anyhow::bail!(
+                            "refusing to write: these rules would block a currently-connected SSH \
                          client — {}. Unblock it first.",
-                        names.join(", ")
-                    )
-                }
-                LockoutStatus::Risks(_) | LockoutStatus::LogUnavailable => {}
-            }
+                            names.join(", ")
+                        )
+                    }
+                    LockoutStatus::Risks(_) => true,
+                    LockoutStatus::LogUnavailable => false,
+                };
             crate::firewall::write_script(&out, &built.script)?;
             db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
-            anyhow::Ok((out, built.rules.len(), backend))
+            anyhow::Ok((out, built.rules.len(), backend, guard_ran))
         })
         .await?;
 
@@ -1460,6 +1488,16 @@ async fn write_firewall(state: &AppState, apply: bool) -> anyhow::Result<String>
             "Wrote {count} rule(s) to {}. Run it to apply.",
             path.display()
         ));
+    }
+    // Before `apply_for_real`, as the cron orders it, so `--no-apply` is
+    // not what hides the refusal.
+    if !guard_ran {
+        anyhow::bail!(
+            "wrote {count} rule(s) to {}, but not applied: no SSH log could be read, so the \
+             lockout check could not run. Start `stop-bots web` with --ssh-log <path>, or run \
+             the script by hand.",
+            path.display()
+        );
     }
     if !state.apply_for_real {
         return Ok(format!(
@@ -1590,6 +1628,74 @@ async fn render_firewall(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state whose SSH log is `ssh_log` and whose script goes into `dir`.
+    fn firewall_state(dir: &std::path::Path, ssh_log: std::path::PathBuf) -> AppState {
+        let db = Db::open_in_memory().unwrap();
+        db.block_address_permanently("192.0.2.10").unwrap();
+        let mut state = AppState::new(db, dir.join("nginx"), Some(ssh_log), false);
+        state.firewall_out = Some(dir.join("firewall.nft"));
+        state
+    }
+
+    /// The TUI, `batch --apply` and the internal cron all refuse to *run*
+    /// the script when the lockout check could not run. The console used
+    /// to take an unreadable log as a pass and run it anyway.
+    #[tokio::test]
+    async fn applying_is_refused_when_the_ssh_log_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = firewall_state(tmp.path(), tmp.path().join("no-such-auth.log"));
+
+        let err = format!("{:#}", write_firewall(&state, true).await.unwrap_err());
+
+        assert!(err.contains("SSH log"), "error was: {err}");
+        assert!(err.contains("not applied"), "error was: {err}");
+        assert!(
+            tmp.path().join("firewall.nft").exists(),
+            "writing is inert, so it still happens; only running it is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn writing_alone_goes_ahead_when_the_ssh_log_cannot_be_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = firewall_state(tmp.path(), tmp.path().join("no-such-auth.log"));
+
+        let note = write_firewall(&state, false).await.unwrap();
+        assert!(note.contains("Wrote"), "note was: {note}");
+    }
+
+    #[tokio::test]
+    async fn applying_goes_ahead_when_the_ssh_log_was_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("auth.log");
+        std::fs::write(&log, "").unwrap();
+        let state = firewall_state(tmp.path(), log);
+
+        // `--no-apply` in tests, so this is as far as it can get: past the
+        // guard, and stopped by the switch rather than by the refusal.
+        let note = write_firewall(&state, true).await.unwrap();
+        assert!(note.contains("--no-apply"), "note was: {note}");
+    }
+
+    /// Path mode is the default for good reasons, but it puts this console
+    /// on the same origin as everything else on that site. The choice is
+    /// made on this panel, so the trade has to be stated here.
+    #[test]
+    fn the_web_access_panel_says_path_mode_shares_the_site_s_origin() {
+        let db = Db::open_in_memory().unwrap();
+        let view = load(&db, None, &crate::web::BasePath::default()).unwrap();
+        let rendered = web_access_panel(&view, &Ctx::for_tests()).into_string();
+
+        assert!(
+            rendered.contains("shares the site\u{2019}s origin"),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("use a subdomain"),
+            "rendered was:\n{rendered}"
+        );
+    }
 
     #[test]
     fn category_ids_round_trip() {

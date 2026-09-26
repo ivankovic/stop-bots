@@ -22,10 +22,13 @@
 //!
 //! Every request passes through, outermost first:
 //!
-//! 1. **`Host` allowlist.** Rejects DNS-rebinding before anything reads a
-//!    cookie. First because it is the cheapest and the least conditional.
-//! 2. **Security headers.** Applied to every response including errors, so
-//!    a 404 is as locked down as a page.
+//! 1. **Security headers.** Applied to every response including errors, so
+//!    a 404 is as locked down as a page. Outermost so that "every" includes
+//!    the `Host` refusal below — it used to sit inside it, and the one
+//!    response an attacker's page can provoke went out with none.
+//! 2. **`Host` allowlist.** Rejects DNS-rebinding before anything reads a
+//!    cookie. Ahead of everything that does work, because it is the
+//!    cheapest check and the least conditional.
 //! 3. **Authentication.** Resolves the session cookie into an
 //!    [`Authenticated`], or redirects to `/login`.
 //! 4. **CSRF.** Only on state-changing methods, and only after the session
@@ -34,6 +37,8 @@
 //! Assets and the login endpoints sit outside 3 and 4 — a stylesheet
 //! nobody can load makes the login page unreadable, and a login form
 //! cannot present a session token it does not have yet.
+
+use std::net::IpAddr;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -103,13 +108,14 @@ pub fn router(state: AppState) -> Router {
         );
     }
 
+    // The last `layer` is the outermost; see the module docs for the order.
     app.fallback(not_found)
-        .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             client_address,
         ))
         .layer(middleware::from_fn_with_state(state.clone(), host_guard))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
 
@@ -143,8 +149,13 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> anyhow::Resul
 /// case when the router is driven directly in a test) and no trusted
 /// forwarded header. Guards that consult it must treat `None` as "cannot
 /// tell", never as "not the client".
+///
+/// An address rather than text, canonicalised (see [`resolve_client`]):
+/// the anti-lockout guard asks whether a block *covers* it, and the login
+/// throttle keys on it, and neither works on a string that might be
+/// `::ffff:203.0.113.5` one time and `203.0.113.5` the next.
 #[derive(Debug, Clone, Default)]
-pub struct ClientAddr(pub Option<String>);
+pub struct ClientAddr(pub Option<IpAddr>);
 
 /// Resolves [`ClientAddr`] once per request.
 ///
@@ -175,23 +186,44 @@ async fn client_address(
     let forwarded = request
         .headers()
         .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit(',').next())
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
+        .and_then(|v| v.to_str().ok());
 
     let trusted = state
         .with_db(|db| db.get_bool_setting(crate::web::TRUST_FORWARDED_KEY, false))
         .await
         .unwrap_or(false);
 
-    let resolved = match (trusted, peer.map(|ip| ip.is_loopback())) {
-        (true, Some(true)) => forwarded.or_else(|| peer.map(|ip| ip.to_string())),
-        _ => peer.map(|ip| ip.to_string()),
-    };
-
+    let resolved = resolve_client(peer, forwarded, trusted);
     request.extensions_mut().insert(ClientAddr(resolved));
     next.run(request).await
+}
+
+/// The decision [`client_address`] makes, apart from the request it reads
+/// it from.
+///
+/// Both sides are canonicalised with `to_canonical`, which turns an
+/// IPv4-mapped `::ffff:a.b.c.d` into `a.b.c.d`. A dual-stack bind
+/// (`[::]:8787`) reports every IPv4 client that way, and before this the
+/// mapped form was taken literally: `::ffff:127.0.0.1` is not
+/// `is_loopback`, so a local proxy's header was never believed, and the
+/// anti-lockout guard compared `::ffff:x` against the `x` being blocked.
+///
+/// The forwarded entry has to parse as an address, or it is not used.
+/// It used to be any text at all — `unknown`, `ip:port`, `[v6]` — and that
+/// text became the throttle key and the lockout comparand as it stood. An
+/// entry that is not an address says the proxy's word cannot be read, and
+/// the peer is the honest answer that remains.
+fn resolve_client(peer: Option<IpAddr>, forwarded: Option<&str>, trusted: bool) -> Option<IpAddr> {
+    let peer = peer.map(|ip| ip.to_canonical());
+    let behind_local_proxy = trusted && peer.is_some_and(|ip| ip.is_loopback());
+    if !behind_local_proxy {
+        return peer;
+    }
+    forwarded
+        .and_then(|header| header.rsplit(',').next())
+        .and_then(|entry| entry.trim().parse::<IpAddr>().ok())
+        .map(|ip| ip.to_canonical())
+        .or(peer)
 }
 
 /// Refuses a request whose `Host` this server was not told to answer to.
@@ -268,7 +300,16 @@ async fn require_login(
         .and_then(|c| c.to_str().ok())
         .and_then(|c| cookie_value(c, SESSION_COOKIE));
 
-    let Some(authenticated) = session_id.and_then(|id| state.sessions.validate(&id)) else {
+    // The stored hash is what a session is bound to (see
+    // `auth::Sessions::validate`), read fresh because another process may
+    // have rotated it. One indexed read, the same as `host_guard` makes.
+    let credential = match state.with_db(auth::current_credential).await {
+        Ok(credential) => credential,
+        Err(err) => return internal_error(&err.to_string()),
+    };
+    let authenticated =
+        session_id.and_then(|id| state.sessions.validate(&id, credential.as_deref()));
+    let Some(authenticated) = authenticated else {
         // A 303 for a form post and a 303 for a page load alike: the
         // browser should end up looking at the login page either way.
         return Redirect::to(&state.base.url("/login")).into_response();
@@ -356,7 +397,10 @@ async fn login_submit(
     // `web:trust_forwarded_for` there is not, and everyone shares the
     // "unknown" bucket — which is exactly why the global token bucket
     // inside the throttle exists as well.
-    let key = client.0.clone().unwrap_or_else(|| "unknown".to_string());
+    let key = client
+        .0
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     if let Err(throttled) = state.login_throttle.check(&key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -369,9 +413,15 @@ async fn login_submit(
             .into_response();
     }
 
+    // The hash is read in the same call that verifies against it, so the
+    // session is bound to the password that was actually checked.
     let password = form.password;
     let verified = state
-        .with_db(move |db| auth::verify_password(db, &password))
+        .with_db(move |db| {
+            let verified = auth::verify_password(db, &password)?;
+            let credential = auth::current_credential(db)?;
+            anyhow::Ok(credential.filter(|_| verified))
+        })
         .await;
 
     let secure = state
@@ -380,17 +430,22 @@ async fn login_submit(
         .unwrap_or(false);
 
     match verified {
-        Ok(true) => match state.sessions.create() {
-            Ok((id, _csrf)) => (
-                [(header::SET_COOKIE, session_cookie(&id, secure, &state.base))],
-                Redirect::to(&state.base.url("/")),
-            )
-                .into_response(),
+        Ok(Some(credential)) => match state.sessions.create(&credential) {
+            Ok((id, _csrf)) => {
+                // The right password ends the backoff for this client, so
+                // the operator's next typo starts from zero.
+                state.login_throttle.record_success(&key);
+                (
+                    [(header::SET_COOKIE, session_cookie(&id, secure, &state.base))],
+                    Redirect::to(&state.base.url("/")),
+                )
+                    .into_response()
+            }
             Err(err) => internal_error(&err.to_string()),
         },
         // One message for a wrong password and for no password having been
         // set: neither is worth confirming to whoever is guessing.
-        Ok(false) => {
+        Ok(None) => {
             state.login_throttle.record_failure(&key);
             (
                 StatusCode::UNAUTHORIZED,
@@ -421,7 +476,7 @@ async fn logout(State(state): State<AppState>, request: Request) -> Response {
     }
     (
         [(header::SET_COOKIE, expired_cookie(&state.base))],
-        Redirect::to("/login"),
+        Redirect::to(&state.base.url("/login")),
     )
         .into_response()
 }
@@ -537,20 +592,28 @@ async fn not_found() -> Response {
 /// The audience for this UI is one operator with root on the box, who can
 /// read the same error out of the logs anyway; hiding it would only cost
 /// them a debugging round-trip.
+///
+/// A bare page rather than the console's own chrome. This is reached from
+/// places that have no session — the `Host` guard, the login check — so
+/// there is no CSRF token to put in the chrome's forms and no base path to
+/// build its links from. It used to borrow the test context for both,
+/// and rendered forms carrying a placeholder token and links that left
+/// the prefix.
 pub fn internal_error(message: &str) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Html(
-            layout::page(
-                Tab::Dashboard,
-                &Ctx::for_tests(),
-                Some(Flash::err(message)),
-                maud::html! { p { "The request could not be completed." } },
-            )
-            .into_string(),
-        ),
-    )
-        .into_response()
+    let page = maud::html! {
+        (maud::DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                title { "Error — stop-bots" }
+            }
+            body {
+                h1 { "The request could not be completed." }
+                pre { (message) }
+            }
+        }
+    };
+    (StatusCode::INTERNAL_SERVER_ERROR, Html(page.into_string())).into_response()
 }
 
 /// Renders `content` as a full page, with the session's CSRF token
@@ -653,6 +716,96 @@ mod tests {
     #[test]
     fn logging_out_sends_a_cookie_that_expires_immediately() {
         assert!(expired_cookie(&BasePath::default()).contains("Max-Age=0"));
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    /// A dual-stack bind (`[::]:8787`) sees an IPv4 client as
+    /// `::ffff:a.b.c.d`. Left like that it never equals the `a.b.c.d` the
+    /// operator types into a block form, and the anti-lockout guard
+    /// compares the two.
+    #[test]
+    fn an_ipv4_mapped_peer_is_read_as_the_ipv4_address() {
+        assert_eq!(
+            resolve_client(Some(ip("::ffff:203.0.113.5")), None, false),
+            Some(ip("203.0.113.5"))
+        );
+    }
+
+    /// `::ffff:127.0.0.1` is not `is_loopback`, so a local proxy reaching
+    /// a dual-stack bind over IPv4 used to have its forwarded header
+    /// ignored even with `web:trust_forwarded_for` on.
+    #[test]
+    fn a_mapped_loopback_peer_counts_as_the_local_proxy() {
+        assert_eq!(
+            resolve_client(Some(ip("::ffff:127.0.0.1")), Some("203.0.113.7"), true),
+            Some(ip("203.0.113.7"))
+        );
+    }
+
+    /// The forwarded entry used to be taken as whatever text it was, and
+    /// became the throttle key and the lockout comparand verbatim. Only an
+    /// address is an address; anything else means the proxy's word is
+    /// unusable, and the peer is what is left.
+    #[test]
+    fn a_forwarded_entry_that_is_not_an_address_falls_back_to_the_peer() {
+        for entry in ["unknown", "203.0.113.7:4444", "[2001:db8::1]", "", "a, "] {
+            assert_eq!(
+                resolve_client(Some(ip("127.0.0.1")), Some(entry), true),
+                Some(ip("127.0.0.1")),
+                "forwarded entry was {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forwarded_address_is_canonicalised() {
+        for (entry, expected) in [
+            ("::ffff:203.0.113.7", "203.0.113.7"),
+            ("2001:DB8:0::1", "2001:db8::1"),
+            (" 198.51.100.4 ", "198.51.100.4"),
+        ] {
+            assert_eq!(
+                resolve_client(Some(ip("127.0.0.1")), Some(entry), true),
+                Some(ip(expected)),
+                "forwarded entry was {entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_forwarded_header_is_ignored_unless_trusted_and_local() {
+        let header = Some("203.0.113.7");
+        assert_eq!(
+            resolve_client(Some(ip("127.0.0.1")), header, false),
+            Some(ip("127.0.0.1")),
+            "not trusted"
+        );
+        assert_eq!(
+            resolve_client(Some(ip("198.51.100.4")), header, true),
+            Some(ip("198.51.100.4")),
+            "trusted, but this request did not come through a local proxy"
+        );
+        assert_eq!(resolve_client(None, header, true), None, "no peer at all");
+    }
+
+    /// An error page is reached without a session, so it has none to put
+    /// in a form — it used to render the full page chrome with a
+    /// placeholder token and links that ignored the base path.
+    #[tokio::test]
+    async fn the_error_page_carries_no_forms_and_escapes_its_message() {
+        let response = internal_error("<script>boom</script>");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let page = String::from_utf8_lossy(&bytes);
+        assert!(!page.contains("<form"), "page was:\n{page}");
+        assert!(!page.contains("test-csrf"), "page was:\n{page}");
+        assert!(page.contains("&lt;script&gt;boom"), "page was:\n{page}");
     }
 
     #[test]

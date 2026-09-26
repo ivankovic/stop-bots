@@ -1585,7 +1585,7 @@ fn web_access_path_mode_serves_the_console_through_nginx() {
 
     let site = host.sh("cat /etc/nginx/sites-enabled/test-site.conf");
     assert!(
-        site.contains("location /stop-bots/"),
+        site.contains(r#"location "/stop-bots/""#),
         "no console location block was written. console said:\n{flash}\nconfig:\n{site}"
     );
     let (ok, output, err) = host.run("nginx -t");

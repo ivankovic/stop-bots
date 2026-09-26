@@ -576,6 +576,22 @@ pub fn normalize_trusted_address(address: &str) -> Result<String> {
     })
 }
 
+/// Whether `address` is a `/0` — every IPv4 or every IPv6 address.
+///
+/// Refused as a manual block by both front-ends that take one (the
+/// console's block form and `add-firewall-rule`), for the reason
+/// [`normalize_trusted_address`] refuses it as a trust: it is not a rule,
+/// it is the host off the network, and it is far likelier to be a typo for
+/// a real prefix. The geo allow-list's catch-all is generated, not stored,
+/// so this never stands in its way.
+pub fn is_every_address(address: &str) -> bool {
+    is_valid_address(address)
+        && address
+            .trim()
+            .split_once('/')
+            .is_some_and(|(_, prefix)| prefix.parse::<u32>() == Ok(0))
+}
+
 /// A path exemption that applies only to clients whose user agent contains
 /// `user_agent`, ignoring case.
 ///
