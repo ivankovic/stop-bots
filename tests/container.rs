@@ -839,8 +839,13 @@ impl Host {
     /// The password comes from the installer's own output, which is the
     /// only place it is ever shown — so this also exercises the claim that
     /// an operator can actually get in with what they were handed.
+    ///
+    /// Installed with an SSH log, as on a real Debian host: the console
+    /// refuses to *apply* the firewall when it cannot read one, because the
+    /// anti-lockout check could not run. The container runs no sshd, so the
+    /// log is empty — readable, with nobody connected.
     fn console(&self) -> Console {
-        let out = self.sh("stop-bots install web");
+        let out = self.sh("touch /var/log/auth.log && stop-bots install web --ssh-log /var/log/auth.log");
         let password = out
             .lines()
             .map(str::trim)
