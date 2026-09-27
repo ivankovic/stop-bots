@@ -34,12 +34,22 @@
 //! residue that was unambiguously a bot, generalised from the exact
 //! strings seen to the bot's *name*.
 //!
+//! A second pass on 2026-09-27 read a host's log from April to September —
+//! 451,038 requests, 7,738 distinct user agents — against the patterns that
+//! host was *actually enforcing*, not against the lists. That difference
+//! found three bots ArcJet carries with no category at all (`l9explore`,
+//! ipip.net's banner grabber, BitSight), which therefore no policy could
+//! block. They are here under ArcJet's own names so the entries merge and
+//! the merged bot gains the flag.
+//!
 //! ## What is deliberately not here
 //!
-//! - **Anything already covered upstream.** `curl/7.74.0` and
-//!   `WordPress/6.9.4` were blocked by hand on that server and are both
-//!   already matched by `^curl` and `WordPress\/`; a second copy would
-//!   only make the merge cascade harder to read.
+//! - **General HTTP clients.** `curl`, `python-requests`, `axios`,
+//!   `HeadlessChrome` and `WordPress/` are carried by ArcJet with no
+//!   category, deliberately: health checks, webhooks and a site's own
+//!   scripts use them too. A host that sees them misbehave blocks the one
+//!   bot by hand — which is what the host this list came from did with
+//!   `curl/7.74.0` — rather than every host blocking them by default.
 //! - **Site-specific strings.** A URL that arrived in the user-agent field
 //!   (`http://example.invalid/wp-admin/install.php`) is an attack
 //!   artifact, not a user agent, and one server's own hostname is nobody
@@ -186,7 +196,9 @@ const EXTRAS: &[(&str, &str, Kind)] = &[
     ("FastSourceScanner", "FastSourceScanner", Kind::Scanner),
     ("SmarterMail-Scanner", "SmarterMail-Scanner", Kind::Scanner),
     ("GoScanner", "GoScanner", Kind::Scanner),
-    ("NextScanner", "NextScanner", Kind::Scanner),
+    // `nextscan/2.0` arrived later from the same family; the shorter
+    // name covers both, as `FlowIQ` does.
+    ("NextScanner", "nextscan", Kind::Scanner),
     ("WP-Safe-Scanner", "WP-Safe-Scanner", Kind::Scanner),
     ("CT-WP-Scanner", "CT-WP-Scanner", Kind::Scanner),
     ("ArgusScanner", "ArgusScanner", Kind::Scanner),
@@ -201,6 +213,80 @@ const EXTRAS: &[(&str, &str, Kind)] = &[
     ("RootEvidence", "RootEvidence", Kind::Scanner),
     ("vuln_scanner", "vuln_scanner", Kind::Scanner),
     ("RecordedFuture Inventory", "RecordedFuture", Kind::Scanner),
+    // ---- a second host, 2026-09-27 ----
+    // Carried by ArcJet's list with no category at all, so no policy
+    // default could ever block them. Named exactly as ArcJet names them:
+    // the entries merge by slug, and the merged bot gains the flag.
+    // LeakIX's `l9explore` was the single largest scanner in the log —
+    // 6,042 requests, every one of them refused or a 404.
+    ("L9explore", "l9explore", Kind::Scanner),
+    ("Ipip Crawler", "HTTP Banner Detection", Kind::Scanner),
+    ("Bitsight Crawler", "BitSightBot", Kind::Scanner),
+    // Content-discovery and vulnerability tools, and scanners that say so.
+    ("feroxbuster", "feroxbuster", Kind::Scanner),
+    ("research-scan", "research-scan", Kind::Scanner),
+    ("SecurityResearch", "SecurityResearch", Kind::Scanner),
+    (
+        "NetScope security research scanner",
+        "security research scanner",
+        Kind::Scanner,
+    ),
+    // Probe paths on 76 of 76 requests, behind an otherwise ordinary
+    // Chrome string.
+    (
+        "Yokohama Institute of Information Security",
+        "iisec.ac.jp",
+        Kind::Scanner,
+    ),
+    ("HelloScan", "HelloScan", Kind::Scanner),
+    ("vitesweep", "vitesweep", Kind::Scanner),
+    ("proximity-sweep", "proximity-sweep", Kind::Scanner),
+    ("SecurityAudit", "SecurityAudit", Kind::Scanner),
+    ("VULN-Audit", "VULN-Audit", Kind::Scanner),
+    ("rawgrab", "rawgrab", Kind::Scanner),
+    ("Keydrop (onlyscans.com)", "Keydrop", Kind::Scanner),
+    ("CMS-Detector", "CMS-Detector", Kind::Scanner),
+    ("CMS-Scanner", "CMS-Scanner", Kind::Scanner),
+    ("AIScan", "AIScan", Kind::Scanner),
+    ("tttx.net research scan", "tttx.net", Kind::Scanner),
+    ("zern-scanner", "zern-scanner", Kind::Scanner),
+    ("ScanProxy", "ScanProxy", Kind::Scanner),
+    ("HighPerfScanner", "HighPerfScanner", Kind::Scanner),
+    ("ExchangeScanner", "ExchangeScanner", Kind::Scanner),
+    // `WanscannerBot` and `WanScannerBot`: case-insensitive, one entry.
+    ("WanScanner", "WanScanner", Kind::Scanner),
+    ("NextJSDetector", "NextJSDetector", Kind::Scanner),
+    ("nextjs-scanner", "nextjs-scanner", Kind::Scanner),
+    ("LaravelDetector", "LaravelDetector", Kind::Scanner),
+    ("osint-scanner", "osint-scanner", Kind::Scanner),
+    ("wkscan", "wkscan", Kind::Scanner),
+    // `ipscan/0.4`, `IPScanner/1.0` and `DomainIPScanner/1.3`.
+    ("ipscan", "ipscan", Kind::Scanner),
+    // Hyphenated: `CamScanner` is a document-scanning app, and this is
+    // not it.
+    ("cam-scanner", "cam-scanner", Kind::Scanner),
+    ("RTSP-Scanner", "RTSP-Scanner", Kind::Scanner),
+    ("VPN-Scanner", "VPN-Scanner", Kind::Scanner),
+    ("internal-scan", "internal-scan", Kind::Scanner),
+    ("fingerprint-scan", "fingerprint-scan", Kind::Scanner),
+    ("NxploitedScanner", "Nxploited", Kind::Scanner),
+    ("gitscan", "gitscan", Kind::Scanner),
+    ("FormSQLiScan", "SQLiScan", Kind::Scanner),
+    ("BotDetectorScanner", "BotDetectorScanner", Kind::Scanner),
+    ("NoctraRecon", "NoctraRecon", Kind::Scanner),
+    ("HaloSecurity", "HaloSecurity", Kind::Scanner),
+    ("ForestScanner", "ForestScanner", Kind::Scanner),
+    ("AtomicEdge-Research", "AtomicEdge", Kind::Scanner),
+    ("CloudAnchor Census", "CloudAnchor", Kind::Scanner),
+    // Not a name but an artifact: a scanner rotating through a user-agent
+    // list scraped from a web page sent that page's headings too — "More
+    // Safari 3.0.4 user agents strings -->>", 196 times, every one a
+    // probe or a 404. Nothing real sends it.
+    (
+        "scraped user-agent list",
+        "user agents strings",
+        Kind::Scanner,
+    ),
     // ---- SEO and data-broker crawlers ----
     (
         "SERankingBacklinksBot",
@@ -215,6 +301,16 @@ const EXTRAS: &[(&str, &str, Kind)] = &[
     ("LohiSoftBot", "LohiSoftBot", Kind::Scanner),
     ("SleepBot", "SleepBot", Kind::Scanner),
     ("BrokenLinksBot", "BrokenLinksBot", Kind::Scanner),
+    ("CareerPageBot", "CareerPageBot", Kind::Scanner),
+    ("LeadHausBot", "LeadHausBot", Kind::Scanner),
+    (
+        "IMJ-CompanyPage-Scraper",
+        "CompanyPage-Scraper",
+        Kind::Scanner,
+    ),
+    ("SEOJuice", "SEOJuice", Kind::Scanner),
+    ("PublicWWWBot", "PublicWWWBot", Kind::Scanner),
+    ("leak.info", "leak.info", Kind::Scanner),
 ];
 
 /// The built-in list as `NewBot` rows.
@@ -490,6 +586,21 @@ mod tests {
         }
     }
 
+    /// Every pattern survives the check `nginx::block_text` applies before
+    /// writing. One that failed it would be dropped there without a word,
+    /// and the entry would look shipped while blocking nothing — this list
+    /// is compiled in, so nothing downstream reports on it.
+    #[test]
+    fn every_pattern_can_be_written_to_nginx() {
+        for (name, pattern, _) in EXTRAS {
+            assert!(
+                crate::nginx::pattern_problem(pattern).is_none(),
+                "{name:?}'s pattern {pattern:?} would be dropped: {:?}",
+                crate::nginx::pattern_problem(pattern)
+            );
+        }
+    }
+
     /// Two entries with the same slug would collapse into one row and the
     /// second's category would silently win.
     #[test]
@@ -597,6 +708,72 @@ mod tests {
             // Appended after a complete, ordinary Chrome string.
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
              Chrome/140.0.0.0 Safari/537.36 ModatScanner/1.2 (+https://modat.io/)",
+            // The second host, 2026-09-27.
+            "l9explore/1.2.2",
+            "HTTP Banner Detection (https://security.ipip.net)",
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.6312.86 \
+             Safari/537.36 BitSightBot/1.0",
+            "feroxbuster/2.13.1",
+            "Mozilla/5.0 (compatible; research-scan/1.0)",
+            "net-research-scan/1.0 (+https://example.org/scan-info; abuse contact)",
+            "Mozilla/5.0 (compatible; SecurityResearch/1.0)",
+            "Mozilla/5.0 (compatible; NetScope/1.0; +http://81.90.28.175/; security research \
+             scanner \u{2014} submit exclusion requests at the linked URL)",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like \
+             Gecko, Yokohama Institute of Information Security  https://www.iisec.ac.jp) \
+             Chrome/124.0.0.0 Safari/537.36",
+            "HelloScan/1.0",
+            "vitesweep/1",
+            "proximity-sweep/1.0 (+security-research)",
+            "Mozilla/5.0 (compatible; SecurityAudit/1.0)",
+            "VULN-Audit/1.0",
+            "rawgrab",
+            "Mozilla/5.0; Keydrop.io/1.0(onlyscans.com/about);",
+            "Mozilla/5.0 CMS-Detector/1.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) CMS-Scanner",
+            "Mozilla/5.0 (compatible; AIScan/1.0)",
+            "tttx.net research scan (+https://tttx.net/optout.php; abuse@tttx.net)",
+            "zern-scanner (+https://zern.io)",
+            "ScanProxy/2",
+            "Mozilla/5.0 (X11; Linux x86_64) HighPerfScanner/10G",
+            "Mozilla/5.0 (compatible; ExchangeScanner/2.1)",
+            "Mozilla/5.0 (X11; Linux x86_64; WanscannerBot/1.2; +https://abuse.pend.re) \
+             Gecko/20100101 Firefox/10.0",
+            "WanScannerBot/1.0",
+            "Mozilla/5.0 NextJSDetector/2.0",
+            "nextjs-scanner/1.0 (+authorized-asset-inventory)",
+            "nextscan/2.0",
+            "Mozilla/5.0 (compatible; LaravelDetector/1.0)",
+            "Mozilla/5.0 (compatible; osint-scanner/1.0; +research)",
+            "wkscan/0.1 (+https://github.com/CloudSecurityAlliance-DataSets)",
+            "ipscan/0.4",
+            "Mozilla/5.0 (compatible; IPScanner/1.0)",
+            "DomainIPScanner/1.3",
+            "cam-scanner/1.0",
+            "Mozilla/5.0 (compatible; RTSP-Scanner/1.0)",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) VPN-Scanner/5.3",
+            "internal-scan/1.0",
+            "fingerprint-scan/0.1",
+            "NxploitedScanner/1.1 (+https://github.com/Nxploited)",
+            "Mozilla/5.0 gitscan-go/0.3",
+            "Mozilla/5.0 (compatible; FormSQLiScan/1.0)",
+            "Mozilla/5.0 (compatible; BotDetectorScanner/1.0; +https://botdetector.io/)",
+            "Mozilla/5.0 (compatible; NoctraRecon/1.0)",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like \
+             Gecko) Chrome/146.0.0.0 Safari/537.36 HaloSecurity/1.0 \
+             (+https://www.halosecurity.com/crawler)",
+            "Mozilla/5.0 (compatible; ForestScanner/1.0; +https://forest.info/privacy)",
+            "Mozilla/5.0 (compatible; AtomicEdge-Research/1.0)",
+            "CloudAnchor-Web-Census/1.0",
+            "More Safari 3.0.4 user agents strings -->>",
+            "Mozilla/5.0 (compatible; CareerPageBot/1.0)",
+            "LeadHausBot/1.0 (+https://theleadhaus.io/bot; contact: outreach@theleadhaus.io) \
+             Mozilla/5.0 (compatible)",
+            "IMJ-CompanyPage-Scraper/2.0_fix2 (+https://example.com)",
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; \
+             SEOJuice-SearchBot/1.0; +https://seojuice.io/bot",
+            "Mozilla/5.0 (compatible; PublicWWWBot/1.0; +https://publicwww.com/bot.html)",
+            "Mozilla/4.0 (compatible; fluid/0.0; +http://www.leak.info/bot.html)",
         ];
         for subject in SEEN {
             let lower = subject.to_lowercase();

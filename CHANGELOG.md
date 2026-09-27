@@ -5,6 +5,21 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [Unreleased]
+
+### Added
+
+- **51 more scanners in the built-in list**, read off five months of a
+  real host's access log against what that host was actually blocking.
+  Among them LeakIX's `l9explore` — 6,042 requests there, the largest
+  single scanner in the log — `feroxbuster`, and a run of self-declared
+  security and research scanners. Three (`l9explore`, ipip.net's
+  `HTTP Banner Detection`, `BitSightBot`) were already in ArcJet's list
+  with no category, so no policy could ever block them; the built-in
+  entries merge with those and give them the scanner flag. Every new
+  pattern was checked against every user agent in that log: each matches
+  only the bot it names.
+
 ## [0.0.13] — 2026-09-26
 
 ### Security
