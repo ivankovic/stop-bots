@@ -86,6 +86,18 @@ pub const PROBE_PATHS_ENABLED_DEFAULT: bool = true;
 /// here at all, so there's no reason to hurry it back.
 pub const PROBE_PATHS_TTL_DAYS_DEFAULT: i64 = 5;
 
+/// Injection detection defaults to **on**, for the reason probe paths do:
+/// one request is conclusive, so there is no threshold to tune wrong. A
+/// signature that plain text could produce counts only where no person
+/// types it — see `crate::injection` for the two strengths, and for the
+/// five months of real traffic they were checked against.
+pub const INJECTION_ENABLED_DEFAULT: bool = true;
+
+/// Seven days: longer than a probe path's five, because a payload is an
+/// attack in progress rather than reconnaissance, and shorter than the
+/// honeypot's thirty, which is the one signal that cannot be an accident.
+pub const INJECTION_TTL_DAYS_DEFAULT: i64 = 7;
+
 /// Every extra probe path configured on top of the built-in list: the
 /// `PROBE_PATHS_EXTRA` setting split on newlines, with blank lines and
 /// `#` comments dropped so an admin can annotate the list. Entries that
@@ -195,6 +207,7 @@ pub enum Detector {
     WebScanners,
     SpoofedCrawlers,
     ProbePaths,
+    Injection,
     Honeypot,
     AssetRatio,
     RotatingUserAgent,
@@ -222,11 +235,12 @@ pub struct DetectorSpec {
 }
 
 impl Detector {
-    pub const ALL: [Detector; 9] = [
+    pub const ALL: [Detector; 10] = [
         Detector::SshScanners,
         Detector::WebScanners,
         Detector::SpoofedCrawlers,
         Detector::ProbePaths,
+        Detector::Injection,
         Detector::Honeypot,
         Detector::AssetRatio,
         Detector::RotatingUserAgent,
@@ -268,6 +282,14 @@ impl Detector {
                 job_label: "Block probe paths",
                 enabled_default: PROBE_PATHS_ENABLED_DEFAULT,
                 ttl_days_default: PROBE_PATHS_TTL_DAYS_DEFAULT,
+                uses_ssh_log: false,
+            },
+            Detector::Injection => DetectorSpec {
+                id: "block_injection",
+                label: "Injection attempts",
+                job_label: "Block injection attempts",
+                enabled_default: INJECTION_ENABLED_DEFAULT,
+                ttl_days_default: INJECTION_TTL_DAYS_DEFAULT,
                 uses_ssh_log: false,
             },
             Detector::RobotsTxt => DetectorSpec {

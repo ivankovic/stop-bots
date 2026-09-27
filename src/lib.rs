@@ -31,6 +31,7 @@ pub mod firewall;
 mod golden;
 pub mod health;
 pub mod host;
+pub mod injection;
 pub mod install;
 pub mod ipdetail;
 pub mod ipranges;

@@ -153,6 +153,7 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
         ip,
         status,
         path,
+        request: request.to_string(),
         referer,
         user_agent,
     })
@@ -210,11 +211,15 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
     // Strip the query for the same reason as the combined parser: `/foo?a=1`
     // and `/foo?a=2` are one path as far as "is this a real URL here" goes.
     let path = target.split('?').next().unwrap_or(&target).to_string();
+    // `$request` when the format has it; otherwise the target alone, which
+    // is where nearly every payload is anyway.
+    let request = json_field(obj, "request").unwrap_or_else(|| target.clone());
 
     Some(ParsedLine {
         ip,
         status,
         path,
+        request,
         referer: json_field(obj, "http_referer"),
         // An absent user agent is an empty one for every caller here, so
         // unlike the referer this needs no third state: nothing draws a
@@ -291,6 +296,11 @@ struct ParsedLine {
     ip: IpAddr,
     status: u16,
     path: String,
+    /// The request line as logged, method, query and protocol included —
+    /// what [`injection_ips`] reads, since a payload is mostly in the
+    /// query that [`ParsedLine::path`] drops, and sometimes in place of
+    /// the method.
+    request: String,
     /// Three states, not two, because the format gets a say.
     ///
     /// `Some("-")` (combined) and `Some("")` (`escape=json`) are how NGINX
@@ -530,6 +540,65 @@ pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, St
     let mut ips: Vec<(String, String)> = found
         .into_iter()
         .map(|(ip, path)| (ip.to_string(), path))
+        .collect();
+    ips.sort();
+    ips
+}
+
+/// Every address that sent an exploit payload — in the request line, the
+/// user agent or the referer — with the first signature seen from it.
+///
+/// One request is conclusive, like a probe path: see [`crate::injection`]
+/// for what is matched, why a person searching for `/etc/passwd` is not,
+/// and the evidence the signatures were checked against. The response is
+/// irrelevant for the same reason it is for probe paths — a payload that
+/// got a 200 is the worse case, not the excusable one.
+///
+/// Loopback and private addresses are excluded, as everywhere here.
+///
+/// Each distinct request line, user agent and referer is judged once per
+/// call. A log repeats them endlessly — one host's 451,000 lines held
+/// fewer than 8,000 distinct user agents — and judging every occurrence
+/// took five seconds, on a job the internal cron runs every minute.
+pub fn injection_ips(log_text: &str) -> Vec<(String, String)> {
+    use crate::injection::{in_referer, in_request, in_user_agent};
+
+    fn judged(
+        seen: &mut HashMap<String, Option<&'static str>>,
+        value: &str,
+        judge: fn(&str) -> Option<&'static str>,
+    ) -> Option<&'static str> {
+        if let Some(answer) = seen.get(value) {
+            return *answer;
+        }
+        let answer = judge(value);
+        seen.insert(value.to_string(), answer);
+        answer
+    }
+
+    let mut requests = HashMap::new();
+    let mut user_agents = HashMap::new();
+    let mut referers = HashMap::new();
+    let mut found: HashMap<IpAddr, &'static str> = HashMap::new();
+    for line in log_text.lines().filter_map(parse_line) {
+        if is_local_or_private(&line.ip) || found.contains_key(&line.ip) {
+            continue;
+        }
+        let kind = judged(&mut requests, &line.request, in_request)
+            .or_else(|| judged(&mut user_agents, &line.user_agent, in_user_agent))
+            .or_else(|| {
+                line.referer
+                    .as_deref()
+                    .and_then(|referer| judged(&mut referers, referer, in_referer))
+            });
+        if let Some(kind) = kind {
+            found.insert(line.ip, kind);
+        }
+    }
+
+    let mut ips: Vec<(String, String)> = found
+        .into_iter()
+        .map(|(ip, kind)| (ip.to_string(), kind.to_string()))
         .collect();
     ips.sort();
     ips
@@ -961,6 +1030,17 @@ mod tests {
     fn parse_line_reads_a_missing_referer_as_nginx_writes_it() {
         let line = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"curl/8\"";
         assert_eq!(parse_line(line).unwrap().referer.as_deref(), Some("-"));
+    }
+
+    /// A JSON format with only `$request_uri` still gives the injection
+    /// detector the query it reads.
+    #[test]
+    fn injection_ips_reads_a_json_line_without_a_request_field() {
+        let log = r#"{"remote_addr":"203.0.113.9","status":"404","request_uri":"/?f=../../../../etc/passwd","http_user_agent":"curl/8"}"#;
+        assert_eq!(
+            injection_ips(log),
+            vec![("203.0.113.9".to_string(), "path traversal".to_string())]
+        );
     }
 
     #[test]

@@ -5,6 +5,25 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking �
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [Unreleased]
+
+### Added
+
+- **An injection-attempt detector.** A request carrying an exploit payload
+  gets its address a seven-day firewall block from a single request, like a
+  probe path. It reads the whole request line — query string included,
+  which every other detector drops — plus the user agent and the referer,
+  after undoing percent-, double- and `%u`-encoding, full-width characters
+  and NGINX's own log escapes. It recognises Shellshock, Log4Shell lookups,
+  OGNL and other expression injection, the PHP-CGI `allow_url_include`
+  exploit, command injection, path traversal, NUL and CRLF bytes, and
+  exploits a client names by CVE in its user agent. Signatures a person
+  might type (`/etc/passwd`, `union select`, `<script`) only count outside
+  search-box parameters and referers. On five months of one host's log it
+  matched 715 addresses, none of which had done anything but scan, 157 of
+  them caught by no other detector. On by default, like probe paths; the
+  Dashboard's "Automatic blocking" panel switches it off.
+
 ## [0.0.14] — 2026-09-27
 
 ### Added

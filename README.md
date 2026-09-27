@@ -113,6 +113,12 @@ running. For a server with no stop-bots process on it at all, see
   paths that are legitimate somewhere — `/wp-login.php`, `/wp-admin/`, `/xmlrpc.php`,
   `/phpmyadmin` — since locking out your own administrator would be worse than missing a
   scanner the 404 detector catches anyway. Add your own with `set-probe-paths`.
+- **Injection attempts**: a request carrying an exploit payload — in the path, the query
+  string, the user agent or the referer — such as Shellshock, a Log4Shell `${jndi:` lookup, the
+  PHP-CGI `allow_url_include` exploit, `$(wget …)` or `../../`, however it is encoded. One request
+  is enough, and the block lasts a week. Text a person might type, such as `/etc/passwd` or
+  `union select`, only counts outside search boxes and referers, so searching a blog for it is
+  safe.
 - **Honeypot**: a path published only as `Disallow:` in the generated `robots.txt` and linked
   nowhere. Reaching it means ignoring robots.txt, which deserves a ban. Needs robots.txt
   generation turned on to work at all.

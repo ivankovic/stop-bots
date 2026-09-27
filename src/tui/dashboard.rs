@@ -3753,11 +3753,11 @@ mod tests {
     }
 
     /// Every automatic-blocking option is on screen at once. There are
-    /// fourteen of them and the panel is nine rows tall, which only works
+    /// sixteen of them and the panel is nine rows tall, which only works
     /// because they are dealt into columns — so this is really a test that
     /// the column layout is still doing its job. It used to show five of
-    /// the fourteen, in half the width, and the other nine were a scroll
-    /// away with nothing saying they existed.
+    /// the fourteen there were then, in half the width, and the other nine
+    /// were a scroll away with nothing saying they existed.
     #[test]
     fn every_automatic_blocking_option_is_visible_without_scrolling() {
         let db = Db::open_in_memory().unwrap();
@@ -3786,7 +3786,7 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         let rows = dashboard.protection_rows();
-        assert_eq!(rows.len(), 15, "if this changes, so does the panel height");
+        assert_eq!(rows.len(), 16, "if this changes, so does the panel height");
         for row in rows {
             let label = dashboard.protection_label(row);
             assert!(content.contains(&label), "{label:?} is not on screen");
