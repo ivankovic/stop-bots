@@ -259,6 +259,39 @@ make integration-test
 CI runs it as its own job. Run it before a release, and before trusting any change to
 generated config.
 
+## CLI conventions
+
+The command line is part of the contract from 0.1 on, so these are decided once. The
+tests at the bottom of `src/main.rs` walk the whole command tree and check the parts a
+machine can check.
+
+- **A stored setting is changed by a `set-*` verb.** Every setting a person is meant to
+  change has one: `set-detector`, `set-category`, `set-web`, `set-firewall-backend` and
+  so on. Give a `set-*` verb no flags and it prints what is stored.
+- **Flags on a verb that runs something apply to that run only.** `web --bind`,
+  `batch --backend`, `render-firewall --out` and a `block-*` detector's `--threshold`
+  change nothing stored; without them the run uses what is stored. `install web` is the
+  one exception: it sets up a service that reads its settings from the database, so it
+  stores the console flags exactly as `set-web` would.
+- **A stored on/off value takes an explicit value**: `--enabled true|false`,
+  `--secure-cookie true|false`. Both directions have to be sayable, and a bare flag can
+  only say one. Declare it with `action = clap::ArgAction::Set` and
+  `value_name = "true|false"`, as `bool` when the verb exists to set it and
+  `Option<bool>` when it is one of several optional settings.
+- **A presence flag is for how this run behaves**: `--force`, `--dry-run`, `--no-fetch`,
+  `--remove`. Never for a stored value.
+- **`--db` is global** and falls back to `STOP_BOTS_DB`. Don't add a `db` field to a
+  subcommand; clap refuses a subcommand argument that shadows a global one.
+- **Help text is for someone typing commands.** Name other verbs as they are typed
+  (`apply-blocks`), never as the Rust variant (`ApplyBlocks`), a table, or a module path.
+  The first line of a doc comment is the summary in `stop-bots --help`: a whole sentence,
+  starting with a capital, different from every other command's. Every flag says what it
+  does.
+- **Renaming.** Keep the old spelling working for one release as a hidden alias
+  (`#[command(alias = "...")]`, `#[arg(alias = "...")]`, or a hidden flag that prints a
+  deprecation note on stderr), with a test that the old spelling still parses. Then
+  remove it.
+
 ## Code structure
 
 Rust's project structure must be followed.

@@ -3340,6 +3340,493 @@ fn maintain_can_be_told_to_compact_regardless() {
         .stdout(predicate::str::contains("Compacted anyway"));
 }
 
+// ---- command-line conventions ----
+
+/// `--db` is global: it works before the subcommand as well as after it,
+/// which is where every test above puts it.
+#[test]
+fn db_may_come_before_the_subcommand() {
+    let fx = Fixture::new();
+    stop_bots_bin()
+        .args([
+            "--db",
+            fx.db.to_str().unwrap(),
+            "trust",
+            "--address",
+            "203.0.113.7",
+        ])
+        .assert()
+        .success();
+    fx.run(&["list-trusted"])
+        .stdout(predicate::str::contains("203.0.113.7"));
+}
+
+/// `STOP_BOTS_DB` names the database when no `--db` does, and an explicit
+/// `--db` still wins over it.
+#[test]
+fn stop_bots_db_names_the_database_and_db_overrides_it() {
+    let fx = Fixture::new();
+    let other = fx.db.with_file_name("other.sqlite3");
+
+    stop_bots_bin()
+        .env("STOP_BOTS_DB", &fx.db)
+        .args(["trust", "--address", "203.0.113.7"])
+        .assert()
+        .success();
+    fx.run(&["list-trusted"])
+        .stdout(predicate::str::contains("203.0.113.7"));
+
+    stop_bots_bin()
+        .env("STOP_BOTS_DB", &fx.db)
+        .args(["list-trusted", "--db", other.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nothing is trusted."));
+}
+
+/// Renamed for 0.1; the old spelling works for one release.
+#[test]
+fn block_scanners_still_works_under_its_old_name() {
+    let fx = Fixture::new();
+    let log = fx.db.with_file_name("auth.log");
+    fs::write(&log, repeat_failed_attempt("198.51.100.9", 25)).unwrap();
+
+    for command in ["block-ssh-scanners", "block-scanners"] {
+        fx.run(&[command, "--ssh-log", log.to_str().unwrap(), "--dry-run"])
+            .stdout(predicate::str::contains("Would block 198.51.100.9"));
+    }
+}
+
+/// `web`'s old setting flags still store what they used to, and say what
+/// replaces them.
+#[test]
+fn web_s_deprecated_setting_flags_still_store_and_say_so() {
+    let fx = Fixture::new();
+    fx.cmd(&[
+        "web",
+        "--allowed-hosts",
+        "admin.example.com",
+        "--set-password",
+    ])
+    .assert()
+    .success()
+    .stderr(predicate::str::contains("deprecated"))
+    .stderr(predicate::str::contains("set-web"));
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    assert_eq!(
+        db.get_text_setting(stop_bots::web::ALLOWED_HOSTS_KEY)
+            .unwrap()
+            .as_deref(),
+        Some("admin.example.com")
+    );
+}
+
+// ---- detectors ----
+
+/// The switch, TTL and threshold `set-detector` stores are the ones the
+/// scheduled passes read, and `list-detectors` shows them.
+#[test]
+fn set_detector_stores_the_switch_ttl_and_threshold() {
+    use stop_bots::protection::Detector;
+    let fx = Fixture::new();
+
+    fx.run(&[
+        "set-detector",
+        "injection",
+        "--enabled",
+        "false",
+        "--ttl-days",
+        "3",
+    ]);
+    fx.run(&["set-detector", "ssh-scanners", "--threshold", "40"]);
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    assert!(!Detector::Injection.is_enabled(&db).unwrap());
+    assert_eq!(Detector::Injection.ttl_days(&db).unwrap(), 3);
+    assert_eq!(Detector::SshScanners.threshold(&db).unwrap(), Some(40));
+
+    let listing = fx.run(&["list-detectors"]);
+    let out = String::from_utf8(listing.get_output().stdout.clone()).unwrap();
+    let line = |name: &str| {
+        out.lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no {name} line in:\n{out}"))
+            .split_whitespace()
+            .take(4)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(line("injection"), ["injection", "off", "3d", "-"], "{out}");
+    assert_eq!(
+        line("ssh-scanners"),
+        ["ssh-scanners", "on", "5d", "40"],
+        "{out}"
+    );
+}
+
+/// Running a detector by hand uses the stored threshold unless told
+/// otherwise, so it finds what the scheduled pass would.
+#[test]
+fn a_detector_run_by_hand_uses_the_stored_threshold() {
+    let fx = Fixture::new();
+    let log = fx.db.with_file_name("access.log");
+    let lines: String = (0..4)
+        .map(|i| access_line("203.0.113.9", &format!("/missing-{i}"), 404, "UA"))
+        .collect();
+    fs::write(&log, lines).unwrap();
+    let log = log.to_str().unwrap();
+
+    fx.run(&["block-web-scanners", "--access-log", log, "--dry-run"])
+        .stdout(predicate::str::contains("No scanning IPs found"));
+
+    fx.run(&["set-detector", "web-scanners", "--threshold", "4"]);
+    fx.run(&["block-web-scanners", "--access-log", log, "--dry-run"])
+        .stdout(predicate::str::contains("Would block 203.0.113.9"));
+}
+
+/// Each refusal names why, and a command with one bad flag changes
+/// nothing — not even the flags beside it that were fine.
+#[test]
+fn set_detector_refuses_what_it_cannot_store_and_stores_nothing() {
+    use stop_bots::protection::Detector;
+    let fx = Fixture::new();
+
+    for (args, why) in [
+        (
+            vec![
+                "set-detector",
+                "probe-paths",
+                "--threshold",
+                "5",
+                "--ttl-days",
+                "9",
+            ],
+            "no threshold",
+        ),
+        (
+            vec![
+                "set-detector",
+                "web-scanners",
+                "--threshold",
+                "1",
+                "--ttl-days",
+                "9",
+            ],
+            "threshold under 2",
+        ),
+        (
+            vec!["set-detector", "web-scanners", "--ttl-days", "0"],
+            "from 1 to",
+        ),
+        (
+            vec!["set-detector", "robots-txt", "--enabled", "true"],
+            "set-humans-only",
+        ),
+    ] {
+        fx.cmd(&args)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains(why));
+    }
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    for d in [Detector::ProbePaths, Detector::WebScanners] {
+        assert_eq!(d.ttl_days(&db).unwrap(), d.spec().ttl_days_default);
+    }
+    assert_eq!(Detector::WebScanners.threshold(&db).unwrap(), Some(7));
+    assert!(!Detector::RobotsTxt.is_enabled(&db).unwrap());
+}
+
+#[test]
+fn set_subnet_escalation_switches_it_on_with_a_threshold() {
+    let fx = Fixture::new();
+    fx.run(&["set-subnet-escalation", "--enabled", "true", "--min", "4"])
+        .stdout(predicate::str::contains("escalation is on, at 4"));
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    assert_eq!(
+        stop_bots::protection::subnet_escalation(&db).unwrap(),
+        Some(4)
+    );
+    fx.run(&["list-detectors"])
+        .stdout(predicate::str::contains("escalation: on, at 4"));
+
+    fx.run(&["set-subnet-escalation", "--enabled", "false"]);
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    assert_eq!(stop_bots::protection::subnet_escalation(&db).unwrap(), None);
+}
+
+// ---- categories and bots ----
+
+/// The host-wide category policy reaches the generated NGINX block: an
+/// allowed category's bots are no longer in it.
+#[test]
+fn set_category_changes_what_apply_blocks_writes() {
+    let fx = Fixture::new();
+    fx.seed_bots();
+    let site = fx.write_site("example.com");
+    fx.scan_sites();
+
+    fx.run(&["set-category", "--category", "ai", "--policy", "blocked"]);
+    fx.apply_blocks();
+    let config = fs::read_to_string(&site).unwrap();
+    assert!(config.contains("AISearchBot"), "config was:\n{config}");
+
+    fx.run(&["set-category", "--category", "ai", "--policy", "allowed"])
+        .stdout(predicate::str::contains(
+            "Category ai is now allowed host-wide.",
+        ));
+    fx.apply_blocks();
+    let config = fs::read_to_string(&site).unwrap();
+    assert!(!config.contains("AISearchBot"), "config was:\n{config}");
+}
+
+/// A site override is stored per site, shown by `list-categories
+/// --site`, and removed again by `default` — which on its own, host-wide,
+/// is refused, since there is nothing above the host to follow.
+#[test]
+fn set_category_with_a_site_overrides_it_for_that_site_only() {
+    use stop_bots::db::{Category, Policy};
+    let fx = Fixture::new();
+    fx.write_site("example.com");
+    fx.scan_sites();
+
+    fx.run(&[
+        "set-category",
+        "--category",
+        "search",
+        "--policy",
+        "blocked",
+        "--site",
+        "example.com",
+    ]);
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    let site = db.list_sites().unwrap()[0].id;
+    assert_eq!(
+        db.get_site_category_override(site, Category::Search)
+            .unwrap(),
+        Some(Policy::Blocked)
+    );
+    fx.run(&["list-categories", "--site", "example.com"])
+        .stdout(predicate::str::is_match(r"search\s+\w+\s+blocked").unwrap());
+
+    fx.run(&[
+        "set-category",
+        "--category",
+        "search",
+        "--policy",
+        "default",
+        "--site",
+        "example.com",
+    ]);
+    assert_eq!(
+        db.get_site_category_override(site, Category::Search)
+            .unwrap(),
+        None
+    );
+
+    fx.cmd(&[
+        "set-category",
+        "--category",
+        "search",
+        "--policy",
+        "default",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("nothing above it"));
+}
+
+#[test]
+fn set_bot_overrides_one_bot_host_wide_and_per_site() {
+    use stop_bots::db::{BotStatus, Policy};
+    let fx = Fixture::new();
+    fx.seed_bots();
+    fx.write_site("example.com");
+    fx.scan_sites();
+
+    fx.run(&["list-bots", "--search", "search-bot"])
+        .stdout(predicate::str::contains("ai-search-bot"))
+        .stdout(predicate::str::contains("google-crawler").not());
+
+    fx.run(&["set-bot", "--bot", "ai-search-bot", "--policy", "allowed"]);
+    fx.run(&[
+        "set-bot",
+        "--bot",
+        "google-crawler",
+        "--policy",
+        "blocked",
+        "--site",
+        "example.com",
+    ]);
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    let bots = db.list_bots().unwrap();
+    let bot = |slug: &str| bots.iter().find(|b| b.slug == slug).unwrap().clone();
+    assert_eq!(bot("ai-search-bot").status, BotStatus::Allowed);
+    let site = db.list_sites().unwrap()[0].id;
+    let overrides = db.site_bot_overrides(site).unwrap();
+    assert_eq!(overrides.len(), 1);
+    assert_eq!(overrides[0].bot_id, bot("google-crawler").id);
+    assert_eq!(overrides[0].policy, Policy::Blocked);
+    fx.run(&["list-categories", "--site", "example.com"])
+        .stdout(predicate::str::is_match(r"google-crawler\s+blocked").unwrap());
+
+    fx.run(&["set-bot", "--bot", "ai-search-bot", "--policy", "default"]);
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    let back = db.list_bots().unwrap();
+    assert_eq!(
+        back.iter()
+            .find(|b| b.slug == "ai-search-bot")
+            .unwrap()
+            .status,
+        BotStatus::Default
+    );
+
+    fx.cmd(&["set-bot", "--bot", "no-such-bot", "--policy", "blocked"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("list-bots"));
+}
+
+// ---- firewall ----
+
+/// A disabled rule stays listed and is left out of the script; enabling
+/// it puts it back.
+#[test]
+fn set_firewall_rule_takes_a_rule_out_of_the_script_without_deleting_it() {
+    let fx = Fixture::new();
+    let script = fx.db.with_file_name("fw.nft");
+    let render = || {
+        fx.run(&[
+            "render-firewall",
+            "--out",
+            script.to_str().unwrap(),
+            "--ssh-log",
+            "tests/fixtures/logs/auth.log",
+        ]);
+        fs::read_to_string(&script).unwrap()
+    };
+    fx.run(&["add-firewall-rule", "--address", "198.51.100.7"]);
+
+    fx.run(&["set-firewall-rule", "--id", "1", "--enabled", "false"]);
+    fx.run(&["list-firewall-rules"])
+        .stdout(predicate::str::contains("198.51.100.7 (disabled)"));
+    let written = render();
+    assert!(!written.contains("198.51.100.7"), "script was:\n{written}");
+
+    fx.run(&["set-firewall-rule", "--id", "1", "--enabled", "true"]);
+    let written = render();
+    assert!(written.contains("198.51.100.7"), "script was:\n{written}");
+
+    fx.cmd(&["set-firewall-rule", "--id", "99", "--enabled", "false"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no firewall rule with id: 99"));
+}
+
+/// Without `--backend`, `render-firewall` writes for the backend this
+/// host is set to, rather than refusing to run.
+#[test]
+fn render_firewall_follows_the_stored_backend() {
+    let fx = Fixture::new();
+    let script = fx.db.with_file_name("fw.out");
+    fx.run(&["add-firewall-rule", "--address", "198.51.100.7"]);
+
+    fx.run(&["set-firewall-backend", "--backend", "iptables"])
+        .stdout(predicate::str::contains("firewall.sh"));
+    fx.run(&[
+        "render-firewall",
+        "--out",
+        script.to_str().unwrap(),
+        "--ssh-log",
+        "tests/fixtures/logs/auth.log",
+    ])
+    .stdout(predicate::str::contains("run: sh "));
+    let written = fs::read_to_string(&script).unwrap();
+    assert!(
+        written.contains("-A STOP-BOTS -s 198.51.100.7 -j DROP"),
+        "script was:\n{written}"
+    );
+}
+
+// ---- the web console's settings ----
+
+#[test]
+fn set_web_stores_every_console_setting() {
+    let fx = Fixture::new();
+    fx.run(&[
+        "set-web",
+        "--bind",
+        "0.0.0.0:8788",
+        "--expose",
+        "true",
+        "--base-path",
+        "/stop-bots/",
+        "--allowed-hosts",
+        "admin.example.com",
+        "--trust-forwarded-for",
+        "true",
+        "--secure-cookie",
+        "true",
+    ]);
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    let text = |key| db.get_text_setting(key).unwrap();
+    let flag = |key| db.get_bool_setting(key, false).unwrap();
+    use stop_bots::web::*;
+    assert_eq!(text(BIND_KEY).as_deref(), Some("0.0.0.0:8788"));
+    assert_eq!(text(BASE_PATH_KEY).as_deref(), Some("/stop-bots"));
+    assert_eq!(
+        text(ALLOWED_HOSTS_KEY).as_deref(),
+        Some("admin.example.com")
+    );
+    assert!(flag(EXPOSE_KEY));
+    assert!(flag(TRUST_FORWARDED_KEY));
+    assert!(flag(SECURE_COOKIE_KEY));
+
+    // `false` switches them back off rather than being ignored.
+    fx.run(&[
+        "set-web",
+        "--trust-forwarded-for",
+        "false",
+        "--secure-cookie",
+        "false",
+    ]);
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    assert!(!db.get_bool_setting(TRUST_FORWARDED_KEY, true).unwrap());
+    assert!(!db.get_bool_setting(SECURE_COOKIE_KEY, true).unwrap());
+
+    fx.run(&["set-web"])
+        .stdout(predicate::str::contains("0.0.0.0:8788"))
+        .stdout(predicate::str::contains("admin.example.com"));
+}
+
+/// The same check `web` makes before it binds, made before anything is
+/// stored — and a refusal stores none of the other flags either.
+#[test]
+fn set_web_refuses_a_network_bind_without_exposure_and_stores_nothing() {
+    let fx = Fixture::new();
+    fx.cmd(&[
+        "set-web",
+        "--bind",
+        "0.0.0.0:8788",
+        "--allowed-hosts",
+        "admin.example.com",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("--expose true"));
+
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    assert_eq!(db.get_text_setting(stop_bots::web::BIND_KEY).unwrap(), None);
+    assert_eq!(
+        db.get_text_setting(stop_bots::web::ALLOWED_HOSTS_KEY)
+            .unwrap(),
+        None
+    );
+}
+
 /// A `Command` carrying `args`, for the tests above that need one without
 /// the `Fixture`'s own NGINX directories. Still not the host's: see
 /// [`common::stop_bots_bin`].

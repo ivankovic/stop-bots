@@ -130,7 +130,7 @@ tokio = { version = "1.0", features = ["full"] }
 futures = "0.3"
 
 # For CLI argument parsing
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 # For the web UI. `axum` is close to free here: `reqwest` already brings
 # `hyper`, `http` and `tower`, so this adds the router and little else.
 # Default features off — `axum`'s defaults pull in multipart, ws and

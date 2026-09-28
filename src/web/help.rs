@@ -177,9 +177,9 @@ fn body(view: &View) -> Markup {
                             " block on port 80. Until you run "
                             code { "certbot --nginx -d <host>" }
                             " this console\u{2019}s password form and session cookie cross the network "
-                            "in the clear; the generated file says so too. Pass "
-                            code { "--secure-cookie true" }
-                            " to stop-bots web or stop-bots install web once the certificate is in place."
+                            "in the clear; the generated file says so too. Run "
+                            code { "stop-bots set-web --secure-cookie true" }
+                            " once the certificate is in place."
                         },
                     ))
                     (row(

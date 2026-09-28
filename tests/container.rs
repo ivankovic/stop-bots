@@ -470,8 +470,6 @@ impl Server {
     }
 
     /// Runs `stop-bots` inside the container against a fixed database.
-    /// `--db` is a per-subcommand flag rather than a global one, so it
-    /// goes after the args, not before them.
     fn stop_bots(&self, args: &str) -> String {
         self.sh(&format!("stop-bots {args} --db /tmp/db.sqlite3"))
     }
@@ -572,7 +570,7 @@ impl Host {
     }
 
     /// Runs `stop-bots` on the host against the installed console's
-    /// database. `--db` is a per-subcommand flag, so it goes last.
+    /// database.
     fn stop_bots(&self, args: &str) -> String {
         self.sh(&format!("stop-bots {args} --db {HOST_DB}"))
     }

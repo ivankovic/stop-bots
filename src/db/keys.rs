@@ -100,6 +100,8 @@ pub const DETECT_SUBNET_ESCALATION_MIN: &str = "detect_subnet_escalation_min";
 pub const DETECT_ASSET_RATIO_MIN_PAGES: &str = "detect_asset_ratio_min_pages";
 pub const DETECT_ROTATING_UA_MIN: &str = "detect_rotating_ua_min";
 pub const DETECT_REFERERLESS_MIN_PATHS: &str = "detect_refererless_min_paths";
+pub const DETECT_SSH_SCANNERS_MIN_ATTEMPTS: &str = "detect_ssh_scanners_min_attempts";
+pub const DETECT_WEB_SCANNERS_MIN_PATHS: &str = "detect_web_scanners_min_paths";
 
 // ---- web console ----
 
@@ -150,6 +152,8 @@ pub const ALL: &[&str] = &[
     DETECT_ASSET_RATIO_MIN_PAGES,
     DETECT_ROTATING_UA_MIN,
     DETECT_REFERERLESS_MIN_PATHS,
+    DETECT_SSH_SCANNERS_MIN_ATTEMPTS,
+    DETECT_WEB_SCANNERS_MIN_PATHS,
     WEB_BIND,
     WEB_BASE_PATH,
     WEB_SECURE_COOKIE,

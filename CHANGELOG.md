@@ -35,6 +35,36 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - `SECURITY.md` said every detector is off by default; five are on. It now
   says which, and that blocking traffic you wanted is a matter of tuning.
 
+## [Unreleased]
+
+### Added
+
+- `set-detector <name>` and `list-detectors`: switch, TTL and threshold for
+  every detector, as the internal cron and `batch` use them.
+- `set-subnet-escalation`: IPv4 /24 escalation, previously unreachable.
+- `set-category`, `set-bot` (both with `--site`), `list-categories`, `list-bots`.
+- `set-firewall-rule --enabled`, `set-firewall-backend`.
+- `set-web`: bind, exposure, path prefix, allowed hosts, `X-Forwarded-For`
+  trust and the `Secure` cookie, in one place.
+- `--db` works before or after any subcommand, and falls back to `STOP_BOTS_DB`.
+
+### Changed
+
+- The SSH and web scanner thresholds are stored settings (defaults 20 and 7,
+  as before), so the cron and `batch` honour them.
+- `render-firewall` no longer needs `--backend`: it uses the stored one, and
+  `--out` defaults to that backend's file (`firewall.sh` for iptables).
+- The `block-*` detectors default `--threshold` and `--ttl-days` to the stored
+  values instead of fixed numbers.
+- `block-scanners` is now `block-ssh-scanners`; the old name works for one release.
+- `web --allowed-hosts`, `--trust-forwarded-for`, `--secure-cookie` and `--save`
+  are deprecated in favour of `set-web`. They still work, with a note, for one release.
+
+### Fixed
+
+- `--help`: `web`, `status`, `batch`, `set-log-paths`, `set-nginx-commands` and
+  `set-block-response` showed another command's text or none. Every flag has help now.
+
 ## [0.0.15] — 2026-09-27
 
 ### Added

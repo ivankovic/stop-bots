@@ -54,7 +54,10 @@ pub fn generated_dir(name: &str) -> PathBuf {
 /// `stop-bots`, with those directories already pointed somewhere harmless.
 pub fn stop_bots_bin() -> Command {
     let mut cmd = Command::cargo_bin("stop-bots").unwrap();
-    cmd.env("STOP_BOTS_NGINX_CONF_D", generated_dir("conf.d"))
+    // A developer's own `STOP_BOTS_DB` must never be what a test that
+    // forgot `--db` writes to.
+    cmd.env_remove("STOP_BOTS_DB")
+        .env("STOP_BOTS_NGINX_CONF_D", generated_dir("conf.d"))
         .env("STOP_BOTS_NGINX_DIR", generated_dir("managed"));
     cmd
 }
