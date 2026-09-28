@@ -369,6 +369,22 @@ pub fn web_unit(layout: &Layout) -> String {
          # The database holds the console's password hash.\n\
          UMask=0077\n\
          \n\
+         # The console is here to protect the sites on this host, so it must\n\
+         # never be what starves them. A detector pass reads the whole access\n\
+         # log, which on a busy host is tens of megabytes held twice over, on a\n\
+         # machine that may have 1 GB in all. Lower CPU and I/O priority than\n\
+         # NGINX, so a pass waits for a quiet moment rather than competing.\n\
+         Nice=10\n\
+         IOSchedulingClass=idle\n\
+         # MemoryHigh throttles and reclaims; it never kills. Past it the\n\
+         # console slows down, which a background pass can afford. MemoryMax\n\
+         # is only the backstop for a runaway: at that point the kernel stops\n\
+         # this service rather than choosing a victim host-wide, and\n\
+         # Restart=on-failure brings it back. Percentages are of physical RAM:\n\
+         # 256 MB and 512 MB on a 1 GB VPS, and more on a machine that has it.\n\
+         MemoryHigh=25%\n\
+         MemoryMax=50%\n\
+         \n\
          # Three that `systemd-analyze security` will still flag, each on\n\
          # purpose. User= — see above. CapabilityBoundingSet= — root's ability\n\
          # to write a file it does not own *is* CAP_DAC_OVERRIDE, so trimming\n\

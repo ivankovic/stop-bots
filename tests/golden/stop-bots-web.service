@@ -58,6 +58,22 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 # The database holds the console's password hash.
 UMask=0077
 
+# The console is here to protect the sites on this host, so it must
+# never be what starves them. A detector pass reads the whole access
+# log, which on a busy host is tens of megabytes held twice over, on a
+# machine that may have 1 GB in all. Lower CPU and I/O priority than
+# NGINX, so a pass waits for a quiet moment rather than competing.
+Nice=10
+IOSchedulingClass=idle
+# MemoryHigh throttles and reclaims; it never kills. Past it the
+# console slows down, which a background pass can afford. MemoryMax
+# is only the backstop for a runaway: at that point the kernel stops
+# this service rather than choosing a victim host-wide, and
+# Restart=on-failure brings it back. Percentages are of physical RAM:
+# 256 MB and 512 MB on a 1 GB VPS, and more on a machine that has it.
+MemoryHigh=25%
+MemoryMax=50%
+
 # Three that `systemd-analyze security` will still flag, each on
 # purpose. User= — see above. CapabilityBoundingSet= — root's ability
 # to write a file it does not own *is* CAP_DAC_OVERRIDE, so trimming

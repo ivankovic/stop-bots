@@ -1135,6 +1135,22 @@ fn install_web_writes_a_unit_that_systemd_actually_starts() {
         "enabled",
         "`enable --now` did not enable it, so it would not come back on boot"
     );
+
+    // The resource limits reach the running process, not only the file:
+    // a console on a 1 GB VPS must yield to the NGINX it protects.
+    let pid = host.unit("stop-bots-web.service", "MainPID");
+    let nice = host.sh(&format!("cat /proc/{pid}/stat | cut -d' ' -f19"));
+    assert_eq!(nice.trim(), "10", "the console does not run at Nice=10");
+    assert_eq!(
+        host.unit("stop-bots-web.service", "IOSchedulingClass"),
+        "3",
+        "the console's I/O class is not idle (3)"
+    );
+    let high = host.unit("stop-bots-web.service", "MemoryHigh");
+    assert!(
+        high.parse::<u64>().is_ok(),
+        "MemoryHigh is not a byte limit, so nothing throttles the console: {high}"
+    );
 }
 
 /// **The netlink bug, reproduced and then fixed, in one test.**

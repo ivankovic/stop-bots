@@ -111,6 +111,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   a failed apply leaves the previous chain as it was.
 - **iptables: IPv6 rules are applied** through `ip6tables-restore`, not skipped.
 - `status` counts set elements and ip6tables rules as loaded rules.
+- The web unit runs at `Nice=10` and `IOSchedulingClass=idle`, with
+  `MemoryHigh=25%` (throttles) and `MemoryMax=50%` (backstop) of RAM.
 
 
 - **A render no longer changes what loads at boot.** It writes
