@@ -3354,10 +3354,10 @@ fn stop_bots_cmd(args: &[&str]) -> Command {
 /// A database as 0.0.15 left it, restored from its SQL dump into `db`.
 fn restore_0_0_15(db: &Path) {
     let sql = fs::read_to_string("tests/fixtures/db/db-0.0.15.sql").unwrap();
-    rusqlite::Connection::open(db)
-        .unwrap()
-        .execute_batch(&sql)
-        .unwrap();
+    // No fsyncs for the setup: it is not what is under test.
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute_batch("PRAGMA synchronous = OFF").unwrap();
+    conn.execute_batch(&sql).unwrap();
 }
 
 /// The upgrade an operator actually does: install the new package, run

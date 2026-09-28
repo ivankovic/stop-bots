@@ -271,6 +271,12 @@ fn backup(conn: &Connection, path: &Path, version: u32) -> Result<()> {
                 target.display()
             )
         })?;
+    // `VACUUM INTO` leaves the copy unsynced. It has to be on disk before
+    // the upgrade commits, or a power cut could leave an upgraded database
+    // beside a torn copy of the old one.
+    std::fs::File::open(&target)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("failed to write {} to disk", target.display()))?;
     Ok(())
 }
 
@@ -656,8 +662,12 @@ mod tests {
     }
 
     /// A database written by any 0.0.x: tables, no version.
+    ///
+    /// Written without fsyncs: setting up the fixture is not what is under
+    /// test, and on a busy disk its syncs alone could spend a test's budget.
     fn pre_0_1_database(path: &Path, sql: &str) {
         let conn = Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA synchronous = OFF").unwrap();
         conn.execute_batch(sql).unwrap();
     }
 
@@ -799,10 +809,7 @@ mod tests {
     /// the column and keeps its rows as permanent blocks.
     #[test]
     fn a_firewall_table_from_before_expiry_gets_the_column_and_keeps_its_rules() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite3");
-        pre_0_1_database(
-            &path,
+        let db = upgraded(
             "CREATE TABLE firewall_rules (
                  id INTEGER PRIMARY KEY, address TEXT NOT NULL, port INTEGER,
                  action TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
@@ -810,8 +817,6 @@ mod tests {
              INSERT INTO firewall_rules (address, action, created_at)
              VALUES ('203.0.113.7', 'block', 1700000000);",
         );
-
-        let db = Db::open(&path).unwrap();
 
         let rules = db.list_firewall_rules().unwrap();
         assert_eq!(rules.len(), 1, "{rules:?}");
@@ -824,25 +829,22 @@ mod tests {
     /// entire point is the megabytes it was occupying.
     #[test]
     fn upgrading_drops_a_pre_digest_firewall_signature() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.sqlite3");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-                .unwrap();
-            // What the old `format!("{rules:?}")` would have stored.
-            conn.execute(
-                "INSERT INTO settings VALUES (?1, ?2)",
-                params![
-                    keys::FIREWALL_RENDERED_SIGNATURE,
-                    "[FirewallRule { id: 1, address: \"1.2.3.4\", port: None, action: Block, \
-                     enabled: true, expires_at: None }]"
-                ],
-            )
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             .unwrap();
-        }
+        // What the old `format!("{rules:?}")` would have stored.
+        conn.execute(
+            "INSERT INTO settings VALUES (?1, ?2)",
+            params![
+                keys::FIREWALL_RENDERED_SIGNATURE,
+                "[FirewallRule { id: 1, address: \"1.2.3.4\", port: None, action: Block, \
+                 enabled: true, expires_at: None }]"
+            ],
+        )
+        .unwrap();
 
-        let db = Db::open(&path).unwrap();
+        migrate(&conn, None).unwrap();
+        let db = Db { conn };
 
         let rows: i64 = db
             .conn
@@ -865,12 +867,15 @@ mod tests {
 
     /// Opens `fixture`, restored into a file, the way an upgraded binary
     /// would find it on a host.
-    fn upgraded(fixture: &str) -> (tempfile::TempDir, std::path::PathBuf, Db) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite3");
-        pre_0_1_database(&path, fixture);
-        let db = Db::open(&path).unwrap();
-        (dir, path, db)
+    /// `fixture`, restored into memory and taken through [`migrate`]: the
+    /// same steps as on disk, minus the copy (which the `_on_disk` tests
+    /// cover) and minus every fsync, so what these tests check about the
+    /// data costs nothing on a slow disk.
+    fn upgraded(fixture: &str) -> Db {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(fixture).unwrap();
+        migrate(&conn, None).unwrap();
+        Db { conn }
     }
 
     /// Every table and its columns (name, type, not-null, default,
@@ -913,28 +918,34 @@ mod tests {
 
     #[test]
     fn a_0_0_1_database_upgrades_to_exactly_the_schema_of_a_new_one() {
-        let (_dir, _path, old) = upgraded(DB_0_0_1);
+        let old = upgraded(DB_0_0_1);
         assert_eq!(shape(&old), shape(&Db::open_in_memory().unwrap()));
         assert_eq!(version_of(&old), CURRENT_VERSION);
     }
 
     #[test]
     fn a_0_0_15_database_upgrades_to_exactly_the_schema_of_a_new_one() {
-        let (_dir, _path, old) = upgraded(DB_0_0_15);
+        let old = upgraded(DB_0_0_15);
         assert_eq!(shape(&old), shape(&Db::open_in_memory().unwrap()));
         assert_eq!(version_of(&old), CURRENT_VERSION);
     }
 
+    /// On disk, through `Db::open`, as a host runs it. The oldest release
+    /// here; `tests/cli.rs` does the same for 0.0.15 through the binary.
     #[test]
-    fn upgrading_a_0_0_x_database_leaves_a_copy_of_it() {
-        for (release, fixture) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
-            let (_dir, path, _db) = upgraded(fixture);
-            let copy = Connection::open(backup_path(&path, 0)).unwrap();
-            let rules: i64 = copy
-                .query_row("SELECT COUNT(*) FROM firewall_rules", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(rules, 5, "{release}: the copy should hold the old rules");
-        }
+    fn upgrading_a_0_0_1_database_leaves_a_copy_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        pre_0_1_database(&path, DB_0_0_1);
+
+        let db = Db::open(&path).unwrap();
+
+        assert_eq!(version_of(&db), CURRENT_VERSION);
+        let copy = Connection::open(backup_path(&path, 0)).unwrap();
+        let rules: i64 = copy
+            .query_row("SELECT COUNT(*) FROM firewall_rules", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rules, 5, "the copy should hold the old rules");
     }
 
     /// Both fixtures hold three hand-added rules, which never expire, and
@@ -942,7 +953,7 @@ mod tests {
     #[test]
     fn upgrading_keeps_every_firewall_rule_with_and_without_an_expiry() {
         for (release, fixture) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
-            let (_dir, _path, db) = upgraded(fixture);
+            let db = upgraded(fixture);
             let rules: Vec<_> = db
                 .list_firewall_rules()
                 .unwrap()
@@ -979,7 +990,7 @@ mod tests {
     #[test]
     fn upgrading_keeps_sites_their_rules_and_the_bot_lists() {
         for (release, fixture) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
-            let (_dir, _path, db) = upgraded(fixture);
+            let db = upgraded(fixture);
             let sites = db.list_sites().unwrap();
             let names: Vec<&str> = sites.iter().map(|s| s.server_name.as_str()).collect();
             assert_eq!(names, ["example.com", "localhost"], "{release}");
@@ -1007,7 +1018,7 @@ mod tests {
     fn upgrading_keeps_every_setting() {
         use crate::protection::{self, Detector};
         for (release, fixture) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
-            let (_dir, _path, db) = upgraded(fixture);
+            let db = upgraded(fixture);
             let checks: [(&str, String, String); 12] = [
                 (
                     "geo mode",
@@ -1091,7 +1102,7 @@ mod tests {
     fn upgrading_changes_no_detector_s_default() {
         use crate::protection::Detector;
         for (release, fixture) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
-            let (_dir, _path, db) = upgraded(fixture);
+            let db = upgraded(fixture);
             assert_eq!(db.defaults_generation().unwrap(), 1, "{release}");
             // The fixtures switch web scanners and asset ratio by hand.
             for d in Detector::ALL.into_iter().filter(|d| {
@@ -1113,15 +1124,13 @@ mod tests {
     /// with the schema, never by an upgrade.
     #[test]
     fn only_a_new_database_records_the_current_defaults_generation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("db.sqlite3");
-        let fresh = Db::open(&path).unwrap();
+        let fresh = Db::open_in_memory().unwrap();
         assert_eq!(
             fresh.get_text_setting(keys::DEFAULTS_GENERATION).unwrap(),
             Some(DEFAULTS_GENERATION.to_string())
         );
 
-        let (_dir, _path, upgraded) = upgraded(DB_0_0_15);
+        let upgraded = upgraded(DB_0_0_15);
         assert_eq!(
             upgraded
                 .get_text_setting(keys::DEFAULTS_GENERATION)
@@ -1132,7 +1141,7 @@ mod tests {
 
     #[test]
     fn upgrading_0_0_15_keeps_what_only_it_could_store() {
-        let (_dir, _path, db) = upgraded(DB_0_0_15);
+        let db = upgraded(DB_0_0_15);
         assert_eq!(db.list_trusted_addresses().unwrap(), ["192.0.2.77"]);
         assert_eq!(db.list_trusted_user_agents().unwrap(), ["MyUptimeChecker"]);
         assert!(db.get_auto_apply().unwrap());
@@ -1146,7 +1155,7 @@ mod tests {
     /// them, empty, and they work.
     #[test]
     fn upgrading_0_0_1_adds_the_tables_later_releases_introduced() {
-        let (_dir, _path, db) = upgraded(DB_0_0_1);
+        let db = upgraded(DB_0_0_1);
         assert!(db.list_trusted_addresses().unwrap().is_empty());
         db.trust_address("192.0.2.77").unwrap();
         db.record_ssh_login_ips(&["192.0.2.8".to_string()]).unwrap();
