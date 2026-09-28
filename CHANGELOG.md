@@ -24,6 +24,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - Housekeeping: `REVIEW.md` holds open items only, and `CONTRIBUTING.md` lists
   every module and quotes one coverage figure, measured.
 
+### Fixed
+
+- `SECURITY.md` said every detector is off by default; five are on. It now
+  says which, and that blocking traffic you wanted is a matter of tuning.
+
 ## [0.0.15] — 2026-09-27
 
 ### Added

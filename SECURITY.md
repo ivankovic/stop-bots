@@ -50,8 +50,13 @@ mostly *integrity* failures, not memory safety:
 
 ## What does not
 
-- **Blocking traffic you wanted.** That is the tool working; tune the rules. The README
-  is explicit that every detector is off by default for this reason.
+- **Blocking traffic you wanted.** That is the tool working as configured, and the
+  answer is tuning: switch off the detector or the category that caught it, exempt
+  the path, or allow the address. Several detectors are on by default (the SSH and
+  web scanners, forged crawlers, probe paths and injection attempts), because each
+  has a threshold or a signature that ordinary visitors do not reach; the rest start
+  off. A default that blocks clearly legitimate traffic on an ordinary site is worth a
+  normal bug report, not a security one.
 - **Requiring root.** Writing firewall rules and NGINX config needs privilege. That is the
   job, not a flaw.
 - **The absence of a request-path component.** There is deliberately no runtime component

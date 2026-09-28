@@ -1,8 +1,11 @@
 # Contributing
 
-Everything a contributor — human or otherwise — needs to know about how this code is
-built, tested and laid out. It used to live at the bottom of `README.md`; it was moved
-here so the README stays a description of the *tool* rather than of the workshop.
+**Outside contributions are not accepted at this time** (see the README); this file
+documents how the maintainer and his coding agents work on the project.
+
+Everything they need to know about how this code is built, tested and laid out. It used
+to live at the bottom of `README.md`; it was moved here so the README stays a
+description of the *tool* rather than of the workshop.
 
 The AI-only instructions are in [`AGENTS.md`](AGENTS.md); open work is in `TODO.md`. Releasing is its own
 document, [`RELEASING.md`](RELEASING.md).
