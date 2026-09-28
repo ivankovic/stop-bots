@@ -153,13 +153,6 @@ impl ScanBlockOutcome {
     }
 }
 
-/// The failed-SSH-attempt count above which an address is a scanner, and
-/// the distinct-404 count above which one is a web scanner. Defaults for
-/// every caller that doesn't have a reason to pick its own — the CLI's
-/// `--min-attempts`/`--min-paths` flags do.
-pub const DEFAULT_SSH_ATTEMPTS: usize = 20;
-pub const DEFAULT_WEB_PATHS: usize = 7;
-
 /// Runs whichever detector `detector` names against `log_text`.
 ///
 /// The one place that maps a [`Detector`](crate::protection::Detector) onto
@@ -175,9 +168,20 @@ pub fn run_detector(
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
     use crate::protection::Detector as D;
+    // The stored threshold, which defaults to what these two used to be
+    // hard-coded to. Only the two scanners take it as an argument; the
+    // behavioural three read their own below.
+    let threshold = |d: D| -> Result<usize> {
+        Ok(d.threshold(db)?
+            .expect("both scanner detectors have a threshold"))
+    };
     match detector {
-        D::SshScanners => block_ssh_scanners(db, DEFAULT_SSH_ATTEMPTS, ttl_days, log_text, dry_run),
-        D::WebScanners => block_web_scanners(db, DEFAULT_WEB_PATHS, ttl_days, log_text, dry_run),
+        D::SshScanners => {
+            block_ssh_scanners(db, threshold(D::SshScanners)?, ttl_days, log_text, dry_run)
+        }
+        D::WebScanners => {
+            block_web_scanners(db, threshold(D::WebScanners)?, ttl_days, log_text, dry_run)
+        }
         D::SpoofedCrawlers => block_spoofed_crawlers(db, ttl_days, log_text, dry_run),
         D::ProbePaths => block_probe_paths(db, ttl_days, log_text, dry_run),
         D::Injection => block_injection(db, ttl_days, log_text, dry_run),
@@ -787,6 +791,42 @@ mod tests {
         assert_eq!(outcome.newly_blocked, vec!["198.51.100.9".to_string()]);
         assert_eq!(outcome.already_covered, 0);
         assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+    }
+
+    /// What the internal cron and `batch` run goes through `run_detector`,
+    /// which used to pass a hard-coded 20 whatever the operator wanted. It
+    /// has to read the stored threshold, in both directions.
+    #[test]
+    fn the_scheduled_scanner_pass_uses_the_stored_threshold() {
+        use crate::protection::Detector;
+        let log = ssh_failed_attempt("198.51.100.9", 12);
+
+        let db = Db::open_in_memory().unwrap();
+        let outcome = run_detector(&db, Detector::SshScanners, 5, &log, true).unwrap();
+        assert_eq!(
+            outcome.candidates, 0,
+            "12 attempts crossed the default of 20"
+        );
+
+        Detector::SshScanners.set_threshold(&db, 10).unwrap();
+        let outcome = run_detector(&db, Detector::SshScanners, 5, &log, true).unwrap();
+        assert_eq!(outcome.candidates, 1, "a threshold of 10 was not applied");
+    }
+
+    #[test]
+    fn the_scheduled_web_scanner_pass_uses_the_stored_threshold() {
+        use crate::protection::Detector;
+        let log: String = (0..5)
+            .map(|i| not_found_line("203.0.113.9", &format!("/missing-{i}")))
+            .collect();
+
+        let db = Db::open_in_memory().unwrap();
+        let outcome = run_detector(&db, Detector::WebScanners, 1, &log, true).unwrap();
+        assert_eq!(outcome.candidates, 0, "5 paths crossed the default of 7");
+
+        Detector::WebScanners.set_threshold(&db, 4).unwrap();
+        let outcome = run_detector(&db, Detector::WebScanners, 1, &log, true).unwrap();
+        assert_eq!(outcome.candidates, 1, "a threshold of 4 was not applied");
     }
 
     /// A TTL stored before the ceiling existed, or passed on the command

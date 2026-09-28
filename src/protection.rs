@@ -398,7 +398,69 @@ impl Detector {
         }
         db.set_int_setting(&self.ttl_key(), days)
     }
+
+    /// The `settings` key and default of this detector's threshold, for the
+    /// five that count something. `None` for the ones where a single
+    /// request is conclusive, which have nothing to tune.
+    ///
+    /// The three behavioural keys predate this and keep their names; the
+    /// two scanner keys are new and follow them.
+    pub fn threshold_setting(self) -> Option<(&'static str, i64)> {
+        match self {
+            Detector::SshScanners => {
+                Some((SSH_SCANNERS_MIN_ATTEMPTS, SSH_SCANNERS_MIN_ATTEMPTS_DEFAULT))
+            }
+            Detector::WebScanners => Some((WEB_SCANNERS_MIN_PATHS, WEB_SCANNERS_MIN_PATHS_DEFAULT)),
+            Detector::AssetRatio => Some((ASSET_RATIO_MIN_PAGES, ASSET_RATIO_MIN_PAGES_DEFAULT)),
+            Detector::RotatingUserAgent => Some((ROTATING_UA_MIN, ROTATING_UA_MIN_DEFAULT)),
+            Detector::RefererlessCrawl => {
+                Some((REFERERLESS_MIN_PATHS, REFERERLESS_MIN_PATHS_DEFAULT))
+            }
+            Detector::SpoofedCrawlers
+            | Detector::ProbePaths
+            | Detector::Injection
+            | Detector::Honeypot
+            | Detector::RobotsTxt => None,
+        }
+    }
+
+    /// The threshold this detector runs with, floored at [`MIN_THRESHOLD`]
+    /// (see [`threshold`]), or `None` if it has none.
+    pub fn threshold(self, db: &Db) -> Result<Option<usize>> {
+        self.threshold_setting()
+            .map(|(key, default)| threshold(db, key, default))
+            .transpose()
+    }
+
+    /// Stores a threshold, refusing one under [`MIN_THRESHOLD`] rather than
+    /// storing a value the read would silently raise.
+    pub fn set_threshold(self, db: &Db, value: i64) -> Result<()> {
+        let Some((key, _)) = self.threshold_setting() else {
+            anyhow::bail!(
+                "{} has no threshold: one matching request is already conclusive",
+                self.spec().label
+            );
+        };
+        if value < MIN_THRESHOLD {
+            anyhow::bail!(
+                "a threshold under {MIN_THRESHOLD} matches every address in the log, whatever it \
+                 did (got {value})"
+            );
+        }
+        db.set_int_setting(key, value)
+    }
 }
+
+/// Threshold for the SSH scanner detector: failed-authentication lines
+/// from one address. Twenty, which a person mistyping a password never
+/// reaches and a brute-forcer passes in seconds.
+pub const SSH_SCANNERS_MIN_ATTEMPTS: &str = "detect_ssh_scanners_min_attempts";
+pub const SSH_SCANNERS_MIN_ATTEMPTS_DEFAULT: i64 = 20;
+
+/// Threshold for the web scanner detector: *distinct* paths answered 404
+/// for one address. A visitor following a dead link produces one.
+pub const WEB_SCANNERS_MIN_PATHS: &str = "detect_web_scanners_min_paths";
+pub const WEB_SCANNERS_MIN_PATHS_DEFAULT: i64 = 7;
 
 /// `settings` key: whether a detector that flags several addresses in one
 /// IPv4 `/24` blocks the whole `/24` instead.
@@ -424,12 +486,11 @@ pub const MIN_THRESHOLD: i64 = 2;
 
 /// Reads a detector threshold, floored at [`MIN_THRESHOLD`].
 ///
-/// The floor is at the read rather than at the writes because there are no
-/// writes: none of these thresholds has a CLI verb, a TUI editor or a web
-/// control. They are reachable the way every other verb-less setting in
-/// this project is reachable, and the way TODO.md tells people to reach
-/// them — by hand, with `sqlite3`. So the read is the only place that sees
-/// every caller.
+/// The floor is at the read as well as at the one write,
+/// [`Detector::set_threshold`] (`stop-bots set-detector --threshold`),
+/// because a value can also arrive by hand, with `sqlite3`, or from a
+/// database written before that check existed. The read is the only place
+/// that sees every caller.
 ///
 /// A negative value never gets this far: [`Db::get_int_setting`] screens
 /// those and returns the detector's own default instead, which is what
@@ -453,11 +514,33 @@ pub fn subnet_escalation(db: &Db) -> Result<Option<usize>> {
     if !db.get_bool_setting(SUBNET_ESCALATION, SUBNET_ESCALATION_DEFAULT)? {
         return Ok(None);
     }
-    Ok(Some(threshold(
-        db,
-        SUBNET_ESCALATION_MIN,
-        SUBNET_ESCALATION_MIN_DEFAULT,
-    )?))
+    Ok(Some(subnet_escalation_min(db)?))
+}
+
+/// The escalation threshold, whether or not escalation is on — for a
+/// front-end showing what switching it on would do.
+pub fn subnet_escalation_min(db: &Db) -> Result<usize> {
+    threshold(db, SUBNET_ESCALATION_MIN, SUBNET_ESCALATION_MIN_DEFAULT)
+}
+
+/// Switches `/24` escalation and sets its threshold; `None` leaves either
+/// as it is. The threshold is refused under [`MIN_THRESHOLD`] for the
+/// reason [`Detector::set_threshold`] refuses one: at one, a single
+/// flagged address would block its whole `/24`.
+pub fn set_subnet_escalation(db: &Db, enabled: Option<bool>, min: Option<i64>) -> Result<()> {
+    if let Some(min) = min {
+        if min < MIN_THRESHOLD {
+            anyhow::bail!(
+                "escalating on fewer than {MIN_THRESHOLD} addresses would block a /24 for one \
+                 address's behaviour (got {min})"
+            );
+        }
+        db.set_int_setting(SUBNET_ESCALATION_MIN, min)?;
+    }
+    if let Some(enabled) = enabled {
+        db.set_bool_setting(SUBNET_ESCALATION, enabled)?;
+    }
+    Ok(())
 }
 
 /// Threshold for the asset-ratio detector: distinct successful page URLs
@@ -544,6 +627,63 @@ mod tests {
             threshold(&db, ASSET_RATIO_MIN_PAGES, ASSET_RATIO_MIN_PAGES_DEFAULT).unwrap(),
             ASSET_RATIO_MIN_PAGES_DEFAULT as usize
         );
+    }
+
+    /// The two scanner thresholds used to be constants the cron could not
+    /// be told about. Stored now, but an install that never sets them must
+    /// keep today's behaviour exactly.
+    #[test]
+    fn the_scanner_thresholds_default_to_the_values_they_were_hard_coded_to() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(Detector::SshScanners.threshold(&db).unwrap(), Some(20));
+        assert_eq!(Detector::WebScanners.threshold(&db).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn a_stored_threshold_is_read_back_for_that_detector_only() {
+        let db = Db::open_in_memory().unwrap();
+        Detector::SshScanners.set_threshold(&db, 40).unwrap();
+        assert_eq!(Detector::SshScanners.threshold(&db).unwrap(), Some(40));
+        assert_eq!(Detector::WebScanners.threshold(&db).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn a_threshold_under_the_floor_is_not_stored() {
+        let db = Db::open_in_memory().unwrap();
+        for value in [i64::MIN, -1, 0, 1] {
+            assert!(
+                Detector::WebScanners.set_threshold(&db, value).is_err(),
+                "{value} was accepted"
+            );
+        }
+        assert_eq!(Detector::WebScanners.threshold(&db).unwrap(), Some(7));
+    }
+
+    /// A detector where one request is conclusive has nothing to tune, and
+    /// a stored value would be a setting nothing reads.
+    #[test]
+    fn a_detector_without_a_threshold_refuses_one() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(Detector::ProbePaths.threshold(&db).unwrap(), None);
+        assert!(Detector::ProbePaths.set_threshold(&db, 5).is_err());
+    }
+
+    #[test]
+    fn subnet_escalation_is_off_until_switched_on_and_keeps_its_threshold() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(subnet_escalation(&db).unwrap(), None);
+
+        set_subnet_escalation(&db, None, Some(5)).unwrap();
+        assert_eq!(
+            subnet_escalation(&db).unwrap(),
+            None,
+            "a threshold alone switched it on"
+        );
+        set_subnet_escalation(&db, Some(true), None).unwrap();
+        assert_eq!(subnet_escalation(&db).unwrap(), Some(5));
+
+        assert!(set_subnet_escalation(&db, None, Some(1)).is_err());
+        assert_eq!(subnet_escalation_min(&db).unwrap(), 5);
     }
 
     #[test]
