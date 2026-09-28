@@ -23,8 +23,8 @@ categories = [
     "security",
 ]
 # Internal working documents, kept in the repository but not shipped to
-# everyone who downloads the crate: AI instructions, a 150KB decision log, a
-# TODO list and a code-review scratchpad. All of them are a click away on
+# everyone who downloads the crate: AI instructions, a TODO list, a roadmap and
+# a code-review scratchpad. All of them are a click away on
 # GitHub. `exclude` rather than `include` deliberately — with `include`, the
 # day someone adds a fixture directory and forgets to list it, the published
 # crate silently fails to build.
@@ -33,6 +33,7 @@ exclude = [
     "AGENTS.md",
     "TODO.md",
     "REVIEW.md",
+    "ROADMAP.md",
     "Makefile",
     # Needs Docker to run, and ships a Dockerfile plus a staged binary
     # nobody downloading the crate can use.
