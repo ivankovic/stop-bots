@@ -51,6 +51,8 @@ pub mod event;
 pub mod fetch;
 #[doc(hidden)]
 pub mod firewall;
+#[doc(hidden)]
+pub mod generated;
 #[cfg(test)]
 mod golden;
 #[doc(hidden)]

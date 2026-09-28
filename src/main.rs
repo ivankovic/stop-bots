@@ -1137,8 +1137,9 @@ enum Command {
         /// Print every step and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Replace a unit file that exists and differs from what this
-        /// would write.
+        /// Replace a unit file even if it has been edited since stop-bots
+        /// wrote it. An unedited one, from any version, is replaced
+        /// without this.
         #[arg(long)]
         force: bool,
         /// Enable the unit but do not start it now.
@@ -3227,6 +3228,16 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         start: options.start,
     };
 
+    // Read before `install_web` replaces it. 0.0.1 to 0.0.6 named the
+    // NGINX root in ExecStart; the unit that replaces theirs does not,
+    // because the service now reads it from the database — so a host that
+    // was given `--root` then would quietly go back to /etc/nginx.
+    let legacy_root = std::fs::read_to_string(layout.unit_path())
+        .ok()
+        .and_then(|text| install::legacy::web_unit(&text))
+        .and_then(|unit| unit.root)
+        .filter(|root| root != Path::new(nginx::DEFAULT_ROOT));
+
     let mut steps = install::install_web(&layout, &opts)?;
 
     let prefixed = prefix != Path::new("/");
@@ -3279,6 +3290,17 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
             "bind {addr} recorded in {}",
             layout.db_path.display()
         ));
+        if let Some(root) = &legacy_root {
+            let key = nginx::NginxCommands::ROOT_KEY;
+            if db.get_text_setting(key)?.is_none() {
+                db.set_text_setting(key, &root.to_string_lossy())?;
+                steps.push(format!(
+                    "kept the old unit's --root {} as the stored NGINX root \
+                     (`set-nginx-commands --root`)",
+                    root.display()
+                ));
+            }
+        }
 
         if !web::auth::password_is_set(&db)? {
             let generated = web::auth::generate_password()?;

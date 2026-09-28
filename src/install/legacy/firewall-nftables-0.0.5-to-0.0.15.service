@@ -1,0 +1,21 @@
+# Written by `stop-bots install firewall`. Re-running that command leaves
+# an edited copy of this file alone and tells you so; `--force` replaces it.
+#
+# Deliberately NOT nftables.service: that unit loads /etc/nftables.conf,
+# which is not this file, so it would restore a different ruleset entirely
+# -- and on a stock Debian or Ubuntu it would also `flush ruleset` at boot,
+# dropping whatever else manages tables on this host.
+[Unit]
+Description=Apply the stop-bots firewall ruleset
+Documentation=https://github.com/ivankovic/stop-bots
+After=docker.service ufw.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/stop-bots/firewall.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/stop-bots/firewall.nft
+
+[Install]
+WantedBy=multi-user.target

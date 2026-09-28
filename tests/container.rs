@@ -1479,6 +1479,46 @@ fn reinstalling_leaves_an_edited_unit_alone_unless_forced() {
     );
 }
 
+/// The other half of the refusal above: a unit an earlier release wrote,
+/// and nobody edited, is replaced without `--force`. Before this, every
+/// release that changed the template made a re-install refuse on every
+/// host, which trains operators to reach for `--force` — the flag that
+/// also overwrites the edits the refusal exists for.
+#[test]
+fn reinstalling_over_a_0_0_15_unit_upgrades_it_without_force() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-upgrade-unit");
+    host.put(
+        &format!(
+            "{}/tests/fixtures/units/stop-bots-web-0.0.15.service",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+        "/etc/systemd/system/stop-bots-web.service",
+    );
+
+    let (ok, stdout, stderr) = host.run("stop-bots install web");
+
+    let said = format!("{stdout}{stderr}");
+    assert!(ok, "the 0.0.15 unit was taken for an edit:\n{said}");
+    assert!(
+        said.contains("unedited since stop-bots 0.0.7 to 0.0.15"),
+        "{said}"
+    );
+    assert!(
+        host.sh("cat /etc/systemd/system/stop-bots-web.service")
+            .contains("# stop-bots-template: "),
+        "the unit was not replaced"
+    );
+    assert_eq!(
+        host.unit("stop-bots-web.service", "ActiveState"),
+        "active",
+        "journal:\n{}",
+        host.journal("stop-bots-web.service")
+    );
+}
+
 /// The password is generated once and printed once. A second install must
 /// not roll it, or every re-install locks the operator out of a console
 /// they had bookmarked.
