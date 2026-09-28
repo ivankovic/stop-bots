@@ -915,6 +915,76 @@ fn a_config_that_fails_the_test_is_put_back_byte_for_byte() {
     assert!(!log.contains("systemctl"), "log was: {log}");
 }
 
+/// The first thing a host with NGINX in a container meets: no `nginx` on
+/// PATH. The error names the verb that fixes it.
+#[test]
+fn nginx_missing_from_path_points_at_set_nginx_commands() {
+    let fx = Fixture::new();
+    fx.seed_bots();
+    fx.write_site("a.example");
+    fx.scan_sites();
+    let empty = fx._tmp.path().join("empty-bin");
+    fs::create_dir_all(&empty).unwrap();
+
+    fx.cmd(&["apply-blocks", "--root", fx.nginx_root.to_str().unwrap()])
+        .env("PATH", &empty)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("`nginx` isn't on PATH"))
+        .stderr(predicate::str::contains(
+            "see `stop-bots set-nginx-commands --help`",
+        ));
+}
+
+/// A config root that is not there names both ways to point at the
+/// right one.
+#[test]
+fn a_missing_nginx_root_says_how_to_set_it() {
+    let fx = Fixture::new();
+    let missing = fx._tmp.path().join("no-such-nginx");
+
+    fx.cmd(&["scan-sites", "--root", missing.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not exist"))
+        .stderr(predicate::str::contains(
+            "stop-bots set-nginx-commands --root <dir>",
+        ));
+}
+
+/// A user without write access to the site files is told to use sudo,
+/// after the error that says which file it was.
+#[test]
+fn a_site_file_this_user_cannot_write_says_to_use_sudo() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root is never denied, so there is nothing to see
+    }
+    let fx = Fixture::new();
+    fx.seed_bots();
+    let site = fx.write_site("a.example");
+    fx.scan_sites();
+    fs::set_permissions(&site, fs::Permissions::from_mode(0o444)).unwrap();
+    fs::set_permissions(&fx.nginx_root, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let assert = fx
+        .cmd(&[
+            "apply-blocks",
+            "--root",
+            fx.nginx_root.to_str().unwrap(),
+            "--no-reload",
+        ])
+        .assert();
+    fs::set_permissions(&fx.nginx_root, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("a.example.conf"))
+        .stderr(predicate::str::contains(
+            "This needs root. Run it with sudo.",
+        ));
+}
+
 #[test]
 fn a_change_to_the_trust_file_alone_still_reloads_nginx() {
     let fx = Fixture::new();

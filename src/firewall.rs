@@ -33,7 +33,7 @@
 
 use crate::db::{Db, FirewallAction, FirewallRule, GeoMode, RuleSource};
 use crate::{ipranges, iptables, nftables, sshlog};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::Path;
 
 /// The applied firewall script: what the boot unit `install firewall`
@@ -783,7 +783,14 @@ pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
         .arg(out_path)
         .env("PATH", crate::host::path_with_sbin())
         .output()
-        .context(what)?;
+        .map_err(|err| {
+            let hint = missing_program_hint(backend, err.kind());
+            let err = anyhow::Error::new(err).context(what);
+            match hint {
+                Some(hint) => crate::hint::with(err, hint),
+                None => err,
+            }
+        })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -791,7 +798,7 @@ pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
             backend.apply_command(),
             output.status,
             stderr.trim(),
-            sandbox_hint(&stderr)
+            failure_hint(backend, &stderr, crate::hint::is_root())
         );
     }
     Ok(())
@@ -1325,6 +1332,37 @@ pub fn script_state(db: &Db) -> Result<ScriptState> {
             ScriptState::Changed
         },
     )
+}
+
+/// What to do when the apply program itself is missing: for nftables,
+/// `nft` is not installed; `sh` always is.
+fn missing_program_hint(
+    backend: FirewallBackend,
+    kind: std::io::ErrorKind,
+) -> Option<&'static str> {
+    match (backend, kind) {
+        (FirewallBackend::Nftables, std::io::ErrorKind::NotFound) => Some(
+            "`nft` isn't installed. Install the `nftables` package, or switch to iptables \
+             with `stop-bots set-firewall-backend iptables`.",
+        ),
+        _ => None,
+    }
+}
+
+/// The next step for an apply that ran and failed, if the output names
+/// one: not root, the iptables tools missing, or a sandboxed service
+/// ([`sandbox_hint`]).
+fn failure_hint(backend: FirewallBackend, stderr: &str, root: bool) -> &'static str {
+    let denied = stderr.contains("Operation not permitted") || stderr.contains("Permission denied");
+    if denied && !root {
+        return "\n\nChanging the firewall needs root. Run it with sudo.";
+    }
+    let missing = stderr.contains(": not found") || stderr.contains("command not found");
+    if backend == FirewallBackend::Iptables && missing && stderr.contains("iptables") {
+        return "\n\nThe iptables tools aren't installed. Install the `iptables` package, \
+                or switch to nftables with `stop-bots set-firewall-backend nftables`.";
+    }
+    sandbox_hint(stderr)
 }
 
 /// An explanation to append when the apply failed for a reason the tool
@@ -2169,9 +2207,54 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_nft_says_to_install_it_or_switch_backend() {
+        let hint =
+            missing_program_hint(FirewallBackend::Nftables, std::io::ErrorKind::NotFound).unwrap();
+        assert!(hint.contains("`nftables` package"), "{hint}");
+        assert!(hint.contains("set-firewall-backend iptables"), "{hint}");
+        assert_eq!(
+            missing_program_hint(
+                FirewallBackend::Nftables,
+                std::io::ErrorKind::PermissionDenied
+            ),
+            None
+        );
+    }
+
+    /// Through the real apply: the script is what `sh` runs, and it fails
+    /// the way dash does when `iptables-restore` is not there.
+    #[test]
+    fn a_missing_iptables_restore_says_to_install_it_or_switch_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("firewall.sh");
+        std::fs::write(
+            &script,
+            "echo 'sh: 12: iptables-restore: not found' >&2\nexit 127\n",
+        )
+        .unwrap();
+
+        let err = apply_script(FirewallBackend::Iptables, &script).unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("`iptables` package"), "{text}");
+        assert!(text.contains("set-firewall-backend nftables"), "{text}");
+    }
+
+    #[test]
+    fn a_user_refused_by_the_kernel_is_told_to_use_sudo_and_root_is_not() {
+        let stderr = "Error: Could not process rule: Operation not permitted";
+        for backend in [FirewallBackend::Nftables, FirewallBackend::Iptables] {
+            assert!(failure_hint(backend, stderr, false).contains("sudo"));
+            assert!(!failure_hint(backend, stderr, true).contains("sudo"));
+        }
+    }
+
+    #[test]
     fn an_unrelated_failure_gets_no_hint() {
         assert_eq!(sandbox_hint("nft: command not found"), "");
         assert_eq!(sandbox_hint("Error: syntax error, unexpected newline"), "");
+        let syntax = "Error: syntax error, unexpected newline";
+        assert_eq!(failure_hint(FirewallBackend::Nftables, syntax, false), "");
     }
 
     // ---- the one path, and its policy ----

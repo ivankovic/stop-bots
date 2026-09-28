@@ -66,6 +66,8 @@ mod golden;
 #[doc(hidden)]
 pub mod health;
 #[doc(hidden)]
+pub mod hint;
+#[doc(hidden)]
 pub mod host;
 #[doc(hidden)]
 pub mod injection;

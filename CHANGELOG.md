@@ -119,6 +119,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - **One apply at a time**: NGINX applies and firewall scripts take a lock
   (`/run/stop-bots.lock` as root). A second waits up to 10s, then says
   another stop-bots is applying.
+- **Errors name the next step**: `nginx` not on PATH points at
+  `set-nginx-commands`, a missing NGINX root at `--root`, a permission a
+  non-root user lacks at sudo (or `--db` for the database), a missing
+  `nft` or `iptables-restore` at the package or `set-firewall-backend`.
 
 
 - **A render no longer changes what loads at boot.** It writes

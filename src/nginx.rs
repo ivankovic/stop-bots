@@ -2239,7 +2239,7 @@ fn write_validated(
 ) -> Result<()> {
     let _lock = crate::applylock::hold()?;
     let previous = fs::read_to_string(path).ok();
-    write(path, content)?;
+    write(path, content).map_err(crate::hint::sudo_if_denied)?;
 
     if let Err(err) = test_config(commands) {
         // Put it back before reporting, so the operator is not left with a
@@ -2305,6 +2305,13 @@ pub fn apply_console_access(
     }
 }
 
+/// What to do when the NGINX config root is not there: most often NGINX
+/// is in a container, or installed under another prefix.
+fn missing_root_hint() -> &'static str {
+    "If NGINX's config lives somewhere else, store where with \
+     `stop-bots set-nginx-commands --root <dir>`, or pass `--root <dir>` for one run."
+}
+
 /// Recursively walks `root` looking for NGINX config files containing
 /// `server { ... }` blocks, returning one [`DiscoveredSite`] per block (named
 /// after its first `server_name`). Files with no server block, or that
@@ -2318,7 +2325,10 @@ pub fn apply_console_access(
 /// thing, and still skipped.
 pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
     if !root.exists() {
-        anyhow::bail!("{} does not exist", root.display());
+        return Err(crate::hint::with(
+            anyhow::anyhow!("{} does not exist", root.display()),
+            missing_root_hint(),
+        ));
     }
     let mut sites = Vec::new();
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
@@ -2705,7 +2715,7 @@ pub fn apply_all_sites_and_reload(
 
     let outcome = match apply_all_sites(db, root, &sites) {
         Ok(outcome) => outcome,
-        Err(err) => return Err(snapshot.restore_after(err)),
+        Err(err) => return Err(crate::hint::sudo_if_denied(snapshot.restore_after(err))),
     };
     let Some(commands) = commands.filter(|_| outcome.changed > 0) else {
         return Ok(outcome);
@@ -2803,7 +2813,7 @@ pub fn apply_site_and_reload(
     })();
     let changed = match written {
         Ok(changed) => changed,
-        Err(err) => return Err(snapshot.restore_after(err)),
+        Err(err) => return Err(crate::hint::sudo_if_denied(snapshot.restore_after(err))),
     };
     let Some(commands) = commands.filter(|_| changed) else {
         return Ok((changed, false));
@@ -3219,7 +3229,7 @@ fn run(argv: &[String], what: &str) -> Result<()> {
     let output = std::process::Command::new(program)
         .args(args)
         .output()
-        .with_context(|| format!("failed to run `{}`", argv.join(" ")))?;
+        .map_err(|err| spawn_failure(argv, err))?;
     if !output.status.success() {
         anyhow::bail!(
             "{what} (`{}`) exited with {}: {}",
@@ -3229,6 +3239,25 @@ fn run(argv: &[String], what: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Why `argv` could not be started, and — when its program is not there
+/// at all, the usual state of a host whose NGINX is in a container —
+/// where the commands are set.
+fn spawn_failure(argv: &[String], err: std::io::Error) -> anyhow::Error {
+    let not_found = err.kind() == std::io::ErrorKind::NotFound;
+    let err = anyhow::Error::new(err).context(format!("failed to run `{}`", argv.join(" ")));
+    if !not_found {
+        return err;
+    }
+    crate::hint::with(
+        err,
+        &format!(
+            "`{}` isn't on PATH. If NGINX runs in a container, point stop-bots at it: \
+             see `stop-bots set-nginx-commands --help`.",
+            argv[0]
+        ),
+    )
 }
 
 /// Validates the currently-installed NGINX config. Run before every

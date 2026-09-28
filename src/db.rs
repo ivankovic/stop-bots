@@ -1087,6 +1087,34 @@ fn use_write_ahead_log(conn: &Connection) {
     );
 }
 
+/// `err`, with the next step when the database is someone else's.
+///
+/// The usual way to get here: `stop-bots install web` made the database
+/// root's, 0600 in a 0700 directory, and then someone ran `stop-bots`
+/// without sudo. "failed to secure database: Permission denied" is true
+/// and does not say that. SQLite's own "unable to open database file"
+/// says even less, so a denied open is also recognised by trying the
+/// file directly.
+fn not_yours(path: &Path, err: anyhow::Error, root: bool) -> anyhow::Error {
+    let denied = crate::hint::has_io_kind(&err, std::io::ErrorKind::PermissionDenied)
+        || std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .is_err_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied);
+    if root || !denied {
+        return err;
+    }
+    crate::hint::with(
+        err,
+        &format!(
+            "{} belongs to another user — root, if `stop-bots install` set this host up. \
+             Run it with sudo, or pass `--db <path>` to use a database of your own.",
+            path.display()
+        ),
+    )
+}
+
 /// `settings` key for [`Db::get_humans_only`].
 pub const HUMANS_ONLY_KEY: &str = keys::HUMANS_ONLY;
 
@@ -1111,13 +1139,16 @@ impl Db {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 create_private_dir_all(parent)
-                    .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+                    .with_context(|| format!("failed to create directory: {}", parent.display()))
+                    .map_err(|err| not_yours(path, err, crate::hint::is_root()))?;
             }
         }
         make_private(path)
-            .with_context(|| format!("failed to secure database: {}", path.display()))?;
+            .with_context(|| format!("failed to secure database: {}", path.display()))
+            .map_err(|err| not_yours(path, err, crate::hint::is_root()))?;
         let conn = Connection::open(path)
-            .with_context(|| format!("failed to open database: {}", path.display()))?;
+            .with_context(|| format!("failed to open database: {}", path.display()))
+            .map_err(|err| not_yours(path, err, crate::hint::is_root()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("failed to set the database busy timeout")?;
         use_write_ahead_log(&conn);
@@ -3556,6 +3587,45 @@ mod tests {
             assert!(side.exists(), "{} was not created", side.display());
             assert_eq!(mode_of(&side), 0o600, "{suffix}");
         }
+    }
+
+    /// A database in a directory this user cannot enter is the state
+    /// `install web` leaves for everyone but root. The error names the
+    /// way out rather than only the errno.
+    #[test]
+    fn a_database_this_user_cannot_open_says_to_use_sudo_or_another_db() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let path = locked.join("db.sqlite3");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let opened = Db::open(&path);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if crate::hint::is_root() {
+            // Root is not denied, so there is nothing to test here.
+            return;
+        }
+
+        let text = format!(
+            "{:#}",
+            opened.err().expect("opened a database it cannot reach")
+        );
+        assert!(text.contains("failed to secure database"), "{text}");
+        assert_eq!(
+            text.matches("Run it with sudo, or pass `--db <path>`")
+                .count(),
+            1,
+            "no next step, or more than one: {text}"
+        );
+    }
+
+    #[test]
+    fn root_denied_a_database_is_not_told_to_use_sudo() {
+        let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let text = format!("{:#}", not_yours(Path::new("/nonexistent"), err, true));
+        assert!(!text.contains("sudo"), "{text}");
     }
 
     /// Storing a real-sized feed must not autocommit per row.

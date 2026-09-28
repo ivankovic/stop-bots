@@ -620,7 +620,8 @@ pub fn preflight(layout: &Layout, options: &Options) -> Result<()> {
     if !options.dry_run {
         writable(&layout.unit_dir).with_context(|| {
             format!(
-                "cannot write to {} — `install web` needs root",
+                "cannot write to {} — `install web` needs root. Run it with sudo \
+                 (`sudo stop-bots install web --dry-run` shows the plan first)",
                 layout.unit_dir.display()
             )
         })?;
@@ -731,10 +732,15 @@ pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
     let mut steps = Steps::new();
     steps.push(plan_unit(&state, &unit_path, options.force, &retry)?);
     if !options.dry_run && state != Existing::Current {
-        if let Some(parent) = unit_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&unit_path, &unit)?;
+        (|| -> Result<()> {
+            if let Some(parent) = unit_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::write(&unit_path, &unit)
+                .with_context(|| format!("writing {}", unit_path.display()))
+        })()
+        .map_err(crate::hint::sudo_if_denied)?;
     }
 
     // Not started. The script may not exist yet, and starting a unit that
@@ -1454,6 +1460,28 @@ mod tests {
         let last = steps.iter().last().expect("at least one step");
         assert!(last.contains("render-firewall --apply"), "steps: {steps:?}");
         assert!(!last.contains("nft -f"), "steps: {steps:?}");
+    }
+
+    /// Not root: the error names the unit file and says to use sudo, where
+    /// it used to be a bare "Permission denied (os error 13)".
+    #[test]
+    fn install_firewall_without_permission_names_the_file_and_sudo() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::hint::is_root() {
+            return; // root is never denied, so there is nothing to see
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::create_dir_all(&layout.unit_dir).unwrap();
+        std::fs::set_permissions(&layout.unit_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = install_firewall(&layout, &Options::default());
+        std::fs::set_permissions(&layout.unit_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = result.expect_err("wrote into a read-only directory");
+        let text = format!("{err:#}");
+        assert!(text.contains(FIREWALL_UNIT), "which file? {text}");
+        assert!(text.contains("Run it with sudo"), "{text}");
     }
 
     /// And on the real host, it does.

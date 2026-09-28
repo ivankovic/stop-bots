@@ -336,6 +336,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- ipdetail.rs    <- Everything already known about one address (Firewall detail view)
         |- uadetail.rs    <- The same for one user agent string
         |- health.rs      <- Is this host actually protected? The checks behind `status`
+        |- hint.rs        <- Errors that name the next step (run with sudo, set-nginx-commands)
         |- host.rs        <- The host name, and where the system programs this runs are
         |- install.rs     <- `stop-bots install`: the systemd units and directories
         |- install/       <- The units 0.0.x wrote, to tell an old unit from an edited one
