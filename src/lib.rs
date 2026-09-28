@@ -48,6 +48,8 @@ pub mod dynamic;
 #[doc(hidden)]
 pub mod event;
 #[doc(hidden)]
+pub mod evidence;
+#[doc(hidden)]
 pub mod fetch;
 #[doc(hidden)]
 pub mod firewall;
@@ -71,6 +73,12 @@ pub mod ipranges;
 pub mod iptables;
 #[doc(hidden)]
 pub mod logpaths;
+#[doc(hidden)]
+pub mod logread;
+#[doc(hidden)]
+pub mod logscan;
+#[doc(hidden)]
+pub mod logtime;
 #[doc(hidden)]
 pub mod nftables;
 #[doc(hidden)]

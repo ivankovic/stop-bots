@@ -49,7 +49,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -115,6 +115,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         summary: "managed_files, the record of generated files written",
         apply: v2_managed_files,
+    },
+    Migration {
+        summary: "log_evidence, what each detector has seen from each address",
+        apply: v3_log_evidence,
     },
 ];
 
@@ -644,6 +648,42 @@ fn v2_managed_files(conn: &Connection) -> rusqlite::Result<()> {
             written_at INTEGER NOT NULL,
             version TEXT NOT NULL
         );",
+    )
+}
+
+/// Version 3: what each detector has seen from each address, and when.
+///
+/// Detectors used to count over the whole log on every pass, which is why
+/// an expired block came back: its lines were still there. The log is now
+/// read incrementally, and what a line says is kept here for as long as
+/// the detector's window, so a count can span many reads and still forget
+/// what is older than the window. See `crate::evidence`.
+///
+/// A new table and nothing else, so an older database needs nothing
+/// rewritten: it starts with no evidence, and the first read of each log
+/// supplies what is inside the windows.
+fn v3_log_evidence(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+            CREATE TABLE log_evidence (
+                detector TEXT NOT NULL,
+                address TEXT NOT NULL,
+                -- What was seen: a path, a user agent, a payload's kind;
+                -- or, starting with a newline no log line can hold, a
+                -- clearing observation or a count bucket. See
+                -- `evidence::Item`.
+                item TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                first_seen INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                PRIMARY KEY (detector, address, item)
+            );
+            -- Pruning by age, per detector, once a pass.
+            CREATE INDEX log_evidence_age ON log_evidence (detector, last_seen);
+            -- Forgetting an address's evidence when it is blocked, across
+            -- every detector.
+            CREATE INDEX log_evidence_address ON log_evidence (address);
+        ",
     )
 }
 
@@ -1185,6 +1225,35 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// A database from before the evidence table: the upgrade adds it,
+    /// empty, and leaves what was there.
+    #[test]
+    fn a_version_2_database_gains_the_evidence_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        v1_baseline(&conn).unwrap();
+        v2_managed_files(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('a-key', 'kept')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn, None).unwrap();
+        let db = Db { conn };
+
+        assert_eq!(version_of(&db), CURRENT_VERSION);
+        assert_eq!(
+            db.get_text_setting("a-key").unwrap().as_deref(),
+            Some("kept")
+        );
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM log_evidence", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

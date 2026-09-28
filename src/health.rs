@@ -222,11 +222,18 @@ pub struct Probe {
     /// counts the right number of rules, while enforcing none of them for
     /// anything behind a published container port.
     pub firewall_covers_forward: Option<bool>,
-    /// `(public, parsed)` client addresses in the access log — see
-    /// [`crate::accesslog::client_address_mix`]. `None` when the log could
-    /// not be read, which [`log_sources`] already reports.
+    /// `(public, parsed)` client addresses in the access log's tail — see
+    /// [`crate::accesslog::Survey::public`]. `None` when the log could not
+    /// be read, which [`log_sources`] already reports.
     pub access_log_clients: Option<(usize, usize)>,
 }
+
+/// How much of the access log a probe reads: its last 32 MB. Every
+/// question the probe asks of the log (which formats it holds, whose
+/// addresses it records, whom it turns away) a recent sample answers as
+/// well as the whole file, and the whole file was the one expensive thing
+/// in a probe: on a 1 GB server, a 200 MB log read into memory twice over.
+pub const ACCESS_LOG_SAMPLE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Where the NGINX serving this host's config runs, as far as this host
 /// can tell from outside it.
@@ -279,6 +286,14 @@ const LOW_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// size of.
 const LARGE_DB_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The last [`ACCESS_LOG_SAMPLE_BYTES`] of the access log at `path`, read
+/// through a [`crate::accesslog::Survey`], or `None` if it cannot be read.
+fn access_log_sample(path: &Path, block_status: u16) -> Option<crate::accesslog::Survey> {
+    let mut survey = crate::accesslog::Survey::new(block_status);
+    crate::logread::read_tail(path, ACCESS_LOG_SAMPLE_BYTES, &mut |line| survey.line(line)).ok()?;
+    Some(survey)
+}
+
 /// Runs everything that needs a subprocess or the filesystem.
 ///
 /// Never fails: a probe that cannot answer a question leaves that field
@@ -298,10 +313,11 @@ pub fn probe(
         Some(state) => (Some(state.rules), Some(backend.stored().to_string())),
         None => (None, None),
     };
-    // Read once and answer both questions from it: two reads would be two
-    // different moments, and this one shells out to nothing but the
-    // filesystem.
-    let access_log = paths.access_source(None);
+    // Read once, and only the tail, and every access-log question answered
+    // from that one pass: two reads would be two different moments.
+    let sample = access_log_sample(&paths.access_path(None), block_status);
+    let access_readable = sample.is_some();
+    let survey = sample.unwrap_or_default();
     let nginx_home = nginx_home();
     let container = match &nginx_home {
         NginxHome::Container { name } => Some(name.clone()),
@@ -310,15 +326,8 @@ pub fn probe(
     Probe {
         live_rules,
         live_backend,
-        // From the same read as every other access-log answer below: the
-        // log can be tens of megabytes and reading it twice in one probe
-        // would be the only expensive thing here.
-        turned_away: match &access_log {
-            crate::accesslog::LogSource::Found(text) => {
-                crate::accesslog::turned_away_user_agents(text, block_status)
-            }
-            crate::accesslog::LogSource::Unavailable => Vec::new(),
-        },
+        // From the same read as every other access-log answer below.
+        turned_away: survey.turned_away(),
         conf_d_path: Some(conf_d.display().to_string()),
         conf_d_exists: Some(conf_d.is_dir()),
         stray_generated_files: stray_generated_files(conf_d, Path::new(crate::nginx::CONF_D_DIR)),
@@ -327,18 +336,12 @@ pub fn probe(
         unit_active: unit_is_active(),
         unit_binary: unit_binary(),
         db_free_bytes: free_bytes(db_path),
-        ssh_log_readable: Some(matches!(
-            paths.ssh_source(ssh_log),
-            crate::sshlog::LogSource::Found(_)
-        )),
-        access_log_readable: Some(matches!(&access_log, crate::accesslog::LogSource::Found(_))),
+        // Asked, not read: this used to read the whole log, which on a
+        // journald host was the whole sshd journal, once an hour.
+        ssh_log_readable: Some(paths.ssh(ssh_log).is_readable()),
+        access_log_readable: Some(access_readable),
         access_log_path: Some(paths.access_description(None)),
-        access_log_clients: match &access_log {
-            crate::accesslog::LogSource::Found(text) => {
-                Some(crate::accesslog::client_address_mix(text))
-            }
-            crate::accesslog::LogSource::Unavailable => None,
-        },
+        access_log_clients: access_readable.then_some((survey.public, survey.counts.parsed)),
         nginx_home,
         managed_dir_in_container: container.as_ref().map(|name| {
             // `test -d` inside the container, at the path the generated
@@ -3154,5 +3157,30 @@ mod tests {
         assert_eq!(human_bytes(512), "512.0B");
         assert_eq!(human_bytes(1536), "1.5KB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0GB");
+    }
+
+    /// The probe's sample of a real file: counts, quoted line and all.
+    #[test]
+    fn the_access_log_sample_counts_its_lines_and_quotes_one_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        std::fs::write(
+            &log,
+            "203.0.113.5 - - [28/Sep/2026:06:33:01 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"UA\"\n\
+             custom \x1b[2J format\n",
+        )
+        .unwrap();
+
+        let survey = access_log_sample(&log, 403).expect("readable");
+
+        assert_eq!(
+            (survey.counts.lines, survey.counts.parsed, survey.public),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            survey.unparsed_sample.as_deref(),
+            Some("custom \u{fffd}[2J format")
+        );
+        assert!(access_log_sample(&dir.path().join("none.log"), 403).is_none());
     }
 }

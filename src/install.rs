@@ -126,7 +126,7 @@ pub struct Layout {
     /// check", not "checked and clear".
     ///
     /// Passing no flag is not the same as passing this path. With no
-    /// `--ssh-log`, `sshlog::find_default_source` tries `/var/log/auth.log`
+    /// `--ssh-log`, `sshlog::SshSource::Search` tries `/var/log/auth.log`
     /// and `/var/log/secure`, *then* falls back to `journalctl`, which is
     /// where a journald-only host keeps its sshd lines. An explicit path
     /// deliberately skips that fallback — it means "read this, not whatever

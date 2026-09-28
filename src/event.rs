@@ -88,22 +88,19 @@ pub enum AppEvent {
             Result<Vec<String>, String>,
         )>,
     },
-    /// A cron job's log source has been resolved on a background thread
-    /// (see `App::start_cron_log_job`). Only the *reading* of the SSH/access
-    /// log (and, for the SSH log, the `journalctl` fallback subprocess) is
-    /// blocking enough to move off the main thread — that's what this event
-    /// carries back. The actual parsing/counting/Db writes for the job stay
-    /// on the main thread in `App::finish_cron_log_job`, same as every other
-    /// `Db` access in this app (`Db` isn't `Sync`). `None` means the log
-    /// source was unavailable.
-    CronLogFetched {
-        job: crate::cron::CronJob,
-        log_text: Option<String>,
+    /// A log pass for the internal cron's due `jobs` has read and parsed
+    /// its logs on a background thread (see `App::start_cron_log_pass`).
+    /// Storing what it found, and each job's decision, happen back on the
+    /// main thread in `App::finish_cron_log_pass`, same as every other `Db`
+    /// access in this app (`Db` isn't `Sync`).
+    CronLogRead {
+        jobs: Vec<crate::cron::CronJob>,
+        read: Box<crate::logscan::Read>,
     },
     /// A background read of the SSH log, for Firewall's SSH
     /// panel, has come back (see `App::start_ssh_log_read`). `None` means no log
     /// was readable. Only the read is backgrounded; parsing it into rows
-    /// happens on the main thread, same as `CronLogFetched` above and for
+    /// happens on the main thread, same as `CronLogRead` above and for
     /// the same reason.
     SshLogRead { text: Option<String> },
     /// The background `nginx -t` + `systemctl reload nginx` that follows a

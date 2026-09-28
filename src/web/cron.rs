@@ -33,11 +33,12 @@
 //! `async fn` that awaits its halves in order.
 //!
 //! The one rule this file has to keep by hand is the one `with_db`'s
-//! signature can't express: **read the log outside the lock.** Resolving
-//! the SSH log can shell out to `journalctl`, which is slow, and doing it
-//! inside `with_db` would hold the database against every in-flight
-//! request for the duration. [`crate::cron::read_log_for`] takes no `Db`
-//! precisely so that this stays possible.
+//! signature can't express: **read and parse the logs outside the lock.**
+//! A read can be a large file or a `journalctl`, and doing it inside
+//! `with_db` would hold the database against every in-flight request for
+//! the duration. [`crate::logscan::read`] takes no `Db` precisely so that
+//! this stays possible: the plan is made under the lock, the read happens
+//! outside it, and only storing what it found goes back in.
 
 use std::path::PathBuf;
 
@@ -91,15 +92,28 @@ pub async fn tick(state: &AppState) -> usize {
     };
 
     let mut ran = 0;
-    for job in due {
+    // Every due job that reads a log, in one pass: each log is read once
+    // for all of them, rather than once per job.
+    let log_jobs: Vec<CronJob> = due
+        .iter()
+        .copied()
+        .filter(|j| cron::is_log_job(*j))
+        .collect();
+    if !log_jobs.is_empty() {
+        match run_log_jobs(state, log_jobs.clone()).await {
+            Ok(()) => ran += log_jobs.len(),
+            Err(err) => eprintln!("stop-bots: the log pass failed: {err:#}"),
+        }
+    }
+    for job in due.into_iter().filter(|j| !cron::is_log_job(*j)) {
         let result = match job {
             CronJob::UpdateIpRanges => update_ip_ranges(state).await,
-            CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
-                run_log_job(state, job).await
-            }
             CronJob::HealthCheck => health_check(state).await,
             CronJob::Maintenance => maintenance(state).await,
             CronJob::ApplyNginx => apply_nginx(state).await,
+            CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
+                unreachable!("run in the log pass above")
+            }
         };
         match result {
             Ok(()) => ran += 1,
@@ -153,25 +167,29 @@ async fn maintenance(state: &AppState) -> anyhow::Result<()> {
         .await
 }
 
-/// Reads the log this job needs off the async runtime and outside the
-/// database lock, then runs the job.
-async fn run_log_job(state: &AppState, job: CronJob) -> anyhow::Result<()> {
-    let ssh_log = state.ssh_log.clone();
-    // Read under the lock and moved into the blocking task, for the same
-    // reason `read_log_for` takes no `Db`.
-    let log_paths = state
-        .with_db(|db| Ok(crate::logpaths::LogPaths::from_db(db).unwrap_or_default()))
+/// One log pass for `jobs`: planned under the lock, read and parsed off
+/// the async runtime and outside the lock, stored and decided under it
+/// again.
+async fn run_log_jobs(state: &AppState, jobs: Vec<CronJob>) -> anyhow::Result<()> {
+    let flags = crate::logscan::Flags {
+        ssh_log: state.ssh_log.clone(),
+        access_log: None,
+    };
+    let planned = jobs.clone();
+    let plan = state
+        .with_db(move |db| crate::logscan::plan(db, &planned, &flags))
         .await?;
-    let log_text = tokio::task::spawn_blocking(move || {
-        cron::read_log_for(job, &log_paths, ssh_log.as_deref())
-    })
-    .await
-    .map_err(|err| anyhow::anyhow!("the log-reading thread panicked: {err}"))?;
+    let read = tokio::task::spawn_blocking(move || crate::logscan::read(&plan))
+        .await
+        .map_err(|err| anyhow::anyhow!("the log-reading thread panicked: {err}"))?;
 
     let out = state.firewall_out.clone();
     let apply = state.apply_for_real;
     state
-        .with_db(move |db| cron::run_log_job(db, job, log_text.as_deref(), out.as_deref(), apply))
+        .with_db(move |db| {
+            let applied = crate::logscan::apply(db, read)?;
+            cron::run_log_jobs(db, &jobs, &applied, out.as_deref(), apply)
+        })
         .await?;
     Ok(())
 }

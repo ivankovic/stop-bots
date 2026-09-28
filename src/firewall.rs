@@ -206,17 +206,17 @@ pub enum LockoutStatus {
     Risks(Vec<(String, String)>),
 }
 
-/// Finds recent successful SSH logins (via `ssh_log`, or auto-detected) and
+/// Finds recent successful SSH logins in `ssh_log` (see [`sshlog::SshSource::read`]) and
 /// checks whether any of them would actually end up blocked by `rules` (see
 /// [`lockout_risks`] for what "actually end up" means). Pure with respect to
 /// presentation: callers decide how to report [`LockoutStatus::Risks`] and
 /// whether to proceed anyway.
-pub fn assess_lockout_risk(rules: &[FirewallRule], ssh_log: Option<&Path>) -> LockoutStatus {
-    let source = match ssh_log {
-        Some(path) => sshlog::read_log_file(path),
-        None => sshlog::find_default_source(),
-    };
-    match source {
+pub fn assess_lockout_risk(rules: &[FirewallRule], ssh_log: &sshlog::SshSource) -> LockoutStatus {
+    // Read live, every time, and from wherever `LogPaths` says the log is:
+    // a stored `set-log-paths --ssh-log` used to be ignored here, so a
+    // host with its log somewhere else had a guard that could never run.
+    // The journal is read back a week, not whole.
+    match ssh_log.read(sshlog::recent_since()) {
         sshlog::LogSource::Found(text) => {
             let connected_ips = sshlog::parse_accepted_ips(&text);
             LockoutStatus::Risks(lockout_risks(rules, &connected_ips))
@@ -1128,7 +1128,7 @@ mod tests {
         .unwrap();
 
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        match assess_lockout_risk(&rules, Some(&log_path)) {
+        match assess_lockout_risk(&rules, &sshlog::SshSource::File(log_path)) {
             LockoutStatus::Risks(risks) => {
                 assert_eq!(
                     risks,
@@ -1143,7 +1143,10 @@ mod tests {
     fn assess_lockout_risk_is_unavailable_for_a_nonexistent_log() {
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
         assert!(matches!(
-            assess_lockout_risk(&rules, Some(Path::new("/nonexistent/x.log"))),
+            assess_lockout_risk(
+                &rules,
+                &sshlog::SshSource::File("/nonexistent/x.log".into())
+            ),
             LockoutStatus::LogUnavailable
         ));
     }

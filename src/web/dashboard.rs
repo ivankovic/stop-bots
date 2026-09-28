@@ -1492,8 +1492,11 @@ async fn write_firewall(state: &AppState, apply: bool) -> anyhow::Result<String>
             // Whether the guard actually looked. An unreadable log is not a
             // pass: writing still goes ahead, because a written script is
             // inert, but running it is refused below.
+            let resolved_ssh_log = crate::logpaths::LogPaths::from_db(db)
+                .unwrap_or_default()
+                .ssh(ssh_log.as_deref());
             let guard_ran =
-                match crate::firewall::assess_lockout_risk(&built.rules, ssh_log.as_deref()) {
+                match crate::firewall::assess_lockout_risk(&built.rules, &resolved_ssh_log) {
                     LockoutStatus::Risks(risks) if !risks.is_empty() => {
                         let names: Vec<String> = risks
                             .into_iter()

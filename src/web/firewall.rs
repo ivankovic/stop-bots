@@ -84,20 +84,33 @@ pub async fn page(
     let inspect_ua = params.inspect_ua.clone();
     let ssh_log = state.ssh_log.clone();
 
-    // The log read happens inside the same blocking closure as the
-    // database work. It has to be off the async runtime either way — on a
-    // host with no readable auth.log this shells out to `journalctl`,
-    // which the TUI measured at over half a second.
+    // Where the log is comes from the database (`set-log-paths` used to be
+    // ignored here); reading it does not, and happens outside the lock.
+    // It has to be off the async runtime either way -- on a host with no
+    // readable auth.log it runs `journalctl` -- and it used to run inside
+    // `with_db`, holding the database against every other request for as
+    // long as the whole journal took to print.
+    let source = match state
+        .with_db(move |db| {
+            Ok(crate::logpaths::LogPaths::from_db(db)
+                .unwrap_or_default()
+                .ssh(ssh_log.as_deref()))
+        })
+        .await
+    {
+        Ok(source) => source,
+        Err(err) => return internal_error(&err.to_string()),
+    };
+    let text =
+        tokio::task::spawn_blocking(move || match source.read(crate::sshlog::recent_since()) {
+            crate::sshlog::LogSource::Found(text) => Some(text),
+            crate::sshlog::LogSource::Unavailable => None,
+        })
+        .await
+        .unwrap_or_default();
+
     let live = state
         .with_db(move |db| {
-            let text = match &ssh_log {
-                Some(path) => crate::sshlog::read_log_file(path),
-                None => crate::sshlog::find_default_source(),
-            };
-            let text = match text {
-                crate::sshlog::LogSource::Found(text) => Some(text),
-                crate::sshlog::LogSource::Unavailable => None,
-            };
             let live = Live::load(db, text.as_deref())?;
             // In the same closure as the row load, from the same read of
             // the log: a detail panel assembled from a second, later read

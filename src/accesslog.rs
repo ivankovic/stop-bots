@@ -42,17 +42,18 @@
 //! monitoring probe or health check hammering a stale internal endpoint
 //! isn't an internet scanner on either log.
 
+use crate::evidence::{Evidence, Item, Rule};
 use crate::ipranges::{cidr_contains, is_local_or_private};
+use crate::protection::Detector;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
 
 /// The conventional NGINX access-log location; unlike SSH logs there's no
 /// second common layout to also try, and no journald fallback — NGINX logs
-/// to a file whether or not the system boots under systemd. Public so
-/// `accessstats::record_access_stats` can key its persisted read-offset by
-/// path even when the cron job (which only ever uses this default) never
-/// resolves one explicitly itself.
+/// to a file whether or not the system boots under systemd. What
+/// [`crate::logpaths::LogPaths::access_path`] falls back to when nothing
+/// is stored or given.
 pub const DEFAULT_LOG_PATH: &str = "/var/log/nginx/access.log";
 
 /// The result of looking for access-log data: distinguishes "found and
@@ -79,12 +80,6 @@ pub fn read_log_file(path: &Path) -> LogSource {
         Ok(bytes) => LogSource::Found(String::from_utf8_lossy(&bytes).into_owned()),
         Err(_) => LogSource::Unavailable,
     }
-}
-
-/// Tries [`DEFAULT_LOG_PATH`]. Best-effort: a missing file or permission
-/// error just means "couldn't check", same as `sshlog::find_default_source`.
-pub fn find_default_source() -> LogSource {
-    read_log_file(Path::new(DEFAULT_LOG_PATH))
 }
 
 /// Parses one access-log line in whichever of the two supported formats
@@ -124,7 +119,14 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
     let ip: IpAddr = line.split_whitespace().next()?.parse().ok()?;
 
     let mut fields = line.splitn(3, '"');
-    fields.next()?; // unquoted prefix (ip/user/time) — ip already captured above
+    // Unquoted prefix: ip, remote_user and `[time_local]`. The ip is
+    // captured above; the time is whatever sits between the brackets, and
+    // a line without a readable one still parses, undated.
+    let prefix = fields.next()?;
+    let time = prefix
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .and_then(|(stamp, _)| crate::logtime::nginx_time_local(stamp));
     let request = fields.next()?;
     let after_request = fields.next()?;
 
@@ -156,6 +158,7 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
         request: request.to_string(),
         referer,
         user_agent,
+        time,
     })
 }
 
@@ -226,11 +229,18 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
         // conclusion from "the format doesn't log it" that differs from
         // what it does with "the client didn't send one".
         user_agent: json_field(obj, "http_user_agent").unwrap_or_default(),
+        // `$time_iso8601` or `$time_local`, whichever the format logs.
+        // Neither is required: a line without one parses, undated.
+        time: json_field(obj, "time_iso8601")
+            .and_then(|t| crate::logtime::iso8601(&t))
+            .or_else(|| {
+                json_field(obj, "time_local").and_then(|t| crate::logtime::nginx_time_local(&t))
+            }),
     })
 }
 
 /// Every key [`parse_json_line`] reads.
-const JSON_FIELDS: [&str; 7] = [
+const JSON_FIELDS: [&str; 9] = [
     "remote_addr",
     "status",
     "request_uri",
@@ -238,6 +248,8 @@ const JSON_FIELDS: [&str; 7] = [
     "uri",
     "http_referer",
     "http_user_agent",
+    "time_iso8601",
+    "time_local",
 ];
 
 /// A JSON log line's top-level object, refused if it names any of
@@ -316,6 +328,11 @@ struct ParsedLine {
     /// the detector skips the line rather than answering it wrongly.
     referer: Option<String>,
     user_agent: String,
+    /// When NGINX says the request happened, in Unix seconds: `$time_local`
+    /// in the combined format, `time_iso8601` or `time_local` in a JSON
+    /// one. `None` for a line that carries neither, which a JSON format is
+    /// free to leave out.
+    time: Option<i64>,
 }
 
 /// Every IP with at least `threshold` *distinct* paths that returned 404
@@ -330,23 +347,11 @@ struct ParsedLine {
 /// (see the module docs for why there's no "had a 200" exclusion to go
 /// with it). Deduplicated and sorted for deterministic output.
 pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
-    let mut not_found_paths: HashMap<IpAddr, HashSet<String>> = HashMap::new();
-    for line in log_text.lines().filter_map(parse_line) {
-        if line.status == 404 {
-            not_found_paths
-                .entry(line.ip)
-                .or_default()
-                .insert(line.path);
-        }
-    }
-
-    let mut ips: Vec<String> = not_found_paths
-        .into_iter()
-        .filter(|(ip, paths)| paths.len() >= threshold && !is_local_or_private(ip))
-        .map(|(ip, _)| ip.to_string())
-        .collect();
-    ips.sort();
-    ips
+    addresses(convicted_in_text(
+        log_text,
+        Watch::only(Detector::WebScanners),
+        Rule::Distinct(threshold),
+    ))
 }
 
 /// One crawler that can be impersonated: a marker that identifies it in a
@@ -394,48 +399,14 @@ pub struct CrawlerClaim {
 /// Loopback/private source IPs are excluded, same as [`scanning_ips`].
 /// Deduplicated and sorted for deterministic output.
 pub fn spoofed_crawler_ips(log_text: &str, claims: &[CrawlerClaim]) -> Vec<(String, String)> {
-    let active: Vec<&CrawlerClaim> = claims.iter().filter(|c| !c.ranges.is_empty()).collect();
-    if active.is_empty() {
-        return Vec::new();
-    }
-
-    let mut found: HashMap<IpAddr, &'static str> = HashMap::new();
-    for line in log_text.lines().filter_map(parse_line) {
-        let ip = line.ip;
-        if is_local_or_private(&ip) {
-            continue;
-        }
-        let ua_lower = line.user_agent.to_lowercase();
-        let matched: Vec<&&CrawlerClaim> = active
-            .iter()
-            .filter(|claim| ua_lower.contains(claim.marker))
-            .collect();
-        if matched.is_empty() {
-            continue;
-        }
-        // Verification is per *request*, not per claim: if any crawler this
-        // user agent named vouches for the address, the request is
-        // legitimate and the other names it happens to mention prove
-        // nothing on their own. Checking per claim instead would flag the
-        // real Googlebot the moment its UA string contained some other
-        // crawler's token.
-        if matched
-            .iter()
-            .any(|claim| claim.ranges.iter().any(|cidr| cidr_contains(cidr, ip)))
-        {
-            continue;
-        }
-        if let Some(first) = matched.first() {
-            found.entry(ip).or_insert(first.name);
-        }
-    }
-
-    let mut ips: Vec<(String, String)> = found
-        .into_iter()
-        .map(|(ip, name)| (ip.to_string(), name.to_string()))
-        .collect();
-    ips.sort();
-    ips
+    convicted_in_text(
+        log_text,
+        Watch {
+            claims: claims.to_vec(),
+            ..Watch::only(Detector::SpoofedCrawlers)
+        },
+        Rule::Once,
+    )
 }
 
 /// Request paths that no human, browser or legitimate crawler ever asks
@@ -521,28 +492,14 @@ pub const DEFAULT_PROBE_PATHS: [&str; 13] = [
 /// an internal backup job walking a checkout isn't an attacker.
 /// Deduplicated (first matching path wins per IP) and sorted.
 pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, String)> {
-    if probe_paths.is_empty() {
-        return Vec::new();
-    }
-    let needles: Vec<String> = probe_paths.iter().map(|p| p.to_lowercase()).collect();
-
-    let mut found: HashMap<IpAddr, String> = HashMap::new();
-    for line in log_text.lines().filter_map(parse_line) {
-        if is_local_or_private(&line.ip) {
-            continue;
-        }
-        let path_lower = line.path.to_lowercase();
-        if needles.iter().any(|n| path_lower.contains(n.as_str())) {
-            found.entry(line.ip).or_insert(line.path);
-        }
-    }
-
-    let mut ips: Vec<(String, String)> = found
-        .into_iter()
-        .map(|(ip, path)| (ip.to_string(), path))
-        .collect();
-    ips.sort();
-    ips
+    convicted_in_text(
+        log_text,
+        Watch {
+            probe_paths: probe_paths.to_vec(),
+            ..Watch::only(Detector::ProbePaths)
+        },
+        Rule::Once,
+    )
 }
 
 /// Every address that sent an exploit payload — in the request line, the
@@ -561,47 +518,7 @@ pub fn probe_path_ips(log_text: &str, probe_paths: &[String]) -> Vec<(String, St
 /// fewer than 8,000 distinct user agents — and judging every occurrence
 /// took five seconds, on a job the internal cron runs every minute.
 pub fn injection_ips(log_text: &str) -> Vec<(String, String)> {
-    use crate::injection::{in_referer, in_request, in_user_agent};
-
-    fn judged(
-        seen: &mut HashMap<String, Option<&'static str>>,
-        value: &str,
-        judge: fn(&str) -> Option<&'static str>,
-    ) -> Option<&'static str> {
-        if let Some(answer) = seen.get(value) {
-            return *answer;
-        }
-        let answer = judge(value);
-        seen.insert(value.to_string(), answer);
-        answer
-    }
-
-    let mut requests = HashMap::new();
-    let mut user_agents = HashMap::new();
-    let mut referers = HashMap::new();
-    let mut found: HashMap<IpAddr, &'static str> = HashMap::new();
-    for line in log_text.lines().filter_map(parse_line) {
-        if is_local_or_private(&line.ip) || found.contains_key(&line.ip) {
-            continue;
-        }
-        let kind = judged(&mut requests, &line.request, in_request)
-            .or_else(|| judged(&mut user_agents, &line.user_agent, in_user_agent))
-            .or_else(|| {
-                line.referer
-                    .as_deref()
-                    .and_then(|referer| judged(&mut referers, referer, in_referer))
-            });
-        if let Some(kind) = kind {
-            found.insert(line.ip, kind);
-        }
-    }
-
-    let mut ips: Vec<(String, String)> = found
-        .into_iter()
-        .map(|(ip, kind)| (ip.to_string(), kind.to_string()))
-        .collect();
-    ips.sort();
-    ips
+    convicted_in_text(log_text, Watch::only(Detector::Injection), Rule::Once)
 }
 
 /// Filename extensions treated as "an asset a browser fetches alongside a
@@ -653,27 +570,11 @@ fn is_asset(path: &str) -> bool {
 /// at all — a pure JSON API — where every client looks like this. That is
 /// why the detector is off by default.
 pub fn asset_less_ips(log_text: &str, min_pages: usize) -> Vec<String> {
-    let mut pages: HashMap<IpAddr, HashSet<String>> = HashMap::new();
-    let mut fetched_asset: HashSet<IpAddr> = HashSet::new();
-
-    for line in log_text.lines().filter_map(parse_line) {
-        if is_local_or_private(&line.ip) || line.status >= 400 {
-            continue;
-        }
-        if is_asset(&line.path) {
-            fetched_asset.insert(line.ip);
-        } else {
-            pages.entry(line.ip).or_default().insert(line.path);
-        }
-    }
-
-    let mut ips: Vec<String> = pages
-        .into_iter()
-        .filter(|(ip, paths)| paths.len() >= min_pages && !fetched_asset.contains(ip))
-        .map(|(ip, _)| ip.to_string())
-        .collect();
-    ips.sort();
-    ips
+    addresses(convicted_in_text(
+        log_text,
+        Watch::only(Detector::AssetRatio),
+        Rule::Distinct(min_pages),
+    ))
 }
 
 /// Every IP that presented at least `min_agents` distinct user agents.
@@ -682,27 +583,19 @@ pub fn asset_less_ips(log_text: &str, min_pages: usize) -> Vec<String> {
 /// **The false positive this cannot rule out is large: NAT.** A corporate
 /// gateway, a university, or any mobile carrier doing CGNAT presents
 /// hundreds of real users behind one address, each with their own browser.
-/// Without timestamps (see TODO.md) there is no way to distinguish "twenty
-/// agents over a day from a campus" from "twenty agents in ten seconds
-/// from one scraper", and a threshold is the only control available.
-/// Off by default, and the threshold should be read as "how many distinct
-/// browsers might legitimately share one address here".
+/// The scheduled detector counts only inside its window, an hour by
+/// default (`protection::BEHAVIOURAL_WINDOW_HOURS`), which is what tells
+/// "twenty agents over a day from a campus" from "twenty agents in minutes
+/// from one scraper"; this whole-text form, behind no CLI command, has
+/// only the threshold. Off by default, and the threshold should be read as
+/// "how many distinct browsers might legitimately share one address in an
+/// hour".
 pub fn rotating_user_agent_ips(log_text: &str, min_agents: usize) -> Vec<String> {
-    let mut agents: HashMap<IpAddr, HashSet<String>> = HashMap::new();
-    for line in log_text.lines().filter_map(parse_line) {
-        if is_local_or_private(&line.ip) || line.user_agent.is_empty() || line.user_agent == "-" {
-            continue;
-        }
-        agents.entry(line.ip).or_default().insert(line.user_agent);
-    }
-
-    let mut ips: Vec<String> = agents
-        .into_iter()
-        .filter(|(_, seen)| seen.len() >= min_agents)
-        .map(|(ip, _)| ip.to_string())
-        .collect();
-    ips.sort();
-    ips
+    addresses(convicted_in_text(
+        log_text,
+        Watch::only(Detector::RotatingUserAgent),
+        Rule::Distinct(min_agents),
+    ))
 }
 
 /// Every IP that fetched at least `min_paths` distinct *deep* pages (not
@@ -717,41 +610,11 @@ pub fn rotating_user_agent_ips(log_text: &str, min_agents: usize) -> Vec<String>
 /// referer". The distinct-path threshold is doing all the work: one or two
 /// referer-less deep hits are ordinary, twenty-five are a crawl.
 pub fn refererless_crawl_ips(log_text: &str, min_paths: usize) -> Vec<String> {
-    let mut deep_no_referer: HashMap<IpAddr, HashSet<String>> = HashMap::new();
-    let mut sent_referer: HashSet<IpAddr> = HashSet::new();
-
-    for line in log_text.lines().filter_map(parse_line) {
-        if is_local_or_private(&line.ip) || line.status >= 400 {
-            continue;
-        }
-        // A format that never records the header cannot tell us whether
-        // this request carried one, and "cannot tell" is not "there was
-        // none" — see [`ParsedLine::referer`]. Skipping costs this
-        // detector nothing on a host whose log does record it, and is the
-        // difference between silence and a wrong block on one that
-        // doesn't.
-        let Some(referer) = line.referer.as_deref() else {
-            continue;
-        };
-        // NGINX logs a missing Referer as "-", and as "" under escape=json.
-        let has_referer = !referer.is_empty() && referer != "-";
-        if has_referer {
-            sent_referer.insert(line.ip);
-        } else if line.path != "/" {
-            deep_no_referer
-                .entry(line.ip)
-                .or_default()
-                .insert(line.path);
-        }
-    }
-
-    let mut ips: Vec<String> = deep_no_referer
-        .into_iter()
-        .filter(|(ip, paths)| paths.len() >= min_paths && !sent_referer.contains(ip))
-        .map(|(ip, _)| ip.to_string())
-        .collect();
-    ips.sort();
-    ips
+    addresses(convicted_in_text(
+        log_text,
+        Watch::only(Detector::RefererlessCrawl),
+        Rule::Distinct(min_paths),
+    ))
 }
 
 /// The complement to [`scanning_ips`]: instead of flagging bad traffic,
@@ -777,65 +640,20 @@ pub fn refererless_crawl_ips(log_text: &str, min_paths: usize) -> Vec<String> {
 /// The query string is already stripped by `parse_line`, so a request for
 /// `/?x=/robots.txt` cannot reach this.
 pub fn robots_txt_ips(log_text: &str) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    for line in log_text.lines() {
-        let Some(entry) = parse_line(line) else {
-            continue;
-        };
-        if is_local_or_private(&entry.ip) {
-            continue;
-        }
-        if entry.path.to_lowercase().contains("/robots.txt") {
-            seen.insert(entry.ip.to_string());
-        }
-    }
-    seen.into_iter().collect()
+    addresses(convicted_in_text(
+        log_text,
+        Watch::only(Detector::RobotsTxt),
+        Rule::Once,
+    ))
 }
 
-/// How many parsed lines carried a **public** client address, and how many
-/// lines parsed at all.
-///
-/// Exists to catch a silent failure rather than a noisy one. Every
-/// detector in this module skips private sources — see the four
-/// `is_local_or_private` guards above — so a deployment where NGINX
-/// records its proxy's address instead of the client's does not produce
-/// wrong blocks. It produces *no* blocks, from a log that looks perfectly
-/// healthy and a report that says "checked and clear". That is the shape
-/// of the `--ssh-log` bug: the detector most needed on an exposed host,
-/// switched off by a path nobody chose, with nothing on screen to say so.
-///
-/// The usual cause is NGINX behind something that terminates the
-/// connection itself — a container's port mapping, a load balancer, a CDN
-/// — without `set_real_ip_from`/`real_ip_header` to recover the original
-/// address.
-///
-/// Counts lines, not distinct addresses: one proxy in front of everything
-/// is exactly the case worth catching, and it has one address.
-pub fn client_address_mix(log_text: &str) -> (usize, usize) {
-    let mut public = 0;
-    let mut parsed = 0;
-    for line in log_text.lines() {
-        let Some(entry) = parse_line(line) else {
-            continue;
-        };
-        parsed += 1;
-        if !is_local_or_private(&entry.ip) {
-            public += 1;
-        }
-    }
-    (public, parsed)
-}
-
-/// Feeds [`crate::db::Db::record_user_agent_hits`] via
-/// `crate::accessstats::record_access_stats`.
+/// Successful requests by user agent, for `user_agent_stats`. The
+/// scheduled pass tallies the same thing line by line (see
+/// [`Observer::counting_user_agents`]); this is the whole-text form.
 pub fn successful_user_agent_counts(log_text: &str) -> HashMap<String, u64> {
     let mut counts: HashMap<String, u64> = HashMap::new();
     for line in log_text.lines().filter_map(parse_line) {
-        if line.status < 400
-            && !line.user_agent.is_empty()
-            && line.user_agent != "-"
-            && !is_local_or_private(&line.ip)
-        {
+        if counts_as_a_visit(&line) {
             *counts.entry(line.user_agent).or_insert(0) += 1;
         }
     }
@@ -881,18 +699,16 @@ pub struct TurnedAway {
 ///
 /// Sorted by refusals, most first.
 pub fn turned_away_user_agents(log_text: &str, block_status: u16) -> Vec<TurnedAway> {
-    let mut counts: HashMap<String, (u64, u64)> = HashMap::new();
-    for line in log_text.lines().filter_map(parse_line) {
-        if line.user_agent.is_empty() || line.user_agent == "-" || is_local_or_private(&line.ip) {
-            continue;
-        }
-        let entry = counts.entry(line.user_agent).or_insert((0, 0));
-        if line.status == block_status {
-            entry.0 += 1;
-        } else if line.status < 400 {
-            entry.1 += 1;
-        }
+    let mut survey = Survey::new(block_status);
+    for line in log_text.lines() {
+        survey.line(line);
     }
+    survey.turned_away()
+}
+
+/// `(user agent, (refused, served))` as a report: only agents that were
+/// refused at all, most refused first.
+fn sorted_turned_away(counts: Vec<(String, (u64, u64))>) -> Vec<TurnedAway> {
     let mut turned_away: Vec<TurnedAway> = counts
         .into_iter()
         .filter(|(_, (refused, _))| *refused > 0)
@@ -911,6 +727,395 @@ pub fn turned_away_user_agents(log_text: &str, block_status: u16) -> Vec<TurnedA
             .then(a.user_agent.cmp(&b.user_agent))
     });
     turned_away
+}
+
+// ---- observing: one pass over the lines, for every detector at once ----
+
+/// What the access-log detectors are looking for, resolved from the
+/// database before any log is read.
+///
+/// A plain value with no database handle, because it goes with the read
+/// to wherever the read happens: a blocking thread in the TUI, outside the
+/// web console's lock. See [`crate::logscan`].
+#[derive(Debug, Clone, Default)]
+pub struct Watch {
+    /// The access-log detectors that are on, each with the oldest time a
+    /// line may carry and still count (`None`: any time). A line older
+    /// than its detector's window is not even kept.
+    pub detectors: Vec<(Detector, Option<i64>)>,
+    /// [`crate::protection::probe_paths`].
+    pub probe_paths: Vec<String>,
+    /// [`crate::protection::honeypot_path`].
+    pub honeypot: String,
+    /// [`crate::scanblock::crawler_claims`].
+    pub claims: Vec<CrawlerClaim>,
+}
+
+impl Watch {
+    /// One detector and nothing else, with no window and its built-in
+    /// parameters: what the one-off functions above read a text with.
+    pub fn only(detector: Detector) -> Watch {
+        Watch {
+            detectors: vec![(detector, None)],
+            probe_paths: DEFAULT_PROBE_PATHS.iter().map(|p| p.to_string()).collect(),
+            honeypot: crate::protection::HONEYPOT_PATH_DEFAULT.to_string(),
+            claims: Vec::new(),
+        }
+    }
+
+    pub fn watches(&self, detector: Detector) -> bool {
+        self.detectors.iter().any(|(d, _)| *d == detector)
+    }
+}
+
+/// When a line happened, for the observer.
+#[derive(Debug, Clone, Copy)]
+pub enum Clock {
+    /// The time the line carries, capped at `now`. A line that carries
+    /// none is dated `undated` instead, and not kept as evidence at all if
+    /// that is `None` -- which is what a first read of a log uses, where an
+    /// undated line could be months old.
+    Logged { now: i64, undated: Option<i64> },
+    /// The line's position, for a text read whole with no window: every
+    /// line counts, and "earliest" means "first in the file".
+    Ordinal(i64),
+}
+
+/// What [`Observer`] has counted besides the evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    /// Lines with anything on them.
+    pub lines: usize,
+    /// Of those, lines in a format this module reads.
+    pub parsed: usize,
+}
+
+/// Reads access-log lines one at a time into evidence for every watched
+/// detector, and optionally into the successful-user-agent tally.
+///
+/// One observer, one pass: the point of the design. Each detector used to
+/// parse the whole log on its own, so ten detectors were ten parses.
+pub struct Observer {
+    watch: Watch,
+    needles: Vec<String>,
+    honeypot: String,
+    evidence: Evidence,
+    user_agents: Option<HashMap<String, u64>>,
+    counts: Counts,
+    /// Verdicts already reached on a request line, user agent or referer.
+    /// A log repeats them endlessly -- one host's 451,000 lines held fewer
+    /// than 8,000 distinct user agents -- and judging every occurrence took
+    /// five seconds. Cleared when it grows past [`JUDGED_MAX`], so a flood
+    /// of unique requests cannot grow it without bound.
+    judged: [HashMap<String, Option<&'static str>>; 3],
+    /// Addresses a payload was already recorded for in this read. One is
+    /// conclusive, so the rest of their lines need no judging.
+    injecting: HashSet<IpAddr>,
+}
+
+/// See [`Observer::judged`].
+const JUDGED_MAX: usize = 50_000;
+
+impl Observer {
+    pub fn new(watch: Watch) -> Observer {
+        Observer {
+            needles: watch.probe_paths.iter().map(|p| p.to_lowercase()).collect(),
+            honeypot: watch.honeypot.to_lowercase(),
+            watch,
+            evidence: Evidence::default(),
+            user_agents: None,
+            counts: Counts::default(),
+            judged: Default::default(),
+            injecting: HashSet::new(),
+        }
+    }
+
+    /// Also tally successful requests by user agent, as
+    /// [`successful_user_agent_counts`] does.
+    pub fn counting_user_agents(mut self) -> Observer {
+        self.user_agents = Some(HashMap::new());
+        self
+    }
+
+    /// Reads one line.
+    pub fn line(&mut self, text: &str, clock: Clock) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.counts.lines += 1;
+        let Some(line) = parse_line(text) else {
+            return;
+        };
+        self.counts.parsed += 1;
+        if let Some(tally) = &mut self.user_agents {
+            if counts_as_a_visit(&line) {
+                *tally.entry(line.user_agent.clone()).or_insert(0) += 1;
+            }
+        }
+        if is_local_or_private(&line.ip) {
+            return;
+        }
+        let at = match clock {
+            Clock::Logged { now, undated } => match line.time.or(undated) {
+                Some(at) => at.min(now),
+                None => return,
+            },
+            Clock::Ordinal(n) => n,
+        };
+        let detectors = std::mem::take(&mut self.watch.detectors);
+        for (detector, cutoff) in &detectors {
+            if cutoff.is_some_and(|cutoff| at < cutoff) {
+                continue;
+            }
+            if let Some(item) = self.observe(*detector, &line) {
+                self.evidence.add(*detector, line.ip, item, at);
+            }
+        }
+        self.watch.detectors = detectors;
+    }
+
+    /// What `line` says for `detector`, if anything. The one place each
+    /// access-log detector's idea of a suspicious line is written down.
+    fn observe(&mut self, detector: Detector, line: &ParsedLine) -> Option<Item> {
+        match detector {
+            // A distinct path that does not exist here.
+            Detector::WebScanners => (line.status == 404).then(|| Item::seen(&line.path)),
+            Detector::SpoofedCrawlers => {
+                let active: Vec<&CrawlerClaim> = self
+                    .watch
+                    .claims
+                    .iter()
+                    .filter(|c| !c.ranges.is_empty())
+                    .collect();
+                if active.is_empty() {
+                    return None;
+                }
+                let ua = line.user_agent.to_lowercase();
+                let matched: Vec<&&CrawlerClaim> = active
+                    .iter()
+                    .filter(|claim| ua.contains(claim.marker))
+                    .collect();
+                // Verification is per *request*, not per claim: if any
+                // crawler the user agent named vouches for the address,
+                // the request is legitimate and the other names it
+                // mentions prove nothing on their own. Checking per claim
+                // would flag the real Googlebot the moment its user agent
+                // contained another crawler's token.
+                let vouched = matched
+                    .iter()
+                    .any(|claim| claim.ranges.iter().any(|cidr| cidr_contains(cidr, line.ip)));
+                match matched.first() {
+                    Some(first) if !vouched => Some(Item::seen(first.name)),
+                    _ => None,
+                }
+            }
+            Detector::ProbePaths => {
+                let path = line.path.to_lowercase();
+                self.needles
+                    .iter()
+                    .any(|needle| path.contains(needle.as_str()))
+                    .then(|| Item::seen(&line.path))
+            }
+            Detector::Honeypot => (!self.honeypot.is_empty()
+                && line.path.to_lowercase().contains(&self.honeypot))
+            .then(|| Item::seen(&line.path)),
+            Detector::RobotsTxt => line
+                .path
+                .to_lowercase()
+                .contains("/robots.txt")
+                .then(|| Item::seen(&line.path)),
+            Detector::Injection => {
+                if self.injecting.contains(&line.ip) {
+                    return None;
+                }
+                let kind = self.injection(line)?;
+                self.injecting.insert(line.ip);
+                Some(Item::seen(kind))
+            }
+            // A page, or the asset that clears the whole address.
+            Detector::AssetRatio => (line.status < 400).then(|| {
+                if is_asset(&line.path) {
+                    Item::Clear
+                } else {
+                    Item::seen(&line.path)
+                }
+            }),
+            Detector::RotatingUserAgent => (!line.user_agent.is_empty() && line.user_agent != "-")
+                .then(|| Item::seen(&line.user_agent)),
+            Detector::RefererlessCrawl => {
+                if line.status >= 400 {
+                    return None;
+                }
+                // A format that never records the header cannot say
+                // whether this request carried one, and "cannot tell" is
+                // not "there was none" -- see [`ParsedLine::referer`].
+                let referer = line.referer.as_deref()?;
+                // NGINX logs a missing Referer as "-", and as "" under
+                // escape=json.
+                if !referer.is_empty() && referer != "-" {
+                    Some(Item::Clear)
+                } else {
+                    (line.path != "/").then(|| Item::seen(&line.path))
+                }
+            }
+            // Not an access-log detector.
+            Detector::SshScanners => None,
+        }
+    }
+
+    /// The payload `line` carries, if any: in the request, the user agent
+    /// or the referer. See [`crate::injection`].
+    fn injection(&mut self, line: &ParsedLine) -> Option<&'static str> {
+        use crate::injection::{in_referer, in_request, in_user_agent};
+        let [requests, user_agents, referers] = &mut self.judged;
+        judged(requests, &line.request, in_request)
+            .or_else(|| judged(user_agents, &line.user_agent, in_user_agent))
+            .or_else(|| {
+                line.referer
+                    .as_deref()
+                    .and_then(|referer| judged(referers, referer, in_referer))
+            })
+    }
+
+    /// Everything collected: the evidence, the user-agent tally if one was
+    /// asked for, and the line counts.
+    pub fn finish(self) -> (Evidence, HashMap<String, u64>, Counts) {
+        (
+            self.evidence,
+            self.user_agents.unwrap_or_default(),
+            self.counts,
+        )
+    }
+}
+
+fn judged(
+    seen: &mut HashMap<String, Option<&'static str>>,
+    value: &str,
+    judge: fn(&str) -> Option<&'static str>,
+) -> Option<&'static str> {
+    if let Some(answer) = seen.get(value) {
+        return *answer;
+    }
+    if seen.len() >= JUDGED_MAX {
+        seen.clear();
+    }
+    let answer = judge(value);
+    seen.insert(value.to_string(), answer);
+    answer
+}
+
+/// Whether a line counts towards [`successful_user_agent_counts`].
+fn counts_as_a_visit(line: &ParsedLine) -> bool {
+    line.status < 400
+        && !line.user_agent.is_empty()
+        && line.user_agent != "-"
+        && !is_local_or_private(&line.ip)
+}
+
+/// Every address `rule` convicts in `log_text` under `watch`, read whole
+/// with no window: the one-off form every public detector function above
+/// shares with the incremental one.
+fn convicted_in_text(log_text: &str, watch: Watch, rule: Rule) -> Vec<(String, String)> {
+    let detector = watch.detectors[0].0;
+    let mut observer = Observer::new(watch);
+    for (n, line) in log_text.lines().enumerate() {
+        observer.line(line, Clock::Ordinal(n as i64));
+    }
+    let (evidence, _, _) = observer.finish();
+    crate::evidence::decide(&evidence.rows_for(detector), rule, None)
+}
+
+fn addresses(convicted: Vec<(String, String)>) -> Vec<String> {
+    convicted.into_iter().map(|(address, _)| address).collect()
+}
+
+/// What an access log looks like to this module, from one pass over some
+/// of it: how much of it parses, who it records, and who it turns away.
+/// What the health check reports on. See [`crate::health`].
+#[derive(Debug, Default)]
+pub struct Survey {
+    pub counts: Counts,
+    /// Parsed lines from a public address.
+    ///
+    /// Exists to catch a silent failure rather than a noisy one. Every
+    /// detector skips private sources, so a deployment where NGINX records
+    /// its proxy's address instead of the client's does not produce wrong
+    /// blocks. It produces *no* blocks, from a log that looks perfectly
+    /// healthy. The usual cause is NGINX behind something that terminates
+    /// the connection itself -- a container's port mapping, a load
+    /// balancer, a CDN -- without `set_real_ip_from`/`real_ip_header`.
+    /// Lines, not distinct addresses: one proxy in front of everything is
+    /// exactly the case worth catching, and it has one address.
+    pub public: usize,
+    /// The first line that did not parse, as it is safe to show.
+    pub unparsed_sample: Option<String>,
+    turned_away: HashMap<String, (u64, u64)>,
+    block_status: u16,
+}
+
+impl Survey {
+    pub fn new(block_status: u16) -> Survey {
+        Survey {
+            block_status,
+            ..Survey::default()
+        }
+    }
+
+    pub fn line(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.counts.lines += 1;
+        let Some(line) = parse_line(text) else {
+            if self.unparsed_sample.is_none() {
+                self.unparsed_sample = Some(printable_sample(text));
+            }
+            return;
+        };
+        self.counts.parsed += 1;
+        if is_local_or_private(&line.ip) {
+            return;
+        }
+        self.public += 1;
+        if line.user_agent.is_empty() || line.user_agent == "-" {
+            return;
+        }
+        let entry = self.turned_away.entry(line.user_agent).or_insert((0, 0));
+        if line.status == self.block_status {
+            entry.0 += 1;
+        } else if line.status < 400 {
+            entry.1 += 1;
+        }
+    }
+
+    /// See [`turned_away_user_agents`].
+    pub fn turned_away(&self) -> Vec<TurnedAway> {
+        sorted_turned_away(
+            self.turned_away
+                .iter()
+                .map(|(ua, counts)| (ua.clone(), *counts))
+                .collect(),
+        )
+    }
+}
+
+/// The longest sample line a report quotes, in characters.
+pub const SAMPLE_CHARS: usize = 160;
+
+/// `text` as it is safe to quote in a report: control characters replaced,
+/// and cut at [`SAMPLE_CHARS`]. The line is whatever a client made NGINX
+/// write, so it is treated as hostile.
+pub fn printable_sample(text: &str) -> String {
+    let text = text.trim_end_matches(['\r', '\n']);
+    let mut sample: String = text
+        .chars()
+        .take(SAMPLE_CHARS)
+        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+        .collect();
+    if text.chars().count() > SAMPLE_CHARS {
+        sample.push('\u{2026}');
+    }
+    sample
 }
 
 #[cfg(test)]
@@ -1414,6 +1619,10 @@ mod tests {
                 r#"{"remote_addr":"203.0.113.5","request_uri":"/.env","status":"200","http_referer":"","status":"404"}"#,
             ),
             (
+                "the time injected, to backdate the line out of every window",
+                r#"{"time_local":"28/Sep/2026:06:33:01 +0000","remote_addr":"203.0.113.5","request_uri":"/.env","status":"404","http_user_agent":"","time_local":"01/Jan/2000:00:00:00 +0000"}"#,
+            ),
+            (
                 "the target injected",
                 r#"{"remote_addr":"203.0.113.5","request_uri":"/","http_user_agent":"","request_uri":"/.env","status":"404"}"#,
             ),
@@ -1427,7 +1636,7 @@ mod tests {
     /// log some other variable twice is not a forgery of anything read here.
     #[test]
     fn a_json_line_duplicating_a_field_nobody_reads_still_parses() {
-        let line = r#"{"time_local":"a","remote_addr":"203.0.113.5","request_uri":"/x","status":"404","time_local":"b"}"#;
+        let line = r#"{"body_bytes_sent":"1","remote_addr":"203.0.113.5","request_uri":"/x","status":"404","body_bytes_sent":"2"}"#;
         assert_eq!(
             parse_line(line).map(|l| l.ip),
             Some("203.0.113.5".parse().unwrap())
@@ -1841,5 +2050,183 @@ mod tests {
     #[test]
     fn refererless_crawl_ips_ignores_a_client_below_the_threshold() {
         assert!(refererless_crawl_ips(&pages("203.0.113.9", 5), 25).is_empty());
+    }
+
+    // ---- timestamps ----
+
+    /// 2026-09-28T06:33:01Z.
+    const SEP_28: i64 = 1_790_577_181;
+
+    #[test]
+    fn a_combined_line_carries_its_time() {
+        let line =
+            "203.0.113.5 - - [28/Sep/2026:08:33:01 +0200] \"GET / HTTP/1.1\" 200 1 \"-\" \"UA\"";
+        assert_eq!(parse_line(line).unwrap().time, Some(SEP_28));
+    }
+
+    /// A line whose time NGINX did not write, or wrote in a form this does
+    /// not read, still parses: it is only undated.
+    #[test]
+    fn a_line_without_a_readable_time_still_parses_undated() {
+        for line in [
+            "203.0.113.5 - - [x] \"GET / HTTP/1.1\" 200 1 \"-\" \"UA\"",
+            r#"{"remote_addr":"203.0.113.5","request_uri":"/","status":"200"}"#,
+        ] {
+            let parsed = parse_line(line).expect(line);
+            assert_eq!(parsed.time, None, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_json_line_carries_either_time_variable() {
+        for line in [
+            r#"{"time_iso8601":"2026-09-28T06:33:01+00:00","remote_addr":"203.0.113.5","request_uri":"/","status":"200"}"#,
+            r#"{"time_local":"28/Sep/2026:06:33:01 +0000","remote_addr":"203.0.113.5","request_uri":"/","status":"200"}"#,
+        ] {
+            assert_eq!(parse_line(line).unwrap().time, Some(SEP_28), "{line}");
+        }
+    }
+
+    fn observed(lines: &[String], watch: Watch, clock: Clock) -> Evidence {
+        let mut observer = Observer::new(watch);
+        for line in lines {
+            observer.line(line, clock);
+        }
+        observer.finish().0
+    }
+
+    fn dated(ip: &str, path: &str, at: &str) -> String {
+        format!("{ip} - - [{at}] \"GET {path} HTTP/1.1\" 404 1 \"-\" \"UA\"")
+    }
+
+    /// The whole point of the window: a line older than it is not kept,
+    /// so it can never add to a count again.
+    #[test]
+    fn a_line_older_than_its_detector_s_window_is_not_kept() {
+        let lines = [
+            dated("203.0.113.5", "/.env", "27/Sep/2026:06:33:00 +0000"),
+            dated("203.0.113.6", "/.env", "28/Sep/2026:06:00:00 +0000"),
+        ];
+        let watch = Watch {
+            detectors: vec![(Detector::ProbePaths, Some(SEP_28 - 86_400))],
+            ..Watch::only(Detector::ProbePaths)
+        };
+        let evidence = observed(
+            &lines,
+            watch,
+            Clock::Logged {
+                now: SEP_28,
+                undated: Some(SEP_28),
+            },
+        );
+        let rows = evidence.rows_for(Detector::ProbePaths);
+        let addresses: Vec<&str> = rows.iter().map(|r| r.address.as_str()).collect();
+        assert_eq!(addresses, ["203.0.113.6"]);
+        assert_eq!(rows[0].tally.first, SEP_28 - 1981, "dated by the line");
+    }
+
+    /// On a first read nothing says when an undated line was written, and
+    /// it may be months old: it counts for nothing.
+    #[test]
+    fn an_undated_line_is_only_kept_when_the_read_can_date_it() {
+        let lines =
+            [r#"{"remote_addr":"203.0.113.5","request_uri":"/.env","status":"404"}"#.to_string()];
+        let first_read = observed(
+            &lines,
+            Watch::only(Detector::ProbePaths),
+            Clock::Logged {
+                now: SEP_28,
+                undated: None,
+            },
+        );
+        assert!(first_read.is_empty());
+
+        let later_read = observed(
+            &lines,
+            Watch::only(Detector::ProbePaths),
+            Clock::Logged {
+                now: SEP_28,
+                undated: Some(SEP_28 - 30),
+            },
+        );
+        assert_eq!(
+            later_read.rows_for(Detector::ProbePaths)[0].tally.last,
+            SEP_28 - 30,
+            "dated when it was read"
+        );
+    }
+
+    /// A clock that ran ahead cannot put evidence in the future, where no
+    /// window would ever let go of it.
+    #[test]
+    fn a_line_from_the_future_is_dated_now() {
+        let lines = [dated("203.0.113.5", "/.env", "01/Jan/2030:00:00:00 +0000")];
+        let evidence = observed(
+            &lines,
+            Watch::only(Detector::ProbePaths),
+            Clock::Logged {
+                now: SEP_28,
+                undated: None,
+            },
+        );
+        assert_eq!(
+            evidence.rows_for(Detector::ProbePaths)[0].tally.last,
+            SEP_28
+        );
+    }
+
+    /// One pass serves every detector: the same line is evidence for each
+    /// that it concerns.
+    #[test]
+    fn one_observer_collects_for_every_watched_detector() {
+        let lines = [dated("203.0.113.5", "/.env", "28/Sep/2026:06:00:00 +0000")];
+        let watch = Watch {
+            detectors: vec![
+                (Detector::WebScanners, None),
+                (Detector::ProbePaths, None),
+                (Detector::RobotsTxt, None),
+            ],
+            ..Watch::only(Detector::ProbePaths)
+        };
+        let evidence = observed(
+            &lines,
+            watch,
+            Clock::Logged {
+                now: SEP_28,
+                undated: None,
+            },
+        );
+        assert_eq!(evidence.rows_for(Detector::WebScanners).len(), 1);
+        assert_eq!(evidence.rows_for(Detector::ProbePaths).len(), 1);
+        assert!(evidence.rows_for(Detector::RobotsTxt).is_empty());
+    }
+
+    #[test]
+    fn a_survey_counts_what_did_not_parse_and_keeps_a_safe_sample() {
+        let mut survey = Survey::new(403);
+        survey.line(&ok_line("203.0.113.5", "/"));
+        survey.line("203.0.113.5 custom-format \u{1b}[31m hello");
+        survey.line("another line nobody can read");
+        survey.line("   ");
+
+        assert_eq!(
+            survey.counts,
+            Counts {
+                lines: 3,
+                parsed: 1
+            }
+        );
+        assert_eq!(
+            survey.unparsed_sample.as_deref(),
+            Some("203.0.113.5 custom-format \u{fffd}[31m hello"),
+            "the first unparsed line, with its escape sequence defused"
+        );
+    }
+
+    #[test]
+    fn a_long_sample_is_cut_and_says_so() {
+        let sample = printable_sample(&"x".repeat(1_000));
+        assert_eq!(sample.chars().count(), SAMPLE_CHARS + 1);
+        assert!(sample.ends_with('\u{2026}'));
     }
 }

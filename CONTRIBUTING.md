@@ -311,16 +311,21 @@ Some directories don't exist yet but should be created if the need arises.
         |- db/schema.rs   <- The schema version and the migrations up to it
         |- db/keys.rs     <- Every `settings` key, spelled once
         |- db/managed.rs  <- The record of every generated file written, for cleaning up
+        |- db/evidence.rs <- What the detectors have seen, and each log's read cursor
         |- botlist/       <- One file per bot-list source parser
         |- fetch.rs       <- The one place an outbound HTTP request is made
         |- refresh.rs     <- "Update everything": every downloadable list as fetch-then-store
         |- nginx.rs       <- NGINX site discovery, config injection and generated files
         |- webaccess.rs   <- Putting the web console behind NGINX, for both front-ends
         |- logpaths.rs    <- Where this host's SSH and access logs are, remembered
+        |- logscan.rs     <- One pass over the logs: plan, read (no Db), store
+        |- logread.rs     <- Reading a log a line at a time, from where the last read stopped
+        |- logtime.rs     <- When a log line says it happened
+        |- evidence.rs    <- What each detector counts, and the one decision over it
         |- sshlog.rs      <- SSH log parsing and scan detection
         |- accesslog.rs   <- NGINX access log parsing, the web-log detectors, UA tallying
         |- injection.rs   <- Recognising an exploit payload in a logged request
-        |- accessstats.rs <- Shared CLI+cron logic for recording access-log UA stats
+        |- accessstats.rs <- What one pass tallied into the access-log UA stats
         |- scanblock.rs   <- Shared CLI+cron logic for every detector's detect-and-block pass
         |- protection.rs  <- The detectors' on/off switches, their defaults, and why
         |- ipranges/      <- Crawler, country and third-party IP-range fetching/storage

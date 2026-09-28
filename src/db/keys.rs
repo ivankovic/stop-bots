@@ -171,6 +171,7 @@ const DETECT_PREFIX: &str = "detect:";
 const CRON_LAST_RUN_PREFIX: &str = "cron_last_run:";
 const CRON_LAST_SUMMARY_PREFIX: &str = "cron_last_summary:";
 const ACCESS_LOG_OFFSET_PREFIX: &str = "access_log_offset:";
+const LOG_CURSOR_PREFIX: &str = "log_cursor:";
 
 /// The prefix of every parameterised key. A fixed key never starts with
 /// one, so a family can take any parameter without colliding.
@@ -179,6 +180,7 @@ pub const FAMILIES: &[&str] = &[
     CRON_LAST_RUN_PREFIX,
     CRON_LAST_SUMMARY_PREFIX,
     ACCESS_LOG_OFFSET_PREFIX,
+    LOG_CURSOR_PREFIX,
 ];
 
 /// A detector's on/off switch, `"true"` or `"false"`. `id` is its
@@ -192,6 +194,11 @@ pub fn detector_ttl_days(id: &str) -> String {
     format!("{DETECT_PREFIX}{id}:ttl_days")
 }
 
+/// How far back a detector's evidence counts, in hours.
+pub fn detector_window_hours(id: &str) -> String {
+    format!("{DETECT_PREFIX}{id}:window_hours")
+}
+
 /// When a cron job last ran, in Unix seconds. `id` is its `CronJob::id`.
 pub fn cron_last_run(id: &str) -> String {
     format!("{CRON_LAST_RUN_PREFIX}{id}")
@@ -202,9 +209,19 @@ pub fn cron_last_summary(id: &str) -> String {
     format!("{CRON_LAST_SUMMARY_PREFIX}{id}")
 }
 
-/// How far into `log_path` the access-stats tally has read, in bytes.
+/// How far into `log_path` the access-stats tally had read, in bytes of
+/// decoded text. Written by 0.0.x; now only read, once per log, to start
+/// that log's [`log_cursor`] where the old tally stopped rather than count
+/// the whole file again.
 pub fn access_log_offset(log_path: &str) -> String {
     format!("{ACCESS_LOG_OFFSET_PREFIX}{log_path}")
+}
+
+/// Where the next read of a log resumes: `source` is the path read, or
+/// `journald:<units>` for the journal. The value is a
+/// `logread::FileCursor` or a journal cursor, in their stored forms.
+pub fn log_cursor(source: &str) -> String {
+    format!("{LOG_CURSOR_PREFIX}{source}")
 }
 
 #[cfg(test)]
@@ -244,12 +261,15 @@ mod tests {
         for detector in crate::protection::Detector::ALL {
             keys.push(detector_enabled(detector.id()));
             keys.push(detector_ttl_days(detector.id()));
+            keys.push(detector_window_hours(detector.id()));
         }
         for job in crate::cron::CronJob::all() {
             keys.push(cron_last_run(job.id()));
             keys.push(cron_last_summary(job.id()));
         }
         keys.push(access_log_offset("/var/log/nginx/access.log"));
+        keys.push(log_cursor("/var/log/nginx/access.log"));
+        keys.push(log_cursor("journald:ssh"));
         let mut seen = HashSet::new();
         for key in &keys {
             assert!(seen.insert(key), "{key:?} is produced twice");

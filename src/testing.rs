@@ -182,3 +182,30 @@ pub(crate) fn write_script(path: &std::path::Path, body: &str) {
         path.display()
     );
 }
+
+/// Now, in Unix seconds.
+pub(crate) fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// `at` as NGINX's `$time_local` writes it, in UTC: a log line from a
+/// given moment, for the tests where when it happened is the point.
+pub(crate) fn nginx_time(at: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (y, mo, d, h, mi, s) = crate::logtime::civil(at);
+    format!(
+        "{d:02}/{}/{y}:{h:02}:{mi:02}:{s:02} +0000",
+        MONTHS[mo as usize - 1]
+    )
+}
+
+/// `at` as `journalctl -o short-iso` and a high-precision rsyslog write it.
+pub(crate) fn iso_time(at: i64) -> String {
+    let (y, mo, d, h, mi, s) = crate::logtime::civil(at);
+    format!("{y}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}+0000")
+}

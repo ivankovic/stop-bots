@@ -60,6 +60,34 @@ pub const SPOOFED_CRAWLERS_ENABLED_DEFAULT: bool = true;
 /// nothing) and panicked in debug ones.
 pub const MAX_TTL_DAYS: i64 = 3650;
 
+/// How far back a detector looks, for every detector that is not one of
+/// the three behavioural ones: a day.
+///
+/// For the two that count (twenty failed logins, seven distinct 404s) a
+/// day is the span over which those numbers were chosen: a scanner that
+/// works through a wordlist does it in minutes, and one that spreads the
+/// same attempts over longer than a day is no longer an attack in
+/// progress. For the ones a single line convicts, the window only says how
+/// old that line may be, and a day is the longest a scan is worth
+/// answering after the fact. It is also no longer than any of their block
+/// lengths (see each `ttl_days_default`), so a block always outlives the
+/// evidence that made it.
+pub const EVIDENCE_WINDOW_HOURS: i64 = 24;
+
+/// How far back the behavioural detectors look: an hour.
+///
+/// Each counts *distinct* things a browser also produces, just fewer of
+/// them (pages, user agents, deep pages without a referer), so the window
+/// is what separates a crawl from a visitor. Twenty pages in an hour with
+/// no stylesheet is a scraper; twenty pages over a week of bookmarks is a
+/// regular reader. The household that reached eight user agents in a day
+/// (see `ROTATING_UA_MIN`) is the same argument for the rotating one.
+pub const BEHAVIOURAL_WINDOW_HOURS: i64 = 1;
+
+/// The longest window a detector may be given: thirty days. Longer brings
+/// back what windows replaced, a count over everything ever seen.
+pub const MAX_WINDOW_HOURS: i64 = 30 * 24;
+
 /// One day, matching `block-web-scanners` rather than `block-scanners`'
 /// five. The failure mode worth designing against is a crawler operator
 /// adding a range faster than the daily `UpdateIpRanges` job picks it up:
@@ -230,6 +258,9 @@ pub struct DetectorSpec {
     pub job_label: &'static str,
     pub enabled_default: bool,
     pub ttl_days_default: i64,
+    /// How far back evidence counts, in hours: a line older than this is
+    /// no longer a reason to block. See [`Detector::window_hours`].
+    pub window_hours_default: i64,
     /// Whether this reads the SSH log rather than the NGINX access log.
     pub uses_ssh_log: bool,
     /// The defaults generation this detector arrived in (see
@@ -264,6 +295,7 @@ impl Detector {
                 job_label: "Block SSH scanners",
                 enabled_default: true,
                 ttl_days_default: 5,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
                 uses_ssh_log: true,
                 introduced_in: 1,
             },
@@ -273,6 +305,7 @@ impl Detector {
                 job_label: "Block web scanners",
                 enabled_default: true,
                 ttl_days_default: 1,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -282,6 +315,7 @@ impl Detector {
                 job_label: "Block forged crawler UAs",
                 enabled_default: SPOOFED_CRAWLERS_ENABLED_DEFAULT,
                 ttl_days_default: SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -291,6 +325,7 @@ impl Detector {
                 job_label: "Block probe paths",
                 enabled_default: PROBE_PATHS_ENABLED_DEFAULT,
                 ttl_days_default: PROBE_PATHS_TTL_DAYS_DEFAULT,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -300,6 +335,7 @@ impl Detector {
                 job_label: "Block injection attempts",
                 enabled_default: INJECTION_ENABLED_DEFAULT,
                 ttl_days_default: INJECTION_TTL_DAYS_DEFAULT,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -313,6 +349,7 @@ impl Detector {
                 // wrong thing.
                 enabled_default: false,
                 ttl_days_default: 1,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -322,6 +359,7 @@ impl Detector {
                 job_label: "Block honeypot hits",
                 enabled_default: HONEYPOT_ENABLED_DEFAULT,
                 ttl_days_default: HONEYPOT_TTL_DAYS_DEFAULT,
+                window_hours_default: EVIDENCE_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -334,6 +372,7 @@ impl Detector {
                 job_label: "Block asset-less clients",
                 enabled_default: false,
                 ttl_days_default: 5,
+                window_hours_default: BEHAVIOURAL_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -343,6 +382,7 @@ impl Detector {
                 job_label: "Block rotating user agents",
                 enabled_default: false,
                 ttl_days_default: 5,
+                window_hours_default: BEHAVIOURAL_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -352,6 +392,7 @@ impl Detector {
                 job_label: "Block referer-less crawling",
                 enabled_default: false,
                 ttl_days_default: 5,
+                window_hours_default: BEHAVIOURAL_WINDOW_HOURS,
                 uses_ssh_log: false,
                 introduced_in: 1,
             },
@@ -417,6 +458,39 @@ impl Detector {
 
     pub fn ttl_days(self, db: &Db) -> Result<i64> {
         db.get_int_setting(&self.ttl_key(), self.spec().ttl_days_default)
+    }
+
+    /// `settings` key for its evidence window, in hours.
+    pub fn window_key(self) -> String {
+        keys::detector_window_hours(self.id())
+    }
+
+    /// How far back this detector's evidence counts, in hours: the stored
+    /// value, or the spec's default. A value outside one hour to
+    /// [`MAX_WINDOW_HOURS`] (written by hand) reads as the default, since
+    /// a zero window would switch the detector off without saying so and
+    /// a huge one would bring back the whole-log counting this replaced.
+    pub fn window_hours(self, db: &Db) -> Result<i64> {
+        let default = self.spec().window_hours_default;
+        let hours = db.get_int_setting(&self.window_key(), default)?;
+        Ok(if (1..=MAX_WINDOW_HOURS).contains(&hours) {
+            hours
+        } else {
+            default
+        })
+    }
+
+    /// [`Self::window_hours`] in seconds.
+    pub fn window_seconds(self, db: &Db) -> Result<i64> {
+        Ok(self.window_hours(db)? * 3600)
+    }
+
+    /// Refuses anything outside one hour to [`MAX_WINDOW_HOURS`].
+    pub fn set_window_hours(self, db: &Db, hours: i64) -> Result<()> {
+        if !(1..=MAX_WINDOW_HOURS).contains(&hours) {
+            anyhow::bail!("a detection window is from 1 to {MAX_WINDOW_HOURS} hours, not {hours}");
+        }
+        db.set_int_setting(&self.window_key(), hours)
     }
 
     pub fn set_enabled(self, db: &Db, enabled: bool) -> Result<()> {
@@ -615,6 +689,53 @@ pub const REFERERLESS_MIN_PATHS_DEFAULT: i64 = 25;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block that lapsed while its evidence was still inside the window
+    /// would be judged on the lines that earned it the first time. Evidence
+    /// is forgotten when a block is made (see `Db::forget_evidence_before`),
+    /// so this is not what keeps it from coming back; but it keeps the
+    /// defaults from depending on that alone.
+    #[test]
+    fn no_default_window_outlasts_its_detector_s_default_block() {
+        for detector in Detector::ALL {
+            let spec = detector.spec();
+            assert!(
+                spec.window_hours_default <= spec.ttl_days_default * 24,
+                "{}: a {}h window against a {}-day block",
+                spec.id,
+                spec.window_hours_default,
+                spec.ttl_days_default
+            );
+        }
+    }
+
+    #[test]
+    fn a_window_is_stored_and_one_out_of_range_is_refused() {
+        let db = Db::open_in_memory().unwrap();
+        let detector = Detector::WebScanners;
+        assert_eq!(detector.window_hours(&db).unwrap(), EVIDENCE_WINDOW_HOURS);
+
+        detector.set_window_hours(&db, 6).unwrap();
+        assert_eq!(detector.window_hours(&db).unwrap(), 6);
+        assert_eq!(detector.window_seconds(&db).unwrap(), 6 * 3600);
+
+        for hours in [0, -1, MAX_WINDOW_HOURS + 1] {
+            assert!(detector.set_window_hours(&db, hours).is_err(), "{hours}");
+        }
+    }
+
+    /// Written by hand with `sqlite3`: a zero window must not silently
+    /// switch the detector off.
+    #[test]
+    fn a_stored_window_out_of_range_reads_as_the_default() {
+        let db = Db::open_in_memory().unwrap();
+        let detector = Detector::AssetRatio;
+        db.set_int_setting(&detector.window_key(), 0).unwrap();
+        assert_eq!(
+            detector.window_hours(&db).unwrap(),
+            BEHAVIOURAL_WINDOW_HOURS
+        );
+    }
 
     /// The failure this floor exists to prevent: every detector compares
     /// `count >= threshold`, so a hand-edited 0 turns "block scanners"
