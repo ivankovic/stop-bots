@@ -94,6 +94,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Fixed
 
+- **A log in a format the detectors cannot read is reported.** `status` warns
+  when under half the access log parses, quoting a line, instead of "no requests
+  recorded yet".
 - `SECURITY.md` said every detector is off by default; five are on. It now
   says which, and that blocking traffic you wanted is a matter of tuning.
 

@@ -562,6 +562,7 @@ fn short_check_label(id: &str) -> String {
         "disk-room" => "disk",
         "database-size" => "database",
         "log-sources" => "logs",
+        "access-log-format" => "log format",
         "access-log-clients" => "clients",
         "nginx-deployment" => "runtime",
         "ssh-login-allowlist" => "ssh",
