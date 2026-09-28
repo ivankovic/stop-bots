@@ -64,8 +64,9 @@ impl FirewallBackend {
     /// Falls back to nftables for anything unrecognised, the same
     /// never-fail-a-read-over-a-stored-enum convention `GeoMode` uses.
     /// Nftables rather than iptables because it is the only backend that
-    /// can represent IPv6 and an allowlist catch-all — a host that gets
-    /// the fallback should get the one that can express every rule.
+    /// can do allowlist geo mode and expire a block in the kernel — a host
+    /// that gets the fallback should get the one that can express every
+    /// rule.
     pub fn from_stored(s: &str) -> Self {
         match s {
             "iptables" => FirewallBackend::Iptables,
@@ -233,9 +234,11 @@ pub struct BuiltFirewall {
     /// the same order the script itself will.
     pub rules: Vec<FirewallRule>,
     pub script: String,
-    /// How many rules actually made it into `script`: excludes disabled
-    /// rules, and on iptables, IPv6 rules that backend can't represent
-    /// (see `iptables`'s module docs).
+    /// How many entries `script` puts in the kernel: set elements on
+    /// nftables, chain rules (IPv4 and IPv6 together) on iptables. Excludes
+    /// disabled and already-expired rules, and on nftables an address
+    /// inside a range with the same verdict that lasts at least as long —
+    /// see [`loaded_entries`].
     pub written: usize,
 }
 
@@ -442,42 +445,68 @@ pub fn needs_render(db: &Db) -> Result<bool> {
 }
 
 /// Gathers every firewall rule (see [`all_rules`]) and renders them for
-/// `backend`. Fails immediately, before gathering or rendering anything, if
-/// `backend` is iptables and geo mode is Allowlist — see `iptables`'s
-/// module docs for why that combination can't be safely enforced.
+/// `backend`, as of now. Fails immediately, before gathering or rendering
+/// anything, if `backend` is iptables and geo mode is Allowlist — see the
+/// message below for why.
 pub fn build_script(db: &Db, backend: FirewallBackend) -> Result<BuiltFirewall> {
+    build_script_at(db, backend, now_secs())
+}
+
+/// [`build_script`] as of `now` (Unix seconds), which is what the timeouts
+/// in an nftables script count from.
+///
+/// A rule that has already expired at `now` is dropped from
+/// [`BuiltFirewall::rules`] as well as from the script, so the lockout
+/// guard, which is fed those rules, judges exactly what will be loaded.
+/// An expired Allow it still counted would pass a script that no longer
+/// has it.
+pub fn build_script_at(db: &Db, backend: FirewallBackend, now: i64) -> Result<BuiltFirewall> {
     if db.get_geo_mode()? == GeoMode::Allowlist && matches!(backend, FirewallBackend::Iptables) {
         anyhow::bail!(
-            "Allowlist geo mode requires --backend nftables. iptables cannot safely enforce a \
-             default-deny (catch-all) policy because: (1) it is IPv4-only, so the ::/0 \
-             IPv6 catch-all would be silently skipped, leaving IPv6 traffic unblocked; \
-             and (2) it would block established connections and loopback without \
-             explicit allow rules. Use nftables which handles both address families."
+            "Allowlist geo mode requires --backend nftables. Its catch-all makes the host \
+             default-deny, and only the nftables script lets private sources through on the \
+             forward path before any rule is consulted, so that containers keep their network. \
+             The iptables script evaluates one chain for both paths."
         );
     }
 
-    let rules = all_rules(db)?;
+    let mut rules = all_rules(db)?;
+    rules.retain(|rule| rule.expires_at.is_none_or(|at| at > now));
 
-    let (script, written) = match backend {
-        FirewallBackend::Iptables => {
-            // iptables is IPv4-only; render() skips IPv6 rules.
-            let written = rules
-                .iter()
-                .filter(|r| r.enabled && !r.address.contains(':'))
-                .count();
-            (iptables::render(&rules), written)
-        }
-        FirewallBackend::Nftables => {
-            let written = rules.iter().filter(|r| r.enabled).count();
-            (nftables::render(&rules), written)
-        }
+    let script = match backend {
+        FirewallBackend::Iptables => iptables::render(&rules, now),
+        FirewallBackend::Nftables => nftables::render(&rules, now),
     };
+    let written = loaded_entries(&rules, backend, now);
 
     Ok(BuiltFirewall {
         rules,
         script,
         written,
     })
+}
+
+/// How many entries a script rendered from `rules` at `now` puts in the
+/// kernel: what `status` should find loaded once it has been applied.
+///
+/// Not `rules.len()`. On nftables an address inside a range with the same
+/// verdict that lasts at least as long is left out of the set, because the
+/// range already decides it — a host with overlapping feeds has many of
+/// those — and disabled and expired rules are never loaded on either
+/// backend.
+pub fn loaded_entries(rules: &[FirewallRule], backend: FirewallBackend, now: i64) -> usize {
+    match backend {
+        FirewallBackend::Iptables => iptables::loaded_entries(rules, now),
+        FirewallBackend::Nftables => nftables::loaded_entries(rules, now),
+    }
+}
+
+/// The current time in Unix seconds.
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Writes a rendered script to `out`, creating any missing parent

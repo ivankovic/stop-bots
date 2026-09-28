@@ -565,6 +565,30 @@ impl Server {
         (ok, format!("{stdout}{stderr}"))
     }
 
+    /// Whether the loaded `inet stop_bots` table has `element` in `set` —
+    /// asked of the kernel with `nft get element`, which for an interval
+    /// set also answers for an address inside a listed range.
+    fn in_set(&self, set: &str, element: &str) -> bool {
+        self.run(&format!(
+            "nft get element inet stop_bots {set} '{{ {element} }}'"
+        ))
+        .0
+    }
+
+    /// Renders the firewall for `backend` into `/tmp/fw` and loads it the
+    /// way the apply does. `--force` because a container has no SSH log.
+    fn render_and_load(&self, backend: &str) {
+        self.stop_bots(&format!(
+            "render-firewall --backend {backend} --out /tmp/fw --force"
+        ));
+        let load = if backend == "nftables" {
+            "nft -f /tmp/fw"
+        } else {
+            "sh /tmp/fw"
+        };
+        self.sh(load);
+    }
+
     fn apply_and_reload(&self) {
         self.stop_bots("apply-blocks --root /etc/nginx/sites-enabled --no-reload");
         let (ok, output) = self.nginx_t();
@@ -2040,13 +2064,15 @@ fn status_reports_generated_rules_that_never_reached_the_kernel() {
         "the report does not name the problem:\n{said}"
     );
 
-    // Load them, and the same command has to change its mind.
+    // Load them, and the same command has to change its mind. The rule
+    // is a set element now, and the count has to find it there rather
+    // than call the ruleset behind.
     host.sh("nft -f /etc/stop-bots/firewall.nft");
     let (ok, out, err) = host.run_uncontended(&format!("stop-bots status --db {HOST_DB}"));
     let said = format!("{out}{err}");
     assert!(
-        !said.contains("none loaded into the kernel"),
-        "the report still says nothing is loaded after loading it:\n{said}"
+        !said.contains("none loaded into the kernel") && !said.contains("behind"),
+        "the report does not see what was loaded:\n{said}"
     );
     assert!(
         ok,
@@ -2814,15 +2840,25 @@ fn generated_firewall_scripts_load_into_real_nftables() {
     server.sh("nft -f /tmp/fw.nft");
 
     let ruleset = server.sh("nft list table inet stop_bots");
-    for expected in [
-        "ip saddr 203.0.113.9 drop",
-        "ip saddr 198.51.100.0/24 drop",
-        "ip6 saddr 2001:db8:1:2::/64 drop",
-        "ip saddr 192.0.2.7 accept",
+    for (set, element) in [
+        ("block_v4", "203.0.113.9"),
+        ("block_v4", "198.51.100.0/24"),
+        ("block_v6", "2001:db8:1:2::/64"),
+        ("allow_v4", "192.0.2.7"),
     ] {
         assert!(
-            ruleset.contains(expected),
-            "{expected:?} missing from the loaded ruleset:\n{ruleset}"
+            server.in_set(set, element),
+            "{element} missing from {set} in the loaded ruleset:\n{ruleset}"
+        );
+    }
+    for rule in [
+        "ip saddr @block_v4 drop",
+        "ip6 saddr @block_v6 drop",
+        "ip saddr @allow_v4 accept",
+    ] {
+        assert!(
+            ruleset.contains(rule),
+            "{rule:?} missing from the loaded ruleset:\n{ruleset}"
         );
     }
 
@@ -2832,7 +2868,12 @@ fn generated_firewall_scripts_load_into_real_nftables() {
     server.sh("nft -f /tmp/fw.nft");
     let twice = server.sh("nft list table inet stop_bots");
     assert_eq!(
-        twice.matches("ip saddr 203.0.113.9 drop").count(),
+        twice.matches("203.0.113.9").count(),
+        1,
+        "re-applying must not duplicate elements:\n{twice}"
+    );
+    assert_eq!(
+        twice.matches("@block_v4").count(),
         1,
         "re-applying must not duplicate rules:\n{twice}"
     );
@@ -2941,7 +2982,7 @@ fn batch_apply_enforces_on_both_planes_at_once() {
     // The firewall plane: the script was written *and* loaded.
     let ruleset = server.sh("nft list table inet stop_bots");
     assert!(
-        ruleset.contains("ip saddr 203.0.113.9 drop"),
+        server.in_set("block_v4", "203.0.113.9") && ruleset.contains("ip saddr @block_v4 drop"),
         "batch --apply should have loaded the rules; batch said:\n{output}\nruleset:\n{ruleset}"
     );
 
@@ -3036,4 +3077,252 @@ fn rendering_proceeds_when_no_connected_admin_is_affected() {
     server
         .stop_bots("render-firewall --backend nftables --out /tmp/fw.nft --ssh-log /tmp/auth.log");
     server.sh("nft -c -f /tmp/fw.nft");
+}
+
+// ---- sets, restores and upgrades: the firewall at scale ----
+
+/// The /28 a test network put `ip` in: the range to block around a
+/// client, so that an Allow for the client alone has something to beat.
+fn subnet_28(ip: &str) -> String {
+    let (head, last) = ip.rsplit_once('.').expect("an IPv4 address");
+    let last: u8 = last.parse().expect("an IPv4 address");
+    format!("{head}.{}/28", last / 16 * 16)
+}
+
+/// Real packets against both halves of the ordering the sets must keep:
+/// an address inside a blocked range is dropped, and an Allow given
+/// before that range still lets its one client through.
+fn allow_ahead_of_a_blocked_range_wins(backend: &str, prefix: &str) {
+    let net = Network::create(&format!("{prefix}-net"));
+    let server = Server::start_on_network(&format!("{prefix}-server"), &net);
+    let client = Client::start(&format!("{prefix}-client"), &net);
+    let client_ip = client.address();
+    let range = subnet_28(&client_ip);
+
+    server.stop_bots(&format!(
+        "add-firewall-rule --address {client_ip} --action allow"
+    ));
+    server.stop_bots(&format!(
+        "add-firewall-rule --address {range} --action block"
+    ));
+    server.render_and_load(backend);
+    assert_eq!(
+        client.get(&server.name, "--max-time 5"),
+        "200",
+        "{backend}: the Allow for {client_ip} came first and must beat the block of {range}. \
+         script:\n{}",
+        server.sh("cat /tmp/fw")
+    );
+
+    // The Allow was rule 1. Without it the range decides.
+    server.stop_bots("remove-firewall-rule --id 1");
+    server.render_and_load(backend);
+    assert_eq!(
+        client.get(&server.name, "--max-time 5"),
+        "000",
+        "{backend}: {client_ip} is inside the blocked {range} and must be dropped. script:\n{}",
+        server.sh("cat /tmp/fw")
+    );
+}
+
+#[test]
+fn nftables_sets_drop_a_listed_address_and_an_allow_ahead_still_wins() {
+    if !enabled() {
+        return;
+    }
+    allow_ahead_of_a_blocked_range_wins("nftables", "stop-bots-sets");
+}
+
+#[test]
+fn an_iptables_restore_drops_a_listed_address_and_an_allow_ahead_still_wins() {
+    if !enabled() {
+        return;
+    }
+    allow_ahead_of_a_blocked_range_wins("iptables", "stop-bots-restore");
+}
+
+/// A detector's block expires, and since sets the kernel is what lets it
+/// go: the element carries a `timeout`, and nothing has to apply the
+/// script again for the block to lift.
+#[test]
+fn a_timed_block_is_loaded_with_a_timeout_that_the_kernel_honours() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-timeout");
+    server.sh(
+        "for i in $(seq 25); do echo 'Aug 17 10:00:01 host sshd[100]: Failed password \
+         for root from 203.0.113.50 port 4444 ssh2'; done > /tmp/auth.log",
+    );
+    server.stop_bots("block-scanners --ssh-log /tmp/auth.log --ttl-days 1");
+    server.render_and_load("nftables");
+
+    let set = server.sh("nft list set inet stop_bots block_v4");
+    assert!(
+        set.contains("203.0.113.50 timeout") && set.contains("expires"),
+        "the detector's block should be a timed element:\n{set}"
+    );
+
+    // A day is too long to wait for, so the same script with the timeout
+    // cut to a few seconds: the kernel, not a re-render, has to remove it.
+    // Loaded and looked up in one exec, so a slow runner cannot spend the
+    // timeout between the two.
+    server.sh("sed -E 's/timeout [0-9dhms]+/timeout 4s/' /tmp/fw > /tmp/fw-short");
+    let (present, _, stderr) = server
+        .run("nft -f /tmp/fw-short && nft get element inet stop_bots block_v4 '{ 203.0.113.50 }'");
+    assert!(
+        present,
+        "the element should be there before its timeout: {stderr}"
+    );
+    server.sh("sleep 5");
+    assert!(
+        !server.in_set("block_v4", "203.0.113.50"),
+        "the kernel should have dropped the element when its timeout ran out:\n{}",
+        server.sh("nft list set inet stop_bots block_v4")
+    );
+}
+
+/// IPv6 used to be skipped by this backend altogether, including every
+/// /64 a detector writes. It goes to ip6tables now, into the same chain
+/// shape with the same jump.
+#[test]
+fn the_iptables_backend_loads_ipv6_rules_into_ip6tables() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-ip6tables");
+    server.stop_bots("add-firewall-rule --address 2001:db8:1:2::/64 --action block");
+    server.stop_bots("add-firewall-rule --address 203.0.113.9 --action block");
+    server.render_and_load("iptables");
+
+    let v6 = server.sh("ip6tables -S STOP-BOTS");
+    assert!(
+        v6.contains("-s 2001:db8:1:2::/64 -j DROP"),
+        "the IPv6 rule is not in ip6tables:\n{v6}"
+    );
+    assert!(
+        !v6.contains("203.0.113.9"),
+        "an IPv4 rule reached ip6tables:\n{v6}"
+    );
+    let jumps = server.sh("ip6tables -S INPUT");
+    assert!(
+        jumps.contains("-A INPUT -j STOP-BOTS"),
+        "nothing jumps to the IPv6 chain:\n{jumps}"
+    );
+    assert!(
+        server.sh("iptables -S STOP-BOTS").contains("203.0.113.9"),
+        "the IPv4 half is missing"
+    );
+}
+
+/// The reason for the restore. The old script flushed the chain and then
+/// ran one process per rule under `set -e`, so a failure part way through
+/// left the chain half filled until the next apply. A restore is checked
+/// in full before it is committed: a failed apply leaves the previous
+/// chain exactly as it was.
+#[test]
+fn a_failed_iptables_apply_leaves_the_previous_chain_whole() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-restore-atomic");
+    server.stop_bots("add-firewall-rule --address 203.0.113.9 --action block");
+    server.stop_bots("add-firewall-rule --address 203.0.113.10 --action block");
+    server.render_and_load("iptables");
+    let before = server.sh("iptables -S STOP-BOTS");
+
+    // The same script with a new rule, then one iptables-restore refuses.
+    server.sh(
+        "sed 's|^-A STOP-BOTS -s 203.0.113.10 -j DROP$|&\\n-A STOP-BOTS -s 198.51.100.1 -j DROP\\n-A STOP-BOTS -s not-an-address -j DROP|' \
+         /tmp/fw > /tmp/fw-broken",
+    );
+    assert!(
+        server.sh("cat /tmp/fw-broken").contains("not-an-address"),
+        "the test did not manage to break the script"
+    );
+    let (ok, _, stderr) = server.run("sh /tmp/fw-broken");
+    assert!(!ok, "the broken script should fail");
+    assert!(stderr.contains("not-an-address"), "stderr was:\n{stderr}");
+
+    assert_eq!(
+        server.sh("iptables -S STOP-BOTS"),
+        before,
+        "a failed apply changed the live chain"
+    );
+}
+
+/// A host upgrading from 0.0.15 has that version's script loaded: one rule
+/// per address, no sets. Loading the new one over it has to leave the new
+/// shape and nothing of the old.
+#[test]
+fn a_ruleset_written_by_0_0_15_is_replaced_cleanly_by_sets() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-nft-upgrade");
+    let old = include_str!("fixtures/nftables/written-by-0.0.15.nft");
+    server.sh(&format!("cat > /tmp/old.nft <<'NFT'\n{old}NFT"));
+    server.sh("nft -f /tmp/old.nft");
+    assert!(
+        server
+            .sh("nft list table inet stop_bots")
+            .contains("ip saddr 198.51.100.0/24 drop"),
+        "the 0.0.15 script did not load as it used to"
+    );
+
+    server.stop_bots("add-firewall-rule --address 203.0.113.9 --action block");
+    server.render_and_load("nftables");
+
+    let table = server.sh("nft list table inet stop_bots");
+    for gone in ["198.51.100.0/24", "203.0.113.7", "2001:db8::/32"] {
+        assert!(
+            !table.contains(gone),
+            "{gone} from the 0.0.15 script survived the upgrade:\n{table}"
+        );
+    }
+    assert!(
+        server.in_set("block_v4", "203.0.113.9"),
+        "the new rule is not in its set:\n{table}"
+    );
+}
+
+/// The same for iptables: 0.0.15's script made the chain and the jumps
+/// with plain `iptables` commands. The restore takes the chain over, and
+/// the jumps are found rather than added a second time.
+#[test]
+fn a_chain_written_by_0_0_15_is_taken_over_by_the_restore() {
+    if !enabled() {
+        return;
+    }
+    let server = Server::start("stop-bots-ipt-upgrade");
+    let old = include_str!("fixtures/iptables/written-by-0.0.15.sh");
+    server.sh(&format!("cat > /tmp/old.sh <<'SH'\n{old}SH"));
+    server.sh("sh /tmp/old.sh");
+    assert!(
+        server
+            .sh("iptables -S STOP-BOTS")
+            .contains("198.51.100.0/24"),
+        "the 0.0.15 script did not load as it used to"
+    );
+
+    server.stop_bots("add-firewall-rule --address 203.0.113.9 --action block");
+    server.render_and_load("iptables");
+
+    let chain = server.sh("iptables -S STOP-BOTS");
+    assert_eq!(
+        chain
+            .lines()
+            .filter(|l| l.contains(" -s "))
+            .collect::<Vec<_>>(),
+        vec!["-A STOP-BOTS -s 203.0.113.9/32 -j DROP"],
+        "the chain should hold the new rules and only those:\n{chain}"
+    );
+    for hook in ["INPUT", "FORWARD"] {
+        let jumps = server.sh(&format!("iptables -S {hook}"));
+        assert_eq!(
+            jumps.matches("-j STOP-BOTS").count(),
+            1,
+            "{hook} should jump to STOP-BOTS exactly once:\n{jumps}"
+        );
+    }
 }

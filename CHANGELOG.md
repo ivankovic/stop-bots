@@ -5,6 +5,19 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking â
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [Unreleased]
+
+### Changed
+
+- **nftables: addresses go in sets.** One set per verdict and family, matched by one rule
+  each, instead of one rule per address. First-match order is kept.
+- **nftables: timed blocks expire in the kernel.** A detector's block is a set element with a
+  `timeout`, so it lifts without re-applying the script.
+- **iptables: loaded with `iptables-restore --noflush`.** The chain is replaced in one step, and
+  a failed apply leaves the previous chain as it was.
+- **iptables: IPv6 rules are applied** through `ip6tables-restore`, not skipped.
+- `status` counts set elements and ip6tables rules as loaded rules.
+
 ## [0.0.15] â€” 2026-09-27
 
 ### Added

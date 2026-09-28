@@ -507,6 +507,14 @@ fn live_firewall(backend: FirewallBackend) -> Option<LiveFirewall> {
                     0
                 }
             };
+            // The script loads IPv6 rules into the same chain in
+            // ip6tables. Absent (no chain yet, or no IPv6 on this kernel)
+            // counts as none rather than as not knowing: the IPv4 read
+            // above already proved we may look.
+            let rules = rules
+                + run("ip6tables", &["-S", "STOP-BOTS"])
+                    .map(|output| count_iptables_rules(&output))
+                    .unwrap_or(0);
             // Unlike nftables, the jump lives in a chain we do not own, so
             // this is a second read however it is arranged. Either jump
             // reaches our chain, and which one is present depends on
@@ -527,21 +535,54 @@ fn live_firewall(backend: FirewallBackend) -> Option<LiveFirewall> {
     }
 }
 
-/// Rule lines inside an `nft list table` dump: the ones carrying a
-/// verdict. The table, chain and brace lines are structure, not rules.
+/// What an `nft list table` dump holds: the rule lines that carry a
+/// verdict, plus the elements of every named set. The table, chain, brace
+/// and set-header lines are structure, not rules.
+///
+/// A rule that matches a named set (`ip saddr @block_v4 drop`) is not
+/// counted itself: its elements are, since each is what one rule used to
+/// be, and the script puts one element in the kernel for each entry it
+/// reports writing. A dump from before sets has no elements and counts
+/// the way it always did.
 ///
 /// Split out from the subprocess so the parsing — the part that breaks
 /// when a tool changes its output — is testable in microseconds. The
 /// plumbing around it is covered by the container suite, against a real
 /// `nft`.
 fn count_nft_rules(output: &str) -> usize {
-    output
-        .lines()
-        .filter(|line| {
-            let line = line.trim();
-            line.ends_with("drop") || line.ends_with("accept") || line.ends_with("return")
-        })
-        .count()
+    let mut count = 0;
+    let mut in_elements = false;
+    for line in output.lines() {
+        let line = line.trim();
+        let listed = if in_elements {
+            Some(line)
+        } else {
+            line.strip_prefix("elements = {")
+        };
+        if let Some(listed) = listed {
+            // `elements = { a, b,` then `c timeout 1d expires 23h, d }`:
+            // one element per comma-separated item, over as many lines as
+            // nft wraps them onto.
+            in_elements = !listed.ends_with('}');
+            count += listed
+                .trim_end_matches('}')
+                .split(',')
+                .filter(|item| !item.trim().is_empty())
+                .count();
+            continue;
+        }
+        let verdict = line.ends_with("drop")
+            || line.ends_with("accept")
+            || line.ends_with("return")
+            // `reject` is listed with what it answers:
+            // `reject with icmpx port-unreachable`.
+            || line.ends_with("reject")
+            || line.contains(" reject with ");
+        if verdict && !line.contains(" @") {
+            count += 1;
+        }
+    }
+    count
 }
 
 /// `iptables -S` prints one `-A STOP-BOTS ...` per rule, plus an `-N` line
@@ -743,9 +784,15 @@ fn run_allowing_failure(program: &str, args: &[&str]) -> Option<String> {
 pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     let mut checks = Vec::new();
     let backend = firewall::stored_backend(db)?;
-    let expected = firewall::all_rules(db)?.len();
+    let rules = firewall::all_rules(db)?;
+    let expected = rules.len();
 
-    checks.push(firewall_enforced(probe, expected));
+    // What the kernel should hold, which is not `expected`: a set leaves
+    // out an address a range already covers, and nothing disabled or
+    // expired is loaded. Compared against the rule count, a host with
+    // overlapping feeds would read as a ruleset that is behind.
+    let loadable = firewall::loaded_entries(&rules, backend, now_secs());
+    checks.push(firewall_enforced(probe, loadable));
     checks.push(firewall_persistence(probe, backend));
     checks.push(script_freshness(db, expected)?);
     checks.push(nginx_applied(db)?);
@@ -2449,6 +2496,35 @@ mod tests {
         assert_eq!(check(&report, "firewall-enforced").level, Level::Ok);
     }
 
+    /// A set leaves out an address a range with the same verdict already
+    /// covers, so the kernel holds fewer entries than there are rules. The
+    /// expected count has to be what the script loads, or a host with
+    /// overlapping feeds reads as a ruleset that is behind.
+    #[test]
+    fn addresses_a_range_already_covers_are_not_expected_in_the_kernel() {
+        let db = db();
+        with_rules(&db, 100);
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.0/24".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+
+        let report = assess(
+            &db,
+            &Probe {
+                // The /24, and the five structural rules a real dump has.
+                live_rules: Some(6),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        let check = check(&report, "firewall-enforced");
+        assert_eq!(check.level, Level::Ok, "was: {}", check.detail);
+    }
+
     /// nftables rules live in kernel memory only. A host that is protected
     /// now and comes back open after a reboot is worth a word.
     /// The advice this check used to give, and why it no longer does.
@@ -2909,6 +2985,44 @@ mod tests {
                     }\n";
 
         assert_eq!(count_nft_rules(dump), 3);
+    }
+
+    /// What `nft list table` prints for a rendered script with sets,
+    /// verbatim from nftables 1.0.9: the elements are what the script
+    /// loaded, one per address, and a rule that matches a set is not one
+    /// more.
+    #[test]
+    fn nft_set_elements_are_counted_and_the_rules_that_match_them_are_not() {
+        let dump = "table inet stop_bots {\n\
+                    \tset allow_v4 {\n\
+                    \t\ttype ipv4_addr\n\
+                    \t\tflags interval\n\
+                    \t\telements = { 203.0.113.7 }\n\
+                    \t}\n\
+                    \n\
+                    \tset block_v4 {\n\
+                    \t\ttype ipv4_addr\n\
+                    \t\tflags interval,timeout\n\
+                    \t\telements = { 192.0.2.77 timeout 1d1h expires 1d59m59s989ms, 198.51.100.0/24,\n\
+                    \t\t\t     198.51.101.0/24, 198.51.102.0/24 }\n\
+                    \t}\n\
+                    \n\
+                    \tchain bot_block {\n\
+                    \t\ttype filter hook input priority filter - 1; policy accept;\n\
+                    \t\tct state established,related accept\n\
+                    \t\tiif \"lo\" accept\n\
+                    \t\tjump bot_rules\n\
+                    \t}\n\
+                    \n\
+                    \tchain bot_rules {\n\
+                    \t\tip saddr @allow_v4 accept\n\
+                    \t\tip saddr @block_v4 drop\n\
+                    \t\tip saddr 192.0.2.9 tcp dport 22 reject with icmp port-unreachable\n\
+                    \t}\n\
+                    }\n";
+
+        // Five elements, two structural accepts, and the reject.
+        assert_eq!(count_nft_rules(dump), 8);
     }
 
     /// An empty table is zero rules, not an unreadable ruleset — the

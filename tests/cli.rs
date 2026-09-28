@@ -106,6 +106,27 @@ impl Fixture {
     }
 }
 
+/// The rule in an nftables script that decides `element`, and its line
+/// number: the `add rule` matching the set whose `add element` block lists
+/// it, e.g. `(31, "ip saddr @allow_v4 accept")`. Lower lines are matched
+/// first. `None` if no set lists `element`.
+fn nft_rule_for(script: &str, element: &str) -> Option<(usize, String)> {
+    let mut set = None;
+    for line in script.lines() {
+        if let Some(rest) = line.strip_prefix("add element inet stop_bots ") {
+            set = rest.split(' ').next();
+        } else if line.starts_with('\t') && line.trim().trim_end_matches(',') == element {
+            let matcher = format!("@{} ", set?);
+            return script.lines().enumerate().find_map(|(at, l)| {
+                l.strip_prefix("add rule inet stop_bots bot_rules ")
+                    .filter(|rule| rule.contains(&matcher))
+                    .map(|rule| (at, rule.to_string()))
+            });
+        }
+    }
+    None
+}
+
 /// `--no-reload` throughout: these run on whatever machine hosts the test
 /// suite, and an apply without it shells out to the real `nginx -t` and
 /// `systemctl reload nginx`.
@@ -821,12 +842,15 @@ fn trust_reaches_the_firewall_script_first_and_nginx_through_the_trust_file() {
         empty_log.to_str().unwrap(),
     ]);
     let script = fs::read_to_string(&script_path).unwrap();
-    let accept = script
-        .find("ip saddr 203.0.113.0/24 accept")
+    let (accept, rule) = nft_rule_for(&script, "203.0.113.0/24")
         .unwrap_or_else(|| panic!("no accept for the trusted range:\n{script}"));
-    let drop = script
-        .find("ip saddr 203.0.113.9 drop")
+    assert!(
+        rule.ends_with(" accept"),
+        "the trusted range is in {rule:?}"
+    );
+    let (drop, rule) = nft_rule_for(&script, "203.0.113.9")
         .unwrap_or_else(|| panic!("the block rule went missing:\n{script}"));
+    assert!(rule.ends_with(" drop"), "the block is in {rule:?}");
     assert!(accept < drop, "the accept must come first:\n{script}");
 
     fx.apply_blocks();
@@ -1478,9 +1502,15 @@ fn firewall_add_list_render_remove_happy_path() {
         "script was:\n{script}"
     );
     // This is the safety property that matters most: the script must never
-    // touch chains/policies outside our own dedicated STOP-BOTS chain.
-    assert!(!script.contains("*filter"), "script was:\n{script}");
-    assert!(!script.contains("COMMIT"), "script was:\n{script}");
+    // touch chains/policies outside our own dedicated STOP-BOTS chain. The
+    // restore it feeds declares that one chain and sets no policy.
+    let declared: Vec<&str> = script.lines().filter(|l| l.starts_with(':')).collect();
+    assert_eq!(
+        declared,
+        vec![":STOP-BOTS - [0:0]", ":STOP-BOTS - [0:0]"],
+        "one declaration per family, of our chain only:\n{script}"
+    );
+    assert!(!script.contains(" -P "), "script was:\n{script}");
 
     stop_bots_bin()
         .args(["remove-firewall-rule", "--db", db_path, "--id", "1"])
@@ -1804,17 +1834,18 @@ fn render_firewall_allowlist_mode_does_not_warn_when_an_earlier_allow_rule_cover
         .stderr(predicate::str::contains("WARNING").not());
 
     let script = fs::read_to_string(&script_path).unwrap();
+    for (element, verdict) in [
+        ("4.5.6.7", " accept"),
+        ("0.0.0.0/0", " drop"),
+        ("::/0", " drop"),
+    ] {
+        let (_, rule) = nft_rule_for(&script, element)
+            .unwrap_or_else(|| panic!("{element} is in no set:\n{script}"));
+        assert!(rule.ends_with(verdict), "{element} is decided by {rule:?}");
+    }
     assert!(
-        script.contains("ip saddr 4.5.6.7 accept"),
-        "script was:\n{script}"
-    );
-    assert!(
-        script.contains("ip saddr 0.0.0.0/0 drop"),
-        "script was:\n{script}"
-    );
-    assert!(
-        script.contains("ip6 saddr ::/0 drop"),
-        "script was:\n{script}"
+        nft_rule_for(&script, "4.5.6.7").unwrap().0 < nft_rule_for(&script, "0.0.0.0/0").unwrap().0,
+        "the admin's Allow must come before the catch-all:\n{script}"
     );
 }
 
@@ -2436,10 +2467,11 @@ fn batch_protects_the_connected_admin_ahead_of_a_block_covering_them() {
     fixture.batch(&[]).assert().success();
 
     let script = fs::read_to_string(fixture.firewall_script()).unwrap();
-    let allow = script.find("ip saddr 192.0.2.10 accept");
-    let block = script.find("ip saddr 192.0.2.0/24 drop");
+    let allow = nft_rule_for(&script, "192.0.2.10");
+    let block = nft_rule_for(&script, "192.0.2.0/24");
     assert!(
-        matches!((allow, block), (Some(a), Some(b)) if a < b),
+        matches!((&allow, &block), (Some((a, allow)), Some((b, block)))
+            if a < b && allow.ends_with(" accept") && block.ends_with(" drop")),
         "the admin's address should be allowed ahead of the block:\n{script}"
     );
 }
