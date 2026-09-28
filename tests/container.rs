@@ -107,10 +107,44 @@ fn runtime_is_podman() -> bool {
     runtime().contains("podman")
 }
 
-const IMAGE: &str = "stop-bots-test:latest";
+/// Appended to every image tag and every container and network name, from
+/// `STOP_BOTS_CONTAINER_SUFFIX`. Unset, the names are what they always
+/// were.
+///
+/// Two checkouts running this suite at once otherwise share one image tag
+/// and one set of container names: the second build replaces the image
+/// under the first run, which then tests the other checkout's binary, and
+/// each run's `rm -f` removes the other's containers. A suffix per
+/// checkout keeps them apart.
+fn suffix() -> &'static str {
+    static SUFFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SUFFIX.get_or_init(|| std::env::var("STOP_BOTS_CONTAINER_SUFFIX").unwrap_or_default())
+}
+
+/// `name`, with [`suffix`] if there is one.
+fn scoped(name: &str) -> String {
+    match suffix() {
+        "" => name.to_string(),
+        suffix => format!("{name}-{suffix}"),
+    }
+}
+
+/// The image tag, which is `latest` unless [`suffix`] says otherwise.
+fn tagged(image: &str) -> String {
+    match suffix() {
+        "" => format!("{image}:latest"),
+        suffix => format!("{image}:{suffix}"),
+    }
+}
+
+fn image() -> String {
+    tagged("stop-bots-test")
+}
 
 /// The image with a real init — see `Dockerfile.host` and [`Host`].
-const HOST_IMAGE: &str = "stop-bots-host:latest";
+fn host_image() -> String {
+    tagged("stop-bots-host")
+}
 
 /// Builds the image exactly once per test binary run.
 ///
@@ -138,7 +172,7 @@ fn build_host_image() {
                 "-f",
                 &format!("{ctx}/Dockerfile.host"),
                 "-t",
-                HOST_IMAGE,
+                &host_image(),
                 &ctx,
             ])
             .output()
@@ -187,7 +221,7 @@ fn stage_binary() -> String {
 fn build_image_now() {
     let ctx = stage_binary();
     let out = Command::new(runtime())
-        .args(["build", "-q", "-t", IMAGE, &ctx])
+        .args(["build", "-q", "-t", &image(), &ctx])
         .output()
         .expect("failed to run the image build");
     assert!(
@@ -246,6 +280,7 @@ impl Network {
     }
 
     fn create_in(name: &str, subnet_for: fn(usize) -> String) -> Network {
+        let name = &scoped(name);
         let _ = Command::new(runtime())
             .args(["network", "rm", name])
             .output();
@@ -325,9 +360,18 @@ struct Client {
 impl Client {
     fn start(name: &str, net: &Network) -> Client {
         build_image();
+        let name = &scoped(name);
         let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
         let out = Command::new(runtime())
-            .args(["run", "-d", "--name", name, "--network", &net.name, IMAGE])
+            .args([
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--network",
+                &net.name,
+                &image(),
+            ])
             .output()
             .expect("failed to start the client container");
         assert!(
@@ -406,6 +450,7 @@ impl Server {
 
     fn spawn(name: &str, network: Option<&str>) -> Server {
         build_image();
+        let name = &scoped(name);
         // Leftover from a previous aborted run.
         let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
 
@@ -422,7 +467,7 @@ impl Server {
             args.push("--network".to_string());
             args.push(network.to_string());
         }
-        args.push(IMAGE.to_string());
+        args.push(image());
         let out = Command::new(runtime())
             .args(&args)
             .output()
@@ -579,6 +624,7 @@ impl Host {
 
     fn boot(name: &str) -> Host {
         build_host_image();
+        let name = &scoped(name);
         // Leftover from a previous aborted run.
         let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
 
@@ -632,7 +678,7 @@ impl Host {
             args.push("--tmpfs".to_string());
             args.push("/run/lock".to_string());
         }
-        args.push(HOST_IMAGE.to_string());
+        args.push(host_image());
 
         let out = Command::new(runtime())
             .args(&args)
@@ -1775,13 +1821,13 @@ fn fetching_the_honeypot_gets_a_real_client_blocked_end_to_end() {
     server.apply_and_reload();
 
     assert_eq!(
-        client.get("stop-bots-honeypot", ""),
+        client.get(&server.name, ""),
         "200",
         "the client cannot reach the server to begin with"
     );
 
     // The bait, fetched by the real client through the real server.
-    client.get_path("stop-bots-honeypot", "/trap-me", "");
+    client.get_path(&server.name, "/trap-me", "");
 
     let found = server.stop_bots("block-honeypot --access-log /var/log/nginx/access.log");
     assert!(
@@ -1793,7 +1839,7 @@ fn fetching_the_honeypot_gets_a_real_client_blocked_end_to_end() {
     server.sh("nft -f /etc/stop-bots/firewall.nft");
 
     assert_eq!(
-        client.get("stop-bots-honeypot", "--max-time 5"),
+        client.get(&server.name, "--max-time 5"),
         "000",
         "the client was detected and blocked but can still reach the server. ruleset:\n{}",
         server.sh("nft list ruleset")
@@ -1937,13 +1983,13 @@ fn probing_for_dotenv_gets_a_real_client_blocked_end_to_end() {
     server.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
     server.apply_and_reload();
     assert_eq!(
-        client.get("stop-bots-probe", ""),
+        client.get(&server.name, ""),
         "200",
         "the client cannot reach the server to begin with"
     );
 
-    client.get_path("stop-bots-probe", "/.env", "");
-    client.get_path("stop-bots-probe", "/.git/config", "");
+    client.get_path(&server.name, "/.env", "");
+    client.get_path(&server.name, "/.git/config", "");
 
     let found = server.stop_bots("block-probe-paths --access-log /var/log/nginx/access.log");
     assert!(
@@ -1955,7 +2001,7 @@ fn probing_for_dotenv_gets_a_real_client_blocked_end_to_end() {
     server.sh("nft -f /etc/stop-bots/firewall.nft");
 
     assert_eq!(
-        client.get("stop-bots-probe", "--max-time 5"),
+        client.get(&server.name, "--max-time 5"),
         "000",
         "the prober was detected and blocked but can still reach the server. ruleset:\n{}",
         server.sh("nft list ruleset")
@@ -2299,7 +2345,7 @@ fn allowlist_mode_really_drops_everything_outside_the_selection() {
     let client = Client::start("stop-bots-allowlist-client", &net);
 
     assert_eq!(
-        client.get("stop-bots-allowlist", ""),
+        client.get(&server.name, ""),
         "200",
         "the client cannot reach the server before any rules exist"
     );
@@ -2314,7 +2360,7 @@ fn allowlist_mode_really_drops_everything_outside_the_selection() {
     server.sh("nft -f /etc/stop-bots/firewall.nft");
 
     assert_eq!(
-        client.get("stop-bots-allowlist", "--max-time 5"),
+        client.get(&server.name, "--max-time 5"),
         "000",
         "allowlist mode let an address outside the selection through. ruleset:\n{}",
         server.sh("nft list ruleset")
