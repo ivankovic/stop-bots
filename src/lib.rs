@@ -36,6 +36,8 @@ pub mod accessstats;
 #[doc(hidden)]
 pub mod app;
 #[doc(hidden)]
+pub mod applylock;
+#[doc(hidden)]
 pub mod batch;
 #[doc(hidden)]
 pub mod blocks;

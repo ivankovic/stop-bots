@@ -760,7 +760,12 @@ fn unsafe_script_directory(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) 
 /// child gets [`crate::host::path_with_sbin`]: under an `/etc/cron.d`
 /// entry `PATH` is `/usr/bin:/bin`, which has neither `nft` nor the
 /// `iptables` every line of the iptables script runs.
+///
+/// Holds [`crate::applylock`] while the script runs, so the TUI, the
+/// console and a cron `batch` never run two scripts over the same table at
+/// once; a second one waits briefly, then says another is applying.
 pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
+    let _lock = crate::applylock::hold()?;
     let (program, args, what): (_, &[&str], _) = match backend {
         FirewallBackend::Iptables => (
             "sh",

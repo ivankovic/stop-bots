@@ -304,6 +304,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- main.rs        <- CLI entry point (clap subcommands) and their handlers
         |- lib.rs         <- Every module below, for main.rs and tests/; not a supported API
         |- app.rs         <- The TUI app controller, responds to events and controls the UI
+        |- applylock.rs   <- One NGINX or firewall apply at a time, across processes (flock)
         |- event.rs       <- Terminal event plumbing (ticks, key events, app events)
         |- tui.rs         <- Outer TUI chrome (tab bar, footer) and screen dispatch
         |- tui/           <- One file per TUI screen (Dashboard, Bot settings, Firewall, ...)

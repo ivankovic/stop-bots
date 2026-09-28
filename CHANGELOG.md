@@ -116,6 +116,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - **The database runs in WAL mode**: readers no longer wait for a writer.
   Its `-wal`/`-shm` are 0600, `install web` tightens them and
   `uninstall --purge` removes them.
+- **One apply at a time**: NGINX applies and firewall scripts take a lock
+  (`/run/stop-bots.lock` as root). A second waits up to 10s, then says
+  another stop-bots is applying.
 
 
 - **A render no longer changes what loads at boot.** It writes

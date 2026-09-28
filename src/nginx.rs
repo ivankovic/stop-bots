@@ -2237,6 +2237,7 @@ fn write_validated(
     commands: &NginxCommands,
     write: impl Fn(&Path, &str) -> Result<()>,
 ) -> Result<()> {
+    let _lock = crate::applylock::hold()?;
     let previous = fs::read_to_string(path).ok();
     write(path, content)?;
 
@@ -2679,11 +2680,18 @@ pub struct ApplyAllOutcome {
 ///
 /// `None` writes without testing or reloading: `--no-reload` and
 /// `--no-apply`, for a host whose NGINX this process must not touch.
+///
+/// **One at a time**, across processes: it holds [`crate::applylock`]
+/// from before the snapshot to after the reload, and a second apply waits
+/// briefly and then reports that another stop-bots is applying.
 pub fn apply_all_sites_and_reload(
     db: &crate::db::Db,
     root: &Path,
     commands: Option<&NginxCommands>,
 ) -> Result<ApplyAllOutcome> {
+    // Before the snapshot, not after: what a failed test restores has to
+    // be the state no other apply was halfway through changing.
+    let _lock = crate::applylock::hold()?;
     let sites = discover_sites(root)?;
     let generated = planned_managed_files(db, root)?
         .into_iter()
@@ -2777,6 +2785,7 @@ pub fn apply_site_and_reload(
     site: &crate::db::Site,
     commands: Option<&NginxCommands>,
 ) -> Result<(bool, bool)> {
+    let _lock = crate::applylock::hold()?;
     let managed = planned_managed_files(db, root)?;
     record_managed_files(db, &managed)?;
     let config_path = Path::new(&site.config_path);
