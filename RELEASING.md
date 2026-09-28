@@ -275,13 +275,47 @@ two.
 
 ## Versioning
 
-While the crate is `0.0.x`, cargo treats every release as breaking, which is the honest
-signal: `src/lib.rs` exposes every module, so the public API is currently "whatever the
-binary needed". Narrowing that surface is a prerequisite for `0.1.0`, and designing it
-deliberately is a prerequisite for `1.0.0`.
+The version number describes the program, not the Rust library. From `0.1.0` on, the
+contract a version makes is:
 
-The MSRV in `Cargo.toml` (`rust-version`) is enforced by a dedicated CI job. Raising it is
-a breaking change; a dependency raising *its* MSRV shows up as that job going red.
+- **the command line**: every verb and flag, and what each one does;
+- **the database**: a release opens every database an earlier release wrote, with the
+  settings in it intact, and a database a `0.1.x` release has used can still be opened
+  by any earlier `0.1.x`, so going back one patch release is safe;
+- **the files it writes**: the NGINX blocks it injects, the managed `conf.d` files, the
+  firewall script and the systemd units, including the markers it finds its own text by
+  (`# BEGIN stop-bots (DO NOT EDIT)` and its siblings);
+- **the paths it uses**: `/var/lib/stop-bots`, `/etc/stop-bots` and the files in them,
+  and every other default location.
+
+A `0.1.x` patch release breaks none of that. A change that does waits for the next
+minor, `0.2.0`, and is written up in the changelog. In practice, **breaking** means:
+
+- removing or renaming a verb or a flag without keeping the old name as an alias;
+- changing what an existing flag or verb does in a way a script relying on it would
+  notice;
+- writing a database that a previous `0.1.x` cannot open or would misread;
+- changing a generated-file marker, so that a newer release no longer recognises what
+  an older one wrote (or the other way round), or changing a default path.
+
+Adding a verb, a flag or a setting is not breaking. Nor is changing generated output
+*between* the markers, as long as the program still recognises and replaces what the
+previous release wrote there.
+
+**The library is not part of the contract.** `src/lib.rs` makes every module `pub` so
+that `main.rs`, `tests/` and `examples/` can reach them. The modules are
+`#[doc(hidden)]`, the crate documentation says there is no supported Rust API, and any
+of it can change in any release, patch releases included. Designing a public Rust API
+is not a goal for `1.0` either. The product is the binary; a designed library would be a
+second product with its own users, and nobody has asked for one.
+
+While the version is `0.0.x`, cargo treats every release as breaking, and that is also
+true of the contract above: it is still being settled. `ROADMAP.md` lists what has to
+hold before `0.1.0`.
+
+The MSRV in `Cargo.toml` (`rust-version`) is enforced by a dedicated CI job. Raising it
+changes who can build the program, so it waits for a minor release too; a dependency
+raising *its* MSRV shows up as that job going red.
 
 ## The README's claims
 

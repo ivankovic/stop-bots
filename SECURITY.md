@@ -2,13 +2,20 @@
 
 ## Supported versions
 
-While the project is `0.0.x` there is exactly one supported version: the latest release.
-Fixes go into a new release rather than being backported.
+Exactly one version is supported: the latest release. Fixes go into a new release
+rather than being backported.
 
 | Version        | Supported |
 | -------------- | --------- |
-| latest `0.0.x` | yes       |
+| latest `0.0.x` | yes, until `0.1.0` is released |
+| latest `0.1.x` | yes, once released |
 | anything older | no        |
+
+From `0.1.0` on, a patch release keeps the command line, the database and the
+generated files compatible (see "Versioning" in `RELEASING.md`), so moving to the
+latest `0.1.x` to get a fix never means reconfiguring. The Rust library is not a
+supported API: a flaw in it is in scope when the `stop-bots` program can reach it, not
+when only other Rust code calling the library could.
 
 ## Reporting a vulnerability
 

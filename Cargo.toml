@@ -1,9 +1,11 @@
 [package]
 name = "stop-bots"
-# 0.0.x on purpose: cargo treats every 0.0.z bump as a breaking change, which
-# is the honest signal for a crate whose library API is the whole of
-# `src/lib.rs` and is not yet designed to be depended on. The value here is the
-# binary; the lib is published because the integration tests use it.
+# The version describes the binary: its command line, its database, the files
+# it writes and the paths it uses (RELEASING.md, "Versioning"). The library in
+# `src/lib.rs` is not covered by it. It exists so that main.rs and the
+# integration tests can reach the internals, its modules are #[doc(hidden)],
+# and it can change in any release. 0.0.x while even the binary's contract is
+# still moving; from 0.1.0, a patch release breaks none of it.
 version = "0.0.15"
 edition = "2021"
 rust-version = "1.88"

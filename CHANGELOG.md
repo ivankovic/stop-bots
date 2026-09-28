@@ -1,14 +1,18 @@
 # Changelog
 
-Notable changes per release. Versions follow [semver](https://semver.org), with the
-caveat that `0.0.x` means cargo treats *every* release as potentially breaking — which is
-the intent while the library API in `src/lib.rs` is still whatever the binary happened to
-need.
+Notable changes per release. Versions follow [semver](https://semver.org) for the
+program: its command line, its database, the files it writes and the paths it uses.
+While the version is `0.0.x` any release may break those; from `0.1.0` a patch release
+breaks none of them. The Rust library in `src/lib.rs` is not a supported API and is not
+covered: it can change in any release. `RELEASING.md` says what counts as breaking.
 
 ## [Unreleased]
 
 ### Changed
 
+- **The Rust library is not a supported API.** Its modules are hidden from the
+  documentation, and the version now describes the program alone: its command
+  line, database, generated files and paths. `RELEASING.md` says what breaks them.
 - **A release is built only after the tests pass**, on both `x86_64` and
   `aarch64`. The `aarch64` tests also run on every push to `main`; before,
   that binary was shipped having only ever run `--version`.
