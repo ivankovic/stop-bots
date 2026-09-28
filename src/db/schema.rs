@@ -49,7 +49,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 1;
+pub const CURRENT_VERSION: u32 = 2;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -107,10 +107,16 @@ pub struct Migration {
 /// - **Keep stored values' meaning.** A step that renames a settings key
 ///   or changes how a value is spelled must rewrite the existing rows,
 ///   because the old binary is gone and nothing else will.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    summary: "the 0.0.x schema, with the column and cleanup every 0.0.x open applied",
-    apply: v1_baseline,
-}];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        summary: "the 0.0.x schema, with the column and cleanup every 0.0.x open applied",
+        apply: v1_baseline,
+    },
+    Migration {
+        summary: "managed_files, the record of generated files written",
+        apply: v2_managed_files,
+    },
+];
 
 /// Where the copy of a database at `version` is kept before it is
 /// migrated: next to it, named for the version it holds, so a failed or
@@ -623,6 +629,24 @@ fn v1_baseline(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Version 2: a record of every generated file written outside
+/// stop-bots' own directories, so cleaning up — after a setting changes,
+/// and by `uninstall` — works from what was written rather than from a
+/// list of where files would be written today. See `db::managed`.
+///
+/// Starts empty. Files written before it existed are still found by the
+/// fixed list of names `nginx::unused_managed_files` keeps as a fallback.
+fn v2_managed_files(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE managed_files (
+            path TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            written_at INTEGER NOT NULL,
+            version TEXT NOT NULL
+        );",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,6 +725,30 @@ mod tests {
             (version, bind.as_str()),
             (0, "a-value"),
             "the copy is the database as it was, version included"
+        );
+    }
+
+    /// A version-1 database — what the first 0.1 builds wrote — gains the
+    /// record of generated files, empty, and keeps what it had.
+    #[test]
+    fn a_version_1_database_gains_the_managed_files_record() {
+        let conn = Connection::open_in_memory().unwrap();
+        v1_baseline(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('a-key', 'a-value')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn, None).unwrap();
+
+        let db = Db { conn };
+        assert_eq!(version_of(&db), CURRENT_VERSION);
+        assert!(db.managed_files().unwrap().is_empty());
+        assert_eq!(
+            db.get_text_setting("a-key").unwrap().as_deref(),
+            Some("a-value")
         );
     }
 

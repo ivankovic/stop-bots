@@ -26,7 +26,10 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod keys;
+mod managed;
 pub mod schema;
+
+pub use managed::ManagedFile;
 
 /// Whether a category or bot should be allowed through or blocked at the NGINX layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

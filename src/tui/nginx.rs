@@ -914,13 +914,18 @@ impl Nginx {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        // `self.root`, not the stored setting: this screen was given a root
+        // (a `--root` flag beats it), and generating the `http`-context
+        // files under a different one than the site files are being
+        // written to is the bug `conf_d_dir` exists to prevent, one layer
+        // up.
+        let managed_writes = nginx::planned_managed_files(db, &self.root)?;
+        // Recorded here, with the `Db` in hand, because the write happens
+        // on a thread that has none. Before the write is the safe side:
+        // see `nginx::record_managed_files`.
+        nginx::record_managed_files(db, &managed_writes)?;
         Ok(ApplyPlan {
-            // `self.root`, not the stored setting: this screen was given
-            // a root (a `--root` flag beats it), and generating the
-            // `http`-context files under a different one than the site
-            // files are being written to is the bug `conf_d_dir` exists
-            // to prevent, one layer up.
-            managed_writes: nginx::planned_managed_files(db, &self.root)?,
+            managed_writes,
             managed_removals: match action {
                 SiteAction::ApplyAll => nginx::unused_managed_files(db, &self.root)?,
                 _ => Vec::new(),

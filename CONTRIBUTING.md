@@ -310,6 +310,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- db.rs          <- SQLite storage: bots, sites, firewall rules, settings, ...
         |- db/schema.rs   <- The schema version and the migrations up to it
         |- db/keys.rs     <- Every `settings` key, spelled once
+        |- db/managed.rs  <- The record of every generated file written, for cleaning up
         |- botlist/       <- One file per bot-list source parser
         |- fetch.rs       <- The one place an outbound HTTP request is made
         |- refresh.rs     <- "Update everything": every downloadable list as fetch-then-store
