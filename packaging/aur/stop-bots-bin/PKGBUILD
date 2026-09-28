@@ -1,10 +1,13 @@
 # Maintainer: Marko Ivankovic <marko@ivankovic.me>
 pkgname=stop-bots-bin
 _pkgname=stop-bots
-pkgver=0.0.8
+pkgver=0.0.15
 pkgrel=1
 pkgdesc="A TUI that helps you configure your server to stop bad bots and still allow good bots (prebuilt binary)"
-arch=('x86_64')
+# Both architectures the release workflow builds a static musl binary for.
+# Arch's $CARCH spells them the way the Rust target triples do, which is what
+# lets one package() serve both.
+arch=('x86_64' 'aarch64')
 url="https://github.com/ivankovic/stop-bots"
 license=('AGPL-3.0-or-later')
 # None. The published binary is statically linked against musl, which is
@@ -16,14 +19,16 @@ conflicts=("$_pkgname")
 optdepends=('nginx: to apply the generated site blocking rules'
             'nftables: to apply the generated firewall script'
             'iptables: alternative firewall backend')
-_tarball="$_pkgname-$pkgver-x86_64-unknown-linux-musl"
-source=("$_tarball.tar.gz::$url/releases/download/v$pkgver/$_tarball.tar.gz")
-# The release workflow publishes a .sha256 next to the tarball; paste its
-# digest here rather than trusting a fresh download.
-sha256sums=('cfd83bb32f4c39b34baf605a91e3cd2ad2bcb789ce509f9fe272b77c39157ec8')
+_release="$url/releases/download/v$pkgver/$_pkgname-$pkgver"
+source_x86_64=("$_pkgname-$pkgver-x86_64.tar.gz::$_release-x86_64-unknown-linux-musl.tar.gz")
+source_aarch64=("$_pkgname-$pkgver-aarch64.tar.gz::$_release-aarch64-unknown-linux-musl.tar.gz")
+# Written by packaging/bump.py from the .sha256 file the release workflow
+# publishes next to each tarball, rather than from a fresh download.
+sha256sums_x86_64=('8d61d857dd876297c2be5de8461089d5a89c7ae90cd9f03b4c8f0b73c685ce30')
+sha256sums_aarch64=('3f726427f05f4ff539b801d0fe12993efba723d52b28b0d3c2e953336060608d')
 
 package() {
-  cd "$_tarball"
+  cd "$_pkgname-$pkgver-$CARCH-unknown-linux-musl"
   install -Dm0755 "$_pkgname" "$pkgdir/usr/bin/$_pkgname"
   install -Dm0644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
   install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE"

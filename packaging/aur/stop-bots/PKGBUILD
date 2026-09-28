@@ -1,6 +1,6 @@
 # Maintainer: Marko Ivankovic <marko@ivankovic.me>
 pkgname=stop-bots
-pkgver=0.0.8
+pkgver=0.0.15
 pkgrel=1
 pkgdesc="A TUI that helps you configure your server to stop bad bots and still allow good bots"
 arch=('x86_64')
@@ -22,7 +22,8 @@ optdepends=('nginx: to apply the generated site blocking rules'
 # publish` produced, so what is built here is byte-for-byte what
 # `cargo install stop-bots` builds.
 source=("$pkgname-$pkgver.tar.gz::https://static.crates.io/crates/$pkgname/$pkgname-$pkgver.crate")
-sha256sums=('19100e7e74f5c46c935d8dfdea35ce2388c93981b30b93a77fac0aac17026d7d')
+# Written by packaging/bump.py: the checksum crates.io recorded at publish.
+sha256sums=('e9d2959033cab1857c047cef619b4e7fa67d70c4a92aa068649f5606daa8b7ca')
 
 prepare() {
   cd "$pkgname-$pkgver"

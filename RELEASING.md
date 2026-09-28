@@ -217,9 +217,17 @@ shipped with it. Step 2 is cheap to run and the only thing that catches that.
 
 7. **Update the hand-maintained distribution packages** — the AUR ones and the Gentoo
    ebuild. They consume artefacts that only exist once steps 5 and 6 are done — the
-   GitHub release tarball and the crates.io `.crate` — so they are genuinely last, not
-   merely listed last. `packaging/README.md` has the checksum commands and the
-   submission steps for each.
+   GitHub release tarballs and the crates.io `.crate` — so they are genuinely last, not
+   merely listed last. One script rewrites all three from what was published:
+
+   ```
+   python3 packaging/bump.py 0.0.1
+   git add packaging && git commit -m "packaging: 0.0.1"
+   ```
+
+   It fetches the published checksums (a network read only), writes both PKGBUILDs
+   and generates the ebuild from the tag's `Cargo.lock`. Submitting to the AUR and
+   the overlay stays manual; `packaging/README.md` has the steps for each.
 
    Debian and Ubuntu are **not** in this step: the `.deb`s were built and published by
    step 5. `packaging/README.md` says which packages need a human and which do not.

@@ -14,6 +14,9 @@ need.
   that binary was shipped having only ever run `--version`.
 - `rand` 0.10.3, and the release workflow on `upload-artifact` v7 and
   `download-artifact` v8.
+- **AUR and Gentoo packages at 0.0.15**, seven releases on from 0.0.8.
+  `stop-bots-bin` now also installs on `aarch64`. `packaging/bump.py <version>`
+  does this after each release from the published checksums.
 
 ## [0.0.15] — 2026-09-27
 
