@@ -2710,6 +2710,153 @@ pub fn apply_site_and_reload(
     Ok((changed, true))
 }
 
+// ---- taking it all out again: `stop-bots uninstall` ----
+
+/// `content` with every block stop-bots injected taken out of every
+/// `server` block — the bot-blocking block and the console's `location`,
+/// found by their markers — and the line break each insertion added.
+///
+/// The exact inverse of an insertion: a block is put right after the
+/// `server {` brace with a newline in front of it, so where that is still
+/// how it sits, the newline goes too and the file is byte for byte what it
+/// was before stop-bots touched it. A block somebody has moved elsewhere
+/// in the `server` block loses only its own lines.
+pub fn without_injected_blocks(content: &str) -> String {
+    let mut content = content.to_string();
+    // One block per pass, re-parsed each time: taking one out shifts the
+    // offsets of everything after it. Each pass removes at least one
+    // marker line, so this ends.
+    //
+    // Within a `server` block, the one nearest the brace goes first. Both
+    // kinds are inserted right after the brace, so that is the one
+    // inserted last, and taking insertions back in reverse order is what
+    // leaves the brace's own line break where it was.
+    loop {
+        let blocks = parse_server_blocks(&content);
+        let found = blocks.iter().find_map(|block| {
+            [
+                locate_existing_block(&content, block),
+                locate_console_block(&content, block),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .map(|range| (block.open, range))
+        });
+        let Some((open, (start, end))) = found else {
+            return content;
+        };
+        let inserted_newline = start == open + 2 && content.as_bytes()[open + 1] == b'\n';
+        let start = if inserted_newline { open + 1 } else { start };
+        content.replace_range(start..end, "");
+    }
+}
+
+/// Whether `path` is the console's own site file, as the `Web Access`
+/// panel writes it (see [`console_site_path`]) — by its first line, which
+/// every version has written, so that a file an operator put at the same
+/// path is left alone.
+pub fn is_console_site_file(path: &Path) -> bool {
+    use std::io::BufRead;
+    let Ok(file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut first = String::new();
+    std::io::BufReader::new(file)
+        .read_line(&mut first)
+        .is_ok_and(|_| {
+            first.starts_with('#')
+                && first.contains("by stop-bots")
+                && first.contains("(`Web Access` panel)")
+        })
+}
+
+/// What [`remove_everything`] did, or would do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Removal {
+    /// Site files that had a block taken out.
+    pub site_files: Vec<PathBuf>,
+    /// Generated files that were there and were deleted.
+    pub generated: Vec<PathBuf>,
+    /// Whether the result passed the test and NGINX was reloaded.
+    pub reloaded: bool,
+}
+
+/// Takes every injected block out of every site file under `root` and
+/// deletes `generated`, as one change: tested with `commands`, **put back
+/// byte for byte if the test fails**, and reloaded only once it passes.
+///
+/// The same machinery an apply uses ([`Snapshot`], [`test_or_restore`]),
+/// for the same reason: a config NGINX rejects is not loaded by this
+/// reload, it is loaded by the next one — certbot's at 3am.
+///
+/// The site files are rewritten before the generated files go, the
+/// reverse of an apply's order and for the same reason: nothing may be
+/// left referring to a zone or variable that is gone.
+///
+/// `commands` is `None` for a tree that is not the running NGINX's
+/// (`uninstall --prefix`); `dry_run` works out the same answer and writes
+/// nothing.
+pub fn remove_everything(
+    root: &Path,
+    generated: &[PathBuf],
+    commands: Option<&NginxCommands>,
+    dry_run: bool,
+) -> Result<Removal> {
+    let mut edits = Vec::new();
+    let mut paths: Vec<PathBuf> = discover_sites(root)?
+        .into_iter()
+        .map(|site| site.config_path)
+        .collect();
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let stripped = without_injected_blocks(&content);
+        if stripped != content {
+            edits.push((path, stripped));
+        }
+    }
+    let present: Vec<PathBuf> = generated
+        .iter()
+        .filter(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()))
+        .cloned()
+        .collect();
+    let mut removal = Removal {
+        site_files: edits.iter().map(|(path, _)| path.clone()).collect(),
+        generated: present.clone(),
+        reloaded: false,
+    };
+    if dry_run || (edits.is_empty() && present.is_empty()) {
+        return Ok(removal);
+    }
+
+    let snapshot = Snapshot::of_apply(
+        root,
+        present.iter().cloned(),
+        edits.iter().map(|(path, _)| path.as_path()),
+    )?;
+    let written = (|| -> Result<()> {
+        for (path, content) in &edits {
+            write_site_file(path, root, content)?;
+        }
+        remove_planned_managed_files(&present)?;
+        Ok(())
+    })();
+    if let Err(err) = written {
+        return Err(snapshot.restore_after(err));
+    }
+    let Some(commands) = commands else {
+        return Ok(removal);
+    };
+    test_or_restore(&snapshot, commands)?;
+    run(&commands.reload, "the NGINX reload")
+        .context("the config without stop-bots passed the test, but the reload failed")?;
+    removal.reloaded = true;
+    Ok(removal)
+}
+
 /// Every file an apply may touch, as it was before the apply began, so
 /// that a config NGINX rejects can be taken back.
 ///
@@ -6056,5 +6203,165 @@ server {
             block.contains("server_name console.example.com;"),
             "was:\n{block}"
         );
+    }
+
+    /// The deprecated `web --secure-cookie` is not what the file tells an
+    /// operator to run.
+    #[test]
+    fn the_subdomain_block_points_at_set_web() {
+        let block = console_server_block("console.example.com", &upstream());
+        assert!(
+            block.contains("stop-bots set-web --secure-cookie true"),
+            "was:\n{block}"
+        );
+    }
+
+    // ---- uninstall ----
+
+    /// A site file with both kinds of block in it, inserted the way the
+    /// product inserts them, in either order.
+    fn with_both_blocks(site: &str, console_first: bool) -> String {
+        let with_block = |content: &str| {
+            let block = parse_server_blocks(content)
+                .into_iter()
+                .find(|b| b.is_tls)
+                .unwrap();
+            apply_block(content, &block, &cfg(&["BadBot"]))
+        };
+        let with_console = |content: &str| {
+            with_console_location(content, "example.com", "/stop-bots/", &upstream()).unwrap()
+        };
+        if console_first {
+            with_block(&with_console(site))
+        } else {
+            with_console(&with_block(site))
+        }
+    }
+
+    /// "Back as it was" means the bytes: every insertion is taken back
+    /// with the line break it added, whichever order they went in.
+    #[test]
+    fn taking_the_blocks_out_restores_the_file_byte_for_byte() {
+        for console_first in [true, false] {
+            let applied = with_both_blocks(TWO_BLOCK_SITE, console_first);
+            assert!(applied.contains(BLOCK_BEGIN) && applied.contains(CONSOLE_BEGIN));
+
+            assert_eq!(
+                without_injected_blocks(&applied),
+                TWO_BLOCK_SITE,
+                "console first: {console_first}; applied was:\n{applied}"
+            );
+        }
+    }
+
+    /// Every `server` block, not just the first one that has a block.
+    #[test]
+    fn taking_the_blocks_out_covers_every_server_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, TWO_BLOCK_SITE).unwrap();
+        apply_blocks_to_file(&path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
+        let applied = fs::read_to_string(&path).unwrap();
+        assert_eq!(applied.matches(BLOCK_BEGIN).count(), 2, "{applied}");
+
+        assert_eq!(without_injected_blocks(&applied), TWO_BLOCK_SITE);
+    }
+
+    /// A file stop-bots never touched comes back unchanged — including one
+    /// with a hand-written `if` that merely looks like ours.
+    #[test]
+    fn a_file_without_blocks_is_left_as_it_is() {
+        let own = "server {\n    # BEGIN my stuff\n    if ($http_user_agent ~* \"x\") { return 403; }\n}\n";
+        assert_eq!(without_injected_blocks(own), own);
+    }
+
+    fn site_root_with_blocks() -> (tempfile::TempDir, PathBuf) {
+        let dir = root_with_a_conf_d();
+        let path = dir.path().join("site.conf");
+        fs::write(&path, with_both_blocks(TWO_BLOCK_SITE, false)).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn removing_everything_takes_out_blocks_and_generated_files() {
+        let (dir, site) = site_root_with_blocks();
+        let limits = rate_limit_conf_path(&dir.path().join("conf.d"));
+        fs::write(&limits, rate_limit_conf_body(10, 10)).unwrap();
+
+        let removal = remove_everything(
+            dir.path(),
+            std::slice::from_ref(&limits),
+            Some(&commands_that(true)),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&site).unwrap(), TWO_BLOCK_SITE);
+        assert!(!limits.exists(), "the generated file is still there");
+        assert_eq!(removal.site_files, [site]);
+        assert_eq!(removal.generated, [limits]);
+        assert!(removal.reloaded);
+    }
+
+    /// The rule every apply keeps: a config NGINX refuses is put back,
+    /// not left for the next reload to find.
+    #[test]
+    fn removing_everything_is_put_back_when_the_test_fails() {
+        let (dir, site) = site_root_with_blocks();
+        let before = fs::read_to_string(&site).unwrap();
+        let limits = rate_limit_conf_path(&dir.path().join("conf.d"));
+        fs::write(&limits, rate_limit_conf_body(10, 10)).unwrap();
+
+        let err = remove_everything(
+            dir.path(),
+            std::slice::from_ref(&limits),
+            Some(&commands_that(false)),
+            false,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("put back"), "was: {err:#}");
+        assert_eq!(fs::read_to_string(&site).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(&limits).unwrap(),
+            rate_limit_conf_body(10, 10)
+        );
+    }
+
+    #[test]
+    fn a_dry_run_of_removing_everything_changes_nothing() {
+        let (dir, site) = site_root_with_blocks();
+        let before = fs::read_to_string(&site).unwrap();
+
+        let removal = remove_everything(dir.path(), &[], Some(&commands_that(true)), true).unwrap();
+
+        assert_eq!(removal.site_files, std::slice::from_ref(&site));
+        assert!(!removal.reloaded);
+        assert_eq!(fs::read_to_string(&site).unwrap(), before);
+    }
+
+    /// The console's own file is recognised by the first line every
+    /// version wrote, and a file of the operator's at that path is not.
+    #[test]
+    fn the_console_site_file_is_known_by_its_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stop-bots-console.conf");
+        for (first_line, ours) in [
+            (
+                "# Written by stop-bots (`Web Access` panel). Safe to edit or delete.",
+                true,
+            ),
+            (
+                &format!(
+                    "# {} (`Web Access` panel). Safe to edit or delete.",
+                    crate::generated::generated_by()
+                )[..],
+                true,
+            ),
+            ("server {", false),
+        ] {
+            fs::write(&path, format!("{first_line}\nserver {{\n}}\n")).unwrap();
+            assert_eq!(is_console_site_file(&path), ours, "{first_line}");
+        }
     }
 }

@@ -1519,6 +1519,103 @@ fn reinstalling_over_a_0_0_15_unit_upgrades_it_without_force() {
     );
 }
 
+/// `uninstall` puts the host back as it was: every site file byte for
+/// byte, no generated `conf.d` file, no nft table, no iptables chain, no
+/// unit — against the real systemd, NGINX, nft and iptables, with the
+/// console running and its internal cron free to put things back until
+/// it is stopped.
+///
+/// Both firewall backends are applied, because a host that switched
+/// backends has both, and `uninstall` removes whichever exist.
+#[test]
+fn uninstall_puts_the_host_back_as_it_was() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-uninstall");
+    // Everything `uninstall` promises to put back, read the same way
+    // before and after. Not /etc/stop-bots: this image creates it empty,
+    // and `uninstall` removes it once it is.
+    //
+    // Nor the nft tables `iptables` itself owns. Debian's `iptables` is
+    // iptables-nft, which creates `ip filter` the first time a rule is
+    // added and never removes it; what is in it is exactly what
+    // `iptables -S` lists, compared here too. Deleting that table would
+    // delete ufw's and Docker's rules along with ours.
+    let state = || {
+        host.sh("set -e\n\
+             find /etc/nginx -type f | sort | xargs sha256sum\n\
+             echo '-- nft'\n\
+             nft list tables | grep -v -e '^table ip filter$' -e '^table ip6 filter$' || true\n\
+             echo '-- iptables'; iptables -S; ip6tables -S\n\
+             echo '-- units'; find /etc/systemd/system -name 'stop-bots*' | sort\n\
+             systemctl list-unit-files 'stop-bots*' --no-legend | sort")
+    };
+    let before = state();
+
+    host.sh("stop-bots install web");
+    host.wait_for_console();
+    host.sh("stop-bots install firewall");
+    host.seed_bot("badbot", "BadBot");
+    host.stop_bots("set-rate-limit --enabled true");
+    host.stop_bots("trust --address 192.0.2.77");
+    host.stop_bots("apply-blocks");
+    host.stop_bots("add-firewall-rule --address 203.0.113.60");
+    host.stop_bots("render-firewall --backend nftables --out /etc/stop-bots/firewall.nft");
+    host.sh("nft -f /etc/stop-bots/firewall.nft");
+    host.stop_bots("render-firewall --backend iptables --out /etc/stop-bots/firewall.sh");
+    host.sh("sh /etc/stop-bots/firewall.sh");
+    let applied = state();
+    for (what, needle) in [
+        ("the site block", "stop-bots-limits.conf"),
+        ("the nft table", "table inet stop_bots"),
+        ("the iptables chain", "-N STOP-BOTS"),
+        ("the web unit", "stop-bots-web.service"),
+        ("the firewall unit", "stop-bots-firewall.service"),
+    ] {
+        assert!(
+            applied.contains(needle),
+            "{what} was never there:\n{applied}"
+        );
+    }
+
+    let (ok, stdout, stderr) = host.run("stop-bots uninstall");
+
+    let said = format!("{stdout}{stderr}");
+    assert!(ok, "uninstall failed:\n{said}");
+    assert_eq!(
+        state(),
+        before,
+        "the host is not as it was. uninstall said:\n{said}"
+    );
+    assert_eq!(
+        host.sh("find /etc/stop-bots -type f 2>/dev/null || true")
+            .trim(),
+        "",
+        "{said}"
+    );
+    let (valid, out, err) = host.run("nginx -t");
+    assert!(
+        valid,
+        "NGINX does not load what uninstall left:\n{out}{err}"
+    );
+    // Polled: a reload is asynchronous, and an old worker can still answer.
+    let mut served = String::new();
+    for _ in 0..50 {
+        served = host
+            .sh("curl -s -o /dev/null -w '%{http_code}' -A 'BadBot/1.0' http://127.0.0.1:8080/");
+        if served.trim() == "200" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(served.trim(), "200", "the running NGINX still blocks");
+    assert!(
+        host.run(&format!("test -f {HOST_DB}")).0 && said.contains(HOST_DB),
+        "the database must be kept, and the output must say where:\n{said}"
+    );
+}
+
 /// The password is generated once and printed once. A second install must
 /// not roll it, or every re-install locks the operator out of a console
 /// they had bookmarked.

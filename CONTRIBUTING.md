@@ -329,6 +329,8 @@ Some directories don't exist yet but should be created if the need arises.
         |- health.rs      <- Is this host actually protected? The checks behind `status`
         |- host.rs        <- The host name, and where the system programs this runs are
         |- install.rs     <- `stop-bots install`: the systemd units and directories
+        |- install/       <- The units 0.0.x wrote, to tell an old unit from an edited one
+        |- uninstall.rs   <- `stop-bots uninstall`: the host back as it was
         |- batch.rs       <- Batch mode: one unattended pass, for a real crontab
         |- cron.rs        <- The internal cron: which background jobs run how often
         |- dynamic.rs     <- What is hitting the server now, shared by the TUI and web screens

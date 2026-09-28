@@ -3196,6 +3196,121 @@ fn install_web_refuses_a_host_that_is_not_debian() {
         .stderr(predicate::str::contains("not look like Debian"));
 }
 
+// ---- uninstall ----
+
+/// The host back as it was, end to end through the binary: an applied
+/// site, a generated `conf.d` file, both units and a firewall script go;
+/// the site file is byte for byte what it was before; the database stays,
+/// and the output says where.
+///
+/// Under `--prefix`, which runs no system program; the unit tests in
+/// `uninstall` cover the host's path with fakes, and the container suite
+/// with the real ones.
+#[test]
+fn uninstall_takes_a_prefix_back_to_how_it_was() {
+    let (tmp, _) = fake_debian_root();
+    let prefix = tmp.path();
+    let run = |args: &[&str]| {
+        stop_bots_bin()
+            .env("STOP_BOTS_NGINX_DIR", prefix.join("etc/stop-bots/nginx"))
+            .env("STOP_BOTS_NGINX_CONF_D", prefix.join("etc/nginx/conf.d"))
+            .args(args)
+            .args([
+                "--db",
+                prefix
+                    .join("var/lib/stop-bots/db.sqlite3")
+                    .to_str()
+                    .unwrap(),
+            ])
+            .assert()
+            .success()
+    };
+    let root = prefix.join("etc/nginx");
+    fs::create_dir_all(root.join("conf.d")).unwrap();
+    fs::create_dir_all(root.join("sites-enabled")).unwrap();
+    let site = write_site(&root.join("sites-enabled"), "example.com");
+    let before = fs::read_to_string(&site).unwrap();
+    // First, while there is no database for it to read the backend from.
+    run(&["install", "firewall", "--prefix", prefix.to_str().unwrap()]);
+    // Rate limiting alone is a block and a generated `conf.d` file.
+    run(&["set-rate-limit", "--enabled", "true"]);
+    run(&[
+        "apply-blocks",
+        "--root",
+        root.to_str().unwrap(),
+        "--no-reload",
+    ]);
+    fs::create_dir_all(prefix.join("etc/stop-bots")).unwrap();
+    let units = prefix.join("etc/systemd/system");
+    fs::write(
+        units.join("stop-bots-web.service"),
+        include_str!("fixtures/units/stop-bots-web-0.0.15.service"),
+    )
+    .unwrap();
+    fs::write(prefix.join("etc/stop-bots/firewall.nft"), "table\n").unwrap();
+    assert_ne!(
+        fs::read_to_string(&site).unwrap(),
+        before,
+        "nothing was applied"
+    );
+
+    let out = run(&["uninstall", "--prefix", prefix.to_str().unwrap()]);
+
+    let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
+    assert_eq!(fs::read_to_string(&site).unwrap(), before, "{stdout}");
+    for gone in [
+        root.join("conf.d/stop-bots-limits.conf"),
+        units.join("stop-bots-web.service"),
+        units.join("stop-bots-firewall.service"),
+        prefix.join("etc/stop-bots"),
+    ] {
+        assert!(
+            !gone.exists(),
+            "{} is still there:\n{stdout}",
+            gone.display()
+        );
+    }
+    let db = prefix.join("var/lib/stop-bots/db.sqlite3");
+    assert!(db.exists(), "the database went without --purge");
+    assert!(
+        stdout.contains(&db.display().to_string()),
+        "the output must say where the database is:\n{stdout}"
+    );
+}
+
+/// `--purge` deletes the database, which every part still installed reads.
+#[test]
+fn uninstall_refuses_purge_on_a_part() {
+    let tmp = tempfile::tempdir().unwrap();
+    stop_bots_bin()
+        .args([
+            "uninstall",
+            "nginx",
+            "--purge",
+            "--prefix",
+            tmp.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only with `all`"));
+}
+
+/// Half an uninstall is worse than none, and permissions are where one
+/// would stop half way. Skipped when the suite runs as root, where this
+/// would uninstall the machine running it.
+#[test]
+fn uninstall_needs_root_without_a_prefix() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root, where this would uninstall the test machine");
+        return;
+    }
+    stop_bots_bin()
+        .args(["uninstall", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("needs root"));
+}
+
 // ---- auto-apply ----
 
 /// The switch itself: off by default, settable, and readable back.

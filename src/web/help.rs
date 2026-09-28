@@ -316,6 +316,20 @@ fn body(view: &View) -> Markup {
                             "is in."
                         },
                     ))
+                    (row(
+                        "Stop everything",
+                        html! {
+                            "On the host, "
+                            code { "sudo stop-bots uninstall --dry-run" }
+                            " lists every step, and without "
+                            code { "--dry-run" }
+                            " takes them: both units stopped and removed, the firewall rules and "
+                            "every NGINX block taken out (tested, and put back if NGINX refuses), "
+                            "and the generated files deleted. The database is kept unless "
+                            code { "--purge" }
+                            " is given. This console is one of the things it stops."
+                        },
+                    ))
                 } }
             },
         ))
@@ -488,6 +502,18 @@ mod tests {
         for key in ["<code>u</code>", "<code>a</code>", "<code>w</code>"] {
             assert!(rendered.contains(key), "{key} is not named:\n{rendered}");
         }
+    }
+
+    /// Someone who wants it all gone is told the one command, and that
+    /// it has a dry run.
+    #[test]
+    fn the_help_says_how_to_stop_everything() {
+        let rendered = body(&view(true)).into_string();
+
+        assert!(
+            rendered.contains("sudo stop-bots uninstall --dry-run"),
+            "the page never says how to remove stop-bots:\n{rendered}"
+        );
     }
 
     /// The buttons live in the header, which is where someone reading

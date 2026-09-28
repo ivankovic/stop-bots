@@ -90,6 +90,8 @@ pub mod tui;
 #[doc(hidden)]
 pub mod uadetail;
 #[doc(hidden)]
+pub mod uninstall;
+#[doc(hidden)]
 pub mod web;
 #[doc(hidden)]
 pub mod webaccess;

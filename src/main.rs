@@ -1192,6 +1192,38 @@ enum Command {
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         secure_cookie: Option<bool>,
     },
+    /// Remove stop-bots from this host and put it back as it was.
+    ///
+    /// Stops and removes both units, deletes the live nft table or
+    /// iptables chain, takes the injected blocks out of every NGINX site
+    /// (tested with `nginx -t`, put back if that fails, then reloaded),
+    /// and deletes the generated NGINX files and firewall scripts. Every
+    /// step is reported, a failed one does not stop the rest, and any
+    /// failure makes the exit status non-zero.
+    ///
+    /// The database is kept, with every setting and rule, unless --purge
+    /// is given; the output says where it is. Needs root, except with
+    /// --prefix. Run it with --dry-run first.
+    Uninstall {
+        /// What to remove: `nginx`, `firewall`, `web`, or `all` (the
+        /// default), which is all three plus /etc/stop-bots itself.
+        #[arg(value_enum, default_value = "all")]
+        target: UninstallTarget,
+        /// Print every step and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also delete the database and the copies upgrades kept of it.
+        /// Only with `all`.
+        #[arg(long)]
+        purge: bool,
+        /// Remove from this prefix instead of `/`, as `install --prefix`
+        /// wrote it. Nothing outside it is touched, and no systemctl, nft,
+        /// iptables or NGINX test or reload is run.
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+        #[arg(long, help = ROOT_HELP)]
+        root: Option<PathBuf>,
+    },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
         #[arg(long, help = ROOT_HELP)]
@@ -1220,6 +1252,31 @@ enum InstallTarget {
     /// is a different file, and on a stock Debian or Ubuntu it flushes
     /// every other table on the host first.
     Firewall,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum UninstallTarget {
+    /// The blocks in every site, the generated conf.d files and
+    /// /etc/stop-bots/nginx.
+    Nginx,
+    /// The live nft table or iptables chain, the boot unit and the
+    /// firewall scripts.
+    Firewall,
+    /// The web console's unit.
+    Web,
+    /// All of the above, and /etc/stop-bots once it is empty.
+    All,
+}
+
+impl From<UninstallTarget> for stop_bots::uninstall::Target {
+    fn from(target: UninstallTarget) -> Self {
+        match target {
+            UninstallTarget::Nginx => Self::Nginx,
+            UninstallTarget::Firewall => Self::Firewall,
+            UninstallTarget::Web => Self::Web,
+            UninstallTarget::All => Self::All,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -1428,6 +1485,13 @@ async fn main() -> Result<()> {
             }),
             InstallTarget::Firewall => run_install_firewall(binary, prefix, dry_run, force),
         },
+        Some(Command::Uninstall {
+            target,
+            dry_run,
+            purge,
+            prefix,
+            root,
+        }) => run_uninstall(db, target, dry_run, purge, prefix, root),
         Some(Command::Status {
             ssh_log,
             quiet,
@@ -3176,6 +3240,78 @@ fn run_install_firewall(
     }
     if dry_run {
         println!("\nDry run — nothing was changed.");
+    }
+    Ok(())
+}
+
+/// `stop-bots uninstall`. The work, and the reasoning about its order, is
+/// in `stop_bots::uninstall`; this checks the flags and prints the report.
+fn run_uninstall(
+    db: Option<PathBuf>,
+    target: UninstallTarget,
+    dry_run: bool,
+    purge: bool,
+    prefix: Option<PathBuf>,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    use stop_bots::uninstall::{self, Outcome, Plan};
+
+    if purge && target != UninstallTarget::All {
+        anyhow::bail!(
+            "--purge deletes the database, so it goes only with `all`: whatever `nginx`, \
+             `firewall` or `web` leaves installed still reads it"
+        );
+    }
+    // Asked of the uid rather than tried, unlike `install`: a run that got
+    // half way on permissions would leave exactly the half-removed host
+    // this command exists to avoid.
+    if prefix.is_none() && unsafe { libc::geteuid() } != 0 {
+        anyhow::bail!(
+            "uninstall changes /etc, systemd and the firewall, and needs root. Run it with \
+             sudo — `sudo stop-bots uninstall --dry-run` first to see the plan — or pass \
+             --prefix to run it against a staged tree."
+        );
+    }
+
+    let plan = Plan::resolve(prefix.as_deref(), db, root.as_deref())?;
+    let report = uninstall::run(&plan, target.into(), &uninstall::Options { dry_run, purge });
+
+    println!(
+        "{}",
+        if dry_run {
+            "Dry run — nothing was changed. Would:"
+        } else {
+            "Uninstalling:"
+        }
+    );
+    for step in &report.steps {
+        match &step.outcome {
+            Outcome::Done => println!("  done     {}", step.what),
+            Outcome::Planned => println!("  would    {}", step.what),
+            Outcome::Skipped(why) => println!("  skipped  {} ({why})", step.what),
+            Outcome::Failed(why) => {
+                println!("  FAILED   {}", step.what);
+                for line in why.lines() {
+                    println!("           {line}");
+                }
+            }
+        }
+    }
+    if !report.kept.is_empty() {
+        println!("\nLeft in place:");
+        for kept in &report.kept {
+            println!("  {kept}");
+        }
+    }
+    let failed = report.failures();
+    if failed > 0 {
+        anyhow::bail!(
+            "{failed} step(s) failed; every other step was done. Fix what is named above \
+             and run the same command again: what is already gone is skipped."
+        );
+    }
+    if dry_run {
+        println!("\nRe-run without --dry-run to do it.");
     }
     Ok(())
 }
