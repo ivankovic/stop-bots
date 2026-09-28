@@ -69,6 +69,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Must equal `rust-version` in Cargo.toml. Dependabot is told to leave
+      # this ref alone (see .github/dependabot.yml): it once proposed the
+      # newest Rust here, which would have made this job test nothing.
       - name: Install Rust (MSRV from Cargo.toml)
         uses: dtolnay/rust-toolchain@1.88.0
 

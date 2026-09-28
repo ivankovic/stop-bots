@@ -12,6 +12,8 @@ need.
 - **A release is built only after the tests pass**, on both `x86_64` and
   `aarch64`. The `aarch64` tests also run on every push to `main`; before,
   that binary was shipped having only ever run `--version`.
+- `rand` 0.10.3, and the release workflow on `upload-artifact` v7 and
+  `download-artifact` v8.
 
 ## [0.0.15] — 2026-09-27
 

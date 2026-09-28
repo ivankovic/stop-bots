@@ -24,3 +24,11 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    # Its refs name a toolchain, not a release of the action. `@stable` is a
+    # branch and is left alone anyway, but `@1.88.0` in ci.yml's `msrv` job is
+    # a tag, and dependabot "bumped" it to the newest Rust (#8) — which would
+    # have turned the MSRV check into a second stable build that can never
+    # fail for the reason it exists. It moves with `rust-version` in
+    # Cargo.toml, by hand.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
