@@ -30,7 +30,7 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::db::{Category, Db, GeoMode, Policy};
-use crate::firewall::{FirewallBackend, LockoutStatus};
+use crate::firewall::{FirewallBackend, ScriptState};
 use crate::health;
 use crate::protection::Detector;
 use crate::web::layout::{self, Ctx, PillKind, Tab};
@@ -60,12 +60,14 @@ struct View {
     sources_total: usize,
     sources_stale: usize,
     rule_count: usize,
-    firewall_needs_update: bool,
+    script_state: crate::firewall::ScriptState,
     auto_apply_firewall: bool,
-    /// Where the "Write script" button writes, from `AppState`. Shown, not
-    /// asked for — see [`render_firewall`] for why the console does not
-    /// take a destination from the form.
+    /// The applied script — what the boot unit loads — from `AppState`.
+    /// Shown, not asked for — see [`render_firewall`] for why the console
+    /// does not take a destination from the form.
     firewall_out: String,
+    /// Where "Write script" writes, beside `firewall_out`.
+    firewall_rendered: String,
     /// The remembered backend, so the dropdown opens on the one this host
     /// actually renders for.
     firewall_backend: FirewallBackend,
@@ -113,7 +115,10 @@ fn load(
         .count();
 
     let rules = crate::firewall::all_rules(db)?;
-    let signature = crate::firewall::rules_signature(&rules);
+    // The path the *current* backend would write to, not a fixed one:
+    // showing `firewall.nft` next to an iptables selection is how the two
+    // drifted apart in the first place.
+    let applied = crate::firewall::output_path(firewall_out, crate::firewall::stored_backend(db)?);
 
     Ok(View {
         health,
@@ -140,15 +145,10 @@ fn load(
         sources_total: sources.len(),
         sources_stale,
         rule_count: rules.len(),
-        // The path the *current* backend would write to, not a fixed one:
-        // showing `firewall.nft` next to an iptables selection is how the
-        // two drifted apart in the first place.
-        firewall_out: crate::firewall::output_path(
-            firewall_out,
-            crate::firewall::stored_backend(db)?,
-        )
-        .display()
-        .to_string(),
+        firewall_rendered: crate::firewall::rendered_path(&applied)
+            .display()
+            .to_string(),
+        firewall_out: applied.display().to_string(),
         firewall_backend: crate::firewall::stored_backend(db)?,
         sites: db
             .list_sites()?
@@ -164,8 +164,7 @@ fn load(
         serving_base_path: serving.as_str().to_string(),
         allowed_hosts: crate::web::configured_hosts(db)?,
         auto_apply_firewall: db.get_auto_apply_firewall()?,
-        firewall_needs_update: db.get_firewall_rendered_signature()?.as_deref()
-            != Some(signature.as_str()),
+        script_state: crate::firewall::script_state(db)?,
         jobs: crate::cron::status(db)?,
     })
 }
@@ -676,10 +675,18 @@ fn firewall_panel(view: &View, ctx: &Ctx) -> Markup {
                         td {
                             @if view.rule_count == 0 {
                                 span .hint { "nothing to write" }
-                            } @else if view.firewall_needs_update {
-                                (layout::pill("SCRIPT IS STALE", PillKind::Warn))
                             } @else {
-                                (layout::pill("SCRIPT MATCHES", PillKind::Allowed))
+                                @match view.script_state {
+                                    ScriptState::Applied => {
+                                        (layout::pill("APPLIED", PillKind::Allowed))
+                                    }
+                                    ScriptState::RenderedNotApplied => {
+                                        (layout::pill("RENDERED, NOT APPLIED", PillKind::Warn))
+                                    }
+                                    ScriptState::Changed => {
+                                        (layout::pill("CHANGED, NOT APPLIED", PillKind::Warn))
+                                    }
+                                }
                             }
                         }
                     }
@@ -736,12 +743,13 @@ fn firewall_panel(view: &View, ctx: &Ctx) -> Markup {
                     button .primary type="submit" { "Write script" }
                 }
                 p .hint {
-                    "Writing is inert — the script does nothing until it is run. Ticking "
-                    "\u{201c}run it after writing\u{201d} enforces it immediately, after the same "
-                    "anti-lockout check "
+                    "Writes " code { (view.firewall_rendered) } ", which is inert: nothing runs "
+                    "it, and a reboot loads " code { (view.firewall_out) } ", the last script "
+                    "applied. Ticking \u{201c}run it after writing\u{201d} enforces it now and "
+                    "makes it the one loaded at boot, after the same anti-lockout check "
                     code { "stop-bots batch --apply" }
                     " runs: rules that would block a currently-connected SSH client are "
-                    "refused rather than written."
+                    "refused, and so is running it when no SSH log could be read."
                 }
                 p .hint {
                     "nftables is recommended: addresses go in sets, and a timed block is "
@@ -1019,7 +1027,10 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
             post(set_auto_apply_firewall),
         )
         .route(&base.url("/update-all"), post(update_all))
-        .route(&base.url("/apply-all"), post(apply_all))
+        .route(
+            &base.url("/apply-all"),
+            axum::routing::get(confirm_apply_all).post(apply_all),
+        )
         .route(&base.url("/web-access"), post(set_web_access))
 }
 
@@ -1405,6 +1416,133 @@ async fn update_all(State(state): State<AppState>, _auth: Auth) -> Response {
     back_with(&state.base, "/", &message, failures.is_empty())
 }
 
+/// Lines of diff the confirm page shows before it stops and says where the
+/// rest is. A first apply on a host with reputation feeds is a 44,000-line
+/// script; a page that size helps nobody review anything.
+const DIFF_LINES_SHOWN: usize = 4_000;
+
+#[derive(Deserialize)]
+struct ConfirmQuery {
+    diff: Option<String>,
+}
+
+/// "Apply everything"'s confirm page: what would change, and the button
+/// that does it. A page of its own rather than a JavaScript `confirm()`,
+/// so it works without script and can carry the summary and the diff.
+///
+/// A `GET`, and it changes nothing: the NGINX half reads files through the
+/// functions the apply uses, and the firewall half is a dry run of the same
+/// [`crate::firewall::FirewallRun`] the apply makes — guard included,
+/// reading the SSH log outside the database lock.
+async fn confirm_apply_all(
+    State(state): State<AppState>,
+    auth: Auth,
+    Query(query): Query<ConfirmQuery>,
+) -> Response {
+    let root = state.nginx_root.clone();
+    let out_override = state.firewall_out.clone();
+    let for_real = state.apply_for_real;
+    let ssh_log = state.ssh_log.clone();
+    let read = state
+        .with_db(move |db| {
+            let nginx =
+                crate::nginx::preview_all_sites(db, &root).map_err(|err| format!("{err:#}"));
+            let backend = crate::firewall::stored_backend(db)?;
+            let run = crate::firewall::FirewallRun::new(
+                backend,
+                crate::firewall::output_path(out_override.as_deref(), backend),
+            )
+            .apply(true)
+            .for_real(for_real)
+            .dry_run(true);
+            let source = crate::logpaths::LogPaths::from_db(db)
+                .unwrap_or_default()
+                .ssh(ssh_log.as_deref());
+            anyhow::Ok((
+                nginx,
+                crate::firewall::prepare(db, run).map_err(|err| format!("{err:#}")),
+                source,
+            ))
+        })
+        .await;
+    let (nginx, prepared, source) = match read {
+        Ok(read) => read,
+        Err(err) => return internal_error(&err.to_string()),
+    };
+    let firewall = match prepared {
+        Ok(prepared) => tokio::task::spawn_blocking(move || {
+            crate::firewall::execute(prepared, crate::firewall::SshLog::Read(&source))
+        })
+        .await
+        .map_err(|err| format!("the preview thread panicked: {err}")),
+        Err(err) => Err(err),
+    };
+    let preview = crate::preview::ApplyPreview { nginx, firewall };
+
+    let ctx = Ctx::for_request(&auth.csrf, &state).await;
+    let show_diff = query.diff.is_some();
+    render(
+        Tab::Dashboard,
+        &ctx,
+        None,
+        confirm_body(&preview, show_diff, &ctx),
+    )
+}
+
+fn confirm_body(preview: &crate::preview::ApplyPreview, show_diff: bool, ctx: &Ctx) -> Markup {
+    let diff = if show_diff {
+        let full = preview.diff();
+        let total = full.lines().count();
+        let mut shown: String = full
+            .lines()
+            .take(DIFF_LINES_SHOWN)
+            .flat_map(|line| [line, "\n"])
+            .collect();
+        if total > DIFF_LINES_SHOWN {
+            shown.push_str(&format!(
+                "\u{2026} {} more line(s). `stop-bots batch --dry-run --diff` prints all of it.\n",
+                total - DIFF_LINES_SHOWN
+            ));
+        }
+        Some(shown)
+    } else {
+        None
+    };
+    layout::panel(
+        "Apply everything?",
+        Some("Nothing has changed yet"),
+        html! {
+            .panel-body {
+                p {
+                    "This writes the NGINX config for every site and reloads NGINX, then \
+                     writes the firewall script and runs it as root. The two are independent: \
+                     whichever fails, the other still gets its turn."
+                }
+                pre .preview { (preview.lines().join("\n")) }
+                .row {
+                    form .inline method="post" action=(ctx.url("/apply-all")) {
+                        (layout::csrf_field(ctx))
+                        button .primary type="submit" { "Apply everything" }
+                    }
+                    @if show_diff {
+                        a href=(ctx.url("/apply-all")) { "Hide the diff" }
+                    } @else {
+                        a href=(ctx.url("/apply-all?diff=1")) { "Show the diff" }
+                    }
+                    a href=(ctx.url("/")) { "Cancel" }
+                }
+                @if let Some(diff) = diff {
+                    @if diff.is_empty() {
+                        p .hint { "Nothing would change." }
+                    } @else {
+                        pre .diff { (diff) }
+                    }
+                }
+            }
+        },
+    )
+}
+
 /// Writes and enforces both planes: the NGINX config, then the firewall.
 ///
 /// The two are independent on purpose, same as `batch --apply`: whichever
@@ -1454,20 +1592,13 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
 /// Renders the firewall script, writes it, and runs it.
 ///
 /// The console refusing to *apply* the script used to be one of its three
-/// deliberate omissions. That was reversed on request, so this is the one
-/// place it happens, and the guards are what make it defensible:
-///
-/// - `assess_lockout_risk` runs against the rules in the order the script
-///   will evaluate them, before anything is written, and a risk is a
-///   refusal, not a warning. A guard that *could not run* — no readable
-///   SSH log — refuses the apply but not the write, which is where
-///   `batch --apply`, the TUI and the internal cron all draw the line. It
-///   used to count as a pass here.
-/// - `apply_for_real` gates the run itself, so `stop-bots web --no-apply`
-///   keeps the old write-only behaviour.
-/// - The script that runs is the one just written to `firewall_out`, not a
-///   freshly derived one, so what executes is what the guard approved and
-///   what the operator can read afterwards.
+/// deliberate omissions. That was reversed on request, and what makes it
+/// defensible is that it goes through [`crate::firewall`]'s one path, with
+/// the policy every front-end shares (see `FirewallRun`): a connected SSH
+/// client the rules would block refuses the write and the apply, and a
+/// guard that *could not run* refuses the apply. `apply_for_real` gates
+/// the run itself, so `stop-bots web --no-apply` keeps the write-only
+/// behaviour.
 ///
 /// The lockout guard covers SSH, not this console: the console's own
 /// address is protected separately by the "refusing to block the address
@@ -1478,83 +1609,60 @@ async fn write_and_apply_firewall(state: &AppState) -> anyhow::Result<String> {
 }
 
 /// Renders and writes the script, and runs it when `apply` is set.
+///
+/// Three hops rather than one: the database half under the lock, the guard,
+/// write and `nft -f` outside it (a subprocess, and on a big ruleset a slow
+/// one), and the signatures back under it.
 async fn write_firewall(state: &AppState, apply: bool) -> anyhow::Result<String> {
     let out_override = state.firewall_out.clone();
+    let for_real = state.apply_for_real;
     let ssh_log = state.ssh_log.clone();
-    let (path, count, backend, guard_ran) = state
+    let (prepared, source) = state
         .with_db(move |db| {
             let backend = crate::firewall::stored_backend(db)?;
             // Derived from the backend inside the same closure that chose
             // it, so the two cannot disagree — an iptables script in a
             // `.nft` file is what happens when they are decided apart.
-            let out = crate::firewall::output_path(out_override.as_deref(), backend);
-            let built = crate::firewall::build_script(db, backend)?;
-            // Whether the guard actually looked. An unreadable log is not a
-            // pass: writing still goes ahead, because a written script is
-            // inert, but running it is refused below.
-            let resolved_ssh_log = crate::logpaths::LogPaths::from_db(db)
+            let applied = crate::firewall::output_path(out_override.as_deref(), backend);
+            let run = crate::firewall::FirewallRun::new(backend, applied)
+                .apply(apply)
+                .for_real(for_real);
+            // Where the SSH log is, as `LogPaths` resolves it: the console's
+            // `--ssh-log` first, then the stored path, then a search.
+            let source = crate::logpaths::LogPaths::from_db(db)
                 .unwrap_or_default()
                 .ssh(ssh_log.as_deref());
-            let guard_ran =
-                match crate::firewall::assess_lockout_risk(&built.rules, &resolved_ssh_log) {
-                    LockoutStatus::Risks(risks) if !risks.is_empty() => {
-                        let names: Vec<String> = risks
-                            .into_iter()
-                            .map(|(ip, rule)| format!("{ip} (by rule {rule})"))
-                            .collect();
-                        anyhow::bail!(
-                            "refusing to write: these rules would block a currently-connected SSH \
-                         client — {}. Unblock it first.",
-                            names.join(", ")
-                        )
-                    }
-                    LockoutStatus::Risks(_) => true,
-                    LockoutStatus::LogUnavailable => false,
-                };
-            crate::firewall::write_script(&out, &built.script)?;
-            db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
-            anyhow::Ok((out, built.rules.len(), backend, guard_ran))
+            anyhow::Ok((crate::firewall::prepare(db, run)?, source))
         })
         .await?;
 
-    if !apply {
-        return Ok(format!(
-            "Wrote {count} rule(s) to {}. Run it to apply.",
-            path.display()
-        ));
-    }
-    // Before `apply_for_real`, as the cron orders it, so `--no-apply` is
-    // not what hides the refusal.
-    if !guard_ran {
-        anyhow::bail!(
-            "wrote {count} rule(s) to {}, but not applied: no SSH log could be read, so the \
-             lockout check could not run. Start `stop-bots web` with --ssh-log <path>, or run \
-             the script by hand.",
-            path.display()
-        );
-    }
-    if !state.apply_for_real {
-        return Ok(format!(
-            "Wrote {count} rule(s) to {} (not applied: --no-apply)",
-            path.display()
-        ));
-    }
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::firewall::execute(prepared, crate::firewall::SshLog::Read(&source))
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("the firewall thread panicked: {err}"))?;
 
-    // Blocking: this runs `nft -f` or `sh`, which is a subprocess, and a
-    // subprocess on the async runtime blocks whatever else that thread was
-    // going to serve.
-    let script = path.clone();
-    let applied =
-        tokio::task::spawn_blocking(move || crate::firewall::apply_script(backend, &script))
-            .await
-            .map_err(|err| anyhow::anyhow!("the apply thread panicked: {err}"))?;
-    applied
-        .map_err(|err| err.context(format!("wrote {count} rule(s), but applying them failed")))?;
+    let recorded = outcome.clone();
+    state
+        .with_db(move |db| crate::firewall::record(db, &recorded))
+        .await?;
 
-    Ok(format!(
-        "Wrote and applied {count} rule(s) to {}.",
-        path.display()
-    ))
+    let summary = capitalised(&outcome.summary());
+    if outcome.succeeded() {
+        Ok(summary)
+    } else {
+        Err(anyhow::anyhow!("{summary}"))
+    }
+}
+
+/// `text` with its first letter upper-cased, for a flash made of a
+/// sentence written to be embedded in others.
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// Reloads NGINX, honouring `--no-apply`.
@@ -1685,8 +1793,12 @@ mod tests {
         assert!(err.contains("SSH log"), "error was: {err}");
         assert!(err.contains("not applied"), "error was: {err}");
         assert!(
-            tmp.path().join("firewall.nft").exists(),
+            tmp.path().join("firewall.next.nft").exists(),
             "writing is inert, so it still happens; only running it is refused"
+        );
+        assert!(
+            !tmp.path().join("firewall.nft").exists(),
+            "and the script the boot unit loads is left alone"
         );
     }
 
@@ -1833,8 +1945,11 @@ mod tests {
         );
     }
 
+    /// Three states, and the one that matters is the middle one: a script
+    /// the cron rendered on its own is on disk and inert, and saying "up to
+    /// date" about it is how an operator comes to believe it is enforced.
     #[test]
-    fn the_firewall_row_reads_differently_at_zero_rules_and_when_stale() {
+    fn the_firewall_row_says_whether_the_rules_were_applied_or_only_rendered() {
         let db = Db::open_in_memory().unwrap();
         db.add_firewall_rule(&crate::db::NewFirewallRule {
             address: "192.0.2.9".into(),
@@ -1842,13 +1957,29 @@ mod tests {
             action: crate::db::FirewallAction::Block,
         })
         .unwrap();
+        let signature = crate::firewall::rules_signature(&crate::firewall::all_rules(&db).unwrap());
+        let row = |db: &Db| {
+            let view = load(db, None, &crate::web::BasePath::default()).unwrap();
+            firewall_panel(&view, &Ctx::for_tests()).into_string()
+        };
 
-        let view = load(&db, None, &crate::web::BasePath::default()).unwrap();
-        let rendered = body(&view, &Ctx::for_tests()).into_string();
-        assert!(
-            rendered.contains("SCRIPT IS STALE"),
-            "a rule added since the last render makes the on-disk script stale"
-        );
+        for (what, record, expected) in [
+            ("changed since any render", None, "CHANGED, NOT APPLIED"),
+            ("rendered only", Some(false), "RENDERED, NOT APPLIED"),
+            ("applied", Some(true), "APPLIED"),
+        ] {
+            if let Some(applied) = record {
+                db.set_firewall_rendered_signature(&signature).unwrap();
+                if applied {
+                    db.set_firewall_applied_signature(&signature).unwrap();
+                }
+            }
+            let rendered = row(&db);
+            assert!(
+                rendered.contains(expected),
+                "{what}: the panel was\n{rendered}"
+            );
+        }
     }
     /// The panel must show the path the *current* backend would write to.
     /// Showing `firewall.nft` beside an iptables selection is how a real

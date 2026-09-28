@@ -806,9 +806,11 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     // expired is loaded. Compared against the rule count, a host with
     // overlapping feeds would read as a ruleset that is behind.
     let loadable = firewall::loaded_entries(&rules, backend, now_secs());
-    checks.push(firewall_enforced(probe, loadable));
+    let applied = db.get_firewall_applied_signature()?.as_deref()
+        == Some(firewall::rules_signature(&rules).as_str());
+    checks.push(firewall_enforced(probe, loadable, applied));
     checks.push(firewall_persistence(probe, backend));
-    checks.push(script_freshness(db, expected)?);
+    checks.push(script_freshness(db, expected, backend)?);
     checks.push(nginx_applied(db)?);
     checks.push(generated_files_reachable(probe));
     checks.push(service_health(probe));
@@ -965,7 +967,14 @@ fn generated_files_reachable(probe: &Probe) -> Check {
 }
 
 /// The check this module exists for.
-fn firewall_enforced(probe: &Probe, expected: usize) -> Check {
+///
+/// `applied` is whether the configured rules are the ones last applied.
+/// When they are not, a kernel short of `expected` is the rules waiting to
+/// be applied — `script-fresh` says that, once — rather than a ruleset
+/// something took rules out of, which is what this check is for.
+fn firewall_enforced(probe: &Probe, expected: usize, applied: bool) -> Check {
+    let apply =
+        "press \u{201c}Apply everything\u{201d}, or run `stop-bots render-firewall --apply`";
     let (level, detail, fix) = match probe.live_rules {
         None => (
             Level::Unknown,
@@ -976,17 +985,25 @@ fn firewall_enforced(probe: &Probe, expected: usize) -> Check {
         Some(0) => (
             Level::Critical,
             format!("{expected} rule(s) generated, none loaded into the kernel"),
-            Some("run the generated script, or press \u{201c}Apply everything\u{201d}".to_string()),
+            Some(apply.to_string()),
         ),
         // Exact equality is the wrong test: the rendered script also
         // carries structural rules, and the ruleset can legitimately gain
         // a rule between a render and a look. What matters is whether the
         // kernel is carrying roughly what was generated, or a fraction of
         // it.
+        Some(live) if live * 10 < expected * 9 && !applied => (
+            Level::Ok,
+            format!("{live} rule(s) loaded; the rest are configured and not applied yet"),
+            None,
+        ),
         Some(live) if live * 10 < expected * 9 => (
             Level::Warn,
-            format!("{live} rule(s) loaded, {expected} generated — the ruleset is behind"),
-            Some("re-run the generated script to catch the kernel up".to_string()),
+            format!(
+                "{live} rule(s) loaded, {expected} applied — something removed rules from the \
+                 kernel since"
+            ),
+            Some(format!("apply again to catch the kernel up: {apply}")),
         ),
         Some(live) => (Level::Ok, format!("{live} rule(s) loaded"), None),
     };
@@ -1112,36 +1129,61 @@ fn firewall_persistence(probe: &Probe, backend: FirewallBackend) -> Check {
 /// The one check here that already existed — the Dashboard's "needs
 /// updating" row — folded in so that one panel answers the whole question
 /// rather than half of it in two places.
-fn script_freshness(db: &Db, expected: usize) -> Result<Check> {
-    let rendered = db.get_firewall_rendered_signature()?;
-    let stale = firewall::needs_render(db)?;
+///
+/// **Against what was applied, not what was rendered.** The internal cron
+/// renders on its own, to a script nothing loads (see
+/// `firewall::rendered_path`), so "rendered" says nothing about what the
+/// kernel holds or what a reboot restores. Comparing against the last
+/// render is how this check came to say "up to date" about blocks nobody
+/// had applied.
+fn script_freshness(db: &Db, expected: usize, backend: FirewallBackend) -> Result<Check> {
+    use firewall::ScriptState;
+    let state = firewall::script_state(db)?;
 
-    // Nothing to render and nothing rendered is not staleness, it is a
-    // host that has not been configured yet. Saying otherwise puts a
-    // warning on every fresh install, and a check that cries wolf on a
-    // brand-new database is one nobody reads on the day it matters.
-    let untouched = expected == 0 && rendered.is_none();
+    // Nothing to enforce and nothing ever applied is not staleness, it is
+    // a host that has not been configured yet — even once the cron has
+    // rendered its empty script. Saying otherwise puts a warning on every
+    // fresh install, and a check that cries wolf on a brand-new database
+    // is one nobody reads on the day it matters.
+    let untouched = expected == 0 && db.get_firewall_applied_signature()?.is_none();
+    let stale = state != ScriptState::Applied && !untouched;
+    let rendered = firewall::rendered_path(&firewall::default_output_path(backend));
 
     Ok(Check {
         id: "script-fresh",
-        title: "Generated script matches the rules",
-        level: if stale && !untouched {
-            Level::Warn
-        } else {
-            Level::Ok
-        },
-        detail: match (untouched, stale) {
-            (true, _) => "no rules to render yet".to_string(),
-            (_, true) => {
-                let changed = format!("the rules changed since the last render ({expected} now)");
+        title: "Applied rules match the configuration",
+        level: if stale { Level::Warn } else { Level::Ok },
+        detail: match (untouched, state) {
+            (true, _) => "no rules to apply yet".to_string(),
+            (_, ScriptState::Applied) => {
+                "up to date: the rules applied are the ones configured".to_string()
+            }
+            (_, ScriptState::RenderedNotApplied) => format!(
+                "rendered to {}, not applied: the kernel and a reboot still have the last \
+                 rules applied",
+                rendered.display()
+            ),
+            (_, ScriptState::Changed) => {
+                let changed = format!("the rules changed since the last apply ({expected} now)");
                 match scheduled_render(db)? {
-                    Some(at) => format!("{changed}. Will auto-render at {}", format_utc(at)),
+                    Some(at) => format!(
+                        "{changed}. Will auto-render{} at {}",
+                        if db.get_auto_apply_firewall()? {
+                            " and apply"
+                        } else {
+                            ""
+                        },
+                        format_utc(at)
+                    ),
                     None => changed,
                 }
             }
-            (_, false) => "up to date".to_string(),
         },
-        fix: (stale && !untouched).then(|| "render the firewall script again".to_string()),
+        fix: stale.then(|| {
+            "apply it: \u{201c}Apply everything\u{201d}, `stop-bots render-firewall --apply`, or \
+             `stop-bots batch --apply`"
+                .to_string()
+        }),
     })
 }
 
@@ -1871,6 +1913,14 @@ mod tests {
             .unwrap_or_else(|| panic!("no check called {id}"))
     }
 
+    /// Records the current rules as rendered and applied, as a successful
+    /// apply does.
+    fn applied_now(db: &Db) {
+        let signature = crate::firewall::rules_signature(&crate::firewall::all_rules(db).unwrap());
+        db.set_firewall_rendered_signature(&signature).unwrap();
+        db.set_firewall_applied_signature(&signature).unwrap();
+    }
+
     fn with_rules(db: &Db, count: usize) {
         for i in 0..count {
             db.add_firewall_rule(&crate::db::NewFirewallRule {
@@ -2536,12 +2586,13 @@ mod tests {
         assert_eq!(check(&report, "firewall-enforced").level, Level::Ok);
     }
 
-    /// A ruleset well short of what was generated is worth saying, but it
+    /// A ruleset well short of what was applied is worth saying, but it
     /// is not the same as nothing being loaded at all.
     #[test]
-    fn a_ruleset_far_behind_the_generated_one_warns() {
+    fn a_ruleset_far_behind_the_applied_one_warns() {
         let db = db();
         with_rules(&db, 100);
+        applied_now(&db);
 
         let report = assess(
             &db,
@@ -2554,7 +2605,34 @@ mod tests {
 
         let check = check(&report, "firewall-enforced");
         assert_eq!(check.level, Level::Warn);
-        assert!(check.detail.contains("behind"), "was: {}", check.detail);
+        assert!(check.detail.contains("removed"), "was: {}", check.detail);
+    }
+
+    /// Rules waiting to be applied are one warning, not two: the kernel is
+    /// holding what it was given, and `script-fresh` is the check that
+    /// says the rest are waiting.
+    #[test]
+    fn a_kernel_short_by_the_unapplied_rules_is_said_once() {
+        let db = db();
+        with_rules(&db, 100);
+
+        let report = assess(
+            &db,
+            &Probe {
+                live_rules: Some(3),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        let enforced = check(&report, "firewall-enforced");
+        assert_eq!(enforced.level, Level::Ok, "was: {}", enforced.detail);
+        assert!(
+            enforced.detail.contains("not applied"),
+            "was: {}",
+            enforced.detail
+        );
+        assert_eq!(check(&report, "script-fresh").level, Level::Warn);
     }
 
     /// A few rules either way is not drift — the rendered script carries
@@ -2938,16 +3016,62 @@ mod tests {
         );
     }
 
-    /// The line belongs to the warning, not to the check: a script that
-    /// matches the rules has nothing to say about a future render.
+    /// What the internal cron leaves behind on its own: the rules rendered
+    /// to a script nothing loads. That is not up to date, and saying it was
+    /// is how an operator came to believe blocks were enforced.
     #[test]
-    fn an_up_to_date_script_says_nothing_about_auto_rendering() {
+    fn a_script_rendered_and_not_applied_is_not_up_to_date() {
         let db = db();
         with_rules(&db, 3);
         db.set_firewall_rendered_signature(&crate::firewall::rules_signature(
             &crate::firewall::all_rules(&db).unwrap(),
         ))
         .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+        let check = check(&report, "script-fresh");
+
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("not applied"), "{}", check.detail);
+        assert!(
+            check.detail.contains("firewall.next.nft"),
+            "it should name the file waiting: {}",
+            check.detail
+        );
+        assert!(
+            check
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("--apply")),
+            "{:?}",
+            check.fix
+        );
+    }
+
+    /// A database from before the applied signature existed has none. It
+    /// reads as not applied until the first apply — nothing recorded what
+    /// the kernel was given — but a fresh one with nothing to enforce is
+    /// not warned about, even once the cron has rendered its empty script.
+    #[test]
+    fn a_fresh_database_the_cron_rendered_is_not_told_to_apply() {
+        let db = db();
+        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(
+            &crate::firewall::all_rules(&db).unwrap(),
+        ))
+        .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+
+        assert_eq!(check(&report, "script-fresh").level, Level::Ok);
+    }
+
+    /// The line belongs to the warning, not to the check: rules that are
+    /// the ones applied have nothing to say about a future render.
+    #[test]
+    fn an_up_to_date_script_says_nothing_about_auto_rendering() {
+        let db = db();
+        with_rules(&db, 3);
+        applied_now(&db);
         db.set_cron_last_run(
             crate::cron::CronJob::RenderFirewall.id(),
             now_secs() - 3_600,

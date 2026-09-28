@@ -1237,6 +1237,70 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     }
 }
 
+/// What [`run_apply`] would change, without changing it: the same plan,
+/// read rather than written. Touches no `Db`, so it runs where the apply
+/// would.
+///
+/// A site file that cannot be read is left out here; the apply names it
+/// when it fails on it.
+pub fn preview_apply(plan: &ApplyPlan) -> Vec<nginx::FileChange> {
+    let mut changes = Vec::new();
+    for (path, body) in &plan.managed_writes {
+        let before = std::fs::read_to_string(path).ok();
+        if before.as_deref() != Some(body.as_str()) {
+            changes.push(nginx::FileChange {
+                path: path.clone(),
+                before,
+                after: Some(body.clone()),
+            });
+        }
+    }
+
+    // Several sites can share a file, and each edit sees the one before,
+    // exactly as the apply's writes do.
+    let mut files: Vec<(PathBuf, String, String)> = Vec::new();
+    for site in &plan.sites {
+        let at = match files
+            .iter()
+            .position(|(path, _, _)| path == &site.config_path)
+        {
+            Some(at) => at,
+            None => match std::fs::read_to_string(&site.config_path) {
+                Ok(content) => {
+                    files.push((site.config_path.clone(), content.clone(), content));
+                    files.len() - 1
+                }
+                Err(_) => continue,
+            },
+        };
+        let (path, _, current) = &mut files[at];
+        if let Ok(next) = nginx::block_for_site(current, path, &site.server_name, &site.config) {
+            *current = next;
+        }
+    }
+    changes.extend(
+        files
+            .into_iter()
+            .filter(|(_, before, after)| before != after)
+            .map(|(path, before, after)| nginx::FileChange {
+                path,
+                before: Some(before),
+                after: Some(after),
+            }),
+    );
+
+    for path in &plan.managed_removals {
+        if let Ok(before) = std::fs::read_to_string(path) {
+            changes.push(nginx::FileChange {
+                path: path.clone(),
+                before: Some(before),
+                after: None,
+            });
+        }
+    }
+    changes
+}
+
 /// `anyhow::Error` isn't `Clone`, and the managed-file write is shared by
 /// every site in a plan, so its failure has to be reproducible per site.
 fn clone_error(err: &anyhow::Error) -> (bool, String) {

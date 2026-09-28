@@ -883,7 +883,9 @@ async fn writing_the_firewall_script_produces_a_file_and_records_the_signature()
         .block_address_permanently("192.0.2.10")
         .unwrap();
 
-    let out = tmp.path().join("firewall.nft");
+    // Beside the configured script, which is the applied one: writing
+    // alone must never reach what a boot unit loads.
+    let out = tmp.path().join("firewall.next.nft");
     let (_, flash) = act(&app, &cookie, &csrf, "/render-firewall", "backend=nftables").await;
 
     assert!(flash.contains("Wrote"), "was: {flash}");
@@ -926,7 +928,7 @@ async fn the_firewall_script_goes_where_the_server_was_configured_to_put_it() {
         elsewhere.display()
     );
     assert!(
-        tmp.path().join("firewall.nft").exists(),
+        tmp.path().join("firewall.next.nft").exists(),
         "the configured destination was not written"
     );
 }
@@ -2555,8 +2557,78 @@ async fn apply_everything_writes_but_does_not_enforce_under_no_apply() {
 
     assert!(flash.contains("not applied: --no-apply"), "was: {flash}");
     assert!(
-        tmp.path().join("firewall.nft").exists(),
+        tmp.path().join("firewall.next.nft").exists(),
         "the script should still have been written"
+    );
+    assert!(
+        !tmp.path().join("firewall.nft").exists(),
+        "nothing was applied, so nothing may reach the script a boot unit loads"
+    );
+}
+
+/// One click on "Apply everything" changes nothing: the button is a `GET`
+/// to a page that says what would change — the files, the rules, the
+/// lockout check — and carries the `POST` that does it.
+#[tokio::test]
+async fn apply_everything_asks_first_and_asking_changes_nothing() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+    Db::open(&db_path)
+        .unwrap()
+        .block_address_permanently("192.0.2.10")
+        .unwrap();
+
+    let home = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        home.contains(r#"method="get" action="/apply-all""#),
+        "the header button must not post:\n{home}"
+    );
+
+    let page = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/apply-all"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+    for expected in [
+        "Apply everything?",
+        "all of it is new",
+        "lockout check",
+        r#"method="post" action="/apply-all""#,
+        "Show the diff",
+    ] {
+        assert!(page.contains(expected), "no {expected:?} on:\n{page}");
+    }
+    assert!(
+        !tmp.path().join("firewall.next.nft").exists(),
+        "a preview wrote the script"
+    );
+    assert_eq!(
+        Db::open(&db_path)
+            .unwrap()
+            .get_firewall_rendered_signature()
+            .unwrap(),
+        None,
+        "a preview recorded a render"
+    );
+
+    let diff = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/apply-all?diff=1"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        diff.contains("+\t192.0.2.10"),
+        "the diff should show the rule it adds:\n{diff}"
     );
 }
 
@@ -2576,7 +2648,10 @@ async fn the_render_form_can_ask_for_an_apply_and_still_respects_no_apply() {
     .await;
 
     assert!(flash.contains("not applied: --no-apply"), "was: {flash}");
-    assert!(tmp.path().join("firewall.nft").exists(), "was: {flash}");
+    assert!(
+        tmp.path().join("firewall.next.nft").exists(),
+        "was: {flash}"
+    );
 }
 
 /// The backend choice is remembered, so a one-click "Apply everything" has

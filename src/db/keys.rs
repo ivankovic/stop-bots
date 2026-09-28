@@ -85,6 +85,9 @@ pub const LOGS_SSH_PATH: &str = "logs:ssh_path";
 pub const FIREWALL_BACKEND: &str = "firewall:backend";
 /// Digest of the rule set as last rendered (see `firewall::rules_signature`).
 pub const FIREWALL_RENDERED_SIGNATURE: &str = "firewall_rendered_signature";
+/// Digest of the rule set as last applied: run, and copied to the script
+/// the boot unit loads.
+pub const FIREWALL_APPLIED_SIGNATURE: &str = "firewall:applied_signature";
 /// Whether the internal cron applies the rendered firewall script.
 pub const AUTO_APPLY_FIREWALL: &str = "auto_apply_firewall";
 
@@ -144,6 +147,7 @@ pub const ALL: &[&str] = &[
     LOGS_SSH_PATH,
     FIREWALL_BACKEND,
     FIREWALL_RENDERED_SIGNATURE,
+    FIREWALL_APPLIED_SIGNATURE,
     AUTO_APPLY_FIREWALL,
     DETECT_PROBE_PATHS_EXTRA,
     DETECT_HONEYPOT_PATH,

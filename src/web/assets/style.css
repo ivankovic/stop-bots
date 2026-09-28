@@ -555,3 +555,20 @@ td { transition: background 240ms ease-out; }
   td { transition: none; }
   .caret { animation: none; }
 }
+
+/* "Apply everything"'s confirm page: the summary, and the diff on request.
+   Scrolls inside itself, so a long firewall diff does not push the buttons
+   off the page. */
+pre.preview, pre.diff {
+  font: 12px/1.5 var(--mono);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 12px 0;
+}
+pre.diff {
+  max-height: 60vh;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}

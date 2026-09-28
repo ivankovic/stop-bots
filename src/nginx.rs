@@ -2361,19 +2361,31 @@ pub fn apply_blocks_to_file(
     site_configs: &[(String, BlockConfig)],
     default_config: &BlockConfig,
 ) -> Result<bool> {
-    let mut content = fs::read_to_string(config_path)
+    let before = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
-
-    let block_count = parse_server_blocks(&content).len();
-    if block_count == 0 {
+    let after = blocks_for_file(&before, config_path, site_configs, default_config)?;
+    if after == before {
         return Ok(false);
     }
+    write_site_file(config_path, root, &after)?;
+    Ok(true)
+}
+
+/// What [`apply_blocks_to_file`] would make of `content`, without writing
+/// it — the half a preview shares with the apply, so the two cannot differ.
+pub fn blocks_for_file(
+    content: &str,
+    config_path: &Path,
+    site_configs: &[(String, BlockConfig)],
+    default_config: &BlockConfig,
+) -> Result<String> {
+    let mut content = content.to_string();
+    let block_count = parse_server_blocks(&content).len();
 
     // Editing a block shifts the byte offsets of every block after it, so
     // re-parse before each edit rather than reusing stale spans. Block order
     // is stable across re-parses since edits only rewrite sentinel lines
     // inside existing braces, never add or remove server blocks.
-    let mut changed = false;
     for i in 0..block_count {
         let blocks = parse_server_blocks(&content);
         let block = nth_block(&blocks, i, block_count, config_path)?;
@@ -2383,18 +2395,9 @@ pub fn apply_blocks_to_file(
             .and_then(|name| site_configs.iter().find(|(n, _)| n == name))
             .map(|(_, config)| config)
             .unwrap_or(default_config);
-        let updated = apply_block(&content, block, config);
-        if updated != content {
-            changed = true;
-            content = updated;
-        }
+        content = apply_block(&content, block, config);
     }
-
-    if !changed {
-        return Ok(false);
-    }
-    write_site_file(config_path, root, &content)?;
-    Ok(true)
+    Ok(content)
 }
 
 /// Block `i` of `blocks`, which must still number `expected`.
@@ -2528,32 +2531,124 @@ pub fn apply_block_for_site(
     server_name: &str,
     config: &BlockConfig,
 ) -> Result<bool> {
-    let mut content = fs::read_to_string(config_path)
+    let before = fs::read_to_string(config_path)
         .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let after = block_for_site(&before, config_path, server_name, config)?;
+    if after == before {
+        return Ok(false);
+    }
+    write_site_file(config_path, root, &after)?;
+    Ok(true)
+}
 
+/// What [`apply_block_for_site`] would make of `content`, without writing
+/// it.
+pub fn block_for_site(
+    content: &str,
+    config_path: &Path,
+    server_name: &str,
+    config: &BlockConfig,
+) -> Result<String> {
+    let mut content = content.to_string();
     let block_count = parse_server_blocks(&content).len();
 
-    // Same re-parse-before-each-edit approach as apply_blocks_to_file:
+    // Same re-parse-before-each-edit approach as `blocks_for_file`:
     // editing a block shifts the byte offsets of every block after it.
-    let mut changed = false;
     for i in 0..block_count {
         let blocks = parse_server_blocks(&content);
         let block = nth_block(&blocks, i, block_count, config_path)?;
         if block.names.first().map(String::as_str) != Some(server_name) {
             continue;
         }
-        let updated = apply_block(&content, block, config);
-        if updated != content {
-            changed = true;
-            content = updated;
+        content = apply_block(&content, block, config);
+    }
+    Ok(content)
+}
+
+/// One file an apply would change: its content before and after, `None`
+/// for a file that does not exist (before) or would be removed (after).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: PathBuf,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+impl FileChange {
+    /// A unified diff of the change, labelled with the path.
+    pub fn diff(&self) -> String {
+        let label = self.path.display().to_string();
+        crate::diff::unified(
+            self.before.as_deref(),
+            self.after.as_deref(),
+            &label,
+            &label,
+        )
+    }
+
+    /// `(new)`, `(removed)` or nothing, for a summary line.
+    pub fn kind(&self) -> &'static str {
+        match (&self.before, &self.after) {
+            (None, Some(_)) => " (new)",
+            (Some(_), None) => " (removed)",
+            _ => "",
+        }
+    }
+}
+
+/// Every file [`apply_all_sites_and_reload`] would change under `root`,
+/// and how, without changing any of them: the generated files it would
+/// write or remove, and each site file it would rewrite. Through the same
+/// functions the apply uses, so a preview cannot promise something the
+/// apply then does differently.
+pub fn preview_all_sites(db: &crate::db::Db, root: &Path) -> Result<Vec<FileChange>> {
+    let sites = discover_sites(root)?;
+    let mut changes: Vec<FileChange> = Vec::new();
+    for (path, body) in planned_managed_files(db, root)? {
+        let before = fs::read_to_string(&path).ok();
+        if before.as_deref() != Some(body.as_str()) {
+            changes.push(FileChange {
+                path,
+                before,
+                after: Some(body),
+            });
         }
     }
 
-    if !changed {
-        return Ok(false);
+    let default_config = default_block_config(db)?;
+    let known_sites = db.list_sites()?;
+    let mut config_paths: Vec<_> = sites.iter().map(|s| s.config_path.clone()).collect();
+    config_paths.sort();
+    config_paths.dedup();
+    for path in config_paths {
+        // The same per-file join `apply_all_sites` makes, for its reason.
+        let site_configs: Vec<(String, BlockConfig)> = known_sites
+            .iter()
+            .filter(|s| Path::new(&s.config_path) == path.as_path())
+            .map(|s| Ok((s.server_name.clone(), block_config_for_site(db, s.id)?)))
+            .collect::<Result<_>>()?;
+        let before = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let after = blocks_for_file(&before, &path, &site_configs, &default_config)?;
+        if after != before {
+            changes.push(FileChange {
+                path,
+                before: Some(before),
+                after: Some(after),
+            });
+        }
     }
-    write_site_file(config_path, root, &content)?;
-    Ok(true)
+
+    for path in unused_managed_files(db, root)? {
+        if let Ok(before) = fs::read_to_string(&path) {
+            changes.push(FileChange {
+                path,
+                before: Some(before),
+                after: None,
+            });
+        }
+    }
+    Ok(changes)
 }
 
 /// What [`apply_all_sites_and_reload`] did.

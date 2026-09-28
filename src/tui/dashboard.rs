@@ -56,22 +56,26 @@
 //!
 //! - `u` downloads every list this host uses ([`crate::refresh`]), one
 //!   source at a time — `KeyOutcome::UpdateEverything`.
-//! - `a` writes the NGINX config and then writes and runs the firewall
-//!   script — `KeyOutcome::ApplyEverything`. Two independent halves, the
-//!   same two `batch --apply` does. The NGINX reload it triggers overlaps
-//!   the firewall render rather than preceding it: both are started from
-//!   `App::finish_site_apply`, and neither reads what the other writes.
+//! - `a` shows what applying would change and asks
+//!   (`KeyOutcome::PreviewApplyEverything`, then [`Popup::ConfirmApply`]);
+//!   Enter there writes the NGINX config and then writes and runs the
+//!   firewall script — `KeyOutcome::ApplyEverything`. Two independent
+//!   halves, the same two `batch --apply` does. The NGINX reload it
+//!   triggers overlaps the firewall render rather than preceding it: both
+//!   are started from `App::finish_site_apply`, and neither reads what the
+//!   other writes.
 //! - `F` opens the render popup ([`Popup::RenderFirewall`]) — capital,
 //!   like `A` on NGINX, because it writes to the host.
 //! - `w` opens the Web Access form ([`Popup::WebAccess`]), which puts this
 //!   console behind NGINX on a subdomain or a path prefix
 //!   ([`crate::webaccess`]).
 //!
-//! None of the four is behind a confirmation popup, matching the
-//! console's one-click buttons: an update only downloads, and the apply
-//! goes through the same anti-lockout guard the render popup does. They
-//! are hinted in the footer (see [`Dashboard::hints`]), which is
-//! context-sensitive, so panel titles stay titles.
+//! Only `a` asks first, as the console's button does: it rewrites every
+//! site and runs a script as root on one keypress, and the confirmation
+//! shows the files, the rules added and removed and the lockout guard's
+//! verdict, with the diff on `d`. The four are hinted in the footer (see
+//! [`Dashboard::hints`]), which is context-sensitive, so panel titles stay
+//! titles.
 //!
 //! ## Geo-blocking
 //!
@@ -113,7 +117,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Stylize,
     text::{Line, Span},
-    widgets::{Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -195,6 +199,16 @@ const PROTECTION_TTL_CHOICES: [i64; 3] = [1, 7, 30];
 /// selection, or switching the geo mode itself.
 #[derive(Debug, Clone)]
 enum Popup {
+    /// "Apply everything"'s confirmation: what would change, the lockout
+    /// guard's verdict, and the diff on `d`. Enter applies; Esc changes
+    /// nothing. Behind `Arc`s because the popup is cloned every frame and
+    /// a first apply's firewall diff is tens of thousands of lines.
+    ConfirmApply {
+        lines: std::sync::Arc<[String]>,
+        diff: std::sync::Arc<[String]>,
+        show_diff: bool,
+        scroll: usize,
+    },
     Category {
         category: Category,
         selected: usize,
@@ -288,14 +302,12 @@ pub struct Dashboard {
     /// here — this panel only displays it, `App` is what actually runs due
     /// jobs.
     cron_status: Vec<crate::cron::JobStatus>,
-    /// Whether the current rule set (`firewall::all_rules`) differs from
-    /// what was in effect the last time the firewall was actually rendered
-    /// (`firewall::rules_signature`, compared via
-    /// `Db::get_firewall_rendered_signature`) — shown as the Firewall
-    /// script panel's tag so an admin can tell, without opening the render popup, whether
-    /// e.g. a scanner blocked since the last daily `RenderFirewall` cron
-    /// tick is actually reflected in the on-disk script yet.
-    firewall_needs_update: bool,
+    /// Whether the current rule set is the one last applied, only
+    /// rendered, or changed since either (`firewall::script_state`) —
+    /// shown as the Firewall script panel's tag, so an admin can tell
+    /// without opening the render popup whether e.g. a scanner blocked a
+    /// minute ago is enforced, or only sitting in a script the cron wrote.
+    script_state: crate::firewall::ScriptState,
     /// How many rules a render would write, for the Firewall script panel
     /// — see its three-state line, which reads differently at zero.
     rule_count: usize,
@@ -336,7 +348,7 @@ impl Dashboard {
         self.reputation = db.list_reputation_sources()?;
         self.auto_apply_firewall = db.get_auto_apply_firewall()?;
         self.cron_status = crate::cron::status(db)?;
-        self.firewall_needs_update = firewall_needs_update(db)?;
+        self.script_state = crate::firewall::script_state(db)?;
         self.rule_count = crate::firewall::all_rules(db)?.len();
         if self.list_state.selected().is_none() {
             self.list_state.select(Some(0));
@@ -384,15 +396,14 @@ impl Dashboard {
             .count()
     }
 
-    /// Whether the Firewall script panel currently reads `[ STALE ]` —
-    /// `pub(crate)` and test-only, purely so `App`'s own tests
-    /// (a different module) can assert that a render triggered through the
-    /// key/outcome flow actually refreshes this cached value, not just the
-    /// underlying `Db` signature (see `App::handle_key_event`'s
-    /// `RenderFirewall` arm).
+    /// What the Firewall script panel's tag currently says — `pub(crate)`
+    /// and test-only, purely so `App`'s own tests (a different module) can
+    /// assert that a render triggered through the key/outcome flow actually
+    /// refreshes this cached value, not just the underlying `Db` signature
+    /// (see `App::handle_key_event`'s `RenderFirewall` arm).
     #[cfg(test)]
-    pub(crate) fn firewall_needs_update(&self) -> bool {
-        self.firewall_needs_update
+    pub(crate) fn script_state(&self) -> crate::firewall::ScriptState {
+        self.script_state
     }
 
     #[cfg(test)]
@@ -645,20 +656,28 @@ impl Dashboard {
         // Three states, not two. A fresh install has no rules at all,
         // and telling someone to press `F` there sends them to render
         // an empty script — which looks like the tool doing nothing.
-        let script = match (self.rule_count, self.firewall_needs_update) {
+        use crate::firewall::ScriptState;
+        let script = match (self.rule_count, self.script_state) {
             (0, _) => Line::from(vec![
                 " no rules yet".into(),
                 " \u{2014} enable a detector".fg(theme.dim()),
             ]),
-            (n, true) => Line::from(vec![
+            (n, ScriptState::Changed) => Line::from(vec![
                 format!(" {n} rules  ").into(),
-                "[ STALE ]".yellow(),
-                "  F to write".fg(theme.dim()),
+                "[ CHANGED ]".yellow(),
+                "  a to apply".fg(theme.dim()),
             ]),
-            (n, false) => Line::from(vec![
+            // The state the internal cron leaves behind on its own: the
+            // script is on disk and inert. Saying "up to date" here is how
+            // an operator comes to believe it is enforced.
+            (n, ScriptState::RenderedNotApplied) => Line::from(vec![
                 format!(" {n} rules  ").into(),
-                "[ UP TO DATE ]".green(),
+                "[ NOT APPLIED ]".yellow(),
+                "  a to apply".fg(theme.dim()),
             ]),
+            (n, ScriptState::Applied) => {
+                Line::from(vec![format!(" {n} rules  ").into(), "[ APPLIED ]".green()])
+            }
         };
         let inputs = Line::from(vec![
             format!(" {} site(s)", self.site_count).into(),
@@ -883,6 +902,19 @@ impl Dashboard {
 
     fn render_popup(&self, frame: &mut Frame, area: Rect, popup: Popup, theme: Theme) {
         match popup {
+            Popup::ConfirmApply {
+                lines,
+                diff,
+                show_diff,
+                scroll,
+            } => render_confirm_apply(
+                frame,
+                area,
+                &lines,
+                show_diff.then_some(&diff[..]),
+                scroll,
+                theme,
+            ),
             // Three of the five popups are the same widget with different
             // strings: a centred list, one row per option, the selected row
             // reversed. Only the two that are *not* option lists — a text
@@ -955,6 +987,13 @@ impl Dashboard {
                     ]),
                     Line::from(""),
                     Line::from(format!("Output: {}_", out_path)),
+                    Line::from(format!(
+                        // Not "applied": that word is how a test tells
+                        // the render's own message has arrived.
+                        "  writes {} first; this path once it has run",
+                        crate::firewall::rendered_path(std::path::Path::new(&out_path)).display()
+                    ))
+                    .fg(theme.dim()),
                     Line::from(vec![
                         Span::from("Apply after writing: "),
                         Span::from(if apply_after_write { "[x]" } else { "[ ]" }),
@@ -1075,6 +1114,7 @@ impl Dashboard {
                 Popup::GeoMode { .. } => self.handle_geo_mode_popup_key(key, db, message),
                 Popup::RenderFirewall { .. } => self.handle_render_firewall_popup_key(key),
                 Popup::WebAccess { .. } => self.handle_web_access_popup_key(key),
+                Popup::ConfirmApply { .. } => self.handle_confirm_apply_popup_key(key, message),
             };
         }
 
@@ -1088,16 +1128,15 @@ impl Dashboard {
             return Ok(KeyOutcome::Consumed);
         }
 
-        // Host-wide, one key each, and deliberately not behind a popup:
-        // they mirror the console's two buttons, which are one click each
-        // too. Neither is irreversible — an update only downloads, and the
-        // apply goes through the same anti-lockout guard the render popup
-        // does (see `App::start_everything_firewall`).
+        // Host-wide, one key each. An update only downloads, so it just
+        // runs. An apply rewrites every site and runs the firewall script
+        // as root, so it asks first, with what would change in front of
+        // the operator — see `Popup::ConfirmApply`.
         if key.code == KeyCode::Char('u') {
             return Ok(KeyOutcome::UpdateEverything);
         }
         if key.code == KeyCode::Char('a') {
-            return Ok(KeyOutcome::ApplyEverything);
+            return Ok(KeyOutcome::PreviewApplyEverything);
         }
 
         // 'w' opens the Web Access form — the TUI's half of the
@@ -1143,9 +1182,18 @@ impl Dashboard {
         // every screen that has a list worth filtering, and this one does
         // not, so the key is free rather than overloaded.
         if key.code == KeyCode::Char('F') {
+            // Opens on the backend this host renders for, and that
+            // backend's applied script — an iptables host offered
+            // `firewall.nft` ends up with a shell script in it.
+            let backend = crate::firewall::stored_backend(db)?;
             self.popup = Some(Popup::RenderFirewall {
-                backend_selected: 0, // default to nftables (recommended)
-                out_path: crate::firewall::DEFAULT_OUTPUT_PATH.to_string(),
+                backend_selected: match backend {
+                    crate::firewall::FirewallBackend::Nftables => 0,
+                    crate::firewall::FirewallBackend::Iptables => 1,
+                },
+                out_path: crate::firewall::default_output_path(backend)
+                    .display()
+                    .to_string(),
                 apply_after_write: false,
                 error: None,
             });
@@ -1568,6 +1616,61 @@ impl Dashboard {
         }
     }
 
+    /// "Apply everything"'s confirmation. Enter is the only key that
+    /// applies; everything else reads, scrolls or leaves.
+    fn handle_confirm_apply_popup_key(
+        &mut self,
+        key: KeyEvent,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let Some(Popup::ConfirmApply {
+            diff,
+            show_diff,
+            scroll,
+            ..
+        }) = &mut self.popup
+        else {
+            unreachable!("dispatched on this variant")
+        };
+        let last = diff.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Enter => {
+                self.popup = None;
+                return Ok(KeyOutcome::ApplyEverything);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.popup = None;
+                *message = Some("Nothing applied.".to_string());
+            }
+            KeyCode::Char('d') => {
+                *show_diff = !*show_diff;
+                *scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => *scroll = (*scroll + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+            KeyCode::PageDown | KeyCode::Char(' ') => *scroll = (*scroll + 20).min(last),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(20),
+            _ => {}
+        }
+        Ok(KeyOutcome::Consumed)
+    }
+
+    /// Opens "Apply everything"'s confirmation with `preview` in it — `App`
+    /// works the preview out off the event loop and hands it back here.
+    pub fn show_apply_preview(&mut self, preview: &crate::preview::ApplyPreview) {
+        self.popup = Some(Popup::ConfirmApply {
+            lines: preview.lines().into(),
+            diff: preview.diff().lines().map(str::to_string).collect(),
+            show_diff: false,
+            scroll: 0,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn confirm_apply_is_open(&self) -> bool {
+        matches!(self.popup, Some(Popup::ConfirmApply { .. }))
+    }
+
     /// The firewall render form: a backend choice, an editable output
     /// path, and an apply-after-write toggle. The only popup here whose
     /// `Char` handling is text entry rather than navigation, which is why
@@ -1904,6 +2007,89 @@ fn policy_tag(policy: Policy) -> Span<'static> {
 /// someone edits the text inside one — and then the thing that gets cut
 /// off is a key hint or a validation message, i.e. the part that was
 /// there to be read.
+/// "Apply everything"'s confirmation: the summary on top, wrapped, and the
+/// diff below it when asked for, drawn a screenful at a time from `scroll`
+/// — a first apply's firewall diff is tens of thousands of lines, and only
+/// the visible ones become `Line`s.
+fn render_confirm_apply(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[String],
+    diff: Option<&[String]>,
+    scroll: usize,
+    theme: Theme,
+) {
+    let popup_area = crate::tui::centered_rect(
+        area.width.saturating_sub(4).min(120),
+        area.height.saturating_sub(2),
+        area,
+    );
+    frame.render_widget(Clear, popup_area);
+    let block = crate::tui::popup("Apply everything?", theme);
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let width = inner.width.max(1) as usize;
+    let summary_height: usize = lines
+        .iter()
+        .map(|line| line.chars().count().div_ceil(width).max(1))
+        .sum();
+    let [summary, rest, hint] = Layout::vertical([
+        Constraint::Length(summary_height as u16 + 1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let summary_lines: Vec<Line> = lines.iter().map(|line| Line::from(line.as_str())).collect();
+    frame.render_widget(
+        Paragraph::new(summary_lines).wrap(Wrap { trim: false }),
+        summary,
+    );
+
+    let (body, keys): (Vec<Line>, &str) = match diff {
+        None => (
+            vec![
+                "This writes the NGINX config for every site and reloads NGINX, then writes the \
+                 firewall script and runs it as root."
+                    .into(),
+            ],
+            "Enter apply  d show the diff  Esc cancel",
+        ),
+        Some([]) => (
+            vec!["Nothing would change.".fg(theme.dim()).into()],
+            "Enter apply  d hide the diff  Esc cancel",
+        ),
+        Some(diff) => (
+            diff.iter()
+                .skip(scroll)
+                .take(rest.height as usize)
+                .map(|line| {
+                    let span = Span::from(line.as_str());
+                    match line.as_bytes().first() {
+                        Some(b'+') if !line.starts_with("+++") => span.green(),
+                        Some(b'-') if !line.starts_with("---") => span.red(),
+                        Some(b'@') => span.cyan(),
+                        _ => span,
+                    }
+                    .into()
+                })
+                .collect(),
+            "Enter apply  d hide the diff  \u{2191}/\u{2193} PgUp/PgDn scroll  Esc cancel",
+        ),
+    };
+    let body = Paragraph::new(body);
+    frame.render_widget(
+        if diff.is_none() {
+            body.wrap(Wrap { trim: false })
+        } else {
+            body
+        },
+        rest,
+    );
+    frame.render_widget(Paragraph::new(Line::from(keys).fg(theme.dim())), hint);
+}
+
 fn widest_line(lines: &[Line<'_>]) -> u16 {
     lines
         .iter()
@@ -1964,19 +2150,6 @@ fn format_relative_time(t: i64) -> String {
     } else {
         format!("{}d ago", elapsed / 86_400)
     }
-}
-
-/// Whether the firewall's current rule set differs from what was in effect
-/// at the last successful render — see the `Dashboard::firewall_needs_update`
-/// field doc for what this drives. Never reads the on-disk script itself:
-/// comparing a signature the app itself persisted on the last successful
-/// write (`Db::get_firewall_rendered_signature`) keeps this hermetic (no
-/// dependency on a real system path existing) and correctly reflects "did
-/// the desired rules change since our own last render", not "does some
-/// file's bytes happen to match", which is also unaffected by which
-/// backend/output path that last render used (see `rules_signature`'s doc).
-fn firewall_needs_update(db: &Db) -> Result<bool> {
-    crate::firewall::needs_render(db)
 }
 
 fn is_stale(last_fetched_at: Option<i64>) -> bool {
@@ -3022,16 +3195,56 @@ mod tests {
                 .unwrap(),
             KeyOutcome::UpdateEverything
         );
+        // `a` asks for the preview; the apply is only ever the answer to it.
         assert_eq!(
             dashboard
                 .handle_key(KeyEvent::from(KeyCode::Char('a')), &db, &mut message)
                 .unwrap(),
+            KeyOutcome::PreviewApplyEverything
+        );
+    }
+
+    /// In the confirmation, Enter is the only key that applies; the others
+    /// read, scroll or leave.
+    #[test]
+    fn only_enter_in_the_confirmation_applies() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        let preview = crate::preview::ApplyPreview {
+            nginx: Ok(Vec::new()),
+            firewall: Err("not needed here".to_string()),
+        };
+        let mut message = None;
+        let mut press = |dashboard: &mut Dashboard, code| {
+            dashboard
+                .handle_key(KeyEvent::from(code), &db, &mut message)
+                .unwrap()
+        };
+
+        dashboard.show_apply_preview(&preview);
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('d'),
+            KeyCode::Down,
+            KeyCode::PageDown,
+            KeyCode::Char('d'),
+        ] {
+            assert_eq!(
+                press(&mut dashboard, code),
+                KeyOutcome::Consumed,
+                "{code:?}"
+            );
+            assert!(dashboard.confirm_apply_is_open(), "{code:?} closed it");
+        }
+        assert_eq!(
+            press(&mut dashboard, KeyCode::Enter),
             KeyOutcome::ApplyEverything
         );
-        assert!(
-            dashboard.popup.is_none(),
-            "neither is behind a popup, the same as the console's buttons"
-        );
+        assert!(!dashboard.confirm_apply_is_open());
+
+        dashboard.show_apply_preview(&preview);
+        assert_eq!(press(&mut dashboard, KeyCode::Esc), KeyOutcome::Consumed);
+        assert!(!dashboard.confirm_apply_is_open());
     }
 
     /// A popup owns every key while it is open — `a` is a letter someone
@@ -3080,6 +3293,32 @@ mod tests {
                 assert_eq!(out_path, crate::firewall::DEFAULT_OUTPUT_PATH);
                 assert!(!apply_after_write);
                 assert!(error.is_none());
+            }
+            other => panic!("expected a RenderFirewall popup, got {other:?}"),
+        }
+    }
+
+    /// On a host set to iptables the popup opens on iptables and its own
+    /// script, not on nftables' file.
+    #[test]
+    fn f_key_opens_on_the_stored_backend_and_its_path() {
+        let db = Db::open_in_memory().unwrap();
+        crate::firewall::store_backend(&db, crate::firewall::FirewallBackend::Iptables).unwrap();
+        let mut dashboard = Dashboard::default();
+        let mut message = None;
+
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('F')), &db, &mut message)
+            .unwrap();
+
+        match dashboard.popup.unwrap() {
+            Popup::RenderFirewall {
+                backend_selected,
+                out_path,
+                ..
+            } => {
+                assert_eq!(backend_selected, 1, "iptables");
+                assert_eq!(out_path, "/etc/stop-bots/firewall.sh");
             }
             other => panic!("expected a RenderFirewall popup, got {other:?}"),
         }
@@ -3207,38 +3446,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn firewall_needs_update_is_true_before_any_render() {
-        let db = Db::open_in_memory().unwrap();
-        assert!(firewall_needs_update(&db).unwrap());
-    }
-
-    #[test]
-    fn firewall_needs_update_is_false_right_after_a_matching_render() {
-        let db = Db::open_in_memory().unwrap();
-        let rules = crate::firewall::all_rules(&db).unwrap();
-        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&rules))
-            .unwrap();
-        assert!(!firewall_needs_update(&db).unwrap());
-    }
-
-    #[test]
-    fn firewall_needs_update_is_true_again_after_the_rule_set_changes() {
-        let db = Db::open_in_memory().unwrap();
-        let rules = crate::firewall::all_rules(&db).unwrap();
-        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&rules))
-            .unwrap();
-
-        db.add_firewall_rule(&crate::db::NewFirewallRule {
-            address: "9.9.9.9".to_string(),
-            port: None,
-            action: crate::db::FirewallAction::Block,
-        })
-        .unwrap();
-
-        assert!(firewall_needs_update(&db).unwrap());
-    }
-
     /// With no rules at all — a fresh install — the panel must not say
     /// "F to write". Pressing `F` there renders an empty script, which
     /// looks like the tool doing nothing, and it is the first screen a
@@ -3273,86 +3480,58 @@ mod tests {
         assert!(!content.contains("F to write"), "content was:\n{content}");
     }
 
+    /// The panel's tag in each of its three states. The middle one is what
+    /// the internal cron leaves behind on its own — a script on disk that
+    /// nothing loads — and it must not read as up to date.
     #[test]
-    fn render_shows_the_firewall_summary_row() {
+    fn the_firewall_summary_row_says_applied_only_when_it_was() {
         let db = Db::open_in_memory().unwrap();
         // A rule to write. Without one the panel says something else
-        // entirely, and deliberately — see the test below.
+        // entirely, and deliberately — see the test above.
         db.add_firewall_rule(&crate::db::NewFirewallRule {
             address: "203.0.113.9".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
         })
         .unwrap();
-        let mut dashboard = Dashboard::default();
-        dashboard.refresh(&db).unwrap();
+        let signature = crate::firewall::rules_signature(&crate::firewall::all_rules(&db).unwrap());
+        let row = |db: &Db| {
+            let mut dashboard = Dashboard::default();
+            dashboard.refresh(db).unwrap();
+            let mut terminal = test_terminal();
+            terminal
+                .draw(|frame| {
+                    dashboard.render(
+                        frame,
+                        frame.area(),
+                        Theme::Dark,
+                        &[],
+                        &std::collections::HashSet::new(),
+                    )
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
 
-        let mut terminal = test_terminal();
-        terminal
-            .draw(|frame| {
-                dashboard.render(
-                    frame,
-                    frame.area(),
-                    Theme::Dark,
-                    &[],
-                    &std::collections::HashSet::new(),
-                )
-            })
-            .unwrap();
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
+        let content = row(&db);
         assert!(content.contains("1 rules"), "content was:\n{content}");
-        assert!(content.contains("STALE"), "content was:\n{content}");
-        assert!(content.contains("F to write"), "content was:\n{content}");
-    }
+        assert!(content.contains("CHANGED"), "content was:\n{content}");
+        assert!(content.contains("a to apply"), "content was:\n{content}");
 
-    #[test]
-    fn render_shows_the_firewall_summary_row_as_up_to_date_after_a_render() {
-        let db = Db::open_in_memory().unwrap();
-        db.add_firewall_rule(&crate::db::NewFirewallRule {
-            address: "203.0.113.9".to_string(),
-            port: None,
-            action: crate::db::FirewallAction::Block,
-        })
-        .unwrap();
-        let rules = crate::firewall::all_rules(&db).unwrap();
-        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&rules))
-            .unwrap();
+        db.set_firewall_rendered_signature(&signature).unwrap();
+        let content = row(&db);
+        assert!(content.contains("NOT APPLIED"), "content was:\n{content}");
 
-        let mut dashboard = Dashboard::default();
-        dashboard.refresh(&db).unwrap();
-
-        let mut terminal = test_terminal();
-        terminal
-            .draw(|frame| {
-                dashboard.render(
-                    frame,
-                    frame.area(),
-                    Theme::Dark,
-                    &[],
-                    &std::collections::HashSet::new(),
-                )
-            })
-            .unwrap();
-
-        let content = terminal
-            .backend()
-            .buffer()
-            .content
-            .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
-        assert!(content.contains("UP TO DATE"), "content was:\n{content}");
-        assert!(
-            !content.contains("needs updating"),
-            "content was:\n{content}"
-        );
+        db.set_firewall_applied_signature(&signature).unwrap();
+        let content = row(&db);
+        assert!(content.contains("[ APPLIED ]"), "content was:\n{content}");
+        assert!(!content.contains("a to apply"), "content was:\n{content}");
     }
 
     // ---- Automatic blocking panel ----

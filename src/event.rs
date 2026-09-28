@@ -108,13 +108,17 @@ pub enum AppEvent {
     /// carries the stringified failure, `anyhow::Error` not being `Clone`.
     NginxReloaded { result: Result<(), String> },
     /// A background firewall render has finished (see
-    /// `App::start_firewall_render`). `signature` is the rendered rule set's
-    /// signature, for the main thread to persist — the `Db` write can't
-    /// happen on the worker. `Err` carries the stringified failure, which
-    /// includes the lockout guard refusing.
+    /// `App::start_firewall_render`): what the guard found, and what was
+    /// written and applied, for the main thread to record — the `Db`
+    /// writes can't happen on the worker. Boxed because it carries the
+    /// script.
     FirewallRendered {
-        signature: String,
-        outcome: Result<crate::app::RenderOutcome, String>,
+        outcome: Box<crate::firewall::FirewallOutcome>,
+    },
+    /// What "Apply everything" would change has been worked out (see
+    /// `App::start_apply_preview`), for the Dashboard to ask about.
+    ApplyPreviewed {
+        preview: Box<crate::preview::ApplyPreview>,
     },
     /// A background walk of the NGINX config root has finished. The
     /// `upsert_site` calls it implies happen on the main thread, `Db` not

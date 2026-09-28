@@ -1886,6 +1886,19 @@ impl Db {
         Ok(())
     }
 
+    /// The rule-set signature as of the last successful apply — the rules
+    /// the kernel was given and the boot unit's script holds. `None` until
+    /// one has been recorded, which includes every database from before
+    /// this was: nothing then recorded what the kernel had.
+    pub fn get_firewall_applied_signature(&self) -> Result<Option<String>> {
+        self.get_text_setting(keys::FIREWALL_APPLIED_SIGNATURE)
+    }
+
+    /// Records `signature` as the rule set just applied.
+    pub fn set_firewall_applied_signature(&self, signature: &str) -> Result<()> {
+        self.set_text_setting(keys::FIREWALL_APPLIED_SIGNATURE, signature)
+    }
+
     // ---- user agent stats ----
 
     /// Adds `counts` (user agent -> hit count from one log-parsing pass, see

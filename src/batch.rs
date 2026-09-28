@@ -76,17 +76,18 @@
 
 use crate::cron::CronJob;
 use crate::db::Db;
-use crate::firewall::{self, FirewallBackend, LockoutStatus};
+use crate::firewall::{self, FirewallBackend};
 use crate::protection::Detector;
 use crate::{nginx, refresh};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 /// Everything a batch run needs to know, resolved from the CLI.
 pub struct BatchOptions {
     /// The NGINX config root to scan and apply to.
     pub root: PathBuf,
-    /// Where the firewall script is written.
+    /// The applied firewall script: the one the boot unit loads. A render
+    /// is written beside it and replaces it only when applied.
     pub out: PathBuf,
     pub backend: FirewallBackend,
     /// Whether to reload NGINX and run the firewall script, rather than
@@ -327,75 +328,42 @@ fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
     Step::new("nginx blocks", outcome)
 }
 
-/// Renders the firewall script, and runs it if `--apply`.
+/// Renders the firewall script, and runs it if `--apply` — through
+/// [`firewall::render_and_apply`], whose policy is the one every front-end
+/// shares. Here that means a guard that *could not run* refuses the apply:
+/// on a host where no SSH log is readable, the check silently passing is
+/// how this project once wrote and applied a script that took a server off
+/// the network, and there is no human here to decide otherwise.
 ///
-/// The lockout guard is the whole reason this function is not three lines.
-/// See [`lockout_verdict`] for why "the guard could not run" is a refusal
-/// here and only a note in `render-firewall`.
+/// `--out` names the *applied* script, the one the boot unit loads; the
+/// render goes beside it (see [`firewall::rendered_path`]) and replaces it
+/// only when an apply succeeded.
 fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
-    let outcome = (|| -> Result<String> {
-        let built = firewall::build_script(db, options.backend)?;
-        lockout_verdict(db, &built.rules, options)?;
-
-        firewall::write_script(&options.out, &built.script)?;
-        db.set_firewall_rendered_signature(&firewall::rules_signature(&built.rules))?;
-        let mut summary = format!("{} rule(s) to {}", built.written, options.out.display());
-
-        if options.apply {
-            firewall::apply_script(options.backend, &options.out)
-                .with_context(|| format!("script written to {}", options.out.display()))?;
-            summary.push_str(", applied");
-        }
-        Ok(summary)
-    })();
+    let run = firewall::FirewallRun::new(options.backend, &options.out)
+        .apply(options.apply)
+        .force(options.force);
+    // Wherever `LogPaths` says the SSH log is: `--ssh-log` first, then the
+    // stored path, then a search.
+    let outcome = crate::logpaths::LogPaths::from_db(db)
+        .map(|paths| paths.ssh(options.ssh_log.as_deref()))
+        .and_then(|source| firewall::render_and_apply(db, run, firewall::SshLog::Read(&source)))
+        .and_then(|outcome| {
+            let summary = outcome.summary();
+            if outcome.succeeded() {
+                Ok(summary)
+            } else if outcome.refused() {
+                Err(anyhow::anyhow!(
+                    "{summary}. Point --ssh-log at the right file, or --force if you know"
+                ))
+            } else {
+                Err(anyhow::anyhow!("{summary}"))
+            }
+        });
     let step = Step::new("firewall", outcome);
     if step.outcome.is_ok() {
         crate::cron::record_run(db, CronJob::RenderFirewall, "rendered by batch run");
     }
     step
-}
-
-/// Decides whether these rules may be written and applied.
-///
-/// Without `--apply` nothing is enforced, so a risky rule set is written
-/// anyway and the admin still gets to look at the script before running
-/// it — same as `render-firewall`.
-///
-/// With `--apply`, both a guard that objects and a guard that *could not
-/// run* are refusals. The second is the one worth spelling out: on a host
-/// where no SSH log is readable, the check silently passing is how this
-/// project once wrote and applied a script that took a server off the
-/// network. An interactive run can print a note and let a human decide;
-/// there is no human here.
-fn lockout_verdict(
-    db: &Db,
-    rules: &[crate::db::FirewallRule],
-    options: &BatchOptions,
-) -> Result<()> {
-    if !options.apply || options.force {
-        return Ok(());
-    }
-    let source = crate::logpaths::LogPaths::from_db(db)?.ssh(options.ssh_log.as_deref());
-    match firewall::assess_lockout_risk(rules, &source) {
-        LockoutStatus::LogUnavailable => anyhow::bail!(
-            "refusing to apply: no SSH log could be read, so the lockout safety check \
-             could not run. Point --ssh-log at the right file, or drop --apply and run \
-             the script by hand. --force overrides this."
-        ),
-        LockoutStatus::Risks(risks) if !risks.is_empty() => {
-            let ips = risks
-                .iter()
-                .map(|(ip, cidr)| format!("{ip} (blocked by {cidr})"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            anyhow::bail!(
-                "refusing to apply: would block {} currently-connected SSH client \
-                 IP address(es): {ips}. --force overrides this.",
-                risks.len()
-            )
-        }
-        _ => Ok(()),
-    }
 }
 
 #[cfg(test)]

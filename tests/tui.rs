@@ -1296,10 +1296,18 @@ fn dashboard_render_popup_applies_the_script_through_nft() {
     send_key(&mut session, "\r");
     session.exp_string("applied").unwrap();
 
-    let script = fs::read_to_string(&out_path).expect("the script should have been written");
-    assert!(script.contains("table"), "script was: {script}");
+    // The rendered script is what runs; once it has, it is copied to the
+    // path the popup named, which is the one a boot unit loads.
+    let rendered = tmp.path().join("fw.next.nft");
     let log = fs::read_to_string(&calls).expect("nft should have been invoked");
-    assert_eq!(log.trim(), format!("nft -f {}", out_path.display()));
+    assert_eq!(log.trim(), format!("nft -f {}", rendered.display()));
+    let script = fs::read_to_string(&out_path).expect("the applied script should be in place");
+    assert!(script.contains("table"), "script was: {script}");
+    assert_eq!(
+        fs::read_to_string(&rendered).unwrap(),
+        script,
+        "what runs at boot must be what was applied"
+    );
 
     send_key(&mut session, "q");
     session.exp_eof().unwrap();

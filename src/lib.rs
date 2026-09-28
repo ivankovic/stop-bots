@@ -44,6 +44,8 @@ pub mod cron;
 #[doc(hidden)]
 pub mod db;
 #[doc(hidden)]
+pub mod diff;
+#[doc(hidden)]
 pub mod dynamic;
 #[doc(hidden)]
 pub mod event;
@@ -83,6 +85,8 @@ pub mod logtime;
 pub mod nftables;
 #[doc(hidden)]
 pub mod nginx;
+#[doc(hidden)]
+pub mod preview;
 #[doc(hidden)]
 pub mod protection;
 #[doc(hidden)]

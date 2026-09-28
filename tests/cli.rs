@@ -1752,6 +1752,103 @@ fn render_firewall_lockout_check_covers_derived_country_ranges_too() {
     assert!(!script_path.exists());
 }
 
+/// `render-firewall --apply`, end to end against a fake `nft`: the
+/// rendered script is what runs, and only once it has does it become the
+/// script a boot unit loads.
+#[test]
+fn render_firewall_apply_runs_the_render_and_then_makes_it_the_boot_script() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, calls) = fake_tools(tmp.path());
+    let db_path = tmp.path().join("db.sqlite3");
+    let applied = tmp.path().join("firewall.nft");
+    let rendered = tmp.path().join("firewall.next.nft");
+    stop_bots_bin()
+        .args(["add-firewall-rule", "--db", db_path.to_str().unwrap()])
+        .args(["--address", "203.0.113.9"])
+        .assert()
+        .success();
+
+    stop_bots_bin()
+        .env("PATH", path_with(&bin))
+        .args([
+            "render-firewall",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--apply",
+        ])
+        .args(["--out", applied.to_str().unwrap()])
+        .args(["--ssh-log", "tests/fixtures/logs/auth.log"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("loads at boot"));
+
+    let log = fs::read_to_string(&calls).unwrap();
+    assert_eq!(log.trim(), format!("nft -f {}", rendered.display()));
+    let boot = fs::read_to_string(&applied).expect("the applied script should be in place");
+    assert!(boot.contains("203.0.113.9"), "applied script was:\n{boot}");
+    assert_eq!(fs::read_to_string(&rendered).unwrap(), boot);
+}
+
+/// With no SSH log to check against, the script is written for review and
+/// not run, and the script a boot unit loads is left alone.
+#[test]
+fn render_firewall_apply_refuses_when_the_lockout_check_cannot_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, calls) = fake_tools(tmp.path());
+    let db_path = tmp.path().join("db.sqlite3");
+    let applied = tmp.path().join("firewall.nft");
+
+    stop_bots_bin()
+        .env("PATH", path_with(&bin))
+        .args([
+            "render-firewall",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--apply",
+        ])
+        .args(["--out", applied.to_str().unwrap()])
+        .args(["--ssh-log", "/nonexistent/auth.log"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not applied"))
+        .stderr(predicate::str::contains("--force overrides this"));
+
+    assert!(!calls.exists(), "nft must not have run");
+    assert!(!applied.exists());
+    assert!(tmp.path().join("firewall.next.nft").exists());
+}
+
+/// A script `nft` rejects must not become what the host loads at boot:
+/// the previous applied script stays exactly as it was.
+#[test]
+fn a_failed_apply_leaves_the_boot_script_as_it_was() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, _calls) = fake_tools(tmp.path());
+    fs::write(tmp.path().join("fail-nft"), "Error: syntax error\n").unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let applied = tmp.path().join("firewall.nft");
+    fs::write(&applied, "# what was applied last week\n").unwrap();
+
+    stop_bots_bin()
+        .env("PATH", path_with(&bin))
+        .args([
+            "render-firewall",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--apply",
+        ])
+        .args(["--out", applied.to_str().unwrap()])
+        .args(["--ssh-log", "tests/fixtures/logs/auth.log"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("applying failed"));
+
+    assert_eq!(
+        fs::read_to_string(&applied).unwrap(),
+        "# what was applied last week\n"
+    );
+}
+
 #[test]
 fn geo_mode_and_country_selection_cli_happy_path() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2401,8 +2498,15 @@ impl Fixture {
         self.cmd(&args)
     }
 
+    /// The applied script: what `--out` names, and what the boot unit
+    /// loads. Only an apply writes it.
     fn firewall_script(&self) -> std::path::PathBuf {
         self.managed.join("firewall.nft")
+    }
+
+    /// The rendered script beside it, which every run writes.
+    fn rendered_script(&self) -> std::path::PathBuf {
+        self.managed.join("firewall.next.nft")
     }
 }
 
@@ -2423,8 +2527,12 @@ fn batch_scans_applies_and_renders_in_one_pass() {
         "the site config should carry the generated block:\n{config}"
     );
     assert!(
-        fixture.firewall_script().exists(),
+        fixture.rendered_script().exists(),
         "the firewall script should have been written"
+    );
+    assert!(
+        !fixture.firewall_script().exists(),
+        "without --apply, nothing reaches the script the boot unit loads"
     );
 }
 
@@ -2489,12 +2597,17 @@ fn batch_apply_refuses_when_the_lockout_check_cannot_run() {
         ])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("refusing to apply"))
+        .stderr(predicate::str::contains("not applied"))
+        .stderr(predicate::str::contains("lockout check could not run"))
         .stderr(predicate::str::contains("--ssh-log"));
 
     assert!(
         !fixture.firewall_script().exists(),
-        "refusing must mean nothing was written, not just nothing applied"
+        "refusing must mean nothing reached the script the boot unit loads"
+    );
+    assert!(
+        fixture.rendered_script().exists(),
+        "the rendered script is inert, so it is written for review"
     );
 }
 
@@ -2522,7 +2635,7 @@ fn batch_protects_the_connected_admin_ahead_of_a_block_covering_them() {
 
     fixture.batch(&[]).assert().success();
 
-    let script = fs::read_to_string(fixture.firewall_script()).unwrap();
+    let script = fs::read_to_string(fixture.rendered_script()).unwrap();
     let allow = nft_rule_for(&script, "192.0.2.10");
     let block = nft_rule_for(&script, "192.0.2.0/24");
     assert!(
@@ -2551,7 +2664,72 @@ fn batch_without_apply_writes_rules_the_guard_would_refuse_to_apply() {
 
     fixture.batch(&[]).assert().success();
 
-    assert!(fixture.firewall_script().exists());
+    assert!(fixture.rendered_script().exists());
+}
+
+/// `batch --dry-run` prints what the two planes would do and changes
+/// nothing: no site file, no script, and not even the rendered signature
+/// a Dashboard reads.
+#[test]
+fn a_batch_dry_run_says_what_would_change_and_changes_nothing() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    let site = fixture.write_site("example.com");
+    let before = fs::read_to_string(&site).unwrap();
+    fixture.run(&["add-firewall-rule", "--address", "203.0.113.9"]);
+
+    let output = fixture.batch(&["--apply", "--dry-run"]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(output.status.success(), "stdout:\n{stdout}");
+    for (what, expected) in [
+        ("that it is a dry run", "Dry run"),
+        ("the site file", "example.com"),
+        ("the rules against the applied script", "all of it is new"),
+        ("the lockout check", "lockout check passed"),
+        ("the verdict", "would be applied"),
+    ] {
+        assert!(stdout.contains(expected), "no {what} in:\n{stdout}");
+    }
+    assert_eq!(fs::read_to_string(&site).unwrap(), before);
+    assert!(!fixture.rendered_script().exists());
+    assert!(!fixture.firewall_script().exists());
+    let db = stop_bots::db::Db::open(&fixture.db).unwrap();
+    assert_eq!(db.get_firewall_rendered_signature().unwrap(), None);
+}
+
+/// And `--diff` shows how: the site's new block and the script's rules.
+#[test]
+fn a_batch_dry_run_with_diff_prints_every_change() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    fixture.write_site("example.com");
+    fixture.run(&["add-firewall-rule", "--address", "203.0.113.9"]);
+
+    fixture
+        .batch(&["--dry-run", "--diff"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+++ "))
+        .stdout(predicate::str::contains("+\t203.0.113.9"))
+        .stdout(predicate::str::contains("+    # BEGIN stop-bots"));
+}
+
+#[test]
+fn apply_blocks_dry_run_lists_and_diffs_without_writing() {
+    let fixture = Fixture::new();
+    fixture.seed_bots();
+    let site = fixture.write_site("example.com");
+    let before = fs::read_to_string(&site).unwrap();
+    let root = fixture.nginx_root.to_str().unwrap();
+
+    fixture
+        .run(&["apply-blocks", "--root", root, "--dry-run", "--diff"])
+        .stdout(predicate::str::contains("1 file(s) would change"))
+        .stdout(predicate::str::contains(site.to_str().unwrap()))
+        .stdout(predicate::str::contains("+    # BEGIN stop-bots"));
+
+    assert_eq!(fs::read_to_string(&site).unwrap(), before);
 }
 
 /// One step failing must not stop the others, and must still be visible:

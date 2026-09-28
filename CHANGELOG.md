@@ -28,6 +28,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - A `managed_files` table (schema version 2) records every generated NGINX
   file written; cleaning up works from it, so a `conf.d` left behind by an
   old NGINX root is removed too.
+- `render-firewall --apply`: runs the script if the lockout check allows, and
+  makes it the one loaded at boot.
+- `apply-blocks --dry-run` and `batch --dry-run` print what would change and change
+  nothing; `--diff` adds a unified diff of every file.
 
 ### Changed
 
@@ -91,6 +95,21 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   a failed apply leaves the previous chain as it was.
 - **iptables: IPv6 rules are applied** through `ip6tables-restore`, not skipped.
 - `status` counts set elements and ip6tables rules as loaded rules.
+
+
+- **A render no longer changes what loads at boot.** It writes
+  `/etc/stop-bots/firewall.next.nft` (or `.next.sh`); only an apply that succeeded
+  copies it to `firewall.nft`, the file `stop-bots-firewall.service` loads.
+- **One lockout policy for every front-end.** No readable SSH log: the script is
+  written, with a note, and not applied. A connected SSH client the rules would
+  block: nothing is written or applied. `--force` overrides both.
+- The Dashboards and `status` say whether the rules are applied, rendered and not
+  applied, or changed. `batch --out` names the applied script.
+- **"Apply everything" asks first.** `a` in the TUI and the console's button show the
+  files that would change, the rules added and removed, and the lockout check's
+  verdict, with a diff on request (`d`, or "Show the diff").
+- The TUI's render popup opens on the stored backend and its path, and remembers
+  the backend it renders for, as the console does.
 
 ### Fixed
 

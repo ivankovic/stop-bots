@@ -19,7 +19,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
-use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule};
+use stop_bots::db::{Db, FirewallAction, NewFirewallRule};
 use stop_bots::protection::Detector;
 use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
 
@@ -146,6 +146,13 @@ enum Command {
         /// left on.
         #[arg(long)]
         no_reload: bool,
+        /// Print which files would change, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// With --dry-run, also print a unified diff of every file that
+        /// would change
+        #[arg(long, requires = "dry_run")]
+        diff: bool,
     },
     /// Add a firewall rule blocking (or allowing) an IP address or CIDR range
     AddFirewallRule {
@@ -239,17 +246,21 @@ enum Command {
     /// `add-country`). Derived rules are computed fresh on each render and
     /// never stored.
     ///
-    /// This command only writes the script; it never runs it. Review it,
-    /// then run it (`nft -f <script>` or `sh <script>`) — or let `batch
-    /// --apply`, or "Apply everything" in the TUI or the web console, do
-    /// both steps.
+    /// Without --apply this only writes the script, to
+    /// /etc/stop-bots/firewall.next.nft (or firewall.next.sh), which
+    /// nothing loads. Review it, then run `render-firewall --apply`: that
+    /// runs it and copies it to /etc/stop-bots/firewall.nft (or
+    /// firewall.sh), the script `install firewall` loads at boot. `batch
+    /// --apply` and "Apply everything" in the TUI or the web console do the
+    /// same.
     ///
     /// Before writing anything, checks recent successful SSH logins (from
     /// /var/log/auth.log, /var/log/secure or journalctl) against every
     /// address about to be blocked, simulating the same first-match-wins
     /// order the script itself will evaluate. If any currently-connected
-    /// client would be cut off, it refuses to write the script (pass
-    /// --force to override).
+    /// client would be cut off, it refuses to write the script. If no SSH
+    /// log could be read, it writes the script but refuses to apply it.
+    /// --force overrides both.
     ///
     /// Allowlist geo mode needs the nftables backend: iptables has no
     /// loopback/established-connection allowance and silently permits all
@@ -261,15 +272,19 @@ enum Command {
         /// changed.
         #[arg(long)]
         backend: Option<FirewallBackend>,
-        /// Where to write the script. Defaults to
-        /// /etc/stop-bots/firewall.nft for nftables and
-        /// /etc/stop-bots/firewall.sh for iptables: the file `stop-bots
-        /// install firewall` loads at boot and the health check looks for.
-        /// Writing anywhere else gives a script nothing reads.
+        /// Write the script to this file instead, for you to review or run
+        /// yourself; nothing loads it at boot. With --apply it names the
+        /// applied script instead, as `batch --out` does, and the script is
+        /// written beside it as <name>.next.<ext>
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Write the script even if it would block an IP with a recent
-        /// successful SSH login
+        /// Run the script once it is written, if the lockout check allows,
+        /// and make it the script loaded at boot
+        #[arg(long)]
+        apply: bool,
+        /// Write, and with --apply run, the script even if it would block
+        /// an IP with a recent successful SSH login, or no SSH log could be
+        /// read to check
         #[arg(long)]
         force: bool,
         /// Check this SSH log file instead of auto-detecting one — for a
@@ -1071,10 +1086,14 @@ enum Command {
     /// With --apply, the SSH lockout guard refuses — and refusing means
     /// nothing is applied — if the rules would block a currently-connected
     /// client, *or* if no SSH log could be read at all so the check could
-    /// not run. An interactive `render-firewall` only prints a note in that
-    /// second case, because a human is watching; from crontab nobody is.
-    /// Pass --ssh-log if the log isn't where this expects, or --force if
-    /// you know what you're doing.
+    /// not run. That is the same line every other apply draws. Pass
+    /// --ssh-log if the log isn't where this expects, or --force if you
+    /// know what you're doing.
+    ///
+    /// The script is written to /etc/stop-bots/firewall.next.nft (or
+    /// .next.sh) and copied to firewall.nft, the file the boot unit loads,
+    /// only once it has been applied. --dry-run prints what would change
+    /// and changes nothing.
     ///
     /// Refreshes bot lists and crawler IP ranges in full, and reputation
     /// feeds and country ranges only where they are switched on or
@@ -1089,9 +1108,11 @@ enum Command {
         /// only writing both
         #[arg(long)]
         apply: bool,
-        /// Path to write the generated firewall script to. Defaults to
-        /// /etc/stop-bots/firewall.nft, or firewall.sh for iptables —
-        /// which generates a shell script, not an nftables one
+        /// The applied firewall script: what an apply replaces, and what the
+        /// boot unit loads. The script is written beside it as
+        /// <name>.next.<ext>. Defaults to /etc/stop-bots/firewall.nft, or
+        /// firewall.sh for iptables — which generates a shell script, not an
+        /// nftables one
         #[arg(long)]
         out: Option<PathBuf>,
         /// Which firewall to generate for. Defaults to whichever backend
@@ -1117,9 +1138,20 @@ enum Command {
         /// an access log changes every second)
         #[arg(long)]
         no_fetch: bool,
-        /// Print a line per step, not just the failures
+        /// Print a line per step, not just the failures. With --dry-run,
+        /// also print the diffs --diff prints
         #[arg(long, short)]
         verbose: bool,
+        /// Print what the NGINX and firewall steps would change — the
+        /// files, the rules added and removed against the applied script,
+        /// the lockout check's verdict — and change nothing: nothing is
+        /// downloaded, scanned, written, applied or recorded
+        #[arg(long)]
+        dry_run: bool,
+        /// With --dry-run, also print a unified diff of every file that
+        /// would change, the firewall script included
+        #[arg(long, requires = "dry_run")]
+        diff: bool,
     },
     /// Set stop-bots up as a system service.
     ///
@@ -1513,29 +1545,40 @@ async fn main() -> Result<()> {
             force,
             no_fetch,
             verbose,
+            dry_run,
+            diff,
         }) => {
-            run_batch(
-                db,
-                BatchRequest {
-                    root,
-                    out,
-                    backend,
-                    apply,
-                    ssh_log,
-                    access_log,
-                    force,
-                    no_fetch,
-                },
-                verbose,
-            )
-            .await
+            let request = BatchRequest {
+                root,
+                out,
+                backend,
+                apply,
+                ssh_log,
+                access_log,
+                force,
+                no_fetch,
+            };
+            if dry_run {
+                preview_batch(db, request, diff || verbose)
+            } else {
+                run_batch(db, request, verbose).await
+            }
         }
         Some(Command::ScanSites { root }) => scan_sites(root.as_deref(), db),
         Some(Command::UpdateBotLists { source_id, source }) => {
             update_bot_lists(db, source_id, source).await
         }
-        Some(Command::ApplyBlocks { root, no_reload }) => {
-            apply_blocks(root.as_deref(), db, no_reload)
+        Some(Command::ApplyBlocks {
+            root,
+            no_reload,
+            dry_run,
+            diff,
+        }) => {
+            if dry_run {
+                preview_apply_blocks(root.as_deref(), db, diff)
+            } else {
+                apply_blocks(root.as_deref(), db, no_reload)
+            }
         }
         Some(Command::AddFirewallRule {
             address,
@@ -1548,9 +1591,19 @@ async fn main() -> Result<()> {
         Some(Command::RenderFirewall {
             backend,
             out,
+            apply,
             force,
             ssh_log,
-        }) => render_firewall(db, backend, out, force, ssh_log),
+        }) => render_firewall(
+            db,
+            RenderRequest {
+                backend,
+                out,
+                apply,
+                force,
+                ssh_log,
+            },
+        ),
         Some(Command::SetFirewallBackend { backend }) => set_firewall_backend(db, backend),
         Some(Command::BlockSshScanners {
             threshold,
@@ -2026,6 +2079,57 @@ async fn update_bot_lists(
         None => botlist::update(&db, kind).await?,
     };
     println!("Stored {count} bot(s) from {}", kind.name());
+    Ok(())
+}
+
+/// `apply-blocks --dry-run`: the files an apply would change, and with
+/// `--diff` how, through the functions the apply uses. Writes nothing.
+fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    let root = nginx::root(&db, root)?;
+    let changes = nginx::preview_all_sites(&db, &root);
+    println!("Dry run: nothing is written or reloaded.");
+    let changes = changes.map_err(|err| format!("{err:#}"));
+    for line in stop_bots::preview::nginx_lines(&changes) {
+        println!("{line}");
+    }
+    let changes = changes.map_err(|err| anyhow::anyhow!(err))?;
+    if diff {
+        print!("{}", stop_bots::preview::nginx_diff(&changes));
+    }
+    Ok(())
+}
+
+/// `batch --dry-run`: what the NGINX and firewall steps would change,
+/// against the database as it is — nothing is downloaded or scanned first,
+/// because both would write to it.
+fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    let root = nginx::root(&db, request.root.as_deref())?;
+    let (backend, out) = firewall_target(&db, request.backend, request.out)?;
+    let run = stop_bots::firewall::FirewallRun::new(backend, out)
+        .apply(request.apply)
+        .force(request.force);
+    // The flag, else the path `set-log-paths` stored, else the search.
+    let source = stop_bots::logpaths::LogPaths::from_db(&db)?.ssh(request.ssh_log.as_deref());
+    let preview = stop_bots::preview::apply_everything(
+        &db,
+        &root,
+        run,
+        stop_bots::firewall::SshLog::Read(&source),
+    );
+
+    println!(
+        "Dry run: nothing is downloaded, scanned, written, applied or recorded. Against the \
+         database as it is, `batch{}` would:",
+        if request.apply { " --apply" } else { "" }
+    );
+    for line in preview.lines() {
+        println!("{line}");
+    }
+    if diff {
+        print!("{}", preview.diff());
+    }
     Ok(())
 }
 
@@ -3770,36 +3874,23 @@ fn list_selected_countries(db_path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// The lockout safety check `render_firewall` runs before writing anything:
-/// finds recent successful SSH logins (via `--ssh-log`, or auto-detected)
-/// and warns if any of them would actually end up blocked by `rules` (see
-/// [`stop_bots::firewall::lockout_risks`] for what "actually end up" means).
-/// Returns whether it's safe to proceed — `false` means the caller should
-/// refuse to write the script unless `--force` was passed. A log source
-/// that couldn't be found or read at all is not a risk in itself (nothing
-/// to check against), just a note that the check didn't run.
-fn check_lockout_risk(
-    db: &Db,
-    rules: &[FirewallRule],
-    ssh_log: Option<&Path>,
-    force: bool,
-) -> Result<bool> {
-    // The flag, else the path `set-log-paths` stored, else the search.
-    let source = stop_bots::logpaths::LogPaths::from_db(db)?.ssh(ssh_log);
-    match stop_bots::firewall::assess_lockout_risk(rules, &source) {
-        stop_bots::firewall::LockoutStatus::LogUnavailable => {
-            eprintln!(
-                "Note: couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — skipping the lockout safety check. Run as root, or pass --ssh-log, for this check to work."
-            );
-            Ok(true)
-        }
-        stop_bots::firewall::LockoutStatus::Risks(risks) => {
-            if risks.is_empty() {
-                return Ok(true);
+/// What `render-firewall` says on stderr about the lockout guard, before
+/// the outcome: the warning names every client at risk, and an unreadable
+/// log is a note on a write and a refusal on an apply.
+fn report_lockout_guard(outcome: &stop_bots::firewall::FirewallOutcome) {
+    match &outcome.guard {
+        stop_bots::firewall::Guard::LogUnreadable => eprintln!(
+            "Note: couldn't read any SSH log (tried the stored path, /var/log/auth.log, \
+             /var/log/secure and journalctl), so the lockout safety check could not run.{} Run as root, or pass \
+             --ssh-log, for this check to work.",
+            if outcome.apply == stop_bots::firewall::ApplyStep::NotAsked {
+                " The script is written anyway: it is not applied."
+            } else {
+                ""
             }
-            print_lockout_warning(&risks);
-            Ok(force)
-        }
+        ),
+        stop_bots::firewall::Guard::Ran(risks) if !risks.is_empty() => print_lockout_warning(risks),
+        stop_bots::firewall::Guard::Ran(_) => {}
     }
 }
 
@@ -3847,33 +3938,83 @@ fn firewall_target(
     Ok((backend, out))
 }
 
-fn render_firewall(
-    db_path: Option<PathBuf>,
+/// `render-firewall`, through the one path every front-end shares (see
+/// `firewall::FirewallRun` for the policy).
+///
+/// Without `--out` the script goes beside the applied one — the file the
+/// boot unit loads — and `--apply` is what promotes it. With `--out` alone
+/// it goes where the operator said, which is theirs to run. With both,
+/// `--out` names the applied script, as it does for `batch`.
+fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<()> {
+    use stop_bots::firewall::{ApplyStep, WriteStep};
+
+    let db = open_db(db_path)?;
+    let named = if request.apply {
+        request.out.clone()
+    } else {
+        None
+    };
+    let (backend, applied) = firewall_target(&db, request.backend, named)?;
+    let mut run = stop_bots::firewall::FirewallRun::new(backend, applied)
+        .apply(request.apply)
+        .force(request.force);
+    if let (Some(out), false) = (&request.out, request.apply) {
+        run = run.rendered_at(out);
+    }
+    // The flag, else the path `set-log-paths` stored, else the search.
+    let source = stop_bots::logpaths::LogPaths::from_db(&db)?.ssh(request.ssh_log.as_deref());
+    let outcome = stop_bots::firewall::render_and_apply(
+        &db,
+        run,
+        stop_bots::firewall::SshLog::Read(&source),
+    )?;
+
+    report_lockout_guard(&outcome);
+    let rendered = outcome.rendered_path.display();
+    match (&outcome.write, &outcome.apply) {
+        (WriteStep::Refused, _) => anyhow::bail!(
+            "Refusing to write firewall rules: would block a currently-connected SSH client. \
+             Re-run with --force if you're sure."
+        ),
+        (WriteStep::Failed(err), _) => anyhow::bail!("{err}"),
+        (WriteStep::Written, ApplyStep::NotAsked) if request.out.is_some() => println!(
+            "Wrote {} rule(s) to {rendered}. Not applied — review it, then run: {} {rendered}",
+            outcome.entries,
+            backend.apply_command(),
+        ),
+        (WriteStep::Written, ApplyStep::NotAsked) => println!(
+            "Wrote {} rule(s) to {rendered}. Not applied — review it, then run \
+             `stop-bots render-firewall --apply`, which checks for a lockout again, runs it, and \
+             makes it the script loaded at boot ({}).",
+            outcome.entries,
+            outcome.applied_path.display()
+        ),
+        (WriteStep::Written, ApplyStep::Refused) => {
+            anyhow::bail!("{}. --force overrides this.", outcome.summary())
+        }
+        _ if outcome.succeeded() => println!("{}", capitalised(&outcome.summary())),
+        _ => anyhow::bail!("{}", outcome.summary()),
+    }
+    Ok(())
+}
+
+/// `render-firewall`'s flags, gathered.
+struct RenderRequest {
     backend: Option<FirewallBackend>,
     out: Option<PathBuf>,
+    apply: bool,
     force: bool,
     ssh_log: Option<PathBuf>,
-) -> Result<()> {
-    let db = open_db(db_path)?;
-    let (backend, out) = firewall_target(&db, backend, out)?;
-    let out = out.as_path();
-    let built = stop_bots::firewall::build_script(&db, backend)?;
+}
 
-    if !check_lockout_risk(&db, &built.rules, ssh_log.as_deref(), force)? {
-        anyhow::bail!(
-            "Refusing to write firewall rules: would block a currently-connected SSH client. Re-run with --force if you're sure."
-        );
+/// `text` with its first letter upper-cased: the shared summaries are
+/// written to sit inside other sentences.
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
-
-    stop_bots::firewall::write_script(out, &built.script)?;
-    println!(
-        "Wrote {} rule(s) to {}. Not applied automatically — review it, then run: {} {}",
-        built.written,
-        out.display(),
-        backend.apply_command(),
-        out.display()
-    );
-    Ok(())
 }
 
 /// Finds scanning IPs in the SSH log and adds a temporary Block rule for
@@ -4736,76 +4877,6 @@ mod tests {
         assert_eq!(format_expiry(expires_at), "expires in 1h");
     }
 
-    fn rule(address: &str, action: FirewallAction) -> FirewallRule {
-        FirewallRule {
-            id: 0,
-            address: address.to_string(),
-            port: None,
-            action,
-            enabled: true,
-            expires_at: None,
-        }
-    }
-
-    #[test]
-    fn check_lockout_risk_blocks_without_force_and_passes_with_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("auth.log");
-        std::fs::write(
-            &log_path,
-            "Accepted publickey for admin from 4.5.6.7 port 12345 ssh2\n",
-        )
-        .unwrap();
-
-        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        assert!(!check_lockout_risk(
-            &Db::open_in_memory().unwrap(),
-            &rules,
-            Some(&log_path),
-            false
-        )
-        .unwrap());
-        assert!(check_lockout_risk(
-            &Db::open_in_memory().unwrap(),
-            &rules,
-            Some(&log_path),
-            true
-        )
-        .unwrap());
-    }
-
-    #[test]
-    fn check_lockout_risk_passes_when_the_log_has_no_matching_login() {
-        let dir = tempfile::tempdir().unwrap();
-        let log_path = dir.path().join("auth.log");
-        std::fs::write(
-            &log_path,
-            "Accepted publickey for admin from 9.9.9.9 port 12345 ssh2\n",
-        )
-        .unwrap();
-
-        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        assert!(check_lockout_risk(
-            &Db::open_in_memory().unwrap(),
-            &rules,
-            Some(&log_path),
-            false
-        )
-        .unwrap());
-    }
-
-    #[test]
-    fn check_lockout_risk_passes_when_the_log_source_is_unavailable() {
-        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        assert!(check_lockout_risk(
-            &Db::open_in_memory().unwrap(),
-            &rules,
-            Some(Path::new("/nonexistent/x.log")),
-            false
-        )
-        .unwrap());
-    }
-
     /// With neither flag, a render follows the host: the stored backend,
     /// and that backend's own file. An iptables host used to get
     /// `firewall.nft` holding a shell script.
@@ -4857,10 +4928,13 @@ mod tests {
 
         let result = render_firewall(
             Some(db_path),
-            Some(FirewallBackend::Iptables),
-            Some(out.clone()),
-            false,
-            None,
+            RenderRequest {
+                backend: Some(FirewallBackend::Iptables),
+                out: Some(out.clone()),
+                apply: false,
+                force: false,
+                ssh_log: None,
+            },
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nftables"));

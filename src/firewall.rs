@@ -16,23 +16,30 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! Shared firewall-rendering logic used by both the CLI's `render-firewall`
-//! subcommand and the TUI's Dashboard "render firewall" popup (`f` key) —
-//! gathering rules, the allowlist/iptables guard, script rendering and the
-//! lockout safety check all live here so the two callers can never drift
-//! out of sync with each other. Presentation (what gets printed to stderr
-//! for the CLI vs. what gets put in the TUI's status message) stays with
-//! each caller.
+//! The firewall: gathering rules, the allowlist/iptables guard, script
+//! rendering, the lockout guard, writing and applying.
+//!
+//! **One path, five front-ends.** `render-firewall`, `batch`, the internal
+//! cron, the TUI and the web console all go render → guard → write → apply
+//! through [`prepare`], [`execute`] and [`record`] (or [`render_and_apply`],
+//! all three at once), with one policy — see [`FirewallRun`]. They differ
+//! only in how they put the [`FirewallOutcome`] into words. It is the one
+//! path in this project that can take a server off the network, and it
+//! used to exist five times with four answers to "no SSH log".
+//!
+//! **Two scripts.** A render writes [`rendered_path`]; only an apply copies
+//! it to the applied path, which is what `stop-bots-firewall.service`
+//! loads at boot.
 
 use crate::db::{Db, FirewallAction, FirewallRule, GeoMode};
 use crate::{ipranges, iptables, nftables, sshlog};
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// The default output path for a rendered firewall script — shared by the
-/// Dashboard's `f`-key render popup and the internal cron's
-/// `RenderFirewall` job (see `crate::cron`), so a script one renders is
-/// where the other expects to find it.
+/// The applied firewall script: what the boot unit `install firewall`
+/// writes loads, and what an apply replaces. Renders go beside it (see
+/// [`rendered_path`]). Every front-end defaults to it, so a script one
+/// applies is where the others expect to find it.
 pub const DEFAULT_OUTPUT_PATH: &str = "/etc/stop-bots/firewall.nft";
 
 /// Which backend to render a script for.
@@ -196,32 +203,89 @@ pub fn lockout_risks(rules: &[FirewallRule], connected_ips: &[String]) -> Vec<(S
     risks
 }
 
-/// What checking `rules` against currently-connected SSH clients found.
-pub enum LockoutStatus {
-    /// No SSH log could be found or read at all — nothing to check
-    /// against, not itself a risk.
-    LogUnavailable,
-    /// Checked; these currently-connected `(ip, matching_rule_address)`
-    /// pairs would actually end up blocked (empty if none would).
-    Risks(Vec<(String, String)>),
+/// What the lockout guard found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Guard {
+    /// The SSH log was read. These currently-connected `(ip,
+    /// matching_rule_address)` pairs would end up blocked; empty is a pass.
+    Ran(Vec<(String, String)>),
+    /// No SSH log could be found or read, so there was nothing to check
+    /// against. Not a risk in itself, and not a pass either.
+    LogUnreadable,
 }
 
-/// Finds recent successful SSH logins in `ssh_log` (see [`sshlog::SshSource::read`]) and
-/// checks whether any of them would actually end up blocked by `rules` (see
-/// [`lockout_risks`] for what "actually end up" means). Pure with respect to
-/// presentation: callers decide how to report [`LockoutStatus::Risks`] and
-/// whether to proceed anyway.
-pub fn assess_lockout_risk(rules: &[FirewallRule], ssh_log: &sshlog::SshSource) -> LockoutStatus {
-    // Read live, every time, and from wherever `LogPaths` says the log is:
-    // a stored `set-log-paths --ssh-log` used to be ignored here, so a
-    // host with its log somewhere else had a guard that could never run.
-    // The journal is read back a week, not whole.
-    match ssh_log.read(sshlog::recent_since()) {
-        sshlog::LogSource::Found(text) => {
-            let connected_ips = sshlog::parse_accepted_ips(&text);
-            LockoutStatus::Risks(lockout_risks(rules, &connected_ips))
+impl Guard {
+    /// The connected clients the rules would block. Empty when the guard
+    /// could not run, which is why this alone never means "safe".
+    pub fn risks(&self) -> &[(String, String)] {
+        match self {
+            Guard::Ran(risks) => risks,
+            Guard::LogUnreadable => &[],
         }
-        sshlog::LogSource::Unavailable => LockoutStatus::LogUnavailable,
+    }
+
+    /// Whether the guard ran *and* found nothing.
+    pub fn passed(&self) -> bool {
+        matches!(self, Guard::Ran(risks) if risks.is_empty())
+    }
+
+    /// One line for any front-end: what the guard found.
+    pub fn describe(&self) -> String {
+        match self {
+            Guard::Ran(risks) if risks.is_empty() => "lockout check passed: the SSH log was read, \
+                                                      and no connected client would be blocked"
+                .to_string(),
+            Guard::Ran(risks) => format!(
+                "lockout check FAILED: these rules would block {} connected SSH client(s): {}",
+                risks.len(),
+                risks
+                    .iter()
+                    .map(|(ip, rule)| format!("{ip} (blocked by {rule})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Guard::LogUnreadable => "lockout check could not run: no SSH log could be read \
+                                     (pass --ssh-log, or run as root)"
+                .to_string(),
+        }
+    }
+}
+
+/// Where the lockout guard gets its SSH log.
+#[derive(Debug, Clone, Copy)]
+pub enum SshLog<'a> {
+    /// Read it from here, live: what [`crate::logpaths::LogPaths::ssh`]
+    /// resolved — a flag, else the stored path, else a search.
+    Read(&'a sshlog::SshSource),
+    /// Already read by the caller; `None` means nothing could be read.
+    Text(Option<&'a str>),
+    /// Already read and parsed into the addresses with a recent login, as
+    /// the internal cron's log pass does; `None` means nothing could be
+    /// read.
+    Connected(Option<&'a [String]>),
+}
+
+/// Checks `rules` against the SSH clients `log` says are connected — see
+/// [`lockout_risks`] for what "would be blocked" means.
+///
+/// Reads the log **live**, every time, when asked to read, and from
+/// wherever `LogPaths` says it is: a stored `set-log-paths --ssh-log` used
+/// to be ignored here, so a host with its log elsewhere had a guard that
+/// could never run. The journal is read back a week, not whole. It is the
+/// one guard between a keypress and a server that can no longer be
+/// reached, and a cached copy could be minutes old.
+pub fn check_lockout(rules: &[FirewallRule], log: SshLog<'_>) -> Guard {
+    let connected = match log {
+        SshLog::Read(source) => match source.read(sshlog::recent_since()) {
+            sshlog::LogSource::Found(text) => Some(sshlog::parse_accepted_ips(&text)),
+            sshlog::LogSource::Unavailable => None,
+        },
+        SshLog::Text(text) => text.map(sshlog::parse_accepted_ips),
+        SshLog::Connected(connected) => connected.map(<[String]>::to_vec),
+    };
+    match connected {
+        Some(connected) => Guard::Ran(lockout_risks(rules, &connected)),
+        None => Guard::LogUnreadable,
     }
 }
 
@@ -230,7 +294,7 @@ pub fn assess_lockout_risk(rules: &[FirewallRule], ssh_log: &sshlog::SshSource) 
 pub struct BuiltFirewall {
     /// Every rule that went into `script`: admin-managed rules followed by
     /// derived crawler/geo rules, in the exact order they were rendered —
-    /// feed this to [`assess_lockout_risk`] so the safety check evaluates
+    /// feed this to [`check_lockout`] so the safety check evaluates
     /// the same order the script itself will.
     pub rules: Vec<FirewallRule>,
     pub script: String,
@@ -653,29 +717,11 @@ fn unsafe_script_directory(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) 
 /// command (`sh <out>` for iptables, `nft -f <out>` for nftables — see
 /// [`FirewallBackend::apply_command`]) against it. This is the one place in
 /// the whole project that executes a generated firewall script rather than
-/// only ever writing it — the Dashboard's render popup's "apply after
-/// writing" toggle (`App::start_firewall_render`), gated by the same
-/// `apply_firewall`/explicit-confirmation guard `nginx::reload` uses for
-/// NGINX reloads.
+/// only ever writing it, and it has exactly one caller: [`execute`], which
+/// runs it only after the lockout guard has passed (or been forced past)
+/// and only for a front-end that was asked to apply — see [`FirewallRun`]
+/// for the policy and who asks.
 ///
-/// There are exactly three callers, and one of them *is* unattended — this
-/// comment once claimed there were none of those, which is the wrong answer
-/// to the one question anyone reads it to ask:
-///
-/// - `App::start_firewall_render`, from the TUI Dashboard's render popup,
-///   only when the TUI was started without `--no-apply`.
-/// - `web::dashboard::write_and_apply_firewall`, from the console's "run it
-///   after writing" box or its "Apply everything" button, only when the
-///   console was started without `--no-apply`. The console refusing to do
-///   this at all was a deliberate omission until it was reversed on
-///   request; the guard below is what replaced the omission.
-/// - `batch::render_and_apply_firewall`, under `batch --apply`, which is
-///   the documented crontab entry point and has nobody watching.
-///
-/// All three run `assess_lockout_risk` over the same rules, in the same
-/// order the script will evaluate them, before the script is written — and
-/// under `batch --apply` a guard that merely *could not run* is a refusal
-/// too.
 /// So `README.md`'s "generated, never applied *automatically*" holds in the
 /// sense that matters: nothing applies a script without an operator having
 /// asked for it, whether by pressing a key or by putting `--apply` in a
@@ -715,6 +761,536 @@ pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// ---- the one path: render, guard, write, apply ----
+
+/// Where the script a render writes goes, beside the `applied` one.
+///
+/// **Two files, because a reboot must not enforce what nobody applied.**
+/// `stop-bots-firewall.service` loads the applied script at boot. Every
+/// front-end used to write straight to that file, the internal cron
+/// included, whether or not anyone then applied it — so a detector's block,
+/// written at 3am and never applied, went live at the next reboot. A render
+/// now writes `firewall.next.nft` (or `.next.sh`); only an apply that
+/// succeeded copies it over `firewall.nft`.
+///
+/// The applied path keeps the name every existing unit, `include` line and
+/// habit already points at. Moving the *rendered* one is what changes
+/// nothing for a host that upgrades.
+pub fn rendered_path(applied: &Path) -> std::path::PathBuf {
+    let stem = applied
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let name = match applied.extension() {
+        Some(ext) => format!("{stem}.next.{}", ext.to_string_lossy()),
+        None => format!("{stem}.next"),
+    };
+    applied.with_file_name(name)
+}
+
+/// One run of the firewall path, as a front-end asks for it.
+///
+/// ## The policy, which every front-end shares
+///
+/// - **Writing** the rendered script is allowed when no SSH log could be
+///   read. The outcome carries the note, and a written script is inert:
+///   nothing loads it, at boot or otherwise, until an apply.
+/// - **Writing is refused** when the guard ran and found that a connected
+///   SSH client would be blocked, unless `force`. A script that would lock
+///   the operator out is not worth reviewing, and one that is on disk gets
+///   run by hand.
+/// - **Applying is refused** when the log could not be read, or when a
+///   connected client would be blocked, unless `force`. "The check could
+///   not run" is not "the check passed", whoever is watching.
+/// - **An apply runs the rendered script and then promotes it** to
+///   `applied_path`, the file the boot unit loads. A failed apply promotes
+///   nothing.
+/// - **The rendered signature is recorded on every write, the applied one
+///   on every apply** (see [`record`]); a dry run records neither.
+///
+/// Five front-ends used to implement this themselves and handled "no SSH
+/// log" four different ways: the TUI refused to write, the console wrote
+/// but would not apply, the cron wrote without applying, `batch` bailed,
+/// and `render-firewall` printed a note and recorded no signature.
+#[derive(Debug, Clone)]
+pub struct FirewallRun {
+    pub backend: FirewallBackend,
+    /// The applied script: what the boot unit loads, and what an apply
+    /// replaces.
+    pub applied_path: std::path::PathBuf,
+    /// Where the rendered script is written. [`rendered_path`] of
+    /// `applied_path` unless the operator named a file
+    /// (`render-firewall --out`).
+    pub rendered_path: std::path::PathBuf,
+    /// Whether to run the script once it is written.
+    pub apply: bool,
+    /// Whether this process may really run `nft`/`sh`. `false` under
+    /// `--no-apply`/`--no-reload` and in tests, where an apply that the
+    /// guard allowed stops short and says so.
+    pub for_real: bool,
+    /// Past the guard's refusals, for someone who knows.
+    pub force: bool,
+    /// Decide and describe everything, and write, run and record nothing.
+    pub dry_run: bool,
+}
+
+impl FirewallRun {
+    /// A write-only run for `backend`, applied path `applied_path`.
+    pub fn new(backend: FirewallBackend, applied_path: impl Into<std::path::PathBuf>) -> Self {
+        let applied_path = applied_path.into();
+        FirewallRun {
+            backend,
+            rendered_path: rendered_path(&applied_path),
+            applied_path,
+            apply: false,
+            for_real: true,
+            force: false,
+            dry_run: false,
+        }
+    }
+
+    pub fn apply(self, apply: bool) -> Self {
+        FirewallRun { apply, ..self }
+    }
+
+    pub fn for_real(self, for_real: bool) -> Self {
+        FirewallRun { for_real, ..self }
+    }
+
+    pub fn force(self, force: bool) -> Self {
+        FirewallRun { force, ..self }
+    }
+
+    pub fn dry_run(self, dry_run: bool) -> Self {
+        FirewallRun { dry_run, ..self }
+    }
+
+    /// Writes the rendered script to `path` rather than beside the applied
+    /// one.
+    pub fn rendered_at(self, path: impl Into<std::path::PathBuf>) -> Self {
+        FirewallRun {
+            rendered_path: path.into(),
+            ..self
+        }
+    }
+}
+
+/// A run with every database read done, so the rest can happen where no
+/// `Db` may go — the TUI's worker thread, or outside the console's lock.
+#[derive(Debug)]
+pub struct Prepared {
+    pub run: FirewallRun,
+    pub built: BuiltFirewall,
+    /// [`rules_signature`] of `built.rules`, for [`record`].
+    pub signature: String,
+}
+
+/// Reads and renders: the database half of a run. Fails before anything
+/// is checked or written if the rules cannot be rendered for this backend
+/// at all (see [`build_script`]).
+pub fn prepare(db: &Db, run: FirewallRun) -> Result<Prepared> {
+    let built = build_script(db, run.backend)?;
+    let signature = rules_signature(&built.rules);
+    Ok(Prepared {
+        run,
+        built,
+        signature,
+    })
+}
+
+/// What happened to the rendered script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WriteStep {
+    /// Written (or, in a dry run, would be).
+    Written,
+    /// The guard found a connected client the rules would block.
+    Refused,
+    Failed(String),
+}
+
+/// What happened to the apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyStep {
+    /// Nobody asked for one.
+    NotAsked,
+    /// The guard could not run, or found a risk — [`FirewallOutcome::guard`]
+    /// says which.
+    Refused,
+    /// The write before it did not happen.
+    NotReached,
+    /// Allowed, but this process may not change the host (`--no-apply`).
+    NotForReal,
+    /// Ran, and the script is now the one loaded at boot (or, in a dry run,
+    /// would be).
+    Applied,
+    /// Ran, but copying it over the applied script failed, so a reboot
+    /// loads the previous one.
+    AppliedNotSaved(String),
+    Failed(String),
+}
+
+/// Rules the rendered script adds and removes against the applied one.
+///
+/// Compared as rules, not as text: an element's `timeout` counts down from
+/// the moment it is rendered, so every timed block's line differs between
+/// two renders a minute apart even though nothing changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleChange {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    /// Whether there was an applied script to compare with at all.
+    pub baseline: bool,
+}
+
+/// Everything one run did, for a front-end to put into words.
+#[derive(Debug, Clone)]
+pub struct FirewallOutcome {
+    pub backend: FirewallBackend,
+    pub rendered_path: std::path::PathBuf,
+    pub applied_path: std::path::PathBuf,
+    /// Rules in the script, the Allows ahead of everything included.
+    pub rules: usize,
+    /// What the script puts in the kernel — see [`loaded_entries`].
+    pub entries: usize,
+    pub signature: String,
+    pub guard: Guard,
+    /// Whether `force` was set: a refusal it overrode is still worth saying.
+    pub forced: bool,
+    pub dry_run: bool,
+    pub change: RuleChange,
+    pub write: WriteStep,
+    pub apply: ApplyStep,
+    /// The rendered script, and the applied one it would replace, for a
+    /// diff on request.
+    pub script: String,
+    pub previous: Option<String>,
+}
+
+/// The half of a run that touches no database: the guard, the write, the
+/// apply and the promotion, by the policy on [`FirewallRun`].
+pub fn execute(prepared: Prepared, ssh_log: SshLog<'_>) -> FirewallOutcome {
+    let Prepared {
+        run,
+        built,
+        signature,
+    } = prepared;
+    let guard = check_lockout(&built.rules, ssh_log);
+    let previous = std::fs::read_to_string(&run.applied_path).ok();
+    let change = rule_change(previous.as_deref(), &built.script);
+
+    let may_write = guard.risks().is_empty() || run.force;
+    let may_apply = guard.passed() || run.force;
+
+    let write = if !may_write {
+        WriteStep::Refused
+    } else if run.dry_run {
+        WriteStep::Written
+    } else {
+        match write_script(&run.rendered_path, &built.script) {
+            Ok(()) => WriteStep::Written,
+            Err(err) => WriteStep::Failed(format!(
+                "could not write {}: {err}",
+                run.rendered_path.display()
+            )),
+        }
+    };
+
+    let apply = if !run.apply {
+        ApplyStep::NotAsked
+    } else if !may_apply {
+        ApplyStep::Refused
+    } else if write != WriteStep::Written {
+        ApplyStep::NotReached
+    } else if !run.for_real {
+        ApplyStep::NotForReal
+    } else if run.dry_run {
+        ApplyStep::Applied
+    } else {
+        match apply_script(run.backend, &run.rendered_path) {
+            Err(err) => ApplyStep::Failed(format!("{err:#}")),
+            Ok(()) if run.rendered_path == run.applied_path => ApplyStep::Applied,
+            Ok(()) => match write_script(&run.applied_path, &built.script) {
+                Ok(()) => ApplyStep::Applied,
+                Err(err) => ApplyStep::AppliedNotSaved(format!(
+                    "could not copy it to {}: {err}",
+                    run.applied_path.display()
+                )),
+            },
+        }
+    };
+
+    FirewallOutcome {
+        backend: run.backend,
+        rendered_path: run.rendered_path,
+        applied_path: run.applied_path,
+        rules: built.rules.len(),
+        entries: built.written,
+        signature,
+        guard,
+        forced: run.force,
+        dry_run: run.dry_run,
+        change,
+        write,
+        apply,
+        script: built.script,
+        previous,
+    }
+}
+
+/// Records what `outcome` wrote and applied: the rendered signature on a
+/// write, the applied one on an apply. A dry run records nothing.
+pub fn record(db: &Db, outcome: &FirewallOutcome) -> Result<()> {
+    if outcome.dry_run {
+        return Ok(());
+    }
+    if outcome.write == WriteStep::Written {
+        db.set_firewall_rendered_signature(&outcome.signature)?;
+    }
+    if outcome.applied() {
+        db.set_firewall_applied_signature(&outcome.signature)?;
+    }
+    Ok(())
+}
+
+/// The whole path in one call, for a front-end that may hold the `Db`
+/// throughout: `render-firewall`, `batch` and the internal cron.
+pub fn render_and_apply(db: &Db, run: FirewallRun, ssh_log: SshLog<'_>) -> Result<FirewallOutcome> {
+    let outcome = execute(prepare(db, run)?, ssh_log);
+    record(db, &outcome)?;
+    Ok(outcome)
+}
+
+impl FirewallOutcome {
+    /// Whether the kernel now holds this script.
+    pub fn applied(&self) -> bool {
+        !self.dry_run
+            && matches!(
+                self.apply,
+                ApplyStep::Applied | ApplyStep::AppliedNotSaved(_)
+            )
+    }
+
+    /// Whether the guard refused something — the write or the apply — so a
+    /// front-end can say what gets past it there.
+    pub fn refused(&self) -> bool {
+        self.write == WriteStep::Refused || self.apply == ApplyStep::Refused
+    }
+
+    /// Whether everything asked for happened. A refusal is not a success:
+    /// `batch` exits non-zero on it, which is what makes cron mail someone.
+    pub fn succeeded(&self) -> bool {
+        self.write == WriteStep::Written
+            && matches!(
+                self.apply,
+                ApplyStep::NotAsked | ApplyStep::NotForReal | ApplyStep::Applied
+            )
+    }
+
+    /// Why the apply (or the write) was refused. What gets past it differs
+    /// by front-end — a flag, a setting, nothing at all — so each adds its
+    /// own; see [`FirewallOutcome::refused`].
+    fn refusal(&self) -> String {
+        match &self.guard {
+            Guard::LogUnreadable => {
+                "no SSH log could be read, so the lockout check could not run".to_string()
+            }
+            Guard::Ran(risks) => format!(
+                "it would block {} connected SSH client(s): {}",
+                risks.len(),
+                risks
+                    .iter()
+                    .map(|(ip, rule)| format!("{ip} (blocked by {rule})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+
+    /// `+3 / -1 rule(s) against the applied script`, or why there is no
+    /// comparison.
+    pub fn change_summary(&self) -> String {
+        if !self.change.baseline {
+            return format!(
+                "no applied script at {} yet, so all of it is new",
+                self.applied_path.display()
+            );
+        }
+        if self.change.added.is_empty() && self.change.removed.is_empty() {
+            return format!("same rules as the applied {}", self.applied_path.display());
+        }
+        format!(
+            "+{} / -{} against the applied {}",
+            self.change.added.len(),
+            self.change.removed.len(),
+            self.applied_path.display()
+        )
+    }
+
+    /// One line, for a status message, a flash or a cron summary.
+    pub fn summary(&self) -> String {
+        let (wrote, refused) = if self.dry_run {
+            ("would write", "would not write")
+        } else {
+            ("wrote", "did not write")
+        };
+        let rendered = self.rendered_path.display();
+        let applied = self.applied_path.display();
+        let mut out = match &self.write {
+            WriteStep::Written => format!("{wrote} {} rule(s) to {rendered}", self.entries),
+            WriteStep::Refused => format!("{refused} {rendered}: {}", self.refusal()),
+            WriteStep::Failed(err) => err.clone(),
+        };
+        match &self.apply {
+            ApplyStep::NotAsked => {
+                if self.write == WriteStep::Written {
+                    out.push_str(
+                        "; not applied — review it, then apply it (\u{201c}Apply everything\u{201d} \
+                         or `stop-bots render-firewall --apply`)",
+                    );
+                }
+            }
+            ApplyStep::Refused if self.write == WriteStep::Refused => {}
+            ApplyStep::Refused => out.push_str(&format!(
+                "; {}: {}",
+                if self.dry_run {
+                    "would not be applied"
+                } else {
+                    "not applied"
+                },
+                self.refusal()
+            )),
+            ApplyStep::NotReached => out.push_str("; not applied"),
+            ApplyStep::NotForReal => out.push_str("; not applied: --no-apply"),
+            ApplyStep::Applied => out.push_str(&format!(
+                "; {}applied, and {applied} is what loads at boot",
+                if self.dry_run { "would be " } else { "" }
+            )),
+            ApplyStep::AppliedNotSaved(err) => out.push_str(&format!(
+                "; applied, but {err}, so a reboot loads the previous rules"
+            )),
+            ApplyStep::Failed(err) => out.push_str(&format!("; applying failed: {err}")),
+        }
+        if self.write == WriteStep::Written && self.guard == Guard::LogUnreadable {
+            if self.forced && self.applied() {
+                out.push_str(". Forced past a lockout check that could not run");
+            } else if self.apply == ApplyStep::NotAsked {
+                out.push_str(". Note: no SSH log could be read, so the lockout check did not run");
+            }
+        }
+        out
+    }
+
+    /// The whole story, a line each, for a preview or `--verbose`.
+    pub fn lines(&self) -> Vec<String> {
+        vec![
+            format!(
+                "Firewall ({}): {} rule(s), {} kernel entries; {}",
+                self.backend.stored(),
+                self.rules,
+                self.entries,
+                self.change_summary()
+            ),
+            format!(
+                "{}{}",
+                self.guard.describe(),
+                if self.forced && !self.guard.passed() {
+                    " — overridden by --force"
+                } else {
+                    ""
+                }
+            ),
+            self.summary(),
+        ]
+    }
+
+    /// The rendered script against the applied one, as a unified diff.
+    pub fn diff(&self) -> String {
+        crate::diff::unified(
+            self.previous.as_deref(),
+            Some(&self.script),
+            &self.applied_path.display().to_string(),
+            &self.rendered_path.display().to_string(),
+        )
+    }
+}
+
+/// The rules a script loads, one comparable string each: set elements
+/// (`block_v4 192.0.2.7`) and rules (`add rule …`, `-A …`), with an
+/// element's `timeout` left off. Structural lines are the same in every
+/// render of one backend, so comparing them costs nothing and cancels out.
+fn rule_lines(script: &str) -> std::collections::BTreeSet<String> {
+    let mut lines = std::collections::BTreeSet::new();
+    let mut set: Option<&str> = None;
+    for line in script.lines().map(str::trim) {
+        if let Some(name) = set {
+            if line == "}" {
+                set = None;
+                continue;
+            }
+            let element = line.trim_end_matches(',');
+            let element = element.split(" timeout ").next().unwrap_or(element);
+            lines.insert(format!("{name} {element}"));
+        } else if let Some(rest) = line.strip_prefix("add element ") {
+            // `add element inet stop_bots block_v4 {`
+            set = rest.split_whitespace().nth(2);
+        } else if line.starts_with("add rule ") || line.starts_with("-A ") {
+            lines.insert(line.to_string());
+        }
+    }
+    lines
+}
+
+/// [`RuleChange`] between an applied script (if there is one) and `new`.
+pub fn rule_change(applied: Option<&str>, new: &str) -> RuleChange {
+    let Some(applied) = applied else {
+        return RuleChange {
+            added: rule_lines(new).into_iter().collect(),
+            removed: Vec::new(),
+            baseline: false,
+        };
+    };
+    let (old, new) = (rule_lines(applied), rule_lines(new));
+    RuleChange {
+        added: new.difference(&old).cloned().collect(),
+        removed: old.difference(&new).cloned().collect(),
+        baseline: true,
+    }
+}
+
+/// Where the rules stand against what was rendered and what was applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ScriptState {
+    /// The rules are the ones last applied.
+    Applied,
+    /// Rendered to the `.next` script, and not applied since.
+    RenderedNotApplied,
+    /// Changed since the last render too — and what a screen shows before
+    /// it has looked.
+    #[default]
+    Changed,
+}
+
+/// Where this host's rules stand — the Dashboard's "script" row in both
+/// front-ends and `status`'s `script-fresh` check. Compares signatures the
+/// app recorded, never file contents, so it works the same whatever path
+/// or backend a run used.
+///
+/// A database from before the applied signature existed has none, and
+/// reads as not applied until the first apply: nothing recorded what, if
+/// anything, the kernel was given.
+pub fn script_state(db: &Db) -> Result<ScriptState> {
+    let current = rules_signature(&all_rules(db)?);
+    Ok(
+        if db.get_firewall_applied_signature()?.as_deref() == Some(current.as_str()) {
+            ScriptState::Applied
+        } else if db.get_firewall_rendered_signature()?.as_deref() == Some(current.as_str()) {
+            ScriptState::RenderedNotApplied
+        } else {
+            ScriptState::Changed
+        },
+    )
 }
 
 /// An explanation to append when the apply failed for a reason the tool
@@ -1118,7 +1694,7 @@ mod tests {
     }
 
     #[test]
-    fn assess_lockout_risk_reports_risks_from_the_log() {
+    fn the_guard_reports_risks_from_the_log_it_reads() {
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("auth.log");
         std::fs::write(
@@ -1128,27 +1704,31 @@ mod tests {
         .unwrap();
 
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        match assess_lockout_risk(&rules, &sshlog::SshSource::File(log_path)) {
-            LockoutStatus::Risks(risks) => {
-                assert_eq!(
-                    risks,
-                    vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())]
-                );
-            }
-            LockoutStatus::LogUnavailable => panic!("expected the log to be found"),
-        }
+        assert_eq!(
+            check_lockout(&rules, SshLog::Read(&sshlog::SshSource::File(log_path))),
+            Guard::Ran(vec![("4.5.6.7".to_string(), "4.5.6.0/24".to_string())])
+        );
     }
 
     #[test]
-    fn assess_lockout_risk_is_unavailable_for_a_nonexistent_log() {
+    fn the_guard_cannot_run_on_a_nonexistent_log() {
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        assert!(matches!(
-            assess_lockout_risk(
-                &rules,
-                &sshlog::SshSource::File("/nonexistent/x.log".into())
-            ),
-            LockoutStatus::LogUnavailable
-        ));
+        let guard = check_lockout(
+            &rules,
+            SshLog::Read(&sshlog::SshSource::File("/nonexistent/x.log".into())),
+        );
+        assert_eq!(guard, Guard::LogUnreadable);
+        assert!(!guard.passed(), "a guard that could not run has not passed");
+    }
+
+    #[test]
+    fn the_guard_reads_text_it_is_handed() {
+        let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
+        assert!(check_lockout(&rules, SshLog::Text(Some(""))).passed());
+        assert_eq!(
+            check_lockout(&rules, SshLog::Text(None)),
+            Guard::LogUnreadable
+        );
     }
 
     #[test]
@@ -1520,5 +2100,245 @@ mod tests {
     fn an_unrelated_failure_gets_no_hint() {
         assert_eq!(sandbox_hint("nft: command not found"), "");
         assert_eq!(sandbox_hint("Error: syntax error, unexpected newline"), "");
+    }
+
+    // ---- the one path, and its policy ----
+
+    /// An SSH log in which 4.5.6.7 is connected.
+    const CONNECTED: &str = "Accepted publickey for admin from 4.5.6.7 port 12345 ssh2\n";
+
+    /// A database blocking 4.5.6.0/24, and a run for it into `dir`. Never
+    /// for real: nothing here may run `nft` on the machine running tests.
+    fn blocking_the_admin(dir: &Path) -> (Db, FirewallRun) {
+        let db = Db::open_in_memory().unwrap();
+        db.block_address_permanently("4.5.6.0/24").unwrap();
+        let run =
+            FirewallRun::new(FirewallBackend::Nftables, dir.join("firewall.nft")).for_real(false);
+        (db, run)
+    }
+
+    #[test]
+    fn the_rendered_script_sits_beside_the_applied_one() {
+        for (applied, rendered) in [
+            (
+                "/etc/stop-bots/firewall.nft",
+                "/etc/stop-bots/firewall.next.nft",
+            ),
+            (
+                "/etc/stop-bots/firewall.sh",
+                "/etc/stop-bots/firewall.next.sh",
+            ),
+            ("/srv/rules", "/srv/rules.next"),
+        ] {
+            assert_eq!(rendered_path(Path::new(applied)), Path::new(rendered));
+        }
+    }
+
+    /// The policy, as a table: what each guard verdict allows, for a write
+    /// and for an apply, with and without `--force`. One place, because
+    /// five front-ends used to decide this five ways.
+    #[test]
+    fn the_guard_decides_the_write_and_the_apply_the_same_way_for_everyone() {
+        let unrelated = "Accepted publickey for admin from 9.9.9.9 port 1 ssh2\n";
+        let cases = [
+            // (what, log, force, write, apply)
+            (
+                "passed",
+                Some(unrelated),
+                false,
+                WriteStep::Written,
+                ApplyStep::NotForReal,
+            ),
+            (
+                "log unreadable",
+                None,
+                false,
+                WriteStep::Written,
+                ApplyStep::Refused,
+            ),
+            (
+                "log unreadable, forced",
+                None,
+                true,
+                WriteStep::Written,
+                ApplyStep::NotForReal,
+            ),
+            (
+                "would lock out",
+                Some(CONNECTED),
+                false,
+                WriteStep::Refused,
+                ApplyStep::Refused,
+            ),
+            (
+                "would lock out, forced",
+                Some(CONNECTED),
+                true,
+                WriteStep::Written,
+                ApplyStep::NotForReal,
+            ),
+        ];
+        for (what, log, force, write, apply) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let (db, run) = blocking_the_admin(dir.path());
+            let run = run.apply(true).force(force);
+
+            let outcome = render_and_apply(&db, run, SshLog::Text(log)).unwrap();
+
+            assert_eq!(outcome.write, write, "{what}: {}", outcome.summary());
+            assert_eq!(outcome.apply, apply, "{what}: {}", outcome.summary());
+            assert_eq!(
+                dir.path().join("firewall.next.nft").exists(),
+                write == WriteStep::Written,
+                "{what}: the rendered script's existence should follow the write"
+            );
+            assert!(
+                !dir.path().join("firewall.nft").exists(),
+                "{what}: nothing was applied, so the boot script must not appear"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_says_why_in_the_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+
+        let unreadable = render_and_apply(&db, run.clone().apply(true), SshLog::Text(None))
+            .unwrap()
+            .summary();
+        assert!(unreadable.contains("not applied"), "{unreadable}");
+        assert!(unreadable.contains("could not run"), "{unreadable}");
+
+        let risky = render_and_apply(&db, run, SshLog::Text(Some(CONNECTED)))
+            .unwrap()
+            .summary();
+        assert!(risky.contains("4.5.6.7 (blocked by 4.5.6.0/24)"), "{risky}");
+    }
+
+    /// A write with no apply notes that the check did not run: nothing is
+    /// refused, but nothing was checked either.
+    #[test]
+    fn a_write_the_guard_could_not_check_carries_a_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+
+        let outcome = render_and_apply(&db, run, SshLog::Text(None)).unwrap();
+
+        assert!(outcome.succeeded(), "{}", outcome.summary());
+        assert!(
+            outcome.summary().contains("did not run"),
+            "{}",
+            outcome.summary()
+        );
+    }
+
+    /// The rendered signature is recorded on every write — including one
+    /// the guard could not check, which `render-firewall` used to skip —
+    /// and the applied one only on an apply.
+    #[test]
+    fn a_write_records_the_rendered_signature_and_only_an_apply_the_applied_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+
+        let outcome = render_and_apply(&db, run.apply(true), SshLog::Text(None)).unwrap();
+
+        assert_eq!(
+            db.get_firewall_rendered_signature().unwrap().as_deref(),
+            Some(outcome.signature.as_str())
+        );
+        assert_eq!(db.get_firewall_applied_signature().unwrap(), None);
+        assert_eq!(script_state(&db).unwrap(), ScriptState::RenderedNotApplied);
+
+        // What a successful apply records, without running anything.
+        let applied = FirewallOutcome {
+            apply: ApplyStep::Applied,
+            ..outcome
+        };
+        record(&db, &applied).unwrap();
+        assert_eq!(script_state(&db).unwrap(), ScriptState::Applied);
+
+        db.block_address_permanently("192.0.2.1").unwrap();
+        assert_eq!(script_state(&db).unwrap(), ScriptState::Changed);
+    }
+
+    /// A dry run decides everything and does nothing: no file, no
+    /// signature, and the verdict an apply would get.
+    #[test]
+    fn a_dry_run_writes_and_records_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+        let run = run.apply(true).for_real(true).dry_run(true);
+
+        let outcome = render_and_apply(&db, run, SshLog::Text(Some(""))).unwrap();
+
+        assert_eq!(outcome.apply, ApplyStep::Applied, "{}", outcome.summary());
+        assert!(
+            outcome.summary().contains("would write"),
+            "{}",
+            outcome.summary()
+        );
+        assert!(!outcome.applied(), "a dry run applied nothing");
+        assert!(!dir.path().join("firewall.next.nft").exists());
+        assert_eq!(db.get_firewall_rendered_signature().unwrap(), None);
+        assert_eq!(db.get_firewall_applied_signature().unwrap(), None);
+    }
+
+    /// `render-firewall --out` writes where it was told, not beside the
+    /// applied script.
+    #[test]
+    fn a_named_rendered_path_is_used_as_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+        let chosen = dir.path().join("review-me.nft");
+
+        render_and_apply(&db, run.rendered_at(&chosen), SshLog::Text(None)).unwrap();
+
+        assert!(chosen.exists());
+        assert!(!dir.path().join("firewall.next.nft").exists());
+    }
+
+    /// Compared as rules: an element's timeout counts down from the render,
+    /// so two renders a minute apart must not read as every timed block
+    /// removed and added again.
+    #[test]
+    fn the_rule_change_ignores_timeouts_and_counts_real_changes() {
+        let applied = "add element inet stop_bots block_v4 {\n\t192.0.2.1 timeout 1d,\n\
+                       \t192.0.2.2\n}\n";
+        let new = "add element inet stop_bots block_v4 {\n\t192.0.2.1 timeout 23h59m,\n\
+                   \t192.0.2.3\n}\n";
+
+        let change = rule_change(Some(applied), new);
+
+        assert_eq!(change.added, vec!["block_v4 192.0.2.3"]);
+        assert_eq!(change.removed, vec!["block_v4 192.0.2.2"]);
+        assert!(change.baseline);
+        assert!(!rule_change(None, new).baseline);
+    }
+
+    #[test]
+    fn the_rule_change_reads_iptables_rules_too() {
+        let change = rule_change(
+            Some("-A STOP-BOTS -i lo -j ACCEPT\n-A STOP-BOTS -s 192.0.2.2 -j DROP\n"),
+            "-A STOP-BOTS -i lo -j ACCEPT\n-A STOP-BOTS -s 192.0.2.3 -j DROP\n",
+        );
+        assert_eq!(change.added, vec!["-A STOP-BOTS -s 192.0.2.3 -j DROP"]);
+        assert_eq!(change.removed, vec!["-A STOP-BOTS -s 192.0.2.2 -j DROP"]);
+    }
+
+    /// The diff on request is the rendered script against the applied one,
+    /// labelled with both paths.
+    #[test]
+    fn the_diff_is_against_the_applied_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run) = blocking_the_admin(dir.path());
+        std::fs::write(dir.path().join("firewall.nft"), "# the old script\n").unwrap();
+
+        let outcome = render_and_apply(&db, run.dry_run(true), SshLog::Text(None)).unwrap();
+        let diff = outcome.diff();
+
+        assert!(diff.contains("-# the old script"), "{diff}");
+        assert!(diff.contains("+\t4.5.6.0/24"), "{diff}");
+        assert!(diff.contains("firewall.next.nft"), "{diff}");
     }
 }

@@ -43,9 +43,10 @@
 //!
 //! **Each job only does what its equivalent CLI subcommand does, and by
 //! default that stops at writing.** `RenderFirewall` writes the script to
-//! disk on a timer, same as `render-firewall`; running it (`sh`/`nft -f`)
-//! is the admin's, on purpose — see `src/iptables.rs`/`src/nftables.rs`'s
-//! "generate-only" module docs.
+//! disk on a timer, same as `render-firewall` — beside the applied script
+//! the boot unit loads, never over it, so a reboot does not enforce what
+//! nobody applied. Running it (`sh`/`nft -f`) is the admin's, on purpose —
+//! see `src/iptables.rs`/`src/nftables.rs`'s "generate-only" module docs.
 //!
 //! Two switches move that line, and only for the admin who sets them.
 //! `Db::get_auto_apply` lets `ApplyNginx` write site configs and reload
@@ -53,19 +54,15 @@
 //! script it just wrote. Both are off by default and each is set
 //! separately, because the risks are not comparable: a bad NGINX config is
 //! caught by `nginx -t` and costs a failed reload, while a bad firewall
-//! ruleset locks you out of the host.
-//!
-//! The firewall one carries an extra condition the interactive paths do
-//! not. They treat `LockoutStatus::LogUnavailable` — the anti-lockout
-//! check could not read an SSH log, so it could not run — as a pass, which
-//! is reasonable while a person is reading the result and can get back in.
-//! Here it is a refusal. "The check could not run" is not "the check
-//! passed" when nobody is watching.
+//! ruleset locks you out of the host. The firewall one goes through the
+//! same guard as every other apply (see `firewall::FirewallRun`), which
+//! refuses when the anti-lockout check could not read an SSH log: "the
+//! check could not run" is not "the check passed".
 
 use crate::db::Db;
 use crate::nginx::NginxCommands;
 use crate::protection::Detector;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One of the background jobs the internal cron schedules.
@@ -643,25 +640,22 @@ fn run_detector(db: &Db, detector: Detector, applied: &crate::logscan::Applied) 
     }
 }
 
-/// The work behind the `RenderFirewall` job: writes the current firewall
-/// rules to `out_path` using the nftables backend (which handles allowlist
-/// geo mode, unlike iptables — see `firewall::build_script`), skipping the
-/// write if doing so would risk locking out a currently-connected SSH
-/// client.
+/// The work behind the `RenderFirewall` job: renders the current rules for
+/// the stored backend and writes them beside the applied script (see
+/// [`crate::firewall::rendered_path`]) — never over it, so what the boot
+/// unit loads stays what was last applied.
 ///
-/// Same safety check the interactive render runs, except the connected
-/// clients are already known from the pass that read the SSH log, so this
-/// applies `firewall::lockout_risks` directly. `None` (log unavailable)
-/// skips the check entirely, matching the interactive path's
-/// `LogUnavailable` case.
+/// Goes through [`crate::firewall::render_and_apply`] like every other
+/// front-end, with the connected clients already known from the pass that read the
+/// SSH log; `None` means the log could not be read, so the guard could not
+/// run.
 ///
 /// **Writes, and applies only when told to twice.** A script on disk does
 /// nothing until someone runs it, and that stays the default; see this
-/// module's docs for why the line is where it is. `Db::get_auto_apply_firewall`
-/// moves it, and even then this refuses unless the lockout guard actually
-/// *ran* — `connected` of `None` means it could not, which the
-/// interactive paths treat as a pass and this does not. A person reading
-/// a refusal can get back into the host; a cron job at 3am cannot.
+/// module's docs for why the line is where it is.
+/// `Db::get_auto_apply_firewall` moves it, and the shared policy then
+/// refuses unless the lockout guard actually *ran*. A person reading a
+/// refusal can get back into the host; a cron job at 3am cannot.
 fn render_firewall(
     db: &Db,
     out_override: Option<&std::path::Path>,
@@ -675,54 +669,25 @@ fn render_firewall(
         // quietly replaced their iptables script with an nftables one at
         // the same path, and the next apply ran `sh` over nftables syntax.
         let backend = crate::firewall::stored_backend(db)?;
-        let out_path = crate::firewall::output_path(out_override, backend);
-        let out_path = out_path.as_path();
-        let built = crate::firewall::build_script(db, backend)?;
-        // Whether the guard *ran*, which is a different fact from whether
-        // it objected — and the one that decides if this may apply.
-        let mut guard_ran = false;
-        if let Some(connected_ips) = connected {
-            let risks = crate::firewall::lockout_risks(&built.rules, connected_ips);
-            if !risks.is_empty() {
-                anyhow::bail!(
-                    "skipped: would block {} currently-connected SSH client IP address(es)",
-                    risks.len()
-                );
-            }
-            guard_ran = true;
-        }
-        // Named in the error, because this is the one failure here an
-        // operator has to act on outside stop-bots, and "Permission
-        // denied (os error 13)" on its own doesn't say which file to fix.
-        // The default is under `/etc`, so an unprivileged `stop-bots web`
-        // hits this on every daily run until someone grants the write or
-        // points `render-firewall` somewhere else.
-        crate::firewall::write_script(out_path, &built.script)
-            .with_context(|| format!("could not write {}", out_path.display()))?;
-        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(&built.rules))?;
-        let wrote = format!("wrote {} rule(s) to {}", built.written, out_path.display());
-
-        if !db.get_auto_apply_firewall()? {
-            return Ok(wrote);
-        }
-        if !guard_ran {
-            // The one refusal this switch exists to make. `batch --apply`
-            // takes the same line for the same reason: a guard that could
-            // not run has not passed.
-            return Ok(format!(
-                "{wrote}; not applied: the SSH log could not be read, so the lockout check \
-                 could not run"
-            ));
-        }
-        if !apply_for_real {
-            return Ok(format!("{wrote}; not applied (--no-apply)"));
-        }
-        // The script just written, not a freshly derived one, so what runs
-        // is what the guard approved and what an operator can read
-        // afterwards.
-        Ok(match crate::firewall::apply_script(backend, out_path) {
-            Ok(()) => format!("{wrote}, and applied them"),
-            Err(err) => format!("{wrote}, but applying them failed: {err:#}"),
+        let run = crate::firewall::FirewallRun::new(
+            backend,
+            crate::firewall::output_path(out_override, backend),
+        )
+        .apply(db.get_auto_apply_firewall()?)
+        .for_real(apply_for_real);
+        let outcome = crate::firewall::render_and_apply(
+            db,
+            run,
+            crate::firewall::SshLog::Connected(connected),
+        )?;
+        // The write's own failure names the file, because this is the one
+        // failure here an operator has to act on outside stop-bots: the
+        // default is under `/etc`, so an unprivileged `stop-bots web` hits
+        // it on every run until someone grants the write.
+        Ok(match outcome.write {
+            crate::firewall::WriteStep::Written => outcome.summary(),
+            crate::firewall::WriteStep::Refused => format!("skipped: {}", outcome.summary()),
+            crate::firewall::WriteStep::Failed(_) => format!("error: {}", outcome.summary()),
         })
     })();
     match result {
@@ -845,7 +810,14 @@ mod tests {
         // it.
         let summary = render_firewall(&db, Some(&out), None, true);
 
-        assert!(out.exists(), "the script should still be written");
+        assert!(
+            crate::firewall::rendered_path(&out).exists(),
+            "the script should still be written"
+        );
+        assert!(
+            !out.exists(),
+            "and not put where the boot unit would load it"
+        );
         assert!(
             summary.contains("not applied"),
             "it should refuse, not apply: {summary}"
@@ -857,8 +829,8 @@ mod tests {
     }
 
     /// And with the switch off, a readable log changes nothing: writing
-    /// without applying stays the default, and the summary says only what
-    /// it wrote.
+    /// without applying stays the default — to the rendered script, which
+    /// nothing loads, never to the applied one the boot unit does.
     #[test]
     fn the_firewall_is_only_written_while_auto_apply_is_off() {
         let dir = tempfile::tempdir().unwrap();
@@ -868,9 +840,10 @@ mod tests {
 
         let summary = render_firewall(&db, Some(&out), Some(&[]), true);
 
-        assert!(out.exists());
+        assert!(crate::firewall::rendered_path(&out).exists());
+        assert!(!out.exists(), "an unapplied render reached the boot script");
         assert!(summary.starts_with("wrote "), "{summary}");
-        assert!(!summary.contains("applied"), "{summary}");
+        assert!(summary.contains("not applied"), "{summary}");
     }
 
     /// `--no-apply` outranks the switch, the same way it outranks every
@@ -886,7 +859,7 @@ mod tests {
         // and finds nothing — the one case that would otherwise apply.
         let summary = render_firewall(&db, Some(&out), Some(&[]), false);
 
-        assert!(summary.contains("not applied (--no-apply)"), "{summary}");
+        assert!(summary.contains("not applied: --no-apply"), "{summary}");
     }
 
     /// The switched-*on* path is covered in `tests/cli.rs`, not here.
@@ -1277,7 +1250,7 @@ mod tests {
         let summary = render_firewall(&db, Some(&out_path), None, false);
 
         assert!(summary.contains("wrote"), "summary was: {summary}");
-        assert!(out_path.exists());
+        assert!(crate::firewall::rendered_path(&out_path).exists());
     }
 
     /// An unprivileged `stop-bots web` hits this once a day, forever, so
@@ -1298,7 +1271,11 @@ mod tests {
 
         assert!(summary.starts_with("error: "), "summary was: {summary}");
         assert!(
-            summary.contains(&out_path.display().to_string()),
+            summary.contains(
+                &crate::firewall::rendered_path(&out_path)
+                    .display()
+                    .to_string()
+            ),
             "summary named no path: {summary}"
         );
     }
@@ -1317,7 +1294,7 @@ mod tests {
         let summary = render_firewall(&db, Some(&out_path), None, false);
 
         assert!(summary.contains("wrote"), "summary was: {summary}");
-        assert!(out_path.exists());
+        assert!(crate::firewall::rendered_path(&out_path).exists());
     }
 
     #[test]

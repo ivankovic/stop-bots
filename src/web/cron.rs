@@ -390,11 +390,10 @@ mod tests {
 
         tick(&state).await;
 
-        assert!(
-            state.firewall_out.as_ref().unwrap().exists(),
-            "no script at {}",
-            state.firewall_out.as_ref().unwrap().display()
-        );
+        // Beside it, rather: the cron renders and does not apply, so it
+        // writes the script nothing loads, not the one the boot unit does.
+        let rendered = crate::firewall::rendered_path(state.firewall_out.as_ref().unwrap());
+        assert!(rendered.exists(), "no script at {}", rendered.display());
         let summary = state
             .with_db(|db| db.get_cron_last_summary(CronJob::RenderFirewall.id()))
             .await

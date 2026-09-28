@@ -222,10 +222,13 @@ pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Marku
                                     "Update everything" kbd { "u" }
                                 }
                             }
-                            form .inline method="post" action=(ctx.url("/apply-all")) {
-                                (csrf_field(ctx))
-                                button .primary type="submit" title="Write and reload the NGINX config, then write and run the firewall script" {
-                                    "Apply everything" kbd { "a" }
+                            // A `GET` to the confirm page, which shows
+                            // what would change and carries the `POST`
+                            // that does it: one click here changes
+                            // nothing.
+                            form .inline method="get" action=(ctx.url("/apply-all")) {
+                                button .primary type="submit" title="See what would change in the NGINX config and the firewall, then apply both" {
+                                    "Apply everything\u{2026}" kbd { "a" }
                                 }
                             }
                             // No `onclick`: an inline event handler needs

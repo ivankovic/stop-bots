@@ -343,8 +343,13 @@ pub enum KeyOutcome {
     /// reason [`Self::UpdateSource`] does — the screen's key handler stays
     /// free of I/O, and its tests stay fast and offline.
     UpdateEverything,
-    /// The Dashboard's `a` key: write and reload the NGINX config, then
-    /// write and run the firewall script. Both halves shell out, so — same
+    /// The Dashboard's `a` key: work out what "Apply everything" would
+    /// change, and ask. Reading every site file and the SSH log is I/O, so
+    /// `App` does it, and hands the answer back for the Dashboard's
+    /// confirmation popup.
+    PreviewApplyEverything,
+    /// That popup, confirmed: write and reload the NGINX config, then write
+    /// and run the firewall script. Both halves shell out, so — same
     /// reasoning as [`Self::ReloadNginx`] and [`Self::RenderFirewall`] —
     /// `App` performs them.
     ApplyEverything,

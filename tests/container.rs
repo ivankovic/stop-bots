@@ -2291,6 +2291,51 @@ fn status_notices_that_the_ruleset_will_not_survive_a_reboot() {
     );
 }
 
+/// **A reboot enforces only what was applied.** The internal cron, `batch`
+/// without `--apply` and a bare `render-firewall` all write a script; none
+/// of them may change what `stop-bots-firewall.service` loads, or a block
+/// nobody applied goes live at the next boot. Checked against the real
+/// unit under real systemd: apply one rule, render a second without
+/// applying, then drop the table and restart the unit the way a boot
+/// would.
+#[test]
+fn the_boot_unit_loads_only_what_was_applied() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-boot-applied");
+    let root = "--root /etc/nginx/sites-enabled";
+
+    host.stop_bots("add-firewall-rule --address 203.0.113.70");
+    // `--force`: a container has no SSH log for the lockout check.
+    host.stop_bots("render-firewall --apply --force");
+    host.sh("stop-bots install firewall");
+
+    host.stop_bots("add-firewall-rule --address 203.0.113.71");
+    host.stop_bots("render-firewall");
+    host.stop_bots(&format!("batch --no-fetch --force {root}"));
+    let rendered = host.sh("cat /etc/stop-bots/firewall.next.nft");
+    assert!(
+        rendered.contains("203.0.113.71"),
+        "the unapplied rule should be in the rendered script:\n{rendered}"
+    );
+
+    host.sh("nft delete table inet stop_bots");
+    host.sh("systemctl restart stop-bots-firewall.service");
+
+    assert!(
+        host.run("nft get element inet stop_bots block_v4 '{ 203.0.113.70 }'")
+            .0,
+        "the applied rule did not come back with the unit"
+    );
+    assert!(
+        !host
+            .run("nft get element inet stop_bots block_v4 '{ 203.0.113.71 }'")
+            .0,
+        "a rule nobody applied was loaded by the boot unit"
+    );
+}
+
 /// Run without root, the probe cannot read the ruleset — and must say so
 /// rather than reporting a host it could not look at as healthy.
 #[test]
@@ -2376,10 +2421,10 @@ fn the_console_writes_each_backend_to_its_own_path_in_its_own_syntax() {
 
     // A decoy from "the other backend", to catch a render that writes to
     // whichever path it happened to be started with.
-    host.sh("printf 'DECOY - must not be overwritten\n' > /etc/stop-bots/firewall.sh");
+    host.sh("printf 'DECOY - must not be overwritten\n' > /etc/stop-bots/firewall.next.sh");
 
     console.post("/render-firewall", &[("backend", "nftables"), ("out", "")]);
-    let nft = host.sh("cat /etc/stop-bots/firewall.nft");
+    let nft = host.sh("cat /etc/stop-bots/firewall.next.nft");
     assert!(
         nft.contains("203.0.113.23"),
         "the nftables render did not land in firewall.nft:\n{nft}"
@@ -2396,7 +2441,7 @@ fn the_console_writes_each_backend_to_its_own_path_in_its_own_syntax() {
     // backend's output landing in the other's file, and a shebang is what
     // tells them apart: the iptables render is a shell script, the
     // nftables one is not.
-    let sh_after = host.sh("cat /etc/stop-bots/firewall.sh");
+    let sh_after = host.sh("cat /etc/stop-bots/firewall.next.sh");
     assert!(
         !sh_after.contains("add rule") && !sh_after.contains("nft "),
         "an nftables render overwrote the iptables script:\n{sh_after}"
@@ -2404,11 +2449,11 @@ fn the_console_writes_each_backend_to_its_own_path_in_its_own_syntax() {
 
     // Now the other way round: switching backend must move the *path*
     // too, not just the syntax.
-    host.sh("rm -f /etc/stop-bots/firewall.sh");
-    host.sh("printf 'DECOY - must not be overwritten\n' > /etc/stop-bots/firewall.nft");
+    host.sh("rm -f /etc/stop-bots/firewall.next.sh");
+    host.sh("printf 'DECOY - must not be overwritten\n' > /etc/stop-bots/firewall.next.nft");
     console.post("/render-firewall", &[("backend", "iptables"), ("out", "")]);
 
-    let sh = host.sh("cat /etc/stop-bots/firewall.sh");
+    let sh = host.sh("cat /etc/stop-bots/firewall.next.sh");
     assert!(
         sh.starts_with("#!/bin/sh"),
         "the iptables render is not a shell script:\n{sh}"
@@ -2423,7 +2468,7 @@ fn the_console_writes_each_backend_to_its_own_path_in_its_own_syntax() {
     // between the decoy and this read would have replaced it with a
     // perfectly legitimate nftables render, and the old assertion called
     // that the bug.
-    let nft_after = host.sh("cat /etc/stop-bots/firewall.nft");
+    let nft_after = host.sh("cat /etc/stop-bots/firewall.next.nft");
     assert!(
         !nft_after.starts_with("#!/bin/sh"),
         "an iptables render overwrote the nftables script — the bug exactly:\n{nft_after}"
@@ -2450,15 +2495,15 @@ fn batch_follows_the_stored_backend_unless_the_flag_says_otherwise() {
 
     // The console is where the backend is chosen, so choose it there.
     console.post("/render-firewall", &[("backend", "iptables"), ("out", "")]);
-    host.sh("rm -f /etc/stop-bots/firewall.sh /etc/stop-bots/firewall.nft");
+    host.sh("rm -f /etc/stop-bots/firewall.next.sh /etc/stop-bots/firewall.next.nft");
 
     // No --backend: the stored choice has to decide both syntax and path.
     host.stop_bots("batch --no-fetch --force --root /etc/nginx/sites-enabled");
     assert!(
-        !host.run("test -e /etc/stop-bots/firewall.nft").0,
+        !host.run("test -e /etc/stop-bots/firewall.next.nft").0,
         "a crontab-shaped run wrote an nftables script to a host set to iptables"
     );
-    let written = host.sh("cat /etc/stop-bots/firewall.sh");
+    let written = host.sh("cat /etc/stop-bots/firewall.next.sh");
     assert!(
         written.starts_with("#!/bin/sh") && written.contains("203.0.113.50"),
         "the stored backend did not decide what batch generated:\n{written}"
@@ -2466,7 +2511,7 @@ fn batch_follows_the_stored_backend_unless_the_flag_says_otherwise() {
 
     // An explicit flag still overrides it, in both syntax and path.
     host.stop_bots("batch --no-fetch --force --backend nftables --root /etc/nginx/sites-enabled");
-    let forced = host.sh("cat /etc/stop-bots/firewall.nft");
+    let forced = host.sh("cat /etc/stop-bots/firewall.next.nft");
     assert!(
         !forced.starts_with("#!/bin/sh") && forced.contains("203.0.113.50"),
         "an explicit --backend did not win:\n{forced}"
@@ -3224,9 +3269,14 @@ fn batch_without_apply_writes_both_and_enforces_neither() {
          --out /tmp/fw.nft --access-log /dev/null",
     );
 
+    // Beside `--out`, which names the applied script: nothing was applied.
     assert!(
-        server.run("test -s /tmp/fw.nft").0,
+        server.run("test -s /tmp/fw.next.nft").0,
         "the script should have been written"
+    );
+    assert!(
+        !server.run("test -e /tmp/fw.nft").0,
+        "and not where the applied script goes"
     );
     let (loaded, _, _) = server.run("nft list table inet stop_bots");
     assert!(!loaded, "but nothing should have been loaded into nftables");
