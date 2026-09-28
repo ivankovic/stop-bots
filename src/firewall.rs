@@ -24,7 +24,7 @@
 //! for the CLI vs. what gets put in the TUI's status message) stays with
 //! each caller.
 
-use crate::db::{Db, FirewallAction, FirewallRule, GeoMode};
+use crate::db::{Db, FirewallAction, FirewallRule, GeoMode, RuleSource};
 use crate::{ipranges, iptables, nftables, sshlog};
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -143,6 +143,9 @@ pub fn derived_firewall_rules(db: &Db) -> Result<Vec<FirewallRule>> {
             action,
             enabled: true,
             expires_at: None,
+            source: Some(RuleSource::List),
+            created_at: None,
+            evidence: None,
         })
         .collect())
 }
@@ -313,6 +316,9 @@ pub fn private_allow_rules() -> Vec<FirewallRule> {
             action: FirewallAction::Allow,
             enabled: true,
             expires_at: None,
+            source: Some(RuleSource::Private),
+            created_at: None,
+            evidence: None,
         })
         .collect()
 }
@@ -346,6 +352,9 @@ pub fn ssh_allow_rules(db: &Db) -> Result<Vec<FirewallRule>> {
             action: FirewallAction::Allow,
             enabled: true,
             expires_at: None,
+            source: Some(RuleSource::SshLogin),
+            created_at: None,
+            evidence: Some("a successful SSH login in the last week".to_string()),
         })
         .collect())
 }
@@ -367,6 +376,9 @@ pub fn trusted_allow_rules(db: &Db) -> Result<Vec<FirewallRule>> {
             action: FirewallAction::Allow,
             enabled: true,
             expires_at: None,
+            source: Some(RuleSource::Trusted),
+            created_at: None,
+            evidence: None,
         })
         .collect())
 }
@@ -410,7 +422,7 @@ pub fn rules_signature(rules: &[FirewallRule]) -> String {
 
     let mut hasher = Sha256::new();
     for rule in rules {
-        hasher.update(format!("{rule:?}").as_bytes());
+        hasher.update(rendered_fields(rule).as_bytes());
         hasher.update(b"\n");
     }
     hasher
@@ -421,6 +433,23 @@ pub fn rules_signature(rules: &[FirewallRule]) -> String {
             let _ = write!(out, "{byte:02x}");
             out
         })
+}
+
+/// The part of `rule` a script is rendered from, spelled exactly as
+/// `FirewallRule`'s `Debug` was before 0.1 added its source, creation time
+/// and evidence.
+///
+/// Those three explain a rule; they change nothing in the script. Hashing
+/// them would mark every host's script stale on upgrade, and again each
+/// time a rule's evidence was filled in, for a render that writes the same
+/// bytes. Keeping the old spelling means a signature stored by 0.0.x
+/// still matches the same rules now.
+fn rendered_fields(rule: &FirewallRule) -> String {
+    format!(
+        "FirewallRule {{ id: {:?}, address: {:?}, port: {:?}, action: {:?}, enabled: {:?}, \
+         expires_at: {:?} }}",
+        rule.id, rule.address, rule.port, rule.action, rule.enabled, rule.expires_at
+    )
 }
 
 /// Whether the rules have changed since the last successful render — the
@@ -760,6 +789,9 @@ mod tests {
             action,
             enabled: true,
             expires_at: None,
+            source: None,
+            created_at: None,
+            evidence: None,
         }
     }
 
@@ -864,6 +896,8 @@ mod tests {
             address: "4.5.6.7".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         db.record_ssh_login_ips(&["4.5.6.7".to_string()]).unwrap();
@@ -928,6 +962,8 @@ mod tests {
             address: "10.0.5.0/24".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -963,6 +999,8 @@ mod tests {
             address: "198.51.100.0/24".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         db.trust_address("198.51.100.0/28").unwrap();
@@ -1003,6 +1041,8 @@ mod tests {
             address: "4.5.6.7".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -1319,6 +1359,8 @@ mod tests {
             address: "9.9.9.9".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         db.replace_country_ranges("us", &["4.5.6.0/24".to_string()])
@@ -1349,6 +1391,31 @@ mod tests {
             rule("5.6.7.8", FirewallAction::Block),
         ];
         assert_ne!(rules_signature(&a), rules_signature(&b));
+    }
+
+    /// Why a rule exists is not part of the script, so it must not make
+    /// the script look stale — and a signature 0.0.x stored must still
+    /// match the same rules after the upgrade, which it does only if what
+    /// is hashed is spelled as 0.0.x's `Debug` spelled it.
+    #[test]
+    fn the_signature_ignores_why_a_rule_exists_and_matches_what_0_0_x_stored() {
+        let plain = rule("203.0.113.7", FirewallAction::Block);
+        let explained = FirewallRule {
+            source: Some(RuleSource::Cli),
+            created_at: Some(1_790_000_000),
+            evidence: Some("GET /.env HTTP/1.1".into()),
+            ..plain.clone()
+        };
+
+        assert_eq!(
+            rules_signature(std::slice::from_ref(&plain)),
+            rules_signature(&[explained])
+        );
+        assert_eq!(
+            rendered_fields(&plain),
+            "FirewallRule { id: 0, address: \"203.0.113.7\", port: None, action: Block, \
+             enabled: true, expires_at: None }"
+        );
     }
 
     /// The property the whole fix rests on: the stored value's size is a

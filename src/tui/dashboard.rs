@@ -3233,6 +3233,8 @@ mod tests {
             address: "9.9.9.9".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -3282,6 +3284,8 @@ mod tests {
             address: "203.0.113.9".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         let mut dashboard = Dashboard::default();
@@ -3319,6 +3323,8 @@ mod tests {
             address: "203.0.113.9".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         let rules = crate::firewall::all_rules(&db).unwrap();

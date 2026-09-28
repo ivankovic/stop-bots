@@ -477,6 +477,15 @@ pub fn untrust(db: &Db, entry: &TrustedEntry) -> Result<bool> {
     }
 }
 
+/// The evidence line a block made from an SSH row records: what the
+/// operator was looking at when they chose to block it.
+pub fn attempts_evidence(count: u64) -> String {
+    match count {
+        1 => "1 failed SSH login when it was blocked".to_string(),
+        n => format!("{n} failed SSH logins when it was blocked"),
+    }
+}
+
 /// Formats a future Unix timestamp `expires_at` as a short "Nd"/"Nh"
 /// relative string for a `RowStatus::Blocked`'s "until" text — same
 /// rounding convention as `main.rs::format_expiry` (that one isn't
@@ -612,7 +621,8 @@ mod tests {
     #[test]
     fn a_trusted_address_with_a_block_row_shows_as_trusted() {
         let db = Db::open_in_memory().unwrap();
-        db.block_address_permanently("198.51.100.9").unwrap();
+        db.block_address_permanently("198.51.100.9", crate::db::RuleSource::Tui, None)
+            .unwrap();
         db.trust_address("198.51.100.9").unwrap();
         let log = "Failed password for root from 198.51.100.9 port 4444 ssh2\n";
 

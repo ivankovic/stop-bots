@@ -2917,6 +2917,8 @@ mod tests {
             address: "192.0.2.0/24".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         let mut app = App::new(

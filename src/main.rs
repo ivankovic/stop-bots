@@ -19,7 +19,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
-use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule};
+use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule, RuleSource};
 use stop_bots::protection::Detector;
 use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
 
@@ -1371,23 +1371,10 @@ impl DetectorArg {
         out
     };
 
-    /// Exhaustive on purpose: a detector added to `Detector::ALL` without
-    /// a command-line name is a compile error, not a detector `set-detector`
-    /// cannot reach.
+    /// The name `set-detector` and `--source` both take — one list, in
+    /// `blocks::detector_name`, so the two can never disagree.
     fn name(self) -> &'static str {
-        use stop_bots::protection::Detector as D;
-        match self.0 {
-            D::SshScanners => "ssh-scanners",
-            D::WebScanners => "web-scanners",
-            D::SpoofedCrawlers => "spoofed-crawlers",
-            D::ProbePaths => "probe-paths",
-            D::Injection => "injection",
-            D::Honeypot => "honeypot",
-            D::AssetRatio => "asset-ratio",
-            D::RotatingUserAgent => "rotating-ua",
-            D::RefererlessCrawl => "refererless",
-            D::RobotsTxt => "robots-txt",
-        }
+        stop_bots::blocks::detector_name(self.0)
     }
 }
 
@@ -2074,6 +2061,8 @@ fn add_firewall_rule(
         address,
         port,
         action,
+        source: RuleSource::Cli,
+        evidence: None,
     })?;
     println!("Added firewall rule #{id}");
     Ok(())
@@ -4197,6 +4186,12 @@ fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
             );
         }
     }
+    if outcome.skipped_unblocked > 0 {
+        println!(
+            "Left {} alone: unblocked by hand recently (trust an address to exempt it for good).",
+            outcome.skipped_unblocked
+        );
+    }
     if outcome.newly_blocked.is_empty() {
         println!(
             "Found {} {}(s), all already covered by an existing firewall rule.",
@@ -4744,6 +4739,9 @@ mod tests {
             action,
             enabled: true,
             expires_at: None,
+            source: None,
+            created_at: None,
+            evidence: None,
         }
     }
 

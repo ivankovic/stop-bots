@@ -880,7 +880,7 @@ async fn writing_the_firewall_script_produces_a_file_and_records_the_signature()
 
     Db::open(&db_path)
         .unwrap()
-        .block_address_permanently("192.0.2.10")
+        .block_address_permanently("192.0.2.10", stop_bots::db::RuleSource::Tui, None)
         .unwrap();
 
     let out = tmp.path().join("firewall.nft");
@@ -1861,7 +1861,8 @@ async fn no_url_on_any_page_escapes_the_prefix() {
         source_id: "well-known-bots".into(),
     })
     .unwrap();
-    db.block_address_permanently("192.0.2.9").unwrap();
+    db.block_address_permanently("192.0.2.9", stop_bots::db::RuleSource::Tui, None)
+        .unwrap();
     db.set_country_selected("CN", true).unwrap();
     drop(db);
     write_site(&tmp, "example.com");
@@ -2411,6 +2412,8 @@ async fn the_dashboard_reports_system_status_once_a_probe_exists() {
             address: "198.51.100.7".to_string(),
             port: None,
             action: stop_bots::db::FirewallAction::Block,
+            source: stop_bots::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         stop_bots::health::store_probe(

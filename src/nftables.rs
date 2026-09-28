@@ -662,6 +662,9 @@ mod tests {
                 action: FirewallAction::parse(&r.action).unwrap(),
                 enabled: r.enabled,
                 expires_at: None,
+                source: None,
+                created_at: None,
+                evidence: None,
             })
             .collect()
     }
@@ -928,6 +931,8 @@ mod tests {
             address: "203.0.113.7".to_string(),
             port: Some(443),
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 

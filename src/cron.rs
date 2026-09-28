@@ -836,6 +836,8 @@ mod tests {
             address: "198.51.100.7".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         db.set_auto_apply_firewall(true).unwrap();
@@ -937,6 +939,8 @@ mod tests {
             address: "198.51.100.7".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -957,6 +961,8 @@ mod tests {
             address: "198.51.100.7".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         // Ran one minute ago and left no signature — exactly what a render
@@ -1001,6 +1007,8 @@ mod tests {
             address: "198.51.100.7".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         for job in CronJob::all() {
@@ -1214,6 +1222,8 @@ mod tests {
             address: "203.0.113.0/24".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 

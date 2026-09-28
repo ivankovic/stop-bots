@@ -592,7 +592,11 @@ impl Firewall {
                         row.address
                     ));
                 } else {
-                    db.block_address_permanently(&row.address)?;
+                    db.block_address_permanently(
+                        &row.address,
+                        crate::db::RuleSource::Tui,
+                        Some(&crate::dynamic::attempts_evidence(row.count)),
+                    )?;
                     *message = Some(format!(
                         "Permanently blocked {} — run render-firewall (then apply the script) to enforce it.",
                         row.address
@@ -1538,6 +1542,8 @@ mod tests {
                 address: "198.51.100.9".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             3600,
         )

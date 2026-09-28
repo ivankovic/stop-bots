@@ -1666,7 +1666,8 @@ mod tests {
     /// A state whose SSH log is `ssh_log` and whose script goes into `dir`.
     fn firewall_state(dir: &std::path::Path, ssh_log: std::path::PathBuf) -> AppState {
         let db = Db::open_in_memory().unwrap();
-        db.block_address_permanently("192.0.2.10").unwrap();
+        db.block_address_permanently("192.0.2.10", crate::db::RuleSource::Tui, None)
+            .unwrap();
         let mut state = AppState::new(db, dir.join("nginx"), Some(ssh_log), false);
         state.firewall_out = Some(dir.join("firewall.nft"));
         state
@@ -1840,6 +1841,8 @@ mod tests {
             address: "192.0.2.9".into(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 

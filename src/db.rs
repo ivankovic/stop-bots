@@ -25,10 +25,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod blocks;
 pub mod evidence;
 pub mod keys;
 mod managed;
 pub mod schema;
+
+pub use crate::blocks::RuleSource;
+pub use blocks::{BlockQuery, UNBLOCK_MIN_SECONDS};
 
 pub use managed::ManagedFile;
 
@@ -436,6 +440,12 @@ impl FirewallAction {
 /// [`Db::add_firewall_rule_with_ttl`], e.g. `block-scanners`/
 /// `block-web-scanners`'s auto-detected rows) — see
 /// [`Db::list_firewall_rules`] for how expiry is actually enforced.
+///
+/// `source`, `created_at` and `evidence` say why it exists (see
+/// [`crate::blocks`]). A stored rule always has a `created_at`; `source`
+/// and `evidence` are `None` on a rule written before 0.1. A rule that is
+/// never stored — an Allow for an SSH login or a trusted address, a range
+/// from a downloaded list — has a `source` naming which, and no id.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FirewallRule {
     pub id: i64,
@@ -444,14 +454,24 @@ pub struct FirewallRule {
     pub action: FirewallAction,
     pub enabled: bool,
     pub expires_at: Option<i64>,
+    pub source: Option<RuleSource>,
+    pub created_at: Option<i64>,
+    pub evidence: Option<String>,
 }
 
 /// Fields needed to add a new firewall rule.
+///
+/// `source` is not optional: every writer says who it is, so no rule
+/// written from 0.1 on has to be explained as "before 0.1".
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewFirewallRule {
     pub address: String,
     pub port: Option<u16>,
     pub action: FirewallAction,
+    pub source: RuleSource,
+    /// The log line that made a detector write it, if there was one.
+    /// Cleaned up by [`crate::blocks::evidence_line`] on the way in.
+    pub evidence: Option<String>,
 }
 
 /// How big the database file is and how much of it is free space SQLite
@@ -926,6 +946,28 @@ fn reject_an_overbroad_fetch(source: &str, addresses: &[String], max_v4_share: f
 /// short enough that an address stops being special once it stops being
 /// used.
 pub const SSH_LOGIN_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
+
+/// The columns [`firewall_rule_from_row`] reads, in its order.
+const FIREWALL_RULE_COLUMNS: &str =
+    "id, address, port, action, enabled, expires_at, source, created_at, evidence";
+
+/// One `firewall_rules` row, selected as [`FIREWALL_RULE_COLUMNS`].
+fn firewall_rule_from_row(row: &rusqlite::Row) -> rusqlite::Result<FirewallRule> {
+    let action: String = row.get(3)?;
+    Ok(FirewallRule {
+        id: row.get(0)?,
+        address: row.get(1)?,
+        port: row.get(2)?,
+        action: FirewallAction::parse(&action).unwrap_or(FirewallAction::Block),
+        enabled: row.get(4)?,
+        expires_at: row.get(5)?,
+        source: row
+            .get::<_, Option<String>>(6)?
+            .map(|stored| RuleSource::from_stored(&stored)),
+        created_at: row.get(7)?,
+        evidence: row.get(8)?,
+    })
+}
 
 fn now() -> i64 {
     SystemTime::now()
@@ -2367,25 +2409,33 @@ impl Db {
 
     // ---- firewall rules ----
 
-    /// Adds a new firewall rule, enabled by default, that never expires.
-    /// Returns its id. Every hand-added rule (`add-firewall-rule`) goes
-    /// through here — permanent unless an admin removes it themselves.
+    /// Adds a firewall rule, enabled, that never expires, and returns its
+    /// id. Every hand-added rule (`add-firewall-rule`) goes through here —
+    /// permanent unless an admin removes it themselves.
+    ///
+    /// There is one row per address, verdict and port (see
+    /// [`schema`]'s version 4), so adding one that exists extends it: see
+    /// [`Self::add_firewall_rule_with_ttl`].
     pub fn add_firewall_rule(&self, rule: &NewFirewallRule) -> Result<i64> {
         self.insert_firewall_rule(rule, None)
     }
 
-    /// Adds a new firewall rule, enabled by default, that expires
-    /// `ttl_seconds` from now — [`Self::list_firewall_rules`] (and so every
-    /// renderer/lister that reads through it) stops returning the row once
-    /// its `expires_at` has passed, and actually deletes it at that point
-    /// rather than just hiding it. Used for auto-detected scanner rules
-    /// (`block-scanners`/`block-web-scanners`), where a temporary block is
-    /// the point — a bot that stops scanning shouldn't stay blocked
-    /// forever, and one that doesn't will simply get re-flagged and
-    /// re-added on the next detection run after this one lapses.
-    /// `ttl_seconds` isn't validated as positive: a zero or negative value
-    /// legitimately produces an already-expired row (used by tests to
-    /// exercise pruning deterministically without waiting or mocking time).
+    /// Adds a firewall rule, enabled, that expires `ttl_seconds` from now
+    /// — [`Self::list_firewall_rules`] (and so every renderer/lister that
+    /// reads through it) stops returning the row once its `expires_at` has
+    /// passed, and actually deletes it at that point rather than just
+    /// hiding it. Used for the detectors' blocks, where a temporary block
+    /// is the point. `ttl_seconds` isn't validated as positive: a zero or
+    /// negative value legitimately produces an already-expired row (used
+    /// by tests to exercise pruning deterministically without waiting or
+    /// mocking time).
+    ///
+    /// **If the same rule is already stored** (same address, verdict and
+    /// port), that row is kept and its expiry becomes the later of the two
+    /// — none, if either is permanent. Its `created_at`, source and
+    /// evidence stay, because they say when and why the address was first
+    /// blocked. The one exception is a row that has already expired but
+    /// not been pruned: that block is over, and this is a new one.
     pub fn add_firewall_rule_with_ttl(
         &self,
         rule: &NewFirewallRule,
@@ -2395,18 +2445,23 @@ impl Db {
     }
 
     /// Ensures `address` ends up with a permanent (`expires_at = NULL`)
-    /// Block rule — the Firewall screen's "Enter" action, for
-    /// both a not-yet-blocked IP and one already temporarily blocked by
-    /// `block-scanners`/`block-web-scanners` (that TTL is upgraded to
-    /// permanent, since pressing Enter on an already-blocked row is a
-    /// deliberate "make sure this one never lapses" action, not a no-op).
-    /// Prunes expired rows first (same reasoning as
-    /// [`Self::list_firewall_rules`]) so a lapsed row is never mistaken for
-    /// still covering the address. If any row for `address` survives that
-    /// prune, it's updated in place to a permanent Block rule rather than
-    /// inserting a second row for the same address; otherwise a new
-    /// permanent rule is added, same as [`Self::add_firewall_rule`].
-    pub fn block_address_permanently(&self, address: &str) -> Result<()> {
+    /// Block rule — the Firewall screens' block action, for both a
+    /// not-yet-blocked address and one a detector already blocked for a
+    /// while (that TTL is lifted: blocking an already-blocked row is a
+    /// deliberate "make sure this one never lapses", not a no-op).
+    ///
+    /// Any other rule for exactly `address` with the same port becomes
+    /// that block, as it always has: an Allow or a Reject for the address
+    /// is turned into a Block in place, or merged into the Block already
+    /// there. A new row, if one is needed, records `source` and
+    /// `evidence`; an existing one keeps its own, since it says when and
+    /// why the address was first blocked.
+    pub fn block_address_permanently(
+        &self,
+        address: &str,
+        source: RuleSource,
+        evidence: Option<&str>,
+    ) -> Result<()> {
         if !is_valid_address(address) {
             anyhow::bail!("invalid firewall rule address: {address}");
         }
@@ -2414,20 +2469,55 @@ impl Db {
         // parses `address.trim()`, so a trailing newline passes the check
         // and would otherwise be written into the middle of a rule line.
         let address = address.trim();
-        self.prune_expired_firewall_rules()?;
-        let changed = self.conn.execute(
-            "UPDATE firewall_rules SET action = 'block', expires_at = NULL, enabled = 1
-             WHERE address = ?1",
-            params![address],
-        )?;
-        if changed == 0 {
-            self.add_firewall_rule(&NewFirewallRule {
-                address: address.to_string(),
-                port: None,
-                action: FirewallAction::Block,
-            })?;
-        }
-        Ok(())
+        self.batch(|| {
+            self.prune_expired_firewall_rules()?;
+            let rows: Vec<(i64, Option<u16>, String)> = self
+                .conn
+                .prepare(
+                    "SELECT id, port, action FROM firewall_rules WHERE address = ?1 ORDER BY id",
+                )?
+                .query_map(params![address], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            // One surviving row per port: the Block if there is one,
+            // otherwise the oldest other rule, turned into it.
+            let mut kept: HashMap<Option<u16>, i64> = HashMap::new();
+            for (id, port, action) in &rows {
+                if action == FirewallAction::Block.as_str() {
+                    kept.insert(*port, *id);
+                }
+            }
+            for (id, port, _) in &rows {
+                kept.entry(*port).or_insert(*id);
+            }
+            for (id, port, _) in &rows {
+                if kept.get(port) != Some(id) {
+                    self.conn
+                        .execute("DELETE FROM firewall_rules WHERE id = ?1", params![id])?;
+                }
+            }
+            for id in kept.values() {
+                self.conn.execute(
+                    "UPDATE firewall_rules SET action = 'block', expires_at = NULL, enabled = 1
+                     WHERE id = ?1",
+                    params![id],
+                )?;
+            }
+            if kept.is_empty() {
+                self.insert_firewall_rule(
+                    &NewFirewallRule {
+                        address: address.to_string(),
+                        port: None,
+                        action: FirewallAction::Block,
+                        source,
+                        evidence: evidence.map(str::to_string),
+                    },
+                    None,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     fn insert_firewall_rule(&self, rule: &NewFirewallRule, expires_at: Option<i64>) -> Result<i64> {
@@ -2436,12 +2526,43 @@ impl Db {
         }
         // Trimmed for the same reason as `block_address_permanently`.
         let address = rule.address.trim();
-        self.conn.execute(
-            "INSERT INTO firewall_rules (address, port, action, enabled, created_at, expires_at)
-             VALUES (?1, ?2, ?3, 1, ?4, ?5)",
-            params![address, rule.port, rule.action.as_str(), now(), expires_at],
+        let evidence = rule
+            .evidence
+            .as_deref()
+            .and_then(crate::blocks::evidence_line);
+        // Every right-hand side below reads the row as it was before this
+        // statement, which is what lets each of them ask whether that row
+        // had already lapsed.
+        let id = self.conn.query_row(
+            "INSERT INTO firewall_rules
+                 (address, port, action, enabled, created_at, expires_at, source, evidence)
+             VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7)
+             ON CONFLICT (address, action, IFNULL(port, -1)) DO UPDATE SET
+                 created_at = CASE WHEN expires_at <= excluded.created_at
+                     THEN excluded.created_at ELSE created_at END,
+                 source = CASE WHEN expires_at <= excluded.created_at
+                     THEN excluded.source ELSE source END,
+                 evidence = CASE WHEN expires_at <= excluded.created_at
+                     THEN excluded.evidence ELSE COALESCE(evidence, excluded.evidence) END,
+                 enabled = CASE WHEN expires_at <= excluded.created_at
+                     THEN 1 ELSE enabled END,
+                 expires_at = CASE
+                     WHEN expires_at <= excluded.created_at THEN excluded.expires_at
+                     WHEN expires_at IS NULL OR excluded.expires_at IS NULL THEN NULL
+                     ELSE MAX(expires_at, excluded.expires_at) END
+             RETURNING id",
+            params![
+                address,
+                rule.port,
+                rule.action.as_str(),
+                now(),
+                expires_at,
+                rule.source.stored(),
+                evidence
+            ],
+            |row| row.get(0),
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(id)
     }
 
     /// Deletes every firewall rule whose `expires_at` has passed. Returns
@@ -2462,32 +2583,40 @@ impl Db {
         )?)
     }
 
-    /// Deletes the firewall rule with the given id. Errors if no such rule exists.
+    /// Deletes the firewall rule with the given id. Errors if no such rule
+    /// exists. A detector's block is also recorded as unblocked by hand
+    /// (see [`crate::blocks`]), so the next pass does not put it back.
     pub fn remove_firewall_rule(&self, id: i64) -> Result<()> {
-        let changed = self
-            .conn
-            .execute("DELETE FROM firewall_rules WHERE id = ?1", params![id])?;
-        if changed == 0 {
-            anyhow::bail!("no firewall rule with id: {id}");
-        }
-        Ok(())
+        self.batch(|| {
+            let rules = self.firewall_rules_where("id = ?1", params![id])?;
+            if rules.is_empty() {
+                anyhow::bail!("no firewall rule with id: {id}");
+            }
+            self.conn
+                .execute("DELETE FROM firewall_rules WHERE id = ?1", params![id])?;
+            self.record_unblocks(&rules)
+        })
     }
 
     /// Removes any Block rule for the exact address `address` — the reverse
-    /// of [`Self::block_address_permanently`], backing the Dynamic
-    /// Protection screen's unblock action. A no-op (not an error) if none
-    /// exists, same idempotent spirit as `block_address_permanently`. Only
-    /// ever deletes a row matching this exact address: it never touches a
-    /// CIDR range that happens to contain it, since those are derived
-    /// (`derived_firewall_rules`) and never stored as `firewall_rules` rows
-    /// in the first place — nor an Allow rule that coincidentally shares
-    /// the address, which this action has no business touching.
+    /// of [`Self::block_address_permanently`], backing the Firewall
+    /// screens' unblock action. A no-op (not an error) if none exists,
+    /// same idempotent spirit as `block_address_permanently`. Only ever
+    /// deletes a row matching this exact address: it never touches a CIDR
+    /// range that happens to contain it, nor an Allow rule that shares the
+    /// address, which this action has no business touching. A detector's
+    /// block is recorded as unblocked by hand, as in
+    /// [`Self::remove_firewall_rule`].
     pub fn unblock_address(&self, address: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM firewall_rules WHERE address = ?1 AND action = 'block'",
-            params![address],
-        )?;
-        Ok(())
+        self.batch(|| {
+            let rules =
+                self.firewall_rules_where("address = ?1 AND action = 'block'", params![address])?;
+            self.conn.execute(
+                "DELETE FROM firewall_rules WHERE address = ?1 AND action = 'block'",
+                params![address],
+            )?;
+            self.record_unblocks(&rules)
+        })
     }
 
     /// Removes `user_agent` from the manually-blocked list — the reverse of
@@ -2521,22 +2650,22 @@ impl Db {
     /// sees a table with no stale, already-lapsed rows in it.
     pub fn list_firewall_rules(&self) -> Result<Vec<FirewallRule>> {
         self.prune_expired_firewall_rules()?;
-        let mut stmt = self.conn.prepare(
-            "SELECT id, address, port, action, enabled, expires_at FROM firewall_rules ORDER BY id",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let action: String = row.get(3)?;
-            Ok(FirewallRule {
-                id: row.get(0)?,
-                address: row.get(1)?,
-                port: row.get(2)?,
-                action: FirewallAction::parse(&action).unwrap_or(FirewallAction::Block),
-                enabled: row.get(4)?,
-                expires_at: row.get(5)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
+        self.firewall_rules_where("1", [])
             .context("failed to list firewall rules")
+    }
+
+    /// The rules matching `condition`, a SQL expression over
+    /// `firewall_rules`' columns, in id order.
+    fn firewall_rules_where(
+        &self,
+        condition: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Vec<FirewallRule>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {FIREWALL_RULE_COLUMNS} FROM firewall_rules WHERE {condition} ORDER BY id"
+        ))?;
+        let rows = stmt.query_map(params, firewall_rule_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     // ---- SSH login addresses (anti-lockout) ----
@@ -4103,6 +4232,8 @@ mod tests {
             address: "not-an-ip".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         });
         assert!(result.is_err());
         assert!(db.list_firewall_rules().unwrap().is_empty());
@@ -4120,6 +4251,8 @@ mod tests {
                 address: address.to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             });
             assert!(result.is_err(), "{address} should have been rejected");
         }
@@ -4133,12 +4266,16 @@ mod tests {
             address: "1.2.3.4".to_string(),
             port: Some(80),
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         db.add_firewall_rule(&NewFirewallRule {
             address: "2001:db8::/32".to_string(),
             port: None,
             action: FirewallAction::Allow,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -4157,6 +4294,8 @@ mod tests {
             address: "1.2.3.4".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         assert_eq!(db.list_firewall_rules().unwrap()[0].expires_at, None);
@@ -4171,6 +4310,8 @@ mod tests {
                 address: "1.2.3.4".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             60,
         )
@@ -4184,7 +4325,8 @@ mod tests {
     #[test]
     fn block_address_permanently_adds_a_new_rule_when_none_exists() {
         let db = Db::open_in_memory().unwrap();
-        db.block_address_permanently("198.51.100.9").unwrap();
+        db.block_address_permanently("198.51.100.9", crate::db::RuleSource::Tui, None)
+            .unwrap();
 
         let rules = db.list_firewall_rules().unwrap();
         assert_eq!(rules.len(), 1);
@@ -4205,12 +4347,15 @@ mod tests {
                 address: "198.51.100.9".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             60,
         )
         .unwrap();
 
-        db.block_address_permanently("198.51.100.9").unwrap();
+        db.block_address_permanently("198.51.100.9", crate::db::RuleSource::Tui, None)
+            .unwrap();
 
         let rules = db.list_firewall_rules().unwrap();
         assert_eq!(rules.len(), 1);
@@ -4220,8 +4365,10 @@ mod tests {
     #[test]
     fn block_address_permanently_is_a_no_op_on_an_already_permanent_rule() {
         let db = Db::open_in_memory().unwrap();
-        db.block_address_permanently("198.51.100.9").unwrap();
-        db.block_address_permanently("198.51.100.9").unwrap();
+        db.block_address_permanently("198.51.100.9", crate::db::RuleSource::Tui, None)
+            .unwrap();
+        db.block_address_permanently("198.51.100.9", crate::db::RuleSource::Tui, None)
+            .unwrap();
 
         assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
     }
@@ -4229,13 +4376,16 @@ mod tests {
     #[test]
     fn block_address_permanently_rejects_an_invalid_address() {
         let db = Db::open_in_memory().unwrap();
-        assert!(db.block_address_permanently("not-an-address").is_err());
+        assert!(db
+            .block_address_permanently("not-an-address", crate::db::RuleSource::Tui, None)
+            .is_err());
     }
 
     #[test]
     fn unblock_address_removes_a_permanent_block() {
         let db = Db::open_in_memory().unwrap();
-        db.block_address_permanently("198.51.100.9").unwrap();
+        db.block_address_permanently("198.51.100.9", crate::db::RuleSource::Tui, None)
+            .unwrap();
 
         db.unblock_address("198.51.100.9").unwrap();
 
@@ -4250,6 +4400,8 @@ mod tests {
                 address: "198.51.100.9".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             3600,
         )
@@ -4274,6 +4426,8 @@ mod tests {
             address: "198.51.100.9".to_string(),
             port: None,
             action: FirewallAction::Allow,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -4296,6 +4450,8 @@ mod tests {
                 address: "1.2.3.4".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             -1,
         )
@@ -4311,6 +4467,8 @@ mod tests {
                 address: "1.2.3.4".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             60,
         )
@@ -4370,6 +4528,8 @@ mod tests {
             address: "1.2.3.4".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         db.add_firewall_rule_with_ttl(
@@ -4377,6 +4537,8 @@ mod tests {
                 address: "5.6.7.8".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             -1,
         )
@@ -4386,6 +4548,8 @@ mod tests {
                 address: "9.10.11.12".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             60,
         )
@@ -4415,6 +4579,8 @@ mod tests {
                 address: "1.2.3.4".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             })
             .unwrap();
 
@@ -4738,9 +4904,12 @@ mod tests {
             address: "  9.9.9.9\n".to_string(),
             port: None,
             action: FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
-        db.block_address_permanently(" 8.8.8.8 ").unwrap();
+        db.block_address_permanently(" 8.8.8.8 ", crate::db::RuleSource::Tui, None)
+            .unwrap();
         db.replace_country_ranges("xx", &[" 7.7.7.0/24 ".to_string()])
             .unwrap();
 
@@ -5586,5 +5755,158 @@ mod tests {
             BlockResponse::Forbidden
         );
         assert_eq!(BlockResponse::from_stored(""), BlockResponse::Forbidden);
+    }
+
+    // ---- one row per rule ----
+
+    fn detector_rule(address: &str) -> NewFirewallRule {
+        NewFirewallRule {
+            address: address.to_string(),
+            port: None,
+            action: FirewallAction::Block,
+            source: RuleSource::Detector(crate::protection::Detector::WebScanners),
+            evidence: Some("\"GET /wp-admin HTTP/1.1\" 404".to_string()),
+        }
+    }
+
+    /// Two writers adding the same rule — the TUI's cron and a `batch`
+    /// from crontab, say — end with one row, not two.
+    #[test]
+    fn adding_a_rule_that_exists_extends_it_and_keeps_when_and_why() {
+        let db = Db::open_in_memory().unwrap();
+        let first = db
+            .add_firewall_rule_with_ttl(&detector_rule("198.51.100.7"), 3_600)
+            .unwrap();
+        db.conn
+            .execute("UPDATE firewall_rules SET created_at = 5", [])
+            .unwrap();
+
+        let again = db
+            .add_firewall_rule_with_ttl(
+                &NewFirewallRule {
+                    source: RuleSource::Cli,
+                    evidence: None,
+                    ..detector_rule("198.51.100.7")
+                },
+                86_400,
+            )
+            .unwrap();
+
+        assert_eq!(again, first, "the same row");
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        let rule = &rules[0];
+        assert!(rule.expires_at.unwrap() - now() > 3_600, "the later expiry");
+        assert_eq!(rule.created_at, Some(5), "first blocked");
+        assert_eq!(
+            rule.source,
+            Some(RuleSource::Detector(
+                crate::protection::Detector::WebScanners
+            ))
+        );
+        assert!(rule.evidence.is_some(), "the first evidence stays");
+    }
+
+    #[test]
+    fn a_shorter_or_permanent_addition_never_shortens_a_rule() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule_with_ttl(&detector_rule("198.51.100.7"), 86_400)
+            .unwrap();
+        db.add_firewall_rule_with_ttl(&detector_rule("198.51.100.7"), 60)
+            .unwrap();
+        assert!(db.list_firewall_rules().unwrap()[0].expires_at.unwrap() - now() > 3_600);
+
+        db.add_firewall_rule(&detector_rule("198.51.100.7"))
+            .unwrap();
+        db.add_firewall_rule_with_ttl(&detector_rule("198.51.100.7"), 60)
+            .unwrap();
+        assert_eq!(
+            db.list_firewall_rules().unwrap()[0].expires_at,
+            None,
+            "permanent stays permanent"
+        );
+    }
+
+    /// An expired row not yet pruned is a block that is over; adding the
+    /// address again is a new block, with its own time and reason.
+    #[test]
+    fn adding_over_an_expired_row_starts_a_new_block() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule_with_ttl(&detector_rule("198.51.100.7"), -10)
+            .unwrap();
+        db.conn
+            .execute("UPDATE firewall_rules SET created_at = 5", [])
+            .unwrap();
+
+        db.add_firewall_rule(&NewFirewallRule {
+            source: RuleSource::Cli,
+            evidence: None,
+            ..detector_rule("198.51.100.7")
+        })
+        .unwrap();
+
+        let rule = &db.list_firewall_rules().unwrap()[0];
+        assert_eq!(rule.expires_at, None);
+        assert_eq!(rule.source, Some(RuleSource::Cli));
+        assert_eq!(rule.evidence, None);
+        assert!(rule.created_at.unwrap() > 5);
+    }
+
+    /// A different verdict or port is a different rule.
+    #[test]
+    fn the_same_address_with_another_verdict_or_port_is_its_own_rule() {
+        let db = Db::open_in_memory().unwrap();
+        for (port, action) in [
+            (None, FirewallAction::Block),
+            (None, FirewallAction::Allow),
+            (Some(22), FirewallAction::Block),
+        ] {
+            db.add_firewall_rule(&NewFirewallRule {
+                port,
+                action,
+                ..detector_rule("198.51.100.7")
+            })
+            .unwrap();
+        }
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 3);
+    }
+
+    /// Blocking by hand what a detector blocked keeps the detector's
+    /// explanation, and an Allow for the address is turned into the block
+    /// rather than left to win ahead of it.
+    #[test]
+    fn blocking_by_hand_merges_every_rule_for_the_address_into_one_block() {
+        let db = Db::open_in_memory().unwrap();
+        db.add_firewall_rule(&NewFirewallRule {
+            action: FirewallAction::Allow,
+            ..detector_rule("198.51.100.7")
+        })
+        .unwrap();
+        db.add_firewall_rule_with_ttl(&detector_rule("198.51.100.7"), 60)
+            .unwrap();
+
+        db.block_address_permanently("198.51.100.7", RuleSource::Tui, Some("seen"))
+            .unwrap();
+
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert_eq!(rules[0].action, FirewallAction::Block);
+        assert_eq!(rules[0].expires_at, None);
+        assert_eq!(
+            rules[0].source,
+            Some(RuleSource::Detector(
+                crate::protection::Detector::WebScanners
+            ))
+        );
+    }
+
+    #[test]
+    fn blocking_a_new_address_by_hand_records_the_front_end_and_what_it_saw() {
+        let db = Db::open_in_memory().unwrap();
+        db.block_address_permanently("198.51.100.7", RuleSource::Web, Some("3 failed SSH logins"))
+            .unwrap();
+        let rule = &db.list_firewall_rules().unwrap()[0];
+        assert_eq!(rule.source, Some(RuleSource::Web));
+        assert_eq!(rule.evidence.as_deref(), Some("3 failed SSH logins"));
     }
 }

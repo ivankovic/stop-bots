@@ -38,6 +38,8 @@ pub mod app;
 #[doc(hidden)]
 pub mod batch;
 #[doc(hidden)]
+pub mod blocks;
+#[doc(hidden)]
 pub mod botlist;
 #[doc(hidden)]
 pub mod cron;
@@ -93,6 +95,8 @@ pub mod scanblock;
 pub mod sshlog;
 #[cfg(test)]
 mod testing;
+#[doc(hidden)]
+pub mod trigger;
 #[doc(hidden)]
 pub mod tui;
 #[doc(hidden)]
