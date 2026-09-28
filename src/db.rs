@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod schema;
+
 /// Whether a category or bot should be allowed through or blocked at the NGINX layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Policy {
@@ -1007,7 +1009,9 @@ pub const HUMANS_ONLY_KEY: &str = "humans_only";
 
 impl Db {
     /// Opens (creating if necessary) the database at `path`, creating parent
-    /// directories as needed, and ensures the schema is up to date.
+    /// directories as needed, and brings its schema up to date — copying
+    /// it first if it is older, and refusing it if it is newer (see
+    /// [`schema`]).
     ///
     /// Sets [`BUSY_TIMEOUT`], which SQLite does not do for you.
     ///
@@ -1033,9 +1037,8 @@ impl Db {
             .with_context(|| format!("failed to open database: {}", path.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("failed to set the database busy timeout")?;
-        let db = Db { conn };
-        db.init_schema()?;
-        Ok(db)
+        schema::migrate(&conn, Some(path))?;
+        Ok(Db { conn })
     }
 
     /// Where this database lives on disk, or `None` for an in-memory one.
@@ -1058,358 +1061,8 @@ impl Db {
     /// Opens an in-memory database. Intended for tests.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().context("failed to open in-memory database")?;
-        let db = Db { conn };
-        db.init_schema()?;
-        Ok(db)
-    }
-
-    fn init_schema(&self) -> Result<()> {
-        // The whole batch runs inside one transaction. Not for atomicity —
-        // every statement is `IF NOT EXISTS`, so a partial schema would
-        // heal on the next open — but for durability cost: in autocommit
-        // mode each CREATE TABLE is its own transaction with its own
-        // fsync, and on an ordinary disk that made a *fresh database open
-        // take ~450ms*. One transaction is one fsync. This is first-run
-        // and test-suite time, and it was almost all of both.
-        self.conn.execute_batch(
-            "
-            BEGIN;
-            CREATE TABLE IF NOT EXISTS sources (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                url TEXT NOT NULL,
-                last_fetched_at INTEGER,
-                bot_count INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS bots (
-                id INTEGER PRIMARY KEY,
-                slug TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                is_ai INTEGER NOT NULL DEFAULT 0,
-                is_search_engine INTEGER NOT NULL DEFAULT 0,
-                is_scanner INTEGER NOT NULL DEFAULT 0,
-                user_agent_pattern TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'default',
-                source_id TEXT NOT NULL REFERENCES sources(id),
-                updated_at INTEGER NOT NULL
-            );
-
-            -- One source's raw contribution for a bot, keyed by (slug,
-            -- source_id) rather than bots.id: the first time a source
-            -- contributes a slug, there may be no `bots` row for it yet.
-            -- A `bots` row's own is_ai/is_search_engine/is_scanner/
-            -- user_agent_pattern/name is the *merged* view recomputed from
-            -- every row here for that slug (see Db::recompute_merged_bot)
-            -- whenever any of them changes — this is what lets two
-            -- different sources both describing the same bot (e.g. one
-            -- tagging it is_ai, another tagging the same name is_scanner)
-            -- combine instead of whichever fetched last silently
-            -- overwriting the other's categorization.
-            CREATE TABLE IF NOT EXISTS bot_source_entries (
-                slug TEXT NOT NULL,
-                source_id TEXT NOT NULL REFERENCES sources(id),
-                name TEXT NOT NULL,
-                is_ai INTEGER NOT NULL DEFAULT 0,
-                is_search_engine INTEGER NOT NULL DEFAULT 0,
-                is_scanner INTEGER NOT NULL DEFAULT 0,
-                user_agent_pattern TEXT NOT NULL,
-                PRIMARY KEY (slug, source_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS sites (
-                id INTEGER PRIMARY KEY,
-                server_name TEXT NOT NULL,
-                config_path TEXT NOT NULL,
-                discovered_at INTEGER NOT NULL,
-                UNIQUE(server_name, config_path)
-            );
-
-            CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS firewall_rules (
-                id INTEGER PRIMARY KEY,
-                address TEXT NOT NULL,
-                port INTEGER,
-                action TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER
-            );
-
-            -- Row presence encodes an override; absence means \"inherit the
-            -- global category default\" (see get_site_category_override).
-            CREATE TABLE IF NOT EXISTS site_category_overrides (
-                site_id INTEGER NOT NULL REFERENCES sites(id),
-                category TEXT NOT NULL,
-                policy TEXT NOT NULL,
-                PRIMARY KEY (site_id, category)
-            );
-
-            -- Same presence-encodes-override convention as above, but for a
-            -- single bot on a single site (see get_site_bot_override).
-            CREATE TABLE IF NOT EXISTS site_bot_overrides (
-                site_id INTEGER NOT NULL REFERENCES sites(id),
-                bot_id INTEGER NOT NULL REFERENCES bots(id),
-                policy TEXT NOT NULL,
-                PRIMARY KEY (site_id, bot_id)
-            );
-
-            -- Published crawler IP-range sources (Google, Bing, GPTBot, ...)
-            -- and their current CIDRs. Kept separate from `sources`/`bots`:
-            -- these publish one list per *publisher*, not per UA-slug, so
-            -- there is no bot row to merge into (see `IpRangeSource`'s doc
-            -- comment). `ip_ranges` is a plain child table, not a
-            -- source-entries/merge setup like `bot_source_entries` — two
-            -- sources publishing the exact same CIDR is not a real scenario
-            -- worth designing for.
-            -- Request-path prefixes where this site's bot block does not
-            -- apply. Per site rather than host-wide because a rule like
-            -- 'block AI bots everywhere except /blog' is inherently a
-            -- property of that site's own URL space.
-            CREATE TABLE IF NOT EXISTS site_path_exemptions (
-                site_id INTEGER NOT NULL REFERENCES sites(id),
-                path TEXT NOT NULL,
-                PRIMARY KEY (site_id, path)
-            );
-            -- The same, but only for clients whose user agent contains
-            -- `user_agent`, ignoring case: 'let okhttp reach /remote.php/dav/
-            -- on this site', for an app whose HTTP library a bot list names.
-            -- A table of its own rather than a column on the one above,
-            -- whose primary key would have to grow, which SQLite can only do
-            -- by rebuilding the table.
-            CREATE TABLE IF NOT EXISTS site_agent_exemptions (
-                site_id INTEGER NOT NULL REFERENCES sites(id),
-                path TEXT NOT NULL,
-                user_agent TEXT NOT NULL,
-                PRIMARY KEY (site_id, path, user_agent)
-            );
-            -- One row per (site, enabled request-shape rule). Row presence
-            -- is the flag, the shape `selected_countries` uses; a per-site
-            -- table rather than columns on `sites` because `sites` rows are
-            -- rewritten wholesale by every scan and a setting must not be
-            -- lost because someone re-ran discovery, and a table rather than
-            -- one boolean column per rule so a new rule is a new
-            -- `RequestRule` variant and no schema change.
-            --
-            -- This replaced a single-purpose `site_reject_http_1x` table,
-            -- whose `http_1x` rule became one variant among six. That table
-            -- is not created any more: nothing has read it since, and no
-            -- released version ever wrote it.
-            CREATE TABLE IF NOT EXISTS site_request_rules (
-                site_id INTEGER NOT NULL REFERENCES sites(id),
-                rule TEXT NOT NULL,
-                PRIMARY KEY (site_id, rule)
-            );
-            CREATE TABLE IF NOT EXISTS ip_range_sources (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                url TEXT NOT NULL,
-                category TEXT NOT NULL,
-                last_fetched_at INTEGER,
-                range_count INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS ip_ranges (
-                source_id TEXT NOT NULL REFERENCES ip_range_sources(id),
-                cidr TEXT NOT NULL,
-                PRIMARY KEY (source_id, cidr)
-            );
-
-            -- One country's currently-known CIDR blocks (from IPdeny),
-            -- fetched on demand per country rather than all ~250 at once —
-            -- see `Db::replace_country_ranges`.
-            CREATE TABLE IF NOT EXISTS country_ip_ranges (
-                country_code TEXT NOT NULL,
-                cidr TEXT NOT NULL,
-                fetched_at INTEGER NOT NULL,
-                PRIMARY KEY (country_code, cidr)
-            );
-
-            -- Row presence means \"this country is in the active geo
-            -- list\", host-wide (not per-site: per-site geo was dropped
-            -- once real CIDR data, not just
-            -- country codes, was in scope: some countries carry tens of
-            -- thousands of CIDR blocks, which is impractical to enforce per
-            -- NGINX vhost). What being \"in the list\" actually *means* —
-            -- blocked, or the only ones allowed — depends on the
-            -- `geo_mode` setting (see GeoMode), which is why this table is
-            -- named for what it stores (a selection) rather than for one
-            -- mode's interpretation of it.
-            CREATE TABLE IF NOT EXISTS selected_countries (
-                country_code TEXT PRIMARY KEY,
-                added_at INTEGER NOT NULL
-            );
-
-            -- Successful-access user-agent frequency — the complement to
-            -- `firewall_rules`' bad-traffic focus: `accesslog::
-            -- successful_user_agent_counts` tallies who's actually browsing
-            -- the site (status < 400, non-local/private IP) each time
-            -- `Db::record_user_agent_hits` runs, and this table accumulates
-            -- those counts across runs rather than replacing them, so it
-            -- reflects lifetime traffic seen, not just the current log
-            -- window (which may itself be rotated/truncated at any time).
-            CREATE TABLE IF NOT EXISTS user_agent_stats (
-                user_agent TEXT PRIMARY KEY,
-                hit_count INTEGER NOT NULL DEFAULT 0,
-                last_seen_at INTEGER NOT NULL
-            );
-
-            -- Literal user agents an admin chose to permanently block from
-            -- the Dashboard's \"Firewall\" screen — distinct from
-            -- `bots`/`bot_source_entries`: those describe *known,
-            -- publicly-catalogued* bots with category flags and a merge
-            -- cascade across sources, which doesn't fit a one-off exact
-            -- string an admin flagged by hand. Kept as its own small table,
-            -- same shape as `selected_countries`/`firewall_rules`, and
-            -- folded into `Db::compute_blocked_patterns`'s output (see
-            -- there) so it enforces the same way any other blocked pattern
-            -- does, globally and un-overridable per site — matching how a
-            -- global per-bot pin already can't be overridden by a site's
-            -- category override.
-            -- Third-party reputation and cloud-provider CIDR feeds.
-            -- Deliberately NOT stored in `ip_range_sources`: that table's
-            -- `category` column is a *bot* category, and
-            -- `blocked_ip_ranges` decides whether to apply a source's
-            -- ranges by looking up that category's default. A reputation
-            -- feed has no bot category, and worse, `IpRangeSourceKind::ALL`
-            -- is what `scanblock::known_crawler_ranges` iterates to build
-            -- the *exemption* list for scanner detection — adding feeds
-            -- there would start exempting Spamhaus-listed addresses from
-            -- being flagged as scanners, which is exactly backwards. A
-            -- separate table keeps both concerns from ever meeting.
-            CREATE TABLE IF NOT EXISTS reputation_sources (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                url TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 0,
-                last_fetched_at INTEGER,
-                range_count INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS reputation_ranges (
-                source_id TEXT NOT NULL REFERENCES reputation_sources(id),
-                cidr TEXT NOT NULL,
-                PRIMARY KEY (source_id, cidr)
-            );
-            CREATE TABLE IF NOT EXISTS blocked_user_agents (
-                user_agent TEXT PRIMARY KEY,
-                blocked_at INTEGER NOT NULL
-            );
-            -- Addresses a successful SSH login has been observed from, and
-            -- when we observed it. The anti-lockout guarantee is built on
-            -- this table: `firewall::all_rules` turns every row inside the
-            -- window into an Allow rule ahead of everything else, so an
-            -- address the operator actually logs in from cannot be blocked
-            -- by any rule, derived or hand-written.
-            --
-            -- `seen_at` is *observation* time, not login time, and that is
-            -- deliberate rather than a shortcut. sshd\'s own timestamps are
-            -- not usable for a window this long: the syslog file format
-            -- carries no year, and the `journalctl -o cat` fallback strips
-            -- timestamps entirely. Observation time needs neither. It is
-            -- also what survives log rotation — once a login is recorded
-            -- here it stays for the full window even after the line that
-            -- proved it is gone, which is the case that matters, since an
-            -- operator who has not logged in for six days is exactly the
-            -- one at risk of locking themselves out.
-            --
-            -- The trade is that a first run against an old log dates every
-            -- login in it to now, over-protecting for up to a week. That
-            -- errs in the safe direction for a table whose whole job is
-            -- keeping the operator\'s way back in open.
-            CREATE TABLE IF NOT EXISTS ssh_login_ips (
-                address TEXT PRIMARY KEY,
-                seen_at INTEGER NOT NULL
-            );
-            -- Clients an operator has said must never be blocked. The
-            -- hand-written counterpart of `ssh_login_ips`: an address here
-            -- becomes an Allow rule ahead of every other firewall rule and
-            -- clears the NGINX block, and a user agent here clears the
-            -- NGINX block (it cannot reach the firewall, which never sees
-            -- one). Stored normalised — see `normalize_trusted_address` —
-            -- so the primary key is what deduplicates `10.0.0.5/24` and
-            -- `10.0.0.0/24`.
-            CREATE TABLE IF NOT EXISTS trusted_addresses (
-                address TEXT PRIMARY KEY,
-                trusted_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS trusted_user_agents (
-                user_agent TEXT PRIMARY KEY,
-                trusted_at INTEGER NOT NULL
-            );
-            COMMIT;
-            ",
-        )?;
-
-        // `firewall_rules.expires_at` is on the `CREATE TABLE` above, which
-        // only takes effect for a database created fresh by this version —
-        // an existing database from before this column existed needs it
-        // added explicitly. This project has never needed a schema
-        // migration before now (see the doc comment on `Bot::source_id`),
-        // so there's no migration runner to hook into; this one column is
-        // simple enough to guard by hand instead: `ALTER TABLE ADD COLUMN`
-        // errors ("duplicate column name") if the column is already there
-        // (which it always is on a fresh database, since `CREATE TABLE`
-        // just added it above), so check via `PRAGMA table_info` first and
-        // only run the `ALTER` on a database that actually predates it.
-        let has_expires_at = self
-            .conn
-            .prepare("SELECT 1 FROM pragma_table_info('firewall_rules') WHERE name = 'expires_at'")?
-            .exists([])?;
-        if !has_expires_at {
-            self.conn.execute(
-                "ALTER TABLE firewall_rules ADD COLUMN expires_at INTEGER",
-                [],
-            )?;
-        }
-
-        // `firewall_rendered_signature` used to hold the rule set's entire
-        // `Debug` dump rather than a digest of it (see
-        // `firewall::rules_signature`). On a host with reputation feeds
-        // enabled that is megabytes in one `settings` row — 4.7 MB, 31% of
-        // the whole database, on the host that prompted this — and nothing
-        // shrinks it until something happens to re-render. The CLI's
-        // `render-firewall` doesn't record a signature at all, so on a
-        // host driven from the command line that is *never*.
-        //
-        // Dropping it on open is the whole migration. The value is a cache
-        // of "what did we last render", so losing it costs one spurious
-        // "the rules changed" until the next render writes a digest — the
-        // same one-off the format change causes anyway. Guarded by length
-        // so it runs once and is a no-op forever after: a digest is
-        // exactly 64 hex characters, and a `Debug` dump of even a single
-        // rule is over a hundred, so the two can't be confused.
-        self.conn.execute(
-            "DELETE FROM settings
-             WHERE key = 'firewall_rendered_signature' AND length(value) <> 64",
-            [],
-        )?;
-
-        // Seed default category policies, matching the product defaults shown
-        // in the README: scanners and AI bots blocked by default, search engines allowed.
-        for (key, default) in [
-            (Category::Scanner.settings_key(), Policy::Blocked),
-            (Category::Search.settings_key(), Policy::Allowed),
-            (Category::Ai.settings_key(), Policy::Blocked),
-        ] {
-            self.conn.execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
-                params![key, default.as_str()],
-            )?;
-        }
-
-        // Seed the default geo mode: Blocklist (block specific countries,
-        // allow everything else) — the least surprising default, and the
-        // only one that's safe to render on either firewall backend.
-        self.conn.execute(
-            "INSERT OR IGNORE INTO settings (key, value) VALUES ('geo_mode', ?1)",
-            params![GeoMode::Blocklist.as_str()],
-        )?;
-
-        Ok(())
+        schema::migrate(&conn, None)?;
+        Ok(Db { conn })
     }
 
     /// Runs `f` inside a single transaction, committing on `Ok` and rolling
@@ -5404,44 +5057,9 @@ mod tests {
         );
     }
 
-    /// The upgrade path off the verbatim-dump format: a database carrying
-    /// one must come back with it gone, not merely ignored, because the
-    /// entire point is the megabytes it was occupying.
-    #[test]
-    fn opening_a_database_drops_a_pre_digest_firewall_signature() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("legacy.sqlite3");
-        {
-            let db = Db::open(&path).unwrap();
-            // What the old `format!("{rules:?}")` would have stored.
-            db.set_firewall_rendered_signature(
-                "[FirewallRule { id: 1, address: \"1.2.3.4\", port: None, \
-                 action: Block, enabled: true, expires_at: None }]",
-            )
-            .unwrap();
-        }
-
-        let reopened = Db::open(&path).unwrap();
-
-        assert_eq!(reopened.get_firewall_rendered_signature().unwrap(), None);
-        let rows: i64 = reopened
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM settings WHERE key = 'firewall_rendered_signature'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            rows, 0,
-            "the row itself should be gone, not just unreadable"
-        );
-    }
-
-    /// ...and the migration must not eat a real one. It runs on every
-    /// open, so a signature that survived one restart has to survive every
-    /// restart — otherwise the dashboard would claim the script was stale
-    /// after each one.
+    /// A real signature survives reopening — otherwise the dashboard would
+    /// claim the script was stale after every restart. (Dropping the old
+    /// verbatim dumps is `schema`'s job, once, on upgrade.)
     #[test]
     fn opening_a_database_keeps_a_digest_firewall_signature() {
         let dir = tempfile::tempdir().unwrap();

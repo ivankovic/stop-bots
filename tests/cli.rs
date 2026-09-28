@@ -3348,3 +3348,59 @@ fn stop_bots_cmd(args: &[&str]) -> Command {
     cmd.args(args);
     cmd
 }
+
+// ---- upgrading from 0.0.x ----
+
+/// A database as 0.0.15 left it, restored from its SQL dump into `db`.
+fn restore_0_0_15(db: &Path) {
+    let sql = fs::read_to_string("tests/fixtures/db/db-0.0.15.sql").unwrap();
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .execute_batch(&sql)
+        .unwrap();
+}
+
+/// The upgrade an operator actually does: install the new package, run
+/// any command. The rules are all still there, and the database as it
+/// was sits next to it.
+#[test]
+fn the_first_command_after_an_upgrade_keeps_the_rules_and_leaves_a_copy() {
+    let fixture = Fixture::new();
+    restore_0_0_15(&fixture.db);
+
+    fixture.run(&["list-firewall-rules"]).stdout(
+        predicate::str::contains("203.0.113.7")
+            .and(predicate::str::contains("198.51.100.0/24"))
+            .and(predicate::str::contains("203.0.113.99")),
+    );
+
+    let mut backup = fixture.db.as_os_str().to_owned();
+    backup.push(".bak-v0");
+    assert!(
+        Path::new(&backup).exists(),
+        "no pre-upgrade copy at {backup:?}"
+    );
+}
+
+/// Going back a version must not quietly misread what the newer one
+/// wrote: it stops, and says which two versions disagree.
+#[test]
+fn a_database_from_a_newer_release_is_refused() {
+    let fixture = Fixture::new();
+    fixture.run(&["list-firewall-rules"]);
+    rusqlite::Connection::open(&fixture.db)
+        .unwrap()
+        .pragma_update(None, "user_version", 999)
+        .unwrap();
+
+    fixture
+        .cmd(&["list-firewall-rules"])
+        .assert()
+        .failure()
+        .stderr(
+            predicate::str::contains("schema version 999").and(predicate::str::contains(format!(
+                "versions up to {}",
+                stop_bots::db::schema::CURRENT_VERSION
+            ))),
+        );
+}

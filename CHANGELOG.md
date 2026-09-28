@@ -29,6 +29,14 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - `SECURITY.md` said every detector is off by default; five are on. It now
   says which, and that blocking traffic you wanted is a matter of tuning.
 
+## [Unreleased]
+
+### Changed
+
+- **The database has a schema version** (`PRAGMA user_version`). Upgrading
+  from any 0.0.x first copies the database to `<db>.bak-v0` (mode 0600),
+  and a database written by a newer stop-bots is refused rather than misread.
+
 ## [0.0.15] — 2026-09-27
 
 ### Added
