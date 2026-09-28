@@ -796,6 +796,45 @@ mod tests {
         conn.execute_batch(sql).unwrap();
     }
 
+    /// Under WAL, committed rows can still be in the `-wal` rather than
+    /// the main file. A copy of the main file alone would miss them; the
+    /// copy made before an upgrade must not, and must stand on its own.
+    #[test]
+    fn the_copy_before_an_upgrade_includes_what_is_still_in_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;
+                 PRAGMA synchronous = OFF;
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO settings VALUES ('a-key', 'only-in-the-wal');",
+            )
+            .unwrap();
+
+        drop(Db::open(&path).unwrap());
+        drop(writer);
+
+        let backup = backup_path(&path, 0);
+        let copy = Connection::open(&backup).unwrap();
+        let value: String = copy
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'a-key'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, "only-in-the-wal");
+        let mut wal = backup.into_os_string();
+        wal.push("-wal");
+        assert!(
+            !std::path::Path::new(&wal).exists(),
+            "the copy is in WAL mode, so it is not one self-contained file"
+        );
+    }
+
     #[test]
     fn a_pre_0_1_database_is_copied_before_it_is_upgraded() {
         use std::os::unix::fs::PermissionsExt;

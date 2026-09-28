@@ -231,8 +231,16 @@ impl Stored {
         if !db_path.is_file() {
             return Ok(Stored::default());
         }
-        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("failed to read {}", db_path.display()))?;
+        // Read-write but never created, and only ever read. Not
+        // READ_ONLY: a read-only connection to a WAL database has to
+        // create the `-wal` and `-shm` files and then cannot delete them,
+        // so a dry run would leave two new files beside the database.
+        // Nor `Db::open`, which would upgrade the schema.
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("failed to read {}", db_path.display()))?;
         // The console may be mid-write when this runs: it is stopped only
         // later, by the plan this is building.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -1001,6 +1009,9 @@ mod tests {
         let staged = Staged::new();
         let db = staged.write("var/lib/stop-bots/db.sqlite3", "");
         let backup = staged.write("var/lib/stop-bots/db.sqlite3.bak-v0", "");
+        // What WAL leaves beside it while the console has it open.
+        let wal = staged.write("var/lib/stop-bots/db.sqlite3-wal", "");
+        let shm = staged.write("var/lib/stop-bots/db.sqlite3-shm", "");
 
         let kept = run(&staged.plan, Target::All, &Options::default());
         assert!(db.exists() && backup.exists());
@@ -1021,7 +1032,9 @@ mod tests {
             },
         );
         assert_eq!(purged.failures(), 0, "{purged:#?}");
-        assert!(!db.exists() && !backup.exists());
+        for file in [&db, &backup, &wal, &shm] {
+            assert!(!file.exists(), "{} survived --purge", file.display());
+        }
         assert!(
             !staged.path("var/lib/stop-bots").exists(),
             "the emptied directory was left"
@@ -1142,5 +1155,27 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, [std::ffi::OsString::from("db.sqlite3")]);
+    }
+
+    /// A database this release wrote is in WAL mode, and a dry run must
+    /// not leave a `-wal` and `-shm` behind by reading it.
+    #[test]
+    fn reading_a_wal_database_leaves_no_files_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        crate::db::Db::open(&path)
+            .unwrap()
+            .set_text_setting(NginxCommands::ROOT_KEY, "/srv/nginx")
+            .unwrap();
+
+        let plan = Plan::resolve(None, Some(path.clone()), None).unwrap();
+
+        assert_eq!(plan.nginx_root, PathBuf::from("/srv/nginx"));
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["db.sqlite3"]);
     }
 }

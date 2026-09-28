@@ -113,6 +113,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - `status` counts set elements and ip6tables rules as loaded rules.
 - The web unit runs at `Nice=10` and `IOSchedulingClass=idle`, with
   `MemoryHigh=25%` (throttles) and `MemoryMax=50%` (backstop) of RAM.
+- **The database runs in WAL mode**: readers no longer wait for a writer.
+  Its `-wal`/`-shm` are 0600, `install web` tightens them and
+  `uninstall --purge` removes them.
 
 
 - **A render no longer changes what loads at boot.** It writes

@@ -3281,12 +3281,15 @@ mod tests {
     }
 
     /// The size check reports rather than judges on an ordinary database,
-    /// and the number it reports is the one an admin would get from `du`.
+    /// and the number it reports is the one an admin would get from `du`
+    /// once the write-ahead log is checkpointed: the `-wal` is bounded and
+    /// comes and goes, and is not what a size check is watching grow.
     #[test]
     fn database_size_reports_an_ordinary_database_without_complaint() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ordinary.sqlite3");
         let db = Db::open(&path).unwrap();
+        db.checkpoint().unwrap();
 
         let check = database_size(&db).unwrap();
 

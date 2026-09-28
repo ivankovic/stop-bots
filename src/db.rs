@@ -478,7 +478,8 @@ pub struct NewFirewallRule {
 /// is holding on to — see [`Db::size_on_disk`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DbSize {
-    /// The file's total size.
+    /// The database's size in pages. Its `-wal` is not counted: that is
+    /// bounded by `journal_size_limit` and emptied by every checkpoint.
     pub bytes: u64,
     /// The part of `bytes` that is on the freelist: already reclaimable by
     /// SQLite for its own reuse, and returnable to the filesystem by
@@ -1051,6 +1052,41 @@ fn make_private(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// How large the write-ahead log may stay once a checkpoint has emptied
+/// it. SQLite reuses the file rather than shrinking it, so without a limit
+/// one large transaction (a feed's worth of ranges) leaves a `-wal` that
+/// size on disk for good.
+const WAL_SIZE_LIMIT: i64 = 16 * 1024 * 1024;
+
+/// Switches the database to write-ahead logging.
+///
+/// In the default rollback mode a writer locks out every reader for the
+/// length of its transaction, and the console, the TUI and a cron `batch`
+/// all read and write this file. With WAL, readers never wait for the
+/// writer and the writer never waits for readers; only two writers still
+/// take turns, which `busy_timeout` covers.
+///
+/// WAL is a property of the file, so once one process has set it every
+/// later open finds it already on, older binaries included (SQLite has
+/// read WAL databases since 3.7). SQLite gives the `-wal` and `-shm` files
+/// the main file's mode and owner, so [`make_private`]'s 0600 covers them.
+///
+/// Best effort, and deliberately so: a filesystem without shared-memory
+/// support refuses WAL and SQLite stays in rollback mode, which is how
+/// every release before this one ran. Changing the mode also needs a
+/// moment with no other connection open; if an older binary is holding
+/// the file, the next open tries again.
+fn use_write_ahead_log(conn: &Connection) {
+    let _ = conn.query_row("PRAGMA journal_mode = WAL", [], |row| {
+        row.get::<_, String>(0)
+    });
+    let _ = conn.query_row(
+        &format!("PRAGMA journal_size_limit = {WAL_SIZE_LIMIT}"),
+        [],
+        |row| row.get::<_, i64>(0),
+    );
+}
+
 /// `settings` key for [`Db::get_humans_only`].
 pub const HUMANS_ONLY_KEY: &str = keys::HUMANS_ONLY;
 
@@ -1084,6 +1120,7 @@ impl Db {
             .with_context(|| format!("failed to open database: {}", path.display()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("failed to set the database busy timeout")?;
+        use_write_ahead_log(&conn);
         schema::migrate(&conn, Some(path))?;
         Ok(Db { conn })
     }
@@ -2121,8 +2158,23 @@ impl Db {
         self.conn
             .execute_batch("VACUUM")
             .context("failed to vacuum the database")?;
+        // Under WAL the rewritten pages land in the `-wal` first, and the
+        // main file only shrinks when they are checkpointed back into it.
+        // Truncating also empties the `-wal`, which VACUUM had just filled
+        // with a copy of the whole database.
+        self.checkpoint()?;
         let after = self.size_on_disk()?.map(|size| size.bytes).unwrap_or(0);
         Ok(before.saturating_sub(after))
+    }
+
+    /// Copies everything in the write-ahead log back into the database
+    /// file and empties the `-wal`, so the file on disk is the whole
+    /// database again. SQLite does this on its own every thousand pages or
+    /// so; this is for when it has to have happened now.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .context("failed to checkpoint the database")
     }
 
     /// How many bytes of `log_path`'s content `record_access_stats` had
@@ -3443,6 +3495,53 @@ mod tests {
         assert_eq!(mode_of(&parent), 0o755);
     }
 
+    /// With WAL a reader never waits for the writer, and the console, the
+    /// TUI and a cron `batch` all share this file.
+    #[test]
+    fn a_database_on_disk_is_opened_in_write_ahead_log_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("db.sqlite3")).unwrap();
+
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(mode, "wal");
+    }
+
+    /// A database an older release wrote is in rollback mode, and the
+    /// first open by this one switches it: WAL is stored in the file.
+    #[test]
+    fn a_rollback_mode_database_is_switched_to_wal_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        drop(Db::open(&path).unwrap());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("PRAGMA synchronous = OFF").unwrap();
+            conn.query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))
+                .unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('probe', 'kept')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+
+        let mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert_eq!(
+            db.get_text_setting("probe").unwrap().as_deref(),
+            Some("kept")
+        );
+    }
+
     /// SQLite gives its write-ahead log and shared-memory index the main
     /// file's mode, so making the main file private covers them too.
     #[test]
@@ -3450,9 +3549,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("db.sqlite3");
         let db = Db::open(&path).unwrap();
-        db.conn
-            .query_row("PRAGMA journal_mode = WAL", [], |_| Ok(()))
-            .unwrap();
         db.set_text_setting("probe", "x").unwrap();
 
         for suffix in ["-wal", "-shm"] {
@@ -5732,6 +5828,15 @@ mod tests {
         assert!(after.bytes < grown.bytes, "vacuum should shrink the file");
         assert_eq!(reclaimed, grown.bytes - after.bytes);
         assert_eq!(after.free_bytes, 0, "vacuum should leave no freelist");
+        // Under WAL the file itself only shrinks once the rewrite is
+        // checkpointed back into it, and the `-wal` holds a copy until then.
+        let on_disk = |suffix: &str| {
+            std::fs::metadata(dir.path().join(format!("size.sqlite3{suffix}")))
+                .map(|meta| meta.len())
+                .unwrap_or(0)
+        };
+        assert_eq!(on_disk(""), after.bytes, "the file on disk did not shrink");
+        assert_eq!(on_disk("-wal"), 0, "the -wal still holds the rewrite");
     }
 
     /// An in-memory database has no file, and saying "0 bytes" about one

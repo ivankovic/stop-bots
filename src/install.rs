@@ -824,10 +824,19 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
 /// the installer. A mode travels with a file through a backup or a `cp`
 /// in a way the directory it used to live in does not.
 ///
+/// Its `-wal` and `-shm` too, when they are there: the database runs in
+/// WAL mode, and the `-wal` holds recently committed rows, the password
+/// hash included, until they are checkpointed into the main file.
+///
 /// Called after the database has been written, because it has to exist.
 pub fn secure_database(path: &Path) -> Result<()> {
-    if path.exists() {
-        set_mode(path, 0o600)?;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut file = path.as_os_str().to_owned();
+        file.push(suffix);
+        let file = PathBuf::from(file);
+        if file.exists() {
+            set_mode(&file, 0o600)?;
+        }
     }
     Ok(())
 }
@@ -941,6 +950,28 @@ mod tests {
     #[test]
     fn the_generated_unit_is_what_it_was() {
         crate::golden::assert_golden("stop-bots-web.service", &web_unit(&system_layout()));
+    }
+
+    /// Under WAL the `-wal` holds rows not yet checkpointed, the password
+    /// hash among them, so it is tightened with the database.
+    #[test]
+    fn securing_the_database_covers_its_wal_companions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        for suffix in ["", "-wal", "-shm"] {
+            let file = dir.path().join(format!("db.sqlite3{suffix}"));
+            std::fs::write(&file, "").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        secure_database(&db).unwrap();
+
+        for suffix in ["", "-wal", "-shm"] {
+            let file = dir.path().join(format!("db.sqlite3{suffix}"));
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "db.sqlite3{suffix} was left {mode:04o}");
+        }
     }
 
     /// The unit must not name an SSH log unless asked to.
