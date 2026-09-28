@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule};
+use stop_bots::protection::Detector;
 use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
 
 const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
@@ -62,8 +63,25 @@ fn ttl_days_arg(raw: &str) -> Result<i64, String> {
     }
 }
 
-/// Help text shared by every subcommand's `--db` flag.
-const DB_HELP: &str = "Database path (defaults to /var/lib/stop-bots/db.sqlite3, falling back to a per-user location if that's not writable)";
+/// Help text for the global `--db` flag.
+const DB_HELP: &str =
+    "Database path. Defaults to $STOP_BOTS_DB, then /var/lib/stop-bots/db.sqlite3, \
+falling back to a per-user location if that is not writable";
+
+/// Help text shared by every `--root` flag.
+const ROOT_HELP: &str = "NGINX config root. Defaults to the one stored by `set-nginx-commands \
+--root`, else /etc/nginx";
+
+/// Help text shared by every detector subcommand's `--access-log`.
+const ACCESS_LOG_HELP: &str = "Read this NGINX access log instead of the stored one \
+(`set-log-paths`), else /var/log/nginx/access.log";
+
+/// Help text shared by every detector subcommand's `--dry-run`.
+const DRY_RUN_HELP: &str = "Show what would be blocked without storing anything";
+
+/// Help text shared by every detector subcommand's `--ttl-days`.
+const TTL_HELP: &str = "How many days a block lasts. Defaults to this detector's stored TTL \
+(`set-detector`)";
 
 #[derive(Parser)]
 // `version` is not decoration: this ships as a tagged GitHub release
@@ -75,28 +93,40 @@ const DB_HELP: &str = "Database path (defaults to /var/lib/stop-bots/db.sqlite3,
     about = "Configure your server to stop bad bots"
 )]
 struct Cli {
+    // Global, so it works before or after the subcommand, and read from
+    // `STOP_BOTS_DB` when not given. Every subcommand used to declare its
+    // own copy; `stop-bots scan-sites --db x` still parses the same way,
+    // because a global flag is accepted after the subcommand too. A `//`
+    // comment rather than `///`, which clap would print as long help.
+    #[arg(long, global = true, env = "STOP_BOTS_DB", value_name = "PATH", help = DB_HELP)]
+    db: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
+// Conventions for everything below — written down in CONTRIBUTING.md
+// under "CLI conventions", and checked by the tests at the bottom of this
+// file:
+//
+// - A stored on/off setting takes an explicit value, `--enabled
+//   true|false`, so both directions can be said. A presence flag is only
+//   for how *this run* behaves (`--force`, `--dry-run`, `--no-fetch`).
+// - A stored setting is changed by a `set-*` verb. Flags on a verb that
+//   runs something (`web`, `batch`, `render-firewall`, the `block-*`
+//   detectors) apply to that run and are never written back.
+// - Help text names commands the way a user types them (`apply-blocks`),
+//   never the Rust variant (`ApplyBlocks`) or a table or module name.
 #[derive(Subcommand)]
 enum Command {
     /// Discover NGINX sites under a config root and store them in the database
     #[command(alias = "scan")]
     ScanSites {
-        /// Root directory to scan for NGINX config files
-        /// NGINX config root. Defaults to the path stored by
-        /// `set-nginx-commands --root`, else /etc/nginx.
-        #[arg(long)]
+        #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
     },
     /// Download and store the latest known-bot list from one source
     #[command(alias = "update")]
     UpdateBotLists {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// Which bot-list source to update: well-known-bots, ai-robots-txt
         /// or nginx-bad-bots
         #[arg(long, default_value = "well-known-bots")]
@@ -108,12 +138,8 @@ enum Command {
     },
     /// Apply the current blocking policy to every discovered NGINX site
     ApplyBlocks {
-        /// NGINX config root. Defaults to the path stored by
-        /// `set-nginx-commands --root`, else /etc/nginx.
-        #[arg(long)]
+        #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// Skip reloading NGINX after writing config changes (e.g. for
         /// tests, or to review the written config before it goes live).
         /// Applying is a no-op without a reload, so real usage wants this
@@ -129,10 +155,9 @@ enum Command {
         /// Restrict the rule to a single TCP port
         #[arg(long)]
         port: Option<u16>,
+        /// `block` or `allow`
         #[arg(long, default_value = "block")]
         action: String,
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
     },
     /// Never block an address or a user agent, whatever else matches it.
     ///
@@ -163,10 +188,8 @@ enum Command {
         /// Stop trusting it instead
         #[arg(long)]
         remove: bool,
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
     },
-    /// List the user agents this host's blocking policy is turning away
+    /// List the user agents this host's blocking policy is turning away.
     ///
     /// Reads the NGINX access log and counts, per user agent, how many
     /// requests came back with the configured block response and how many
@@ -182,39 +205,44 @@ enum Command {
     ///
     /// Allow one with `stop-bots trust --user-agent`.
     ListTurnedAway {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// Check this NGINX access log file instead of the default
-        /// /var/log/nginx/access.log
-        #[arg(long)]
+        #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
     },
     /// List every trusted address and user agent
-    ListTrusted {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-    },
-    /// List all stored firewall rules
-    ListFirewallRules {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-    },
+    ListTrusted,
+    /// List all stored firewall rules, with their ids
+    ListFirewallRules,
     /// Remove a firewall rule by id
     RemoveFirewallRule {
+        /// The rule's id, as `list-firewall-rules` shows it
         #[arg(long)]
         id: i64,
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+    },
+    /// Switch a stored firewall rule off or back on, without deleting it.
+    ///
+    /// A disabled rule stays in the list, marked "(disabled)", and is left
+    /// out of the next script `render-firewall` writes. Like every rule
+    /// change, it takes effect once that script is applied.
+    SetFirewallRule {
+        /// The rule's id, as `list-firewall-rules` shows it
+        #[arg(long)]
+        id: i64,
+        /// Whether the rule is rendered into the firewall script
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: bool,
     },
     /// Write the firewall rules to a script for you to review and apply.
     ///
-    /// Render the stored firewall rules into an iptables or nftables script.
-    /// The script is written to disk only — it is never executed by this
-    /// tool. Review it, then apply it yourself. Also includes derived rules
-    /// from any blocked-by-default crawler IP-range source and the current
-    /// geo mode's selected countries (see UpdateIpRanges/AddCountry/
-    /// SetGeoMode) — these are computed fresh each render, never stored as
-    /// their own firewall_rules rows.
+    /// Renders every stored rule into an nftables or iptables script, plus
+    /// the rules derived from blocked crawler IP ranges, switched-on
+    /// reputation feeds and the geo selection (see `set-geo-mode` and
+    /// `add-country`). Derived rules are computed fresh on each render and
+    /// never stored.
+    ///
+    /// This command only writes the script; it never runs it. Review it,
+    /// then run it (`nft -f <script>` or `sh <script>`) — or let `batch
+    /// --apply`, or "Apply everything" in the TUI or the web console, do
+    /// both steps.
     ///
     /// Before writing anything, checks recent successful SSH logins (from
     /// /var/log/auth.log, /var/log/secure or journalctl) against every
@@ -223,19 +251,23 @@ enum Command {
     /// client would be cut off, it refuses to write the script (pass
     /// --force to override).
     ///
-    /// Allowlist geo mode (see SetGeoMode) requires --backend nftables:
-    /// iptables has no loopback/established-connection allowance and
-    /// silently permits all IPv6 (it skips IPv6 rules entirely), both fatal
-    /// once a trailing "block everything else" rule is in play.
+    /// Allowlist geo mode needs the nftables backend: iptables has no
+    /// loopback/established-connection allowance and silently permits all
+    /// IPv6 (it skips IPv6 rules entirely), both fatal once a trailing
+    /// "block everything else" rule is in play.
     RenderFirewall {
+        /// Which firewall to write for. Defaults to the backend this host
+        /// is set to (`set-firewall-backend`), which is nftables unless
+        /// changed.
         #[arg(long)]
-        backend: FirewallBackend,
-        /// Path to write the generated script to. Defaults to
-        /// /etc/stop-bots/firewall.nft, which is what `stop-bots install
-        /// firewall` loads at boot and what the health check looks for --
-        /// writing anywhere else gives a script nothing reads.
-        #[arg(long, default_value = stop_bots::firewall::DEFAULT_OUTPUT_PATH)]
-        out: PathBuf,
+        backend: Option<FirewallBackend>,
+        /// Where to write the script. Defaults to
+        /// /etc/stop-bots/firewall.nft for nftables and
+        /// /etc/stop-bots/firewall.sh for iptables: the file `stop-bots
+        /// install firewall` loads at boot and the health check looks for.
+        /// Writing anywhere else gives a script nothing reads.
+        #[arg(long)]
+        out: Option<PathBuf>,
         /// Write the script even if it would block an IP with a recent
         /// successful SSH login
         #[arg(long)]
@@ -245,185 +277,148 @@ enum Command {
         /// aren't at their usual path
         #[arg(long)]
         ssh_log: Option<PathBuf>,
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
     },
-    /// Block IPs with a pile of failed SSH logins.
+    /// Choose which firewall this host generates scripts for.
     ///
-    /// Scans the SSH log for IP addresses with a pile of failed
-    /// authentication attempts — the signature of an automated
-    /// scanner/brute-force bot, not a human — and adds a temporary Block
-    /// rule (expiring after --ttl-days) for each to the firewall_rules
-    /// table. Never blocks an IP that also has a successful login anywhere
-    /// in the same log, or a loopback/private address (see
-    /// stop_bots::sshlog::scanning_ips). Adding a rule here only stores it:
-    /// as with every other firewall_rules row, it has no effect until
-    /// RenderFirewall renders it into a script and you apply that script
-    /// yourself — so this is safe to run unattended (e.g. from cron)
-    /// without risking an immediate, unreviewed lockout. The expiry is
-    /// enforced by RenderFirewall/ListFirewallRules pruning lapsed rows
-    /// on read, not by anything running on a timer — so a block only
-    /// actually lifts on the host the next time you render and re-apply
-    /// after it expires.
-    BlockScanners {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// Minimum number of failed-authentication log lines (not a rate —
-        /// this module doesn't parse timestamps) before an IP is
-        /// considered a scanner rather than someone who mistyped a
-        /// password a couple of times
-        ///
-        /// Must be at least 1. Zero would mean "no evidence required" and
-        /// block every address that appears in the log at all.
-        #[arg(long, default_value_t = 20, value_parser = min_threshold)]
-        threshold: usize,
-        /// How many days an added block rule lasts before it's
-        /// automatically dropped (re-added on a later run if the IP is
-        /// still scanning by then)
-        #[arg(long, default_value_t = 5, value_parser = ttl_days_arg)]
-        ttl_days: i64,
+    /// Read by `render-firewall`, `batch`, the internal cron, `status` and
+    /// `install firewall` whenever they are not told otherwise. The TUI's
+    /// render popup and the web console set the same value.
+    SetFirewallBackend {
+        /// nftables (the default) or iptables
+        #[arg(long)]
+        backend: FirewallBackend,
+    },
+    /// Block addresses with many failed SSH logins.
+    ///
+    /// Scans the SSH log for addresses with many failed logins — the
+    /// signature of a brute-force bot, not a person — and stores a
+    /// temporary block for each. Never blocks an address that also has a
+    /// successful login in the same log, or a loopback or private one.
+    ///
+    /// A stored block has no effect until the firewall script is rendered
+    /// and applied (`render-firewall`, then run the script; or `batch
+    /// --apply`), so this is safe to run unattended. An expired block is
+    /// dropped from the database the next time the rules are read; the
+    /// kernel keeps enforcing it until the script is applied again.
+    ///
+    /// The internal cron runs the same detector with the stored settings;
+    /// change those with `set-detector ssh-scanners`.
+    #[command(alias = "block-scanners")]
+    BlockSshScanners {
+        /// Failed-login lines from one address before it counts as a
+        /// scanner rather than someone who mistyped a password. A count,
+        /// not a rate: log timestamps are not read. Defaults to the stored
+        /// threshold (`set-detector ssh-scanners --threshold`), which is 20
+        /// unless changed. Must be at least 1.
+        #[arg(long, value_parser = min_threshold)]
+        threshold: Option<usize>,
+        #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
+        ttl_days: Option<i64>,
         /// Check this SSH log file instead of auto-detecting one
         #[arg(long)]
         ssh_log: Option<PathBuf>,
-        /// Show what would be added without writing to the database
-        #[arg(long)]
+        #[arg(long, help = DRY_RUN_HELP)]
         dry_run: bool,
     },
-    /// Block IPs that probed a pile of nonexistent URLs.
+    /// Block addresses that asked for many nonexistent URLs.
     ///
-    /// Scans the NGINX access log for IP addresses that requested a pile of
-    /// distinct nonexistent URLs (404s) — the signature of an automated
-    /// vulnerability/URL scanner, not a human clicking a dead link — and
-    /// adds a temporary Block rule (expiring after --ttl-days) for each to
-    /// the firewall_rules table. Unlike BlockScanners, an IP is not
-    /// exempted just because it also got a successful (200) response
-    /// somewhere in the log: a scanner's own recon traffic almost always
-    /// includes one (see stop_bots::accesslog::scanning_ips for the full
-    /// reasoning). Also excludes IPs inside known crawler ranges (Googlebot/
-    /// Bingbot/GPTBot). Adding a rule here only stores it: same as every
-    /// other firewall_rules row, it has no effect until RenderFirewall
-    /// renders it into a script and you apply that script yourself — same
-    /// expiry-is-enforced-on-read caveat as BlockScanners.
+    /// Scans the NGINX access log for addresses that requested many
+    /// distinct URLs answered 404 — the signature of a vulnerability
+    /// scanner, not a person clicking a dead link — and stores a temporary
+    /// block for each. Unlike `block-ssh-scanners`, a successful response
+    /// elsewhere in the log does not exempt an address: a scanner's own
+    /// reconnaissance almost always includes one. Addresses inside a
+    /// verified crawler's published ranges (Googlebot, Bingbot, GPTBot)
+    /// are never blocked.
+    ///
+    /// Same caveats as `block-ssh-scanners`: nothing is enforced until the
+    /// firewall script is rendered and applied.
     BlockWebScanners {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// Minimum number of *distinct* 404-returning paths (not total
-        /// hits, and not a rate — this module doesn't parse timestamps)
-        /// before an IP is considered a scanner rather than a client that
-        /// hit one dead link
-        ///
-        /// Must be at least 1. Zero would mean "no evidence required" and
-        /// block every address that appears in the log at all.
-        #[arg(long, default_value_t = 7, value_parser = min_threshold)]
-        threshold: usize,
-        /// How many days an added block rule lasts before it's
-        /// automatically dropped (re-added on a later run if the IP is
-        /// still scanning by then)
-        #[arg(long, default_value_t = 1, value_parser = ttl_days_arg)]
-        ttl_days: i64,
-        /// Check this NGINX access log file instead of the default
-        /// /var/log/nginx/access.log
-        #[arg(long)]
+        /// Distinct 404'd paths from one address before it counts as a
+        /// scanner (not total hits, and not a rate). Defaults to the stored
+        /// threshold (`set-detector web-scanners --threshold`), which is 7
+        /// unless changed. Must be at least 1.
+        #[arg(long, value_parser = min_threshold)]
+        threshold: Option<usize>,
+        #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
+        ttl_days: Option<i64>,
+        #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
-        /// Show what would be added without writing to the database
-        #[arg(long)]
+        #[arg(long, help = DRY_RUN_HELP)]
         dry_run: bool,
     },
-    /// Block IPs faking a Googlebot/Bingbot/GPTBot user agent.
+    /// Block addresses faking a Googlebot, Bingbot or GPTBot user agent.
     ///
-    /// Scans the NGINX access log for IP addresses that claimed, via their
-    /// User-Agent, to be Googlebot, Bingbot or GPTBot while connecting from
-    /// an address that crawler's own operator does not publish — the
-    /// cheapest and most common bot disguise there is — and adds a
-    /// temporary Block rule (expiring after --ttl-days) for each.
+    /// Scans the NGINX access log for addresses that claim, in their user
+    /// agent, to be Googlebot, Bingbot or GPTBot while connecting from an
+    /// address that crawler's operator does not publish — the cheapest and
+    /// most common bot disguise there is — and stores a temporary block for
+    /// each.
     ///
-    /// This is the offline stand-in for forward-confirmed reverse DNS:
-    /// real rDNS needs a lookup per request, which nothing here is in a
-    /// position to do, but the operators' published CIDR lists answer the
-    /// same "is this actually Google?" question against a log after the
-    /// fact. There is deliberately no --threshold: one forged request is
-    /// already conclusive, unlike the behavioural counting BlockScanners
-    /// and BlockWebScanners do.
+    /// This is the offline stand-in for forward-confirmed reverse DNS: the
+    /// operators' published address lists answer the same "is this really
+    /// Google?" question against a log after the fact. There is no
+    /// --threshold: one forged request is already conclusive.
     ///
-    /// Inert until UpdateIpRanges has fetched at least one crawler's
-    /// ranges — with no ranges stored, every real crawler request would
-    /// look forged, so those sources are skipped rather than treated as
-    /// "nothing is legitimate". Same storage-only, expiry-enforced-on-read
-    /// caveats as BlockScanners.
+    /// Inert until `update-ip-ranges` has fetched at least one crawler's
+    /// ranges: with none stored, every real crawler request would look
+    /// forged, so that crawler is skipped. Same caveats as
+    /// `block-ssh-scanners`.
     BlockSpoofedCrawlers {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// How many days an added block rule lasts. Short by default: if a
+        /// How many days a block lasts. Defaults to this detector's stored
+        /// TTL (`set-detector`), which is one day unless changed: if a
         /// crawler operator publishes a new range faster than the daily
         /// range refresh picks it up, this bounds how long a real crawler
-        /// address stays blocked. A genuine impersonator is re-flagged on
-        /// its next request anyway.
-        #[arg(long, default_value_t = stop_bots::protection::SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT, value_parser = ttl_days_arg)]
-        ttl_days: i64,
-        /// Check this NGINX access log file instead of the default
-        /// /var/log/nginx/access.log
-        #[arg(long)]
+        /// address stays blocked.
+        #[arg(long, value_parser = ttl_days_arg)]
+        ttl_days: Option<i64>,
+        #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
-        /// Show what would be added without writing to the database
-        #[arg(long)]
+        #[arg(long, help = DRY_RUN_HELP)]
         dry_run: bool,
     },
-    /// Block IPs that asked for /.env, /.git/config and friends.
+    /// Block addresses that asked for /.env, /.git/config and friends.
     ///
-    /// Block IPs that asked for /.env, /.git/config and friends.
+    /// Scans the NGINX access log for addresses that requested a path
+    /// nothing legitimate asks for — `/.env`, `/.git/config`,
+    /// `/wp-config.php`, `/vendor/phpunit/...` and similar — and stores a
+    /// temporary block for each.
     ///
-    /// Scans the NGINX access log for IP addresses that requested a path
-    /// nothing legitimate ever asks for — `/.env`, `/.git/config`,
-    /// `/wp-config.php`, `/vendor/phpunit/...` and friends — and adds a
-    /// temporary Block rule (expiring after --ttl-days) for each.
+    /// No --threshold: one request to any of these is already conclusive.
+    /// The built-in list leaves out commonly probed paths that are also
+    /// legitimate somewhere — `/wp-login.php`, `/wp-admin/`,
+    /// `/xmlrpc.php`, `/phpmyadmin` — since instantly blocking a site's own
+    /// administrator would be far worse than missing a scanner that
+    /// `block-web-scanners` catches anyway. Add paths of your own with
+    /// `set-probe-paths`.
     ///
-    /// No --threshold, unlike BlockWebScanners: one request to any of
-    /// these is already conclusive. The built-in list is chosen strictly
-    /// for that reason and deliberately excludes commonly-probed paths
-    /// that are *also* legitimate somewhere — `/wp-login.php`,
-    /// `/wp-admin/`, `/xmlrpc.php`, `/phpmyadmin` — since instant-blocking
-    /// a site's own administrator would be far worse than missing a
-    /// scanner that BlockWebScanners catches anyway. Add site-specific
-    /// paths with SetProbePaths.
-    ///
-    /// Same storage-only, expiry-enforced-on-read caveats as BlockScanners.
+    /// Same caveats as `block-ssh-scanners`.
     BlockProbePaths {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        #[arg(long, default_value_t = stop_bots::protection::PROBE_PATHS_TTL_DAYS_DEFAULT, value_parser = ttl_days_arg)]
-        ttl_days: i64,
-        /// Check this NGINX access log file instead of the default
-        /// /var/log/nginx/access.log
-        #[arg(long)]
+        #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
+        ttl_days: Option<i64>,
+        #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
-        /// Show what would be added without writing to the database
-        #[arg(long)]
+        #[arg(long, help = DRY_RUN_HELP)]
         dry_run: bool,
     },
     /// Set the extra probe paths, on top of the built-in list.
     ///
-    /// Replaces the extra probe paths checked by BlockProbePaths, on top of
-    /// the built-in list (which is never removable — turn the detector off
-    /// instead). One path per line; blank lines and `#` comments are
-    /// ignored, and every entry must start with `/` since matching is
-    /// anchored at the start of the request path.
+    /// Replaces the extra paths `block-probe-paths` checks. The built-in
+    /// list is never removable — switch the detector off instead. One path
+    /// per line; blank lines and `#` comments are ignored, and every entry
+    /// must start with `/`, since matching is anchored at the start of the
+    /// request path.
     SetProbePaths {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// Newline-separated paths. Pass an empty string to clear.
         #[arg(long)]
         paths: String,
     },
-    /// Lists every probe path currently checked, built-in and extra
-    ListProbePaths {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-    },
+    /// List every probe path currently checked, built-in and extra
+    ListProbePaths,
     /// Block anything that fetched the honeypot trap path.
     ///
     /// Scans the NGINX access log for anything that fetched the honeypot
-    /// trap path and adds a temporary Block rule (expiring after
-    /// --ttl-days) for each.
+    /// trap path and stores a temporary block for each.
     ///
     /// The trap path is published as `Disallow:` in the robots.txt this
     /// tool generates and is otherwise unreferenced, so fetching it means
@@ -434,69 +429,102 @@ enum Command {
     /// accident.
     ///
     /// Does nothing until the path is actually published: turn on
-    /// robots.txt generation (NGINX, or the robots.txt setting on
-    /// the CLI) and apply, or add the Disallow line yourself.
+    /// robots.txt generation (`set-robots-txt --enabled true`) and apply,
+    /// or add the Disallow line yourself.
     BlockHoneypot {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        #[arg(long, default_value_t = stop_bots::protection::HONEYPOT_TTL_DAYS_DEFAULT, value_parser = ttl_days_arg)]
-        ttl_days: i64,
-        /// Check this NGINX access log file instead of the default
-        /// /var/log/nginx/access.log
-        #[arg(long)]
+        #[arg(long, value_parser = ttl_days_arg, help = TTL_HELP)]
+        ttl_days: Option<i64>,
+        #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
-        /// Show what would be added without writing to the database
-        #[arg(long)]
+        #[arg(long, help = DRY_RUN_HELP)]
         dry_run: bool,
     },
     /// Set the honeypot trap path.
     ///
-    /// Must start with `/`. Pick something
-    /// that does *not* sound valuable: a path like `/admin` or `/backup`
-    /// would also be guessed by scanners that never read robots.txt, which
-    /// turns a precise "ignored robots.txt" signal into just another probe
-    /// path.
+    /// Pick something that does *not* sound valuable: a path like `/admin`
+    /// or `/backup` would also be guessed by scanners that never read
+    /// robots.txt, which turns a precise "ignored robots.txt" signal into
+    /// just another probe path.
     SetHoneypotPath {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+        /// The trap path. Must start with `/`, and contain only characters
+        /// a URL path spells literally.
         #[arg(long)]
         path: String,
     },
+    /// List every detector with its switch, TTL and threshold.
+    ///
+    /// These are the settings the internal cron and `batch` run the
+    /// detectors with. Change them with `set-detector`, and IPv4 /24
+    /// escalation with `set-subnet-escalation`.
+    ListDetectors,
+    /// Switch a detector on or off, and set its TTL and threshold.
+    ///
+    /// These are what the internal cron (inside `stop-bots web` or the
+    /// TUI) and `batch` use. Switching a detector off stops it adding
+    /// blocks; it never removes the ones it already added, which expire on
+    /// their own. Give no flags to print the detector's current settings.
+    ///
+    /// Only the five detectors that count something take a threshold:
+    /// ssh-scanners, web-scanners, asset-ratio, rotating-ua and
+    /// refererless. For the others one matching request is conclusive.
+    ///
+    /// robots-txt cannot be switched here: it runs exactly when "humans
+    /// only" is on (`set-humans-only`).
+    SetDetector {
+        /// Which detector
+        detector: DetectorArg,
+        /// Whether it runs
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: Option<bool>,
+        /// How many days each block it adds lasts, from 1 to 3650
+        #[arg(long)]
+        ttl_days: Option<i64>,
+        /// How much evidence from one address before it is blocked: failed
+        /// logins, 404'd paths, pages without assets, user agents or
+        /// referer-less pages, depending on the detector. At least 2.
+        #[arg(long)]
+        threshold: Option<i64>,
+    },
+    /// Block a whole IPv4 /24 when several of its addresses are flagged.
+    ///
+    /// When on, a detector that flags at least --min addresses in one IPv4
+    /// /24 in the same pass blocks the /24 instead. Off by default:
+    /// blocking 256 addresses because three misbehaved is collateral by
+    /// design. IPv6 needs no switch: a detection always blocks the /64,
+    /// which is one network, the same as one IPv4 address.
+    SetSubnetEscalation {
+        /// Whether to escalate
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: Option<bool>,
+        /// Flagged addresses in one /24 before it escalates. At least 2,
+        /// and 3 unless changed.
+        #[arg(long)]
+        min: Option<i64>,
+    },
     /// Tally which user agents are getting through successfully.
     ///
-    /// Reads the NGINX access log and tallies which user agents made a
-    /// successful (non-4xx/5xx) request, adding the counts onto the
-    /// `user_agent_stats` table (see stop_bots::accessstats::
-    /// record_access_stats) — a read of who's actually visiting
-    /// successfully, complementing BlockWebScanners' bad-traffic detection
-    /// rather than replacing it. Additive across runs: re-running over an
-    /// overlapping or rotated log window accumulates onto each user
-    /// agent's existing count instead of resetting it.
+    /// Reads the NGINX access log and adds up, per user agent, the requests
+    /// that were answered successfully (anything but 4xx and 5xx) — a view
+    /// of who is actually visiting, next to the detectors' view of who is
+    /// misbehaving. Additive across runs: re-reading an overlapping or
+    /// rotated log adds onto each user agent's count rather than resetting
+    /// it.
     RecordAccessStats {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// Check this NGINX access log file instead of the default
-        /// /var/log/nginx/access.log
-        #[arg(long)]
+        #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
     },
-    /// Lists recorded user-agent hit counts, most-seen first
-    ListAccessStats {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-    },
+    /// List recorded user-agent hit counts, most-seen first
+    ListAccessStats,
     /// Prune stale rows and compact the database.
     ///
-    /// Drops `user_agent_stats` rows for agents not seen in 90 days (and
-    /// any excess over 20,000 rows, least recently seen first), clears
-    /// lapsed firewall rules, and rewrites the file to hand free pages
-    /// back to the filesystem if enough has accumulated to be worth it.
-    /// The internal cron does this daily on its own — this runs it now,
-    /// which is what a host that has already grown wants, and what a host
-    /// with no `sqlite3` installed has no other way to do
+    /// Drops user-agent statistics not seen in 90 days (and any excess over
+    /// 20,000 rows, least recently seen first), clears lapsed firewall
+    /// rules, and rewrites the file to hand free pages back to the
+    /// filesystem if enough has accumulated to be worth it. The internal
+    /// cron does this daily on its own. This runs it now, which is what a
+    /// host that has already grown wants, and what a host with no `sqlite3`
+    /// installed has no other way to do.
     Maintain {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// Compact the file even when there is little to reclaim. The
         /// scheduled job weighs that up for itself; this overrides it
         #[arg(long)]
@@ -504,11 +532,9 @@ enum Command {
     },
     /// Download one crawler's published IP ranges.
     ///
-    /// Download and store the current CIDR list for one published crawler
-    /// IP-range source (Googlebot, Bingbot or GPTBot)
+    /// Downloads and stores the current CIDR list for one published crawler
+    /// IP-range source: Googlebot, Bingbot or GPTBot.
     UpdateIpRanges {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// Which source to update: googlebot, bingbot or gptbot
         #[arg(long)]
         source_id: String,
@@ -520,15 +546,15 @@ enum Command {
     },
     /// Download one third-party CIDR feed (does not switch it on).
     ///
-    /// Download and store one third-party CIDR feed: an abuse/reputation
-    /// list (firehol-level1, tor-exits, blocklist-de) or a cloud
-    /// provider's published address space (aws, google-cloud,
-    /// digitalocean). Fetching does *not* switch the feed on — see
-    /// SetReputationSource — so refreshing a feed you deliberately
-    /// disabled never silently re-enables it.
+    /// Downloads and stores one third-party CIDR feed: a reputation list
+    /// (firehol-level1, tor-exits, blocklist-de) or a cloud provider's
+    /// published address space (aws, google-cloud, digitalocean). Fetching
+    /// does *not* switch the feed on — see `set-reputation-source` — so
+    /// refreshing a feed you deliberately disabled never silently re-enables
+    /// it.
     UpdateReputationSource {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+        /// Which feed: firehol-level1, tor-exits, blocklist-de, aws,
+        /// google-cloud or digitalocean
         #[arg(long)]
         source_id: String,
         /// Read the list from a local file instead of downloading it
@@ -539,9 +565,9 @@ enum Command {
     },
     /// Switch a third-party CIDR feed on or off.
     ///
-    /// While on, every CIDR it
-    /// holds becomes a derived Block rule at render-firewall time (nothing
-    /// is written to firewall_rules, same as crawler and country ranges).
+    /// While on, every range it holds is blocked in the next script
+    /// `render-firewall` writes. Nothing is added to the stored rule list,
+    /// the same as crawler and country ranges.
     ///
     /// All feeds are off by default. Note what the cloud-provider ones
     /// actually do: they block *every* visitor hosted at that provider,
@@ -549,31 +575,23 @@ enum Command {
     /// just bots. Unlike the behavioural detectors there's no evidence
     /// involved, and a wrongly-blocked visitor has no way to tell you.
     SetReputationSource {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+        /// Which feed, as `list-reputation-sources` names it
         #[arg(long)]
         source_id: String,
-        /// `true` or `false`. Spelled out as a value rather than a bare
-        /// `--enabled` flag so the *off* direction is expressible at all
-        /// — a flag would only ever be able to turn feeds on.
-        #[arg(long, action = clap::ArgAction::Set)]
+        /// Whether its ranges are blocked
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
     /// List the third-party CIDR feeds.
     ///
     /// Lists every third-party CIDR feed with its on/off state and how many
-    /// ranges it currently holds
-    ListReputationSources {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-    },
+    /// ranges it currently holds.
+    ListReputationSources,
     /// Download one country's IP ranges (does not select it).
     ///
-    /// Download and store IPdeny's current aggregated CIDR list for one
-    /// country (does not select it — see AddCountry)
+    /// Downloads and stores IPdeny's current aggregated CIDR list for one
+    /// country. It does not select it — see `add-country`.
     UpdateCountryRanges {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// Two-letter country code, e.g. "us" or "nl"
         #[arg(long)]
         country: String,
@@ -585,43 +603,88 @@ enum Command {
     },
     /// Set the geo mode: blocklist or allowlist.
     ///
-    /// "blocklist" (selected countries are
-    /// blocked, everything else allowed — the default) or "allowlist"
-    /// (selected countries are the only ones allowed, everything else
-    /// blocked). Switching modes doesn't touch the selected-country list
-    /// itself, only how render-firewall interprets it.
+    /// "blocklist" (the default) blocks the selected countries and allows
+    /// everything else; "allowlist" allows only the selected countries and
+    /// blocks everything else. Switching modes doesn't touch the
+    /// selected-country list itself, only how `render-firewall` reads it.
     SetGeoMode {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+        /// blocklist or allowlist
         #[arg(long)]
         mode: GeoModeArg,
     },
     /// Add a country to the geo selection.
     ///
-    /// Add a country to the host-wide geo selection (fetch its ranges first
-    /// with UpdateCountryRanges). What this means depends on the current
-    /// geo mode — see SetGeoMode.
+    /// Adds a country to the host-wide geo selection (fetch its ranges
+    /// first with `update-country-ranges`). What this means depends on the
+    /// geo mode — see `set-geo-mode`.
     AddCountry {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+        /// Two-letter country code, e.g. "us" or "nl"
         #[arg(long)]
         country: String,
     },
     /// Remove a country from the host-wide geo selection
     RemoveCountry {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+        /// Two-letter country code, e.g. "us" or "nl"
         #[arg(long)]
         country: String,
     },
     /// List the current geo mode and every selected country
-    ListSelectedCountries {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-    },
-    /// Turns NGINX rate limiting on or off, and sets its parameters.
+    ListSelectedCountries,
+    /// Set whether a category of bots is allowed or blocked.
     ///
-    /// When on, ApplyBlocks writes a `limit_req_zone` to
+    /// Without --site this is the host-wide default for the category:
+    /// every bot in it follows it unless `set-bot` overrides that bot.
+    /// With --site it overrides the default for that one site; `--policy
+    /// default` removes the override again.
+    ///
+    /// Only changes what would be written: run `apply-blocks` to put it
+    /// into the NGINX config. While "humans only" is on, every category is
+    /// blocked whatever is stored here.
+    SetCategory {
+        /// scanner, search or ai
+        #[arg(long)]
+        category: CategoryArg,
+        /// allowed, blocked, or (with --site) default
+        #[arg(long)]
+        policy: PolicyArg,
+        /// Override the policy for this site only, by its server_name
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// List the category policies, host-wide or for one site
+    ListCategories {
+        /// Show this site's overrides too, by its server_name
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// Allow or block one bot, whatever its category says.
+    ///
+    /// Without --site this is the host-wide status of the bot; `--policy
+    /// default` makes it follow its category again. With --site it
+    /// overrides the bot for that one site only.
+    ///
+    /// Find a bot's slug with `list-bots`. Run `apply-blocks` afterwards to
+    /// write the change into the NGINX config.
+    SetBot {
+        /// The bot's slug, as `list-bots` shows it
+        #[arg(long)]
+        bot: String,
+        /// allowed, blocked, or default
+        #[arg(long)]
+        policy: PolicyArg,
+        /// Override the bot for this site only, by its server_name
+        #[arg(long)]
+        site: Option<String>,
+    },
+    /// List every known bot with its categories and status
+    ListBots {
+        /// Only bots whose slug or name contains this, ignoring case
+        #[arg(long)]
+        search: Option<String>,
+    },
+    /// Turn NGINX rate limiting on or off, and set its parameters.
+    ///
+    /// When on, `apply-blocks` writes a `limit_req_zone` to
     /// /etc/nginx/conf.d/stop-bots-limits.conf (it has to live in `http`
     /// context, so it can't go in the per-site block) and adds a
     /// `limit_req ... burst=N nodelay; limit_req_status 429;` to each
@@ -632,9 +695,8 @@ enum Command {
     /// visitors, and unlike a bot-pattern block there's no user agent to
     /// inspect afterwards to work out who was caught.
     SetRateLimit {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        #[arg(long, action = clap::ArgAction::Set)]
+        /// Whether rate limiting is written into the site configs
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
         /// Sustained requests per second per client address. Generous by
         /// default (10): one page load can easily fire a dozen requests
@@ -647,30 +709,31 @@ enum Command {
     },
     /// Switch one request-shape rule on or off for a site.
     ///
-    /// See the rule list below (see
-    /// SetBlockResponse's siblings in NGINX). Rules:
-    /// http-1x, no-accept, no-accept-language, no-user-agent,
-    /// ip-literal-host, old-tls.
+    /// Each rule turns away requests that don't look like a browser's, and
+    /// each is off by default, one switch per rule so that if something of
+    /// yours stops working you can tell which rule did it. Run
+    /// `apply-blocks` afterwards to write it into the site config.
     SetSiteRule {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// The site's server_name, as `scan-sites` discovered it
         #[arg(long)]
         site: String,
+        /// One of http-1x, no-accept, no-accept-language, no-user-agent,
+        /// ip-literal-host, old-tls
         #[arg(long)]
         rule: String,
-        #[arg(long, action = clap::ArgAction::Set)]
+        /// Whether requests the rule matches are turned away
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
     /// Exempt a path prefix from a site's blocking rules.
     ///
     /// Adds a request-path prefix that a site's blocking rules don't apply
-    /// to. Must start with `/`.
+    /// to. Run `apply-blocks` afterwards to write it into the site config.
     ExemptPath {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+        /// The site's server_name, as `scan-sites` discovered it
         #[arg(long)]
         site: String,
+        /// The path prefix. Must start with `/`.
         #[arg(long)]
         path: String,
         /// Exempt only clients whose user agent contains this, ignoring
@@ -685,10 +748,9 @@ enum Command {
     },
     /// Turn generation of a robots.txt on or off.
     ///
-    /// When on, ApplyBlocks
-    /// writes one to /etc/stop-bots/nginx/robots.txt and adds a
-    /// `location = /robots.txt` block to each site that serves it: one
-    /// `User-agent:` line per currently-blocked bot under a shared
+    /// When on, `apply-blocks` writes one to /etc/stop-bots/nginx/robots.txt
+    /// and adds a `location = /robots.txt` block to each site that serves
+    /// it: one `User-agent:` line per currently-blocked bot under a shared
     /// `Disallow: /`, plus a `Disallow:` for the honeypot trap path.
     ///
     /// Off by default, because it *replaces* whatever the site already
@@ -698,9 +760,8 @@ enum Command {
     /// This is the polite layer under the 403, for the crawlers that
     /// honour it, and it is also what makes the honeypot work at all.
     SetRobotsTxt {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        #[arg(long, action = clap::ArgAction::Set)]
+        /// Whether the robots.txt is generated and served
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
     /// Turn automatic applying of NGINX config on or off.
@@ -715,23 +776,20 @@ enum Command {
     /// Off by default. It reloads a live web server with nobody watching,
     /// which is not something an upgrade should start doing on its own.
     ///
-    /// NGINX only. The firewall script is rendered on a schedule but never
-    /// applied on one, and this does not change that: its anti-lockout
-    /// guard passes when it cannot read the SSH log, which is fine with a
-    /// human reading the result and is how you lose a server without one.
+    /// NGINX only. The firewall script has its own switch,
+    /// `set-auto-apply-firewall`.
     SetAutoApply {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        #[arg(long, action = clap::ArgAction::Set)]
+        /// Whether the internal cron applies NGINX config
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
-    /// Turn automatic applying of the FIREWALL script on or off.
+    /// Turn automatic applying of the firewall script on or off.
     ///
-    /// Separate from SetAutoApply, and separately off by default, because
-    /// the risks are not comparable: a bad NGINX config is caught by
-    /// `nginx -t` and costs a failed reload, while a bad firewall ruleset
-    /// locks you out of the host and no care taken here can undo that
-    /// remotely.
+    /// Separate from `set-auto-apply`, and separately off by default,
+    /// because the risks are not comparable: a bad NGINX config is caught
+    /// by `nginx -t` and costs a failed reload, while a bad firewall
+    /// ruleset locks you out of the host and no care taken here can undo
+    /// that remotely.
     ///
     /// When on, the internal cron runs the script it renders instead of
     /// only writing it — but it refuses to apply unless the anti-lockout
@@ -740,14 +798,14 @@ enum Command {
     /// reading the result; unattended it is not, so this refuses. If the
     /// cron reports that, point `--ssh-log` at a readable log.
     SetAutoApplyFirewall {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        #[arg(long, action = clap::ArgAction::Set)]
+        /// Whether the internal cron runs the firewall script
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
-    /// Serve humans and nothing else: block every catalogued bot whatever
-    /// its category, and give any address that fetches /robots.txt a
-    /// one-day block
+    /// Serve humans and nothing else.
+    ///
+    /// Blocks every catalogued bot whatever its category, and gives any
+    /// address that fetches /robots.txt a one-day block.
     ///
     /// The three category policies are forced to Blocked while this is on
     /// and cannot be edited, but their stored values are untouched — turn
@@ -755,19 +813,13 @@ enum Command {
     /// allowed, because blocking it breaks certificate renewal in a way
     /// that only surfaces two months later.
     SetHumansOnly {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        #[arg(long, action = clap::ArgAction::Set)]
+        /// Whether humans-only mode is on
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
-    /// Prints the robots.txt that would currently be generated, without
-    /// writing anything
-    ShowRobotsTxt {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-    },
+    /// Print the robots.txt that would be generated now, without writing it
+    ShowRobotsTxt,
     /// Set what NGINX sends a blocked request.
-    ///
     ///
     /// These are not interchangeable status codes; each says something
     /// different, and the difference matters most for clients caught by
@@ -784,9 +836,14 @@ enum Command {
     /// but throttles the body to a byte per second, holding the client's
     /// connection open — and one of yours.
     ///
-    /// Host-wide, and only changes what *would* be written: run ApplyBlocks
-    /// afterwards to get the new response code into the site configs. Until
-    /// then NGINX shows every applied site as STALE.
+    /// Host-wide, and only changes what *would* be written: run
+    /// `apply-blocks` afterwards to get the new response into the site
+    /// configs. Until then every applied site shows as STALE.
+    SetBlockResponse {
+        /// What a blocked request gets back
+        #[arg(long)]
+        response: BlockResponseArg,
+    },
     /// Start the web UI.
     ///
     /// Binds 127.0.0.1:8787 by default, which is reachable only from this
@@ -795,22 +852,16 @@ enum Command {
     /// NGINX config, so it is worth reaching over an SSH tunnel
     /// (`ssh -L 8787:127.0.0.1:8787 you@host`) rather than exposing.
     ///
-    /// Binding anywhere else needs --expose as well, on purpose. The
-    /// intended deployment for that is behind the same NGINX this tool is
-    /// protecting, with TLS and the Host allowlist set:
-    ///
-    ///   stop-bots web --bind 0.0.0.0:8787 --expose \
-    ///     --allowed-hosts admin.example.com --save
+    /// The flags here apply to this run only. To change how every later
+    /// run starts — the address, the path prefix, exposure, the Host
+    /// allowlist and the proxy settings — use `set-web`. The service that
+    /// `install web` sets up reads the same settings.
     ///
     /// A password is generated and printed the first time this runs.
     /// It is shown once and stored only as an Argon2 hash, so keep it;
     /// --set-password issues a new one.
     Web {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// NGINX config root to scan for sites. Defaults to the path
-        /// stored by `set-nginx-commands --root`, else /etc/nginx.
-        #[arg(long)]
+        #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
         /// SSH log to read for the Firewall screen.
         #[arg(long)]
@@ -824,11 +875,67 @@ enum Command {
         /// root-owned file anywhere on the host.
         #[arg(long)]
         firewall_out: Option<PathBuf>,
-        /// Address to bind, as `address:port`.
+        /// Address to bind for this run, as `address:port`. Defaults to the
+        /// stored one (`set-web --bind`), else 127.0.0.1:8787.
         #[arg(long)]
         bind: Option<String>,
+        /// Serve under a path prefix for this run. Defaults to the stored
+        /// one (`set-web --base-path`); see there for how the proxy in
+        /// front must be set up.
+        #[arg(long)]
+        base_path: Option<String>,
+        /// Permit this run to bind an address that is not loopback.
+        /// Without it, a non-loopback address is refused rather than
+        /// silently exposing the console to the network. `set-web --expose
+        /// true` makes that permanent.
+        #[arg(long)]
+        expose: bool,
+        /// Deprecated: use `set-web --allowed-hosts`. Still stored, for one
+        /// release.
+        #[arg(long, hide = true)]
+        allowed_hosts: Option<String>,
+        /// Deprecated: use `set-web --trust-forwarded-for`. Still stored,
+        /// for one release.
+        #[arg(long, value_name = "true|false", hide = true)]
+        trust_forwarded_for: Option<bool>,
+        /// Deprecated: use `set-web --secure-cookie`. Still stored, for one
+        /// release.
+        #[arg(long, value_name = "true|false", hide = true)]
+        secure_cookie: Option<bool>,
+        /// Deprecated: use `set-web`. Still persists --bind, --base-path
+        /// and --expose, for one release.
+        #[arg(long, hide = true)]
+        save: bool,
+        /// Generate a new password, print it, and exit without serving.
+        #[arg(long)]
+        set_password: bool,
+        /// Never touch the system: applying writes the database and the
+        /// config files but does not reload NGINX or run the firewall
+        /// script. The same escape hatch the TUI's --no-reload is.
+        #[arg(long)]
+        no_apply: bool,
+    },
+    /// Set how the web console starts and whom it answers.
+    ///
+    /// Every later `stop-bots web`, and the service `install web` sets up,
+    /// reads these. Give no flags to print what is stored.
+    ///
+    /// A non-loopback --bind is refused unless exposure is on, given here
+    /// or stored: the console can rewrite this host's firewall and NGINX
+    /// config. The intended deployment for exposing it is behind the same
+    /// NGINX this tool is protecting, with TLS and the Host allowlist set:
+    ///
+    ///   stop-bots set-web --bind 0.0.0.0:8787 --expose true \
+    ///     --allowed-hosts admin.example.com --secure-cookie true
+    SetWeb {
+        /// Address to bind, as `address:port`
+        #[arg(long)]
+        bind: Option<String>,
+        /// Whether binding an address that is not loopback is permitted
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        expose: Option<bool>,
         /// Serve under a path prefix, for an NGINX location block like
-        /// `https://example.com/stop-bots/`.
+        /// `https://example.com/stop-bots/`. `/` removes it.
         ///
         /// The proxy must NOT strip the prefix — this server matches the
         /// full path including it, and generates links that do too:
@@ -844,52 +951,49 @@ enum Command {
         /// simpler deployment if you can take it.
         #[arg(long)]
         base_path: Option<String>,
-        /// Permit a bind that is not loopback. Without this, a
-        /// non-loopback address is refused rather than silently exposing
-        /// the console to the network.
-        #[arg(long)]
-        expose: bool,
-        /// Comma-separated host names this server will answer to, beyond
-        /// localhost and 127.0.0.1. Required when reaching it by name:
-        /// a request carrying an unlisted Host is refused, which is what
-        /// makes DNS rebinding against the console fail.
-        ///
-        /// Always persisted, with or without --save: the running server
-        /// reads it from the database on every request, so there is
-        /// nowhere else for it to live.
+        /// Comma-separated host names the console answers to, beyond
+        /// localhost and 127.0.0.1. Required when reaching it by name: a
+        /// request carrying an unlisted Host is refused, which is what
+        /// makes DNS rebinding against the console fail. An empty string
+        /// clears it.
         #[arg(long)]
         allowed_hosts: Option<String>,
-        /// Believe the last address in `X-Forwarded-For`, for when this
-        /// server sits behind a proxy on the same host. Without it every
+        /// Believe the last address in `X-Forwarded-For`, for when the
+        /// console sits behind a proxy on the same host. Without it every
         /// proxied request comes from 127.0.0.1, so the login throttle and
         /// the guard against blocking your own address cannot tell clients
         /// apart. Leave it off unless there really is such a proxy.
-        ///
-        /// Always persisted, like --allowed-hosts.
-        #[arg(long, value_name = "true|false")]
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         trust_forwarded_for: Option<bool>,
         /// Mark the session cookie `Secure`. Turn it on behind TLS, or a
         /// browser will also send the session to an `http://` URL for the
         /// same host. Off, a plain-HTTP console cannot keep you logged in.
-        ///
-        /// Always persisted, like --allowed-hosts.
-        #[arg(long, value_name = "true|false")]
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         secure_cookie: Option<bool>,
-        /// Persist --bind and --expose, so a later plain `stop-bots web`
-        /// starts the same way. Nothing is saved unless the address passes
-        /// the exposure check first.
-        #[arg(long)]
-        save: bool,
-        /// Generate a new password, print it, and exit without serving.
-        #[arg(long)]
-        set_password: bool,
-        /// Never touch the system: applying writes the database and the
-        /// config files but does not reload NGINX or run the firewall
-        /// script. The same escape hatch the TUI's --no-reload is.
-        #[arg(long)]
-        no_apply: bool,
     },
-    /// Set the commands used to test and reload NGINX.
+    /// Remember where this host's logs actually are.
+    ///
+    /// The companion to `set-nginx-commands`, for the other half of a
+    /// containerised NGINX. A container that bind-mounts its log directory
+    /// writes the access log somewhere that is not
+    /// /var/log/nginx/access.log on the host, and `--access-log` on a
+    /// single command cannot reach the two things that actually run the
+    /// detectors: the web console and the TUI take no arguments for it, so
+    /// their internal cron reads the default and finds nothing.
+    ///
+    /// A path given here is used whenever no flag overrides it. Pass an
+    /// empty string to clear one. Give neither flag to print what is
+    /// stored.
+    SetLogPaths {
+        /// The NGINX access log every web-side detector reads.
+        #[arg(long)]
+        access_log: Option<String>,
+        /// The SSH authentication log, feeding the SSH scanner detector
+        /// and the anti-lockout window.
+        #[arg(long)]
+        ssh_log: Option<String>,
+    },
+    /// Set the commands used to test and reload NGINX, and its config root.
     ///
     /// Defaults are `nginx -t` and `systemctl reload nginx`, which is what
     /// a normal host install needs. Change them when NGINX is not a
@@ -905,34 +1009,8 @@ enum Command {
     /// characters in an argument rather than syntax. Quote an argument
     /// that genuinely contains a space.
     ///
-    /// Pass neither flag to print the commands currently in effect.
-    /// Remember where this host's logs actually are.
-    ///
-    /// The companion to `set-nginx-commands`, for the other half of a
-    /// containerised NGINX. A container that bind-mounts its log directory
-    /// writes the access log somewhere that is not
-    /// /var/log/nginx/access.log on the host, and `--access-log` on a
-    /// single command cannot reach the two things that actually run the
-    /// detectors: the web console and the TUI take no arguments for it, so
-    /// their internal cron reads the default and finds nothing.
-    ///
-    /// A path given here is used whenever no flag overrides it. Pass an
-    /// empty string to clear one.
-    SetLogPaths {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// The NGINX access log every web-side detector reads.
-        #[arg(long)]
-        access_log: Option<String>,
-        /// The SSH authentication log, feeding the SSH scanner detector
-        /// and the anti-lockout window.
-        #[arg(long)]
-        ssh_log: Option<String>,
-    },
-
+    /// Pass no flag to print the commands currently in effect.
     SetNginxCommands {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// The config check. Must exit non-zero on a bad config.
         #[arg(long)]
         test: Option<String>,
@@ -951,11 +1029,27 @@ enum Command {
         #[arg(long, conflicts_with_all = ["test", "reload", "root"])]
         reset: bool,
     },
-    SetBlockResponse {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
+    /// Report whether this host is actually protected.
+    ///
+    /// Every other check in this tool compares what it would generate
+    /// against what is on disk. This one looks at the kernel, the units
+    /// and the filesystem — the gap that let a host run for three weeks
+    /// with 48,860 generated rules and an empty ruleset.
+    ///
+    /// Exits 1 if anything is CRITICAL and 0 otherwise, so it is usable
+    /// from a monitoring check. `--quiet` prints only what needs
+    /// attention, which is the form to put in cron.
+    Status {
+        /// Read this SSH log instead of auto-detecting one
         #[arg(long)]
-        response: BlockResponseArg,
+        ssh_log: Option<PathBuf>,
+        /// Print only checks that need attention
+        #[arg(long)]
+        quiet: bool,
+        /// Use the last probe the internal cron took instead of looking at
+        /// the host now. Cheap, and what the dashboards show.
+        #[arg(long)]
+        cached: bool,
     },
     /// One unattended pass over everything, for a real cron entry.
     ///
@@ -971,63 +1065,33 @@ enum Command {
     /// With --apply, the SSH lockout guard refuses — and refusing means
     /// nothing is applied — if the rules would block a currently-connected
     /// client, *or* if no SSH log could be read at all so the check could
-    /// not run. Interactive RenderFirewall only prints a note in that
+    /// not run. An interactive `render-firewall` only prints a note in that
     /// second case, because a human is watching; from crontab nobody is.
     /// Pass --ssh-log if the log isn't where this expects, or --force if
     /// you know what you're doing.
     ///
     /// Refreshes bot lists and crawler IP ranges in full, and reputation
     /// feeds and country ranges only where they are switched on or
-    /// Report whether this host is actually protected.
-    ///
-    /// Every other check in this tool compares what it would generate
-    /// against what is on disk. This one looks at the kernel, the units
-    /// and the filesystem — the gap that let a host run for three weeks
-    /// with 48,860 generated rules and an empty ruleset.
-    ///
-    /// Exits 1 if anything is CRITICAL and 0 otherwise, so it is usable
-    /// from a monitoring check. `--quiet` prints only what needs
-    /// attention, which is the form to put in cron.
-    Status {
-        /// Database path (defaults to /var/lib/stop-bots/db.sqlite3,
-        /// falling back to a per-user location if that's not writable)
-        #[arg(long)]
-        db: Option<PathBuf>,
-        /// Read this SSH log instead of auto-detecting one
-        #[arg(long)]
-        ssh_log: Option<PathBuf>,
-        /// Print only checks that need attention
-        #[arg(long)]
-        quiet: bool,
-        /// Use the last probe the internal cron took instead of looking at
-        /// the host now. Cheap, and what the dashboards show.
-        #[arg(long)]
-        cached: bool,
-    },
-    /// selected. One step's failure never stops the others; the exit
-    /// status is non-zero if any of them failed, which is what makes cron
-    /// mail you.
+    /// selected. Runs every detector that is switched on, with its stored
+    /// TTL and threshold (`list-detectors`). One step's failure never stops
+    /// the others; the exit status is non-zero if any of them failed, which
+    /// is what makes cron mail you.
     Batch {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// Root directory to scan for NGINX config files
-        /// NGINX config root. Defaults to the path stored by
-        /// `set-nginx-commands --root`, else /etc/nginx.
-        #[arg(long)]
+        #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
         /// Reload NGINX and run the generated firewall script, rather than
         /// only writing both
         #[arg(long)]
         apply: bool,
         /// Path to write the generated firewall script to. Defaults to
-        /// /etc/stop-bots/firewall.nft, or firewall.sh with --backend
-        /// iptables — which generates a shell script, not an nftables one
+        /// /etc/stop-bots/firewall.nft, or firewall.sh for iptables —
+        /// which generates a shell script, not an nftables one
         #[arg(long)]
         out: Option<PathBuf>,
         /// Which firewall to generate for. Defaults to whichever backend
-        /// this host is set to — the console records that, and a crontab
-        /// that silently disagreed with it used to leave two scripts on
-        /// disk, in two syntaxes, at two paths, one of them stale.
+        /// this host is set to (`set-firewall-backend`) — a crontab that
+        /// silently disagreed with it used to leave two scripts on disk, in
+        /// two syntaxes, at two paths, one of them stale.
         #[arg(long)]
         backend: Option<FirewallBackend>,
         /// Read this SSH log file instead of auto-detecting one. Worth
@@ -1036,8 +1100,7 @@ enum Command {
         /// refuses on
         #[arg(long)]
         ssh_log: Option<PathBuf>,
-        /// Read this NGINX access log instead of auto-detecting one
-        #[arg(long)]
+        #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
         /// Apply even if the lockout guard objects, or could not run
         #[arg(long)]
@@ -1062,13 +1125,15 @@ enum Command {
     /// file that you have edited is left alone rather than replaced, and
     /// --dry-run prints the whole plan without touching anything. Start
     /// there.
+    ///
+    /// `install web` takes the console settings `set-web` does and stores
+    /// them the same way, because the service it starts reads them from
+    /// the database.
     Install {
         /// What to install. `web` writes a systemd unit for the web
         /// console and enables it.
         #[arg(value_enum)]
         target: InstallTarget,
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
         /// Print every step and change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -1085,9 +1150,8 @@ enum Command {
         /// next `cargo clean`.
         #[arg(long)]
         binary: Option<PathBuf>,
-        /// NGINX config root the service will scan.
-        /// NGINX config root. Defaults to the path stored by
-        /// `set-nginx-commands --root`, else /etc/nginx.
+        /// NGINX config root the service will scan. Defaults to the one
+        /// stored by `set-nginx-commands --root`, else /etc/nginx.
         #[arg(long)]
         root: Option<PathBuf>,
         /// Pin the service to this SSH log instead of letting it find one.
@@ -1104,39 +1168,36 @@ enum Command {
         /// unit systemd will ever see, so this skips systemctl entirely.
         #[arg(long)]
         prefix: Option<PathBuf>,
-        /// Address the service will bind. Persisted to the database, not
-        /// written into the unit — the server re-reads it.
+        /// Address the service will bind. Stored, as `set-web --bind`
+        /// would, not written into the unit — the server re-reads it.
         #[arg(long)]
         bind: Option<String>,
-        /// Serve under a path prefix, for an NGINX `location` block.
+        /// Serve under a path prefix, for an NGINX `location` block. See
+        /// `set-web --base-path`.
         #[arg(long)]
         base_path: Option<String>,
-        /// Permit a bind that is not loopback.
+        /// Permit the service to bind an address that is not loopback, and
+        /// store that permission as `set-web --expose true` would.
         #[arg(long)]
         expose: bool,
-        /// Comma-separated host names the console will answer to.
+        /// Comma-separated host names the console will answer to. See
+        /// `set-web --allowed-hosts`.
         #[arg(long)]
         allowed_hosts: Option<String>,
-        /// Believe the last address in `X-Forwarded-For`. See `web`.
-        #[arg(long, value_name = "true|false")]
+        /// Believe the last address in `X-Forwarded-For`. See `set-web`.
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         trust_forwarded_for: Option<bool>,
-        /// Mark the session cookie `Secure`. See `web`.
-        #[arg(long, value_name = "true|false")]
+        /// Mark the session cookie `Secure`. See `set-web`.
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         secure_cookie: Option<bool>,
     },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
-        #[arg(long, help = DB_HELP)]
-        db: Option<PathBuf>,
-        /// Root directory to scan for NGINX config files, when triggering a
-        /// site scan from NGINX
-        /// NGINX config root. Defaults to the path stored by
-        /// `set-nginx-commands --root`, else /etc/nginx.
-        #[arg(long)]
+        #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        /// Skip reloading NGINX after NGINX applies blocking rules
-        /// (e.g. for tests driving the TUI end to end against a throwaway
-        /// fixture root, where there's no real NGINX install to reload)
+        /// Skip reloading NGINX after the NGINX screen applies blocking
+        /// rules (e.g. for tests driving the TUI end to end against a
+        /// throwaway fixture root, where there's no real NGINX to reload)
         #[arg(long)]
         no_reload: bool,
         /// Read this SSH log file instead of auto-detecting one — the same
@@ -1181,6 +1242,105 @@ impl From<GeoModeArg> for stop_bots::db::GeoMode {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CategoryArg {
+    /// Vulnerability and SEO scanners
+    Scanner,
+    /// Search-engine crawlers
+    Search,
+    /// AI crawlers and assistants
+    Ai,
+}
+
+impl From<CategoryArg> for stop_bots::db::Category {
+    fn from(arg: CategoryArg) -> Self {
+        use stop_bots::db::Category as C;
+        match arg {
+            CategoryArg::Scanner => C::Scanner,
+            CategoryArg::Search => C::Search,
+            CategoryArg::Ai => C::Ai,
+        }
+    }
+}
+
+/// `allowed`, `blocked`, or `default` — "follow whatever is above me",
+/// which is the category for a bot and the host-wide policy for a site
+/// override.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum PolicyArg {
+    Allowed,
+    Blocked,
+    /// Follow the category (for a bot) or the host-wide policy (for a
+    /// site override)
+    Default,
+}
+
+impl PolicyArg {
+    /// `None` for `default`, which every override API spells as "no
+    /// override".
+    fn policy(self) -> Option<stop_bots::db::Policy> {
+        match self {
+            PolicyArg::Allowed => Some(stop_bots::db::Policy::Allowed),
+            PolicyArg::Blocked => Some(stop_bots::db::Policy::Blocked),
+            PolicyArg::Default => None,
+        }
+    }
+}
+
+/// A detector as the command line names it.
+///
+/// The stored ids (`block_scanners`, ...) are settings keys and cron-job
+/// ids that can never change; these are the names a person types, and
+/// the stored id is accepted too, as a hidden alias.
+#[derive(Clone, Copy)]
+struct DetectorArg(stop_bots::protection::Detector);
+
+impl DetectorArg {
+    const ALL: [DetectorArg; stop_bots::protection::Detector::ALL.len()] = {
+        let all = stop_bots::protection::Detector::ALL;
+        let mut out = [DetectorArg(all[0]); stop_bots::protection::Detector::ALL.len()];
+        let mut i = 0;
+        while i < all.len() {
+            out[i] = DetectorArg(all[i]);
+            i += 1;
+        }
+        out
+    };
+
+    /// Exhaustive on purpose: a detector added to `Detector::ALL` without
+    /// a command-line name is a compile error, not a detector `set-detector`
+    /// cannot reach.
+    fn name(self) -> &'static str {
+        use stop_bots::protection::Detector as D;
+        match self.0 {
+            D::SshScanners => "ssh-scanners",
+            D::WebScanners => "web-scanners",
+            D::SpoofedCrawlers => "spoofed-crawlers",
+            D::ProbePaths => "probe-paths",
+            D::Injection => "injection",
+            D::Honeypot => "honeypot",
+            D::AssetRatio => "asset-ratio",
+            D::RotatingUserAgent => "rotating-ua",
+            D::RefererlessCrawl => "refererless",
+            D::RobotsTxt => "robots-txt",
+        }
+    }
+}
+
+impl ValueEnum for DetectorArg {
+    fn value_variants<'a>() -> &'a [Self] {
+        &Self::ALL
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(
+            clap::builder::PossibleValue::new(self.name())
+                .help(self.0.spec().label)
+                .alias(self.0.id()),
+        )
+    }
+}
+
 /// Named rather than numeric (`--response forbidden`, not `--response
 /// 403`): "444" means nothing without knowing NGINX's non-standard codes,
 /// and a bare number invites passing an arbitrary one this tool doesn't
@@ -1221,20 +1381,20 @@ impl From<BlockResponseArg> for stop_bots::db::BlockResponse {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // Moved into whichever arm runs; only one does.
+    let db = cli.db;
 
     match cli.command {
         // No flags to pass, so the stored root is the only way this form
         // can be right on a host whose config is not in /etc/nginx.
-        None => run_tui(None, None, false, None).await,
+        None => run_tui(db, None, false, None).await,
         Some(Command::Tui {
-            db,
             root,
             no_reload,
             ssh_log,
         }) => run_tui(db, root, no_reload, ssh_log).await,
         Some(Command::Install {
             target,
-            db,
             dry_run,
             force,
             no_start,
@@ -1268,13 +1428,11 @@ async fn main() -> Result<()> {
             InstallTarget::Firewall => run_install_firewall(binary, prefix, dry_run, force),
         },
         Some(Command::Status {
-            db,
             ssh_log,
             quiet,
             cached,
         }) => run_status(db, ssh_log, quiet, cached),
         Some(Command::Batch {
-            db,
             root,
             apply,
             out,
@@ -1301,97 +1459,97 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Some(Command::ScanSites { root, db }) => scan_sites(root.as_deref(), db),
-        Some(Command::UpdateBotLists {
-            db,
-            source_id,
-            source,
-        }) => update_bot_lists(db, source_id, source).await,
-        Some(Command::ApplyBlocks {
-            root,
-            db,
-            no_reload,
-        }) => apply_blocks(root.as_deref(), db, no_reload),
+        Some(Command::ScanSites { root }) => scan_sites(root.as_deref(), db),
+        Some(Command::UpdateBotLists { source_id, source }) => {
+            update_bot_lists(db, source_id, source).await
+        }
+        Some(Command::ApplyBlocks { root, no_reload }) => {
+            apply_blocks(root.as_deref(), db, no_reload)
+        }
         Some(Command::AddFirewallRule {
             address,
             port,
             action,
-            db,
         }) => add_firewall_rule(db, address, port, &action),
-        Some(Command::ListFirewallRules { db }) => list_firewall_rules(db),
-        Some(Command::RemoveFirewallRule { id, db }) => remove_firewall_rule(db, id),
+        Some(Command::ListFirewallRules) => list_firewall_rules(db),
+        Some(Command::RemoveFirewallRule { id }) => remove_firewall_rule(db, id),
+        Some(Command::SetFirewallRule { id, enabled }) => set_firewall_rule(db, id, enabled),
         Some(Command::RenderFirewall {
             backend,
             out,
             force,
             ssh_log,
-            db,
-        }) => render_firewall(db, backend, &out, force, ssh_log),
-        Some(Command::BlockScanners {
-            db,
+        }) => render_firewall(db, backend, out, force, ssh_log),
+        Some(Command::SetFirewallBackend { backend }) => set_firewall_backend(db, backend),
+        Some(Command::BlockSshScanners {
             threshold,
             ttl_days,
             ssh_log,
             dry_run,
         }) => block_scanners(db, threshold, ttl_days, ssh_log, dry_run),
         Some(Command::BlockWebScanners {
-            db,
             threshold,
             ttl_days,
             access_log,
             dry_run,
         }) => block_web_scanners(db, threshold, ttl_days, access_log, dry_run),
         Some(Command::BlockSpoofedCrawlers {
-            db,
             ttl_days,
             access_log,
             dry_run,
         }) => block_spoofed_crawlers(db, ttl_days, access_log, dry_run),
         Some(Command::BlockProbePaths {
-            db,
             ttl_days,
             access_log,
             dry_run,
         }) => block_probe_paths(db, ttl_days, access_log, dry_run),
-        Some(Command::SetProbePaths { db, paths }) => set_probe_paths(db, paths),
-        Some(Command::ListProbePaths { db }) => list_probe_paths(db),
+        Some(Command::SetProbePaths { paths }) => set_probe_paths(db, paths),
+        Some(Command::ListProbePaths) => list_probe_paths(db),
         Some(Command::BlockHoneypot {
-            db,
             ttl_days,
             access_log,
             dry_run,
         }) => block_honeypot(db, ttl_days, access_log, dry_run),
-        Some(Command::SetHoneypotPath { db, path }) => set_honeypot_path(db, path),
-        Some(Command::RecordAccessStats { db, access_log }) => record_access_stats(db, access_log),
-        Some(Command::ListAccessStats { db }) => list_access_stats(db),
-        Some(Command::Maintain { db, force_compact }) => maintain(db, force_compact),
-        Some(Command::UpdateIpRanges {
-            db,
-            source_id,
-            source,
-        }) => update_ip_ranges(db, source_id, source).await,
-        Some(Command::UpdateReputationSource {
-            db,
-            source_id,
-            source,
-        }) => update_reputation_source(db, source_id, source).await,
-        Some(Command::SetReputationSource {
-            db,
-            source_id,
+        Some(Command::SetHoneypotPath { path }) => set_honeypot_path(db, path),
+        Some(Command::ListDetectors) => list_detectors(db),
+        Some(Command::SetDetector {
+            detector,
             enabled,
-        }) => set_reputation_source(db, source_id, enabled),
-        Some(Command::ListReputationSources { db }) => list_reputation_sources(db),
-        Some(Command::UpdateCountryRanges {
-            db,
-            country,
-            source,
-        }) => update_country_ranges(db, country, source).await,
-        Some(Command::SetGeoMode { db, mode }) => set_geo_mode(db, mode),
-        Some(Command::AddCountry { db, country }) => set_country_selected(db, country, true),
-        Some(Command::RemoveCountry { db, country }) => set_country_selected(db, country, false),
-        Some(Command::ListSelectedCountries { db }) => list_selected_countries(db),
+            ttl_days,
+            threshold,
+        }) => set_detector(db, detector, enabled, ttl_days, threshold),
+        Some(Command::SetSubnetEscalation { enabled, min }) => {
+            set_subnet_escalation(db, enabled, min)
+        }
+        Some(Command::RecordAccessStats { access_log }) => record_access_stats(db, access_log),
+        Some(Command::ListAccessStats) => list_access_stats(db),
+        Some(Command::Maintain { force_compact }) => maintain(db, force_compact),
+        Some(Command::UpdateIpRanges { source_id, source }) => {
+            update_ip_ranges(db, source_id, source).await
+        }
+        Some(Command::UpdateReputationSource { source_id, source }) => {
+            update_reputation_source(db, source_id, source).await
+        }
+        Some(Command::SetReputationSource { source_id, enabled }) => {
+            set_reputation_source(db, source_id, enabled)
+        }
+        Some(Command::ListReputationSources) => list_reputation_sources(db),
+        Some(Command::UpdateCountryRanges { country, source }) => {
+            update_country_ranges(db, country, source).await
+        }
+        Some(Command::SetGeoMode { mode }) => set_geo_mode(db, mode),
+        Some(Command::AddCountry { country }) => set_country_selected(db, country, true),
+        Some(Command::RemoveCountry { country }) => set_country_selected(db, country, false),
+        Some(Command::ListSelectedCountries) => list_selected_countries(db),
+        Some(Command::SetCategory {
+            category,
+            policy,
+            site,
+        }) => set_category(db, category, policy, site),
+        Some(Command::ListCategories { site }) => list_categories(db, site),
+        Some(Command::SetBot { bot, policy, site }) => set_bot(db, bot, policy, site),
+        Some(Command::ListBots { search }) => list_bots(db, search),
         Some(Command::Web {
-            db,
             root,
             ssh_log,
             firewall_out,
@@ -1413,44 +1571,57 @@ async fn main() -> Result<()> {
                 bind,
                 base_path,
                 expose,
-                allowed_hosts,
-                WebProxySettings {
+                DeprecatedWebFlags {
+                    allowed_hosts,
                     trust_forwarded_for,
                     secure_cookie,
+                    save,
                 },
-                save,
                 set_password,
                 no_apply,
             )
             .await
         }
-        Some(Command::SetLogPaths {
+        Some(Command::SetWeb {
+            bind,
+            expose,
+            base_path,
+            allowed_hosts,
+            trust_forwarded_for,
+            secure_cookie,
+        }) => set_web(
             db,
+            WebSettings {
+                bind,
+                expose,
+                base_path,
+                allowed_hosts,
+                trust_forwarded_for,
+                secure_cookie,
+            },
+        ),
+        Some(Command::SetLogPaths {
             access_log,
             ssh_log,
         }) => run_set_log_paths(db, access_log, ssh_log),
         Some(Command::SetNginxCommands {
-            db,
             test,
             reload,
             root,
             reset,
         }) => set_nginx_commands(db, test, reload, root, reset),
-        Some(Command::SetBlockResponse { db, response }) => set_block_response(db, response),
+        Some(Command::SetBlockResponse { response }) => set_block_response(db, response),
         Some(Command::SetRateLimit {
-            db,
             enabled,
             rps,
             burst,
         }) => set_rate_limit(db, enabled, rps, burst),
         Some(Command::SetSiteRule {
-            db,
             site,
             rule,
             enabled,
         }) => set_site_rule(db, site, rule, enabled),
         Some(Command::ExemptPath {
-            db,
             site,
             path,
             user_agent,
@@ -1460,15 +1631,14 @@ async fn main() -> Result<()> {
             address,
             user_agent,
             remove,
-            db,
         }) => trust(db, address, user_agent, remove),
-        Some(Command::ListTurnedAway { db, access_log }) => list_turned_away(db, access_log),
-        Some(Command::ListTrusted { db }) => list_trusted(db),
-        Some(Command::SetRobotsTxt { db, enabled }) => set_robots_txt(db, enabled),
-        Some(Command::SetAutoApply { db, enabled }) => set_auto_apply(db, enabled),
-        Some(Command::SetAutoApplyFirewall { db, enabled }) => set_auto_apply_firewall(db, enabled),
-        Some(Command::SetHumansOnly { db, enabled }) => set_humans_only(db, enabled),
-        Some(Command::ShowRobotsTxt { db }) => show_robots_txt(db),
+        Some(Command::ListTurnedAway { access_log }) => list_turned_away(db, access_log),
+        Some(Command::ListTrusted) => list_trusted(db),
+        Some(Command::SetRobotsTxt { enabled }) => set_robots_txt(db, enabled),
+        Some(Command::SetAutoApply { enabled }) => set_auto_apply(db, enabled),
+        Some(Command::SetAutoApplyFirewall { enabled }) => set_auto_apply_firewall(db, enabled),
+        Some(Command::SetHumansOnly { enabled }) => set_humans_only(db, enabled),
+        Some(Command::ShowRobotsTxt) => show_robots_txt(db),
     }
 }
 
@@ -1724,21 +1894,10 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
         ..request
     };
 
-    // An explicit `--backend` wins; without one, the host's own setting
-    // does. It used to be neither: the flag carried a `nftables` default,
-    // so a host switched to iptables in the console got an nftables script
-    // from every cron run — at the *other* path, so both files existed and
-    // one of them was always stale. The same drift once had the internal
-    // cron overwriting an operator's iptables script with nftables syntax.
-    let backend = match request.backend {
-        Some(backend) => backend.into(),
-        None => stop_bots::firewall::stored_backend(&db)?,
-    };
+    let (backend, out) = firewall_target(&db, request.backend, request.out)?;
     let options = stop_bots::batch::BatchOptions {
         root: request.root.expect("resolved above"),
-        out: request
-            .out
-            .unwrap_or_else(|| stop_bots::firewall::default_output_path(backend)),
+        out,
         backend,
         apply: request.apply,
         ssh_log: request.ssh_log,
@@ -1898,6 +2057,29 @@ fn remove_firewall_rule(db_path: Option<PathBuf>, id: i64) -> Result<()> {
     let db = open_db(db_path)?;
     db.remove_firewall_rule(id)?;
     println!("Removed firewall rule #{id}");
+    Ok(())
+}
+
+fn set_firewall_rule(db_path: Option<PathBuf>, id: i64, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_firewall_rule_enabled(id, enabled)?;
+    println!(
+        "Firewall rule #{id} is now {}.",
+        if enabled { "enabled" } else { "disabled" }
+    );
+    println!("Run `stop-bots render-firewall` and apply the script to put it in effect.");
+    Ok(())
+}
+
+fn set_firewall_backend(db_path: Option<PathBuf>, backend: FirewallBackend) -> Result<()> {
+    let db = open_db(db_path)?;
+    let backend: stop_bots::firewall::FirewallBackend = backend.into();
+    stop_bots::firewall::store_backend(&db, backend)?;
+    println!(
+        "Firewall backend set to {}. Scripts go to {} unless told otherwise.",
+        backend.stored(),
+        stop_bots::firewall::default_output_path(backend).display()
+    );
     Ok(())
 }
 
@@ -2362,6 +2544,366 @@ fn set_robots_txt(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// "on" or "off", for the listings below.
+fn on_off(on: bool) -> &'static str {
+    if on {
+        "on"
+    } else {
+        "off"
+    }
+}
+
+/// One detector's settings as one line: the same wording `list-detectors`
+/// and `set-detector` print, so what one shows the other confirms.
+fn detector_line(db: &Db, detector: DetectorArg) -> Result<String> {
+    let d = detector.0;
+    let threshold = match d.threshold(db)? {
+        Some(value) => value.to_string(),
+        None => "-".to_string(),
+    };
+    let mut label = d.spec().label.to_string();
+    if !d.is_operator_controlled() {
+        label.push_str(" (follows set-humans-only)");
+    }
+    Ok(format!(
+        "{:<17} {:<4} {:>5}d {:>9}  {label}",
+        detector.name(),
+        on_off(d.is_enabled(db)?),
+        d.ttl_days(db)?,
+        threshold,
+    ))
+}
+
+fn list_detectors(db_path: Option<PathBuf>) -> Result<()> {
+    let db = open_db(db_path)?;
+    println!(
+        "{:<17} {:<4} {:>6} {:>9}",
+        "DETECTOR", "ON", "TTL", "THRESHOLD"
+    );
+    for detector in DetectorArg::ALL {
+        println!("{}", detector_line(&db, detector)?);
+    }
+    println!();
+    println!(
+        "IPv4 /24 escalation: {}, at {} flagged address(es) in one /24.",
+        on_off(stop_bots::protection::subnet_escalation(&db)?.is_some()),
+        stop_bots::protection::subnet_escalation_min(&db)?
+    );
+    println!(
+        "The internal cron (inside `stop-bots web` or the TUI) and `batch` run the ones that \
+         are on."
+    );
+    Ok(())
+}
+
+fn set_detector(
+    db_path: Option<PathBuf>,
+    detector: DetectorArg,
+    enabled: Option<bool>,
+    ttl_days: Option<i64>,
+    threshold: Option<i64>,
+) -> Result<()> {
+    use stop_bots::protection::MAX_TTL_DAYS;
+
+    let db = open_db(db_path)?;
+    let d = detector.0;
+    let name = detector.name();
+
+    // Every refusal before any write, so a bad flag leaves the detector
+    // exactly as it was rather than half changed.
+    if enabled.is_some() && !d.is_operator_controlled() {
+        anyhow::bail!(
+            "{name} runs exactly when humans only is on; switch that with `stop-bots \
+             set-humans-only`"
+        );
+    }
+    if let Some(days) = ttl_days {
+        if !(1..=MAX_TTL_DAYS).contains(&days) {
+            anyhow::bail!("a block lasts from 1 to {MAX_TTL_DAYS} days, not {days}");
+        }
+    }
+    if threshold.is_some() && d.threshold_setting().is_none() {
+        anyhow::bail!(
+            "{name} has no threshold: one matching request is already conclusive (the ones \
+             that have one are ssh-scanners, web-scanners, asset-ratio, rotating-ua and \
+             refererless)"
+        );
+    }
+
+    if let Some(value) = threshold {
+        d.set_threshold(&db, value)?;
+    }
+    if let Some(days) = ttl_days {
+        d.set_ttl_days(&db, days)?;
+    }
+    if let Some(on) = enabled {
+        d.set_enabled(&db, on)?;
+    }
+
+    println!(
+        "{:<17} {:<4} {:>6} {:>9}",
+        "DETECTOR", "ON", "TTL", "THRESHOLD"
+    );
+    println!("{}", detector_line(&db, detector)?);
+    if enabled == Some(false) {
+        // The distinction the README draws, said where it bites.
+        println!(
+            "Blocks it already added stay until they expire; remove one with \
+             `stop-bots remove-firewall-rule`."
+        );
+    }
+    Ok(())
+}
+
+fn set_subnet_escalation(
+    db_path: Option<PathBuf>,
+    enabled: Option<bool>,
+    min: Option<i64>,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    stop_bots::protection::set_subnet_escalation(&db, enabled, min)?;
+    let on = stop_bots::protection::subnet_escalation(&db)?.is_some();
+    println!(
+        "IPv4 /24 escalation is {}, at {} flagged address(es) in one /24.",
+        on_off(on),
+        stop_bots::protection::subnet_escalation_min(&db)?
+    );
+    if on {
+        println!(
+            "A detector pass that flags that many addresses in one /24 now blocks all 256 \
+             addresses in it."
+        );
+    }
+    Ok(())
+}
+
+fn policy_word(policy: stop_bots::db::Policy) -> &'static str {
+    match policy {
+        stop_bots::db::Policy::Allowed => "allowed",
+        stop_bots::db::Policy::Blocked => "blocked",
+    }
+}
+
+/// The name a category is typed as, which is also how it is printed.
+fn category_name(category: CategoryArg) -> &'static str {
+    match category {
+        CategoryArg::Scanner => "scanner",
+        CategoryArg::Search => "search",
+        CategoryArg::Ai => "ai",
+    }
+}
+
+const CATEGORIES: [CategoryArg; 3] = [CategoryArg::Scanner, CategoryArg::Search, CategoryArg::Ai];
+
+/// Said wherever a category or bot policy is set or shown, because it
+/// outranks both and nothing else on screen would explain why a stored
+/// "allowed" is not in force.
+const HUMANS_ONLY_NOTE: &str = "Humans only is on: every catalogued bot but Let's Encrypt is \
+blocked whatever is set here. The stored values come back when it is switched off \
+(`stop-bots set-humans-only --enabled false`).";
+
+fn set_category(
+    db_path: Option<PathBuf>,
+    category: CategoryArg,
+    policy: PolicyArg,
+    site: Option<String>,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    let name = category_name(category);
+    match site {
+        None => {
+            let Some(policy) = policy.policy() else {
+                anyhow::bail!(
+                    "the host-wide policy has nothing above it to follow: use allowed or \
+                     blocked. `--policy default` removes a site's override, with --site"
+                );
+            };
+            db.set_category_default(category.into(), policy)?;
+            println!("Category {name} is now {} host-wide.", policy_word(policy));
+        }
+        Some(site) => {
+            let site = find_site(&db, &site)?;
+            db.set_site_category_override(site.id, category.into(), policy.policy())?;
+            match policy.policy() {
+                Some(policy) => println!(
+                    "{}: category {name} is now {}, whatever the host-wide policy says.",
+                    site.server_name,
+                    policy_word(policy)
+                ),
+                None => println!(
+                    "{}: category {name} follows the host-wide policy again.",
+                    site.server_name
+                ),
+            }
+        }
+    }
+    if db.get_humans_only()? {
+        println!("{HUMANS_ONLY_NOTE}");
+    }
+    println!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    Ok(())
+}
+
+fn list_categories(db_path: Option<PathBuf>, site: Option<String>) -> Result<()> {
+    let db = open_db(db_path)?;
+    let site = site.map(|name| find_site(&db, &name)).transpose()?;
+
+    match &site {
+        None => println!("{:<9} POLICY", "CATEGORY"),
+        Some(site) => println!("{:<9} {:<9} {}", "CATEGORY", "HOST-WIDE", site.server_name),
+    }
+    for category in CATEGORIES {
+        let stored = db.get_stored_category_default(category.into())?;
+        match &site {
+            None => println!("{:<9} {}", category_name(category), policy_word(stored)),
+            Some(site) => {
+                let over = db
+                    .get_site_category_override(site.id, category.into())?
+                    .map(policy_word)
+                    .unwrap_or("(host-wide)");
+                println!(
+                    "{:<9} {:<9} {over}",
+                    category_name(category),
+                    policy_word(stored)
+                );
+            }
+        }
+    }
+
+    if let Some(site) = &site {
+        let overrides = db.site_bot_overrides(site.id)?;
+        if !overrides.is_empty() {
+            let bots = db.list_bots()?;
+            println!();
+            println!("Bot overrides on {}:", site.server_name);
+            for over in overrides {
+                let slug = bots
+                    .iter()
+                    .find(|b| b.id == over.bot_id)
+                    .map(|b| b.slug.as_str())
+                    .unwrap_or("(unknown bot)");
+                println!("  {slug:<30} {}", policy_word(over.policy));
+            }
+        }
+    }
+    if db.get_humans_only()? {
+        println!();
+        println!("{HUMANS_ONLY_NOTE}");
+    }
+    Ok(())
+}
+
+/// Finds a bot by slug, failing with the way to look one up rather than a
+/// bare "not found".
+fn find_bot(db: &Db, slug: &str) -> Result<stop_bots::db::Bot> {
+    db.list_bots()?
+        .into_iter()
+        .find(|b| b.slug == slug)
+        .with_context(|| {
+            format!(
+                "no bot with slug {slug:?} — find it with `stop-bots list-bots --search <name>`"
+            )
+        })
+}
+
+fn set_bot(
+    db_path: Option<PathBuf>,
+    slug: String,
+    policy: PolicyArg,
+    site: Option<String>,
+) -> Result<()> {
+    use stop_bots::db::BotStatus;
+
+    let db = open_db(db_path)?;
+    let bot = find_bot(&db, &slug)?;
+    match site {
+        None => {
+            let status = match policy {
+                PolicyArg::Allowed => BotStatus::Allowed,
+                PolicyArg::Blocked => BotStatus::Blocked,
+                PolicyArg::Default => BotStatus::Default,
+            };
+            db.set_bot_status(&bot.slug, status)?;
+            match policy.policy() {
+                Some(policy) => println!("{} is now {} host-wide.", bot.slug, policy_word(policy)),
+                None => println!("{} follows its category again.", bot.slug),
+            }
+        }
+        Some(site) => {
+            let site = find_site(&db, &site)?;
+            db.set_site_bot_override(site.id, bot.id, policy.policy())?;
+            match policy.policy() {
+                Some(policy) => println!(
+                    "{}: {} is now {}, whatever the host-wide setting says.",
+                    site.server_name,
+                    bot.slug,
+                    policy_word(policy)
+                ),
+                None => println!(
+                    "{}: {} follows the host-wide setting again.",
+                    site.server_name, bot.slug
+                ),
+            }
+        }
+    }
+    if db.get_humans_only()? {
+        println!("{HUMANS_ONLY_NOTE}");
+    }
+    println!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    Ok(())
+}
+
+fn list_bots(db_path: Option<PathBuf>, search: Option<String>) -> Result<()> {
+    use stop_bots::db::BotStatus;
+
+    let db = open_db(db_path)?;
+    let needle = search.as_deref().map(str::to_lowercase);
+    let bots: Vec<_> = db
+        .list_bots()?
+        .into_iter()
+        .filter(|b| match &needle {
+            Some(n) => b.slug.to_lowercase().contains(n) || b.name.to_lowercase().contains(n),
+            None => true,
+        })
+        .collect();
+    if bots.is_empty() {
+        match &search {
+            Some(s) => println!("No bot matches {s:?}."),
+            None => println!("No bots stored yet — run `stop-bots update-bot-lists` first."),
+        }
+        return Ok(());
+    }
+    println!("{:<9} {:<22} {:<30} NAME", "STATUS", "CATEGORIES", "SLUG");
+    for bot in bots {
+        let status = match bot.status {
+            BotStatus::Default => "category",
+            BotStatus::Allowed => "allowed",
+            BotStatus::Blocked => "blocked",
+        };
+        let mut categories = Vec::new();
+        if bot.is_scanner {
+            categories.push("scanner");
+        }
+        if bot.is_search_engine {
+            categories.push("search");
+        }
+        if bot.is_ai {
+            categories.push("ai");
+        }
+        let categories = if categories.is_empty() {
+            "-".to_string()
+        } else {
+            categories.join(",")
+        };
+        println!(
+            "{status:<9} {categories:<22} {:<30} {}",
+            bot.slug,
+            stop_bots::uadetail::printable(&bot.name)
+        );
+    }
+    Ok(())
+}
+
 fn show_robots_txt(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     print!("{}", nginx::robots_txt_body(&db)?);
@@ -2388,16 +2930,77 @@ struct InstallWeb {
     secure_cookie: Option<bool>,
 }
 
-/// The two console settings that only matter behind a proxy, as given on
-/// the command line: `None` leaves what is stored alone.
-struct WebProxySettings {
+/// Every console setting `set-web` can change, as given on the command
+/// line: `None` leaves what is stored alone.
+///
+/// Also what `install web` stores its proxy flags through, so the two
+/// cannot disagree about how a setting is written.
+#[derive(Default)]
+struct WebSettings {
+    bind: Option<String>,
+    expose: Option<bool>,
+    base_path: Option<String>,
+    allowed_hosts: Option<String>,
     trust_forwarded_for: Option<bool>,
     secure_cookie: Option<bool>,
 }
 
-impl WebProxySettings {
+impl WebSettings {
+    fn is_empty(&self) -> bool {
+        self.bind.is_none()
+            && self.expose.is_none()
+            && self.base_path.is_none()
+            && self.allowed_hosts.is_none()
+            && self.trust_forwarded_for.is_none()
+            && self.secure_cookie.is_none()
+    }
+
+    /// Checks everything, then writes it — so a refusal stores nothing.
+    ///
+    /// A non-loopback `bind` needs exposure on, given here or already
+    /// stored: the same check `stop-bots web` makes before it binds, made
+    /// before the address is stored rather than at the next start.
     fn store(&self, db: &Db) -> Result<()> {
         use stop_bots::web;
+
+        let bind = match &self.bind {
+            Some(raw) => {
+                let addr: std::net::SocketAddr = raw
+                    .parse()
+                    .with_context(|| format!("`{raw}` is not a valid `address:port`"))?;
+                let exposed = match self.expose {
+                    Some(on) => on,
+                    None => db.get_bool_setting(web::EXPOSE_KEY, false)?,
+                };
+                if !web::is_loopback(&addr) && !exposed {
+                    anyhow::bail!(
+                        "refusing to store {addr}, which is reachable from the network, while \
+                         exposure is off. The console can rewrite this host's firewall and NGINX \
+                         config. If that is what you want, add --expose true."
+                    );
+                }
+                Some(addr)
+            }
+            None => None,
+        };
+        let base = self
+            .base_path
+            .as_deref()
+            .map(web::BasePath::parse)
+            .transpose()?;
+
+        if let Some(on) = self.expose {
+            db.set_bool_setting(web::EXPOSE_KEY, on)?;
+        }
+        if let Some(addr) = bind {
+            db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
+        }
+        if let Some(base) = base {
+            db.set_text_setting(web::BASE_PATH_KEY, base.as_str())?;
+        }
+        if let Some(hosts) = &self.allowed_hosts {
+            db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
+        }
         if let Some(on) = self.trust_forwarded_for {
             db.set_bool_setting(web::TRUST_FORWARDED_KEY, on)?;
         }
@@ -2406,6 +3009,95 @@ impl WebProxySettings {
         }
         Ok(())
     }
+}
+
+/// `web`'s flags that used to write settings, kept working for one
+/// release and hidden from `--help`. `set-web` replaces all four.
+struct DeprecatedWebFlags {
+    allowed_hosts: Option<String>,
+    trust_forwarded_for: Option<bool>,
+    secure_cookie: Option<bool>,
+    save: bool,
+}
+
+impl DeprecatedWebFlags {
+    /// Says which flags were used and what replaces them, on stderr so a
+    /// service's stdout is not disturbed. Silent when none were.
+    fn warn(&self) {
+        let mut used = Vec::new();
+        if self.allowed_hosts.is_some() {
+            used.push("--allowed-hosts");
+        }
+        if self.trust_forwarded_for.is_some() {
+            used.push("--trust-forwarded-for");
+        }
+        if self.secure_cookie.is_some() {
+            used.push("--secure-cookie");
+        }
+        if self.save {
+            used.push("--save");
+        }
+        if !used.is_empty() {
+            eprintln!(
+                "Note: `stop-bots web {}` is deprecated and goes away in the next release. \
+                 Store settings with `stop-bots set-web` instead; flags on `web` apply to one \
+                 run.",
+                used.join(" ")
+            );
+        }
+    }
+}
+
+fn set_web(db_path: Option<PathBuf>, settings: WebSettings) -> Result<()> {
+    use stop_bots::web;
+
+    let db = open_db(db_path)?;
+    if settings.is_empty() {
+        println!("Nothing to change. Current settings:");
+    } else {
+        settings.store(&db)?;
+    }
+
+    let addr = web::resolve_bind(&db, None)?;
+    let exposed = db.get_bool_setting(web::EXPOSE_KEY, false)?;
+    let base = web::BasePath::from_db(&db)?;
+    let hosts = web::configured_hosts(&db)?;
+    let on_off = |on: bool| if on { "on" } else { "off" };
+    println!("  bind:                {addr}");
+    println!("  expose:              {}", on_off(exposed));
+    println!(
+        "  base path:           {}",
+        if base.is_root() { "/" } else { base.as_str() }
+    );
+    println!(
+        "  allowed hosts:       {}",
+        if hosts.is_empty() {
+            "(loopback names only)".to_string()
+        } else {
+            hosts.join(", ")
+        }
+    );
+    println!(
+        "  trust forwarded-for: {}",
+        on_off(db.get_bool_setting(web::TRUST_FORWARDED_KEY, false)?)
+    );
+    println!(
+        "  secure cookie:       {}",
+        on_off(db.get_bool_setting(web::SECURE_COOKIE_KEY, false)?)
+    );
+    if !web::is_loopback(&addr) && !exposed {
+        // Only reachable by switching exposure off under a stored
+        // non-loopback bind, which is the safe direction and so allowed.
+        println!(
+            "\n`stop-bots web` will refuse to start on {addr} until exposure is back on or the \
+             bind is loopback."
+        );
+    }
+    if !settings.is_empty() {
+        println!("\nA running console reads the host list and proxy settings on every request;");
+        println!("the bind address and path prefix take effect when it is next started.");
+    }
+    Ok(())
 }
 
 /// Writes and enables the unit that re-applies the rendered firewall
@@ -2577,9 +3269,10 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         if let Some(hosts) = &options.allowed_hosts {
             db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
         }
-        WebProxySettings {
+        WebSettings {
             trust_forwarded_for: options.trust_forwarded_for,
             secure_cookie: options.secure_cookie,
+            ..WebSettings::default()
         }
         .store(&db)?;
         steps.push(format!(
@@ -2661,11 +3354,12 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     println!();
     println!("One thing that changes now that this runs as root: the internal cron's");
     println!(
-        "daily RenderFirewall job can write {}/firewall.nft,",
+        "daily firewall render can write {}/firewall.nft,",
         layout.output_dir.display()
     );
-    println!("which it could not before. Nothing applies that script — running it is");
-    println!("still yours to do, or `stop-bots batch --apply` from a crontab.");
+    println!("which it could not before. That script is applied only when you ask: run it");
+    println!("yourself, use `stop-bots batch --apply` from a crontab, or switch on");
+    println!("`stop-bots set-auto-apply-firewall --enabled true`.");
 
     Ok(())
 }
@@ -2681,14 +3375,13 @@ async fn run_web(
     bind: Option<String>,
     base_path: Option<String>,
     expose: bool,
-    allowed_hosts: Option<String>,
-    proxy: WebProxySettings,
-    save: bool,
+    deprecated: DeprecatedWebFlags,
     set_password: bool,
     no_apply: bool,
 ) -> Result<()> {
     use stop_bots::web::{self, auth, server, state::AppState};
 
+    deprecated.warn();
     let db = open_db(db_path)?;
     let root = nginx::root(&db, root.as_deref())?;
 
@@ -2723,22 +3416,25 @@ async fn run_web(
             "refusing to bind {addr}, which is reachable from the network.\n\n\
              The web UI can rewrite this host's firewall and NGINX config, so exposing it \n\
              is a deliberate act rather than a default. If that is what you want:\n\n    \
-             stop-bots web --bind {addr} --expose --allowed-hosts <your-hostname>\n\n\
+             stop-bots set-web --bind {addr} --expose true --allowed-hosts <your-hostname>\n    \
+             stop-bots web\n\n\
              Otherwise reach it over an SSH tunnel and leave it on loopback:\n\n    \
              ssh -L 8787:127.0.0.1:8787 <this-host>"
         );
     }
 
-    // The host allowlist is read from the database on every request, so it
-    // is stored whether or not --save was given — there is nowhere else for
-    // it to live. The flag's help says so. The same goes for the two proxy
-    // settings.
-    if let Some(hosts) = &allowed_hosts {
-        db.set_text_setting(web::ALLOWED_HOSTS_KEY, hosts)?;
+    // The deprecated flags, still honoured for one release: the three the
+    // server reads per request were always stored, and `--save` stored the
+    // rest. After the exposure check, so a refused bind stores nothing.
+    WebSettings {
+        allowed_hosts: deprecated.allowed_hosts,
+        trust_forwarded_for: deprecated.trust_forwarded_for,
+        secure_cookie: deprecated.secure_cookie,
+        ..WebSettings::default()
     }
-    proxy.store(&db)?;
+    .store(&db)?;
 
-    if save {
+    if deprecated.save {
         db.set_text_setting(web::BIND_KEY, &addr.to_string())?;
         db.set_text_setting(web::BASE_PATH_KEY, base.as_str())?;
         if expose {
@@ -2778,10 +3474,11 @@ async fn run_web(
         // request refused. It used to say a bare address would be
         // accepted, which is only true of a loopback one.
         eprintln!(
-            "Warning: bound to {addr} with no --allowed-hosts set. Only requests for \n\
+            "Warning: bound to {addr} with no allowed hosts set. Only requests for \n\
              localhost or a loopback address will be answered; a host name, or this \n\
              machine's own network address, is refused. This is the DNS-rebinding guard \n\
-             doing its job; list the name or address you will use."
+             doing its job; list the name or address you will use with \n\
+             `stop-bots set-web --allowed-hosts`."
         );
     }
 
@@ -2803,7 +3500,8 @@ async fn run_web(
             // proxy case that is otherwise fine.
             eprintln!(
                 "Note: the session cookie is not marked Secure, so a browser will also send \n\
-                 it to an http:// URL for this host. Behind TLS, pass --secure-cookie true."
+                 it to an http:// URL for this host. Behind TLS, run \n\
+                 `stop-bots set-web --secure-cookie true`."
             );
         }
     }
@@ -2943,15 +3641,40 @@ impl From<FirewallBackend> for stop_bots::firewall::FirewallBackend {
     }
 }
 
+/// Which backend a render is for and where its script goes, for
+/// `render-firewall` and `batch` alike.
+///
+/// An explicit `--backend` wins; without one, the host's own setting does,
+/// and the default path follows whichever backend that turned out to be.
+/// Both used to be fixed instead: `batch`'s flag carried an `nftables`
+/// default, so a host switched to iptables in the console got an nftables
+/// script from every cron run — at the *other* path, so both files existed
+/// and one was always stale — and `render-firewall` required `--backend`
+/// and defaulted `--out` to `.nft` even for iptables, leaving a shell
+/// script in a file named for nftables.
+fn firewall_target(
+    db: &Db,
+    backend: Option<FirewallBackend>,
+    out: Option<PathBuf>,
+) -> Result<(stop_bots::firewall::FirewallBackend, PathBuf)> {
+    let backend = match backend {
+        Some(backend) => backend.into(),
+        None => stop_bots::firewall::stored_backend(db)?,
+    };
+    let out = out.unwrap_or_else(|| stop_bots::firewall::default_output_path(backend));
+    Ok((backend, out))
+}
+
 fn render_firewall(
     db_path: Option<PathBuf>,
-    backend: FirewallBackend,
-    out: &Path,
+    backend: Option<FirewallBackend>,
+    out: Option<PathBuf>,
     force: bool,
     ssh_log: Option<PathBuf>,
 ) -> Result<()> {
     let db = open_db(db_path)?;
-    let backend: stop_bots::firewall::FirewallBackend = backend.into();
+    let (backend, out) = firewall_target(&db, backend, out)?;
+    let out = out.as_path();
     let built = stop_bots::firewall::build_script(&db, backend)?;
 
     if !check_lockout_risk(&built.rules, ssh_log.as_deref(), force)? {
@@ -2978,12 +3701,13 @@ fn render_firewall(
 /// reconstructs the on-screen messages from the returned outcome.
 fn block_scanners(
     db_path: Option<PathBuf>,
-    threshold: usize,
-    ttl_days: i64,
+    threshold: Option<usize>,
+    ttl_days: Option<i64>,
     ssh_log: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let (threshold, ttl_days) = detector_defaults(&db, Detector::SshScanners, threshold, ttl_days)?;
 
     let log_text = read_ssh_log(ssh_log.as_deref())?;
 
@@ -3005,12 +3729,13 @@ fn block_scanners(
 /// and reconstructs the on-screen messages from the returned outcome.
 fn block_web_scanners(
     db_path: Option<PathBuf>,
-    threshold: usize,
-    ttl_days: i64,
+    threshold: Option<usize>,
+    ttl_days: Option<i64>,
     access_log: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let (threshold, ttl_days) = detector_defaults(&db, Detector::WebScanners, threshold, ttl_days)?;
 
     let log_text = read_access_log(&db, access_log.as_deref())?;
 
@@ -3044,11 +3769,15 @@ fn block_web_scanners(
 
 fn block_spoofed_crawlers(
     db_path: Option<PathBuf>,
-    ttl_days: i64,
+    ttl_days: Option<i64>,
     access_log: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let ttl_days = match ttl_days {
+        Some(days) => days,
+        None => Detector::SpoofedCrawlers.ttl_days(&db)?,
+    };
 
     let log_text = read_access_log(&db, access_log.as_deref())?;
 
@@ -3074,11 +3803,15 @@ fn block_spoofed_crawlers(
 
 fn block_probe_paths(
     db_path: Option<PathBuf>,
-    ttl_days: i64,
+    ttl_days: Option<i64>,
     access_log: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let ttl_days = match ttl_days {
+        Some(days) => days,
+        None => Detector::ProbePaths.ttl_days(&db)?,
+    };
 
     let log_text = read_access_log(&db, access_log.as_deref())?;
 
@@ -3134,11 +3867,15 @@ fn list_probe_paths(db_path: Option<PathBuf>) -> Result<()> {
 
 fn block_honeypot(
     db_path: Option<PathBuf>,
-    ttl_days: i64,
+    ttl_days: Option<i64>,
     access_log: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
     let db = open_db(db_path)?;
+    let ttl_days = match ttl_days {
+        Some(days) => days,
+        None => Detector::Honeypot.ttl_days(&db)?,
+    };
 
     let log_text = read_access_log(&db, access_log.as_deref())?;
 
@@ -3166,6 +3903,29 @@ fn set_honeypot_path(db_path: Option<PathBuf>, path: String) -> Result<()> {
          Disallow line for it yourself."
     );
     Ok(())
+}
+
+/// A detector subcommand's threshold and TTL: the flag if one was given,
+/// else what is stored — the values the internal cron and `batch` use, so
+/// running a detector by hand behaves like the scheduled pass unless told
+/// otherwise.
+fn detector_defaults(
+    db: &Db,
+    detector: Detector,
+    threshold: Option<usize>,
+    ttl_days: Option<i64>,
+) -> Result<(usize, i64)> {
+    let threshold = match threshold {
+        Some(value) => value,
+        None => detector
+            .threshold(db)?
+            .context("this detector has no threshold")?,
+    };
+    let ttl_days = match ttl_days {
+        Some(days) => days,
+        None => detector.ttl_days(db)?,
+    };
+    Ok((threshold, ttl_days))
 }
 
 /// Reads the NGINX access log for a detector subcommand: `--access-log` if
@@ -3374,6 +4134,264 @@ fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    // ---- `--help` ----
+    //
+    // Doc comments on `Command` used to slide onto the wrong variant: a
+    // variant with no comment of its own silently took the next one's, so
+    // `web --help` described the block response and `status` described
+    // `batch`. Nothing failed, because every string was well-formed. These
+    // walk the whole command tree instead of spot-checking a few verbs.
+
+    use clap::CommandFactory;
+
+    /// Every subcommand, by name, with its clap definition.
+    fn subcommands() -> Vec<clap::Command> {
+        Cli::command()
+            .get_subcommands()
+            .filter(|c| c.get_name() != "help")
+            .cloned()
+            .collect()
+    }
+
+    /// `ApplyBlocks` for `apply-blocks`: how a variant name leaks into
+    /// help text written by someone looking at the enum.
+    fn variant_name(command: &str) -> String {
+        command
+            .split('-')
+            .map(|word| {
+                let mut chars = word.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().chain(chars).collect(),
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// All the text `stop-bots <command> --help` prints that we wrote.
+    fn help_texts(command: &clap::Command) -> Vec<(String, String)> {
+        let name = command.get_name().to_string();
+        let mut texts = Vec::new();
+        for text in [command.get_about(), command.get_long_about()]
+            .into_iter()
+            .flatten()
+        {
+            texts.push((name.clone(), text.to_string()));
+        }
+        for arg in command.get_arguments() {
+            for text in [arg.get_help(), arg.get_long_help()].into_iter().flatten() {
+                texts.push((format!("{name} --{}", arg.get_id()), text.to_string()));
+            }
+        }
+        texts
+    }
+
+    #[test]
+    fn every_subcommand_has_a_description() {
+        for command in subcommands() {
+            let about = command
+                .get_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            assert!(
+                !about.trim().is_empty(),
+                "`{}` has no description",
+                command.get_name()
+            );
+        }
+    }
+
+    /// Two commands saying the same thing is how a misplaced doc comment
+    /// shows up: one variant lost its text and inherited its neighbour's.
+    #[test]
+    fn no_two_subcommands_share_a_description() {
+        let mut seen: std::collections::HashMap<String, String> = Default::default();
+        for command in subcommands() {
+            let about = command
+                .get_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            if let Some(other) = seen.insert(about.clone(), command.get_name().to_string()) {
+                panic!("`{}` and `{other}` both say {about:?}", command.get_name());
+            }
+        }
+    }
+
+    /// `batch` used to open "selected. One step's failure..." — the tail
+    /// of a sentence whose start had been cut off onto `status`.
+    #[test]
+    fn every_description_starts_a_sentence() {
+        for command in subcommands() {
+            let about = command
+                .get_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let first = about.chars().next().unwrap_or(' ');
+            assert!(
+                first.is_uppercase(),
+                "`{}` starts mid-sentence: {about:?}",
+                command.get_name()
+            );
+        }
+    }
+
+    #[test]
+    fn every_flag_says_what_it_does() {
+        for command in subcommands() {
+            for arg in command.get_arguments() {
+                let id = arg.get_id().as_str();
+                if id == "help" || id == "version" {
+                    continue;
+                }
+                let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+                assert!(
+                    !help.trim().is_empty(),
+                    "`{} --{id}` has no help",
+                    command.get_name()
+                );
+            }
+        }
+    }
+
+    /// A reader types `apply-blocks`; `ApplyBlocks`, a table name or a
+    /// Rust path means nothing to them and goes stale on a rename.
+    #[test]
+    fn help_text_names_commands_as_they_are_typed() {
+        let variants: Vec<String> = subcommands()
+            .iter()
+            .map(|c| c.get_name())
+            .filter(|name| name.contains('-'))
+            .map(variant_name)
+            .collect();
+        let internal = ["stop_bots::", "firewall_rules", "user_agent_stats"];
+        for command in subcommands() {
+            for (place, text) in help_texts(&command) {
+                for word in internal
+                    .iter()
+                    .copied()
+                    .chain(variants.iter().map(String::as_str))
+                {
+                    assert!(!text.contains(word), "`{place}` says {word:?}:\n{text}");
+                }
+            }
+        }
+    }
+
+    /// `block-probe-paths` printed its opening sentence twice, because the
+    /// summary was repeated as the first paragraph of the long text.
+    #[test]
+    fn no_paragraph_of_a_command_s_help_is_repeated() {
+        for command in subcommands() {
+            let long = command
+                .get_long_about()
+                .map(|a| a.to_string())
+                .unwrap_or_default();
+            let mut paragraphs: Vec<String> = long
+                .split("\n\n")
+                .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|p| !p.is_empty())
+                .collect();
+            let count = paragraphs.len();
+            paragraphs.sort();
+            paragraphs.dedup();
+            assert_eq!(
+                paragraphs.len(),
+                count,
+                "`{}` repeats a paragraph:\n{long}",
+                command.get_name()
+            );
+        }
+    }
+
+    /// clap's own consistency checks — duplicate ids, a global flag
+    /// shadowed by a subcommand's own, conflicts naming missing args — run
+    /// only when asked, and a debug build panics on them at startup.
+    #[test]
+    fn the_command_line_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    /// `--db` is global: accepted before or after the subcommand.
+    #[test]
+    fn db_is_accepted_before_and_after_the_subcommand() {
+        for args in [
+            &["stop-bots", "--db", "/tmp/x.db", "list-trusted"][..],
+            &["stop-bots", "list-trusted", "--db", "/tmp/x.db"][..],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.db.as_deref(), Some(Path::new("/tmp/x.db")), "{args:?}");
+        }
+    }
+
+    /// The old spellings keep working for one release, and stay out of
+    /// `--help` so nobody starts using them now.
+    #[test]
+    fn a_renamed_command_still_parses_under_its_old_name() {
+        let cli = Cli::try_parse_from(["stop-bots", "block-scanners", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::BlockSshScanners { dry_run: true, .. })
+        ));
+        let help = Cli::command().render_help().to_string();
+        assert!(
+            !help.contains("block-scanners"),
+            "the old name is advertised:\n{help}"
+        );
+    }
+
+    #[test]
+    fn web_s_deprecated_flags_still_parse_but_are_not_advertised() {
+        let cli = Cli::try_parse_from([
+            "stop-bots",
+            "web",
+            "--save",
+            "--allowed-hosts",
+            "a.example",
+            "--trust-forwarded-for",
+            "true",
+            "--secure-cookie",
+            "false",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Some(Command::Web { save: true, .. })));
+
+        let mut root = Cli::command();
+        let help = root
+            .find_subcommand_mut("web")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for flag in [
+            "--save",
+            "--allowed-hosts",
+            "--trust-forwarded-for",
+            "--secure-cookie",
+        ] {
+            assert!(
+                !help.contains(flag),
+                "`web --help` still offers {flag}:\n{help}"
+            );
+        }
+    }
+
+    /// A detector is named the way it is typed, and the stored id — the
+    /// one a settings key or cron job carries — is accepted too.
+    #[test]
+    fn every_detector_has_a_command_line_name_and_accepts_its_stored_id() {
+        for detector in DetectorArg::ALL {
+            for spelling in [detector.name(), detector.0.id()] {
+                let cli = Cli::try_parse_from(["stop-bots", "set-detector", spelling]).unwrap();
+                let Some(Command::SetDetector {
+                    detector: parsed, ..
+                }) = cli.command
+                else {
+                    panic!("{spelling} did not parse as set-detector");
+                };
+                assert_eq!(parsed.0, detector.0, "{spelling}");
+            }
+        }
+    }
+
     /// An explicit `--ssh-log` that cannot be read must say so about *that
     /// path*, and must not claim the other two sources were tried — they
     /// were not. The wording is the whole point of the test: a message
@@ -3576,6 +4594,45 @@ mod tests {
         assert!(check_lockout_risk(&rules, Some(Path::new("/nonexistent/x.log")), false).unwrap());
     }
 
+    /// With neither flag, a render follows the host: the stored backend,
+    /// and that backend's own file. An iptables host used to get
+    /// `firewall.nft` holding a shell script.
+    #[test]
+    fn a_render_with_no_flags_follows_the_stored_backend_and_its_path() {
+        use stop_bots::firewall::FirewallBackend as Stored;
+        let db = Db::open_in_memory().unwrap();
+
+        let (backend, out) = firewall_target(&db, None, None).unwrap();
+        assert_eq!(backend, Stored::Nftables);
+        assert_eq!(out, PathBuf::from("/etc/stop-bots/firewall.nft"));
+
+        stop_bots::firewall::store_backend(&db, Stored::Iptables).unwrap();
+        let (backend, out) = firewall_target(&db, None, None).unwrap();
+        assert_eq!(backend, Stored::Iptables);
+        assert_eq!(out, PathBuf::from("/etc/stop-bots/firewall.sh"));
+    }
+
+    /// A flag names this run only: it wins over the stored backend, and
+    /// the default path follows the backend it chose.
+    #[test]
+    fn a_render_s_flags_win_over_the_stored_backend() {
+        use stop_bots::firewall::FirewallBackend as Stored;
+        let db = Db::open_in_memory().unwrap();
+        stop_bots::firewall::store_backend(&db, Stored::Iptables).unwrap();
+
+        let (backend, out) = firewall_target(&db, Some(FirewallBackend::Nftables), None).unwrap();
+        assert_eq!(backend, Stored::Nftables);
+        assert_eq!(out, PathBuf::from("/etc/stop-bots/firewall.nft"));
+
+        let (_, out) = firewall_target(&db, None, Some(PathBuf::from("/tmp/fw"))).unwrap();
+        assert_eq!(out, PathBuf::from("/tmp/fw"));
+        assert_eq!(
+            stop_bots::firewall::stored_backend(&db).unwrap(),
+            Stored::Iptables,
+            "a run's flag was written back"
+        );
+    }
+
     #[test]
     fn render_firewall_rejects_allowlist_mode_on_iptables() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3586,7 +4643,13 @@ mod tests {
         }
         let out = tmp.path().join("fw.sh");
 
-        let result = render_firewall(Some(db_path), FirewallBackend::Iptables, &out, false, None);
+        let result = render_firewall(
+            Some(db_path),
+            Some(FirewallBackend::Iptables),
+            Some(out.clone()),
+            false,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nftables"));
         assert!(!out.exists());
@@ -3623,7 +4686,14 @@ mod tests {
             .collect();
         std::fs::write(&log_path, log).unwrap();
 
-        block_web_scanners(Some(db_path.clone()), 15, 1, Some(log_path), false).unwrap();
+        block_web_scanners(
+            Some(db_path.clone()),
+            Some(15),
+            Some(1),
+            Some(log_path),
+            false,
+        )
+        .unwrap();
 
         let db = Db::open(&db_path).unwrap();
         assert!(db.list_firewall_rules().unwrap().is_empty());
@@ -3651,7 +4721,14 @@ mod tests {
             .collect();
         std::fs::write(&log_path, log).unwrap();
 
-        block_web_scanners(Some(db_path.clone()), 15, 1, Some(log_path), false).unwrap();
+        block_web_scanners(
+            Some(db_path.clone()),
+            Some(15),
+            Some(1),
+            Some(log_path),
+            false,
+        )
+        .unwrap();
 
         let db = Db::open(&db_path).unwrap();
         assert_eq!(
@@ -3676,7 +4753,14 @@ mod tests {
         let log: String = "Failed password for root from 198.51.100.9 port 4444 ssh2\n".repeat(25);
         std::fs::write(&log_path, &log).unwrap();
 
-        block_scanners(Some(db_path.clone()), 20, -1, Some(log_path.clone()), false).unwrap();
+        block_scanners(
+            Some(db_path.clone()),
+            Some(20),
+            Some(-1),
+            Some(log_path.clone()),
+            false,
+        )
+        .unwrap();
         {
             // The rule from the first (instantly-expired) call must
             // already be gone before the second call ever runs, exactly
@@ -3685,7 +4769,14 @@ mod tests {
             assert!(db.list_firewall_rules().unwrap().is_empty());
         }
 
-        block_scanners(Some(db_path.clone()), 20, 5, Some(log_path), false).unwrap();
+        block_scanners(
+            Some(db_path.clone()),
+            Some(20),
+            Some(5),
+            Some(log_path),
+            false,
+        )
+        .unwrap();
 
         let db = Db::open(&db_path).unwrap();
         let rules = db.list_firewall_rules().unwrap();

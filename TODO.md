@@ -42,21 +42,12 @@ list — which meant the open items below were unfindable inside it.
   it until it is restarted. The Web Access panel now says so explicitly, with
   a "Restart needed" row naming what this process is serving; the underlying
   fix is rebuilding the router in place, which nothing does yet.
-* **No CLI verb for the web UI's own settings.** `web:secure_cookie` and
-  `web:trust_forwarded_for` have to be set by hand, unlike `web:bind` and
-  `web:allowed_hosts`, which `stop-bots web --save` writes. A
-  `set-web-option`-shaped verb, or flags on `web`, would close it.
 
 ## Known gaps
 
 Deliberate omissions rather than oversights — each is a thing someone will
 eventually ask for, with the reason it isn't there.
 
-* **CLI verbs that don't exist**, though the `Db` methods behind them do and are
-  tested: category defaults (`set_category_default`), per-bot status
-  (`set_bot_status`), per-site category and bot overrides, and toggling a
-  firewall rule's `enabled` flag (`set_firewall_rule_enabled` — only add and
-  remove are wired up). All are reachable from the TUI.
 * **TUI screens that don't exist**: firewall rules (CLI-only), and crawler
   IP-range sources (Googlebot/Bingbot/GPTBot — also CLI-only, unlike country
   ranges, which do have a Dashboard panel).

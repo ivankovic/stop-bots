@@ -137,7 +137,7 @@ impl BasePath {
             Some(raw) => Self::parse(&raw).with_context(|| {
                 format!(
                     "the stored `{BASE_PATH_KEY}` setting is not a usable path prefix; \
-                     replace it with `stop-bots web --base-path /stop-bots --save`"
+                     replace it with `stop-bots set-web --base-path /stop-bots`"
                 )
             }),
             None => Ok(Self::default()),
