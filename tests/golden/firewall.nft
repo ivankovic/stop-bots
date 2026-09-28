@@ -8,6 +8,9 @@
 #
 # Two hooks: "input" for services on this host, "forward" for ones in
 # containers, whose traffic is DNAT'd past "input" entirely.
+#
+# Addresses are in sets, matched first to last by the rules in bot_rules.
+# An element with a timeout is removed by the kernel when it runs out.
 
 add table inet stop_bots
 delete table inet stop_bots
@@ -24,7 +27,29 @@ add rule inet stop_bots bot_forward ip saddr { 127.0.0.0/8, 10.0.0.0/8, 172.16.0
 add rule inet stop_bots bot_forward ip6 saddr { ::1, fc00::/7 } accept
 add rule inet stop_bots bot_forward jump bot_rules
 
-add rule inet stop_bots bot_rules ip saddr 203.0.113.7 accept
-add rule inet stop_bots bot_rules ip saddr 198.51.100.0/24 drop
-add rule inet stop_bots bot_rules ip saddr 192.0.2.9 tcp dport 22 drop
-add rule inet stop_bots bot_rules ip6 saddr 2001:db8::/32 drop
+add set inet stop_bots allow_v4 { type ipv4_addr; flags interval; }
+add set inet stop_bots block_v4 { type ipv4_addr; flags interval, timeout; }
+add set inet stop_bots block_v6 { type ipv6_addr; flags interval; }
+add set inet stop_bots block_tcp22_v4 { type ipv4_addr; flags interval; }
+
+add rule inet stop_bots bot_rules ip saddr @allow_v4 accept
+add rule inet stop_bots bot_rules ip saddr @block_v4 drop
+add rule inet stop_bots bot_rules ip6 saddr @block_v6 drop
+add rule inet stop_bots bot_rules ip saddr @block_tcp22_v4 tcp dport 22 drop
+
+add element inet stop_bots allow_v4 {
+	203.0.113.7
+}
+
+add element inet stop_bots block_v4 {
+	198.51.100.0/24,
+	192.0.2.77 timeout 1d1h
+}
+
+add element inet stop_bots block_v6 {
+	2001:db8::/32
+}
+
+add element inet stop_bots block_tcp22_v4 {
+	192.0.2.9
+}

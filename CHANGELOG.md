@@ -8,6 +8,17 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- `set-detector <name>` and `list-detectors`: switch, TTL and threshold for
+  every detector, as the internal cron and `batch` use them.
+- `set-subnet-escalation`: IPv4 /24 escalation, previously unreachable.
+- `set-category`, `set-bot` (both with `--site`), `list-categories`, `list-bots`.
+- `set-firewall-rule --enabled`, `set-firewall-backend`.
+- `set-web`: bind, exposure, path prefix, allowed hosts, `X-Forwarded-For`
+  trust and the `Secure` cookie, in one place.
+- `--db` works before or after any subcommand, and falls back to `STOP_BOTS_DB`.
+
 ### Changed
 
 - **The database has a schema version** (`PRAGMA user_version`). Upgrading
@@ -30,25 +41,6 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - Housekeeping: `REVIEW.md` holds open items only, and `CONTRIBUTING.md` lists
   every module and quotes one coverage figure, measured.
 
-### Fixed
-
-- `SECURITY.md` said every detector is off by default; five are on. It now
-  says which, and that blocking traffic you wanted is a matter of tuning.
-
-## [Unreleased]
-
-### Added
-
-- `set-detector <name>` and `list-detectors`: switch, TTL and threshold for
-  every detector, as the internal cron and `batch` use them.
-- `set-subnet-escalation`: IPv4 /24 escalation, previously unreachable.
-- `set-category`, `set-bot` (both with `--site`), `list-categories`, `list-bots`.
-- `set-firewall-rule --enabled`, `set-firewall-backend`.
-- `set-web`: bind, exposure, path prefix, allowed hosts, `X-Forwarded-For`
-  trust and the `Secure` cookie, in one place.
-- `--db` works before or after any subcommand, and falls back to `STOP_BOTS_DB`.
-
-### Changed
 
 - The SSH and web scanner thresholds are stored settings (defaults 20 and 7,
   as before), so the cron and `batch` honour them.
@@ -60,7 +52,21 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - `web --allowed-hosts`, `--trust-forwarded-for`, `--secure-cookie` and `--save`
   are deprecated in favour of `set-web`. They still work, with a note, for one release.
 
+
+- **nftables: addresses go in sets.** One set per verdict and family, matched by one rule
+  each, instead of one rule per address. First-match order is kept.
+- **nftables: timed blocks expire in the kernel.** A detector's block is a set element with a
+  `timeout`, so it lifts without re-applying the script.
+- **iptables: loaded with `iptables-restore --noflush`.** The chain is replaced in one step, and
+  a failed apply leaves the previous chain as it was.
+- **iptables: IPv6 rules are applied** through `ip6tables-restore`, not skipped.
+- `status` counts set elements and ip6tables rules as loaded rules.
+
 ### Fixed
+
+- `SECURITY.md` said every detector is off by default; five are on. It now
+  says which, and that blocking traffic you wanted is a matter of tuning.
+
 
 - `--help`: `web`, `status`, `batch`, `set-log-paths`, `set-nginx-commands` and
   `set-block-response` showed another command's text or none. Every flag has help now.

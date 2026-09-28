@@ -947,7 +947,7 @@ impl Dashboard {
                         Span::from("  [ "),
                         Span::from(match backend_selected {
                             0 => "nftables (recommended)",
-                            1 => "iptables (IPv4 only)",
+                            1 => "iptables (no kernel expiry, no allowlist)",
                             _ => "unknown",
                         })
                         .reversed(),

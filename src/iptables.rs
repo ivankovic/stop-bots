@@ -16,38 +16,60 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-//! Renders [`FirewallRule`]s into a shell script of plain `iptables`
-//! commands.
+//! Renders [`FirewallRule`]s into a shell script that loads them with
+//! `iptables-restore --noflush` and `ip6tables-restore --noflush`.
 //!
-//! Deliberately *not* an `iptables-save`/`iptables-restore` dump: restoring a
-//! full `*filter` table (as `iptables-restore` does) replaces the entire
-//! table, including chain policies and any unrelated rules an admin already
-//! has (e.g. their SSH allow rule) — silently, if they just pipe our output
-//! in. Instead this renders individually-additive `iptables` invocations that
-//! only ever touch our own `STOP-BOTS` chain, safe to run alongside whatever
-//! else is already configured. This module never executes `iptables`
-//! itself — see [`render`] for what gets written, applying it is a manual
-//! step for the admin.
+//! Not a full `iptables-save` dump: restoring a whole `*filter` table
+//! replaces it, including chain policies and any unrelated rules an admin
+//! already has (e.g. their SSH allow rule). The fragment this renders
+//! declares one chain, `STOP-BOTS`, and appends only to it. With
+//! `--noflush`, declaring a chain that exists empties it, so the fragment
+//! replaces our chain and nothing else, and it does so in one commit.
 //!
-//! `iptables` is IPv4-only — feeding it an IPv6 address fails at runtime
-//! (`host/network ... not found`), which combined with `set -e` would abort
-//! the script partway through, having applied only some rules. So IPv6
-//! rules are skipped here (left as a comment) rather than emitted broken;
-//! use [`crate::nftables`] for IPv6, which handles both families in one
-//! table.
+//! ## Why a restore and not one `iptables -A` per rule
+//!
+//! The script used to flush `STOP-BOTS` and then run one `iptables -A`
+//! process per rule. With tens of thousands of rules, the chain was empty,
+//! then partly filled, for as long as those processes took to run, and a
+//! failure part way through (under `set -e`) left it partly filled until
+//! the next apply. A restore is checked in full before it changes anything
+//! and is committed at once, so a failed apply leaves the previous chain as
+//! it was. `-w` waits for the xtables lock instead of failing when another
+//! tool holds it.
+//!
+//! The jumps into `STOP-BOTS` from `INPUT`, `FORWARD` and `DOCKER-USER`
+//! stay as guarded shell commands after the restore: `-C` before `-I` is
+//! the only idempotent way to add a rule to a chain we do not own, and a
+//! restore has no equivalent of `-C`.
+//!
+//! No `ipset`. It would do for this backend what named sets do for
+//! nftables, but it is a separate package that most hosts do not have, and
+//! `iptables-restore` is in the `iptables` package itself.
+//!
+//! ## IPv6
+//!
+//! `iptables` is IPv4-only, and IPv6 rules used to be skipped, including
+//! every /64 a detector writes. They now go to `ip6tables-restore`, into a
+//! `STOP-BOTS` chain of the same shape in the IPv6 tables, with the same
+//! jumps. On a host where `ip6tables` cannot be used (IPv6 disabled in the
+//! kernel), the script says so and exits non-zero if there were IPv6
+//! rules to load. The IPv4 half has been applied by then.
+//!
+//! ## Expiry
+//!
+//! iptables has no timeouts without `ipset`, so a rule that expires stays
+//! in the chain until the script is rendered and applied again. A rule
+//! already expired at render time is left out.
 //!
 //! ## Default-deny (allowlist) mode
 //!
 //! For allowlist geo-blocking (block everything except selected countries),
-//! [`crate::db::geo_firewall_rules`] generates a trailing `0.0.0.0/0` Block
-//! rule. Unlike `nftables`, iptables cannot safely enforce this because:
-//! 1. iptables is IPv4-only — the corresponding `::/0` IPv6 catch-all would
-//!    be silently skipped, leaving IPv6 traffic completely unblocked.
-//! 2. Without explicit allow rules for established connections and loopback
-//!    (which this module now adds), a `0.0.0.0/0` rule would block all existing
-//!    connections and local traffic. We now add those safety rules (see
-//!    [`render`]), but the IPv6 limitation remains — hence allowlist mode
-//!    requires the nftables backend (enforced in `main.rs`).
+//! [`crate::db::geo_firewall_rules`] generates trailing `0.0.0.0/0` and
+//! `::/0` Block rules. This backend is not offered for it: see
+//! [`crate::firewall::build_script`]. The established/related and loopback
+//! accepts at the top of each chain are here all the same, so a catch-all
+//! Block an admin adds by hand cannot cut existing connections or local
+//! traffic.
 
 use crate::db::{FirewallAction, FirewallRule};
 
@@ -65,52 +87,92 @@ fn is_ipv6(address: &str) -> bool {
     address.contains(':')
 }
 
-/// Renders `rules` (skipping disabled ones) into an idempotent `iptables`
-/// shell script: safe to run repeatedly, and safe to run alongside any other
-/// firewall rules already on the system.
-///
-/// IPv6 rules are skipped (see module docs); ports are rendered as
-/// `-p tcp --dport <port>` — there's no protocol field on [`FirewallRule`]
-/// yet, so UDP-specific rules aren't representable either (see TODO.md).
-///
-/// The generated chain always includes explicit ACCEPT rules for established/
-/// related connections and loopback traffic before any user rules, ensuring
-/// that a trailing catch-all block rule (used in allowlist geo mode) won't
-/// lock out existing connections or local traffic.
-pub fn render(rules: &[FirewallRule]) -> String {
-    let mut out = String::new();
-    out.push_str("#!/bin/sh\n");
-    out.push_str("# Generated by stop-bots. Not executed automatically — review, then run\n");
-    out.push_str("# with: sh <this file>\n");
-    out.push_str("#\n");
-    out.push_str(&format!(
-        "# Only ever touches the dedicated {CHAIN} chain, plus the jumps into it\n"
-    ));
-    out.push_str("# from INPUT, FORWARD and DOCKER-USER. Existing rules in those chains,\n");
-    out.push_str("# all other chains, and every chain policy are left alone.\n");
-    out.push_str("set -e\n\n");
+/// What the rules turn into: one `-A` line per rule, split by family.
+struct Plan {
+    v4: Vec<String>,
+    v6: Vec<String>,
+    /// Addresses that are not addresses, left out and named in a comment.
+    skipped: Vec<String>,
+}
 
-    out.push_str(&format!(
-        "if ! iptables -L {CHAIN} -n >/dev/null 2>&1; then\n"
-    ));
-    out.push_str(&format!("    iptables -N {CHAIN}\n"));
-    out.push_str("fi\n");
-    out.push_str(&format!("iptables -F {CHAIN}\n"));
-    out.push_str(&format!(
-        "if ! iptables -C INPUT -j {CHAIN} 2>/dev/null; then\n"
-    ));
-    out.push_str(&format!("    iptables -I INPUT -j {CHAIN}\n"));
-    out.push_str("fi\n");
+impl Plan {
+    fn new(rules: &[FirewallRule], now: i64) -> Plan {
+        let mut plan = Plan {
+            v4: Vec::new(),
+            v6: Vec::new(),
+            skipped: Vec::new(),
+        };
+        for rule in rules.iter().filter(|r| r.enabled) {
+            // Defence in depth. `Db` refuses to store an address this would
+            // reject, so reaching here means a row predating that check (or
+            // a database edited by hand). The script is executable input —
+            // `sh` for this backend — so an address that isn't one is
+            // dropped rather than interpolated.
+            if !crate::db::is_valid_address(&rule.address) {
+                plan.skipped.push(rule.address.clone());
+                continue;
+            }
+            if rule.expires_at.is_some_and(|at| at <= now) {
+                continue;
+            }
+            // What was validated is the trimmed form, so that is what goes
+            // in the script: a trailing newline would end the line early
+            // and make `-j DROP` a line of its own.
+            let address = rule.address.trim();
+            let mut line = format!("-A {CHAIN} -s {address}");
+            if let Some(port) = rule.port {
+                line.push_str(&format!(" -p tcp --dport {port}"));
+            }
+            line.push_str(&format!(" -j {}", action_word(rule.action)));
+            if is_ipv6(address) {
+                plan.v6.push(line);
+            } else {
+                plan.v4.push(line);
+            }
+        }
+        plan
+    }
+}
 
-    // `INPUT` alone only covers services running on the host. Traffic for a
-    // published container port is DNAT'd and then *forwarded*, so it never
-    // reaches `INPUT` and an `INPUT`-only jump enforces nothing for it —
-    // see the module docs in `crate::nftables` for the same reasoning.
+/// How many rules a render of `rules` at `now` puts in the two chains,
+/// IPv4 and IPv6 together. What `health` expects to find loaded, and
+/// what "wrote N rule(s)" reports.
+pub fn loaded_entries(rules: &[FirewallRule], now: i64) -> usize {
+    let plan = Plan::new(rules, now);
+    plan.v4.len() + plan.v6.len()
+}
+
+/// The restore fragment for one family: our chain, emptied and refilled.
+///
+/// The established/related and loopback accepts come first, before any
+/// user rule, so that a catch-all Block cannot cut existing connections or
+/// local traffic.
+fn fragment(out: &mut String, restore: &str, delimiter: &str, lines: &[String]) {
+    out.push_str(&format!("{restore} -w --noflush <<'{delimiter}'\n"));
+    out.push_str("*filter\n");
+    out.push_str(&format!(":{CHAIN} - [0:0]\n"));
     out.push_str(&format!(
-        "if ! iptables -C FORWARD -j {CHAIN} 2>/dev/null; then\n"
+        "-A {CHAIN} -m state --state ESTABLISHED,RELATED -j ACCEPT\n"
     ));
-    out.push_str(&format!("    iptables -I FORWARD -j {CHAIN}\n"));
-    out.push_str("fi\n");
+    out.push_str(&format!("-A {CHAIN} -i lo -j ACCEPT\n"));
+    for line in lines {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("COMMIT\n");
+    out.push_str(&format!("{delimiter}\n"));
+}
+
+/// The guarded jumps into our chain from the chains that see traffic,
+/// indented by `indent`.
+fn jumps(out: &mut String, tool: &str, indent: &str) {
+    for chain in ["INPUT", "FORWARD"] {
+        out.push_str(&format!(
+            "{indent}if ! {tool} -w -C {chain} -j {CHAIN} 2>/dev/null; then\n"
+        ));
+        out.push_str(&format!("{indent}    {tool} -w -I {chain} -j {CHAIN}\n"));
+        out.push_str(&format!("{indent}fi\n"));
+    }
 
     // And again from `DOCKER-USER`, which exists only when Docker does.
     //
@@ -123,64 +185,78 @@ pub fn render(rules: &[FirewallRule]) -> String {
     // Docker documents for exactly this, so we take both: the rules are
     // idempotent and `DROP` is terminal, so being traversed twice costs a
     // second pass over a short chain and changes no verdict.
-    out.push_str("if iptables -L DOCKER-USER -n >/dev/null 2>&1; then\n");
     out.push_str(&format!(
-        "    if ! iptables -C DOCKER-USER -j {CHAIN} 2>/dev/null; then\n"
+        "{indent}if {tool} -w -L DOCKER-USER -n >/dev/null 2>&1; then\n"
     ));
-    out.push_str(&format!("        iptables -I DOCKER-USER -j {CHAIN}\n"));
-    out.push_str("    fi\n");
+    out.push_str(&format!(
+        "{indent}    if ! {tool} -w -C DOCKER-USER -j {CHAIN} 2>/dev/null; then\n"
+    ));
+    out.push_str(&format!(
+        "{indent}        {tool} -w -I DOCKER-USER -j {CHAIN}\n"
+    ));
+    out.push_str(&format!("{indent}    fi\n"));
+    out.push_str(&format!("{indent}fi\n"));
+}
+
+/// Renders `rules` (skipping disabled and already-expired ones, as of
+/// `now` in Unix seconds) into an idempotent shell script: safe to run
+/// repeatedly, and safe to run alongside any other firewall rules already
+/// on the system.
+///
+/// Ports are rendered as `-p tcp --dport <port>` — there's no protocol
+/// field on [`FirewallRule`] yet, so UDP-specific rules aren't
+/// representable (see TODO.md).
+pub fn render(rules: &[FirewallRule], now: i64) -> String {
+    let plan = Plan::new(rules, now);
+
+    let mut out = String::new();
+    out.push_str("#!/bin/sh\n");
+    out.push_str("# Generated by stop-bots. Not executed automatically — review, then run\n");
+    out.push_str("# with: sh <this file>\n");
+    out.push_str("#\n");
+    out.push_str(&format!(
+        "# Replaces the {CHAIN} chain in one step with iptables-restore --noflush,\n"
+    ));
+    out.push_str("# then adds the jumps into it from INPUT, FORWARD and DOCKER-USER.\n");
+    out.push_str("# Existing rules in those chains, all other chains, and every chain\n");
+    out.push_str("# policy are left alone. IPv6 rules get the same chain in ip6tables.\n");
+    out.push_str(&format!(
+        "# {} IPv4 rule(s), {} IPv6 rule(s).\n",
+        plan.v4.len(),
+        plan.v6.len()
+    ));
+    for address in &plan.skipped {
+        // `{:?}`, not `{}`: an unvalidated address can contain a newline,
+        // which would end the comment and make the remainder of it a
+        // command.
+        out.push_str(&format!(
+            "# skipped (not an IP address or CIDR range): {address:?}\n"
+        ));
+    }
+    out.push_str("set -e\n\n");
+
+    fragment(&mut out, "iptables-restore", "STOP_BOTS_IPV4", &plan.v4);
+    // `INPUT` alone only covers services running on the host. Traffic for
+    // a published container port is DNAT'd and then *forwarded*, so it
+    // never reaches `INPUT` and an `INPUT`-only jump enforces nothing for
+    // it — see the module docs in `crate::nftables` for the same reasoning.
+    jumps(&mut out, "iptables", "");
+
+    // Listing `INPUT` is the cheapest proof that ip6tables works here at
+    // all; it fails on a kernel booted with IPv6 disabled.
+    out.push_str("\nif ip6tables -w -L INPUT -n >/dev/null 2>&1; then\n");
+    fragment(&mut out, "ip6tables-restore", "STOP_BOTS_IPV6", &plan.v6);
+    jumps(&mut out, "ip6tables", "    ");
+    if !plan.v6.is_empty() {
+        out.push_str("else\n");
+        out.push_str(&format!(
+            "    echo \"stop-bots: ip6tables cannot be used on this host, so {} IPv6 rule(s) \
+             were not applied\" >&2\n",
+            plan.v6.len()
+        ));
+        out.push_str("    exit 1\n");
+    }
     out.push_str("fi\n");
-
-    // Safety first: always accept established/related connections and loopback.
-    // This is critical for allowlist mode where a trailing 0.0.0.0/0 block rule
-    // would otherwise lock out all existing connections and local traffic.
-    // Note: iptables is IPv4-only, so we can't match IPv6 addresses or set an
-    // IPv6 default policy — both reasons allowlist mode requires nftables.
-    out.push_str(&format!(
-        "iptables -A {CHAIN} -m state --state ESTABLISHED,RELATED -j ACCEPT\n"
-    ));
-    out.push_str(&format!("iptables -A {CHAIN} -i lo -j ACCEPT\n"));
-
-    let enabled: Vec<&FirewallRule> = rules.iter().filter(|r| r.enabled).collect();
-    if !enabled.is_empty() {
-        out.push('\n');
-    }
-    for rule in enabled {
-        // Defence in depth. `Db` refuses to store an address this would
-        // reject, so reaching here means a row predating that check (or a
-        // database edited by hand). The script is executable input — `sh`
-        // for this backend — so an address that isn't one is dropped rather
-        // than interpolated. `{:?}` in the note, not `{}`: an unvalidated
-        // address can contain a newline, which would end the comment and
-        // make the remainder of it a command.
-        if !crate::db::is_valid_address(&rule.address) {
-            out.push_str(&format!(
-                "# skipped (not an IP address or CIDR range): {:?}\n",
-                rule.address
-            ));
-            continue;
-        }
-        // What was validated is the trimmed form, so that is what goes in
-        // the script: a trailing newline would end the command early and
-        // make `-j DROP` a command of its own.
-        let address = rule.address.trim();
-        if is_ipv6(address) {
-            out.push_str(&format!(
-                "# skipped (IPv6, not supported by iptables): {address} — use nftables instead\n"
-            ));
-            continue;
-        }
-        out.push_str("iptables -A ");
-        out.push_str(CHAIN);
-        out.push_str(" -s ");
-        out.push_str(address);
-        if let Some(port) = rule.port {
-            out.push_str(&format!(" -p tcp --dport {port}"));
-        }
-        out.push_str(" -j ");
-        out.push_str(action_word(rule.action));
-        out.push('\n');
-    }
 
     out
 }
@@ -189,8 +265,11 @@ pub fn render(rules: &[FirewallRule]) -> String {
 mod tests {
     use super::*;
     use crate::db::NewFirewallRule;
-    use crate::testing::{allow, block, block_port, disabled};
+    use crate::testing::{allow, block, block_port, block_until, disabled};
     use serde::Deserialize;
+
+    /// Any fixed moment will do.
+    const NOW: i64 = 1_800_000_000;
 
     #[derive(Deserialize)]
     struct JsonRule {
@@ -218,33 +297,55 @@ mod tests {
     const RULES_JSON: &str = include_str!("../tests/fixtures/iptables/rules.json");
     const BASIC_RULES: &str = include_str!("../tests/fixtures/iptables/basic_rules.txt");
 
+    /// The lines between `<restore> ... <<'DELIM'` and `DELIM`: what one
+    /// restore is handed.
+    fn fragment_of<'a>(script: &'a str, delimiter: &str) -> Vec<&'a str> {
+        script
+            .lines()
+            .skip_while(|l| !l.ends_with(&format!("<<'{delimiter}'")))
+            .skip(1)
+            .take_while(|l| *l != delimiter)
+            .collect()
+    }
+
+    /// A restore fragment can say far more than "fill this chain": a
+    /// policy line, another chain's declaration, a rule in `INPUT`. Every
+    /// line in ours is the table header, our own chain's declaration, a
+    /// rule appended to our own chain, or the commit.
+    #[test]
+    fn the_restore_touches_our_chain_and_nothing_else() {
+        let rendered = render(&[block("1.2.3.4"), block("2001:db8::1")], NOW);
+
+        for delimiter in ["STOP_BOTS_IPV4", "STOP_BOTS_IPV6"] {
+            let fragment = fragment_of(&rendered, delimiter);
+            assert!(
+                fragment.len() > 3,
+                "no {delimiter} fragment in:\n{rendered}"
+            );
+            for line in fragment {
+                assert!(
+                    line == "*filter"
+                        || line == format!(":{CHAIN} - [0:0]")
+                        || line.starts_with(&format!("-A {CHAIN} "))
+                        || line == "COMMIT",
+                    "{delimiter} carries a line that reaches past {CHAIN}: {line:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn render_never_touches_other_chains_or_policies() {
-        let rendered = render(&[]);
-        // `-P` is the only way to change a policy, and a table-level
-        // restore is the only way to replace rules wholesale. Neither
-        // appears; `FORWARD` and `DOCKER-USER` now do, which is why this
-        // no longer just greps for their names — see the test below for
-        // what it is allowed to say about them.
-        assert!(
-            !rendered.contains("iptables -P"),
-            "rendered was:\n{rendered}"
-        );
-        assert!(!rendered.contains("OUTPUT"), "rendered was:\n{rendered}");
-        assert!(!rendered.contains("*filter"), "rendered was:\n{rendered}");
-        assert!(!rendered.contains("COMMIT"), "rendered was:\n{rendered}");
-        assert!(!rendered.to_lowercase().contains("flush ruleset"));
-        // Ours is the only chain flushed. Flushing a chain we merely jump
-        // from would throw away an admin's own rules.
-        let flushed: Vec<&str> = rendered
-            .lines()
-            .filter(|line| line.contains("-F "))
-            .collect();
-        assert_eq!(
-            flushed,
-            vec![format!("iptables -F {CHAIN}")],
-            "only {CHAIN} may be flushed, but rendered was:\n{rendered}"
-        );
+        let rendered = render(&[], NOW);
+        // `-P` is the only way to change a policy, and `-F`/`-X` the way to
+        // empty or delete a chain. None appears: our chain is emptied by
+        // being declared in the restore, which touches no other chain.
+        for forbidden in [" -P ", " -F", " -X", "OUTPUT", "flush ruleset"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "{forbidden:?} in:\n{rendered}"
+            );
+        }
     }
 
     /// The change that made this backend reach containerised services, and
@@ -253,36 +354,40 @@ mod tests {
     /// A packet for a published container port is DNAT'd and forwarded, so
     /// an `INPUT`-only jump never sees it. Both other chains therefore get
     /// a jump — and a jump is *all* they get: every line naming one is a
-    /// guarded `-C`/`-I` of our own chain, never a rule of its own.
+    /// guarded `-C`/`-I` of our own chain, never a rule of its own. The
+    /// same holds for ip6tables.
     #[test]
     fn every_hop_into_our_chain_is_covered_and_nothing_else_is_added() {
-        let rendered = render(&[block("1.2.3.4")]);
+        let rendered = render(&[block("1.2.3.4")], NOW);
 
-        for chain in ["INPUT", "FORWARD", "DOCKER-USER"] {
+        for tool in ["iptables", "ip6tables"] {
+            for chain in ["INPUT", "FORWARD", "DOCKER-USER"] {
+                assert!(
+                    rendered.contains(&format!("{tool} -w -I {chain} -j {CHAIN}")),
+                    "{chain} should jump to {CHAIN} in {tool}, but rendered was:\n{rendered}"
+                );
+                assert!(
+                    rendered.contains(&format!("{tool} -w -C {chain} -j {CHAIN}")),
+                    "the {tool} {chain} jump should be guarded, but rendered was:\n{rendered}"
+                );
+            }
+            // DOCKER-USER exists only where Docker does, so unlike the
+            // other two its jump is additionally guarded on the chain.
             assert!(
-                rendered.contains(&format!("iptables -I {chain} -j {CHAIN}")),
-                "{chain} should jump to {CHAIN}, but rendered was:\n{rendered}"
-            );
-            assert!(
-                rendered.contains(&format!("iptables -C {chain} -j {CHAIN}")),
-                "the {chain} jump should be guarded, but rendered was:\n{rendered}"
+                rendered.contains(&format!(
+                    "if {tool} -w -L DOCKER-USER -n >/dev/null 2>&1; then"
+                )),
+                "the {tool} DOCKER-USER jump should be guarded on Docker being present, \
+                 but rendered was:\n{rendered}"
             );
         }
-
-        // DOCKER-USER exists only where Docker does, so unlike the other
-        // two its jump is additionally guarded on the chain being there.
-        assert!(
-            rendered.contains("if iptables -L DOCKER-USER -n >/dev/null 2>&1; then"),
-            "the DOCKER-USER jump should be guarded on Docker being present, \
-             but rendered was:\n{rendered}"
-        );
 
         // Nothing but jumps. A rule added to a chain we don't own would
         // outlive our chain and could not be cleaned up by re-running.
         for line in rendered.lines() {
             let line = line.trim();
             if (line.contains("FORWARD") || line.contains("DOCKER-USER") || line.contains("INPUT"))
-                && line.starts_with("iptables")
+                && (line.starts_with("iptables") || line.starts_with("ip6tables"))
             {
                 assert!(
                     line.ends_with(&format!("-j {CHAIN}")),
@@ -292,83 +397,70 @@ mod tests {
         }
     }
 
+    /// The chain is filled before anything jumps to it, so on a first
+    /// apply no packet is sent into a chain that is still empty.
     #[test]
-    fn render_empty_rules_still_sets_up_chain_and_jump() {
-        let rendered = render(&[]);
-        assert!(rendered.contains(&format!("iptables -N {CHAIN}")));
-        assert!(rendered.contains(&format!("iptables -F {CHAIN}")));
-        assert!(rendered.contains(&format!("iptables -I INPUT -j {CHAIN}")));
-        assert!(
-            !rendered.contains("-A STOP-BOTS -s"),
-            "rendered was:\n{rendered}"
-        );
-        // Even with no user rules, we still have safety rules for established/related and loopback
-        assert!(
-            rendered.contains("state --state ESTABLISHED,RELATED"),
-            "rendered was:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("-i lo -j ACCEPT"),
-            "rendered was:\n{rendered}"
-        );
+    fn the_chain_is_filled_before_the_jumps_are_added() {
+        let rendered = render(&[block("1.2.3.4")], NOW);
+        let filled = rendered.find("iptables-restore").unwrap();
+        let jumped = rendered.find("iptables -w -I INPUT").unwrap();
+        assert!(filled < jumped, "rendered was:\n{rendered}");
     }
 
     #[test]
-    fn render_is_idempotent_via_guarded_chain_creation_and_jump() {
-        let rendered = render(&[]);
-        // Chain creation and the INPUT jump are both guarded so re-running
-        // the script never duplicates the jump rule or errors on an
-        // already-existing chain.
-        assert!(
-            rendered.contains("if ! iptables -L STOP-BOTS -n"),
+    fn render_empty_rules_still_sets_up_chain_and_jump() {
+        let rendered = render(&[], NOW);
+        let fragment = fragment_of(&rendered, "STOP_BOTS_IPV4");
+        assert_eq!(
+            fragment,
+            vec![
+                "*filter",
+                ":STOP-BOTS - [0:0]",
+                // Even with no user rules, the safety rules for
+                // established/related and loopback are there.
+                "-A STOP-BOTS -m state --state ESTABLISHED,RELATED -j ACCEPT",
+                "-A STOP-BOTS -i lo -j ACCEPT",
+                "COMMIT",
+            ],
             "rendered was:\n{rendered}"
         );
-        assert!(
-            rendered.contains("if ! iptables -C INPUT -j STOP-BOTS"),
-            "rendered was:\n{rendered}"
-        );
+        assert!(rendered.contains(&format!("iptables -w -I INPUT -j {CHAIN}")));
     }
 
     #[test]
     fn render_matches_fixture_rule_lines_from_json_input() {
         let rules = rules_from_fixture(RULES_JSON);
-        let rendered = render(&rules);
+        let rendered = render(&rules, NOW);
 
         // These lines come straight from tests/fixtures/iptables/rules.json,
         // rendered the same way tests/fixtures/iptables/basic_rules.txt shows
         // hand-written stop-bots rules being expressed.
-        assert!(
-            rendered.contains("-A STOP-BOTS -s 1.2.3.4 -j DROP"),
-            "rendered was:\n{rendered}"
-        );
-        assert!(BASIC_RULES.contains("-A STOP-BOTS -s 1.2.3.4 -j DROP"));
-
-        assert!(
-            rendered.contains("-A STOP-BOTS -s 5.6.7.0/24 -j DROP"),
-            "rendered was:\n{rendered}"
-        );
-        assert!(BASIC_RULES.contains("-A STOP-BOTS -s 5.6.7.0/24 -j DROP"));
-
-        assert!(
-            rendered.contains("-A STOP-BOTS -s 8.9.10.11 -p tcp --dport 80 -j DROP"),
-            "rendered was:\n{rendered}"
-        );
-        assert!(BASIC_RULES.contains("-A STOP-BOTS -s 8.9.10.11 -p tcp --dport 80 -j DROP"));
-
-        assert!(
-            rendered.contains("-A STOP-BOTS -s 12.13.14.15 -j REJECT"),
-            "rendered was:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("-A STOP-BOTS -s 66.249.64.0/19 -j ACCEPT"),
-            "rendered was:\n{rendered}"
-        );
+        for line in [
+            "-A STOP-BOTS -s 1.2.3.4 -j DROP",
+            "-A STOP-BOTS -s 5.6.7.0/24 -j DROP",
+            "-A STOP-BOTS -s 8.9.10.11 -p tcp --dport 80 -j DROP",
+        ] {
+            assert!(
+                rendered.contains(&format!("\n{line}\n")),
+                "{line:?} missing, rendered was:\n{rendered}"
+            );
+            assert!(BASIC_RULES.contains(line));
+        }
+        for line in [
+            "-A STOP-BOTS -s 12.13.14.15 -j REJECT",
+            "-A STOP-BOTS -s 66.249.64.0/19 -j ACCEPT",
+        ] {
+            assert!(
+                rendered.contains(&format!("\n{line}\n")),
+                "{line:?} missing, rendered was:\n{rendered}"
+            );
+        }
     }
 
     #[test]
     fn render_skips_disabled_rules() {
         let rules = rules_from_fixture(RULES_JSON);
-        let rendered = render(&rules);
+        let rendered = render(&rules, NOW);
         // rule-6 in the fixture (192.168.1.100) is disabled.
         assert!(
             !rendered.contains("192.168.1.100"),
@@ -376,22 +468,75 @@ mod tests {
         );
     }
 
+    /// IPv6 used to be skipped here, including every /64 a detector
+    /// writes. Now it goes to ip6tables, and never to iptables, which
+    /// would refuse the whole restore over it.
     #[test]
-    fn render_skips_ipv6_addresses_instead_of_emitting_a_broken_rule() {
-        // `iptables` is IPv4-only: an `-s 2001:db8::1` rule would error at
-        // apply time ("host/network ... not found"), and with `set -e` that
-        // aborts the whole script partway through. So IPv6 rules must never
-        // appear as an `iptables -A ...` line — they're left as a comment.
-        let rules = vec![block("2001:db8::1")];
-        let rendered = render(&rules);
+    fn an_ipv6_rule_goes_to_ip6tables_and_not_to_iptables() {
+        let rendered = render(&[block("2001:db8::/64"), block("1.2.3.4")], NOW);
+
+        let v4 = fragment_of(&rendered, "STOP_BOTS_IPV4");
+        let v6 = fragment_of(&rendered, "STOP_BOTS_IPV6");
         assert!(
-            !rendered.contains("iptables -A STOP-BOTS -s 2001:db8::1"),
+            v6.contains(&"-A STOP-BOTS -s 2001:db8::/64 -j DROP"),
             "rendered was:\n{rendered}"
         );
         assert!(
-            rendered.contains("2001:db8::1"),
+            !v4.iter().any(|l| l.contains("2001:db8")),
             "rendered was:\n{rendered}"
         );
+        assert!(
+            !v6.iter().any(|l| l.contains("1.2.3.4")),
+            "rendered was:\n{rendered}"
+        );
+        assert_eq!(
+            loaded_entries(&[block("2001:db8::/64"), block("1.2.3.4")], NOW),
+            2
+        );
+    }
+
+    /// On a host without working ip6tables, IPv6 rules cannot be loaded.
+    /// The script has to fail and say so rather than succeed quietly with
+    /// part of the policy missing.
+    #[test]
+    fn ipv6_rules_on_a_host_without_ip6tables_fail_loudly() {
+        let with_v6 = render(&[block("2001:db8::/64")], NOW);
+        assert!(
+            with_v6.contains("1 IPv6 rule(s) were not applied\" >&2\n    exit 1\n"),
+            "rendered was:\n{with_v6}"
+        );
+
+        // With nothing to load there is nothing to report.
+        let without = render(&[block("1.2.3.4")], NOW);
+        assert!(!without.contains("exit 1"), "rendered was:\n{without}");
+    }
+
+    #[test]
+    fn an_expired_rule_is_left_out() {
+        let rules = [
+            block_until("203.0.113.9", NOW - 1),
+            block_until("203.0.113.10", NOW + 60),
+        ];
+        let rendered = render(&rules, NOW);
+
+        assert!(
+            !rendered.contains("203.0.113.9 "),
+            "rendered was:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("-A STOP-BOTS -s 203.0.113.10 -j DROP"),
+            "rendered was:\n{rendered}"
+        );
+        assert_eq!(loaded_entries(&rules, NOW), 1);
+    }
+
+    /// First match wins in a chain, and the order is the order given.
+    #[test]
+    fn rules_keep_their_order() {
+        let rendered = render(&[allow("203.0.113.7"), block("203.0.113.0/24")], NOW);
+        let allow_at = rendered.find("-s 203.0.113.7 -j ACCEPT").unwrap();
+        let block_at = rendered.find("-s 203.0.113.0/24 -j DROP").unwrap();
+        assert!(allow_at < block_at, "rendered was:\n{rendered}");
     }
 
     #[test]
@@ -405,17 +550,16 @@ mod tests {
         .unwrap();
 
         let rules = db.list_firewall_rules().unwrap();
-        let rendered = render(&rules);
+        let rendered = render(&rules, NOW);
         assert!(
             rendered.contains("-A STOP-BOTS -s 203.0.113.7 -p tcp --dport 443 -j DROP"),
             "rendered was:\n{rendered}"
         );
     }
 
-    /// The same rule set as `nftables`' golden, rendered for iptables —
-    /// which silently skips the IPv6 rule (see the module docs). The golden
-    /// is the exact script to hand to `sh -n` / a real `iptables-restore`
-    /// review on a machine that has one.
+    /// The same rule set as `nftables`' golden, rendered for iptables. The
+    /// golden is the exact script to hand to `sh -n` / a real
+    /// `iptables-restore` on a machine that has one.
     #[test]
     fn rendered_script_matches_the_golden() {
         let rules = vec![
@@ -423,16 +567,18 @@ mod tests {
             block("198.51.100.0/24"),
             block_port("192.0.2.9", 22),
             block("2001:db8::/32"),
+            block_until("192.0.2.77", NOW + 90_000),
             disabled("10.0.0.1"),
         ];
-        crate::golden::assert_golden("firewall.iptables.sh", &render(&rules));
+        crate::golden::assert_golden("firewall.iptables.sh", &render(&rules, NOW));
     }
+
     /// The database now refuses such a row, so this can only come from a
     /// database written before that check existed — but the script is
     /// executable input, and the cost of checking again here is nothing.
     #[test]
     fn render_skips_an_address_that_is_not_one_rather_than_emitting_it() {
-        let rendered = render(&[block("1.2.3.4/24; touch /tmp/pwned")]);
+        let rendered = render(&[block("1.2.3.4/24; touch /tmp/pwned")], NOW);
 
         let statements: Vec<&str> = rendered
             .lines()
@@ -450,18 +596,18 @@ mod tests {
 
     /// Validation trims, so an address with whitespace around it is valid
     /// — and must be rendered as what was validated. Untrimmed, a trailing
-    /// newline ended the command early and made `-j DROP` a command of its
-    /// own, which under `set -e` aborts the script partway through.
+    /// newline ended the line early and made `-j DROP` a line of its own,
+    /// which the restore refuses.
     #[test]
     fn an_address_is_rendered_trimmed() {
-        let rendered = render(&[block(" 1.2.3.4\n"), block(" 2001:db8::1 ")]);
+        let rendered = render(&[block(" 1.2.3.4\n"), block(" 2001:db8::1 ")], NOW);
 
         assert!(
-            rendered.contains(&format!("iptables -A {CHAIN} -s 1.2.3.4 -j DROP\n")),
+            rendered.contains(&format!("\n-A {CHAIN} -s 1.2.3.4 -j DROP\n")),
             "rendered was:\n{rendered}"
         );
         assert!(
-            rendered.contains("# skipped (IPv6, not supported by iptables): 2001:db8::1 —"),
+            rendered.contains(&format!("\n-A {CHAIN} -s 2001:db8::1 -j DROP\n")),
             "rendered was:\n{rendered}"
         );
     }
@@ -470,14 +616,16 @@ mod tests {
     /// written as, making the rest of it a statement — so the note escapes.
     #[test]
     fn the_skip_note_cannot_be_escaped_with_a_newline() {
-        let rendered = render(&[block("1.2.3.4\nflush ruleset")]);
+        let rendered = render(&[block("1.2.3.4\nflush ruleset")], NOW);
 
         let statements: Vec<&str> = rendered
             .lines()
             .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
             .collect();
         assert!(
-            !statements.iter().any(|line| line.contains("flush")),
+            // "ruleset", not "flush": the restore's own `--noflush` is a
+            // statement that legitimately says "flush".
+            !statements.iter().any(|line| line.contains("ruleset")),
             "the payload escaped the comment:\n{rendered}"
         );
     }

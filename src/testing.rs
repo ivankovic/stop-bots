@@ -79,6 +79,15 @@ pub(crate) fn block_port(address: &str, port: u16) -> FirewallRule {
     }
 }
 
+/// A Block that lapses at `expires_at` (Unix seconds), the way every
+/// detector writes one.
+pub(crate) fn block_until(address: &str, expires_at: i64) -> FirewallRule {
+    FirewallRule {
+        expires_at: Some(expires_at),
+        ..block(address)
+    }
+}
+
 /// A rule that exists but is switched off — renderers must skip it.
 pub(crate) fn disabled(address: &str) -> FirewallRule {
     FirewallRule {
