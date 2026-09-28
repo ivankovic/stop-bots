@@ -1510,11 +1510,31 @@ impl Db {
     /// same never-fail-a-read-over-a-stored-enum convention the enums here
     /// already use.
     pub fn get_bool_setting(&self, key: &str, default: bool) -> Result<bool> {
+        Ok(self.get_bool_setting_if_set(key)?.unwrap_or(default))
+    }
+
+    /// The same, but `None` rather than a default when nothing usable is
+    /// stored: for a caller whose default depends on more than the key,
+    /// or that needs to know whether anyone has chosen at all.
+    pub fn get_bool_setting_if_set(&self, key: &str) -> Result<Option<bool>> {
         Ok(match self.get_raw_setting(key)?.as_deref() {
-            Some("true") => true,
-            Some("false") => false,
-            _ => default,
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            _ => None,
         })
+    }
+
+    /// The defaults generation this database was created at (see
+    /// [`schema::DEFAULTS_GENERATION`]): what decides whether something
+    /// added in a later release starts on or off here.
+    ///
+    /// A database from before 0.1 has no row. It reads as generation 1,
+    /// which is everything that existed then, so none of it changes.
+    pub fn defaults_generation(&self) -> Result<u32> {
+        Ok(self
+            .get_raw_setting(keys::DEFAULTS_GENERATION)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1))
     }
 
     pub fn set_bool_setting(&self, key: &str, value: bool) -> Result<()> {

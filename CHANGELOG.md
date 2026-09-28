@@ -36,6 +36,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - **The database has a schema version** (`PRAGMA user_version`). Upgrading
   from any 0.0.x first copies the database to `<db>.bak-v0` (mode 0600),
   and a database written by a newer stop-bots is refused rather than misread.
+- **An upgrade never switches a detector on.** A detector added after your
+  database was created starts off there, and the Dashboard's Automatic
+  blocking panel marks it "new" until you switch it either way.
 
 ## [0.0.15] — 2026-09-27
 

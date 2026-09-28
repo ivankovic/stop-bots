@@ -232,6 +232,12 @@ pub struct DetectorSpec {
     pub ttl_days_default: i64,
     /// Whether this reads the SSH log rather than the NGINX access log.
     pub uses_ssh_log: bool,
+    /// The defaults generation this detector arrived in (see
+    /// `db::schema::DEFAULTS_GENERATION`). On a database created in an
+    /// earlier one it is off until the operator turns it on, whatever
+    /// `enabled_default` says: an upgrade never starts blocking by itself.
+    /// Every detector that existed at 0.1 is generation 1.
+    pub introduced_in: u32,
 }
 
 impl Detector {
@@ -259,6 +265,7 @@ impl Detector {
                 enabled_default: true,
                 ttl_days_default: 5,
                 uses_ssh_log: true,
+                introduced_in: 1,
             },
             Detector::WebScanners => DetectorSpec {
                 id: "block_web_scanners",
@@ -267,6 +274,7 @@ impl Detector {
                 enabled_default: true,
                 ttl_days_default: 1,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
             Detector::SpoofedCrawlers => DetectorSpec {
                 id: "block_spoofed_crawlers",
@@ -275,6 +283,7 @@ impl Detector {
                 enabled_default: SPOOFED_CRAWLERS_ENABLED_DEFAULT,
                 ttl_days_default: SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
             Detector::ProbePaths => DetectorSpec {
                 id: "block_probe_paths",
@@ -283,6 +292,7 @@ impl Detector {
                 enabled_default: PROBE_PATHS_ENABLED_DEFAULT,
                 ttl_days_default: PROBE_PATHS_TTL_DAYS_DEFAULT,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
             Detector::Injection => DetectorSpec {
                 id: "block_injection",
@@ -291,6 +301,7 @@ impl Detector {
                 enabled_default: INJECTION_ENABLED_DEFAULT,
                 ttl_days_default: INJECTION_TTL_DAYS_DEFAULT,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
             Detector::RobotsTxt => DetectorSpec {
                 id: "block_robots_txt",
@@ -303,6 +314,7 @@ impl Detector {
                 enabled_default: false,
                 ttl_days_default: 1,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
             Detector::Honeypot => DetectorSpec {
                 id: "block_honeypot",
@@ -311,6 +323,7 @@ impl Detector {
                 enabled_default: HONEYPOT_ENABLED_DEFAULT,
                 ttl_days_default: HONEYPOT_TTL_DAYS_DEFAULT,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
             // The three below are off by default. Each has a false
             // positive it cannot rule out on its own; see the detector
@@ -322,6 +335,7 @@ impl Detector {
                 enabled_default: false,
                 ttl_days_default: 5,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
             Detector::RotatingUserAgent => DetectorSpec {
                 id: "block_rotating_ua",
@@ -330,6 +344,7 @@ impl Detector {
                 enabled_default: false,
                 ttl_days_default: 5,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
             Detector::RefererlessCrawl => DetectorSpec {
                 id: "block_refererless",
@@ -338,6 +353,7 @@ impl Detector {
                 enabled_default: false,
                 ttl_days_default: 5,
                 uses_ssh_log: false,
+                introduced_in: 1,
             },
         }
     }
@@ -368,11 +384,28 @@ impl Detector {
     /// thing, and the two would disagree — which on this detector means
     /// either a day-long block per crawler on a host that never asked for
     /// one, or the mode's sharpest rule quietly not running.
+    ///
+    /// Every other detector answers from its switch, and a detector nobody
+    /// has switched follows [`enabled_by_default`]: its spec's default,
+    /// unless it arrived after this database was created.
     pub fn is_enabled(self, db: &Db) -> Result<bool> {
         if self == Detector::RobotsTxt {
             return db.get_humans_only();
         }
-        db.get_bool_setting(&self.enabled_key(), self.spec().enabled_default)
+        Ok(match db.get_bool_setting_if_set(&self.enabled_key())? {
+            Some(chosen) => chosen,
+            None => enabled_by_default(&self.spec(), db.defaults_generation()?),
+        })
+    }
+
+    /// Whether this detector arrived after the database was created and
+    /// nobody has switched it on or off since: the UIs mark it "new", so an
+    /// operator learns it exists. It is off, by [`enabled_by_default`].
+    /// Choosing either way clears the mark.
+    pub fn is_new_here(self, db: &Db) -> Result<bool> {
+        Ok(self.is_operator_controlled()
+            && self.spec().introduced_in > db.defaults_generation()?
+            && db.get_bool_setting_if_set(&self.enabled_key())?.is_none())
     }
 
     /// Whether the operator can change [`Self::is_enabled`], or whether
@@ -398,6 +431,18 @@ impl Detector {
         }
         db.set_int_setting(&self.ttl_key(), days)
     }
+}
+
+/// Whether a detector nobody has switched on or off runs, on a database
+/// created at defaults generation `created_at`.
+///
+/// This is the whole upgrade policy for detectors. Before 0.1 a detector
+/// ran whenever its spec said so, which is how 0.0.15 turned its injection
+/// detector on for every existing install. Now a detector newer than the
+/// database is off until someone turns it on; the ones that were already
+/// there keep the defaults they always had.
+pub fn enabled_by_default(spec: &DetectorSpec, created_at: u32) -> bool {
+    spec.enabled_default && spec.introduced_in <= created_at
 }
 
 /// `settings` key: whether a detector that flags several addresses in one
@@ -578,6 +623,150 @@ mod tests {
         for d in Detector::ALL {
             assert_eq!(d.is_enabled(&db).unwrap(), d.spec().enabled_default);
             assert_eq!(d.ttl_days(&db).unwrap(), d.spec().ttl_days_default);
+        }
+    }
+
+    // ---- the defaults policy across upgrades ----
+
+    fn spec(enabled_default: bool, introduced_in: u32) -> DetectorSpec {
+        DetectorSpec {
+            enabled_default,
+            introduced_in,
+            ..Detector::ProbePaths.spec()
+        }
+    }
+
+    /// The whole policy, pinned: only a detector at least as old as the
+    /// database gets its spec's default; one that arrived later is off.
+    #[test]
+    fn a_detector_newer_than_the_database_is_off_until_chosen() {
+        let cases = [
+            (
+                "on by default, as old as the database",
+                spec(true, 1),
+                1,
+                true,
+            ),
+            (
+                "on by default, older than the database",
+                spec(true, 1),
+                2,
+                true,
+            ),
+            (
+                "on by default, newer than the database",
+                spec(true, 2),
+                1,
+                false,
+            ),
+            (
+                "off by default, as old as the database",
+                spec(false, 1),
+                1,
+                false,
+            ),
+            (
+                "off by default, newer than the database",
+                spec(false, 2),
+                1,
+                false,
+            ),
+        ];
+        for (what, spec, created_at, expected) in cases {
+            assert_eq!(enabled_by_default(&spec, created_at), expected, "{what}");
+        }
+    }
+
+    /// A choice the operator made is theirs, whichever generation.
+    #[test]
+    fn a_switched_detector_follows_its_switch_on_any_database() {
+        let db = Db::open_in_memory().unwrap();
+        // Older than every detector there is: all of them are "new" here.
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 0)
+            .unwrap();
+
+        Detector::ProbePaths.set_enabled(&db, true).unwrap();
+        Detector::Honeypot.set_enabled(&db, false).unwrap();
+
+        assert!(Detector::ProbePaths.is_enabled(&db).unwrap());
+        assert!(!Detector::Honeypot.is_enabled(&db).unwrap());
+    }
+
+    /// Through a real database: every detector that would be on by
+    /// default reads off on a database older than it, and is marked new
+    /// until someone chooses, either way.
+    #[test]
+    fn on_an_older_database_new_detectors_read_off_and_new_until_chosen() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 0)
+            .unwrap();
+
+        for d in Detector::ALL
+            .into_iter()
+            .filter(|d| d.is_operator_controlled())
+        {
+            assert!(!d.is_enabled(&db).unwrap(), "{} ran on its own", d.id());
+            assert!(d.is_new_here(&db).unwrap(), "{} is not marked new", d.id());
+        }
+
+        Detector::Injection.set_enabled(&db, true).unwrap();
+        Detector::ProbePaths.set_enabled(&db, false).unwrap();
+        assert!(!Detector::Injection.is_new_here(&db).unwrap(), "turned on");
+        assert!(
+            !Detector::ProbePaths.is_new_here(&db).unwrap(),
+            "turned off"
+        );
+    }
+
+    /// Nothing is new on a database created by this very release.
+    #[test]
+    fn nothing_is_new_on_a_new_database() {
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(
+            db.defaults_generation().unwrap(),
+            crate::db::schema::DEFAULTS_GENERATION
+        );
+        for d in Detector::ALL {
+            assert!(!d.is_new_here(&db).unwrap(), "{}", d.id());
+        }
+    }
+
+    /// Every detector that existed before the policy did is generation 1,
+    /// so no upgrade from 0.0.x changes what runs. A detector added from
+    /// now on is not in this list, and must carry a later generation — and
+    /// that generation must be one this binary knows, or it would never be
+    /// on anywhere.
+    #[test]
+    fn only_the_detectors_from_before_0_1_are_generation_1() {
+        let before_0_1 = [
+            "block_scanners",
+            "block_web_scanners",
+            "block_spoofed_crawlers",
+            "block_probe_paths",
+            "block_injection",
+            "block_honeypot",
+            "block_asset_ratio",
+            "block_rotating_ua",
+            "block_refererless",
+            "block_robots_txt",
+        ];
+        for d in Detector::ALL {
+            let spec = d.spec();
+            if before_0_1.contains(&spec.id) {
+                assert_eq!(spec.introduced_in, 1, "{}", spec.id);
+            } else {
+                assert!(
+                    spec.introduced_in > 1,
+                    "{} is new since 0.1: give it `introduced_in` a new generation",
+                    spec.id
+                );
+            }
+            assert!(
+                spec.introduced_in <= crate::db::schema::DEFAULTS_GENERATION,
+                "{}: bump DEFAULTS_GENERATION to {}",
+                spec.id,
+                spec.introduced_in
+            );
         }
     }
 

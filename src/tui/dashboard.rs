@@ -269,6 +269,10 @@ pub struct Dashboard {
     /// A map rather than a struct of named fields, so a new detector is a
     /// row in `Detector::ALL` and nothing here.
     detectors: std::collections::HashMap<Detector, (bool, i64)>,
+    /// Detectors that arrived after this database was created and that
+    /// nobody has switched yet: off, and marked "new" so the operator
+    /// learns they exist. See `Detector::is_new_here`.
+    new_detectors: std::collections::HashSet<Detector>,
     /// Every third-party CIDR feed, ordered by id — the order
     /// `ProtectionRow::Feed`'s index refers to.
     reputation: Vec<crate::db::ReputationSource>,
@@ -324,6 +328,10 @@ impl Dashboard {
         self.detectors = Detector::ALL
             .into_iter()
             .map(|d| Ok((d, (d.is_enabled(db)?, d.ttl_days(db)?))))
+            .collect::<Result<_>>()?;
+        self.new_detectors = Detector::ALL
+            .into_iter()
+            .filter_map(|d| d.is_new_here(db).map(|new| new.then_some(d)).transpose())
             .collect::<Result<_>>()?;
         self.reputation = db.list_reputation_sources()?;
         self.auto_apply_firewall = db.get_auto_apply_firewall()?;
@@ -835,6 +843,9 @@ impl Dashboard {
             // tag already carries it.
             ProtectionRow::AutoApplyFirewall => String::new(),
             _ if self.protection_enabled(row) => format!(" {}d", self.protection_ttl_days(row)),
+            ProtectionRow::Detect(detector) if self.new_detectors.contains(&detector) => {
+                " new".to_string()
+            }
             _ => String::new(),
         }
     }
@@ -859,7 +870,14 @@ impl Dashboard {
                 label_width = label_width
             )),
             tag,
-            Span::from(self.protection_detail(row)),
+            // "new" is the one detail worth catching the eye: something an
+            // upgrade added and left off, which nobody has looked at yet.
+            match row {
+                ProtectionRow::Detect(detector) if self.new_detectors.contains(&detector) => {
+                    Span::from(self.protection_detail(row)).yellow()
+                }
+                _ => Span::from(self.protection_detail(row)),
+            },
         ])
     }
 
@@ -3501,6 +3519,50 @@ mod tests {
             Detector::SpoofedCrawlers.is_enabled(&db).unwrap(),
             "the other detector must be untouched"
         );
+    }
+
+    fn detector_row_text(dashboard: &Dashboard, detector: Detector) -> String {
+        dashboard
+            .protection_row_line(ProtectionRow::Detect(detector), 20)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// A detector an upgrade added stays off on an existing database, and
+    /// the panel says why it is there: "new", until the operator chooses.
+    #[test]
+    fn a_detector_added_since_the_database_was_created_is_marked_new_and_off() {
+        let db = Db::open_in_memory().unwrap();
+        // Older than every detector, so each one is new here.
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 0)
+            .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let text = detector_row_text(&dashboard, Detector::Injection);
+        assert!(text.ends_with("[ OFF ] new"), "row was: {text:?}");
+
+        Detector::Injection.set_enabled(&db, false).unwrap();
+        dashboard.refresh(&db).unwrap();
+        let text = detector_row_text(&dashboard, Detector::Injection);
+        assert!(
+            text.ends_with("[ OFF ]"),
+            "chosen, so no longer new: {text:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_marked_new_on_a_database_this_release_created() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        for detector in Detector::ALL {
+            let text = detector_row_text(&dashboard, detector);
+            assert!(!text.contains("new"), "row was: {text:?}");
+        }
     }
 
     // ---- reputation / provider feed rows ----

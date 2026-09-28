@@ -54,7 +54,7 @@ struct View {
     geo_mode: GeoMode,
     selected_countries: Vec<String>,
     fetched_countries: Vec<(String, i64, i64)>,
-    detectors: Vec<(Detector, bool, i64)>,
+    detectors: Vec<DetectorRow>,
     feeds: Vec<crate::db::ReputationSource>,
     site_count: usize,
     sources_total: usize,
@@ -126,7 +126,14 @@ fn load(
         fetched_countries: db.list_fetched_countries()?,
         detectors: Detector::ALL
             .into_iter()
-            .map(|d| Ok((d, d.is_enabled(db)?, d.ttl_days(db)?)))
+            .map(|detector| {
+                Ok(DetectorRow {
+                    detector,
+                    enabled: detector.is_enabled(db)?,
+                    ttl_days: detector.ttl_days(db)?,
+                    new: detector.is_new_here(db)?,
+                })
+            })
             .collect::<anyhow::Result<_>>()?,
         feeds: db.list_reputation_sources()?,
         site_count: db.list_sites()?.len(),
@@ -519,6 +526,17 @@ fn geo_panel(view: &View, ctx: &Ctx) -> Markup {
 
 // ---- detectors ----
 
+/// One row of the Automatic blocking panel.
+struct DetectorRow {
+    detector: Detector,
+    enabled: bool,
+    ttl_days: i64,
+    /// Added since this database was created and not yet switched either
+    /// way: off, and marked so the operator learns it exists. See
+    /// `Detector::is_new_here`.
+    new: bool,
+}
+
 fn detectors_panel(view: &View, ctx: &Ctx) -> Markup {
     layout::panel(
         "Automatic blocking",
@@ -533,7 +551,7 @@ fn detectors_panel(view: &View, ctx: &Ctx) -> Markup {
                     th .right { "Action" }
                 } }
                 tbody {
-                    @for (detector, enabled, ttl_days) in &view.detectors {
+                    @for DetectorRow { detector, enabled, ttl_days, new } in &view.detectors {
                         tr {
                             td {
                                 (detector.spec().label)
@@ -546,6 +564,12 @@ fn detectors_panel(view: &View, ctx: &Ctx) -> Markup {
                                     (layout::pill("ON", PillKind::Allowed))
                                 } @else {
                                     (layout::pill("OFF", PillKind::Neutral))
+                                }
+                                @if *new {
+                                    " "
+                                    span title="Added by an upgrade. Off until you turn it on" {
+                                        (layout::pill("NEW", PillKind::Warn))
+                                    }
                                 }
                             }
                             td .num { (ttl_days) "d" }
@@ -1696,6 +1720,41 @@ mod tests {
             rendered.contains("use a subdomain"),
             "rendered was:\n{rendered}"
         );
+    }
+
+    /// The web twin of the TUI's "new" mark: a detector an upgrade added
+    /// shows OFF and NEW until the operator switches it either way.
+    #[test]
+    fn a_detector_added_since_the_database_was_created_shows_off_and_new() {
+        let db = Db::open_in_memory().unwrap();
+        let panel = |db: &Db| {
+            let view = load(db, None, &crate::web::BasePath::default()).unwrap();
+            detectors_panel(&view, &Ctx::for_tests()).into_string()
+        };
+        assert!(
+            !panel(&db).contains(">NEW<"),
+            "nothing is new on a new database"
+        );
+
+        // Older than every detector, so each one is new here.
+        db.set_int_setting(crate::db::keys::DEFAULTS_GENERATION, 0)
+            .unwrap();
+        let rendered = panel(&db);
+        assert!(!rendered.contains(">ON<"), "rendered was:\n{rendered}");
+        let operator_controlled = Detector::ALL
+            .iter()
+            .filter(|d| d.is_operator_controlled())
+            .count();
+        assert_eq!(
+            rendered.matches(">NEW<").count(),
+            operator_controlled,
+            "rendered was:\n{rendered}"
+        );
+
+        for d in Detector::ALL {
+            d.set_enabled(&db, false).unwrap();
+        }
+        assert!(!panel(&db).contains(">NEW<"), "every one has been chosen");
     }
 
     #[test]

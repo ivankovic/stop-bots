@@ -39,6 +39,12 @@
 //! `NginxCommands::TEST_KEY`) so their call sites read in their own terms.
 //! Those names are aliases of these constants, never a second spelling.
 
+// ---- the database itself ----
+
+/// The defaults generation the database was created at. Written once, by
+/// [`super::schema`], when it creates a database.
+pub const DEFAULTS_GENERATION: &str = "db:defaults_generation";
+
 // ---- bot blocking policy ----
 
 /// Stored `Policy` for bots flagged as scanners, seeded by the schema.
@@ -116,6 +122,7 @@ pub const HEALTH_PROBE_AT: &str = "health:probe_at";
 /// Every fixed key above. The tests check that each constant in this file
 /// is listed, and that none collide.
 pub const ALL: &[&str] = &[
+    DEFAULTS_GENERATION,
     DEFAULT_STATUS_SCANNER,
     DEFAULT_STATUS_SEARCH,
     DEFAULT_STATUS_AI,

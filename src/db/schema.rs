@@ -51,6 +51,23 @@ use super::{keys, Category, GeoMode, Policy};
 /// build's tests rather than a user's upgrade.
 pub const CURRENT_VERSION: u32 = 1;
 
+/// The generation of defaults this binary creates a database with.
+///
+/// A default is what a setting reads as when no row holds it. Before 0.1
+/// a new detector's default applied to every database, old or new, which
+/// is how 0.0.15's injection detector switched itself on across every
+/// existing install. Now a database remembers the generation it was
+/// created at (`keys::DEFAULTS_GENERATION`, written once, when [`migrate`]
+/// creates it; see `Db::defaults_generation`), and anything introduced in
+/// a later generation stays off there until the operator chooses. The
+/// policy itself is `protection::Detector::is_enabled`.
+///
+/// **Bump this** when adding something that acts by default, such as a
+/// detector that is on by default, and mark it `introduced_in` the new
+/// number. It is separate from [`CURRENT_VERSION`]: a new default needs no
+/// schema change, and a schema change brings no new default.
+pub const DEFAULTS_GENERATION: u32 = 1;
+
 /// One step from version `n - 1` to version `n`, where `n` is its position
 /// in [`MIGRATIONS`] counting from one.
 pub struct Migration {
@@ -143,6 +160,15 @@ pub(super) fn migrate(conn: &Connection, path: Option<&Path>) -> Result<()> {
             })?;
         }
         conn.pragma_update(None, "user_version", CURRENT_VERSION)?;
+        // Only a database made just now gets today's defaults. One that
+        // existed keeps the generation it had: none, before 0.1, which
+        // `Db::defaults_generation` reads as 1.
+        if fresh {
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+                params![keys::DEFAULTS_GENERATION, DEFAULTS_GENERATION.to_string()],
+            )?;
+        }
         Ok(())
     })();
     match result {
@@ -1056,6 +1082,52 @@ mod tests {
                 "{release}"
             );
         }
+    }
+
+    /// A 0.0.x database is defaults generation 1, the generation of every
+    /// detector that existed then: nothing that ran before an upgrade
+    /// stops, nothing new starts, and nothing is marked new.
+    #[test]
+    fn upgrading_changes_no_detector_s_default() {
+        use crate::protection::Detector;
+        for (release, fixture) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
+            let (_dir, _path, db) = upgraded(fixture);
+            assert_eq!(db.defaults_generation().unwrap(), 1, "{release}");
+            // The fixtures switch web scanners and asset ratio by hand.
+            for d in Detector::ALL.into_iter().filter(|d| {
+                d.is_operator_controlled()
+                    && ![Detector::WebScanners, Detector::AssetRatio].contains(d)
+            }) {
+                assert_eq!(
+                    d.is_enabled(&db).unwrap(),
+                    d.spec().enabled_default,
+                    "{release}: {}",
+                    d.id()
+                );
+                assert!(!d.is_new_here(&db).unwrap(), "{release}: {}", d.id());
+            }
+        }
+    }
+
+    /// The generation is the one the database was *created* at: written
+    /// with the schema, never by an upgrade.
+    #[test]
+    fn only_a_new_database_records_the_current_defaults_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        let fresh = Db::open(&path).unwrap();
+        assert_eq!(
+            fresh.get_text_setting(keys::DEFAULTS_GENERATION).unwrap(),
+            Some(DEFAULTS_GENERATION.to_string())
+        );
+
+        let (_dir, _path, upgraded) = upgraded(DB_0_0_15);
+        assert_eq!(
+            upgraded
+                .get_text_setting(keys::DEFAULTS_GENERATION)
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
