@@ -719,6 +719,12 @@ fn firewall_panel(view: &View, ctx: &Ctx) -> Markup {
                     " runs: rules that would block a currently-connected SSH client are "
                     "refused rather than written."
                 }
+                p .hint {
+                    "nftables is recommended: addresses go in sets, and a timed block is "
+                    "removed by the kernel when it expires. iptables loads IPv4 and IPv6 "
+                    "(through ip6tables) one rule per address, keeps a timed block until the "
+                    "script is run again, and cannot do allowlist geo mode."
+                }
 
             }
         },
