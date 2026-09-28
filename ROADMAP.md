@@ -101,7 +101,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 - [ ] **The journald fallback reads the whole sshd journal** each minute, on every Firewall
   page view and in every lockout check (`sshlog.rs:84`, *verified*). This is the default
   path on Debian 12+ and Fedora. Use `--since` plus a stored cursor. **S**
-- [ ] **nftables sets instead of one rule per address.** www's table is 44,547 lines with
+- [x] **nftables sets instead of one rule per address.** www's table is 44,547 lines with
   no sets *(verified)*, so every new connection walks a linear chain. Use named interval
   sets per family and verdict. As a bonus, per-element `timeout` makes expiry happen in the
   kernel, which fixes the next item on the nft side. **M**
@@ -114,7 +114,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   - The minimum is to parse the timestamp both log formats already carry and give each
     detector a window. The README's "expires on its own and is re-added if the behaviour
     continues" is not true today. **M–L**
-- [ ] **iptables: be honest about scale.** One `iptables -A` process per rule after a
+- [x] **iptables: be honest about scale.** One `iptables -A` process per rule after a
   flush, with no `-w`, so the chain sits empty while tens of thousands of processes run.
   IPv6 is silently skipped, including every `/64` a detector writes. For 0.1, either
   switch to `iptables-restore --noflush` for the one chain, or refuse feeds and geo
@@ -122,7 +122,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 
 ### B. Upgrades don't break you
 
-- [ ] **Schema versioning.**
+- [x] **Schema versioning.**
   - Use `PRAGMA user_version` with an ordered list of migrations. Today's schema, plus the
     two ad-hoc fixes in `init_schema`, is version 1.
   - Copy the database before migrating.
@@ -138,15 +138,15 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 - [ ] **Generated files carry the generator version** in their header, never in the
   markers. **Freeze the marker strings.** Record what was written (in the database or a
   manifest) and clean up from that record, not from a hard-coded list of names. **S**
-- [ ] **A defaults policy for upgrades.** v0.0.15 turned a new detector on for every
+- [x] **A defaults policy for upgrades.** v0.0.15 turned a new detector on for every
   existing install. From 0.1, something new that blocks arrives off on an existing
   database, or at least lands in a "new since your last version" notice. **S**
-- [ ] **One registry of settings keys.** About forty keys in three naming styles across
+- [x] **One registry of settings keys.** About forty keys in three naming styles across
   nine modules. A rename silently orphans the old value. **S**
 
 ### C. Surfaces that tell the truth
 
-- [ ] **Fix `--help`** *(verified)*. Doc comments are attached to the wrong variants:
+- [x] **Fix `--help`** *(verified)*. Doc comments are attached to the wrong variants:
   - `web --help` says "Set what NGINX sends a blocked request";
   - `set-log-paths` shows the `set-nginx-commands` text;
   - `set-nginx-commands` has no description at all;
@@ -154,12 +154,12 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   - `batch` starts mid-sentence.
 
   Add a test that every subcommand's description is non-empty and unique. **S**
-- [ ] **Declare the contract.**
+- [x] **Declare the contract.**
   - Put the library behind `#[doc(hidden)]` or a `pub mod internal`.
   - Say in the README and the crate docs that there is no supported Rust API.
   - Update `RELEASING.md` and `SECURITY.md` (the supported-versions table becomes "latest
     0.1.x"). **S**
-- [ ] **CLI conventions, decided once.**
+- [x] **CLI conventions, decided once.**
   - Booleans come in three forms today (`--enabled true`, `Option<bool>`, presence flags).
   - Settings persist two ways (`set-*` verbs vs `web --save`).
   - `--db` is repeated on every subcommand instead of being global, and there is no
@@ -168,7 +168,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
     to `.nft` even for iptables (`main.rs:237`, *verified*).
 
   Rename freely now, with hidden aliases for one release. **M**
-- [ ] **CLI verbs for what only the UIs can do.**
+- [x] **CLI verbs for what only the UIs can do.**
   - detector on/off, TTL and thresholds;
   - category defaults and per-bot status;
   - enabling and disabling a firewall rule;
@@ -213,12 +213,12 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 
 ### E. Release engineering
 
-- [ ] Gate `release.yml` on the test job, and run the tests on `ubuntu-24.04-arm`: the
+- [x] Gate `release.yml` on the test job, and run the tests on `ubuntu-24.04-arm`: the
   aarch64 binary is shipped but only `--version` is ever run. **S**
-- [ ] Merge dependabot #8 and #9. **S**
-- [ ] AUR and Gentoo are seven releases behind (0.0.8). Script the version bump, or mark
+- [x] Merge dependabot #8 and #9. **S**
+- [x] AUR and Gentoo are seven releases behind (0.0.8). Script the version bump, or mark
   them unmaintained in `packaging/README.md`. **S**
-- [ ] Housekeeping:
+- [x] Housekeeping:
   - `REVIEW.md` has an empty Pending section, 29 finished items and nine references to the
     deleted SPECS.md.
   - `TODO.md` quotes old line counts.
