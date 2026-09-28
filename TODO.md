@@ -115,15 +115,16 @@ and which are not.
 Recorded so the decision is made on evidence rather than on how the code felt
 that day.
 
-* **`db.rs` is ~2,400 lines of code across fourteen concerns**, already marked
+* **`db.rs` is ~3,500 lines before its tests (~5,900 with them), across
+  seventeen concerns**, already marked
   out by `// ---- section ----` banners — which is also exactly where a `db/`
   split would fall, one file per banner. Not done, and the reason is worth
   keeping: `Db` is one struct wrapping one connection, so the mechanical version
-  spreads `impl Db` blocks across files and moves 2,400 lines without making any
+  spreads `impl Db` blocks across files and moves 3,500 lines without making any
   one of them easier to read. The banners already provide the navigation a split
   would. The version that would genuinely help — decomposing into per-concern
   types — is a design exercise, not a tidy-up.
-* **`main.rs` is ~1,800 lines**, most of it the `Commands` enum and its help
-  text. Lifting the enum into its own module is self-contained and would halve
-  the file. Smaller and safer than the `db.rs` split, if file size is what
+* **`main.rs` is ~3,400 lines before its tests**, about 1,100 of them the
+  `Command` enum and its help text. Lifting the enum into its own module is
+  self-contained and would take a third off the file. Smaller and safer than the `db.rs` split, if file size is what
   bothers you.

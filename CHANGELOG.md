@@ -21,6 +21,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - **AUR and Gentoo packages at 0.0.15**, seven releases on from 0.0.8.
   `stop-bots-bin` now also installs on `aarch64`. `packaging/bump.py <version>`
   does this after each release from the published checksums.
+- Housekeeping: `REVIEW.md` holds open items only, and `CONTRIBUTING.md` lists
+  every module and quotes one coverage figure, measured.
 
 ## [0.0.15] — 2026-09-27
 

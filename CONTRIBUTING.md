@@ -100,20 +100,21 @@ it just doesn't report per-test time.
 
 ### Coverage
 
-92.8% of lines, measured with `cargo llvm-cov --summary-only --workspace`. That figure
-*understates* it: the container suite (`make integration-test`) runs a binary inside Docker,
-so its coverage never comes back.
+92.5% of lines (33,814 lines, 2,522 not covered), measured on 2026-09-28 at `0.0.15`
+with `cargo llvm-cov --summary-only --workspace`. This is the one place that figure is
+quoted; the comment on the `coverage` job in `ci.yml` points here. It *understates*
+coverage: the container suite (`make integration-test`) runs a binary inside Docker, so
+its coverage never comes back.
 
 It is a check, not a boast — but the check and the achieved figure are deliberately two
 different numbers. CI runs the same command with `--fail-under-lines 90`, and the badge
 at the top of the README claims that **floor**, not this snapshot.
 
-A floor set at today's figure would be a trap rather than a check. 92.8% of ~19,000 lines
-leaves only a few hundred uncovered lines of headroom — one ordinary function landing slightly
-under-tested turns CI red on an unrelated pull request, and the quickest fix at that point
-is to edit the floor down, which is exactly the rot the floor exists to prevent. 90% is
-low enough to survive normal development and high enough that a real collapse is a red
-build.
+A floor set at today's figure would be a trap rather than a check: with no headroom, one
+ordinary function landing slightly under-tested turns CI red on an unrelated pull
+request, and the quickest fix at that point is to edit the floor down, which is exactly
+the rot the floor exists to prevent. 90% is low enough to survive normal development
+(about 850 lines of headroom today) and high enough that a real collapse is a red build.
 
 Raising the floor as the achieved figure rises is welcome. It just has to move together
 with the badge in `README.md` and this paragraph.
@@ -265,19 +266,30 @@ Some directories don't exist yet but should be created if the need arises.
 <root of the repository>
     |- /src               <- The implementation
         |- main.rs        <- CLI entry point (clap subcommands) and their handlers
+        |- lib.rs         <- Every module below, for main.rs and tests/; not a supported API
         |- app.rs         <- The TUI app controller, responds to events and controls the UI
         |- event.rs       <- Terminal event plumbing (ticks, key events, app events)
         |- tui.rs         <- Outer TUI chrome (tab bar, footer) and screen dispatch
         |- tui/           <- One file per TUI screen (Dashboard, Bot settings, Firewall, ...)
         |- db.rs          <- SQLite storage: bots, sites, firewall rules, settings, ...
         |- botlist/       <- One file per bot-list source parser
+        |- fetch.rs       <- The one place an outbound HTTP request is made
+        |- refresh.rs     <- "Update everything": every downloadable list as fetch-then-store
         |- nginx.rs       <- NGINX site discovery, config injection and generated files
+        |- webaccess.rs   <- Putting the web console behind NGINX, for both front-ends
+        |- logpaths.rs    <- Where this host's SSH and access logs are, remembered
         |- sshlog.rs      <- SSH log parsing and scan detection
-        |- accesslog.rs   <- NGINX access log parsing, all four detectors, UA tallying
+        |- accesslog.rs   <- NGINX access log parsing, the web-log detectors, UA tallying
+        |- injection.rs   <- Recognising an exploit payload in a logged request
         |- accessstats.rs <- Shared CLI+cron logic for recording access-log UA stats
         |- scanblock.rs   <- Shared CLI+cron logic for every detector's detect-and-block pass
         |- protection.rs  <- The detectors' on/off switches, their defaults, and why
         |- ipranges/      <- Crawler, country and third-party IP-range fetching/storage
+        |- ipdetail.rs    <- Everything already known about one address (Firewall detail view)
+        |- uadetail.rs    <- The same for one user agent string
+        |- health.rs      <- Is this host actually protected? The checks behind `status`
+        |- host.rs        <- The host name, and where the system programs this runs are
+        |- install.rs     <- `stop-bots install`: the systemd units and directories
         |- batch.rs       <- Batch mode: one unattended pass, for a real crontab
         |- cron.rs        <- The internal cron: which background jobs run how often
         |- dynamic.rs     <- What is hitting the server now, shared by the TUI and web screens
@@ -286,10 +298,17 @@ Some directories don't exist yet but should be created if the need arises.
         |- firewall.rs    <- Shared firewall-rendering logic (lockout safety, script writing)
         |- iptables.rs    <- iptables script generation
         |- nftables.rs    <- nftables script generation
+        |- golden.rs      <- Golden-file comparison for generated output (tests only)
+        |- testing.rs     <- Shared unit-test fixtures (tests only)
     |- /tests           <- Integration and end-to-end automated tests
+    |- /examples        <- screenshots.rs, which generates docs/screenshots/
+    |- /packaging       <- APT landing page, AUR PKGBUILDs, Gentoo ebuild, bump.py
+    |- /scripts         <- build-apt-repo.sh (the APT repository) and deploy-remote.sh
     |- README.md        <- What the tool is and how to use it. High level only
     |- CONTRIBUTING.md  <- This file. How the code is built, tested and laid out
-    |- RELEASING.md     <- The release process, and why it is split the way it is
+    |- RELEASING.md     <- The release process, versioning, and what counts as breaking
+    |- SECURITY.md      <- Supported versions and how to report a vulnerability
+    |- ROADMAP.md       <- What 0.1 and 1.0 mean, and what stands between here and there
     |- CHANGELOG.md     <- What changed, per release
     |- AGENTS.md        <- AI-only instructions
     |- REVIEW.md        <- Comments about the codebase that need to be improved uppon
