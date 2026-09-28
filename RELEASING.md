@@ -200,7 +200,8 @@ shipped with it. Step 2 is cheap to run and the only thing that catches that.
    git push origin v0.0.1
    ```
 
-   This builds `x86_64` and `aarch64` Linux binaries — statically linked against musl,
+   This runs the test suite on `x86_64` and `aarch64` runners, and only if both pass
+   builds `x86_64` and `aarch64` Linux binaries — statically linked against musl,
    so one package serves every distribution — creates the GitHub release with a tarball,
    a `.deb` and a SHA-256 for each, and then republishes the APT repository with both
    `.deb`s added. Releases with a `v0.0.` prefix are marked pre-release automatically.

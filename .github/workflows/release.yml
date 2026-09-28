@@ -1,7 +1,7 @@
 name: Release
 
-# Tag-driven: pushing `v0.0.1` builds the binaries, creates the matching
-# GitHub release, and republishes the APT repository on GitHub Pages.
+# Tag-driven: pushing `v0.0.1` runs the tests, builds the binaries, creates the
+# matching GitHub release, and republishes the APT repository on GitHub Pages.
 #
 # This workflow deliberately does NOT run `cargo publish`. A tag can be deleted
 # and re-pushed; a crates.io version cannot — it can only be yanked, and
@@ -37,8 +37,18 @@ jobs:
           fi
           echo "Version $manifest matches tag $GITHUB_REF_NAME."
 
+  # The same tests CI runs, on both architectures this workflow ships. A tag
+  # is normally pushed after CI went green on main (RELEASING.md step 4), but
+  # nothing enforces that order, and a release is the one build that must not
+  # start from an untested tree. Reused from test.yml rather than copied, so
+  # the gate cannot drift from what CI checks.
+  test:
+    uses: ./.github/workflows/test.yml
+    with:
+      runners: '["ubuntu-latest", "ubuntu-24.04-arm"]'
+
   build:
-    needs: verify-version
+    needs: [verify-version, test]
     runs-on: ${{ matrix.runner }}
     strategy:
       # Both artifacts are wanted, and one architecture failing should still

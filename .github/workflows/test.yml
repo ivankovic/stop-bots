@@ -1,0 +1,64 @@
+name: Test
+
+# The test job, on its own so that two workflows can run the same steps:
+# `ci.yml` on every push and pull request, and `release.yml` before it builds
+# anything from a tag. A copy in each would drift, and the copy that drifted
+# would be the one guarding the release.
+#
+# `runners` is a JSON list, so each caller decides what the architectures
+# cost it. The aarch64 binary is shipped, so its tests have to run somewhere
+# before it is; they do not have to run on every pull request.
+on:
+  workflow_call:
+    inputs:
+      runners:
+        description: JSON list of runner labels to test on
+        type: string
+        default: '["ubuntu-latest"]'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      # One architecture failing should still let the other report, so a
+      # red run says which of the two it is.
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(inputs.runners) }}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --check
+
+      # `-D warnings` goes on the clippy invocation rather than in a global
+      # RUSTFLAGS: RUSTFLAGS reaches dependency compilation too, so a new
+      # compiler lint firing inside some crate we merely depend on would fail
+      # this job for something nobody here can fix.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # nextest rather than plain `cargo test`, for one reason: it reports
+      # per-test wall time and flags any test that exceeds the budgets in
+      # .config/nextest.toml (300ms per unit test, 1s per e2e test) as
+      # SLOW — which is what keeps those budgets a practice instead of a
+      # sentence in the README. Runaway tests are killed at a generous
+      # multiple of the budget, so a hang fails the build rather than
+      # stalling it.
+      - name: Test
+        run: cargo nextest run

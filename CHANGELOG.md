@@ -5,6 +5,14 @@ caveat that `0.0.x` means cargo treats *every* release as potentially breaking â
 the intent while the library API in `src/lib.rs` is still whatever the binary happened to
 need.
 
+## [Unreleased]
+
+### Changed
+
+- **A release is built only after the tests pass**, on both `x86_64` and
+  `aarch64`. The `aarch64` tests also run on every push to `main`; before,
+  that binary was shipped having only ever run `--version`.
+
 ## [0.0.15] â€” 2026-09-27
 
 ### Added

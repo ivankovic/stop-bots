@@ -15,42 +15,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The steps live in test.yml, which release.yml runs too before it builds
+  # anything from a tag.
+  #
+  # aarch64 on pushes to main only, not on pull requests or the weekly run.
+  # Its binary is shipped, so its tests have to pass before a release, and a
+  # push to main is what every release is cut from (RELEASING.md step 4); a
+  # pull request that breaks only aarch64 is rare enough to find there.
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Format
-        run: cargo fmt --check
-
-      # `-D warnings` goes on the clippy invocation rather than in a global
-      # RUSTFLAGS: RUSTFLAGS reaches dependency compilation too, so a new
-      # compiler lint firing inside some crate we merely depend on would fail
-      # this job for something nobody here can fix.
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Install nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
-      # nextest rather than plain `cargo test`, for one reason: it reports
-      # per-test wall time and flags any test that exceeds the budgets in
-      # .config/nextest.toml (300ms per unit test, 1s per e2e test) as
-      # SLOW — which is what keeps those budgets a practice instead of a
-      # sentence in the README. Runaway tests are killed at a generous
-      # multiple of the budget, so a hang fails the build rather than
-      # stalling it.
-      - name: Test
-        run: cargo nextest run
+    uses: ./.github/workflows/test.yml
+    with:
+      runners: >-
+        ${{ github.event_name == 'push'
+        && '["ubuntu-latest", "ubuntu-24.04-arm"]'
+        || '["ubuntu-latest"]' }}
 
   # This project is security software, so learning about an advisory in its
   # own dependency tree from someone else's bug report is not acceptable.
