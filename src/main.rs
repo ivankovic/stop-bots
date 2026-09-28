@@ -310,11 +310,13 @@ enum Command {
     /// temporary block for each. Never blocks an address that also has a
     /// successful login in the same log, or a loopback or private one.
     ///
-    /// A stored block has no effect until the firewall script is rendered
-    /// and applied (`render-firewall`, then run the script; or `batch
-    /// --apply`), so this is safe to run unattended. An expired block is
-    /// dropped from the database the next time the rules are read; the
-    /// kernel keeps enforcing it until the script is applied again.
+    /// A stored block has no effect until the firewall script is applied
+    /// (`render-firewall --apply`, `batch --apply`, or "Apply everything"),
+    /// so this is safe to run unattended. Once applied, a block lasts its
+    /// TTL: on nftables the kernel removes it when it runs out, with no
+    /// re-apply; on iptables it stays loaded until the script is applied
+    /// again. Either way the database drops it the next time the rules are
+    /// read.
     ///
     /// The internal cron runs the same detector with the stored settings;
     /// change those with `set-detector ssh-scanners`.
