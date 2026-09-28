@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod keys;
 pub mod schema;
 
 /// Whether a category or bot should be allowed through or blocked at the NGINX layer.
@@ -90,9 +91,9 @@ pub enum Category {
 impl Category {
     fn settings_key(self) -> &'static str {
         match self {
-            Category::Scanner => "default_status_scanner",
-            Category::Search => "default_status_search",
-            Category::Ai => "default_status_ai",
+            Category::Scanner => keys::DEFAULT_STATUS_SCANNER,
+            Category::Search => keys::DEFAULT_STATUS_SEARCH,
+            Category::Ai => keys::DEFAULT_STATUS_AI,
         }
     }
 
@@ -1005,7 +1006,7 @@ fn make_private(path: &Path) -> std::io::Result<()> {
 }
 
 /// `settings` key for [`Db::get_humans_only`].
-pub const HUMANS_ONLY_KEY: &str = "humans_only";
+pub const HUMANS_ONLY_KEY: &str = keys::HUMANS_ONLY;
 
 impl Db {
     /// Opens (creating if necessary) the database at `path`, creating parent
@@ -1438,8 +1439,8 @@ impl Db {
 
     pub fn get_geo_mode(&self) -> Result<GeoMode> {
         let value: String = self.conn.query_row(
-            "SELECT value FROM settings WHERE key = 'geo_mode'",
-            [],
+            "SELECT value FROM settings WHERE key = ?1",
+            params![keys::GEO_MODE],
             |row| row.get(0),
         )?;
         Ok(GeoMode::from_str(&value))
@@ -1447,9 +1448,9 @@ impl Db {
 
     pub fn set_geo_mode(&self, mode: GeoMode) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('geo_mode', ?1)
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![mode.as_str()],
+            params![keys::GEO_MODE, mode.as_str()],
         )?;
         Ok(())
     }
@@ -1464,8 +1465,8 @@ impl Db {
         let value: Option<String> = self
             .conn
             .query_row(
-                "SELECT value FROM settings WHERE key = 'block_response'",
-                [],
+                "SELECT value FROM settings WHERE key = ?1",
+                params![keys::BLOCK_RESPONSE],
                 |row| row.get(0),
             )
             .optional()?;
@@ -1673,11 +1674,11 @@ impl Db {
     /// nobody is. NGINX has a real pre-check in `nginx -t` and a bounded
     /// failure mode; the firewall has neither, unattended.
     pub fn get_auto_apply(&self) -> Result<bool> {
-        self.get_bool_setting("auto_apply", false)
+        self.get_bool_setting(keys::AUTO_APPLY, false)
     }
 
     pub fn set_auto_apply(&self, auto: bool) -> Result<()> {
-        self.set_bool_setting("auto_apply", auto)
+        self.set_bool_setting(keys::AUTO_APPLY, auto)
     }
 
     /// Whether the internal cron *applies* the firewall script it renders,
@@ -1698,19 +1699,19 @@ impl Db {
     /// when nobody is watching. So this path applies only when the guard
     /// actually ran and found nothing, which is stricter than the button.
     pub fn get_auto_apply_firewall(&self) -> Result<bool> {
-        self.get_bool_setting("auto_apply_firewall", false)
+        self.get_bool_setting(keys::AUTO_APPLY_FIREWALL, false)
     }
 
     pub fn set_auto_apply_firewall(&self, auto: bool) -> Result<()> {
-        self.set_bool_setting("auto_apply_firewall", auto)
+        self.set_bool_setting(keys::AUTO_APPLY_FIREWALL, auto)
     }
 
     pub fn get_serve_robots_txt(&self) -> Result<bool> {
-        self.get_bool_setting("serve_robots_txt", false)
+        self.get_bool_setting(keys::SERVE_ROBOTS_TXT, false)
     }
 
     pub fn set_serve_robots_txt(&self, serve: bool) -> Result<()> {
-        self.set_bool_setting("serve_robots_txt", serve)
+        self.set_bool_setting(keys::SERVE_ROBOTS_TXT, serve)
     }
 
     /// Whether generated site configs carry a `limit_req`. Off by
@@ -1718,11 +1719,11 @@ impl Db {
     /// visitors, and unlike a bot-pattern block there's no user agent to
     /// inspect afterwards to work out who was caught.
     pub fn get_rate_limit_enabled(&self) -> Result<bool> {
-        self.get_bool_setting("rate_limit_enabled", false)
+        self.get_bool_setting(keys::RATE_LIMIT_ENABLED, false)
     }
 
     pub fn set_rate_limit_enabled(&self, enabled: bool) -> Result<()> {
-        self.set_bool_setting("rate_limit_enabled", enabled)
+        self.set_bool_setting(keys::RATE_LIMIT_ENABLED, enabled)
     }
 
     /// Sustained requests per second per client address. 10/s is
@@ -1730,22 +1731,22 @@ impl Db {
     /// dozen requests for assets, so anything tighter would need
     /// `location`-level exemptions to be usable at all.
     pub fn get_rate_limit_rps(&self) -> Result<i64> {
-        Ok(self.get_int_setting("rate_limit_rps", 10)?.max(1))
+        Ok(self.get_int_setting(keys::RATE_LIMIT_RPS, 10)?.max(1))
     }
 
     pub fn set_rate_limit_rps(&self, rps: i64) -> Result<()> {
-        self.set_int_setting("rate_limit_rps", rps.max(1))
+        self.set_int_setting(keys::RATE_LIMIT_RPS, rps.max(1))
     }
 
     /// How many requests may exceed the rate before any are refused. 20 —
     /// twice the default rate — absorbs the burst of a single page load
     /// without letting a sustained flood through.
     pub fn get_rate_limit_burst(&self) -> Result<i64> {
-        Ok(self.get_int_setting("rate_limit_burst", 20)?.max(0))
+        Ok(self.get_int_setting(keys::RATE_LIMIT_BURST, 20)?.max(0))
     }
 
     pub fn set_rate_limit_burst(&self, burst: i64) -> Result<()> {
-        self.set_int_setting("rate_limit_burst", burst.max(0))
+        self.set_int_setting(keys::RATE_LIMIT_BURST, burst.max(0))
     }
 
     /// Shared-memory size for the rate-limit zone, in megabytes. 10MB
@@ -1753,14 +1754,14 @@ impl Db {
     /// `$binary_remote_addr`; NGINX starts evicting (and logging) beyond
     /// that rather than failing.
     pub fn get_rate_limit_zone_mb(&self) -> Result<i64> {
-        Ok(self.get_int_setting("rate_limit_zone_mb", 10)?.max(1))
+        Ok(self.get_int_setting(keys::RATE_LIMIT_ZONE_MB, 10)?.max(1))
     }
 
     pub fn set_block_response(&self, response: BlockResponse) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('block_response', ?1)
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![response.stored()],
+            params![keys::BLOCK_RESPONSE, response.stored()],
         )?;
         Ok(())
     }
@@ -1787,7 +1788,7 @@ impl Db {
             .conn
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
-                params![format!("cron_last_run:{job_id}")],
+                params![keys::cron_last_run(job_id)],
                 |row| row.get(0),
             )
             .optional()?;
@@ -1809,9 +1810,9 @@ impl Db {
             "INSERT INTO settings (key, value) VALUES (?1, ?2), (?3, ?4)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![
-                format!("cron_last_run:{job_id}"),
+                keys::cron_last_run(job_id),
                 ran_at.to_string(),
-                format!("cron_last_summary:{job_id}"),
+                keys::cron_last_summary(job_id),
                 summary
             ],
         )?;
@@ -1824,7 +1825,7 @@ impl Db {
             .conn
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
-                params![format!("cron_last_summary:{job_id}")],
+                params![keys::cron_last_summary(job_id)],
                 |row| row.get(0),
             )
             .optional()?)
@@ -1843,8 +1844,8 @@ impl Db {
         Ok(self
             .conn
             .query_row(
-                "SELECT value FROM settings WHERE key = 'firewall_rendered_signature'",
-                [],
+                "SELECT value FROM settings WHERE key = ?1",
+                params![keys::FIREWALL_RENDERED_SIGNATURE],
                 |row| row.get(0),
             )
             .optional()?)
@@ -1854,9 +1855,9 @@ impl Db {
     /// disk by a firewall render.
     pub fn set_firewall_rendered_signature(&self, signature: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO settings (key, value) VALUES ('firewall_rendered_signature', ?1)
+            "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![signature],
+            params![keys::FIREWALL_RENDERED_SIGNATURE, signature],
         )?;
         Ok(())
     }
@@ -2056,7 +2057,7 @@ impl Db {
             .conn
             .query_row(
                 "SELECT value FROM settings WHERE key = ?1",
-                params![format!("access_log_offset:{log_path}")],
+                params![keys::access_log_offset(log_path)],
                 |row| row.get(0),
             )
             .optional()?;
@@ -2071,7 +2072,7 @@ impl Db {
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            params![format!("access_log_offset:{log_path}"), offset.to_string()],
+            params![keys::access_log_offset(log_path), offset.to_string()],
         )?;
         Ok(())
     }

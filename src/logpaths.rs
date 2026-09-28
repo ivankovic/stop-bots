@@ -68,8 +68,8 @@ pub struct LogPaths {
 
 impl LogPaths {
     /// `settings` keys. A `logs:` family, alongside `nginx:`.
-    pub const ACCESS_KEY: &'static str = "logs:access_path";
-    pub const SSH_KEY: &'static str = "logs:ssh_path";
+    pub const ACCESS_KEY: &'static str = crate::db::keys::LOGS_ACCESS_PATH;
+    pub const SSH_KEY: &'static str = crate::db::keys::LOGS_SSH_PATH;
 
     /// Reads both from `db`. A row that is present but empty reads as
     /// unset, so clearing one is `set-log-paths --access-log ""` rather

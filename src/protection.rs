@@ -38,7 +38,7 @@
 //! detected" — the latter is the admin's call, via the Firewall
 //! screen or `remove-firewall-rule`.
 
-use crate::db::Db;
+use crate::db::{keys, Db};
 use anyhow::Result;
 
 /// Spoofed-crawler detection defaults to **on**. Unlike the threshold-based
@@ -70,7 +70,7 @@ pub const SPOOFED_CRAWLERS_TTL_DAYS_DEFAULT: i64 = 1;
 
 /// `settings` key: extra probe paths, one per line, appended to
 /// [`crate::accesslog::DEFAULT_PROBE_PATHS`].
-pub const PROBE_PATHS_EXTRA: &str = "detect_probe_paths_extra";
+pub const PROBE_PATHS_EXTRA: &str = keys::DETECT_PROBE_PATHS_EXTRA;
 
 /// Probe-path detection defaults to **on**. The built-in list is chosen
 /// strictly enough that a single request to any of them is conclusive (see
@@ -130,7 +130,7 @@ pub fn probe_paths(db: &Db) -> Result<Vec<String>> {
 }
 
 /// `settings` key: the trap path itself.
-pub const HONEYPOT_PATH: &str = "detect_honeypot_path";
+pub const HONEYPOT_PATH: &str = keys::DETECT_HONEYPOT_PATH;
 
 /// Honeypot detection defaults to **off**, unlike the other two
 /// path-based detectors. Not because it's risky — it's the most precise
@@ -352,12 +352,12 @@ impl Detector {
 
     /// `settings` key for this detector's on/off switch.
     pub fn enabled_key(self) -> String {
-        format!("detect:{}:enabled", self.id())
+        keys::detector_enabled(self.id())
     }
 
     /// `settings` key for its block TTL, in days.
     pub fn ttl_key(self) -> String {
-        format!("detect:{}:ttl_days", self.id())
+        keys::detector_ttl_days(self.id())
     }
 
     /// Whether this detector runs.
@@ -402,12 +402,12 @@ impl Detector {
 
 /// `settings` key: whether a detector that flags several addresses in one
 /// IPv4 `/24` blocks the whole `/24` instead.
-pub const SUBNET_ESCALATION: &str = "detect_subnet_escalation";
+pub const SUBNET_ESCALATION: &str = keys::DETECT_SUBNET_ESCALATION;
 pub const SUBNET_ESCALATION_DEFAULT: bool = false;
 
 /// How many addresses in one `/24` must be flagged in a single pass
 /// before it escalates.
-pub const SUBNET_ESCALATION_MIN: &str = "detect_subnet_escalation_min";
+pub const SUBNET_ESCALATION_MIN: &str = keys::DETECT_SUBNET_ESCALATION_MIN;
 pub const SUBNET_ESCALATION_MIN_DEFAULT: i64 = 3;
 
 /// The smallest threshold any detector will act on.
@@ -465,7 +465,7 @@ pub fn subnet_escalation(db: &Db) -> Result<Option<usize>> {
 /// request count, because the false positive to avoid is a legitimate API
 /// client — which hammers a handful of endpoints rather than walking a
 /// site.
-pub const ASSET_RATIO_MIN_PAGES: &str = "detect_asset_ratio_min_pages";
+pub const ASSET_RATIO_MIN_PAGES: &str = keys::DETECT_ASSET_RATIO_MIN_PAGES;
 pub const ASSET_RATIO_MIN_PAGES_DEFAULT: i64 = 15;
 
 /// Threshold for the rotating-user-agent detector: distinct user agents
@@ -476,12 +476,12 @@ pub const ASSET_RATIO_MIN_PAGES_DEFAULT: i64 = 15;
 /// (each with a second user agent for its media player), a Chromebook and
 /// two phone browsers. The block landed on the TV. A scraper cycling
 /// agents to evade per-agent rules goes far past 20; a home rarely does.
-pub const ROTATING_UA_MIN: &str = "detect_rotating_ua_min";
+pub const ROTATING_UA_MIN: &str = keys::DETECT_ROTATING_UA_MIN;
 pub const ROTATING_UA_MIN_DEFAULT: i64 = 20;
 
 /// Threshold for the referer-less detector: distinct deep (non-root) URLs
 /// fetched with no `Referer`.
-pub const REFERERLESS_MIN_PATHS: &str = "detect_refererless_min_paths";
+pub const REFERERLESS_MIN_PATHS: &str = keys::DETECT_REFERERLESS_MIN_PATHS;
 pub const REFERERLESS_MIN_PATHS_DEFAULT: i64 = 25;
 
 #[cfg(test)]

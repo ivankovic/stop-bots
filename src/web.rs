@@ -61,15 +61,17 @@ use std::net::{IpAddr, SocketAddr};
 
 use anyhow::{Context, Result};
 
+use crate::db::keys;
+
 /// `settings` key for the address the server binds.
-pub const BIND_KEY: &str = "web:bind";
+pub const BIND_KEY: &str = keys::WEB_BIND;
 
 /// Loopback, on a port unlikely to collide with anything an admin already
 /// runs. Not 8080.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 
 /// `settings` key for the path prefix this console is served under.
-pub const BASE_PATH_KEY: &str = "web:base_path";
+pub const BASE_PATH_KEY: &str = keys::WEB_BASE_PATH;
 
 /// The path prefix this console is served under, normalised.
 ///
@@ -192,7 +194,7 @@ impl BasePath {
 /// deployment the README describes — behind NGINX with TLS — where without
 /// it a browser will happily send the session to an `http://` URL for the
 /// same host.
-pub const SECURE_COOKIE_KEY: &str = "web:secure_cookie";
+pub const SECURE_COOKIE_KEY: &str = keys::WEB_SECURE_COOKIE;
 
 /// `settings` key for whether `X-Forwarded-For` may be believed.
 ///
@@ -202,14 +204,14 @@ pub const SECURE_COOKIE_KEY: &str = "web:secure_cookie";
 /// be the address they are about to block and so switching off the
 /// anti-lockout guard from outside. Turn it on only when this server is
 /// genuinely behind a proxy that overwrites the header.
-pub const TRUST_FORWARDED_KEY: &str = "web:trust_forwarded_for";
+pub const TRUST_FORWARDED_KEY: &str = keys::WEB_TRUST_FORWARDED_FOR;
 
 /// `settings` key for the persisted form of `--expose`.
-pub const EXPOSE_KEY: &str = "web:expose";
+pub const EXPOSE_KEY: &str = keys::WEB_EXPOSE;
 
 /// `settings` key for the extra `Host` values this server will answer to,
 /// comma-separated. See [`allowed_host`].
-pub const ALLOWED_HOSTS_KEY: &str = "web:allowed_hosts";
+pub const ALLOWED_HOSTS_KEY: &str = keys::WEB_ALLOWED_HOSTS;
 
 /// Whether `addr` is a loopback address.
 ///

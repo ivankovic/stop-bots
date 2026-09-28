@@ -42,7 +42,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
-use super::{Category, GeoMode, Policy};
+use super::{keys, Category, GeoMode, Policy};
 
 /// The schema version this binary writes, and the newest it will open.
 ///
@@ -562,9 +562,8 @@ fn v1_baseline(conn: &Connection) -> rusqlite::Result<()> {
     // is exactly 64 hex characters, and a `Debug` dump of even a single
     // rule is over a hundred, so the two can't be confused.
     conn.execute(
-        "DELETE FROM settings
-         WHERE key = 'firewall_rendered_signature' AND length(value) <> 64",
-        [],
+        "DELETE FROM settings WHERE key = ?1 AND length(value) <> 64",
+        params![keys::FIREWALL_RENDERED_SIGNATURE],
     )?;
 
     // Seed default category policies, matching the product defaults shown
@@ -586,8 +585,8 @@ fn v1_baseline(conn: &Connection) -> rusqlite::Result<()> {
     // allow everything else) — the least surprising default, and the
     // only one that's safe to render on either firewall backend.
     conn.execute(
-        "INSERT OR IGNORE INTO settings (key, value) VALUES ('geo_mode', ?1)",
-        params![GeoMode::Blocklist.as_str()],
+        "INSERT OR IGNORE INTO settings (key, value) VALUES (?1, ?2)",
+        params![keys::GEO_MODE, GeoMode::Blocklist.as_str()],
     )?;
     Ok(())
 }
@@ -644,7 +643,7 @@ mod tests {
         pre_0_1_database(
             &path,
             "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO settings VALUES ('web:bind', '127.0.0.1:9000');",
+             INSERT INTO settings VALUES ('a-key', 'a-value');",
         );
 
         let db = Db::open(&path).unwrap();
@@ -657,14 +656,14 @@ mod tests {
         let (version, bind): (u32, String) = copy
             .query_row(
                 "SELECT (SELECT user_version FROM pragma_user_version), value
-                 FROM settings WHERE key = 'web:bind'",
+                 FROM settings WHERE key = 'a-key'",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         assert_eq!(
             (version, bind.as_str()),
-            (0, "127.0.0.1:9000"),
+            (0, "a-value"),
             "the copy is the database as it was, version included"
         );
     }
@@ -801,22 +800,29 @@ mod tests {
     fn upgrading_drops_a_pre_digest_firewall_signature() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sqlite3");
-        pre_0_1_database(
-            &path,
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+                .unwrap();
             // What the old `format!("{rules:?}")` would have stored.
-            "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO settings VALUES ('firewall_rendered_signature',
-               '[FirewallRule { id: 1, address: \"1.2.3.4\", port: None, action: Block, \
-                enabled: true, expires_at: None }]');",
-        );
+            conn.execute(
+                "INSERT INTO settings VALUES (?1, ?2)",
+                params![
+                    keys::FIREWALL_RENDERED_SIGNATURE,
+                    "[FirewallRule { id: 1, address: \"1.2.3.4\", port: None, action: Block, \
+                     enabled: true, expires_at: None }]"
+                ],
+            )
+            .unwrap();
+        }
 
         let db = Db::open(&path).unwrap();
 
         let rows: i64 = db
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM settings WHERE key = 'firewall_rendered_signature'",
-                [],
+                "SELECT COUNT(*) FROM settings WHERE key = ?1",
+                params![keys::FIREWALL_RENDERED_SIGNATURE],
                 |row| row.get(0),
             )
             .unwrap();

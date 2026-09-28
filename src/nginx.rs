@@ -2676,10 +2676,10 @@ impl NginxCommands {
     pub const DEFAULT_RELOAD: &'static str = "systemctl reload nginx";
 
     /// `settings` keys, alongside the rest of the `nginx:` family.
-    pub const TEST_KEY: &'static str = "nginx:test_command";
-    pub const RELOAD_KEY: &'static str = "nginx:reload_command";
+    pub const TEST_KEY: &'static str = crate::db::keys::NGINX_TEST_COMMAND;
+    pub const RELOAD_KEY: &'static str = crate::db::keys::NGINX_RELOAD_COMMAND;
     /// Where this host's site configs actually live.
-    pub const ROOT_KEY: &'static str = "nginx:root";
+    pub const ROOT_KEY: &'static str = crate::db::keys::NGINX_ROOT;
 
     /// Reads both from `db`, falling back to the defaults for either one
     /// that was never set. A stored command that no longer parses is an

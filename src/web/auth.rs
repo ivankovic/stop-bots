@@ -57,7 +57,7 @@ use crate::db::Db;
 /// `settings` key holding the Argon2 PHC string. Only ever the hash — the
 /// password itself is shown once, at the moment it is generated, and then
 /// exists nowhere this program can reach.
-pub const PASSWORD_HASH_KEY: &str = "web:password_hash";
+pub const PASSWORD_HASH_KEY: &str = crate::db::keys::WEB_PASSWORD_HASH;
 
 /// Name of the session cookie.
 pub const SESSION_COOKIE: &str = "stop_bots_session";

@@ -1625,8 +1625,8 @@ fn log_sources(probe: &Probe) -> Check {
 
 /// Where the last probe is kept, so both front-ends can render a report
 /// without shelling out.
-pub const PROBE_KEY: &str = "health:probe";
-pub const PROBE_AT_KEY: &str = "health:probe_at";
+pub const PROBE_KEY: &str = crate::db::keys::HEALTH_PROBE;
+pub const PROBE_AT_KEY: &str = crate::db::keys::HEALTH_PROBE_AT;
 
 /// Records a probe for the front-ends to read.
 ///

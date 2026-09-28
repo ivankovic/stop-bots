@@ -81,7 +81,7 @@ impl FirewallBackend {
 /// picked iptables once is not silently handed an nftables script on the
 /// next render. The CLI's `--backend` stays authoritative for the run it
 /// is passed to; it is what writes this.
-pub const BACKEND_KEY: &str = "firewall:backend";
+pub const BACKEND_KEY: &str = crate::db::keys::FIREWALL_BACKEND;
 
 /// The script path for `backend` when nobody has said otherwise.
 ///
