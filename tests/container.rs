@@ -272,14 +272,29 @@ fn private_test_subnet(index: usize) -> String {
 
 impl Network {
     fn create(name: &str) -> Network {
-        Network::create_in(name, test_subnet)
+        Network::create_in(name, test_subnet, None)
     }
 
     fn create_private(name: &str) -> Network {
-        Network::create_in(name, private_test_subnet)
+        Network::create_in(name, private_test_subnet, None)
     }
 
-    fn create_in(name: &str, subnet_for: fn(usize) -> String) -> Network {
+    /// [`Network::create`] with IPv6 as well, from the documentation
+    /// prefix (RFC 3849) for the reason [`test_subnet`] uses TEST-NET-2:
+    /// not private, and routed nowhere.
+    fn create_dual_stack(name: &str) -> Network {
+        Network::create_in(
+            name,
+            test_subnet,
+            Some(|index| format!("2001:db8:{:x}::/64", index % 16)),
+        )
+    }
+
+    fn create_in(
+        name: &str,
+        subnet_for: fn(usize) -> String,
+        ipv6_subnet_for: Option<fn(usize) -> String>,
+    ) -> Network {
         let name = &scoped(name);
         let _ = Command::new(runtime())
             .args(["network", "rm", name])
@@ -293,9 +308,18 @@ impl Network {
         let mut last = String::new();
         for _ in 0..16 {
             let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let subnet = subnet_for(index);
+            let mut args = vec![
+                "network".to_string(),
+                "create".to_string(),
+                "--subnet".to_string(),
+                subnet_for(index),
+            ];
+            if let Some(v6) = ipv6_subnet_for {
+                args.extend(["--ipv6".to_string(), "--subnet".to_string(), v6(index)]);
+            }
+            args.push(name.to_string());
             let out = Command::new(runtime())
-                .args(["network", "create", "--subnet", &subnet, name])
+                .args(&args)
                 .output()
                 .expect("failed to create a container network");
             if out.status.success() {
@@ -335,6 +359,21 @@ fn sh_in(container: &str, cmd: &str) -> String {
         "command failed: {cmd}\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     stdout
+}
+
+/// A container's address on its network: `field` is `IPAddress` or
+/// `GlobalIPv6Address`, as `inspect` names them.
+fn address_of(container: &str, field: &str) -> String {
+    let out = Command::new(runtime())
+        .args([
+            "inspect",
+            "-f",
+            &format!("{{{{range .NetworkSettings.Networks}}}}{{{{.{field}}}}}{{{{end}}}}"),
+            container,
+        ])
+        .output()
+        .expect("failed to inspect a container");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// `docker rm -f`, for the `Drop` impls. Errors are ignored: a container
@@ -387,16 +426,12 @@ impl Client {
 
     /// This container's address on the network, as the server will see it.
     fn address(&self) -> String {
-        let out = Command::new(runtime())
-            .args([
-                "inspect",
-                "-f",
-                "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-                &self.name,
-            ])
-            .output()
-            .expect("failed to inspect the client container");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+        address_of(&self.name, "IPAddress")
+    }
+
+    /// Its IPv6 address, on a [`Network::create_dual_stack`] network.
+    fn address_v6(&self) -> String {
+        address_of(&self.name, "GlobalIPv6Address")
     }
 
     /// Fetches `path` from `host` and returns the status code.
@@ -2577,31 +2612,66 @@ fn a_container_on_a_private_bridge_still_reaches_the_host_in_allowlist_mode() {
     );
 }
 
-/// `nftables`' `inet` family covers IPv4 and IPv6 in one table, which is
-/// the stated reason `iptables::render` may skip IPv6 rules. Stated, and
-/// never checked against an actual IPv6 packet.
+/// `nftables`' `inet` family covers IPv4 and IPv6 in one table, and an
+/// IPv6 block has to stop IPv6 packets from a real second host.
+///
+/// **This test used to pass without testing anything.** It added
+/// 2001:db8::1 to the server's own `lo` and requested it from inside the
+/// server, which failed with "connection refused" before any rule was
+/// consulted: the site listens on `0.0.0.0:8080` only, so nothing answered
+/// on IPv6 at all — and had anything answered, the ruleset accepts `iif
+/// lo` before its sets. Reproduced by running the old request with no
+/// ruleset loaded: `000`, curl exit 7. Now the request comes from a client
+/// container over a dual-stack network, the site listens on IPv6 too, and
+/// the same request is shown to succeed before the rule goes in.
 #[test]
 fn an_ipv6_rule_really_drops_ipv6_traffic() {
     if !enabled() {
         return;
     }
-    let server = Server::start("stop-bots-ipv6");
-    server.sh("ip -6 addr add 2001:db8::1/64 dev lo || true");
-    server.stop_bots("add-firewall-rule --address 2001:db8::/64");
-    server.stop_bots("render-firewall --backend nftables --out /etc/stop-bots/firewall.nft");
-    server.sh("nft -f /etc/stop-bots/firewall.nft");
-
-    let ruleset = server.sh("nft list ruleset");
-    assert!(
-        ruleset.contains("2001:db8::/64"),
-        "the IPv6 rule is not in the live ruleset:\n{ruleset}"
+    let net = Network::create_dual_stack("stop-bots-ipv6-net");
+    let server = Server::start_on_network("stop-bots-ipv6", &net);
+    let client = Client::start("stop-bots-ipv6-client", &net);
+    server.sh(
+        "sed -i 's/listen 8080;/listen 8080;\\n    listen [::]:8080;/' \
+         /etc/nginx/sites-enabled/test-site.conf && nginx -s reload",
     );
-    let (_, code, _) = server
-        .run("curl -s -o /dev/null -w '%{http_code}' --max-time 5 -g 'http://[2001:db8::1]:8080/'");
+    let server_v6 = format!("[{}]", address_of(&server.name, "GlobalIPv6Address"));
+    let client_v6 = client.address_v6();
+    assert!(
+        client_v6.contains(':'),
+        "the client has no IPv6 address: {client_v6:?}"
+    );
+
+    // The control: without it, a request that fails for any other reason
+    // reads as the rule working.
+    let served = (0..20).any(|_| {
+        let ok = client.get(&server_v6, "-g --max-time 2") == "200";
+        if !ok {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        ok
+    });
+    assert!(served, "the IPv6 client was not served before any rule");
+
+    server.stop_bots(&format!("add-firewall-rule --address {client_v6}"));
+    server.stop_bots("render-firewall --backend nftables --out /tmp/fw.nft --force");
+    server.sh("nft -f /tmp/fw.nft");
+
+    assert!(
+        server.in_set("block_v6", &client_v6),
+        "the IPv6 rule is not in the live ruleset:\n{}",
+        server.sh("nft list table inet stop_bots")
+    );
     assert_eq!(
-        code.trim(),
+        client.get(&server_v6, "-g --max-time 5"),
         "000",
-        "an address inside a dropped IPv6 range was still served"
+        "packets from {client_v6} were still served"
+    );
+    assert_eq!(
+        client.get(&address_of(&server.name, "IPAddress"), "--max-time 5"),
+        "200",
+        "the same client over IPv4 is not blocked, so it must still be served"
     );
 }
 
