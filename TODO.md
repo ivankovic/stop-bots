@@ -18,14 +18,6 @@ list — which meant the open items below were unfindable inside it.
   `~*` regex. The `BLOCKLIST` tag can therefore disagree with what actually gets
   blocked — and since the web UI arrived it says so on two screens rather than
   one, because both front-ends now read this from `crate::dynamic`.
-* **`accesslog::read_log_file` reads the whole log into memory.** It is
-  `std::fs::read_to_string`, and the persisted offset in
-  `accessstats::record_access_stats` slices the already-seen prefix off
-  *after* the read — so it saves counting, not reading. On a host whose
-  `access.log` had reached 2.9 GB unrotated, every cron tick would allocate
-  2.9 GB. Seeking to the stored offset instead would read only what was
-  appended, which is what the offset already describes. Logrotate makes it
-  survivable, not correct.
 * **Recommend only the backend that is installed.** Nothing checks whether
   `nft` or `iptables` exists before offering both. `health` now reports which
   backend's live state it read, so the information is to hand.
@@ -80,12 +72,6 @@ path.** Everything is either offline log analysis that writes a database row, or
 text generated into a config file. That is what decides which of these are cheap
 and which are not.
 
-* **Timestamp parsing in `sshlog`/`accesslog`.** The highest-leverage item here,
-  because it gates a whole category: both detectors are count-based and never
-  parse timestamps, so nothing rate-, burst- or sliding-window-based is possible
-  until this exists. (NGINX-side rate limiting did ship — `limit_req` needs no
-  timestamps, because NGINX counts at request time. This is about rate-based
-  *detection* from logs, which is a different thing.)
 * **Escalating TTL for repeat offenders**, fail2ban style. The formula is
   trivial; `firewall_rules` persists only `expires_at`, with no offence count or
   block history. A schema addition, not arithmetic. Worth more now that four

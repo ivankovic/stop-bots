@@ -306,8 +306,9 @@ enum Command {
     #[command(alias = "block-scanners")]
     BlockSshScanners {
         /// Failed-login lines from one address before it counts as a
-        /// scanner rather than someone who mistyped a password. A count,
-        /// not a rate: log timestamps are not read. Defaults to the stored
+        /// scanner rather than someone who mistyped a password. A count
+        /// over the whole log given, not a rate; the internal cron counts
+        /// only inside the detector's window. Defaults to the stored
         /// threshold (`set-detector ssh-scanners --threshold`), which is 20
         /// unless changed. Must be at least 1.
         #[arg(long, value_parser = min_threshold)]
@@ -457,7 +458,7 @@ enum Command {
     /// detectors with. Change them with `set-detector`, and IPv4 /24
     /// escalation with `set-subnet-escalation`.
     ListDetectors,
-    /// Switch a detector on or off, and set its TTL and threshold.
+    /// Switch a detector on or off, and set its TTL, threshold and window.
     ///
     /// These are what the internal cron (inside `stop-bots web` or the
     /// TUI) and `batch` use. Switching a detector off stops it adding
@@ -484,6 +485,11 @@ enum Command {
         /// referer-less pages, depending on the detector. At least 2.
         #[arg(long)]
         threshold: Option<i64>,
+        /// How far back evidence counts, in hours, from 1 to 720: a log
+        /// line older than this is no reason to block. 24 unless changed,
+        /// and 1 for asset-ratio, rotating-ua and refererless.
+        #[arg(long)]
+        window_hours: Option<i64>,
     },
     /// Block a whole IPv4 /24 when several of its addresses are flagged.
     ///
@@ -1582,7 +1588,8 @@ async fn main() -> Result<()> {
             enabled,
             ttl_days,
             threshold,
-        }) => set_detector(db, detector, enabled, ttl_days, threshold),
+            window_hours,
+        }) => set_detector(db, detector, enabled, ttl_days, threshold, window_hours),
         Some(Command::SetSubnetEscalation { enabled, min }) => {
             set_subnet_escalation(db, enabled, min)
         }
@@ -2631,19 +2638,20 @@ fn detector_line(db: &Db, detector: DetectorArg) -> Result<String> {
         label.push_str(" (follows set-humans-only)");
     }
     Ok(format!(
-        "{:<17} {:<4} {:>5}d {:>9}  {label}",
+        "{:<17} {:<4} {:>5}d {:>9} {:>5}h  {label}",
         detector.name(),
         on_off(d.is_enabled(db)?),
         d.ttl_days(db)?,
         threshold,
+        d.window_hours(db)?,
     ))
 }
 
 fn list_detectors(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     println!(
-        "{:<17} {:<4} {:>6} {:>9}",
-        "DETECTOR", "ON", "TTL", "THRESHOLD"
+        "{:<17} {:<4} {:>6} {:>9} {:>6}",
+        "DETECTOR", "ON", "TTL", "THRESHOLD", "WINDOW"
     );
     for detector in DetectorArg::ALL {
         println!("{}", detector_line(&db, detector)?);
@@ -2667,8 +2675,9 @@ fn set_detector(
     enabled: Option<bool>,
     ttl_days: Option<i64>,
     threshold: Option<i64>,
+    window_hours: Option<i64>,
 ) -> Result<()> {
-    use stop_bots::protection::MAX_TTL_DAYS;
+    use stop_bots::protection::{MAX_TTL_DAYS, MAX_WINDOW_HOURS};
 
     let db = open_db(db_path)?;
     let d = detector.0;
@@ -2687,6 +2696,11 @@ fn set_detector(
             anyhow::bail!("a block lasts from 1 to {MAX_TTL_DAYS} days, not {days}");
         }
     }
+    if let Some(hours) = window_hours {
+        if !(1..=MAX_WINDOW_HOURS).contains(&hours) {
+            anyhow::bail!("a detection window is from 1 to {MAX_WINDOW_HOURS} hours, not {hours}");
+        }
+    }
     if threshold.is_some() && d.threshold_setting().is_none() {
         anyhow::bail!(
             "{name} has no threshold: one matching request is already conclusive (the ones \
@@ -2701,13 +2715,16 @@ fn set_detector(
     if let Some(days) = ttl_days {
         d.set_ttl_days(&db, days)?;
     }
+    if let Some(hours) = window_hours {
+        d.set_window_hours(&db, hours)?;
+    }
     if let Some(on) = enabled {
         d.set_enabled(&db, on)?;
     }
 
     println!(
-        "{:<17} {:<4} {:>6} {:>9}",
-        "DETECTOR", "ON", "TTL", "THRESHOLD"
+        "{:<17} {:<4} {:>6} {:>9} {:>6}",
+        "DETECTOR", "ON", "TTL", "THRESHOLD", "WINDOW"
     );
     println!("{}", detector_line(&db, detector)?);
     if enabled == Some(false) {
@@ -3761,8 +3778,15 @@ fn list_selected_countries(db_path: Option<PathBuf>) -> Result<()> {
 /// refuse to write the script unless `--force` was passed. A log source
 /// that couldn't be found or read at all is not a risk in itself (nothing
 /// to check against), just a note that the check didn't run.
-fn check_lockout_risk(rules: &[FirewallRule], ssh_log: Option<&Path>, force: bool) -> Result<bool> {
-    match stop_bots::firewall::assess_lockout_risk(rules, ssh_log) {
+fn check_lockout_risk(
+    db: &Db,
+    rules: &[FirewallRule],
+    ssh_log: Option<&Path>,
+    force: bool,
+) -> Result<bool> {
+    // The flag, else the path `set-log-paths` stored, else the search.
+    let source = stop_bots::logpaths::LogPaths::from_db(db)?.ssh(ssh_log);
+    match stop_bots::firewall::assess_lockout_risk(rules, &source) {
         stop_bots::firewall::LockoutStatus::LogUnavailable => {
             eprintln!(
                 "Note: couldn't read any SSH log (tried /var/log/auth.log, /var/log/secure, journalctl) — skipping the lockout safety check. Run as root, or pass --ssh-log, for this check to work."
@@ -3835,7 +3859,7 @@ fn render_firewall(
     let out = out.as_path();
     let built = stop_bots::firewall::build_script(&db, backend)?;
 
-    if !check_lockout_risk(&built.rules, ssh_log.as_deref(), force)? {
+    if !check_lockout_risk(&db, &built.rules, ssh_log.as_deref(), force)? {
         anyhow::bail!(
             "Refusing to write firewall rules: would block a currently-connected SSH client. Re-run with --force if you're sure."
         );
@@ -3867,7 +3891,7 @@ fn block_scanners(
     let db = open_db(db_path)?;
     let (threshold, ttl_days) = detector_defaults(&db, Detector::SshScanners, threshold, ttl_days)?;
 
-    let log_text = read_ssh_log(ssh_log.as_deref())?;
+    let log_text = read_ssh_log(&db, ssh_log.as_deref())?;
 
     let outcome =
         stop_bots::scanblock::block_ssh_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
@@ -4130,12 +4154,12 @@ fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
 /// generic over the two `LogSource` types: they are distinct enums with
 /// distinct fallback chains, and the error text has to name the right
 /// paths and the right flag to be worth printing at all.
-fn read_ssh_log(ssh_log: Option<&Path>) -> Result<String> {
-    let source = match ssh_log {
-        Some(path) => sshlog::read_log_file(path),
-        None => sshlog::find_default_source(),
-    };
-    match source {
+fn read_ssh_log(db: &Db, ssh_log: Option<&Path>) -> Result<String> {
+    // Through `LogPaths`, like `read_access_log`: a stored path is read
+    // when no flag names one. The journal is read back a week, not whole.
+    let paths = stop_bots::logpaths::LogPaths::from_db(db).unwrap_or_default();
+    let named = ssh_log.or(paths.ssh.as_deref());
+    match paths.ssh(ssh_log).read(sshlog::recent_since()) {
         sshlog::LogSource::Found(text) => Ok(text),
         // Two different failures, and saying the wrong one costs real time.
         // An explicit path is read and nothing else is tried, so claiming a
@@ -4143,11 +4167,11 @@ fn read_ssh_log(ssh_log: Option<&Path>) -> Result<String> {
         // fallback chain instead of at the path they passed — which is
         // exactly how a service pinned to a missing auth.log stayed
         // invisible on a journald-only host.
-        sshlog::LogSource::Unavailable => match ssh_log {
+        sshlog::LogSource::Unavailable => match named {
             Some(path) => anyhow::bail!(
-                "couldn't read the SSH log at {} — that path was given explicitly, so \
-                 /var/log/secure and journalctl were not tried. Drop --ssh-log to search \
-                 all three, point it somewhere readable, or run as root.",
+                "couldn't read the SSH log at {} — that path was given explicitly (by \
+                 --ssh-log or `set-log-paths`), so /var/log/secure and journalctl were not \
+                 tried. Point it somewhere readable, or run as root.",
                 path.display()
             ),
             None => anyhow::bail!(
@@ -4197,26 +4221,29 @@ fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
     }
 }
 
-/// Reads the NGINX access log and records successful-request user-agent
-/// counts — see [`stop_bots::accessstats::record_access_stats`] for the
-/// shared detection/persistence logic (also used by the internal cron's
-/// `RecordAccessStats` job). This CLI wrapper only resolves the log source
-/// and prints the returned outcome's summary.
+/// Reads what was appended to the NGINX access log since the last read and
+/// records successful-request user-agent counts: one pass of
+/// [`stop_bots::logscan`], the same the internal cron's `RecordAccessStats`
+/// job makes. This CLI wrapper only prints the outcome's summary.
 fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
 
-    // Keyed by the path actually read, so a stored path and an explicit
-    // flag do not each keep their own read offset for the same file.
-    let log_path = PathBuf::from(
-        stop_bots::logpaths::LogPaths::from_db(&db)
-            .unwrap_or_default()
-            .access_description(access_log.as_deref()),
-    );
-    let log_text = read_access_log(&db, access_log.as_deref())?;
-
-    let outcome =
-        stop_bots::accessstats::record_access_stats(&db, &log_path.to_string_lossy(), &log_text)?;
-    println!("{}", outcome.summary());
+    // The same pass the internal cron makes, from the same cursor, keyed by
+    // the path actually read: what the console already tallied is not
+    // tallied again, and what this reads the detectors see too.
+    let flags = stop_bots::logscan::Flags {
+        ssh_log: None,
+        access_log,
+    };
+    let applied =
+        stop_bots::logscan::run(&db, &[stop_bots::cron::CronJob::RecordAccessStats], &flags)?;
+    if let stop_bots::logscan::Availability::Unavailable(tried) = &applied.access {
+        anyhow::bail!(
+            "couldn't read the NGINX access log at {tried} — pass --access-log, set one with \
+             `stop-bots set-log-paths --access-log <path>`, or run as root"
+        );
+    }
+    println!("{}", applied.stats.summary());
     Ok(())
 }
 
@@ -4558,8 +4585,11 @@ mod tests {
     /// path they passed.
     #[test]
     fn an_unreadable_explicit_ssh_log_names_the_path_it_was_given() {
-        let err = read_ssh_log(Some(Path::new("/nonexistent/auth.log")))
-            .expect_err("a missing file should not read");
+        let err = read_ssh_log(
+            &Db::open_in_memory().unwrap(),
+            Some(Path::new("/nonexistent/auth.log")),
+        )
+        .expect_err("a missing file should not read");
         let said = err.to_string();
 
         assert!(
@@ -4584,7 +4614,7 @@ mod tests {
         // a readable SSH log, the search succeeds and there is no message
         // to check. Asserting on the error in that case would make the test
         // fail on developer machines for a reason unrelated to the code.
-        if let Err(err) = read_ssh_log(None) {
+        if let Err(err) = read_ssh_log(&Db::open_in_memory().unwrap(), None) {
             let said = err.to_string();
             assert!(
                 said.contains("/var/log/auth.log")
@@ -4728,8 +4758,20 @@ mod tests {
         .unwrap();
 
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        assert!(!check_lockout_risk(&rules, Some(&log_path), false).unwrap());
-        assert!(check_lockout_risk(&rules, Some(&log_path), true).unwrap());
+        assert!(!check_lockout_risk(
+            &Db::open_in_memory().unwrap(),
+            &rules,
+            Some(&log_path),
+            false
+        )
+        .unwrap());
+        assert!(check_lockout_risk(
+            &Db::open_in_memory().unwrap(),
+            &rules,
+            Some(&log_path),
+            true
+        )
+        .unwrap());
     }
 
     #[test]
@@ -4743,13 +4785,25 @@ mod tests {
         .unwrap();
 
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        assert!(check_lockout_risk(&rules, Some(&log_path), false).unwrap());
+        assert!(check_lockout_risk(
+            &Db::open_in_memory().unwrap(),
+            &rules,
+            Some(&log_path),
+            false
+        )
+        .unwrap());
     }
 
     #[test]
     fn check_lockout_risk_passes_when_the_log_source_is_unavailable() {
         let rules = vec![rule("4.5.6.0/24", FirewallAction::Block)];
-        assert!(check_lockout_risk(&rules, Some(Path::new("/nonexistent/x.log")), false).unwrap());
+        assert!(check_lockout_risk(
+            &Db::open_in_memory().unwrap(),
+            &rules,
+            Some(Path::new("/nonexistent/x.log")),
+            false
+        )
+        .unwrap());
     }
 
     /// With neither flag, a render follows the host: the stored backend,

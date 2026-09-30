@@ -36,6 +36,21 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   line; an edited one is still refused. A 0.0.1–0.0.6 unit's `--root` is
   kept as the stored NGINX root.
 - The unit and the Web Access file point at `set-web`, not `web --save`.
+- **Detection has windows, so a block that expires stays expired.** Each
+  detector counts only log lines newer than its window (a day; an hour for
+  the three behavioural ones), stored per detector as `detect:<id>:window_hours`.
+  A block spends the evidence that made it, so only a new offence brings it back,
+  and a first scan never blocks for old lines.
+- **Each log is read once a minute, incrementally.** One pass from a stored
+  cursor (device, inode, offset) serves every detector and the access stats,
+  survives rotation and truncation, and parses outside the web console's lock.
+  On a 200 MB log a tick went from 24 s and 440 MB to 2–3 s and 10 MB, and the
+  TUI's start-up from 2.9 GB to 37 MB.
+- **journald is read with `--since` and a stored cursor**, in `short-iso` so its
+  lines keep their times, instead of the whole sshd journal on every read.
+- **`set-log-paths` is honoured everywhere**: `batch`, the lockout guard, the
+  Firewall screens and `record-access-stats`. A flag still wins.
+- A `log_evidence` table (schema version 3).
 - **The database has a schema version** (`PRAGMA user_version`). Upgrading
   from any 0.0.x first copies the database to `<db>.bak-v0` (mode 0600),
   and a database written by a newer stop-bots is refused rather than misread.
@@ -79,6 +94,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Fixed
 
+- **A log in a format the detectors cannot read is reported.** `status` warns
+  when under half the access log parses, quoting a line, instead of "no requests
+  recorded yet".
 - `SECURITY.md` said every detector is off by default; five are on. It now
   says which, and that blocking traffic you wanted is a matter of tuning.
 

@@ -290,11 +290,6 @@ pub fn status(db: &Db) -> Result<Vec<JobStatus>> {
 /// means the same thing whichever one is open.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Whether this job reads the SSH log rather than the NGINX access log.
-///
-/// `RenderFirewall` reads the SSH log without being a detector: it needs
-/// the currently-connected clients for its lockout guard, not a log to
-/// scan for attackers.
 /// Records that `job` just ran, ignoring a failure to write it.
 ///
 /// Ignored deliberately, and it was `batch`'s private helper before the
@@ -307,6 +302,11 @@ pub fn record_run(db: &Db, job: CronJob, summary: &str) {
     let _ = db.set_cron_last_run(job.id(), now(), summary);
 }
 
+/// Whether this job reads the SSH log rather than the NGINX access log.
+///
+/// `RenderFirewall` reads the SSH log without being a detector: it needs
+/// the currently-connected clients for its lockout guard, not a log to
+/// scan for attackers.
 pub fn uses_ssh_log(job: CronJob) -> bool {
     match job {
         CronJob::Detect(detector) => detector.spec().uses_ssh_log,
@@ -319,121 +319,93 @@ pub fn uses_ssh_log(job: CronJob) -> bool {
     }
 }
 
-/// Reads whichever log `job` needs, `None` if it isn't available.
-///
-/// **Blocking I/O, and slower than it looks** — reading the log file, and
-/// for the SSH log shelling out to `journalctl` when no file exists. Both
-/// front-ends run it off their main thread (`tokio::task::spawn_blocking`)
-/// rather than inline; the TUI stops redrawing otherwise, and the web
-/// server must not do it while holding the database lock.
-///
-/// Takes no `Db` for exactly that reason: this half can be hoisted out of
-/// the lock, and a signature that can't reach the database is what keeps
-/// it that way.
-pub fn read_log_for(
-    job: CronJob,
-    paths: &crate::logpaths::LogPaths,
-    ssh_log: Option<&std::path::Path>,
-) -> Option<String> {
-    // `paths` by value rather than a `&Db`, so this keeps the property the
-    // doc above describes: resolved by the caller while it holds the lock,
-    // read here with no way to reach the database.
-    if uses_ssh_log(job) {
-        match paths.ssh_source(ssh_log) {
-            crate::sshlog::LogSource::Found(text) => Some(text),
-            crate::sshlog::LogSource::Unavailable => None,
-        }
-    } else {
-        match paths.access_source(None) {
-            crate::accesslog::LogSource::Found(text) => Some(text),
-            crate::accesslog::LogSource::Unavailable => None,
-        }
-    }
+/// Whether `job` is one of the jobs a log pass serves (see
+/// [`crate::logscan`]): every detector, the access-stats tally and the
+/// firewall render, whose guard wants the SSH log.
+pub fn is_log_job(job: CronJob) -> bool {
+    matches!(
+        job,
+        CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall
+    )
 }
 
-/// Records every address `ssh_log_text` shows a successful login from, so
-/// the anti-lockout window holds it for a week — including across a log
-/// rotation that drops the line proving it. See the `ssh_login_ips`
-/// schema comment for why the stored time is when we looked, not when
-/// sshd says the login was.
+/// Runs each of `jobs` on what one log pass read and stored, and records
+/// what each did, returning the summaries the Dashboard's "Scheduled
+/// tasks" panel will show.
 ///
-/// Shared by this module's jobs and by `batch`, which is the whole of the
-/// schedule on a host that runs stop-bots only from crontab. Without it
-/// there, such a host's window stayed empty and the guard had only the
-/// Accepted lines logrotate had not yet taken.
-pub fn record_ssh_logins(db: &Db, ssh_log_text: &str) -> Result<usize> {
-    let ips = crate::sshlog::parse_accepted_ips(ssh_log_text);
-    db.record_ssh_login_ips(&ips)?;
-    Ok(ips.len())
-}
-
-/// Runs one log-backed job against already-read log text and records what
-/// happened, returning the summary the Dashboard's "Scheduled tasks" panel
-/// will show.
+/// The log was read once for all of them, before this, by
+/// [`crate::logscan`]; nothing here reads a log. A detector decides on the
+/// evidence stored for it inside its window, which is every line of it
+/// however many passes it took to read them.
 ///
-/// The `Result` covers only the bookkeeping write. **The job's own failure
-/// is never an error** — it becomes the recorded summary instead. A cron
-/// job exists to say what it did without anyone watching, so "the SSH log
-/// was unreadable" is an outcome to record, not something to hand back to
-/// a caller who has no one to tell.
+/// The `Result` covers only the bookkeeping. **A job's own failure is
+/// never an error** -- it becomes the recorded summary instead. A cron job
+/// exists to say what it did without anyone watching, so "the SSH log was
+/// unreadable" is an outcome to record, not something to hand back to a
+/// caller who has no one to tell.
 ///
 /// `firewall_out` is a parameter rather than
 /// [`crate::firewall::DEFAULT_OUTPUT_PATH`] read directly so that tests,
 /// and any front-end that shouldn't write to `/etc`, can point it
 /// somewhere else.
 ///
-/// Panics on [`CronJob::UpdateIpRanges`], which fetches over the network
-/// and goes through [`fetch_ip_ranges`]/[`store_ip_ranges`] instead.
-pub fn run_log_job(
+/// Panics on a job that is not [`is_log_job`]: those go through their own
+/// functions here.
+pub fn run_log_jobs(
     db: &Db,
-    job: CronJob,
-    log_text: Option<&str>,
+    jobs: &[CronJob],
+    applied: &crate::logscan::Applied,
     firewall_out: Option<&std::path::Path>,
     apply_for_real: bool,
-) -> Result<String> {
-    // Before the job itself, and for every SSH-log-backed job rather than
-    // one designated recorder: this is what keeps the anti-lockout window
-    // fed. Detectors run every minute, so an address the operator logs in
-    // from is recorded within a minute of the login and stays protected for
-    // a week afterwards.
-    if uses_ssh_log(job) {
-        if let Some(text) = log_text {
-            record_ssh_logins(db, text)?;
-        }
+) -> Result<Vec<(CronJob, String)>> {
+    let mut summaries = Vec::new();
+    for &job in jobs {
+        let summary = match job {
+            // Every detector runs through one arm. What differs between
+            // them -- the log, the threshold, the window -- is on the spec
+            // or in `scanblock::run_detector`, so a new detector adds no
+            // code here.
+            CronJob::Detect(detector) => run_detector(db, detector, applied),
+            CronJob::RecordAccessStats => {
+                if applied.access.is_readable() {
+                    applied.stats.summary()
+                } else {
+                    "NGINX access log unavailable".to_string()
+                }
+            }
+            CronJob::RenderFirewall => {
+                // The guard's clients: everyone who logged in, in what this
+                // pass read and in the week the window keeps. `None` when
+                // the SSH log could not be read, which is not the same as
+                // "read, and nobody is connected".
+                let connected = if applied.ssh.is_readable() {
+                    let mut all = db.recent_ssh_login_ips()?;
+                    all.extend(applied.logins.iter().cloned());
+                    all.sort();
+                    all.dedup();
+                    Some(all)
+                } else {
+                    None
+                };
+                render_firewall(db, firewall_out, connected.as_deref(), apply_for_real)
+            }
+            CronJob::UpdateIpRanges => {
+                unreachable!("UpdateIpRanges is run via fetch_ip_ranges/store_ip_ranges")
+            }
+            CronJob::HealthCheck => {
+                unreachable!("HealthCheck is run via health_check, which needs no log")
+            }
+            CronJob::Maintenance => {
+                unreachable!("Maintenance is run via maintenance, which needs no log")
+            }
+            CronJob::ApplyNginx => {
+                unreachable!("ApplyNginx is run via apply_nginx, which needs the config root")
+            }
+        };
+        db.set_cron_last_run(job.id(), now(), &summary)?;
+        summaries.push((job, summary));
     }
-
-    let summary = match job {
-        // Every detector runs through one arm. What differs between them —
-        // the log they read, the threshold, the function — is either on the
-        // spec or in `run_detector`, so a new detector adds no code here.
-        CronJob::Detect(detector) => run_detector(db, detector, log_text),
-        CronJob::RecordAccessStats => match log_text {
-            Some(text) => match crate::accessstats::record_access_stats(
-                db,
-                crate::accesslog::DEFAULT_LOG_PATH,
-                text,
-            ) {
-                Ok(outcome) => outcome.summary(),
-                Err(err) => format!("error: {err}"),
-            },
-            None => "NGINX access log unavailable".to_string(),
-        },
-        CronJob::RenderFirewall => render_firewall(db, firewall_out, log_text, apply_for_real),
-        CronJob::UpdateIpRanges => {
-            unreachable!("UpdateIpRanges is run via fetch_ip_ranges/store_ip_ranges")
-        }
-        CronJob::HealthCheck => {
-            unreachable!("HealthCheck is run via health_check, which needs no log")
-        }
-        CronJob::Maintenance => {
-            unreachable!("Maintenance is run via maintenance, which needs no log")
-        }
-        CronJob::ApplyNginx => {
-            unreachable!("ApplyNginx is run via apply_nginx, which needs the config root")
-        }
-    };
-    db.set_cron_last_run(job.id(), now(), &summary)?;
-    Ok(summary)
+    Ok(summaries)
 }
 
 /// How long a user agent may go unseen before its `user_agent_stats` row
@@ -645,7 +617,7 @@ pub fn health_check(db: &Db, ssh_log: Option<&std::path::Path>) -> String {
 /// would leave the job looking permanently overdue in the panel rather
 /// than saying why nothing happened. Every failure — including reading the
 /// detector's own settings — becomes text for the same reason.
-fn run_detector(db: &Db, detector: Detector, log_text: Option<&str>) -> String {
+fn run_detector(db: &Db, detector: Detector, applied: &crate::logscan::Applied) -> String {
     let enabled = match detector.is_enabled(db) {
         Ok(enabled) => enabled,
         Err(err) => return format!("error: {err}"),
@@ -653,18 +625,19 @@ fn run_detector(db: &Db, detector: Detector, log_text: Option<&str>) -> String {
     if !enabled {
         return "disabled".to_string();
     }
-    let Some(text) = log_text else {
-        return if detector.spec().uses_ssh_log {
-            "SSH log unavailable".to_string()
-        } else {
-            "NGINX access log unavailable".to_string()
-        };
+    let (log, name) = if detector.spec().uses_ssh_log {
+        (&applied.ssh, "SSH log")
+    } else {
+        (&applied.access, "NGINX access log")
     };
+    if !log.is_readable() {
+        return format!("{name} unavailable");
+    }
     let ttl = match detector.ttl_days(db) {
         Ok(ttl) => ttl,
         Err(err) => return format!("error: {err}"),
     };
-    match crate::scanblock::run_detector(db, detector, ttl, text, false) {
+    match crate::scanblock::run_detector(db, detector, ttl, applied.now, false) {
         Ok(outcome) => outcome.summary(),
         Err(err) => format!("error: {err}"),
     }
@@ -676,23 +649,23 @@ fn run_detector(db: &Db, detector: Detector, log_text: Option<&str>) -> String {
 /// write if doing so would risk locking out a currently-connected SSH
 /// client.
 ///
-/// Same safety check the interactive render runs, except `ssh_log_text` is
-/// already resolved by [`read_log_for`] rather than being re-resolved
-/// here, so this applies `sshlog::parse_accepted_ips`/
-/// `firewall::lockout_risks` directly. `None` (log unavailable) skips the
-/// check entirely, matching the interactive path's `LogUnavailable` case.
+/// Same safety check the interactive render runs, except the connected
+/// clients are already known from the pass that read the SSH log, so this
+/// applies `firewall::lockout_risks` directly. `None` (log unavailable)
+/// skips the check entirely, matching the interactive path's
+/// `LogUnavailable` case.
 ///
 /// **Writes, and applies only when told to twice.** A script on disk does
 /// nothing until someone runs it, and that stays the default; see this
 /// module's docs for why the line is where it is. `Db::get_auto_apply_firewall`
 /// moves it, and even then this refuses unless the lockout guard actually
-/// *ran* — `ssh_log_text` of `None` means it could not, which the
+/// *ran* — `connected` of `None` means it could not, which the
 /// interactive paths treat as a pass and this does not. A person reading
 /// a refusal can get back into the host; a cron job at 3am cannot.
 fn render_firewall(
     db: &Db,
     out_override: Option<&std::path::Path>,
-    ssh_log_text: Option<&str>,
+    connected: Option<&[String]>,
     apply_for_real: bool,
 ) -> String {
     let result: Result<String> = (|| {
@@ -708,9 +681,8 @@ fn render_firewall(
         // Whether the guard *ran*, which is a different fact from whether
         // it objected — and the one that decides if this may apply.
         let mut guard_ran = false;
-        if let Some(text) = ssh_log_text {
-            let connected_ips = crate::sshlog::parse_accepted_ips(text);
-            let risks = crate::firewall::lockout_risks(&built.rules, &connected_ips);
+        if let Some(connected_ips) = connected {
+            let risks = crate::firewall::lockout_risks(&built.rules, connected_ips);
             if !risks.is_empty() {
                 anyhow::bail!(
                     "skipped: would block {} currently-connected SSH client IP address(es)",
@@ -868,9 +840,9 @@ mod tests {
         .unwrap();
         db.set_auto_apply_firewall(true).unwrap();
 
-        // `None` is what `read_log_for` hands over when no SSH log could
-        // be read — a file that is not there, or a `journalctl` with
-        // nothing in it.
+        // `None` is what a pass hands over when no SSH log could be read
+        // -- a file that is not there, or a `journalctl` with nothing in
+        // it.
         let summary = render_firewall(&db, Some(&out), None, true);
 
         assert!(out.exists(), "the script should still be written");
@@ -894,7 +866,7 @@ mod tests {
         let db = test_db();
         assert!(!db.get_auto_apply_firewall().unwrap(), "off is the default");
 
-        let summary = render_firewall(&db, Some(&out), Some(""), true);
+        let summary = render_firewall(&db, Some(&out), Some(&[]), true);
 
         assert!(out.exists());
         assert!(summary.starts_with("wrote "), "{summary}");
@@ -912,7 +884,7 @@ mod tests {
 
         // An empty log reads as "no connected clients", so the guard runs
         // and finds nothing — the one case that would otherwise apply.
-        let summary = render_firewall(&db, Some(&out), Some(""), false);
+        let summary = render_firewall(&db, Some(&out), Some(&[]), false);
 
         assert!(summary.contains("not applied (--no-apply)"), "{summary}");
     }
@@ -1143,81 +1115,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn read_log_for_reads_the_ssh_log_it_is_given() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.log");
-        std::fs::write(&path, "a line from the fixture\n").unwrap();
-
-        let text = read_log_for(
-            CronJob::Detect(Detector::SshScanners),
-            &crate::logpaths::LogPaths::default(),
-            Some(&path),
-        );
-
-        assert_eq!(text.as_deref(), Some("a line from the fixture\n"));
+    /// A log pass over `jobs`, with both logs pointed at files in `dir`.
+    fn pass(db: &Db, dir: &std::path::Path, jobs: &[CronJob]) -> Vec<(CronJob, String)> {
+        let flags = crate::logscan::Flags {
+            ssh_log: Some(dir.join("auth.log")),
+            access_log: Some(dir.join("access.log")),
+        };
+        let applied = crate::logscan::run(db, jobs, &flags).unwrap();
+        run_log_jobs(db, jobs, &applied, Some(&dir.join("fw.nft")), false).unwrap()
     }
 
-    /// A path that isn't there is "unavailable", not a panic and not a
-    /// fallback to whatever log the host happens to have — an explicit
-    /// `--ssh-log` that is wrong should say so through the job's summary
-    /// rather than quietly reading something else.
-    #[test]
-    fn read_log_for_reports_a_missing_ssh_log_as_unavailable() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let text = read_log_for(
-            CronJob::Detect(Detector::SshScanners),
-            &crate::logpaths::LogPaths::default(),
-            Some(&dir.path().join("nope.log")),
-        );
-
-        assert_eq!(text, None);
-    }
-
-    /// Recording happens on *every* SSH-log-backed job, not in one
-    /// designated place — that is what keeps the window fed minute by
+    /// Recording happens on every pass that reads the SSH log, not in one
+    /// designated place -- that is what keeps the window fed minute by
     /// minute, and what makes an address survive the rotation that drops
     /// the log line proving the login.
     #[test]
-    fn an_ssh_log_job_records_the_addresses_it_saw_logins_from() {
+    fn an_ssh_log_pass_records_the_addresses_it_saw_logins_from() {
         let db = test_db();
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("fw.nft");
-        let log = "Accepted publickey for m from 203.0.113.5 port 55000 ssh2\n";
-
-        run_log_job(
-            &db,
-            CronJob::Detect(Detector::SshScanners),
-            Some(log),
-            Some(&out),
-            false,
+        std::fs::write(
+            dir.path().join("auth.log"),
+            "Accepted publickey for m from 203.0.113.5 port 55000 ssh2\n",
         )
         .unwrap();
+
+        pass(&db, dir.path(), &[CronJob::Detect(Detector::SshScanners)]);
 
         assert_eq!(db.recent_ssh_login_ips().unwrap(), vec!["203.0.113.5"]);
     }
 
-    /// A job that reads the *access* log must not touch this table: its
-    /// text has nothing to do with SSH, and parsing it as if it did would
-    /// be how a stray "Accepted " in a request path becomes an allowlist
-    /// entry.
+    /// A pass that reads only the *access* log must not touch this table:
+    /// its text has nothing to do with SSH, and parsing it as if it did
+    /// would be how a stray "Accepted " in a request path becomes an
+    /// allowlist entry.
     #[test]
-    fn an_access_log_job_records_no_ssh_logins() {
+    fn an_access_log_pass_records_no_ssh_logins() {
         let db = test_db();
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("fw.nft");
-        let log = "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \
-                   \"GET /Accepted%20for%20x%20from%20y HTTP/1.1\" 200 1 \"-\" \"UA\"\n";
-
-        run_log_job(
-            &db,
-            CronJob::RecordAccessStats,
-            Some(log),
-            Some(&out),
-            false,
+        std::fs::write(
+            dir.path().join("access.log"),
+            "203.0.113.5 - - [10/Jul/2026:12:00:00 +0000] \
+             \"GET /Accepted%20for%20x%20from%20y HTTP/1.1\" 200 1 \"-\" \"UA\"\n",
         )
         .unwrap();
+
+        pass(&db, dir.path(), &[CronJob::RecordAccessStats]);
 
         assert!(db.recent_ssh_login_ips().unwrap().is_empty());
     }
@@ -1230,20 +1172,21 @@ mod tests {
     fn a_job_that_could_not_do_anything_still_records_why() {
         let db = test_db();
         let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("fw.nft");
         let detector = Detector::SshScanners;
+        let summary_of = |db: &Db, job: CronJob| pass(db, dir.path(), &[job])[0].1.clone();
 
         detector.set_enabled(&db, false).unwrap();
-        let summary = run_log_job(&db, CronJob::Detect(detector), None, Some(&out), false).unwrap();
-        assert_eq!(summary, "disabled");
+        assert_eq!(summary_of(&db, CronJob::Detect(detector)), "disabled");
 
         detector.set_enabled(&db, true).unwrap();
-        let summary = run_log_job(&db, CronJob::Detect(detector), None, Some(&out), false).unwrap();
-        assert_eq!(summary, "SSH log unavailable");
-
-        let summary =
-            run_log_job(&db, CronJob::RecordAccessStats, None, Some(&out), false).unwrap();
-        assert_eq!(summary, "NGINX access log unavailable");
+        assert_eq!(
+            summary_of(&db, CronJob::Detect(detector)),
+            "SSH log unavailable"
+        );
+        assert_eq!(
+            summary_of(&db, CronJob::RecordAccessStats),
+            "NGINX access log unavailable"
+        );
 
         // Recorded, not just returned — a job that ran and reported
         // nothing is indistinguishable from one that never ran.
@@ -1257,6 +1200,72 @@ mod tests {
                 .as_deref(),
             Some("SSH log unavailable")
         );
+    }
+
+    /// The guard of a scheduled render is fed by the pass that read the
+    /// SSH log: a client that logged in is never cut off, whatever rule
+    /// covers it.
+    #[test]
+    fn a_scheduled_render_refuses_to_cut_off_a_client_it_saw_log_in() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.log"), "").unwrap();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "203.0.113.0/24".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+        })
+        .unwrap();
+
+        // Readable and empty: the guard runs and passes.
+        let summaries = pass(&db, dir.path(), &[CronJob::RenderFirewall]);
+        assert!(summaries[0].1.starts_with("wrote "), "{summaries:?}");
+
+        // A login from inside the block, since the last pass: recorded,
+        // and so allowed ahead of the block rather than refused.
+        std::fs::write(
+            dir.path().join("auth.log"),
+            "Accepted publickey for m from 203.0.113.5 port 1 ssh2\n",
+        )
+        .unwrap();
+        let summaries = pass(&db, dir.path(), &[CronJob::RenderFirewall]);
+        assert!(summaries[0].1.starts_with("wrote "), "{summaries:?}");
+        assert_eq!(db.recent_ssh_login_ips().unwrap(), ["203.0.113.5"]);
+    }
+
+    /// The whole loop end to end, through real files: a probe is blocked,
+    /// the block lapses, the next minute's pass reads the same log and
+    /// blocks nothing, and a new probe is blocked again.
+    #[test]
+    fn a_lapsed_block_is_re_added_only_when_the_offence_is_repeated() {
+        use crate::testing::{nginx_time, now_secs};
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        let probe = |at: i64| {
+            format!(
+                "203.0.113.5 - - [{}] \"GET /.env HTTP/1.1\" 404 1 \"-\" \"curl/8\"\n",
+                nginx_time(at)
+            )
+        };
+        std::fs::write(&log, probe(now_secs() - 60)).unwrap();
+        let job = [CronJob::Detect(Detector::ProbePaths)];
+
+        assert_eq!(pass(&db, dir.path(), &job)[0].1, "blocked 1 IP(s)");
+
+        // The block lapses: pruned, as `list_firewall_rules` does once its
+        // time is up.
+        let id = db.list_firewall_rules().unwrap()[0].id;
+        db.remove_firewall_rule(id).unwrap();
+        assert_eq!(
+            pass(&db, dir.path(), &job)[0].1,
+            "no probing IPs found",
+            "the old line brought it back"
+        );
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut file, probe(now_secs()).as_bytes()).unwrap();
+        assert_eq!(pass(&db, dir.path(), &job)[0].1, "blocked 1 IP(s)");
     }
 
     #[test]

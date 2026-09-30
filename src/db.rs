@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod evidence;
 pub mod keys;
 mod managed;
 pub mod schema;
@@ -1716,7 +1717,7 @@ impl Db {
     /// **Unattended, the anti-lockout guard refuses when it cannot run.**
     /// The interactive paths treat `LockoutStatus::LogUnavailable` as a
     /// pass — reasonable when a person is reading the result and can get
-    /// back in. The cron reads the SSH log through `read_log_for`, which
+    /// back in. The cron reads the SSH log through `logscan`, which
     /// falls back to `journalctl` and can legitimately come back with
     /// nothing, and "the check could not run" is not "the check passed"
     /// when nobody is watching. So this path applies only when the guard
@@ -1901,19 +1902,23 @@ impl Db {
         counts: &HashMap<String, u64>,
         seen_at: i64,
     ) -> Result<()> {
-        self.batch(|| {
-            let mut upsert = self.conn.prepare_cached(
-                "INSERT INTO user_agent_stats (user_agent, hit_count, last_seen_at)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(user_agent) DO UPDATE SET
-                    hit_count = hit_count + excluded.hit_count,
-                    last_seen_at = excluded.last_seen_at",
-            )?;
-            for (user_agent, count) in counts {
-                upsert.execute(params![user_agent, *count as i64, seen_at])?;
-            }
-            Ok(())
-        })
+        self.batch(|| self.upsert_user_agent_hits(counts, seen_at))
+    }
+
+    /// [`Self::record_user_agent_hits`] without its transaction, for a
+    /// caller that is already inside one (see `Db::ingest`).
+    fn upsert_user_agent_hits(&self, counts: &HashMap<String, u64>, seen_at: i64) -> Result<()> {
+        let mut upsert = self.conn.prepare_cached(
+            "INSERT INTO user_agent_stats (user_agent, hit_count, last_seen_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(user_agent) DO UPDATE SET
+                hit_count = hit_count + excluded.hit_count,
+                last_seen_at = excluded.last_seen_at",
+        )?;
+        for (user_agent, count) in counts {
+            upsert.execute(params![user_agent, *count as i64, seen_at])?;
+        }
+        Ok(())
     }
 
     /// Every recorded user agent's accumulated hit count, most-seen first —

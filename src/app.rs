@@ -259,7 +259,7 @@ struct RenderRequest {
     out_path: String,
     force: bool,
     apply: bool,
-    ssh_log: Option<std::path::PathBuf>,
+    ssh_log: crate::sshlog::SshSource,
 }
 
 /// A successful background render, for the main thread to record.
@@ -305,7 +305,7 @@ fn render_firewall_off_thread(
     // apply the script immediately, so it refuses instead. `--force`, or
     // the CLI, remains the way through for someone who knows the log is
     // missing and means it anyway.
-    match crate::firewall::assess_lockout_risk(&built.rules, ssh_log.as_deref()) {
+    match crate::firewall::assess_lockout_risk(&built.rules, &ssh_log) {
         crate::firewall::LockoutStatus::LogUnavailable if !force => {
             return Err(
                 "refusing to write: no SSH log could be read, so the lockout safety \
@@ -550,8 +550,8 @@ impl App {
             Event::App(AppEvent::CronIpRangesFetched { results }) => {
                 self.finish_cron_update_ip_ranges(results)?;
             }
-            Event::App(AppEvent::CronLogFetched { job, log_text }) => {
-                self.finish_cron_log_job(job, log_text)?;
+            Event::App(AppEvent::CronLogRead { jobs, read }) => {
+                self.finish_cron_log_pass(jobs, *read)?;
             }
             Event::App(AppEvent::SshLogRead { text }) => self.finish_ssh_log_read(text)?,
             Event::App(AppEvent::NginxReloaded { result }) => self.finish_nginx_reload(result),
@@ -831,7 +831,15 @@ impl App {
         if due.is_empty() {
             return Ok(());
         }
-        for job in due {
+        // Every due job that reads a log goes in one pass, which reads each
+        // log once for all of them.
+        let (log_jobs, others): (Vec<CronJob>, Vec<CronJob>) = due
+            .into_iter()
+            .partition(|job| crate::cron::is_log_job(*job));
+        if !log_jobs.is_empty() {
+            self.start_cron_log_pass(log_jobs);
+        }
+        for job in others {
             self.run_cron_job(job)?;
         }
         self.refresh()?;
@@ -842,7 +850,7 @@ impl App {
         match job {
             CronJob::UpdateIpRanges => self.start_cron_update_ip_ranges(),
             CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
-                self.start_cron_log_job(job)
+                self.start_cron_log_pass(vec![job])
             }
             CronJob::HealthCheck => self.start_cron_health_check(),
             // Runs inline rather than on the blocking pool like its
@@ -950,36 +958,46 @@ impl App {
         Ok(())
     }
 
-    /// Starts the log-resolution step of a `BlockScanners`/
-    /// `BlockWebScanners`/`RecordAccessStats`/`RenderFirewall` cron job on
-    /// a background thread. `find_default_source` (`sshlog`/`accesslog`) is
-    /// blocking I/O — reading the log file directly, and for the SSH log,
-    /// shelling out to `journalctl` as a fallback when no log file exists —
-    /// which was hanging the whole TUI (nothing redraws or handles input
-    /// while the main thread blocks on it). `tokio::task::spawn_blocking`
-    /// runs this on Tokio's separate blocking-thread pool rather than a
-    /// worker thread the event loop needs, unlike `start_cron_update_ip_ranges`
-    /// (real async I/O, so a plain `tokio::spawn` task is enough there).
-    /// Guarded by `jobs_in_flight`, same reasoning as `UpdateIpRanges`.
-    /// Only the log *read* moves off-thread: the parsing/counting/`Db`
-    /// writes that follow stay on the main thread in `finish_cron_log_job`,
-    /// same `Db`-isn't-`Sync` pattern as every other background task here —
-    /// they're fast (in-memory line scans), so there's no benefit to moving
-    /// them and a second `Db` connection would fight that pattern for no
-    /// reason.
-    fn start_cron_log_job(&mut self, job: CronJob) {
-        if !self.jobs_in_flight.insert(Job::Cron(job)) {
+    /// Starts one log pass for `jobs` (see [`crate::logscan`]): the plan
+    /// here, on the main thread that owns the `Db`; the read and the parse
+    /// on the blocking pool; storing what it found and each job's decision
+    /// back here in [`Self::finish_cron_log_pass`].
+    ///
+    /// **One pass at a time.** This used to start one read per job, each
+    /// on its own blocking thread, so a fresh start ran a dozen full reads
+    /// of the access log at once: 2.9 GB of memory for a 200 MB log. While
+    /// a pass is out, due jobs wait for the next tick rather than starting
+    /// a second one; the pass they would have joined is reading the same
+    /// lines anyway.
+    fn start_cron_log_pass(&mut self, jobs: Vec<CronJob>) {
+        let in_flight = self
+            .jobs_in_flight
+            .iter()
+            .any(|job| matches!(job, Job::Cron(cron) if crate::cron::is_log_job(*cron)));
+        if in_flight {
             return;
         }
+        let flags = crate::logscan::Flags {
+            ssh_log: self.ssh_log.clone(),
+            access_log: None,
+        };
+        let plan = match crate::logscan::plan(&self.db, &jobs, &flags) {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.message = Some(format!("The scheduled log scan could not start: {err:#}"));
+                return;
+            }
+        };
+        for job in &jobs {
+            self.jobs_in_flight.insert(Job::Cron(*job));
+        }
         let sender = self.events.sender();
-        let ssh_log = self.ssh_log.clone();
-        // Resolved here, on the main thread that owns the `Db`, and moved
-        // into the worker -- `read_log_for` deliberately cannot reach the
-        // database itself.
-        let log_paths = crate::logpaths::LogPaths::from_db(&self.db).unwrap_or_default();
         tokio::task::spawn_blocking(move || {
-            let log_text = crate::cron::read_log_for(job, &log_paths, ssh_log.as_deref());
-            let _ = sender.send(Event::App(AppEvent::CronLogFetched { job, log_text }));
+            let read = crate::logscan::read(&plan);
+            let _ = sender.send(Event::App(AppEvent::CronLogRead {
+                jobs,
+                read: Box::new(read),
+            }));
         });
     }
 
@@ -1197,13 +1215,13 @@ impl App {
             return;
         }
         let sender = self.events.sender();
-        let ssh_log = self.ssh_log.clone();
+        // Through the stored paths, like every other reader of this log:
+        // `set-log-paths --ssh-log` used to be ignored here.
+        let source = crate::logpaths::LogPaths::from_db(&self.db)
+            .unwrap_or_default()
+            .ssh(self.ssh_log.as_deref());
         tokio::task::spawn_blocking(move || {
-            let source = match ssh_log.as_deref() {
-                Some(path) => crate::sshlog::read_log_file(path),
-                None => crate::sshlog::find_default_source(),
-            };
-            let text = match source {
+            let text = match source.read(crate::sshlog::recent_since()) {
                 crate::sshlog::LogSource::Found(text) => Some(text),
                 crate::sshlog::LogSource::Unavailable => None,
             };
@@ -1229,23 +1247,23 @@ impl App {
         Ok(())
     }
 
-    /// Applies a log cron job's background-resolved log text (`None` if
-    /// the log was unavailable) back on the main thread, then refreshes
-    /// every screen — mirroring `finish_cron_update_ip_ranges`. The job
-    /// itself, and the recording of its outcome, is
-    /// [`crate::cron::run_log_job`]: shared with the web front-end so that
-    /// the two can't drift.
-    fn finish_cron_log_job(&mut self, job: CronJob, log_text: Option<String>) -> Result<()> {
-        self.jobs_in_flight.remove(&Job::Cron(job));
+    /// Stores what a background log pass read, then runs each of its jobs
+    /// on it, back on the main thread -- mirroring
+    /// `finish_cron_update_ip_ranges`. Both halves are shared with the web
+    /// front-end ([`crate::logscan::apply`], [`crate::cron::run_log_jobs`])
+    /// so that the two can't drift.
+    fn finish_cron_log_pass(
+        &mut self,
+        jobs: Vec<CronJob>,
+        read: crate::logscan::Read,
+    ) -> Result<()> {
+        for job in &jobs {
+            self.jobs_in_flight.remove(&Job::Cron(*job));
+        }
+        let applied = crate::logscan::apply(&self.db, read)?;
         // `None`: no override, so the path follows the stored backend —
         // an nftables render lands in `.nft` and an iptables one in `.sh`.
-        crate::cron::run_log_job(
-            &self.db,
-            job,
-            log_text.as_deref(),
-            None,
-            self.apply_firewall,
-        )?;
+        crate::cron::run_log_jobs(&self.db, &jobs, &applied, None, self.apply_firewall)?;
         self.refresh()?;
         Ok(())
     }
@@ -1293,7 +1311,9 @@ impl App {
         self.jobs_in_flight.insert(Job::RenderFirewall);
         let signature = crate::firewall::rules_signature(&built.rules);
         let apply = apply && self.apply_firewall;
-        let ssh_log = self.ssh_log.clone();
+        let ssh_log = crate::logpaths::LogPaths::from_db(&self.db)
+            .unwrap_or_default()
+            .ssh(self.ssh_log.as_deref());
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
             let outcome = render_firewall_off_thread(
@@ -2250,10 +2270,10 @@ mod tests {
         assert_eq!(app.screen, Screen::BotSettings);
     }
 
-    /// The four log-based cron jobs now resolve their log source on a
-    /// background thread (see `App::start_cron_log_job`) rather than
+    /// The log-based cron jobs read their logs in one pass on a
+    /// background thread (see `App::start_cron_log_pass`) rather than
     /// running inline, so tests that trigger them via `check_cron` must
-    /// drive the resulting `CronLogFetched` events through the same
+    /// drive the resulting `CronLogRead` event through the same
     /// `handle_event` dispatch `App::run` uses before asserting on `Db`
     /// state. Drains until `jobs_in_flight` (populated synchronously
     /// by `check_cron` before this is called) is empty again, rather than a
@@ -2696,7 +2716,7 @@ mod tests {
     /// (`BlockScanners`/`BlockWebScanners`/`RecordAccessStats`/
     /// `RenderFirewall` — no network I/O, so safe to exercise directly
     /// rather than mocking) and record each one's state, once their
-    /// background `CronLogFetched` events are drained. `UpdateIpRanges` is
+    /// background `CronLogRead` event is drained. `UpdateIpRanges` is
     /// deliberately pre-marked as just-run so this test never triggers its
     /// real network fetch.
     #[tokio::test]
@@ -2731,6 +2751,55 @@ mod tests {
             .get_cron_last_run(CronJob::RenderFirewall.id())
             .unwrap()
             .is_some());
+    }
+
+    /// Every due log job goes in one pass, and a second check while that
+    /// pass is out starts no other: the TUI used to start one full read
+    /// per job, all at once, which on a 200 MB log was 2.9 GB of memory.
+    #[tokio::test]
+    async fn due_log_jobs_share_one_pass_and_a_pass_never_overlaps_another() {
+        let mut app = test_app();
+        app.db
+            .set_cron_last_run(CronJob::UpdateIpRanges.id(), now_secs(), "skipped for test")
+            .unwrap();
+        let backdate = |app: &mut App| {
+            app.last_cron_check =
+                std::time::Instant::now() - CRON_CHECK_INTERVAL - std::time::Duration::from_secs(1);
+        };
+
+        backdate(&mut app);
+        app.check_cron().unwrap();
+        let in_flight = app.jobs_in_flight.clone();
+        backdate(&mut app);
+        app.check_cron().unwrap();
+
+        let mut passes = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(150);
+        while !app.jobs_in_flight.is_empty() || std::time::Instant::now() < deadline {
+            let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), app.events.next())
+                    .await
+                    .map(Result::ok)
+            else {
+                continue;
+            };
+            if matches!(event, Event::App(AppEvent::CronLogRead { .. })) {
+                passes += 1;
+            }
+            app.handle_event(event).unwrap();
+        }
+
+        assert_eq!(passes, 1, "one pass for every due log job");
+        for job in CronJob::all()
+            .into_iter()
+            .filter(|j| crate::cron::is_log_job(*j))
+        {
+            assert!(
+                in_flight.contains(&Job::Cron(job)),
+                "{} was not in it",
+                job.id()
+            );
+        }
     }
 
     /// `check_cron` throttles against `Event::Tick`'s 30fps rate: two

@@ -222,11 +222,27 @@ pub struct Probe {
     /// counts the right number of rules, while enforcing none of them for
     /// anything behind a published container port.
     pub firewall_covers_forward: Option<bool>,
-    /// `(public, parsed)` client addresses in the access log — see
-    /// [`crate::accesslog::client_address_mix`]. `None` when the log could
-    /// not be read, which [`log_sources`] already reports.
+    /// `(public, parsed)` client addresses in the access log's tail — see
+    /// [`crate::accesslog::Survey::public`]. `None` when the log could not
+    /// be read, which [`log_sources`] already reports.
     pub access_log_clients: Option<(usize, usize)>,
+    /// `(lines, parsed)`: how many non-empty lines the access log's tail
+    /// held, and how many of them are in a format the detectors read.
+    /// `None` when the log could not be read. See [`access_log_format`].
+    #[serde(default)]
+    pub access_log_lines: Option<(usize, usize)>,
+    /// The first line of that tail that did not parse, cut short and with
+    /// its control characters replaced (it is the client's text).
+    #[serde(default)]
+    pub access_log_unparsed_sample: Option<String>,
 }
+
+/// How much of the access log a probe reads: its last 32 MB. Every
+/// question the probe asks of the log (which formats it holds, whose
+/// addresses it records, whom it turns away) a recent sample answers as
+/// well as the whole file, and the whole file was the one expensive thing
+/// in a probe: on a 1 GB server, a 200 MB log read into memory twice over.
+pub const ACCESS_LOG_SAMPLE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Where the NGINX serving this host's config runs, as far as this host
 /// can tell from outside it.
@@ -279,6 +295,14 @@ const LOW_DISK_BYTES: u64 = 256 * 1024 * 1024;
 /// size of.
 const LARGE_DB_BYTES: u64 = 128 * 1024 * 1024;
 
+/// The last [`ACCESS_LOG_SAMPLE_BYTES`] of the access log at `path`, read
+/// through a [`crate::accesslog::Survey`], or `None` if it cannot be read.
+fn access_log_sample(path: &Path, block_status: u16) -> Option<crate::accesslog::Survey> {
+    let mut survey = crate::accesslog::Survey::new(block_status);
+    crate::logread::read_tail(path, ACCESS_LOG_SAMPLE_BYTES, &mut |line| survey.line(line)).ok()?;
+    Some(survey)
+}
+
 /// Runs everything that needs a subprocess or the filesystem.
 ///
 /// Never fails: a probe that cannot answer a question leaves that field
@@ -298,10 +322,11 @@ pub fn probe(
         Some(state) => (Some(state.rules), Some(backend.stored().to_string())),
         None => (None, None),
     };
-    // Read once and answer both questions from it: two reads would be two
-    // different moments, and this one shells out to nothing but the
-    // filesystem.
-    let access_log = paths.access_source(None);
+    // Read once, and only the tail, and every access-log question answered
+    // from that one pass: two reads would be two different moments.
+    let sample = access_log_sample(&paths.access_path(None), block_status);
+    let access_readable = sample.is_some();
+    let survey = sample.unwrap_or_default();
     let nginx_home = nginx_home();
     let container = match &nginx_home {
         NginxHome::Container { name } => Some(name.clone()),
@@ -310,15 +335,8 @@ pub fn probe(
     Probe {
         live_rules,
         live_backend,
-        // From the same read as every other access-log answer below: the
-        // log can be tens of megabytes and reading it twice in one probe
-        // would be the only expensive thing here.
-        turned_away: match &access_log {
-            crate::accesslog::LogSource::Found(text) => {
-                crate::accesslog::turned_away_user_agents(text, block_status)
-            }
-            crate::accesslog::LogSource::Unavailable => Vec::new(),
-        },
+        // From the same read as every other access-log answer below.
+        turned_away: survey.turned_away(),
         conf_d_path: Some(conf_d.display().to_string()),
         conf_d_exists: Some(conf_d.is_dir()),
         stray_generated_files: stray_generated_files(conf_d, Path::new(crate::nginx::CONF_D_DIR)),
@@ -327,18 +345,14 @@ pub fn probe(
         unit_active: unit_is_active(),
         unit_binary: unit_binary(),
         db_free_bytes: free_bytes(db_path),
-        ssh_log_readable: Some(matches!(
-            paths.ssh_source(ssh_log),
-            crate::sshlog::LogSource::Found(_)
-        )),
-        access_log_readable: Some(matches!(&access_log, crate::accesslog::LogSource::Found(_))),
+        // Asked, not read: this used to read the whole log, which on a
+        // journald host was the whole sshd journal, once an hour.
+        ssh_log_readable: Some(paths.ssh(ssh_log).is_readable()),
+        access_log_readable: Some(access_readable),
         access_log_path: Some(paths.access_description(None)),
-        access_log_clients: match &access_log {
-            crate::accesslog::LogSource::Found(text) => {
-                Some(crate::accesslog::client_address_mix(text))
-            }
-            crate::accesslog::LogSource::Unavailable => None,
-        },
+        access_log_clients: access_readable.then_some((survey.public, survey.counts.parsed)),
+        access_log_lines: access_readable.then_some((survey.counts.lines, survey.counts.parsed)),
+        access_log_unparsed_sample: survey.unparsed_sample.clone(),
         nginx_home,
         managed_dir_in_container: container.as_ref().map(|name| {
             // `test -d` inside the container, at the path the generated
@@ -801,6 +815,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(disk_room(probe));
     checks.push(database_size(db)?);
     checks.push(log_sources(probe));
+    checks.push(access_log_format(probe));
     checks.push(access_log_clients(probe));
     checks.push(ssh_login_allowlist(db)?);
     if let Some(check) = trusted_by_hand(db)? {
@@ -1371,6 +1386,14 @@ fn access_log_clients(probe: &Probe) -> Check {
         // `log_sources` already reports an unreadable log; saying it twice
         // in one report is noise, not emphasis.
         None => (Level::Unknown, "no access log to read".to_string(), None),
+        // Nothing parsed from lines that are there is a format the
+        // detectors cannot read, which `access_log_format` reports; "no
+        // requests recorded yet" was the wrong thing to say about it.
+        Some((_, 0)) if probe.access_log_lines.is_some_and(|(lines, _)| lines > 0) => (
+            Level::Unknown,
+            "none of the logged requests could be read".to_string(),
+            None,
+        ),
         // Not a misconfiguration. A host that has served nothing yet has
         // nothing to say about who it served.
         Some((_, 0)) => (Level::Ok, "no requests recorded yet".to_string(), None),
@@ -1396,6 +1419,60 @@ fn access_log_clients(probe: &Probe) -> Check {
     Check {
         id: "access-log-clients",
         title: "Access log records real clients",
+        level,
+        detail,
+        fix,
+    }
+}
+
+/// Below this share of lines parsed, the access log is mostly in a format
+/// the detectors cannot read. Not zero: a log that parses to nothing is
+/// the obvious case, but a custom `log_format` added beside the stock one
+/// leaves a file that parses in part, and the detectors see only that
+/// part.
+const ACCESS_LOG_MIN_PARSED: f64 = 0.5;
+
+/// Whether the access log is in a format the detectors read.
+///
+/// The failure this exists for is silent: a custom `log_format` parses to
+/// nothing, every detector finds nothing, and the report used to say OK,
+/// "no requests recorded yet", about a log with a million lines in it.
+/// So the lines that did not parse are counted against those that did,
+/// and one of them is quoted, because the next question is always "what
+/// does my log look like, then".
+fn access_log_format(probe: &Probe) -> Check {
+    let (level, detail, fix) = match probe.access_log_lines {
+        // `log_sources` reports an unreadable log.
+        None => (Level::Unknown, "no access log to read".to_string(), None),
+        Some((0, _)) => (Level::Ok, "no requests recorded yet".to_string(), None),
+        Some((lines, parsed)) if (parsed as f64) < lines as f64 * ACCESS_LOG_MIN_PARSED => {
+            let sample = probe
+                .access_log_unparsed_sample
+                .as_deref()
+                .map(|line| format!("; one of them: {line}"))
+                .unwrap_or_default();
+            (
+                Level::Warn,
+                format!(
+                    "only {parsed} of {lines} recent line(s) are in a format the detectors read{sample}"
+                ),
+                Some(
+                    "log in NGINX's `combined` format, or a JSON `log_format ... escape=json` \
+                     keyed by the variable names (remote_addr, status, request_uri or request, \
+                     http_referer, http_user_agent, time_local or time_iso8601)"
+                        .to_string(),
+                ),
+            )
+        }
+        Some((lines, parsed)) => (
+            Level::Ok,
+            format!("{parsed} of {lines} recent line(s) read"),
+            None,
+        ),
+    };
+    Check {
+        id: "access-log-format",
+        title: "Access log format is readable",
         level,
         detail,
         fix,
@@ -1769,6 +1846,8 @@ mod tests {
             access_log_readable: Some(true),
             access_log_path: None,
             access_log_clients: Some((40, 41)),
+            access_log_lines: Some((41, 41)),
+            access_log_unparsed_sample: None,
             // The ordinary host: NGINX is a unit here, and the two
             // container fields have nothing to answer. Every
             // container-arrangement test below states its own.
@@ -2367,12 +2446,14 @@ mod tests {
             &db(),
             &Probe {
                 access_log_clients: Some((0, 0)),
+                access_log_lines: Some((0, 0)),
                 ..healthy()
             },
         )
         .unwrap();
 
         assert_eq!(check2(&report, "access-log-clients").level, Level::Ok);
+        assert_eq!(check2(&report, "access-log-format").level, Level::Ok);
     }
 
     /// One private client among public ones is ordinary — a monitoring
@@ -3154,5 +3235,108 @@ mod tests {
         assert_eq!(human_bytes(512), "512.0B");
         assert_eq!(human_bytes(1536), "1.5KB");
         assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0GB");
+    }
+
+    /// A custom `log_format`: a million lines, none of them read, and the
+    /// report used to call it OK.
+    #[test]
+    fn a_log_mostly_in_an_unread_format_is_a_warning_that_quotes_it() {
+        let db = db();
+        let report = assess(
+            &db,
+            &Probe {
+                access_log_lines: Some((1000, 10)),
+                access_log_clients: Some((10, 10)),
+                access_log_unparsed_sample: Some("203.0.113.5 my-format /x".to_string()),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        let check = check2(&report, "access-log-format");
+        assert_eq!(check.level, Level::Warn, "{check:?}");
+        assert!(
+            check.detail.contains("10 of 1000") && check.detail.contains("my-format"),
+            "{}",
+            check.detail
+        );
+        let fix = check.fix.as_deref().unwrap_or_default();
+        assert!(
+            fix.contains("combined") && fix.contains("escape=json"),
+            "{fix}"
+        );
+    }
+
+    /// And the check beside it no longer calls an unread log empty.
+    #[test]
+    fn a_log_that_parses_to_nothing_is_not_reported_as_empty() {
+        let db = db();
+        let report = assess(
+            &db,
+            &Probe {
+                access_log_lines: Some((500, 0)),
+                access_log_clients: Some((0, 0)),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(check2(&report, "access-log-format").level, Level::Warn);
+        let clients = check2(&report, "access-log-clients");
+        assert!(
+            !clients.detail.contains("no requests recorded yet"),
+            "{clients:?}"
+        );
+    }
+
+    #[test]
+    fn a_log_that_mostly_parses_is_fine() {
+        let db = db();
+        let report = assess(
+            &db,
+            &Probe {
+                access_log_lines: Some((100, 60)),
+                ..healthy()
+            },
+        )
+        .unwrap();
+        assert_eq!(check2(&report, "access-log-format").level, Level::Ok);
+    }
+
+    /// A probe stored by an older version has no line counts; it still
+    /// parses, and the new check has nothing to say about it.
+    #[test]
+    fn a_probe_from_before_the_format_check_still_reads() {
+        let mut stored = serde_json::to_value(healthy()).unwrap();
+        let object = stored.as_object_mut().unwrap();
+        object.remove("access_log_lines");
+        object.remove("access_log_unparsed_sample");
+        let probe: Probe = serde_json::from_value(stored).unwrap();
+        assert_eq!(probe.access_log_lines, None);
+    }
+
+    /// The probe's sample of a real file: counts, quoted line and all.
+    #[test]
+    fn the_access_log_sample_counts_its_lines_and_quotes_one_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        std::fs::write(
+            &log,
+            "203.0.113.5 - - [28/Sep/2026:06:33:01 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"UA\"\n\
+             custom \x1b[2J format\n",
+        )
+        .unwrap();
+
+        let survey = access_log_sample(&log, 403).expect("readable");
+
+        assert_eq!(
+            (survey.counts.lines, survey.counts.parsed, survey.public),
+            (2, 1, 1)
+        );
+        assert_eq!(
+            survey.unparsed_sample.as_deref(),
+            Some("custom \u{fffd}[2J format")
+        );
+        assert!(access_log_sample(&dir.path().join("none.log"), 403).is_none());
     }
 }

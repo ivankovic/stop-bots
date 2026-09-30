@@ -101,22 +101,28 @@ impl LogPaths {
 
     /// The access log this run should read: the flag if given, else the
     /// stored path, else the module default.
+    pub fn access_path(&self, flag: Option<&Path>) -> PathBuf {
+        flag.or(self.access.as_deref())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(crate::accesslog::DEFAULT_LOG_PATH))
+    }
+
+    /// [`Self::access_path`], read whole. For the one-off CLI commands;
+    /// everything that runs on a schedule reads incrementally instead (see
+    /// [`crate::logscan`]).
     pub fn access_source(&self, flag: Option<&Path>) -> crate::accesslog::LogSource {
-        match flag.or(self.access.as_deref()) {
-            Some(path) => crate::accesslog::read_log_file(path),
-            None => crate::accesslog::find_default_source(),
-        }
+        crate::accesslog::read_log_file(&self.access_path(flag))
     }
 
     /// The SSH log this run should read, by the same precedence.
     ///
     /// Note the fallback differs from the access log's: with nothing stored
-    /// and no flag, `sshlog` tries two paths and then `journalctl`, so
+    /// and no flag, `sshlog` tries two paths and then journald, so
     /// "nothing configured" is a real strategy here rather than one guess.
-    pub fn ssh_source(&self, flag: Option<&Path>) -> crate::sshlog::LogSource {
+    pub fn ssh(&self, flag: Option<&Path>) -> crate::sshlog::SshSource {
         match flag.or(self.ssh.as_deref()) {
-            Some(path) => crate::sshlog::read_log_file(path),
-            None => crate::sshlog::find_default_source(),
+            Some(path) => crate::sshlog::SshSource::File(path.to_path_buf()),
+            None => crate::sshlog::SshSource::Search,
         }
     }
 
@@ -159,6 +165,28 @@ mod tests {
         assert_eq!(
             paths.ssh, None,
             "the ssh key was not named, so it is untouched"
+        );
+    }
+
+    /// Every reader of the SSH log goes through here, so a stored path
+    /// reaches the lockout guard, the Firewall screens and the detectors
+    /// alike, and a flag still beats it.
+    #[test]
+    fn the_ssh_log_is_the_flag_then_the_stored_path_then_a_search() {
+        let db = db();
+        assert_eq!(
+            LogPaths::from_db(&db).unwrap().ssh(None),
+            crate::sshlog::SshSource::Search
+        );
+        LogPaths::save(&db, None, Some("/srv/log/auth.log")).unwrap();
+        let paths = LogPaths::from_db(&db).unwrap();
+        assert_eq!(
+            paths.ssh(None),
+            crate::sshlog::SshSource::File("/srv/log/auth.log".into())
+        );
+        assert_eq!(
+            paths.ssh(Some(Path::new("/tmp/other.log"))),
+            crate::sshlog::SshSource::File("/tmp/other.log".into())
         );
     }
 

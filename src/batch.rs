@@ -68,16 +68,17 @@
 //! Dashboard's "Scheduled tasks" panel shows what the *real* cron did
 //! rather than claiming everything is overdue.
 //!
-//! The access-log read offset is shared the same way, and is the easier
-//! half to get wrong: it is keyed by the log's path, so a key of batch's
-//! own would re-tally the whole log on the first run and double-count
-//! every line thereafter. See [`scan_logs`].
+//! Where each log was last read up to is shared the same way (see
+//! [`crate::logscan`]): keyed by the log's path, so a line the console
+//! already read is not read again here, and the other way round. A key of
+//! batch's own would re-read the whole log on the first run and count
+//! every line twice thereafter.
 
 use crate::cron::CronJob;
 use crate::db::Db;
 use crate::firewall::{self, FirewallBackend, LockoutStatus};
 use crate::protection::Detector;
-use crate::{accessstats, nginx, refresh};
+use crate::{nginx, refresh};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -233,62 +234,49 @@ async fn update_lists(db: &Db) -> Vec<Step> {
 /// Records recent SSH logins, tallies the access log and runs every
 /// switched-on detector.
 ///
-/// Both logs are read once and shared across the detectors that want them,
-/// rather than re-read per detector: on a busy server an access log is
-/// tens of megabytes, and eight detectors re-reading it would be eight
-/// times the I/O for identical bytes.
+/// One pass over both logs, the same one the internal cron makes (see
+/// [`crate::logscan`]): each is read once, from where the last reader of
+/// it stopped, whoever that was. The logs are the flags if given and the
+/// stored paths otherwise; `set-log-paths` used to be ignored here.
 fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
-    let mut steps = Vec::new();
-    let access_log =
-        read_log(
-            options.access_log.as_deref(),
-            || match crate::accesslog::find_default_source() {
-                crate::accesslog::LogSource::Found(text) => Some(text),
-                crate::accesslog::LogSource::Unavailable => None,
-            },
-        );
-    let ssh_log = read_log(
-        options.ssh_log.as_deref(),
-        || match crate::sshlog::find_default_source() {
-            crate::sshlog::LogSource::Found(text) => Some(text),
-            crate::sshlog::LogSource::Unavailable => None,
-        },
-    );
-
-    // Before the detectors, as the internal cron does it, and through the
-    // same helper: on a host that runs stop-bots only from crontab this is
-    // the only thing feeding the anti-lockout window, and the firewall step
-    // below renders that window as Allow rules ahead of everything else.
-    let logins = match &ssh_log {
-        Some(text) => crate::cron::record_ssh_logins(db, text)
-            .map(|count| format!("{count} address(es) with a login in the log")),
-        None => Ok("skipped: no SSH log".to_string()),
+    let mut jobs: Vec<CronJob> = Detector::ALL.into_iter().map(CronJob::Detect).collect();
+    jobs.push(CronJob::RecordAccessStats);
+    let flags = crate::logscan::Flags {
+        ssh_log: options.ssh_log.clone(),
+        access_log: options.access_log.clone(),
     };
-    steps.push(Step::new("ssh logins", logins));
-
-    // Keyed by the log's real path, not by anything batch invents. That
-    // key is where `Db` remembers how far into the log has already been
-    // counted, so a key of its own would mean re-tallying the whole log on
-    // the first run and then double-counting every line for as long as
-    // anything else (the TUI, `record-access-stats`) also ran. The number
-    // being inflated is the one Firewall shows an admin when
-    // they decide whether to block a user agent.
-    let log_path = options
-        .access_log
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(crate::accesslog::DEFAULT_LOG_PATH));
-    let stats = match &access_log {
-        Some(text) => accessstats::record_access_stats(db, &log_path.to_string_lossy(), text)
-            .map(|outcome| format!("{} user agent(s)", outcome.distinct_user_agents)),
-        None => Ok("skipped: no NGINX access log".to_string()),
+    let applied = match crate::logscan::run(db, &jobs, &flags) {
+        Ok(applied) => applied,
+        Err(err) => return vec![Step::new("read logs", Err(err))],
     };
-    if stats.is_ok() {
+
+    // Before the detectors, as the internal cron does it: on a host that
+    // runs stop-bots only from crontab this is the only thing feeding the
+    // anti-lockout window, and the firewall step below renders that window
+    // as Allow rules ahead of everything else.
+    let logins = if applied.ssh.is_readable() {
+        Ok(format!(
+            "{} address(es) logged in since the last read",
+            applied.logins.len()
+        ))
+    } else {
+        Ok("skipped: no SSH log".to_string())
+    };
+    let mut steps = vec![Step::new("ssh logins", logins)];
+
+    let stats = if applied.access.is_readable() {
         crate::cron::record_run(db, CronJob::RecordAccessStats, "recorded by batch run");
-    }
+        Ok(format!(
+            "{} user agent(s)",
+            applied.stats.distinct_user_agents
+        ))
+    } else {
+        Ok("skipped: no NGINX access log".to_string())
+    };
     steps.push(Step::new("access stats", stats));
 
     for detector in Detector::ALL {
-        let outcome = run_one_detector(db, detector, &access_log, &ssh_log);
+        let outcome = run_one_detector(db, detector, &applied);
         if let Ok(summary) = &outcome {
             crate::cron::record_run(db, CronJob::Detect(detector), summary);
         }
@@ -300,40 +288,21 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
 fn run_one_detector(
     db: &Db,
     detector: Detector,
-    access_log: &Option<String>,
-    ssh_log: &Option<String>,
+    applied: &crate::logscan::Applied,
 ) -> Result<String> {
     if !detector.is_enabled(db)? {
         return Ok("off".to_string());
     }
     let log = if detector.spec().uses_ssh_log {
-        ssh_log
+        &applied.ssh
     } else {
-        access_log
+        &applied.access
     };
-    let Some(text) = log else {
+    if !log.is_readable() {
         return Ok("skipped: log unavailable".to_string());
-    };
-    let ttl = detector.ttl_days(db)?;
-    Ok(crate::scanblock::run_detector(db, detector, ttl, text, false)?.summary())
-}
-
-/// Reads an override path, or falls back to the project's usual detection.
-/// A missing override is `None` rather than an error: a detector that has
-/// no log to read says so and the run carries on.
-fn read_log(
-    override_path: Option<&Path>,
-    detect: impl FnOnce() -> Option<String>,
-) -> Option<String> {
-    // Lossy, as `sshlog::read_log_file` and `accesslog::read_log_file` are:
-    // both logs carry client-chosen bytes, and one that is not UTF-8 must
-    // not hide the whole file.
-    match override_path {
-        Some(path) => std::fs::read(path)
-            .ok()
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
-        None => detect(),
     }
+    let ttl = detector.ttl_days(db)?;
+    Ok(crate::scanblock::run_detector(db, detector, ttl, applied.now, false)?.summary())
 }
 
 fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
@@ -366,7 +335,7 @@ fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
 fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
     let outcome = (|| -> Result<String> {
         let built = firewall::build_script(db, options.backend)?;
-        lockout_verdict(&built.rules, options)?;
+        lockout_verdict(db, &built.rules, options)?;
 
         firewall::write_script(&options.out, &built.script)?;
         db.set_firewall_rendered_signature(&firewall::rules_signature(&built.rules))?;
@@ -398,11 +367,16 @@ fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
 /// project once wrote and applied a script that took a server off the
 /// network. An interactive run can print a note and let a human decide;
 /// there is no human here.
-fn lockout_verdict(rules: &[crate::db::FirewallRule], options: &BatchOptions) -> Result<()> {
+fn lockout_verdict(
+    db: &Db,
+    rules: &[crate::db::FirewallRule],
+    options: &BatchOptions,
+) -> Result<()> {
     if !options.apply || options.force {
         return Ok(());
     }
-    match firewall::assess_lockout_risk(rules, options.ssh_log.as_deref()) {
+    let source = crate::logpaths::LogPaths::from_db(db)?.ssh(options.ssh_log.as_deref());
+    match firewall::assess_lockout_risk(rules, &source) {
         LockoutStatus::LogUnavailable => anyhow::bail!(
             "refusing to apply: no SSH log could be read, so the lockout safety check \
              could not run. Point --ssh-log at the right file, or drop --apply and run \
@@ -462,20 +436,26 @@ mod tests {
         assert_eq!(db.recent_ssh_login_ips().unwrap(), vec!["203.0.113.5"]);
     }
 
-    /// The same lossy read as every other log path: one byte that is not
-    /// UTF-8 must not hide the rest of the file.
+    /// `set-log-paths` is where a host that keeps its logs elsewhere says
+    /// so, and batch used to read the defaults regardless.
     #[test]
-    fn a_log_with_an_invalid_byte_is_still_read() {
+    fn a_batch_run_reads_the_stored_log_paths_when_no_flag_is_given() {
+        let db = Db::open_in_memory().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.log");
-        std::fs::write(&path, b"Invalid user \xff from 198.51.100.4 port 1\n").unwrap();
+        let ssh_log = dir.path().join("elsewhere-auth.log");
+        std::fs::write(
+            &ssh_log,
+            "Accepted publickey for m from 203.0.113.9 port 55000 ssh2\n",
+        )
+        .unwrap();
+        crate::logpaths::LogPaths::save(&db, None, Some(ssh_log.to_str().unwrap())).unwrap();
+        let options = BatchOptions {
+            ssh_log: None,
+            ..reading_ssh_log(dir.path(), &ssh_log)
+        };
 
-        let text = read_log(Some(&path), || None);
+        scan_logs(&db, &options);
 
-        assert!(
-            text.as_deref()
-                .is_some_and(|text| text.contains("198.51.100.4")),
-            "text was: {text:?}"
-        );
+        assert_eq!(db.recent_ssh_login_ips().unwrap(), vec!["203.0.113.9"]);
     }
 }

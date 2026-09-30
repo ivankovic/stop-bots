@@ -27,6 +27,7 @@
 //! job turns it into a one-line summary for the Dashboard.
 
 use crate::db::{Db, FirewallAction, NewFirewallRule};
+use crate::evidence::{decide, Rule};
 use crate::{accesslog, ipranges, sshlog};
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
@@ -153,43 +154,103 @@ impl ScanBlockOutcome {
     }
 }
 
-/// Runs whichever detector `detector` names against `log_text`.
+/// What `detector` needs to see before it blocks.
+///
+/// The threshold is the stored one (see `Detector::threshold`), the same
+/// for every scheduler; the CLI's one-off `block-scanners` and
+/// `block-web-scanners` take theirs from a flag instead. The SSH scanner
+/// counts failed-login lines; the other four that have a threshold count
+/// distinct things; the rest need one line.
+pub fn rule(db: &Db, detector: crate::protection::Detector) -> Result<Rule> {
+    use crate::protection::Detector as D;
+    Ok(match (detector, detector.threshold(db)?) {
+        (D::SshScanners, Some(n)) => Rule::AtLeast(n),
+        (_, Some(n)) => Rule::Distinct(n),
+        (_, None) => Rule::Once,
+    })
+}
+
+/// Runs `detector` on the evidence stored for it inside its window, as of
+/// `now`, and blocks what that convicts.
 ///
 /// The one place that maps a [`Detector`](crate::protection::Detector) onto
-/// the function that implements it. Both schedulers go through here — the
-/// TUI's internal cron and `crate::batch` — so a detector added to
-/// `Detector::ALL` and forgotten here fails to compile rather than
-/// silently never running from one of them.
+/// what it blocks for. Every scheduler goes through here -- the TUI's and
+/// the web console's internal cron, and `crate::batch` -- so a detector
+/// added to `Detector::ALL` and forgotten here fails to compile rather
+/// than silently never running from one of them.
+///
+/// The evidence is what `crate::logscan` read and stored: every line in the
+/// window, however many passes it took to read them, and nothing older.
+/// See `crate::evidence` for why it is kept rather than re-read.
 pub fn run_detector(
     db: &Db,
     detector: crate::protection::Detector,
     ttl_days: i64,
-    log_text: &str,
+    now: i64,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
     use crate::protection::Detector as D;
-    // The stored threshold, which defaults to what these two used to be
-    // hard-coded to. Only the two scanners take it as an argument; the
-    // behavioural three read their own below.
-    let threshold = |d: D| -> Result<usize> {
-        Ok(d.threshold(db)?
-            .expect("both scanner detectors have a threshold"))
-    };
+    let since = now - detector.window_seconds(db)?;
+    let rule = rule(db, detector)?;
+    let rows = db.evidence_rows(detector, since, rule)?;
+    let convicted = decide(&rows, rule, Some(since));
+    let found = convicted.len();
     match detector {
-        D::SshScanners => {
-            block_ssh_scanners(db, threshold(D::SshScanners)?, ttl_days, log_text, dry_run)
+        D::SshScanners | D::ProbePaths | D::Injection | D::Honeypot | D::RobotsTxt => {
+            let kind = match detector {
+                D::SshScanners => ScanKind::Scanning,
+                D::ProbePaths => ScanKind::ProbePath,
+                D::Injection => ScanKind::Injection,
+                D::Honeypot => ScanKind::Honeypot,
+                _ => ScanKind::RobotsTxt,
+            };
+            let candidates = convicted.into_iter().map(|(ip, _)| ip).collect();
+            add_block_rules(db, kind, found, candidates, 0, true, ttl_days, dry_run)
+        }
+        D::SpoofedCrawlers => {
+            // Checked again against the ranges as they are now: the
+            // evidence was judged against the ranges at the time it was
+            // read, and a crawler that published a new range since then
+            // has just vouched for an address this would otherwise block.
+            let claims = crawler_claims(db)?;
+            let still_forged = |ip: &str, name: &str| {
+                let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+                    return false;
+                };
+                claims
+                    .iter()
+                    .find(|claim| claim.name == name)
+                    .is_some_and(|claim| {
+                        !claim
+                            .ranges
+                            .iter()
+                            .any(|cidr| ipranges::cidr_contains(cidr, addr))
+                    })
+            };
+            let candidates = convicted
+                .into_iter()
+                .filter(|(ip, name)| still_forged(ip, name))
+                .map(|(ip, _)| ip)
+                .collect();
+            add_block_rules(
+                db,
+                ScanKind::SpoofedCrawler,
+                found,
+                candidates,
+                0,
+                !claims.is_empty(),
+                ttl_days,
+                dry_run,
+            )
         }
         D::WebScanners => {
-            block_web_scanners(db, threshold(D::WebScanners)?, ttl_days, log_text, dry_run)
+            let candidates = convicted.into_iter().map(|(ip, _)| ip).collect();
+            excluding_known_crawlers(db, ScanKind::Scanning, candidates, ttl_days, dry_run)
         }
-        D::SpoofedCrawlers => block_spoofed_crawlers(db, ttl_days, log_text, dry_run),
-        D::ProbePaths => block_probe_paths(db, ttl_days, log_text, dry_run),
-        D::Injection => block_injection(db, ttl_days, log_text, dry_run),
-        D::Honeypot => block_honeypot(db, ttl_days, log_text, dry_run),
-        D::AssetRatio => block_asset_ratio(db, ttl_days, log_text, dry_run),
-        D::RotatingUserAgent => block_rotating_ua(db, ttl_days, log_text, dry_run),
-        D::RefererlessCrawl => block_refererless(db, ttl_days, log_text, dry_run),
-        D::RobotsTxt => block_robots_txt(db, ttl_days, log_text, dry_run),
+        D::AssetRatio | D::RotatingUserAgent | D::RefererlessCrawl => {
+            let candidates = convicted.into_iter().map(|(ip, _)| ip).collect();
+            behavioural(db, candidates, ttl_days, dry_run)
+        }
     }
 }
 
@@ -235,30 +296,7 @@ pub fn block_web_scanners(
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
     let candidates = accesslog::scanning_ips(log_text, threshold);
-    let found = candidates.len();
-
-    let crawler_ranges = known_crawler_ranges(db)?;
-    let crawler_exclusion_active = !crawler_ranges.is_empty();
-    let mut kept = Vec::new();
-    let mut skipped_known_crawlers = 0;
-    for ip in candidates {
-        if known_crawler_match(&crawler_ranges, &ip) {
-            skipped_known_crawlers += 1;
-        } else {
-            kept.push(ip);
-        }
-    }
-
-    add_block_rules(
-        db,
-        ScanKind::Scanning,
-        found,
-        kept,
-        skipped_known_crawlers,
-        crawler_exclusion_active,
-        ttl_days,
-        dry_run,
-    )
+    excluding_known_crawlers(db, ScanKind::Scanning, candidates, ttl_days, dry_run)
 }
 
 /// Every CIDR published by a known crawler source (Googlebot, Bingbot,
@@ -533,6 +571,18 @@ fn behavioural(
     ttl_days: i64,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    excluding_known_crawlers(db, ScanKind::NonBrowser, candidates, ttl_days, dry_run)
+}
+
+/// Blocks `candidates`, less any inside a known crawler's published ranges
+/// (see [`known_crawler_ranges`]).
+fn excluding_known_crawlers(
+    db: &Db,
+    kind: ScanKind,
+    candidates: Vec<String>,
+    ttl_days: i64,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
     let found = candidates.len();
     let crawler_ranges = known_crawler_ranges(db)?;
     let crawler_exclusion_active = !crawler_ranges.is_empty();
@@ -547,7 +597,7 @@ fn behavioural(
     }
     add_block_rules(
         db,
-        ScanKind::NonBrowser,
+        kind,
         found,
         kept,
         skipped_known_crawlers,
@@ -661,6 +711,35 @@ fn add_block_rules(
     ttl_days: i64,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    // One transaction for the whole pass: a first scan of a busy log can
+    // block hundreds of addresses, and each insert (and the evidence it
+    // spends) committed on its own was one fsync apiece -- two minutes on
+    // a loaded disk for two hundred blocks.
+    db.batch(|| {
+        add_block_rules_now(
+            db,
+            kind,
+            found,
+            kept,
+            skipped_known_crawlers,
+            crawler_exclusion_active,
+            ttl_days,
+            dry_run,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_block_rules_now(
+    db: &Db,
+    kind: ScanKind,
+    found: usize,
+    kept: Vec<String>,
+    skipped_known_crawlers: usize,
+    crawler_exclusion_active: bool,
+    ttl_days: i64,
+    dry_run: bool,
+) -> Result<ScanBlockOutcome> {
     // Seeded from what's already stored, then *added to as we go*. The
     // second part matters more than it used to: before IPv6 widening, two
     // candidates were only ever equal if the same address appeared twice
@@ -683,6 +762,7 @@ fn add_block_rules(
         .collect();
     let trusted = db.list_trusted_addresses()?;
 
+    let flagged = kept.clone();
     let kept = match crate::protection::subnet_escalation(db)? {
         Some(min) => escalate_subnets(kept, min),
         None => kept,
@@ -735,8 +815,20 @@ fn add_block_rules(
             skipped_trusted += 1;
             continue;
         }
+        // The addresses this block answers for: the one observed, or every
+        // flagged neighbour an escalated /24 or a /64 stands for.
+        let answered: Vec<&String> = observed_in(&flagged, &ip);
         if existing.contains(&ip) {
             already_covered += 1;
+            // Whatever they did before that block was made, it answered. If
+            // it expires, only what they did after it may bring it back.
+            if !dry_run {
+                if let Some(made) = db.block_created_at(&ip)? {
+                    for address in &answered {
+                        db.forget_evidence_before(address, made)?;
+                    }
+                }
+            }
             continue;
         }
         if !dry_run {
@@ -748,6 +840,14 @@ fn add_block_rules(
                 },
                 ttl_seconds,
             )?;
+            // The evidence has been acted on. Kept, it would block the
+            // address again the minute this block expires, from the same
+            // lines -- the bug that made a one-day block last until
+            // logrotate. See `Db::forget_evidence_before`.
+            let made = now_secs();
+            for address in &answered {
+                db.forget_evidence_before(address, made)?;
+            }
         }
         existing.insert(ip.clone());
         newly_blocked.push(ip);
@@ -765,6 +865,27 @@ fn add_block_rules(
         ttl_days,
         dry_run,
     })
+}
+
+/// Which of the `flagged` addresses the block `ip` covers: itself, or
+/// every one inside it when it is a /64 or an escalated /24.
+fn observed_in<'a>(flagged: &'a [String], ip: &str) -> Vec<&'a String> {
+    flagged
+        .iter()
+        .filter(|address| {
+            address.as_str() == ip
+                || address
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|addr| ipranges::cidr_contains(ip, addr))
+        })
+        .collect()
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 #[cfg(test)]
@@ -798,34 +919,50 @@ mod tests {
     /// has to read the stored threshold, in both directions.
     #[test]
     fn the_scheduled_scanner_pass_uses_the_stored_threshold() {
-        use crate::protection::Detector;
-        let log = ssh_failed_attempt("198.51.100.9", 12);
-
         let db = Db::open_in_memory().unwrap();
-        let outcome = run_detector(&db, Detector::SshScanners, 5, &log, true).unwrap();
+        let now = now_secs();
+        let at = now - 1_200;
+        observe(
+            &db,
+            Detector::SshScanners,
+            "198.51.100.9",
+            Item::bucket(at),
+            at,
+            12,
+        );
+
+        let outcome = run_detector(&db, Detector::SshScanners, 5, now, true).unwrap();
         assert_eq!(
             outcome.candidates, 0,
             "12 attempts crossed the default of 20"
         );
 
         Detector::SshScanners.set_threshold(&db, 10).unwrap();
-        let outcome = run_detector(&db, Detector::SshScanners, 5, &log, true).unwrap();
+        let outcome = run_detector(&db, Detector::SshScanners, 5, now, true).unwrap();
         assert_eq!(outcome.candidates, 1, "a threshold of 10 was not applied");
     }
 
     #[test]
     fn the_scheduled_web_scanner_pass_uses_the_stored_threshold() {
-        use crate::protection::Detector;
-        let log: String = (0..5)
-            .map(|i| not_found_line("203.0.113.9", &format!("/missing-{i}")))
-            .collect();
-
         let db = Db::open_in_memory().unwrap();
-        let outcome = run_detector(&db, Detector::WebScanners, 1, &log, true).unwrap();
+        let now = now_secs();
+        for i in 0..5 {
+            let path = format!("/missing-{i}");
+            observe(
+                &db,
+                Detector::WebScanners,
+                "203.0.113.9",
+                Item::seen(&path),
+                now - 60,
+                1,
+            );
+        }
+
+        let outcome = run_detector(&db, Detector::WebScanners, 1, now, true).unwrap();
         assert_eq!(outcome.candidates, 0, "5 paths crossed the default of 7");
 
         Detector::WebScanners.set_threshold(&db, 4).unwrap();
-        let outcome = run_detector(&db, Detector::WebScanners, 1, &log, true).unwrap();
+        let outcome = run_detector(&db, Detector::WebScanners, 1, now, true).unwrap();
         assert_eq!(outcome.candidates, 1, "a threshold of 4 was not applied");
     }
 
@@ -1584,6 +1721,234 @@ mod tests {
         assert_eq!(
             escalated,
             vec!["198.51.100.7".to_string(), "203.0.113.0/24".to_string()]
+        );
+    }
+
+    // ---- detection from stored evidence ----
+
+    use crate::evidence::{Evidence, Item};
+    use crate::protection::Detector;
+
+    /// Stores one observation, as a log pass would.
+    fn observe(db: &Db, detector: Detector, ip: &str, item: Item, at: i64, times: u64) {
+        let mut evidence = Evidence::default();
+        for _ in 0..times {
+            evidence.add(detector, ip.parse().unwrap(), item.clone(), at);
+        }
+        let from = db.get_log_cursor("test").unwrap();
+        let to = format!("{}x", from.clone().unwrap_or_default());
+        assert!(db
+            .ingest(&crate::db::evidence::Ingested {
+                source: "test",
+                from: from.as_deref(),
+                to: Some(&to),
+                evidence: &evidence,
+                user_agents: &HashMap::new(),
+                logins: &[],
+                now: at,
+            })
+            .unwrap());
+    }
+
+    fn probe_at(db: &Db, ip: &str, at: i64) {
+        observe(db, Detector::ProbePaths, ip, Item::seen("/.env"), at, 1);
+    }
+
+    /// The bug windows exist to fix: a block expired, the lines that
+    /// earned it were still there, and the next pass re-added it. Now the
+    /// evidence is spent when the block is made, and only a new offence
+    /// brings the block back.
+    #[test]
+    fn an_expired_block_comes_back_only_for_a_new_offence() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        probe_at(&db, "203.0.113.5", now - 60);
+
+        // A block born expired: the quickest way to stand at the moment
+        // one lapses.
+        let first = run_detector(&db, Detector::ProbePaths, -1, now, false).unwrap();
+        assert_eq!(first.newly_blocked, ["203.0.113.5"]);
+        assert!(db.list_firewall_rules().unwrap().is_empty(), "expired");
+
+        let again = run_detector(&db, Detector::ProbePaths, 5, now + 60, false).unwrap();
+        assert!(
+            again.newly_blocked.is_empty(),
+            "the same old line re-added it: {again:?}"
+        );
+
+        probe_at(&db, "203.0.113.5", now + 120);
+        let reoffended = run_detector(&db, Detector::ProbePaths, 5, now + 180, false).unwrap();
+        assert_eq!(reoffended.newly_blocked, ["203.0.113.5"]);
+    }
+
+    /// A block some other way (by hand, or a detector before this one)
+    /// answers for what came before it too.
+    #[test]
+    fn an_address_already_blocked_keeps_only_what_it_did_after_the_block() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        probe_at(&db, "203.0.113.5", now - 3600);
+        db.add_firewall_rule(&NewFirewallRule {
+            address: "203.0.113.5".to_string(),
+            port: None,
+            action: FirewallAction::Block,
+        })
+        .unwrap();
+
+        let covered = run_detector(&db, Detector::ProbePaths, 5, now, false).unwrap();
+        assert_eq!(covered.already_covered, 1);
+
+        let id = db.list_firewall_rules().unwrap()[0].id;
+        db.remove_firewall_rule(id).unwrap();
+        let after = run_detector(&db, Detector::ProbePaths, 5, now + 60, false).unwrap();
+        assert!(
+            after.newly_blocked.is_empty(),
+            "blocked again for what it did before the first block: {after:?}"
+        );
+    }
+
+    /// A dry run changes nothing, the evidence included.
+    #[test]
+    fn a_dry_run_leaves_the_evidence_for_the_real_one() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        probe_at(&db, "203.0.113.5", now - 60);
+
+        run_detector(&db, Detector::ProbePaths, 5, now, true).unwrap();
+        let real = run_detector(&db, Detector::ProbePaths, 5, now, false).unwrap();
+
+        assert_eq!(real.newly_blocked, ["203.0.113.5"]);
+    }
+
+    /// Twenty failed logins within a day, not twenty since the log began.
+    #[test]
+    fn the_ssh_scanner_counts_only_failures_inside_its_window() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        let failures = |ip: &str, at: i64, times: u64| {
+            observe(&db, Detector::SshScanners, ip, Item::bucket(at), at, times)
+        };
+        failures("203.0.113.5", now - 2 * 86_400, 15);
+        failures("203.0.113.5", now - 600, 10);
+        failures("198.51.100.7", now - 1_200, 12);
+        failures("198.51.100.7", now - 600, 12);
+
+        let outcome = run_detector(&db, Detector::SshScanners, 5, now, false).unwrap();
+
+        assert_eq!(
+            outcome.newly_blocked,
+            ["198.51.100.7"],
+            "25 lines, 15 of them two days old, is 10 inside the window"
+        );
+    }
+
+    /// Distinct 404s add up across passes: seven paths are seven paths,
+    /// however many reads it took to see them.
+    #[test]
+    fn evidence_from_several_passes_adds_up_to_a_threshold() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        for n in 0..4 {
+            let path = format!("/a{n}");
+            observe(
+                &db,
+                Detector::WebScanners,
+                "203.0.113.5",
+                Item::seen(&path),
+                now - 300,
+                1,
+            );
+        }
+        assert!(run_detector(&db, Detector::WebScanners, 1, now, false)
+            .unwrap()
+            .newly_blocked
+            .is_empty());
+
+        for n in 4..7 {
+            let path = format!("/a{n}");
+            observe(
+                &db,
+                Detector::WebScanners,
+                "203.0.113.5",
+                Item::seen(&path),
+                now - 60,
+                1,
+            );
+        }
+        let outcome = run_detector(&db, Detector::WebScanners, 1, now, false).unwrap();
+        assert_eq!(outcome.newly_blocked, ["203.0.113.5"]);
+    }
+
+    /// The behavioural detectors look back an hour: fifteen pages spread
+    /// over an afternoon is a reader, not a scraper.
+    #[test]
+    fn a_behavioural_detector_forgets_after_its_hour() {
+        let db = Db::open_in_memory().unwrap();
+        Detector::AssetRatio.set_enabled(&db, true).unwrap();
+        let now = now_secs();
+        for n in 0..20 {
+            let path = format!("/page{n}");
+            let at = now - 2 * 3600 + n * 60;
+            observe(
+                &db,
+                Detector::AssetRatio,
+                "203.0.113.5",
+                Item::seen(&path),
+                at,
+                1,
+            );
+        }
+
+        let outcome = run_detector(&db, Detector::AssetRatio, 5, now, false).unwrap();
+
+        assert_eq!(outcome.candidates, 0, "{outcome:?}");
+    }
+
+    /// A forged Googlebot is judged against Google's ranges as they are
+    /// now, not as they were when the line was read.
+    #[test]
+    fn a_crawler_that_publishes_the_address_since_is_not_blocked() {
+        let db = Db::open_in_memory().unwrap();
+        seed_googlebot_ranges(&db);
+        let now = now_secs();
+        observe(
+            &db,
+            Detector::SpoofedCrawlers,
+            "203.0.113.9",
+            Item::seen("Googlebot IP ranges"),
+            now - 60,
+            1,
+        );
+        db.replace_ip_ranges(
+            "googlebot",
+            &["66.249.64.0/19".to_string(), "203.0.113.0/24".to_string()],
+        )
+        .unwrap();
+
+        let outcome = run_detector(&db, Detector::SpoofedCrawlers, 1, now, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
+    }
+
+    /// An escalated /24 spends the evidence of every neighbour in it.
+    #[test]
+    fn an_escalated_block_spends_every_neighbour_s_evidence() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_bool_setting(crate::protection::SUBNET_ESCALATION, true)
+            .unwrap();
+        let now = now_secs();
+        for ip in ["203.0.113.1", "203.0.113.2", "203.0.113.3"] {
+            probe_at(&db, ip, now - 60);
+        }
+
+        let outcome = run_detector(&db, Detector::ProbePaths, -1, now, false).unwrap();
+        assert_eq!(outcome.newly_blocked, ["203.0.113.0/24"]);
+
+        assert!(
+            db.evidence_rows(Detector::ProbePaths, 0, Rule::Once)
+                .unwrap()
+                .is_empty(),
+            "the /24 answered for all three"
         );
     }
 }

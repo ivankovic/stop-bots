@@ -1607,6 +1607,62 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
         .contains("4.5.6.0/24"));
 }
 
+/// `set-log-paths --ssh-log` is where a host that keeps its SSH log
+/// somewhere else says so, and the lockout guard used to ignore it: with no
+/// flag it searched the defaults, found nothing, and could not run. Now the
+/// stored path is what it reads.
+#[test]
+fn the_lockout_guard_reads_the_stored_ssh_log() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db_path = db_path.to_str().unwrap();
+    let log_path = tmp.path().join("elsewhere-auth.log");
+    fs::write(
+        &log_path,
+        "Jun 12 01:02:03 host sshd[111]: Accepted publickey for admin from 4.5.6.7 port 54321 ssh2\n",
+    )
+    .unwrap();
+    for args in [
+        vec![
+            "add-firewall-rule",
+            "--db",
+            db_path,
+            "--address",
+            "4.5.6.0/24",
+            "--action",
+            "block",
+        ],
+        vec![
+            "set-log-paths",
+            "--db",
+            db_path,
+            "--ssh-log",
+            log_path.to_str().unwrap(),
+        ],
+    ] {
+        stop_bots_bin().args(args).assert().success();
+    }
+
+    let script_path = tmp.path().join("stop-bots.nft");
+    let output = stop_bots_bin()
+        .args([
+            "render-firewall",
+            "--db",
+            db_path,
+            "--backend",
+            "nftables",
+            "--out",
+            script_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr was:\n{stderr}");
+    assert!(stderr.contains("4.5.6.7"), "stderr was:\n{stderr}");
+    assert!(!script_path.exists());
+}
+
 /// The flip side: a log with logins from unrelated IPs must not trip the
 /// safety net at all — `render-firewall` should behave exactly as if
 /// `--ssh-log` were never passed.
@@ -3586,9 +3642,17 @@ fn set_detector_stores_the_switch_ttl_and_threshold() {
         "--ttl-days",
         "3",
     ]);
-    fx.run(&["set-detector", "ssh-scanners", "--threshold", "40"]);
+    fx.run(&[
+        "set-detector",
+        "ssh-scanners",
+        "--threshold",
+        "40",
+        "--window-hours",
+        "6",
+    ]);
 
     let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    assert_eq!(Detector::SshScanners.window_hours(&db).unwrap(), 6);
     assert!(!Detector::Injection.is_enabled(&db).unwrap());
     assert_eq!(Detector::Injection.ttl_days(&db).unwrap(), 3);
     assert_eq!(Detector::SshScanners.threshold(&db).unwrap(), Some(40));
@@ -3600,13 +3664,17 @@ fn set_detector_stores_the_switch_ttl_and_threshold() {
             .find(|l| l.starts_with(name))
             .unwrap_or_else(|| panic!("no {name} line in:\n{out}"))
             .split_whitespace()
-            .take(4)
+            .take(5)
             .collect::<Vec<_>>()
     };
-    assert_eq!(line("injection"), ["injection", "off", "3d", "-"], "{out}");
+    assert_eq!(
+        line("injection"),
+        ["injection", "off", "3d", "-", "24h"],
+        "{out}"
+    );
     assert_eq!(
         line("ssh-scanners"),
-        ["ssh-scanners", "on", "5d", "40"],
+        ["ssh-scanners", "on", "5d", "40", "6h"],
         "{out}"
     );
 }
@@ -3664,6 +3732,17 @@ fn set_detector_refuses_what_it_cannot_store_and_stores_nothing() {
         (
             vec!["set-detector", "web-scanners", "--ttl-days", "0"],
             "from 1 to",
+        ),
+        (
+            vec![
+                "set-detector",
+                "web-scanners",
+                "--window-hours",
+                "0",
+                "--ttl-days",
+                "9",
+            ],
+            "from 1 to 720 hours",
         ),
         (
             vec!["set-detector", "robots-txt", "--enabled", "true"],

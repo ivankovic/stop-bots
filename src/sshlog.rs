@@ -26,18 +26,19 @@
 //! rules). This module never writes to, rotates, truncates or otherwise
 //! touches any log — it only ever reads.
 
+use crate::evidence::{Evidence, Item};
 use crate::ipranges::is_local_or_private;
+use crate::protection::Detector;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
 
 /// Log file paths covering the two dominant Linux SSH log layouts,
 /// tried in order: Debian/Ubuntu write to `auth.log`, RHEL/CentOS/Fedora
 /// write to `secure`. Neither exists on a systemd-only host that never set
-/// up a syslog-to-file bridge — [`find_default_source`] falls back to
-/// `journalctl` for that case.
-const DEFAULT_LOG_PATHS: &[&str] = &["/var/log/auth.log", "/var/log/secure"];
+/// up a syslog-to-file bridge — [`SshSource::Search`] falls back to
+/// journald for that case.
+pub const DEFAULT_LOG_PATHS: &[&str] = &["/var/log/auth.log", "/var/log/secure"];
 
 /// sshd's systemd unit is named `sshd` on RHEL-derived distros and `ssh` on
 /// Debian-derived ones.
@@ -53,45 +54,213 @@ pub enum LogSource {
     Unavailable,
 }
 
-/// Reads `path` directly, bypassing auto-detection entirely — backs the
-/// CLI's `--ssh-log` override, for containers/non-standard log locations
-/// and for deterministic tests that can't rely on whatever happens to be in
-/// the real system logs.
+/// Where the SSH log is to be read from.
 ///
-/// Read as bytes and decoded lossily, the same as the `journalctl` path
-/// below. The username is client-chosen, so one invalid UTF-8 byte in it
-/// is enough to make a strict read fail — and "unavailable" switches off
-/// both the lockout guard's evidence and the scanner detector until the
-/// log rotates.
-pub fn read_log_file(path: &Path) -> LogSource {
-    match std::fs::read(path) {
-        Ok(bytes) => LogSource::Found(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(_) => LogSource::Unavailable,
-    }
+/// Resolved by [`crate::logpaths::LogPaths::ssh`]: a flag, then the stored
+/// path, then [`SshSource::Search`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SshSource {
+    /// A file someone named. Read that and nothing else: an explicit path
+    /// that is wrong should say so, not quietly read something else.
+    File(PathBuf),
+    /// Nothing named: the first of [`DEFAULT_LOG_PATHS`] that can be
+    /// opened, and journald if none can.
+    Search,
 }
 
-/// Tries every default log file path, then falls back to `journalctl` for
-/// each common sshd unit name. Best-effort throughout: a missing file, a
-/// permission error (these logs are typically root/`adm`-group-only), or a
-/// missing `journalctl` binary all just mean "try the next one" — none of
-/// them is treated as a hard error.
-pub fn find_default_source() -> LogSource {
-    for path in DEFAULT_LOG_PATHS {
-        if let LogSource::Found(content) = read_log_file(Path::new(path)) {
-            return LogSource::Found(content);
+/// Where an [`SshSource`] turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Located {
+    File(PathBuf),
+    Journal,
+}
+
+/// The key the journal's read cursor is stored under (see
+/// `db::keys::log_cursor`).
+pub const JOURNAL_SOURCE: &str = "journald:sshd+ssh";
+
+impl SshSource {
+    /// Where to read. A named file is itself whether or not it can be
+    /// opened; a search takes the first default file that can be, and
+    /// otherwise the journal, which only a read can tell apart from
+    /// nothing.
+    pub fn locate(&self) -> Located {
+        let defaults: Vec<PathBuf> = DEFAULT_LOG_PATHS.iter().map(PathBuf::from).collect();
+        self.locate_among(&defaults)
+    }
+
+    /// [`Self::locate`], searching `search` rather than
+    /// [`DEFAULT_LOG_PATHS`].
+    pub fn locate_among(&self, search: &[PathBuf]) -> Located {
+        match self {
+            SshSource::File(path) => Located::File(path.clone()),
+            SshSource::Search => search
+                .iter()
+                .find(|path| std::fs::File::open(path).is_ok())
+                .map(|path| Located::File(path.clone()))
+                .unwrap_or(Located::Journal),
         }
     }
-    for unit in SSHD_UNIT_NAMES {
-        if let Ok(output) = Command::new("journalctl")
-            .args(["-u", unit, "-o", "cat", "--no-pager"])
-            .output()
-        {
-            if output.status.success() && !output.stdout.is_empty() {
-                return LogSource::Found(String::from_utf8_lossy(&output.stdout).into_owned());
+
+    /// The authentication lines of this log, as one text, for the readers
+    /// that want the whole of it once: the lockout guard, the Firewall
+    /// screens and the one-off CLI commands.
+    ///
+    /// A file is read whole, since logrotate bounds it. The journal is not
+    /// bounded by anything, and used to be read whole on every one of
+    /// those calls; it is read from `since` on. Either way only the lines
+    /// [`parse_auth_line`] reads are kept, which on a busy host is a small
+    /// part of the log and is all any of these readers look at.
+    pub fn read(&self, since: i64) -> LogSource {
+        match self.locate() {
+            Located::File(path) => {
+                let mut text = String::new();
+                match crate::logread::read_whole(&path, &mut |line| keep_auth(&mut text, line)) {
+                    Ok(()) => LogSource::Found(text),
+                    Err(_) => LogSource::Unavailable,
+                }
+            }
+            Located::Journal => self.read_journal_with(Path::new("journalctl"), since),
+        }
+    }
+
+    /// The journal half of [`Self::read`], with `journalctl` named, so a
+    /// test can stand one in.
+    fn read_journal_with(&self, journalctl: &Path, since: i64) -> LogSource {
+        let query = crate::logread::JournalQuery {
+            program: journalctl,
+            units: SSHD_UNIT_NAMES,
+            after_cursor: None,
+            since: Some(since),
+            last: None,
+        };
+        let mut text = String::new();
+        // Nothing at all from journald is how an unprivileged `journalctl`
+        // answers, so it is "could not read", as it always was, rather than
+        // "read, and nobody logged in".
+        match crate::logread::read_journal(&query, &mut |line| keep_auth(&mut text, line)) {
+            Ok(read) if read.lines > 0 => LogSource::Found(text),
+            _ => LogSource::Unavailable,
+        }
+    }
+
+    /// Whether anything can be read from this log, without reading it: for
+    /// the health check, which used to read the whole journal to find out.
+    pub fn is_readable(&self) -> bool {
+        match self.locate() {
+            Located::File(path) => std::fs::File::open(path).is_ok(),
+            Located::Journal => {
+                let query = crate::logread::JournalQuery {
+                    program: Path::new("journalctl"),
+                    units: SSHD_UNIT_NAMES,
+                    after_cursor: None,
+                    since: None,
+                    last: Some(1),
+                };
+                crate::logread::read_journal(&query, &mut |_| {}).is_ok_and(|read| read.lines > 0)
             }
         }
     }
-    LogSource::Unavailable
+}
+
+/// How far back the whole-log readers ([`SshSource::read`]) look into the
+/// journal: the anti-lockout window, a week, which is about what a
+/// weekly-rotated `auth.log` holds and every login the guard protects.
+pub fn recent_since() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    now - crate::db::SSH_LOGIN_WINDOW_SECONDS
+}
+
+/// Appends `line` to `text` if it is one [`parse_auth_line`] reads.
+fn keep_auth(text: &mut String, line: &str) {
+    if parse_auth_line(line).is_some() {
+        text.push_str(line);
+        text.push('\n');
+    }
+}
+
+/// The units whose journal is the SSH log, for [`crate::logscan`].
+pub fn journal_units() -> &'static [&'static str] {
+    SSHD_UNIT_NAMES
+}
+
+/// Reads SSH log lines one at a time into what the pipeline keeps from
+/// them: evidence for the scanner detector, and every address that logged
+/// in.
+pub struct Observer {
+    /// The oldest time a failed login may carry and still count, or `None`
+    /// when the scanner detector is off and no evidence is wanted.
+    cutoff: Option<i64>,
+    now: i64,
+    /// When an undated line happened, if a read can say.
+    undated: Option<i64>,
+    /// The host's offset from UTC, taken once per read: a syslog time is
+    /// local, and asking the C library for every line would cost more than
+    /// the parse.
+    offset: i64,
+    evidence: Evidence,
+    accepted: std::collections::BTreeSet<String>,
+    lines: usize,
+}
+
+impl Observer {
+    /// `cutoff`: see [`Observer::cutoff`]. `undated`: the time to give a
+    /// line that carries none, which only a read of what was just
+    /// appended can say; a first read passes `None` and such lines count
+    /// for nothing.
+    pub fn new(cutoff: Option<i64>, now: i64, undated: Option<i64>) -> Observer {
+        Observer::with_offset(cutoff, now, undated, crate::logtime::local_offset(now))
+    }
+
+    fn with_offset(cutoff: Option<i64>, now: i64, undated: Option<i64>, offset: i64) -> Observer {
+        Observer {
+            cutoff,
+            now,
+            undated,
+            offset,
+            evidence: Evidence::default(),
+            accepted: Default::default(),
+            lines: 0,
+        }
+    }
+
+    pub fn line(&mut self, text: &str) {
+        let Some(auth) = parse_auth_line(text) else {
+            return;
+        };
+        self.lines += 1;
+        if auth.kind == AuthKind::Accepted {
+            self.accepted.insert(auth.ip.to_string());
+            return;
+        }
+        let Some(cutoff) = self.cutoff else {
+            return;
+        };
+        if is_local_or_private(&auth.ip) {
+            return;
+        }
+        let offset = self.offset;
+        let at = crate::logtime::syslog_line(text, self.now, &|_| offset)
+            .or(self.undated)
+            .map(|at| at.min(self.now));
+        if let Some(at) = at.filter(|at| *at >= cutoff) {
+            self.evidence
+                .add(Detector::SshScanners, auth.ip, Item::bucket(at), at);
+        }
+    }
+
+    /// The evidence, every address that logged in (sorted), and how many
+    /// authentication lines were read.
+    pub fn finish(self) -> (Evidence, Vec<String>, usize) {
+        (
+            self.evidence,
+            self.accepted.into_iter().collect(),
+            self.lines,
+        )
+    }
 }
 
 /// The three sshd messages this module reads, by the word they open with.
@@ -194,9 +363,10 @@ fn split_address(rest: &str) -> Option<(&str, IpAddr)> {
 
 /// Where sshd's own message begins in `line`, if `line` came from sshd.
 ///
-/// Two shapes. `journalctl -u ssh -o cat` prints the message alone, so a
-/// line that opens with one of the markers is taken whole; the unit filter
-/// already made sure it was sshd's. A syslog line (`auth.log`, `secure`)
+/// Two shapes. A bare message, as `journalctl -o cat` prints it, opens
+/// with one of the markers and is taken whole: a file written that way is
+/// one someone chose to point `--ssh-log` at. A syslog line (`auth.log`,
+/// `secure`, and the journal as this project reads it, `-o short-iso`)
 /// carries a prefix — `Jun 12 01:02:03 host sshd[123]: `, or an RFC 3339
 /// timestamp in place of the first three fields — and the message starts
 /// right after the first `": "`. Nothing before that is client-controlled,
@@ -241,10 +411,10 @@ fn sshd_message(line: &str) -> Option<&str> {
 /// deduplicated and sorted for deterministic output. Matches sshd's own
 /// `Accepted <method> for <user> from <ip> port <port> ...` message —
 /// identical whether it arrives via classic syslog (with a leading
-/// timestamp/hostname/pid prefix, as in `/var/log/auth.log` or
-/// `/var/log/secure`) or `journalctl -o cat` (which strips that prefix),
-/// since both just carry sshd's own message text verbatim; one parser
-/// covers both. Deliberately keyed on a message that *opens with*
+/// timestamp/hostname/pid prefix, as in `/var/log/auth.log`,
+/// `/var/log/secure` or `journalctl -o short-iso`) or bare (`journalctl -o
+/// cat`), since both just carry sshd's own message text verbatim; one
+/// parser covers both. Deliberately keyed on a message that *opens with*
 /// `"Accepted "` (see [`parse_auth_line`]), not on `" from "` or on the word
 /// appearing anywhere — sshd also logs failed attempts and disconnects
 /// with their own `from <ip>` text, and a client picks its own username,
@@ -432,9 +602,11 @@ fn candidate_failed_attempt_counts(log_text: &str) -> std::collections::HashMap<
 /// Every IP address with at least `threshold` failed-authentication log
 /// lines in `log_text` (see [`parse_failed_attempt_ips`] for exactly what
 /// counts, and note the threshold is a count over *however much of the log
-/// `log_text` happens to hold* — could be a day or a month — not a rate
-/// over a time window; this module doesn't parse timestamps, so pick a
-/// threshold high enough that ordinary typos never reach it. Real scanners
+/// `log_text` happens to hold* — could be a day or a month. This is the
+/// one-off form behind `block-scanners`, which reads the log it is given;
+/// the scheduled detector counts only inside its window (see
+/// [`Observer`] and `crate::evidence`). Pick a threshold high enough that
+/// ordinary typos never reach it. Real scanners
 /// produce dozens to thousands of attempts, not a handful. See
 /// [`candidate_failed_attempt_counts`] for the safety exclusions applied
 /// before thresholding. Deduplicated and sorted for deterministic output.
@@ -513,21 +685,23 @@ Accepted publickey for alice from 203.0.113.5 port 2 ssh2
         assert_eq!(parse_accepted_ips(log), vec!["2001:db8::1".to_string()]);
     }
 
+    /// A named file that is not there is unavailable: nothing else is
+    /// read in its place.
     #[test]
-    fn read_log_file_reports_unavailable_for_a_missing_path() {
+    fn a_named_log_that_is_missing_is_unavailable() {
         assert_eq!(
-            read_log_file(Path::new("/nonexistent/does-not-exist.log")),
+            SshSource::File("/nonexistent/does-not-exist.log".into()).read(0),
             LogSource::Unavailable
         );
     }
 
     #[test]
-    fn read_log_file_reads_an_existing_file() {
+    fn a_named_log_is_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.log");
         std::fs::write(&path, "Accepted publickey for a from 1.2.3.4 port 1 ssh2\n").unwrap();
 
-        match read_log_file(&path) {
+        match SshSource::File(path).read(0) {
             LogSource::Found(content) => assert!(content.contains("1.2.3.4")),
             LogSource::Unavailable => panic!("expected the file to be readable"),
         }
@@ -884,17 +1058,168 @@ Jun 12 01:00:01 h sshd[2]: Accepted publickey for marko from 198.51.100.1 port 2
     /// One byte that is not UTF-8 — a client can put one in a username —
     /// must not make the whole log unreadable until it rotates.
     #[test]
-    fn read_log_file_survives_invalid_utf8() {
+    fn a_log_with_invalid_utf8_is_still_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.log");
         let mut bytes = b"Invalid user \xff\xfe from 198.51.100.4 port 1\n".to_vec();
         bytes.extend_from_slice(b"Accepted publickey for a from 192.0.2.4 port 1 ssh2\n");
         std::fs::write(&path, bytes).unwrap();
 
-        let LogSource::Found(text) = read_log_file(&path) else {
+        let LogSource::Found(text) = SshSource::File(path).read(0) else {
             panic!("a log with one invalid byte was reported unavailable");
         };
         assert_eq!(parse_accepted_ips(&text), vec!["192.0.2.4"]);
         assert_eq!(parse_failed_attempt_ips(&text), vec!["198.51.100.4"]);
+    }
+
+    // ---- the observer the log pass reads with ----
+
+    /// 2026-09-28T06:33:01Z.
+    const SEP_28: i64 = 1_790_577_181;
+
+    fn observed(lines: &[&str], observer: Observer) -> (Evidence, Vec<String>) {
+        let mut observer = observer;
+        for line in lines {
+            observer.line(line);
+        }
+        let (evidence, logins, _) = observer.finish();
+        (evidence, logins)
+    }
+
+    fn failures_kept(evidence: &Evidence) -> Vec<(String, i64)> {
+        let mut rows: Vec<(String, i64)> = evidence
+            .rows_for(Detector::SshScanners)
+            .into_iter()
+            .map(|row| (row.address, row.tally.first))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Syslog writes local time: two hours east of UTC, 08:33 is 06:33Z.
+    #[test]
+    fn a_syslog_line_is_dated_with_the_host_s_offset() {
+        let (evidence, _) = observed(
+            &["Sep 28 08:33:01 host sshd[1]: Failed password for root from 203.0.113.5 port 1 ssh2"],
+            Observer::with_offset(Some(0), SEP_28 + 60, None, 2 * 3600),
+        );
+        assert_eq!(
+            failures_kept(&evidence),
+            [("203.0.113.5".to_string(), SEP_28)]
+        );
+    }
+
+    /// Read at ten past midnight on New Year's Day, a failure from a minute
+    /// before midnight is eleven minutes old, not a year in the future.
+    #[test]
+    fn a_failure_from_last_year_s_last_minute_counts_on_new_year_s_day() {
+        let new_year = 1_798_761_600 + 600; // 2027-01-01T00:10:00Z
+        let (evidence, _) = observed(
+            &["Dec 31 23:59:00 host sshd[1]: Failed password for root from 203.0.113.5 port 1 ssh2"],
+            Observer::with_offset(Some(new_year - 86_400), new_year, None, 0),
+        );
+        assert_eq!(
+            failures_kept(&evidence),
+            [("203.0.113.5".to_string(), new_year - 660)]
+        );
+    }
+
+    #[test]
+    fn a_failure_older_than_the_window_is_not_kept_but_a_login_always_is() {
+        let (evidence, logins) = observed(
+            &[
+                "2026-09-26T06:33:01+00:00 host sshd[1]: Failed password for root from 203.0.113.5 port 1 ssh2",
+                "2026-09-26T06:33:02+00:00 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2",
+                "2026-09-28T06:00:00+00:00 host sshd[1]: Invalid user x from 198.51.100.7 port 3",
+            ],
+            Observer::with_offset(Some(SEP_28 - 86_400), SEP_28, None, 0),
+        );
+        assert_eq!(
+            failures_kept(&evidence),
+            [("198.51.100.7".to_string(), SEP_28 - 1981)]
+        );
+        assert_eq!(logins, ["192.0.2.10"]);
+    }
+
+    /// `journalctl -o cat` wrote no time. On a first read that could be
+    /// anything; on a later one, it was appended since the last.
+    #[test]
+    fn an_undated_failure_counts_only_when_the_read_can_date_it() {
+        let line = "Failed password for root from 203.0.113.5 port 1 ssh2";
+        let (first, _) = observed(&[line], Observer::with_offset(Some(0), SEP_28, None, 0));
+        assert!(first.is_empty());
+        let (later, _) = observed(
+            &[line],
+            Observer::with_offset(Some(0), SEP_28, Some(SEP_28), 0),
+        );
+        assert_eq!(failures_kept(&later).len(), 1);
+    }
+
+    /// With the scanner detector off, no evidence is kept at all; the
+    /// logins are still wanted for the anti-lockout window.
+    #[test]
+    fn with_the_detector_off_only_logins_are_kept() {
+        let (evidence, logins) = observed(
+            &[
+                "2026-09-28T06:00:00+00:00 host sshd[1]: Failed password for root from 203.0.113.5 port 1 ssh2",
+                "2026-09-28T06:00:01+00:00 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2",
+            ],
+            Observer::with_offset(None, SEP_28, None, 0),
+        );
+        assert!(evidence.is_empty());
+        assert_eq!(logins, ["192.0.2.10"]);
+    }
+
+    /// The whole-log readers keep only the lines they read, so a busy
+    /// auth.log costs its authentication lines, not the whole file.
+    #[test]
+    fn a_whole_read_keeps_only_authentication_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.log");
+        std::fs::write(
+            &path,
+            "Sep 28 06:00:00 host CRON[9]: pam_unix(cron:session): session opened\n\
+             Sep 28 06:00:01 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2\n",
+        )
+        .unwrap();
+
+        let LogSource::Found(text) = SshSource::File(path).read(0) else {
+            panic!("the file is there");
+        };
+
+        assert_eq!(
+            text,
+            "Sep 28 06:00:01 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2\n"
+        );
+    }
+
+    /// The journal is read back only as far as it is asked, where it used
+    /// to be read whole on every Firewall page view and every guard.
+    #[test]
+    fn a_whole_read_of_the_journal_asks_only_for_its_window() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("journalctl");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/args\"\n\
+             echo '2026-09-28T06:00:01+0000 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let search = SshSource::Search;
+        assert_eq!(
+            search.locate_among(&[dir.path().join("no-auth.log")]),
+            Located::Journal
+        );
+
+        let LogSource::Found(text) = search.read_journal_with(&program, 1_790_000_000) else {
+            panic!("the fake journal answered");
+        };
+
+        assert!(text.contains("192.0.2.10"), "{text}");
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert!(args.contains("--since=@1790000000"), "{args}");
+        assert!(args.contains("-o short-iso"), "{args}");
     }
 }

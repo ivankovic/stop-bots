@@ -93,8 +93,9 @@ a flood of tarpitted clients competes with real visitors for `worker_connections
 ## From your logs, automatically
 
 Each of these is an independent switch on the Dashboard's "Automatic blocking" panel, and
-each adds a temporary firewall block that expires on its own and is re-added if the behaviour
-continues.
+each adds a temporary firewall block that expires on its own and is re-added only if the
+behaviour continues after it: a detector counts only what the logs show inside its window (a day,
+or an hour for the three behavioural ones below), and a block spends the evidence that made it.
 
 They run on an internal timer that re-reads your SSH and NGINX access logs every minute —
 **but only while the TUI or the web UI is running.** Either one keeps the same schedule, in

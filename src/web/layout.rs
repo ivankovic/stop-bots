@@ -369,6 +369,7 @@ fn chip_label(check: &crate::health::Check) -> &'static str {
         // two below; "Database size" is not a chip-sized word.
         "database-size" => "database",
         "log-sources" => "logs",
+        "access-log-format" => "log format",
         "access-log-clients" => "clients",
         "nginx-deployment" => "runtime",
         _ => check.title,
