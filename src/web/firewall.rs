@@ -493,6 +493,23 @@ fn status_pill(status: RowStatus) -> Markup {
         RowStatus::Unknown => PillKind::Warn,
         RowStatus::Trusted => PillKind::Allowed,
     };
+    // A detector's block says which detector and for how long, and that
+    // is twice as wide as the state column. Cut off with an ellipsis, it
+    // lost exactly the part that was new; so the pill stays `BLOCKED` and
+    // the rest goes on a quiet line under it.
+    if let RowStatus::Blocked { until, by } = status {
+        let note: Vec<String> = until
+            .map(crate::dynamic::format_until)
+            .into_iter()
+            .chain(by.map(|detector| crate::blocks::detector_name(detector).to_string()))
+            .collect();
+        if !note.is_empty() {
+            return html! {
+                (layout::pill("BLOCKED", kind))
+                span .pill-note title=(status.label()) { (note.join(" · ")) }
+            };
+        }
+    }
     layout::pill(&status.label(), kind)
 }
 
@@ -1083,6 +1100,37 @@ async fn unblock_ua(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_detectors_block_keeps_its_pill_short_and_names_the_detector_under_it() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let rendered = status_pill(RowStatus::Blocked {
+            until: Some(now + 5 * 86_400),
+            by: Some(crate::protection::Detector::SshScanners),
+        })
+        .into_string();
+        assert!(
+            rendered.contains(r#"title="BLOCKED">BLOCKED</span>"#),
+            "the pill should say only BLOCKED; rendered:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("pill-note") && rendered.contains("ssh-scanners"),
+            "the detector should be on the line under the pill; rendered:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_hand_block_is_just_the_pill() {
+        let rendered = status_pill(RowStatus::Blocked {
+            until: None,
+            by: None,
+        })
+        .into_string();
+        assert!(!rendered.contains("pill-note"), "rendered:\n{rendered}");
+    }
 
     #[test]
     fn the_filter_query_maps_to_the_shared_filter() {

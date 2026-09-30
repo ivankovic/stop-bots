@@ -385,6 +385,17 @@ td.wrap { word-break: break-all; }
    wider than its column, and a nowrap pill spills over the address beside
    it. Cut it off at the column instead; the address's detail panel shows
    the whole tag. */
+/* What a detector's block adds to its pill — "4d · ssh-scanners" — on
+   its own line, so the pill keeps to its column and nothing is cut off. */
+.pill-note {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .table-scroll td .pill {
   max-width: 100%;
   overflow: hidden;
