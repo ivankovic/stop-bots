@@ -608,7 +608,7 @@ impl App {
                 let kind = botlist::SourceKind::from_id(&source_id)
                     .with_context(|| format!("unknown bot-list source: {source_id}"))?;
                 let raw = kind.fetch().await?;
-                parse_off_thread(move || kind.parse(&raw)).await
+                parse_off_thread(move || kind.parse_counted(&raw)).await
             }
             .await
             .map_err(|err| err.to_string());
@@ -625,15 +625,18 @@ impl App {
     fn finish_source_update(
         &mut self,
         source_id: String,
-        result: Result<Vec<crate::db::NewBot>, String>,
+        result: Result<botlist::Parsed, String>,
     ) -> Result<()> {
         let name = source_display_name(&source_id);
         match result {
-            Ok(bots) => {
+            Ok(parsed) => {
                 let kind = botlist::SourceKind::from_id(&source_id)
                     .expect("source_id always came from a known SourceKind::id()");
-                let count = botlist::store(&self.db, kind, &bots)?;
-                self.message = Some(format!("Stored {count} bot(s) from {name}"));
+                let count = botlist::store(&self.db, kind, &parsed.bots)?;
+                self.message = Some(match botlist::left_out_note(parsed.skipped) {
+                    None => format!("Stored {count} bot(s) from {name}"),
+                    Some(note) => format!("Stored {count} bot(s) from {name}; {note}"),
+                });
                 self.refresh()?;
             }
             Err(err) => {
@@ -2480,7 +2483,10 @@ mod tests {
         let source_id = botlist::SourceKind::WellKnownBots.id();
         app.finish_source_update(
             source_id.to_string(),
-            Ok(vec![crate::testing::new_bot("badbot", source_id)]),
+            Ok(botlist::Parsed {
+                bots: vec![crate::testing::new_bot("badbot", source_id)],
+                skipped: 0,
+            }),
         )
         .unwrap();
 

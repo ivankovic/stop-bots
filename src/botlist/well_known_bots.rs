@@ -66,28 +66,26 @@ fn humanize(slug: &str) -> String {
 }
 
 /// Parses the raw well-known-bots JSON document into [`NewBot`] records.
-/// Bots with no usable user-agent pattern are skipped. Patterns containing a
-/// `"`, or ending in a backslash, are dropped too: they end up embedded in a
-/// double-quoted NGINX string (see `nginx::apply_blocks_to_file`), so an
-/// untrusted pattern with a quote in it could break out and inject
-/// directives into a config loaded as root, and one ending in a backslash
-/// can escape NGINX's own closing quote instead (see `nginx::is_embeddable`
-/// for the mechanics — confirmed against a real `nginx -t`). So is one that
-/// would match every visitor, such as `""` — see `botlist::keeps_pattern`.
+/// Bots with no usable user-agent pattern are skipped. A pattern that
+/// `botlist::keeps_pattern` refuses is dropped: one containing a `"`, one
+/// that is not a regex NGINX would compile (ending in a backslash, `[z-a]`),
+/// and one that would match every visitor, such as `""`.
 /// Each accepted pattern is checked on its own, before they are joined, so
 /// one bad entry costs that entry rather than the bot.
 pub fn parse(json: &str) -> Result<Vec<NewBot>> {
+    parse_counted(json).map(|parsed| parsed.bots)
+}
+
+/// [`parse`], and how many accepted patterns it left out.
+pub fn parse_counted(json: &str) -> Result<crate::botlist::Parsed> {
     let raw: Vec<RawBot> = serde_json::from_str(json).context("failed to parse bot list JSON")?;
 
+    let mut skipped = 0;
     let bots = raw
         .into_iter()
         .filter_map(|b| {
-            let patterns: Vec<String> = b
-                .pattern
-                .accepted
-                .into_iter()
-                .filter(|p| crate::botlist::keeps_pattern(p))
-                .collect();
+            let (patterns, left_out) = crate::botlist::kept_patterns(b.pattern.accepted);
+            skipped += left_out;
             if patterns.is_empty() {
                 return None;
             }
@@ -103,7 +101,7 @@ pub fn parse(json: &str) -> Result<Vec<NewBot>> {
         })
         .collect();
 
-    Ok(bots)
+    Ok(crate::botlist::Parsed { bots, skipped })
 }
 
 /// Downloads the raw well-known-bots JSON document over HTTP.
@@ -154,10 +152,37 @@ mod tests {
         assert_eq!(mixed.user_agent_pattern, "GoodBot");
     }
 
+    /// `Trailing\\` is a regex for a literal backslash, and this list's
+    /// patterns are regexes. It used to be dropped because a backslash at
+    /// the end escaped the closing quote of the NGINX string; written by
+    /// `nginx::nginx_quoted`, it cannot, so it is kept as the rule it is.
     #[test]
-    fn parse_drops_a_pattern_ending_in_a_backslash() {
+    fn parse_keeps_a_pattern_ending_in_an_escaped_backslash() {
         let bots = parse(SAMPLE).unwrap();
-        assert!(!bots.iter().any(|b| b.slug == "trailing-backslash-bot"));
+        let bot = bots
+            .iter()
+            .find(|b| b.slug == "trailing-backslash-bot")
+            .expect("the escaped backslash is a valid regex");
+        assert_eq!(bot.user_agent_pattern, r"Trailing\\");
+    }
+
+    /// An unpaired one is not a regex at all, and still dropped.
+    #[test]
+    fn parse_drops_a_pattern_ending_in_an_unpaired_backslash() {
+        let json = r#"[{"id":"bad","categories":["ai"],"pattern":{"accepted":["Trailing\\","GoodBot"],"forbidden":[]}}]"#;
+        let parsed = parse_counted(json).unwrap();
+        assert_eq!(parsed.bots[0].user_agent_pattern, "GoodBot");
+        assert_eq!(parsed.skipped, 1, "the dropped pattern is counted");
+    }
+
+    /// Patterns PCRE refuses to compile fail `nginx -t`, and with it every
+    /// apply after the fetch that stored them. Each is left out, counted.
+    #[test]
+    fn parse_counts_and_drops_patterns_nginx_would_not_compile() {
+        let json = r#"[{"id":"bad","categories":["ai"],"pattern":{"accepted":["Bot[z-a]x","Bot{2,1}x","Botx{99999}","Bot[[:nope:]]x","Evil(?<n>Bot)","GoodBot"],"forbidden":[]}}]"#;
+        let parsed = parse_counted(json).unwrap();
+        assert_eq!(parsed.bots[0].user_agent_pattern, "GoodBot");
+        assert_eq!(parsed.skipped, 5);
     }
 
     /// `accepted: [""]` joined into the block is an empty alternative:

@@ -240,28 +240,120 @@ fn parse_server_blocks(content: &str) -> Vec<ServerBlock> {
     blocks
 }
 
-/// Whether `pattern` can be embedded verbatim inside the double-quoted
-/// NGINX string [`block_text`] builds, without corrupting the surrounding
-/// config. Two conditions:
+/// `regex` as an NGINX double-quoted string, quotes included, written so
+/// that the text NGINX hands to PCRE is exactly `regex`. **Every regex this
+/// module writes into a config goes through here**, and every check on a
+/// regex ([`pattern_problem`]) is of the text before it: that is only the
+/// regex NGINX compiles because this function is exact.
 ///
-/// - No literal `"` — would end the string early (each botlist parser
-///   already filters this at the source, but this is the last line of
-///   defense for any pattern that reaches here some other way, including a
-///   row already stored in the db from before a parser had this filter).
-/// - Doesn't end in a backslash — NGINX's config parser treats `\"`
-///   immediately before what would be our closing quote as an *escaped*
-///   quote, not a terminator, so a trailing backslash on the last pattern
-///   joined into the string leaves the quoted state open. NGINX then keeps
-///   scanning for a real closing quote through the rest of the file and
-///   reports `too long parameter, probably missing terminating """
-///   character` once it hits EOF still "inside" the string — confirmed
-///   against a real `nginx -t`. (A trailing backslash *pair* avoids that
-///   specific failure by collapsing to one backslash before the closing
-///   quote, but that one leftover backslash then fails regex compilation
-///   instead — `pcre2_compile() failed: \ at end of pattern` — so any
-///   trailing backslash at all is treated as unsafe, not just an odd run.)
-fn is_embeddable(pattern: &str) -> bool {
-    !pattern.contains('"') && !pattern.ends_with('\\')
+/// It used not to exist. Patterns went between the quotes verbatim, and
+/// NGINX's config reader is not verbatim: it undoes escapes inside a quoted
+/// word before any directive sees it. A manually blocked user agent ending
+/// in `\|` was escaped for PCRE as `\\\|`, written as it was, read back by
+/// NGINX as `\\|`, and compiled to "a backslash, or nothing": a rule that
+/// turned away every visitor. `Evil\(` became an unclosed group that failed
+/// `nginx -t`, and with it every later apply, unattended ones included.
+///
+/// What NGINX does, from `ngx_conf_read_token` in
+/// `src/core/ngx_conf_file.c` (the same from 1.0 to 1.27):
+///
+/// 1. **Finding the end of the word.** A backslash makes the next byte
+///    ordinary, so `\"` does not close the string. Nothing else inside
+///    double quotes is special: not `'`, `;`, `{`, `}`, `#`, `$` or
+///    whitespace.
+/// 2. **Unescaping it**, left to right over the bytes between the quotes:
+///    `\"`, `\'` and `\\` become their second byte; `\t`, `\r` and `\n`
+///    become a tab, a carriage return and a line feed; a backslash before
+///    anything else is kept, and the byte after it is then read as an
+///    ordinary byte. [`nginx_unquoted`] is a model of this pass.
+///
+/// The encoding: a `"` is written `\"`, and a backslash is written twice
+/// exactly when the byte written right after it is `\`, `"`, `'`, `t`, `r`
+/// or `n`, or the closing quote; everywhere else once. Pass 2 gives back
+/// every character, by induction over the written text:
+///
+/// - A `"` was written `\"`, which is read as `"`, consuming both bytes.
+/// - A doubled backslash is `\\`, read as one backslash, consuming both.
+/// - A single backslash is followed by a byte outside that set, so it is
+///   kept and only it is consumed. That next byte is not a backslash or a
+///   quote either: the character it starts would then be written with a
+///   leading `\`, and this backslash would have been doubled.
+/// - Any other character is written as itself and read as itself.
+///
+/// Pass 1 agrees on where the string ends: every backslash it pairs with
+/// the next byte is one of the pairs above, or a single backslash followed
+/// by an ordinary byte, so the only unpaired `"` is the closing one. A
+/// regex ending in a backslash has it doubled, so it cannot swallow the
+/// closing quote.
+///
+/// Doubling only where NGINX would otherwise read an escape, rather than
+/// every backslash, keeps every block that was already right byte for byte
+/// the same: `1h4x\.com` is still written `1h4x\.com`, so no site on an
+/// upgraded host reads as stale over a change that did not affect it. The
+/// only blocks whose text changes are the ones NGINX was misreading.
+pub fn nginx_quoted(regex: &str) -> String {
+    let chars: Vec<char> = regex.chars().collect();
+    let mut out = String::with_capacity(regex.len() + 2);
+    out.push('"');
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '"' => out.push_str(r#"\""#),
+            '\\' => {
+                // The byte written right after this backslash: the next
+                // character's first, which for a quote or a backslash is a
+                // backslash; at the end, the closing quote.
+                let next = match chars.get(i + 1) {
+                    None | Some('"' | '\\') => '\\',
+                    Some(&next) => next,
+                };
+                if matches!(next, '\\' | '"' | '\'' | 't' | 'r' | 'n') {
+                    out.push('\\');
+                }
+                out.push('\\');
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// What NGINX makes of the text between the quotes of a double-quoted
+/// word: pass 2 of `ngx_conf_read_token`, as described at
+/// [`nginx_quoted`].
+///
+/// A model, which [`nginx_quoted`] is checked against, and which reads a
+/// quoted value this module wrote back out of a config file.
+pub fn nginx_unquoted(inner: &str) -> String {
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let unescaped = match chars.peek() {
+            Some(&next @ ('"' | '\'' | '\\')) => next,
+            Some('t') => '\t',
+            Some('r') => '\r',
+            Some('n') => '\n',
+            _ => {
+                out.push('\\');
+                continue;
+            }
+        };
+        out.push(unescaped);
+        chars.next();
+    }
+    out
+}
+
+/// The bytes [`nginx_quoted`] writes for `regex`, quotes left out. An
+/// upper bound for the same regex inside a longer `|`-join: the only
+/// character whose encoding depends on what follows it is a final
+/// backslash, which is doubled here and may not be there.
+fn quoted_len(regex: &str) -> usize {
+    nginx_quoted(regex).len() - 2
 }
 
 /// The fewest literal characters every match of a user-agent pattern must
@@ -288,10 +380,8 @@ pub enum PatternProblem {
     /// Empty, or only whitespace.
     Empty,
     /// A newline, tab or other control character — no real user agent has
-    /// one, and NGINX turns `\n`-style escapes into them anyway.
+    /// one.
     ControlCharacter,
-    /// See [`is_embeddable`].
-    NotEmbeddable,
     /// Longer than [`MAX_PATTERN_LEN`].
     TooLong,
     /// Some way of matching it needs fewer than [`MIN_PATTERN_LITERALS`]
@@ -301,6 +391,11 @@ pub enum PatternProblem {
     /// A repeated group that itself repeats something, `(a+)+`: the shape
     /// that makes a backtracking engine take exponential time per request.
     Backtracks,
+    /// Something PCRE refuses to compile: a range out of order (`[z-a]`), a
+    /// quantifier whose numbers are out of order (`{2,1}`) or too big
+    /// (`{99999}`). Written, it would fail `nginx -t` and roll back every
+    /// apply after it.
+    Invalid,
     /// Unbalanced, or a construct (lookaround, `\x`, `\Q`, inline flags)
     /// this check does not understand. Refused rather than guessed at.
     Unchecked,
@@ -311,10 +406,10 @@ impl std::fmt::Display for PatternProblem {
         f.write_str(match self {
             PatternProblem::Empty => "it is empty",
             PatternProblem::ControlCharacter => "it contains a control character",
-            PatternProblem::NotEmbeddable => "it contains a double quote or ends in a backslash",
             PatternProblem::TooLong => "it is too long",
             PatternProblem::MatchesTooMuch => "it would match (nearly) every user agent",
             PatternProblem::Backtracks => "it nests one repetition inside another",
+            PatternProblem::Invalid => "it is not a regex NGINX would compile",
             PatternProblem::Unchecked => "it is not a regex this tool can check",
         })
     }
@@ -322,6 +417,11 @@ impl std::fmt::Display for PatternProblem {
 
 /// Why `pattern` must not be joined into a sentinel block, or `None` when
 /// it is safe to.
+///
+/// `pattern` is the regex as PCRE is to compile it, which is what NGINX
+/// hands PCRE because [`nginx_quoted`] writes it exactly. Checking the text
+/// before quoting was only ever right because of that: when patterns were
+/// written verbatim, this checked one regex and NGINX compiled another.
 ///
 /// **A structural check, not a regex engine.** Deciding whether a PCRE
 /// pattern matches every string needs one, and the `regex` crate would add
@@ -332,15 +432,22 @@ impl std::fmt::Display for PatternProblem {
 /// pattern, `.*`, `^`, `a?b?c?`, `(abc)?` and `Bot|.*` alike, because each
 /// has a way to match nearly nothing. It errs towards refusing: anything it
 /// does not understand is [`PatternProblem::Unchecked`].
+///
+/// **Nor a compiler.** It refuses what it can see PCRE would refuse — an
+/// unbalanced group, a range or quantifier out of order, a count past
+/// PCRE's limit, a POSIX class it does not know, an escape it does not
+/// know — and everything it cannot check. What it cannot promise is that
+/// every pattern it passes compiles: that would take PCRE itself. The one
+/// real compiler on the host is `nginx -t`, which every apply runs before
+/// reloading and which rolls the apply back if it fails; bisecting a
+/// failure down to the one bad pattern would mean a `nginx -t` per step
+/// against a scratch config tree, which an apply does not have.
 pub fn pattern_problem(pattern: &str) -> Option<PatternProblem> {
     if pattern.trim().is_empty() {
         return Some(PatternProblem::Empty);
     }
     if pattern.chars().any(char::is_control) {
         return Some(PatternProblem::ControlCharacter);
-    }
-    if !is_embeddable(pattern) {
-        return Some(PatternProblem::NotEmbeddable);
     }
     if pattern.len() > MAX_PATTERN_LEN {
         return Some(PatternProblem::TooLong);
@@ -371,7 +478,59 @@ struct Measured {
     min_literals: usize,
     /// Whether it contains a quantifier anywhere.
     quantified: bool,
+    /// Whether a quantifier may follow it. An anchor (`^`, `\b`) matches a
+    /// position rather than a character, and no list repeats one.
+    repeatable: bool,
 }
+
+/// A quantifier, as [`Shape::quantifier`] reads it.
+struct Quantifier {
+    /// The fewest repetitions.
+    min: usize,
+    /// Whether it can match more than once.
+    repeats: bool,
+    /// For `{n}`, `{n,}` and `{n,m}`: how many copies of the repeated
+    /// item PCRE compiles, which it does by writing the item out that
+    /// many times.
+    copies: Option<usize>,
+}
+
+/// What stands at a `{`: a quantifier, or a literal brace.
+enum Brace {
+    /// Not a quantifier in any PCRE: `{`, `{}`, `{a}`, `x server {`.
+    Literal,
+    /// `{n}`, `{n,}` or `{n,m}`, `len` characters long.
+    Quantifier {
+        min: usize,
+        max: Option<usize>,
+        len: usize,
+    },
+}
+
+/// One member of a `[...]` class.
+enum Member {
+    /// A single character, which may start or end a range.
+    Char(char),
+    /// A set of characters (`\d`, `[:alpha:]`), which may not.
+    Set,
+}
+
+/// The largest count PCRE accepts in a `{}` quantifier.
+const PCRE_MAX_REPEAT: usize = 65_535;
+
+/// How many characters of pattern a braced quantifier may expand into.
+/// PCRE compiles `(abc){100}` by writing the group out a hundred times,
+/// and a compiled pattern past its size limit fails `nginx -t` with
+/// "regular expression is too large". The largest in any real list is
+/// `\/{0,1}`.
+const MAX_REPEAT_EXPANSION: usize = 4096;
+
+/// The POSIX classes PCRE knows inside `[...]`. Any other name fails to
+/// compile.
+const POSIX_CLASSES: [&str; 14] = [
+    "alnum", "alpha", "ascii", "blank", "cntrl", "digit", "graph", "lower", "print", "punct",
+    "space", "upper", "word", "xdigit",
+];
 
 /// A recursive walk over a PCRE pattern, just deep enough for
 /// [`pattern_problem`].
@@ -405,6 +564,7 @@ impl Shape<'_> {
                 return Ok(Measured {
                     min_literals,
                     quantified,
+                    repeatable: true,
                 });
             }
             self.pos += 1;
@@ -421,14 +581,24 @@ impl Shape<'_> {
             if c == '|' || c == ')' {
                 break;
             }
+            let atom_start = self.pos;
             let atom = self.atom(depth)?;
-            match self.quantifier() {
-                Some((min, repeats)) => {
-                    if repeats && atom.quantified {
+            let atom_len = self.pos - atom_start;
+            match self.quantifier()? {
+                Some(quantifier) => {
+                    if !atom.repeatable {
+                        return Err(PatternProblem::Unchecked);
+                    }
+                    if quantifier.copies.is_some_and(|copies| {
+                        atom_len.saturating_mul(copies) > MAX_REPEAT_EXPANSION
+                    }) {
+                        return Err(PatternProblem::Unchecked);
+                    }
+                    if quantifier.repeats && atom.quantified {
                         return Err(PatternProblem::Backtracks);
                     }
-                    min_literals =
-                        min_literals.saturating_add(atom.min_literals.saturating_mul(min));
+                    min_literals = min_literals
+                        .saturating_add(atom.min_literals.saturating_mul(quantifier.min));
                     quantified = true;
                 }
                 None => {
@@ -443,6 +613,7 @@ impl Shape<'_> {
         Ok(Measured {
             min_literals,
             quantified,
+            repeatable: true,
         })
     }
 
@@ -450,13 +621,19 @@ impl Shape<'_> {
         let literal = |n| Measured {
             min_literals: n,
             quantified: false,
+            repeatable: true,
+        };
+        let anchor = Measured {
+            min_literals: 0,
+            quantified: false,
+            repeatable: false,
         };
         let c = self.peek().ok_or(PatternProblem::Unchecked)?;
         self.pos += 1;
         match c {
             '(' => {
                 // `(?:` is the only `(?` form upstream lists use; the rest
-                // (lookaround, flags, named groups) are refused.
+                // (lookaround, flags, named groups, comments) are refused.
                 if self.peek() == Some('?') {
                     if self.chars.get(self.pos + 1) != Some(&':') {
                         return Err(PatternProblem::Unchecked);
@@ -471,6 +648,11 @@ impl Shape<'_> {
                 Ok(inner)
             }
             '[' => {
+                // `[:alpha:]` outside a class is an error in PCRE, not a
+                // class of `:`, `a`, `l`...
+                if self.posix_class_at(self.pos - 1).is_some() {
+                    return Err(PatternProblem::Invalid);
+                }
                 let start = self.pos;
                 self.class()?;
                 // `[Tt]` is how upstream spells one letter in either case
@@ -484,106 +666,211 @@ impl Shape<'_> {
                 let escaped = self.peek().ok_or(PatternProblem::Unchecked)?;
                 self.pos += 1;
                 match escaped {
-                    // Anchors and character types: they match, but not a
-                    // literal character.
-                    'b' | 'B' | 'A' | 'z' | 'Z' | 'G' | 'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'h'
-                    | 'H' | 'v' | 'V' => Ok(literal(0)),
+                    // Anchors: they match a position, not a character.
+                    'b' | 'B' | 'A' | 'z' | 'Z' | 'G' => Ok(anchor),
+                    // Character types: they match a character, but not a
+                    // literal one.
+                    'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'h' | 'H' | 'v' | 'V' => Ok(literal(0)),
                     // `\x41`, `\p{..}`, `\Q..\E`, back-references: each
                     // would need its own parsing to count honestly.
                     c if c.is_ascii_alphanumeric() => Err(PatternProblem::Unchecked),
                     _ => Ok(literal(1)),
                 }
             }
-            '.' | '^' | '$' => Ok(literal(0)),
+            '^' | '$' => Ok(anchor),
+            '.' => Ok(literal(0)),
             // A quantifier with nothing to repeat.
             '*' | '+' | '?' => Err(PatternProblem::Unchecked),
             // A `{` is a literal unless it reads as a quantifier, which
             // here would have nothing to repeat.
             '{' => {
                 self.pos -= 1;
-                if self.braces().is_some() {
-                    return Err(PatternProblem::Unchecked);
+                match self.brace()? {
+                    Brace::Quantifier { .. } => Err(PatternProblem::Unchecked),
+                    Brace::Literal => {
+                        self.pos += 1;
+                        Ok(literal(1))
+                    }
                 }
-                self.pos += 1;
-                Ok(literal(1))
             }
             _ => Ok(literal(1)),
         }
     }
 
-    /// Skips a `[...]` class, already past its `[`.
+    /// Checks a `[...]` class, already past its `[`: every member PCRE
+    /// knows, and every range in order.
     fn class(&mut self) -> Result<(), PatternProblem> {
         if self.peek() == Some('^') {
             self.pos += 1;
         }
         // A `]` straight after the opening is a literal member.
-        if self.peek() == Some(']') {
-            self.pos += 1;
-        }
+        let mut first = true;
         loop {
-            match self.peek().ok_or(PatternProblem::Unchecked)? {
-                ']' => {
-                    self.pos += 1;
-                    return Ok(());
+            if self.peek().ok_or(PatternProblem::Unchecked)? == ']' && !first {
+                self.pos += 1;
+                return Ok(());
+            }
+            first = false;
+            let from = self.class_member()?;
+            // `a-z`; a `-` last, or first, is a literal member.
+            let is_range =
+                self.peek() == Some('-') && self.chars.get(self.pos + 1).is_some_and(|&c| c != ']');
+            if !is_range {
+                continue;
+            }
+            self.pos += 1;
+            let to = self.class_member()?;
+            match (from, to) {
+                // Compared as bytes: NGINX does not ask PCRE for UTF-8
+                // mode, so a range ending in `é` ends in its first byte.
+                (Member::Char(from), Member::Char(to)) if from.is_ascii() && to.is_ascii() => {
+                    if from > to {
+                        return Err(PatternProblem::Invalid);
+                    }
                 }
-                '\\' => self.pos += 2,
-                '[' if self.chars.get(self.pos + 1) == Some(&':') => {
-                    // `[:alpha:]`: its `]` does not close the class.
-                    let rest = &self.chars[self.pos..];
-                    let close = rest
-                        .windows(2)
-                        .position(|w| w == [':', ']'])
-                        .ok_or(PatternProblem::Unchecked)?;
-                    self.pos += close + 2;
-                }
-                _ => self.pos += 1,
+                (Member::Char(_), Member::Char(_)) => return Err(PatternProblem::Unchecked),
+                // `[\d-z]`: PCRE refuses a range from or to a set.
+                _ => return Err(PatternProblem::Invalid),
             }
         }
     }
 
-    /// A quantifier at the current position, as `(minimum count, whether
-    /// it can repeat)`, consuming it and any lazy or possessive suffix. A
-    /// `{` that is not a valid quantifier is a literal in PCRE, and `None`.
-    fn quantifier(&mut self) -> Option<(usize, bool)> {
-        let found = match self.peek()? {
-            '{' => self.braces()?,
-            symbol => {
-                let found = match symbol {
-                    '?' => (0, false),
-                    '*' => (0, true),
-                    '+' => (1, true),
-                    _ => return None,
-                };
-                self.pos += 1;
-                found
+    /// One member of a class, consumed.
+    fn class_member(&mut self) -> Result<Member, PatternProblem> {
+        let c = self.peek().ok_or(PatternProblem::Unchecked)?;
+        if c == '[' {
+            if let Some((name, len)) = self.posix_class_at(self.pos) {
+                if !POSIX_CLASSES.contains(&name.as_str()) {
+                    return Err(PatternProblem::Invalid);
+                }
+                self.pos += len;
+                return Ok(Member::Set);
             }
+        }
+        self.pos += 1;
+        if c != '\\' {
+            return Ok(Member::Char(c));
+        }
+        let escaped = self.peek().ok_or(PatternProblem::Unchecked)?;
+        self.pos += 1;
+        match escaped {
+            'd' | 'D' | 'w' | 'W' | 's' | 'S' | 'h' | 'H' | 'v' | 'V' => Ok(Member::Set),
+            // `\x`, `\p`, `\N`, `\Q`...: each its own syntax, inside a
+            // class as well as out of it.
+            c if c.is_ascii_alphanumeric() => Err(PatternProblem::Unchecked),
+            c => Ok(Member::Char(c)),
+        }
+    }
+
+    /// The name and length of a POSIX class at `at`, if PCRE would read
+    /// one there: `[:alpha:]`, or the unsupported `[.x.]` and `[=x=]`,
+    /// whose name is given as empty so that it is never a known one.
+    ///
+    /// PCRE's own test (`check_posix_syntax`): a `[` and a terminator, then
+    /// the same terminator right before a `]`, with no `]` or `[` plus
+    /// terminator in between; `\]` and `\\` are skipped over.
+    fn posix_class_at(&self, at: usize) -> Option<(String, usize)> {
+        let rest = self.chars.get(at..)?;
+        if rest.first() != Some(&'[') {
+            return None;
+        }
+        let terminator = *rest.get(1).filter(|c| matches!(c, ':' | '.' | '='))?;
+        let mut i = 2;
+        while i < rest.len() {
+            match rest[i] {
+                '\\' if matches!(rest.get(i + 1), Some(']' | '\\')) => i += 1,
+                '[' if rest.get(i + 1) == Some(&terminator) => return None,
+                ']' => return None,
+                c if c == terminator && rest.get(i + 1) == Some(&']') => {
+                    let name = if terminator == ':' {
+                        rest[2..i].iter().collect()
+                    } else {
+                        String::new()
+                    };
+                    return Some((name, i + 2));
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// A quantifier at the current position, consumed along with any lazy
+    /// or possessive suffix. `None` if there is none, which includes a `{`
+    /// that is a literal.
+    fn quantifier(&mut self) -> Result<Option<Quantifier>, PatternProblem> {
+        let found = match self.peek() {
+            Some('{') => match self.brace()? {
+                Brace::Literal => return Ok(None),
+                Brace::Quantifier { min, max, len } => {
+                    self.pos += len;
+                    Quantifier {
+                        min,
+                        repeats: max.is_none_or(|max| max > 1),
+                        // `{n,}` is n copies and a starred one.
+                        copies: Some(max.map_or(min + 1, |max| max.max(min))),
+                    }
+                }
+            },
+            Some(symbol @ ('?' | '*' | '+')) => {
+                self.pos += 1;
+                Quantifier {
+                    min: usize::from(symbol == '+'),
+                    repeats: symbol != '?',
+                    copies: None,
+                }
+            }
+            _ => return Ok(None),
         };
         if matches!(self.peek(), Some('?' | '+')) {
             self.pos += 1;
         }
-        Some(found)
+        Ok(Some(found))
     }
 
-    /// `{n}`, `{n,}` or `{n,m}` at the current position, consumed. Leaves
-    /// the position alone if what is there is not one.
-    fn braces(&mut self) -> Option<(usize, bool)> {
-        let rest: String = self.chars[self.pos..].iter().take(16).collect();
-        let body = rest.strip_prefix('{')?.split('}').next()?;
-        if body.len() + 2 > rest.len() {
-            return None;
+    /// What the `{` at the current position is. Leaves the position alone.
+    ///
+    /// Only the strict forms, `{n}`, `{n,}` and `{n,m}`, count as a
+    /// quantifier. PCRE2 10.43 also reads `{,n}` and `{ n }` as one, where
+    /// earlier versions read them as literal text: which one a host's NGINX
+    /// has is not something to guess, so those are refused.
+    fn brace(&self) -> Result<Brace, PatternProblem> {
+        let rest = &self.chars[self.pos..];
+        let body_len = rest
+            .iter()
+            .skip(1)
+            .take_while(|&&c| c.is_ascii_digit() || c == ',' || c == ' ')
+            .count();
+        if body_len == 0 || rest.get(body_len + 1) != Some(&'}') {
+            return Ok(Brace::Literal);
         }
+        let body: String = rest[1..=body_len].iter().collect();
+        let number = |text: &str| -> Result<usize, PatternProblem> {
+            if text.is_empty() || !text.chars().all(|c| c.is_ascii_digit()) {
+                return Err(PatternProblem::Unchecked);
+            }
+            match text.parse::<usize>() {
+                Ok(n) if n <= PCRE_MAX_REPEAT => Ok(n),
+                _ => Err(PatternProblem::Invalid),
+            }
+        };
         let (min, max) = match body.split_once(',') {
-            None => (body, Some(body)),
-            Some((min, "")) => (min, None),
-            Some((min, max)) => (min, Some(max)),
+            None => {
+                let n = number(&body)?;
+                (n, Some(n))
+            }
+            Some((min, "")) => (number(min)?, None),
+            Some((min, max)) => (number(min)?, Some(number(max)?)),
         };
-        let min: usize = min.parse().ok()?;
-        let max: Option<usize> = match max {
-            Some(max) => Some(max.parse().ok()?),
-            None => None,
-        };
-        self.pos += body.chars().count() + 2;
-        Some((min, max.is_none_or(|max| max > 1)))
+        if max.is_some_and(|max| max < min) {
+            return Err(PatternProblem::Invalid);
+        }
+        Ok(Brace::Quantifier {
+            min,
+            max,
+            len: body_len + 2,
+        })
     }
 }
 
@@ -591,60 +878,125 @@ impl Shape<'_> {
 /// [`pattern_problem`]), in order. Empty is the same "nothing to block" case
 /// as an empty list, which removes any existing sentinel block instead of
 /// writing an empty one.
+///
+/// Checked again here, at render time, rather than trusted from wherever
+/// they came from: a row stored by an older release, a list fetched before
+/// a check existed. [`skipped_entries`] names what is left out, for the
+/// status report.
 fn usable_patterns(patterns: &[String]) -> Vec<&str> {
     patterns
         .iter()
         .map(String::as_str)
-        .filter(|p| is_usable_pattern(p))
+        .filter(|p| reaches_pcre_intact(p) && is_usable_pattern(p))
         .collect()
 }
 
-/// Maximum byte length of a single chunk [`chunk_patterns`] produces.
+/// Every stored entry the render leaves out, one line each, for the
+/// status report and `apply-blocks` to name: rows an older release stored
+/// without today's checks, and bot-list patterns fetched before them.
+/// Checked the way the render checks them, so the two cannot disagree.
+///
+/// A list, not an error: leaving an entry out is the safe failure, and an
+/// apply must still write everything else. But an entry left out without a
+/// word is a block or an exemption the operator believes is there.
+pub fn skipped_entries(db: &crate::db::Db) -> Result<Vec<String>> {
+    use crate::db;
+    let mut skipped = Vec::new();
+    for ua in db.list_blocked_user_agents()? {
+        let regex = db::escape_regex_literal(&ua);
+        if let Some(problem) = pattern_problem(&regex) {
+            skipped.push(format!("blocked user agent {ua:?}: {problem}"));
+        }
+    }
+    let unusable_bots = db
+        .list_bots()?
+        .iter()
+        .filter(|bot| !is_usable_pattern(&bot.user_agent_pattern))
+        .count();
+    if unusable_bots > 0 {
+        skipped.push(format!(
+            "{unusable_bots} bot-list pattern(s) that are not a regex this tool can check"
+        ));
+    }
+    for ua in db.list_trusted_user_agents()? {
+        if let Err(err) = db::validate_trusted_user_agent(&ua) {
+            skipped.push(format!("trusted user agent {ua:?}: {err}"));
+        }
+    }
+    for site in db.list_sites()? {
+        let name = &site.server_name;
+        for path in db.site_path_exemptions(site.id)? {
+            if let Err(err) = db::validate_exempt_path(&path) {
+                skipped.push(format!("{name}: exempt path {path:?}: {err}"));
+            }
+        }
+        for exemption in db.site_agent_exemptions(site.id)? {
+            let (path, ua) = (&exemption.path, &exemption.user_agent);
+            if let Err(err) =
+                db::validate_exempt_path(path).and_then(|_| db::validate_exemption_user_agent(ua))
+            {
+                skipped.push(format!("{name}: exempt path {path:?} for {ua:?}: {err}"));
+            }
+        }
+    }
+    Ok(skipped)
+}
+
+/// Whether NGINX hands PCRE exactly `regex` when this module writes it:
+/// [`nginx_quoted`] read back through [`nginx_unquoted`]. True of every
+/// string by construction; asked anyway, because a regex that reached PCRE
+/// as something else is how a blocked user agent once became a rule
+/// against every visitor.
+fn reaches_pcre_intact(regex: &str) -> bool {
+    let quoted = nginx_quoted(regex);
+    nginx_unquoted(&quoted[1..quoted.len() - 1]) == regex
+}
+
+/// Maximum byte length of a single chunk [`chunk_patterns`] produces, as
+/// written: after [`nginx_quoted`] has escaped it.
 ///
 /// NGINX's config-file parser has a hard ceiling on the length of a single
 /// quoted parameter — confirmed empirically against a real `nginx -t`:
 /// even a *properly terminated* quoted string fails with `too long
 /// parameter, probably missing terminating """ character` once it crosses
 /// roughly 4100 bytes (matching `NGX_CONF_BUFFER`), regardless of what
-/// precedes it in the file. This is unrelated to the quote-escaping issue
-/// [`is_embeddable`] guards against — even a config free of embedding bugs
-/// can still hit this purely from having enough blocked bots: the
-/// `nginx-bad-bots` source alone is ~700 entries, easily exceeding 4096
-/// bytes once joined with `|`. Set well below the observed failure point to
+/// precedes it in the file. Having enough blocked bots is enough to reach
+/// it: the `nginx-bad-bots` source alone is ~700 entries, easily exceeding
+/// 4096 bytes once joined with `|`. Set well below the observed failure point to
 /// stay safe regardless of how much unrelated content precedes the
 /// sentinel block in a real config file (confirmed empirically too: a
 /// 2000-byte quoted parameter still parses fine even after ~10KB of
 /// preceding file content).
 const MAX_PATTERN_CHUNK_LEN: usize = 2000;
 
-/// Joins `patterns` with `|` into pieces of at most `max_len` bytes each,
-/// **never splitting a pattern**. A single pattern longer than `max_len`
-/// becomes its own oversized chunk rather than being dropped or cut.
+/// Joins `patterns` with `|` into regexes of at most `max_len` bytes each
+/// once written by [`nginx_quoted`], **never splitting a pattern**. A
+/// single pattern longer than `max_len` becomes its own oversized chunk
+/// rather than being dropped or cut.
 ///
 /// This used to join everything first and then split the result on every
 /// `|` — including the `|` of an escaped `\|` and the ones inside a
 /// `(a|b)` group. A chunk could then end in the backslash of `\|`, which
-/// escapes the closing quote of `if ($http_user_agent ~* "...")`, and NGINX
+/// escaped the closing quote of `if ($http_user_agent ~* "...")`, and NGINX
 /// read the start of the next chunk as directives. Verified with a real
 /// `nginx -t`: a line in a downloaded bot list could put an `include` into
-/// a config that root loads, unattended, from cron.
-///
-/// Every chunk is checked again as it is built, and a pattern that would
-/// make one unsafe is left out rather than written: the only safe failure
-/// for a string that is about to become config is to not write it.
+/// a config that root loads, unattended, from cron. Whole patterns are
+/// what keep each chunk a regex; [`nginx_quoted`] is what keeps it inside
+/// its quotes whatever it ends in.
 fn chunk_patterns(patterns: &[&str], max_len: usize) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    for pattern in patterns.iter().filter(|p| is_embeddable(p)) {
+    let mut chunks: Vec<(String, usize)> = Vec::new();
+    for pattern in patterns {
+        let len = quoted_len(pattern);
         match chunks.last_mut() {
-            Some(last) if last.len() + 1 + pattern.len() <= max_len => {
+            Some((last, last_len)) if *last_len + 1 + len <= max_len => {
                 last.push('|');
                 last.push_str(pattern);
+                *last_len += 1 + len;
             }
-            _ => chunks.push(pattern.to_string()),
+            _ => chunks.push((pattern.to_string(), len)),
         }
     }
-    chunks.retain(|chunk| is_embeddable(chunk));
-    chunks
+    chunks.into_iter().map(|(chunk, _)| chunk).collect()
 }
 
 /// Where this project writes NGINX files it fully owns, as opposed to the
@@ -892,18 +1244,20 @@ impl RequestRule {
         matches!(self, RequestRule::Http1x | RequestRule::OldTls)
     }
 
-    /// The NGINX condition, without the surrounding `if (...)`.
-    fn condition(self) -> &'static str {
+    /// The NGINX condition, without the surrounding `if (...)`. A regex in
+    /// one is written by [`nginx_quoted`], like every other.
+    fn condition(self) -> String {
+        let matches = |variable: &str, regex: &str| format!("{variable} ~ {}", nginx_quoted(regex));
         match self {
-            RequestRule::Http1x => r#"$server_protocol ~ "^HTTP/1\.""#,
-            RequestRule::NoAccept => r#"$http_accept = """#,
-            RequestRule::NoAcceptLanguage => r#"$http_accept_language = """#,
-            RequestRule::NoUserAgent => r#"$http_user_agent = """#,
+            RequestRule::Http1x => matches("$server_protocol", r"^HTTP/1\."),
+            RequestRule::NoAccept => r#"$http_accept = """#.to_string(),
+            RequestRule::NoAcceptLanguage => r#"$http_accept_language = """#.to_string(),
+            RequestRule::NoUserAgent => r#"$http_user_agent = """#.to_string(),
             // Anchored, and matching both an IPv4 literal and a bracketed
             // IPv6 one. `$host` is already lowercased and port-stripped by
             // NGINX, which `$http_host` is not.
-            RequestRule::IpLiteralHost => r#"$host ~ "^(\d+\.\d+\.\d+\.\d+|\[)""#,
-            RequestRule::OldTls => r#"$ssl_protocol ~ "^TLSv1(\.[01])?$""#,
+            RequestRule::IpLiteralHost => matches("$host", r"^(\d+\.\d+\.\d+\.\d+|\[)"),
+            RequestRule::OldTls => matches("$ssl_protocol", r"^TLSv1(\.[01])?$"),
         }
     }
 }
@@ -1160,17 +1514,18 @@ pub fn trusted_conf(db: &crate::db::Db) -> Result<Option<String>> {
 ///   is harmless unreferenced.
 ///
 /// User agents match the way a manual user-agent block does: a
-/// case-insensitive, regex-escaped substring. Each one has been through
-/// `db::validate_trusted_user_agent`, and is filtered by [`is_embeddable`]
-/// again here rather than trusting the caller — a quote in a `map` key
-/// would not break one site, it would stop NGINX loading at all.
+/// case-insensitive, regex-escaped substring, written by [`nginx_quoted`]
+/// with the `~*` that makes a `map` key a regex inside the quotes. Each
+/// one has been through `db::validate_trusted_user_agent`, and is checked
+/// again here rather than trusting the caller — a bad `map` key would not
+/// break one site, it would stop NGINX loading at all.
 ///
 /// All three are evaluated lazily, per request, and only when read.
 pub fn trusted_conf_body(addresses: &[String], user_agents: &[String]) -> Option<String> {
     let user_agents: Vec<String> = user_agents
         .iter()
-        .map(|ua| crate::db::escape_for_nginx_regex(ua))
-        .filter(|ua| !ua.is_empty() && is_embeddable(ua))
+        .filter(|ua| is_stored_as_valid(ua, crate::db::validate_trusted_user_agent))
+        .map(|ua| nginx_quoted(&format!("~*{}", crate::db::escape_regex_literal(ua))))
         .collect();
     let addresses: Vec<&String> = addresses
         .iter()
@@ -1189,7 +1544,7 @@ pub fn trusted_conf_body(addresses: &[String], user_agents: &[String]) -> Option
         "map $http_user_agent {TRUSTED_VAR} {{\n    default $stop_bots_trusted_address;\n"
     ));
     for ua in user_agents {
-        out.push_str(&format!("    \"~*{ua}\" 1;\n"));
+        out.push_str(&format!("    {ua} 1;\n"));
     }
     out.push_str("}\n");
     out.push_str(&format!(
@@ -1797,7 +2152,8 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     if let Some(chunks) = &pattern {
         for chunk in chunks {
             out.push_str(&format!(
-                "    if ($http_user_agent ~* \"{chunk}\") {{\n        {set_blocked}"
+                "    if ($http_user_agent ~* {}) {{\n        {set_blocked}",
+                nginx_quoted(chunk)
             ));
         }
     }
@@ -1809,7 +2165,8 @@ fn block_text(config: &BlockConfig) -> Option<String> {
     }
     if let Some(exemptions) = &exemptions {
         out.push_str(&format!(
-            "    if ($uri ~* \"{exemptions}\") {{\n        set $stop_bots_block 0;\n    }}\n"
+            "    if ($uri ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
+            nginx_quoted(exemptions)
         ));
     }
     out.push_str(&agent_clears);
@@ -1928,34 +2285,47 @@ fn for_block(config: &BlockConfig, block: &ServerBlock) -> BlockConfig {
     }
 }
 
+/// Whether `value`, as stored, is exactly what `validate` would store:
+/// how a row is checked again at render time rather than trusted, whatever
+/// wrote it.
+fn is_stored_as_valid(value: &str, validate: fn(&str) -> Result<String>) -> bool {
+    validate(value).is_ok_and(|valid| valid == value)
+}
+
 /// Builds the `$uri` regex that clears the block flag, or `None` when
 /// there are no usable exemptions: `prefixes` match anything under them,
 /// `exact` only themselves.
 ///
-/// Anchored with `^` and alternated, so `/blog` exempts `/blog` and
-/// `/blog/post` but not `/notablog`. Each path is regex-escaped: these are
-/// literal URL prefixes typed by an admin, not hand-written regex, and an
-/// unescaped `.` or `?` in one would quietly widen the exemption far
-/// beyond what was asked for — which, unlike a too-narrow pattern, fails
-/// *open*.
+/// **An exemption is a literal path prefix, never a regex.** Anchored with
+/// `^` and alternated, so `/blog` exempts `/blog` and `/blog/post` but not
+/// `/notablog`. Each path is regex-escaped: these are URL prefixes typed by
+/// an admin, not hand-written regex, and an unescaped `.` or `?` in one
+/// would quietly widen the exemption far beyond what was asked for —
+/// which, unlike a too-narrow pattern, fails *open*. The whole regex is
+/// then written by [`nginx_quoted`]: before it was, a stored `/x\|` reached
+/// PCRE as `^(/x\\|)`, which exempted every path on the site.
+///
+/// Each path is checked again with `db::validate_exempt_path` rather than
+/// trusted, so a row an older release stored without that check is left
+/// out (see [`skipped_entries`]) instead of written.
 ///
 /// Matched against `$uri`, never `$request_uri`, for the reason
 /// [`agent_exemption_clears`] gives: the raw request line is not the path
 /// NGINX serves, and `/robots.txt/../wp-login.php` begins with an exempt
 /// prefix while resolving to a blocked one.
 fn exemption_regex(prefixes: &[String], exact: &[&str]) -> Option<String> {
-    let usable = |p: &&str| p.starts_with('/') && is_embeddable(p);
+    let usable = |p: &&str| is_stored_as_valid(p, crate::db::validate_exempt_path);
     let escaped: Vec<String> = prefixes
         .iter()
         .map(String::as_str)
         .filter(usable)
-        .map(crate::db::escape_for_nginx_regex)
+        .map(crate::db::escape_regex_literal)
         .chain(
             exact
                 .iter()
                 .copied()
                 .filter(usable)
-                .map(|p| format!("{}$", crate::db::escape_for_nginx_regex(p))),
+                .map(|p| format!("{}$", crate::db::escape_regex_literal(p))),
         )
         .collect();
     (!escaped.is_empty()).then(|| format!("^({})", escaped.join("|")))
@@ -1987,16 +2357,14 @@ fn exemption_regex(prefixes: &[String], exact: &[&str]) -> Option<String> {
 /// there.
 ///
 /// The user agent is matched as an escaped, case-insensitive substring,
-/// the same as a trusted one, and filtered again here rather than trusting
-/// the caller, since one bad quoted string stops NGINX loading the file.
+/// the same as a trusted one, and checked again here rather than trusting
+/// the caller, since a user agent that matched more than it says would
+/// exempt every client.
 fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
     let mut out = String::new();
     for group in exemptions.chunk_by(|a, b| a.user_agent == b.user_agent) {
-        let user_agent = crate::db::escape_for_nginx_regex(&group[0].user_agent);
-        if user_agent.is_empty()
-            || !is_embeddable(&user_agent)
-            || user_agent.chars().any(char::is_control)
-        {
+        let user_agent = &group[0].user_agent;
+        if !is_stored_as_valid(user_agent, crate::db::validate_exemption_user_agent) {
             continue;
         }
         let paths: Vec<String> = group.iter().map(|e| e.path.clone()).collect();
@@ -2004,7 +2372,9 @@ fn agent_exemption_clears(exemptions: &[crate::db::AgentExemption]) -> String {
             continue;
         };
         out.push_str(&format!(
-            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* \"{user_agent}\") {{\n        set {AGENT_EXEMPT_VAR} $uri;\n    }}\n    if ({AGENT_EXEMPT_VAR} ~* \"{paths}\") {{\n        set $stop_bots_block 0;\n    }}\n"
+            "    set {AGENT_EXEMPT_VAR} \"\";\n    if ($http_user_agent ~* {}) {{\n        set {AGENT_EXEMPT_VAR} $uri;\n    }}\n    if ({AGENT_EXEMPT_VAR} ~* {}) {{\n        set $stop_bots_block 0;\n    }}\n",
+            nginx_quoted(&crate::db::escape_regex_literal(user_agent)),
+            nginx_quoted(&paths)
         ));
     }
     out
@@ -3819,21 +4189,78 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
-    #[test]
-    fn is_embeddable_rejects_a_literal_quote() {
-        assert!(!is_embeddable("Evil\"Bot"));
+    // ---- writing a regex into a quoted string, exactly ----
+
+    /// Where NGINX's reader ends a double-quoted word that starts at
+    /// `text[0]`: pass 1 of `ngx_conf_read_token`, where a backslash makes
+    /// the next byte ordinary. The index of the closing quote.
+    fn closing_quote(text: &str) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let mut i = 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                b'"' => return Some(i),
+                _ => i += 1,
+            }
+        }
+        None
     }
 
+    /// Every string over the characters NGINX's reader treats specially,
+    /// up to five long: written, it ends at its own closing quote, and
+    /// reads back as itself. The whole of the claim `nginx_quoted` makes.
+    /// (`r` is left out: NGINX treats it exactly as it does `t` and `n`.)
     #[test]
-    fn is_embeddable_rejects_any_trailing_backslash_run() {
-        assert!(!is_embeddable("EvilBot\\"));
-        assert!(!is_embeddable("EvilBot\\\\"));
-        assert!(!is_embeddable("EvilBot\\\\\\"));
+    fn every_regex_reaches_pcre_exactly_as_written() {
+        let alphabet = ['a', '\\', '"', '\'', 't', 'n', '|'];
+        let mut strings = vec![String::new()];
+        for _ in 0..5 {
+            let longer: Vec<String> = strings
+                .iter()
+                .filter(|s| s.chars().count() == strings.last().unwrap().chars().count())
+                .flat_map(|s| alphabet.iter().map(move |c| format!("{s}{c}")))
+                .collect();
+            strings.extend(longer);
+        }
+        for regex in &strings {
+            let quoted = nginx_quoted(regex);
+            assert_eq!(
+                closing_quote(&quoted),
+                Some(quoted.len() - 1),
+                "{regex:?} written as {quoted} does not end at its own quote"
+            );
+            assert_eq!(
+                &nginx_unquoted(&quoted[1..quoted.len() - 1]),
+                regex,
+                "{regex:?} written as {quoted} reaches PCRE as something else"
+            );
+        }
     }
 
+    /// The cases the review found, as written and as NGINX then reads them.
     #[test]
-    fn is_embeddable_accepts_an_interior_backslash() {
-        assert!(is_embeddable("1h4x\\.com"));
+    fn a_backslash_is_doubled_only_where_nginx_would_read_an_escape() {
+        for (regex, written) in [
+            // A blocked `a\|`, escaped for PCRE: every backslash before
+            // another is doubled, the last one is not.
+            (r"a\\\|", r#""a\\\\\|""#),
+            (r"x\\\*", r#""x\\\\\*""#),
+            (r"Evil\\\(", r#""Evil\\\\\(""#),
+            (r#"say "hi""#, r#""say \"hi\"""#),
+            (r#"a\\\""#, r#""a\\\\\\\"""#),
+            (r"end\\", r#""end\\\\""#),
+            (r"\\t and \\n", r#""\\\\t and \\\\n""#),
+            (r"it\'s", r#""it\\'s""#),
+            // Already right before, and byte for byte the same now.
+            (r"1h4x\.com", r#""1h4x\.com""#),
+            (r"ALittle\ Client", r#""ALittle\ Client""#),
+            (r"^(\d+\.\d+\.\d+\.\d+|\[)", r#""^(\d+\.\d+\.\d+\.\d+|\[)""#),
+            ("$foo};", r#""$foo};""#),
+        ] {
+            assert_eq!(nginx_quoted(regex), written, "{regex:?}");
+            assert_eq!(nginx_unquoted(&written[1..written.len() - 1]), regex);
+        }
     }
 
     #[test]
@@ -3842,13 +4269,17 @@ mod tests {
             "GoodBot".to_string(),
             "Trailing\\".to_string(),
             "1h4x\\.com".to_string(),
+            "Quoted\"Bot".to_string(),
         ];
-        assert_eq!(usable_patterns(&patterns), ["GoodBot", "1h4x\\.com"]);
+        assert_eq!(
+            usable_patterns(&patterns),
+            ["GoodBot", "1h4x\\.com", "Quoted\"Bot"]
+        );
     }
 
     #[test]
     fn usable_patterns_is_empty_when_every_pattern_is_unsafe() {
-        let patterns = vec!["Trailing\\".to_string(), "Quoted\"Bot".to_string()];
+        let patterns = vec!["Trailing\\".to_string(), "Evil(".to_string()];
         assert!(usable_patterns(&patterns).is_empty());
     }
 
@@ -3914,10 +4345,17 @@ mod tests {
         assert_eq!(chunks, ["AAA", huge.as_str(), "BBB"]);
     }
 
+    /// The limit is NGINX's, on the bytes in the file, so a chunk is
+    /// measured as written: `a\\` is three characters of regex and five
+    /// of config.
     #[test]
-    fn chunk_patterns_never_emits_an_unsafe_chunk() {
-        let chunks = chunk_patterns(&["AAA", "Evil\\", "Evil\"Bot", "BBB"], 2000);
-        assert_eq!(chunks, ["AAA|BBB"]);
+    fn chunk_patterns_measures_each_chunk_as_written() {
+        let patterns = [r"a\\x", r"b\\x", r"c\\x"];
+        let chunks = chunk_patterns(&patterns, 13);
+        assert_eq!(chunks, [r"a\\x|b\\x", r"c\\x"]);
+        for chunk in &chunks {
+            assert!(nginx_quoted(chunk).len() - 2 <= 13, "{chunk} is too long");
+        }
     }
 
     /// Regression test for the real bug: NGINX's config parser rejects any
@@ -4130,7 +4568,7 @@ mod tests {
         assert!(regexes.len() > 1, "the test needs two chunks:\n{text}");
         for regex in &regexes {
             assert!(
-                is_embeddable(regex),
+                !regex.ends_with('\\'),
                 "unsafe chunk ends {:?}",
                 &regex[regex.len() - 12..]
             );
@@ -4266,8 +4704,8 @@ mod tests {
             "Evil#Bot".to_string(),
             "Evil}Bot".to_string(),
             "x server {".to_string(),
-            crate::db::escape_for_nginx_regex("x # END stop-bots"),
-            crate::db::escape_for_nginx_regex(BLOCK_BEGIN),
+            crate::db::escape_regex_literal("x # END stop-bots"),
+            crate::db::escape_regex_literal(BLOCK_BEGIN),
         ]
     }
 
@@ -4379,9 +4817,9 @@ mod tests {
     #[test]
     fn block_text_is_none_when_there_is_nothing_to_block() {
         assert!(block_text(&BlockConfig::default()).is_none());
-        // Every pattern rejected by `is_embeddable` is the same case as an
-        // empty list: nothing safe left to write.
-        assert!(block_text(&cfg(&["Quoted\"Bot"])).is_none());
+        // Every pattern rejected by `pattern_problem` is the same case as
+        // an empty list: nothing safe left to write.
+        assert!(block_text(&cfg(&["Trailing\\"])).is_none());
     }
 
     #[test]
@@ -5848,7 +6286,7 @@ mod tests {
         for rule in RequestRule::ALL {
             let text = block_text(&cfg_rules(&[rule])).unwrap();
             assert!(
-                text.contains(rule.condition()),
+                text.contains(&rule.condition()),
                 "{} should emit {:?}; text was:\n{text}",
                 rule.label(),
                 rule.condition()
@@ -6508,5 +6946,230 @@ server {
             fs::write(&path, format!("{first_line}\nserver {{\n}}\n")).unwrap();
             assert_eq!(is_console_site_file(&path), ours, "{first_line}");
         }
+    }
+
+    // ---- hostile strings, as NGINX will read them ----
+
+    /// User agents a site that logs in JSON (`escape=json`) can put in
+    /// front of an operator, each with a character NGINX's config reader
+    /// or PCRE treats specially. The container suite checks the same list
+    /// against a real NGINX.
+    const HOSTILE_USER_AGENTS: [&str; 11] = [
+        r"Scraper/2.1 a\|",
+        r"Scraper/2.1 x\*",
+        r"Scraper/2.1 Evil\(",
+        r#"Scraper/2.1 say "hi""#,
+        r#"Scraper/2.1 \"quoted\""#,
+        r"Scraper/2.1 trailing\",
+        r"Scraper/2.1 tab\t",
+        r"Scraper/2.1 line\n",
+        "Scraper/2.1 $foo",
+        "Scraper/2.1 }",
+        "Scraper/2.1 ;",
+    ];
+
+    /// The regex of every `$http_user_agent` test in `text`, as NGINX
+    /// hands it to PCRE: found the way NGINX's reader finds the end of
+    /// the quoted word, then unescaped the way it unescapes one.
+    fn user_agent_regexes_as_nginx_reads_them(text: &str) -> Vec<String> {
+        text.split("if ($http_user_agent ~* ")
+            .skip(1)
+            .map(|rest| {
+                let end = closing_quote(rest).expect("the quoted regex is closed");
+                assert!(
+                    rest[end + 1..].starts_with(") {"),
+                    "the regex's own quote does not end the condition:\n{rest}"
+                );
+                nginx_unquoted(&rest[1..end])
+            })
+            .collect()
+    }
+
+    /// The finding: the regex NGINX compiles for a blocked user agent is
+    /// exactly the escaped literal that `pattern_problem` checked — for
+    /// every one of these, not a match-all and not a broken group.
+    #[test]
+    fn a_hostile_blocked_user_agent_reaches_pcre_as_the_literal_that_was_checked() {
+        for user_agent in HOSTILE_USER_AGENTS {
+            let literal = crate::db::escape_regex_literal(user_agent);
+            assert_eq!(pattern_problem(&literal), None, "{user_agent:?}");
+            let text = block_text(&cfg(&[&literal])).unwrap();
+            assert_eq!(
+                user_agent_regexes_as_nginx_reads_them(&text),
+                [literal],
+                "{user_agent:?} was written as:\n{text}"
+            );
+        }
+    }
+
+    /// The same list as a stored host would have it, written at once: the
+    /// exact bytes to hand `nginx -t`.
+    #[test]
+    fn hostile_user_agents_match_the_golden() {
+        let literals: Vec<String> = HOSTILE_USER_AGENTS
+            .iter()
+            .map(|ua| crate::db::escape_regex_literal(ua))
+            .collect();
+        let text = block_text(&BlockConfig::new(literals, BlockResponse::Forbidden)).unwrap();
+        crate::golden::assert_golden("nginx-block-hostile.conf", &text);
+    }
+
+    /// Trusted and exempted user agents are written into quoted strings
+    /// too, and read back the same way.
+    #[test]
+    fn a_trusted_user_agent_reaches_pcre_as_the_literal_it_is() {
+        let body = trusted_conf_body(&[], &["Pingdom.com_bot (x)".to_string()]).unwrap();
+        let key = body
+            .lines()
+            .find(|line| line.trim_start().starts_with("\"~*"))
+            .expect("a user-agent key")
+            .trim();
+        let end = closing_quote(key).unwrap();
+        assert_eq!(
+            nginx_unquoted(&key[1..end]),
+            r"~*Pingdom\.com_bot \(x\)",
+            "key was: {key}"
+        );
+    }
+
+    /// Patterns PCRE refuses to compile: each would fail `nginx -t` and
+    /// roll back every apply after the one that wrote it.
+    #[test]
+    fn a_pattern_nginx_would_not_compile_is_never_written() {
+        for (pattern, why) in [
+            ("Bot[z-a]x", "a range out of order"),
+            ("Bot[a-Z]x", "a range out of order, by case"),
+            (r"Bot[\d-z]x", "a range from a set"),
+            ("Botx{2,1}", "quantifier numbers out of order"),
+            ("Botx{99999}", "a count past PCRE's limit"),
+            (
+                "Botx{123456789012345678901234567890}",
+                "a count past any limit",
+            ),
+            ("Bot[[:nope:]]x", "an unknown POSIX class"),
+            ("Bot[[.a.]]x", "a collating element"),
+            ("[:alpha:]Bot", "a POSIX class outside a class"),
+        ] {
+            assert_eq!(
+                pattern_problem(pattern),
+                Some(PatternProblem::Invalid),
+                "{pattern:?} ({why})"
+            );
+        }
+    }
+
+    /// Constructs this check cannot be sure of, refused rather than
+    /// guessed at.
+    #[test]
+    fn a_pattern_whose_meaning_depends_on_the_pcre_version_is_refused() {
+        for (pattern, why) in [
+            ("Botx{,5}", "a quantifier only PCRE2 10.43 reads as one"),
+            ("Botx{ 5 }", "likewise, with spaces"),
+            ("Bot^*x", "a repeated anchor"),
+            (r"Bot\b+x", "a repeated word boundary"),
+            (
+                "Bot(?:abcdefgh){1000}",
+                "a group PCRE would write out a thousand times",
+            ),
+            ("Bot(?i)x", "an inline flag"),
+            ("Bot(?#c)x", "a comment"),
+            (r"Bot[\p]x", "an escape with its own syntax, in a class"),
+        ] {
+            assert_eq!(
+                pattern_problem(pattern),
+                Some(PatternProblem::Unchecked),
+                "{pattern:?} ({why})"
+            );
+        }
+    }
+
+    /// And the class and quantifier forms that are fine stay fine.
+    #[test]
+    fn well_formed_classes_and_quantifiers_are_kept() {
+        for pattern in [
+            "Bot[a-z]x",
+            "Bot[Z-a]x",
+            "Bot[a-z-]x",
+            "Bot[-a]x",
+            "Bot[]a]x",
+            "Bot[^]a]x",
+            "Bot[[:alpha:]]x",
+            r"Bot[\d\s.-]x",
+            r"Bot[\]]x",
+            "Botx{2}",
+            "Botx{2,}",
+            "Botx{0,1}",
+            "Bot{}",
+            "Bot{a}",
+            "Bot x{",
+        ] {
+            assert_eq!(pattern_problem(pattern), None, "{pattern:?} must be kept");
+        }
+    }
+
+    /// A path exemption stored before it was validated: `/x\|` reached
+    /// PCRE as `^(/x\\|)` and exempted every path; `/x\(` failed `nginx
+    /// -t`. Now neither is written, and the valid one beside it is.
+    #[test]
+    fn a_stored_path_exemption_that_is_not_a_literal_path_is_left_out() {
+        let text = block_text(&cfg_exempt(&["BadBot"], &[r"/x\|", r"/x\(", "/blog"])).unwrap();
+        assert!(
+            text.contains(r#"if ($uri ~* "^(/blog)") {"#),
+            "text was:\n{text}"
+        );
+        assert!(!text.contains("/x"), "text was:\n{text}");
+    }
+
+    /// A literal path is a literal: every regex character in one is
+    /// escaped, and the escape reaches PCRE.
+    #[test]
+    fn a_path_exemption_reaches_pcre_as_a_literal_prefix() {
+        let text = block_text(&cfg_exempt(&["BadBot"], &["/a.b+(c)"])).unwrap();
+        let rest = text.split("if ($uri ~* ").nth(1).unwrap();
+        let end = closing_quote(rest).unwrap();
+        assert_eq!(nginx_unquoted(&rest[1..end]), r"^(/a\.b\+\(c\))");
+    }
+
+    /// What the render leaves out is named, so that it is not left out in
+    /// silence.
+    #[test]
+    fn skipped_entries_names_every_stored_row_the_render_leaves_out() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        assert!(skipped_entries(&db).unwrap().is_empty());
+
+        db.upsert_site("a.example", "/tmp/a").unwrap();
+        let site = db.list_sites().unwrap()[0].id.to_string();
+        db.insert_unvalidated_row_for_tests(
+            "site_path_exemptions",
+            &[("site_id", &site), ("path", r"/x\|")],
+        );
+        db.insert_unvalidated_row_for_tests(
+            "site_agent_exemptions",
+            &[
+                ("site_id", &site),
+                ("path", "/dav/"),
+                ("user_agent", r#"ok"http"#),
+            ],
+        );
+        db.insert_unvalidated_row_for_tests(
+            "blocked_user_agents",
+            &[("user_agent", "ab"), ("blocked_at", "0")],
+        );
+        // Stored before backslashes were refused, and written exactly now:
+        // not left out.
+        db.insert_unvalidated_row_for_tests(
+            "blocked_user_agents",
+            &[("user_agent", r"Scraper/2.1 a\|"), ("blocked_at", "0")],
+        );
+
+        let skipped = skipped_entries(&db).unwrap();
+        // Named as `{:?}` spells them, so a control character shows.
+        for needle in [r"/x\\|", r#"ok\"http"#, r#""ab""#] {
+            assert!(
+                skipped.iter().any(|line| line.contains(needle)),
+                "{needle} is not named: {skipped:#?}"
+            );
+        }
+        assert_eq!(skipped.len(), 3, "{skipped:#?}");
     }
 }

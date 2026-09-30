@@ -66,9 +66,8 @@ fn category_index(category: Category) -> usize {
 /// the admin sees a configured exemption and blocked traffic, with
 /// nothing to connect the two.
 ///
-/// A literal `"` is rejected for the same reason `nginx::is_embeddable`
-/// rejects it in a user-agent pattern: it would terminate the quoted
-/// config string early and corrupt the whole file.
+/// The rest is `db::validate_exempt_path`'s, which every front-end and the
+/// database itself share: no `"`, `\`, whitespace or control character.
 fn validate_exempt_path(path: &str) -> Result<(), String> {
     if path.is_empty() {
         return Err("Enter a path".to_string());
@@ -76,13 +75,10 @@ fn validate_exempt_path(path: &str) -> Result<(), String> {
     if !path.starts_with('/') {
         return Err("Must start with /".to_string());
     }
-    if path.contains('"') {
-        return Err("Cannot contain a double quote".to_string());
+    match crate::db::validate_exempt_path(path) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(format!("Refused: {err}")),
     }
-    if path.contains(char::is_whitespace) {
-        return Err("Cannot contain spaces".to_string());
-    }
-    Ok(())
 }
 
 /// One row of the exemptions panel: a path, and the user agent it is
@@ -1456,6 +1452,8 @@ mod tests {
         assert!(validate_exempt_path("blog").is_err());
         assert!(validate_exempt_path("/a b").is_err());
         assert!(validate_exempt_path("/a\"b").is_err());
+        assert!(validate_exempt_path(r"/x\|").is_err());
+        assert!(validate_exempt_path("/a\u{7}b").is_err());
     }
 
     #[test]

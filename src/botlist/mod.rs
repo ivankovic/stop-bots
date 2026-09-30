@@ -95,12 +95,22 @@ impl SourceKind {
     /// silently missing, and the previous list stays in place while the
     /// error says why.
     pub fn parse(self, raw: &str) -> Result<Vec<NewBot>> {
-        let bots = match self {
-            SourceKind::WellKnownBots => well_known_bots::parse(raw),
-            SourceKind::AiRobotsTxt => ai_robots_txt::parse(raw),
-            SourceKind::NginxBadBots => nginx_bad_bots::parse(raw),
-            SourceKind::StopBotsExtras => stop_bots_extras::parse(raw),
+        self.parse_counted(raw).map(|parsed| parsed.bots)
+    }
+
+    /// [`Self::parse`], and how many patterns it left out — what a fetch's
+    /// summary reports, so that a list that starts carrying patterns
+    /// NGINX would refuse shows up where somebody reads it.
+    pub fn parse_counted(self, raw: &str) -> Result<Parsed> {
+        let parsed = match self {
+            SourceKind::WellKnownBots => well_known_bots::parse_counted(raw),
+            SourceKind::AiRobotsTxt => ai_robots_txt::parse_counted(raw),
+            SourceKind::NginxBadBots => nginx_bad_bots::parse_counted(raw),
+            SourceKind::StopBotsExtras => {
+                stop_bots_extras::parse(raw).map(|bots| Parsed { bots, skipped: 0 })
+            }
         }?;
+        let bots = &parsed.bots;
         if bots.len() > MAX_SOURCE_ENTRIES {
             anyhow::bail!(
                 "the {} list has {} entries, more than the {MAX_SOURCE_ENTRIES} accepted from \
@@ -122,7 +132,7 @@ impl SourceKind {
                 crate::nginx::MAX_PATTERN_LEN
             );
         }
-        Ok(bots)
+        Ok(parsed)
     }
 
     pub async fn fetch(self) -> Result<String> {
@@ -149,19 +159,75 @@ impl SourceKind {
 /// 800 (well-known-bots, September 2026); this is over ten times that.
 pub const MAX_SOURCE_ENTRIES: usize = 10_000;
 
+/// A parsed list: the bots it holds, and how many of its patterns
+/// [`keeps_pattern`] left out.
+#[derive(Debug, Clone)]
+pub struct Parsed {
+    pub bots: Vec<NewBot>,
+    pub skipped: usize,
+}
+
+impl Parsed {
+    /// The one-line summary of storing this list, `stored` being what the
+    /// store reports: "N bot(s)", and what was left out, if anything was.
+    ///
+    /// Left out one line at a time rather than refused whole: one bad line
+    /// in a list of seven hundred should cost that line. But silently, it
+    /// would also hide a list that has started to go wrong, so the count
+    /// is in the summary `batch` prints to a cron log and the front-ends
+    /// show after an update.
+    pub fn summary(&self, stored: usize) -> String {
+        match left_out_note(self.skipped) {
+            None => format!("{stored} bot(s)"),
+            Some(note) => format!("{stored} bot(s); {note}"),
+        }
+    }
+}
+
+/// What a fetch left out, said in words, or `None` when nothing was.
+pub fn left_out_note(skipped: usize) -> Option<String> {
+    (skipped > 0).then(|| {
+        format!(
+            "left out {skipped} pattern(s) that would match nearly everyone, or that NGINX \
+             would not compile"
+        )
+    })
+}
+
+/// `patterns`, less the ones [`keeps_pattern`] refuses, and how many that
+/// was. What every downloaded list's parser filters its patterns through.
+pub(crate) fn kept_patterns<I: IntoIterator<Item = String>>(patterns: I) -> (Vec<String>, usize) {
+    let mut skipped = 0;
+    let kept = patterns
+        .into_iter()
+        .filter(|pattern| {
+            let keep = keeps_pattern(pattern);
+            skipped += usize::from(!keep);
+            keep
+        })
+        .collect();
+    (kept, skipped)
+}
+
 /// Whether a parser keeps `pattern`: everything `nginx::pattern_problem`
 /// accepts, and one that is only too long, so that [`SourceKind::parse`]
 /// can refuse the whole list over it instead of quietly dropping a line.
 ///
 /// Every parser filters through this, which keeps a pattern that would
-/// match every visitor (an empty key, `accepted: [""]`, a lone `|` line)
-/// out of the database. `nginx::block_text` checks the same thing again
-/// for anything that reached the database some other way.
+/// match every visitor (an empty key, `accepted: [""]`, a lone `|` line),
+/// or that NGINX would refuse to compile (`[z-a]`, `{2,1}`), out of the
+/// database. `nginx::block_text` checks the same thing again for anything
+/// that reached the database some other way.
+///
+/// A `"` is refused here as well, although `nginx::nginx_quoted` writes
+/// one exactly: no real user agent has one, and a list that starts
+/// carrying them has changed into something to be wary of.
 pub(crate) fn keeps_pattern(pattern: &str) -> bool {
-    matches!(
-        crate::nginx::pattern_problem(pattern),
-        None | Some(crate::nginx::PatternProblem::TooLong)
-    )
+    !pattern.contains('"')
+        && matches!(
+            crate::nginx::pattern_problem(pattern),
+            None | Some(crate::nginx::PatternProblem::TooLong)
+        )
 }
 
 /// Turns an arbitrary bot-name string into a lowercase, hyphen-separated
@@ -254,14 +320,23 @@ fn store_inner(db: &Db, kind: SourceKind, bots: &[NewBot]) -> Result<usize> {
 }
 
 /// Fetches `kind`'s list over the network, parses it and stores it in
-/// `db`. Returns the number of bots stored.
-pub async fn update(db: &Db, kind: SourceKind) -> Result<usize> {
+/// `db`. Returns how many bots are stored and how many patterns were left
+/// out, as [`store_raw`] does.
+pub async fn update(db: &Db, kind: SourceKind) -> Result<(usize, usize)> {
     let raw = kind
         .fetch()
         .await
         .with_context(|| format!("failed to update {}", kind.name()))?;
-    let bots = kind.parse(&raw)?;
-    store(db, kind, &bots)
+    store_raw(db, kind, &raw)
+}
+
+/// Parses a downloaded list and stores it. Returns how many bots this
+/// source now contributes (see [`store`]) and how many patterns the parse
+/// left out.
+pub fn store_raw(db: &Db, kind: SourceKind, raw: &str) -> Result<(usize, usize)> {
+    let parsed = kind.parse_counted(raw)?;
+    let count = store(db, kind, &parsed.bots)?;
+    Ok((count, parsed.skipped))
 }
 
 #[cfg(test)]
@@ -351,7 +426,9 @@ mod tests {
             .find(|s| s.id == SourceKind::WellKnownBots.id())
             .unwrap();
         assert!(source.last_fetched_at.is_some());
-        assert_eq!(source.bot_count, 4);
+        // Five: the sample's `Trailing\\` is a valid regex, kept since
+        // `nginx::nginx_quoted` writes it exactly.
+        assert_eq!(source.bot_count, 5);
     }
 
     #[test]

@@ -365,6 +365,14 @@ fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
         if applied.reloaded {
             summary.push_str(", reloaded");
         }
+        // Counted rather than listed: the report is a line per step. The
+        // status report and `apply-blocks` name them.
+        let skipped = nginx::skipped_entries(db)?.len();
+        if skipped > 0 {
+            summary.push_str(&format!(
+                ", {skipped} stored entr(ies) left out (see `stop-bots status`)"
+            ));
+        }
         Ok(summary)
     })();
     Step::new("nginx blocks", outcome)

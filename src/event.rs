@@ -19,7 +19,6 @@
 //! Terminal event plumbing, following the Ratatui event-driven-async
 //! template (<https://github.com/ratatui/templates/tree/main/event-driven-async>).
 
-use crate::db::NewBot;
 use anyhow::{Context, Result};
 use crossterm::event::Event as CrosstermEvent;
 use futures::{FutureExt, StreamExt};
@@ -55,7 +54,7 @@ pub enum AppEvent {
     /// which `Event` needs to be.
     SourceUpdateFinished {
         source_id: String,
-        result: Result<Vec<NewBot>, String>,
+        result: Result<crate::botlist::Parsed, String>,
     },
     /// A background fetch of one country's IP ranges (started from the
     /// Dashboard's "add a country" popup, for a country not already

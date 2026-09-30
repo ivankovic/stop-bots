@@ -831,6 +831,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     if let Some(check) = trusted_by_hand(db)? {
         checks.push(check);
     }
+    if let Some(check) = skipped_entries(db)? {
+        checks.push(check);
+    }
     if let Some(check) = turned_away_clients(db, probe)? {
         checks.push(check);
     }
@@ -1649,6 +1652,47 @@ fn trusted_by_hand(db: &Db) -> Result<Option<Check>> {
         level: Level::Ok,
         detail: parts.join("; "),
         fix: None,
+    }))
+}
+
+/// Stored blocks, exemptions and trusted agents that the NGINX config
+/// leaves out, because they would not mean what they say there (see
+/// `nginx::skipped_entries`).
+///
+/// A warning, not critical: what is written is correct, and leaving an
+/// entry out is the safe failure. But each one is something the operator
+/// believes is in force, and the render drops it without a word anywhere
+/// else. The rows that end up here were stored by a release that did not
+/// check them, and upgrading is exactly when nobody is looking.
+///
+/// Absent when there is nothing, like its neighbours.
+fn skipped_entries(db: &Db) -> Result<Option<Check>> {
+    let skipped = crate::nginx::skipped_entries(db)?;
+    if skipped.is_empty() {
+        return Ok(None);
+    }
+    let named: Vec<&str> = skipped.iter().take(3).map(String::as_str).collect();
+    let more = skipped.len() - named.len();
+    let suffix = if more > 0 {
+        format!("; and {more} more")
+    } else {
+        String::new()
+    };
+    Ok(Some(Check {
+        id: "skipped-entries",
+        title: "Entries left out of the NGINX config",
+        level: Level::Warn,
+        detail: format!(
+            "{} stored entr(ies) are not written: {}{}",
+            skipped.len(),
+            named.join("; "),
+            suffix
+        ),
+        fix: Some(
+            "`stop-bots apply-blocks --dry-run` lists them all; remove each and add it again \
+             in a form that is accepted"
+                .to_string(),
+        ),
     }))
 }
 
@@ -2532,6 +2576,28 @@ mod tests {
     fn nothing_trusted_adds_no_check() {
         let report = assess(&db(), &healthy()).unwrap();
         assert!(report.checks.iter().all(|c| c.id != "trusted"));
+    }
+
+    /// A row an older release stored without today's checks is left out
+    /// of the NGINX config; the report is where that is said.
+    #[test]
+    fn a_stored_entry_the_config_leaves_out_is_a_warning() {
+        let db = db();
+        assert!(assess(&db, &healthy())
+            .unwrap()
+            .checks
+            .iter()
+            .all(|c| c.id != "skipped-entries"));
+
+        db.insert_unvalidated_row_for_tests(
+            "blocked_user_agents",
+            &[("user_agent", "ab"), ("blocked_at", "0")],
+        );
+        let report = assess(&db, &healthy()).unwrap();
+
+        let check = check2(&report, "skipped-entries");
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("\"ab\""), "was: {}", check.detail);
     }
 
     /// An empty allowlist is the ordinary state of a host that has just

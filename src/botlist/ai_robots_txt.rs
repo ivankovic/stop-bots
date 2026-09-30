@@ -41,21 +41,22 @@ pub const SOURCE_URL: &str =
 /// Parses the raw ai.robots.txt JSON document — a flat object keyed by bot
 /// name, e.g. `{"GPTBot": {...}, "ClaudeBot": {...}}` — into [`NewBot`]
 /// records. The per-bot metadata (operator, respect, function, ...) isn't
-/// modeled here; only the key is needed. A name containing a `"`, or ending
-/// in a backslash, is dropped, same reasoning as `well_known_bots::parse`:
-/// it would end up embedded in a double-quoted NGINX string (see
-/// `nginx::apply_blocks_to_file`), so an untrusted one with a quote in it
-/// could break out and inject directives into a config loaded as root, and
-/// one ending in a backslash can escape NGINX's own closing quote instead.
-/// So is one that would match every visitor, such as an empty key — see
-/// `botlist::keeps_pattern`.
+/// modeled here; only the key is needed. A name `botlist::keeps_pattern`
+/// refuses is dropped, as in `well_known_bots::parse`: one containing a
+/// `"`, one ending in a backslash, and one that would match every visitor,
+/// such as an empty key.
 pub fn parse(json: &str) -> Result<Vec<NewBot>> {
+    parse_counted(json).map(|parsed| parsed.bots)
+}
+
+/// [`parse`], and how many names it left out.
+pub fn parse_counted(json: &str) -> Result<crate::botlist::Parsed> {
     let raw: BTreeMap<String, serde::de::IgnoredAny> =
         serde_json::from_str(json).context("failed to parse ai.robots.txt JSON")?;
 
-    let bots = raw
-        .into_keys()
-        .filter(|name| crate::botlist::keeps_pattern(name))
+    let (names, skipped) = crate::botlist::kept_patterns(raw.into_keys());
+    let bots = names
+        .into_iter()
         .map(|name| NewBot {
             slug: slugify(&name),
             user_agent_pattern: name.clone(),
@@ -67,7 +68,7 @@ pub fn parse(json: &str) -> Result<Vec<NewBot>> {
         })
         .collect();
 
-    Ok(bots)
+    Ok(crate::botlist::Parsed { bots, skipped })
 }
 
 /// Downloads the raw ai.robots.txt JSON document over HTTP.

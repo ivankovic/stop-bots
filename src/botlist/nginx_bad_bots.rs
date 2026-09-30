@@ -60,33 +60,40 @@ fn unescape(line: &str) -> String {
 /// verbatim (still escaped) since that's what actually gets joined into
 /// the regex, while `name`/`slug` use the unescaped, human-readable form.
 /// Blank lines are skipped defensively (none are expected upstream, but
-/// nothing guarantees that stays true); a line containing a `"`, or ending
-/// in a backslash, is dropped, same reasoning as `well_known_bots::parse` —
-/// it would break out of (or leave open) the double-quoted NGINX string it
-/// ends up embedded in. A trailing backslash here means a raw, unpaired one
-/// at the end of the line itself — routine mid-pattern escapes like
-/// `1h4x\.com` are untouched, since the backslash there isn't at the end.
-/// A line that would match every visitor (`|`, `.*`) is dropped too — see
-/// `botlist::keeps_pattern`.
+/// nothing guarantees that stays true); a line `botlist::keeps_pattern`
+/// refuses is dropped, as in `well_known_bots::parse`: one containing a
+/// `"`, one ending in a raw, unpaired backslash (routine mid-pattern escapes
+/// like `1h4x\.com` are regex, and kept), and one that would match every
+/// visitor (`|`, `.*`).
 pub fn parse(text: &str) -> Result<Vec<NewBot>> {
-    let bots = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| crate::botlist::keeps_pattern(line))
+    parse_counted(text).map(|parsed| parsed.bots)
+}
+
+/// [`parse`], and how many lines it left out. A blank line is not counted:
+/// it is not a pattern.
+pub fn parse_counted(text: &str) -> Result<crate::botlist::Parsed> {
+    let (lines, skipped) = crate::botlist::kept_patterns(
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string),
+    );
+    let bots = lines
+        .into_iter()
         .map(|line| {
-            let name = unescape(line);
+            let name = unescape(&line);
             NewBot {
                 slug: slugify(&name),
                 name,
                 is_ai: false,
                 is_search_engine: false,
                 is_scanner: true,
-                user_agent_pattern: line.to_string(),
+                user_agent_pattern: line,
                 source_id: SOURCE_ID.to_string(),
             }
         })
         .collect();
-    Ok(bots)
+    Ok(crate::botlist::Parsed { bots, skipped })
 }
 
 /// Downloads the raw bad-user-agents list over HTTP.
@@ -162,5 +169,19 @@ mod tests {
         let bots = parse("GoodBot\n|\n.*\n^\nab\nEvil\x07Bot\n").unwrap();
         let patterns: Vec<&str> = bots.iter().map(|b| b.user_agent_pattern.as_str()).collect();
         assert_eq!(patterns, ["GoodBot"]);
+    }
+
+    /// What is left out is counted for the fetch's summary; a blank line
+    /// is not a pattern and is not.
+    #[test]
+    fn parse_counts_what_it_leaves_out() {
+        let parsed = parse_counted("GoodBot\n\n|\nBot[z-a]x\nBotx{2,1}\n").unwrap();
+        assert_eq!(parsed.bots.len(), 1);
+        assert_eq!(parsed.skipped, 3);
+        assert_eq!(
+            parsed.summary(1),
+            "1 bot(s); left out 3 pattern(s) that would match nearly everyone, or that NGINX \
+             would not compile"
+        );
     }
 }

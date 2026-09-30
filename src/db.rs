@@ -707,11 +707,25 @@ pub fn validate_exemption_user_agent(user_agent: &str) -> Result<String> {
 /// The one that mattered: an empty string, which is in every user agent —
 /// the console's block form posting `user_agent=` blocked every visitor of
 /// every site.
+///
+/// **No backslash and no control character**, although both would now be
+/// written exactly (see `nginx::nginx_quoted`). A blocked user agent is a
+/// literal string, and a backslash in one is how a user agent logged by a
+/// site that writes JSON logs (`\"`, `\\`) turned into a rule against every
+/// visitor while NGINX was misreading them. A real browser or crawler has
+/// neither, so refusing them costs nothing and keeps a second mistake of
+/// that kind from mattering. Bot lists are regexes, and keep their
+/// backslashes.
 pub fn validate_blocked_user_agent(user_agent: &str) -> Result<()> {
     if user_agent.trim().is_empty() {
         anyhow::bail!("an empty user agent would match every client");
     }
-    if let Some(problem) = crate::nginx::pattern_problem(&escape_for_nginx_regex(user_agent)) {
+    if let Some(c) = user_agent.chars().find(|c| *c == '\\' || c.is_control()) {
+        anyhow::bail!(
+            "refusing to block {user_agent:?}: a blocked user agent cannot contain {c:?}"
+        );
+    }
+    if let Some(problem) = crate::nginx::pattern_problem(&escape_regex_literal(user_agent)) {
         anyhow::bail!("refusing to block {user_agent:?}: {problem}");
     }
     Ok(())
@@ -749,6 +763,39 @@ pub fn stored_user_agent(user_agent: &str) -> &str {
         escaped += width;
     }
     user_agent
+}
+
+/// `path` as it will be stored as a path exemption (plain or for one user
+/// agent), or why it cannot be.
+///
+/// **A literal path prefix**, matched from the start of the request path
+/// (`nginx::exemption_regex`), never a regex: every character in it is
+/// escaped before it is written. So each refusal is about a string that
+/// could not mean what it says:
+///
+/// - **Not starting with `/`.** Every request path does, so it could never
+///   match, and an exemption that never fires is invisible: the admin sees
+///   a configured exemption and blocked traffic, with nothing to connect
+///   the two.
+/// - **`"`, `\`, whitespace or a control character.** None is in a path
+///   anyone exempts, and all of them are in the escapes NGINX's config
+///   reader undoes. A stored `/x\|` exempted every path on the site while
+///   exemptions were written verbatim, and `/x\(` failed `nginx -t`.
+pub fn validate_exempt_path(path: &str) -> Result<String> {
+    let path = path.trim();
+    if path.is_empty() {
+        anyhow::bail!("enter a path");
+    }
+    if !path.starts_with('/') {
+        anyhow::bail!("an exempt path must start with `/` (got {path:?})");
+    }
+    if let Some(c) = path
+        .chars()
+        .find(|c| *c == '"' || *c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        anyhow::bail!("an exempt path cannot contain {c:?}");
+    }
+    Ok(path.to_string())
 }
 
 fn validate_user_agent_fragment(user_agent: &str, what: &str) -> Result<String> {
@@ -1799,12 +1846,15 @@ impl Db {
             .context("failed to list site path exemptions")
     }
 
-    pub fn add_site_path_exemption(&self, site_id: i64, path: &str) -> Result<()> {
+    /// Exempts `path` on `site_id`, after [`validate_exempt_path`], and
+    /// returns it as stored (trimmed).
+    pub fn add_site_path_exemption(&self, site_id: i64, path: &str) -> Result<String> {
+        let path = validate_exempt_path(path)?;
         self.conn.execute(
             "INSERT OR IGNORE INTO site_path_exemptions (site_id, path) VALUES (?1, ?2)",
             params![site_id, path],
         )?;
-        Ok(())
+        Ok(path)
     }
 
     pub fn remove_site_path_exemption(&self, site_id: i64, path: &str) -> Result<()> {
@@ -1835,14 +1885,15 @@ impl Db {
 
     /// Exempts `path` on `site_id` for clients whose user agent contains
     /// `user_agent`. Returns the user agent as stored (trimmed), after
-    /// [`validate_exemption_user_agent`]. The path is the caller's to
-    /// check, as for [`Db::add_site_path_exemption`].
+    /// [`validate_exemption_user_agent`]; the path goes through
+    /// [`validate_exempt_path`], as for [`Db::add_site_path_exemption`].
     pub fn add_site_agent_exemption(
         &self,
         site_id: i64,
         path: &str,
         user_agent: &str,
     ) -> Result<String> {
+        let path = validate_exempt_path(path)?;
         let user_agent = validate_exemption_user_agent(user_agent)?;
         self.conn.execute(
             "INSERT OR IGNORE INTO site_agent_exemptions (site_id, path, user_agent) \
@@ -2960,6 +3011,25 @@ impl Db {
     /// Moves a stored login `seconds` further into the past. Test-only —
     /// the window is seven days, so the alternative is a test that cannot
     /// run without waiting a week or injecting a clock everywhere.
+    /// Stores a row the way a release that did not validate it would have:
+    /// what a host that upgrades already has in its database. Test-only,
+    /// since the point of every real write path is that it refuses these.
+    #[cfg(test)]
+    pub fn insert_unvalidated_row_for_tests(&self, table: &str, values: &[(&str, &str)]) {
+        let columns: Vec<&str> = values.iter().map(|(column, _)| *column).collect();
+        let slots: Vec<String> = (1..=values.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "INSERT INTO {table} ({}) VALUES ({})",
+            columns.join(", "),
+            slots.join(", ")
+        );
+        let params: Vec<&dyn rusqlite::ToSql> = values
+            .iter()
+            .map(|(_, value)| value as &dyn rusqlite::ToSql)
+            .collect();
+        self.conn.execute(&sql, params.as_slice()).unwrap();
+    }
+
     #[cfg(test)]
     pub fn backdate_ssh_login_for_tests(&self, address: &str, seconds: i64) -> Result<()> {
         self.conn.execute(
@@ -3525,7 +3595,7 @@ impl Db {
     ///
     /// Also always appends every literal user agent from
     /// [`Self::list_blocked_user_agents`] (regex-escaped — see
-    /// [`escape_for_nginx_regex`] — since these are exact strings captured
+    /// [`escape_regex_literal`] — since these are exact strings captured
     /// from real traffic, not hand-written regex fragments like a bot
     /// list's `user_agent_pattern`), unconditionally and after the
     /// bot/category cascade above: a manual block from the Dynamic
@@ -3580,7 +3650,7 @@ impl Db {
         patterns.extend(
             self.list_blocked_user_agents()?
                 .iter()
-                .map(|ua| escape_for_nginx_regex(ua)),
+                .map(|ua| escape_regex_literal(ua)),
         );
         Ok(patterns)
     }
@@ -3600,14 +3670,19 @@ fn humans_only_allows(pattern: &str) -> bool {
         .any(|allowed| pattern.contains(allowed))
 }
 
-/// Escapes every PCRE/NGINX regex metacharacter in `s` so it matches only
-/// itself when embedded (unanchored, same convention as every other
-/// `user_agent_pattern` fragment — see `nginx::join_patterns`) in the
-/// combined `~*` alternation. Hand-rolled rather than pulling in a `regex`
-/// dependency just for this: the only structural requirement is "produce a
-/// literal-matching fragment safe to sit inside a larger `|`-joined
-/// pattern," not full regex parsing.
-pub(crate) fn escape_for_nginx_regex(s: &str) -> String {
+/// Escapes every PCRE metacharacter in `s` so it matches only itself when
+/// embedded (unanchored, same convention as every other
+/// `user_agent_pattern` fragment) in the combined `~*` alternation.
+/// Hand-rolled rather than pulling in a `regex` dependency just for this:
+/// the only structural requirement is "produce a literal-matching fragment
+/// safe to sit inside a larger `|`-joined pattern," not full regex parsing.
+///
+/// **PCRE's escaping, not NGINX's.** The result is the regex PCRE is to
+/// compile; putting it into a config file is a second step, with escapes of
+/// its own, which `nginx::nginx_quoted` takes. This used to be called
+/// `escape_for_nginx_regex` and its output written into the config as it
+/// was, and NGINX undid half of it: `\\` became `\` before PCRE saw it.
+pub(crate) fn escape_regex_literal(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
         if is_regex_special(c) {
@@ -4165,8 +4240,12 @@ mod tests {
             ("   ", "whitespace only"),
             ("ab", "too short to mean one client"),
             ("curl\n/8.0", "a control character"),
-            ("curl\"8", "a quote"),
             ("curl\\", "a trailing backslash"),
+            (
+                r"ScraperBot/2.1)\|",
+                "a backslash, which JSON logs are full of",
+            ),
+            (r"x\*y", "a backslash in the middle"),
         ] {
             assert!(
                 db.block_user_agent(user_agent).is_err(),
@@ -4174,6 +4253,54 @@ mod tests {
             );
         }
         assert!(db.list_blocked_user_agents().unwrap().is_empty());
+    }
+
+    /// A quote is an ordinary character once the regex is written exactly,
+    /// so a user agent with one can be blocked as it is.
+    #[test]
+    fn a_user_agent_with_a_quote_can_be_blocked() {
+        let db = test_db();
+        db.block_user_agent(r#"Scraper "x" 1.0"#).unwrap();
+        assert_eq!(
+            db.list_blocked_user_agents().unwrap(),
+            [r#"Scraper "x" 1.0"#]
+        );
+    }
+
+    /// An exempt path is a literal prefix, and each of these could not be
+    /// one: `/x\|` reached PCRE as a match-all while exemptions were
+    /// written verbatim, and `/x\(` failed `nginx -t`.
+    #[test]
+    fn an_exempt_path_that_is_not_a_literal_prefix_is_refused() {
+        let db = test_db();
+        db.upsert_site("a.example", "/tmp/a").unwrap();
+        let site = db.list_sites().unwrap()[0].id;
+        for (path, why) in [
+            ("", "empty"),
+            ("blog", "no leading slash"),
+            (r"/x\|", "a backslash"),
+            (r"/x\(", "a backslash"),
+            ("/a\"b", "a quote"),
+            ("/a b", "whitespace"),
+            ("/a\u{7}b", "a control character"),
+        ] {
+            assert!(
+                db.add_site_path_exemption(site, path).is_err(),
+                "{path:?} ({why}) must be refused"
+            );
+            assert!(
+                db.add_site_agent_exemption(site, path, "okhttp").is_err(),
+                "{path:?} ({why}) must be refused for an agent exemption too"
+            );
+        }
+        assert!(db.site_path_exemptions(site).unwrap().is_empty());
+        assert!(db.site_agent_exemptions(site).unwrap().is_empty());
+
+        assert_eq!(
+            db.add_site_path_exemption(site, " /blog ").unwrap(),
+            "/blog"
+        );
+        assert_eq!(db.site_path_exemptions(site).unwrap(), ["/blog"]);
     }
 
     #[test]

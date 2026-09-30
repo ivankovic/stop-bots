@@ -28,12 +28,25 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   only at the daily prune.
 - The web console stores a log pass 5,000 rows at a time and lets its database go
   between them: a 200,000-line pass held every request, `/login` included, for 7 s.
+- **A blocked user agent with a backslash in it blocked every visitor.** NGINX
+  undoes `\\`, `\"` and `\t` in a quoted string before PCRE sees it; every regex
+  is now written so that PCRE gets exactly the text that was checked.
+- **A stored path exemption such as `/x\|` exempted every path**, and `/x\(`
+  failed `nginx -t`. Exemptions are literal prefixes: `"`, `\`, whitespace and
+  control characters are refused, and stored rows that break the rule are left out.
+- Blocked user agents with a backslash or control character are refused. Rows
+  stored earlier are still written, now exactly as they read.
+- Bot-list patterns PCRE would refuse (`[z-a]`, `{2,1}`, `{99999}`, unknown POSIX
+  classes) are left out and counted in the fetch summary, instead of failing
+  every apply.
 
 ### Changed
 
 - The internal cron's daily crawler-range download waits for the first download, as
   the weekly one does: a database that has never downloaded anything leaves it to the
   operator (`u`, "Update everything", or `batch`) instead of fetching on the first tick.
+- Stored entries left out of the NGINX config are named: by `status` and the
+  Dashboards (`skipped-entries`), on stderr by `apply-blocks`, and counted by `batch`.
 
 ## [0.1.0-rc.1] — 2026-09-30
 

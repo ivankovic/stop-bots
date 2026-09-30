@@ -2116,15 +2116,14 @@ async fn update_bot_lists(
     let db = open_db(db_path)?;
     let kind = botlist::SourceKind::from_id(&source_id)
         .with_context(|| format!("unknown bot-list source id: {source_id}"))?;
-    let count = match source {
-        Some(path) => {
-            let raw = std::fs::read_to_string(&path)?;
-            let bots = kind.parse(&raw)?;
-            botlist::store(&db, kind, &bots)?
-        }
+    let (count, skipped) = match source {
+        Some(path) => botlist::store_raw(&db, kind, &std::fs::read_to_string(&path)?)?,
         None => botlist::update(&db, kind).await?,
     };
     println!("Stored {count} bot(s) from {}", kind.name());
+    if let Some(note) = botlist::left_out_note(skipped) {
+        println!("It {note}.");
+    }
     Ok(())
 }
 
@@ -2143,6 +2142,16 @@ fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: boo
     let changes = changes.map_err(|err| anyhow::anyhow!(err))?;
     if diff {
         print!("{}", stop_bots::preview::nginx_diff(&changes));
+    }
+    print_skipped_entries(&db)
+}
+
+/// Says which stored entries the NGINX config leaves out (see
+/// `nginx::skipped_entries`), on stderr, one per line. An apply writes
+/// everything else, so this is a warning and not a failure.
+fn print_skipped_entries(db: &Db) -> Result<()> {
+    for entry in nginx::skipped_entries(db)? {
+        eprintln!("warning: left out of the NGINX config: {entry}");
     }
     Ok(())
 }
@@ -2203,7 +2212,7 @@ fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) 
     if outcome.reloaded {
         println!("Reloaded NGINX");
     }
-    Ok(())
+    print_skipped_entries(&db)
 }
 
 fn add_firewall_rule(

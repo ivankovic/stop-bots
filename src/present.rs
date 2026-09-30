@@ -91,6 +91,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "firewall-reaches-containers" => "containers",
         "ssh-login-allowlist" => "ssh",
         "trusted" => "trusted",
+        "skipped-entries" => "skipped",
         _ => check.title,
     }
 }

@@ -124,9 +124,9 @@ pub async fn fetch(source: &Source) -> Result<String> {
 pub fn store(db: &Db, source: &Source, raw: &str) -> Result<String> {
     match source {
         Source::BotList(kind) => {
-            let bots = kind.parse(raw)?;
-            let count = botlist::store(db, *kind, &bots)?;
-            Ok(format!("{count} bot(s)"))
+            let parsed = kind.parse_counted(raw)?;
+            let count = botlist::store(db, *kind, &parsed.bots)?;
+            Ok(parsed.summary(count))
         }
         Source::CrawlerRanges(kind) => {
             let cidrs = kind.parse(raw)?;

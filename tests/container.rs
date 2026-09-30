@@ -3182,6 +3182,131 @@ fn exempt_paths_and_well_known_stay_reachable_for_a_blocked_client() {
     );
 }
 
+/// `s` in single quotes for `sh -c`, so none of it is shell syntax.
+fn sh_quoted(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// User agents a site that logs in JSON (`escape=json`) can put in front of
+/// an operator, each with a character NGINX's config reader or PCRE treats
+/// specially, and for some a near miss: a user agent the rule would also
+/// have caught had NGINX read the regex differently from how it was
+/// checked. The same list as `HOSTILE_USER_AGENTS` in `src/nginx.rs`.
+const HOSTILE_USER_AGENTS: [(&str, Option<&str>); 11] = [
+    // Read as `...a\\|`: "a backslash, or nothing" — every visitor.
+    (r"Scraper/2.1 a\|", Some("Scraper/2.1 a|")),
+    // Read as `x\\*`: an x and any number of backslashes.
+    (r"Scraper/2.1 x\*", Some("Scraper/2.1 x")),
+    // Read as an unclosed group: `nginx -t` failed, and every apply after.
+    (r"Scraper/2.1 Evil\(", None),
+    (r#"Scraper/2.1 say "hi""#, None),
+    (r#"Scraper/2.1 \"quoted\""#, Some(r#"Scraper/2.1 "quoted""#)),
+    (r"Scraper/2.1 trailing\", None),
+    // Read as a tab and a line feed.
+    (r"Scraper/2.1 tab\t", Some("Scraper/2.1 tab")),
+    (r"Scraper/2.1 line\n", Some("Scraper/2.1 line")),
+    ("Scraper/2.1 $foo", None),
+    ("Scraper/2.1 }", None),
+    ("Scraper/2.1 ;", None),
+];
+
+/// The finding, end to end: blocked user agents with a backslash, a quote
+/// or a brace in them, stored the way a release that took them wrote them,
+/// each turn away exactly that client under a real NGINX — and not a
+/// browser, not curl, not Googlebot.
+///
+/// Stored with `sqlite3` rather than through the console, because the
+/// console now refuses a backslash in a blocked user agent: these are the
+/// rows a host that upgrades already has. Two more such rows ride along:
+/// path exemptions `/x\|` (which exempted every path) and `/x\(` (which
+/// failed `nginx -t`), and a bot list with patterns PCRE refuses, which
+/// failed `nginx -t` at apply time and rolled every apply back.
+#[test]
+fn hostile_stored_entries_block_exactly_their_client_under_a_real_nginx() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-hostile");
+    let db = "/tmp/db.sqlite3";
+    let stop_bots = |args: &str| host.sh(&format!("stop-bots {args} --db {db}"));
+    stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+
+    let mut sql = String::new();
+    for (user_agent, _) in HOSTILE_USER_AGENTS {
+        sql.push_str(&format!(
+            "INSERT INTO blocked_user_agents (user_agent, blocked_at) VALUES ('{}', 0);\n",
+            user_agent.replace('\'', "''")
+        ));
+    }
+    for path in [r"/x\|", r"/x\("] {
+        sql.push_str(&format!(
+            "INSERT INTO site_path_exemptions (site_id, path) \
+             SELECT id, '{path}' FROM sites WHERE server_name = 'test.example';\n"
+        ));
+    }
+    host.sh(&format!("sqlite3 {db} <<'SQL'\n{sql}SQL"));
+
+    let json = r#"[{"id":"listed","categories":["ai"],"pattern":{"accepted":["ListedBot","Bot[z-a]x","Botx{2,1}","Botx{99999}"],"forbidden":[]}}]"#;
+    host.sh(&format!("cat > /tmp/bots.json <<'JSON'\n{json}\nJSON"));
+    let fetched = stop_bots("update-bot-lists --source /tmp/bots.json");
+    assert!(
+        fetched.contains("left out 3 pattern(s)"),
+        "the fetch did not say what it left out:\n{fetched}"
+    );
+
+    let (applied, warned) = {
+        let (ok, stdout, stderr) = host.run(&format!(
+            "stop-bots apply-blocks --root /etc/nginx/sites-enabled --no-reload --db {db}"
+        ));
+        assert!(ok, "apply-blocks failed:\n{stdout}{stderr}");
+        (stdout, stderr)
+    };
+    assert!(
+        warned.contains(r#"exempt path "/x\\|""#) && warned.contains(r#"exempt path "/x\\(""#),
+        "the unwritten exemptions were not named:\n{applied}{warned}"
+    );
+    let (ok, stdout, stderr) = host.run("nginx -t");
+    assert!(
+        ok,
+        "nginx rejected the generated config:\n{stdout}{stderr}\n{}",
+        host.sh("cat /etc/nginx/sites-enabled/test-site.conf")
+    );
+    host.sh("systemctl reload nginx");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let status = |user_agent: &str| {
+        host.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' -A {} http://127.0.0.1:8080/",
+            sh_quoted(user_agent)
+        ))
+        .1
+        .trim()
+        .to_string()
+    };
+    for (user_agent, near_miss) in HOSTILE_USER_AGENTS {
+        assert_eq!(status(user_agent), "403", "{user_agent:?} was served");
+        if let Some(near_miss) = near_miss {
+            assert_eq!(
+                status(near_miss),
+                "200",
+                "{near_miss:?} was refused by the rule for {user_agent:?}"
+            );
+        }
+    }
+    assert_eq!(
+        status("ListedBot/1.0"),
+        "403",
+        "the list's good pattern was lost"
+    );
+    for ordinary in [
+        "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0",
+        "curl/8.14.1",
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+    ] {
+        assert_eq!(status(ordinary), "200", "{ordinary:?} was refused");
+    }
+}
+
 #[test]
 fn the_generated_robots_txt_is_served() {
     if !enabled() {

@@ -215,7 +215,10 @@ fn update_scan_and_apply_blocks_happy_path() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Stored 4 bot(s)"));
+        // Five of the sample's seven bots: one has no pattern, and the two
+        // quoted patterns (one bot's only one) are left out, and said to be.
+        .stdout(predicate::str::contains("Stored 5 bot(s)"))
+        .stdout(predicate::str::contains("It left out 2 pattern(s)"));
 
     scan_sites(&db_path, &nginx_root).stdout(predicate::str::contains("Discovered 2 site(s)"));
 
@@ -4567,4 +4570,30 @@ fn output_piped_into_a_reader_that_stops_early_is_not_a_panic() {
         status.success() || status.signal() == Some(libc::SIGPIPE),
         "status was {status:?}, stderr:\n{stderr}"
     );
+}
+
+/// A blocked user agent or an exempt path stored by an older release
+/// without today's checks is left out of the config, and `apply-blocks`
+/// says which. Here, an exemption with a backslash in it: `/x\|` was a
+/// match-all while exemptions were written verbatim.
+#[test]
+fn apply_blocks_names_what_it_leaves_out() {
+    let fx = Fixture::new();
+    fx.seed_bots();
+    fx.write_site("old.example");
+    fx.scan_sites();
+    let db = rusqlite::Connection::open(&fx.db).unwrap();
+    db.execute(
+        "INSERT INTO site_path_exemptions (site_id, path) \
+         SELECT id, '/x\\|' FROM sites WHERE server_name = 'old.example'",
+        [],
+    )
+    .unwrap();
+    drop(db);
+
+    fx.apply_blocks().stderr(predicate::str::contains(
+        r#"warning: left out of the NGINX config: old.example: exempt path "/x\\|""#,
+    ));
+    let site = fs::read_to_string(fx.nginx_root.join("old.example.conf")).unwrap();
+    assert!(!site.contains("/x"), "the exemption was written:\n{site}");
 }
