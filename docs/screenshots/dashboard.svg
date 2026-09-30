@@ -161,31 +161,38 @@
 <text x="658.8" y="421.5" fill="#6b7c8c" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">44m ago, </text>
 <text x="734.4" y="421.5" fill="#c8d0da" textLength="176.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">4 sources, 21,904 ran</text>
 <text x="910.8" y="421.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="439.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="415.2" y="439.5" fill="#6b7c8c" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">││</text>
+<text x="12.0" y="439.5" fill="#6b7c8c" textLength="420.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└───────────────────────────────────────────────┘│</text>
 <text x="432.0" y="439.5" fill="#c8d0da" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Update every list: </text>
 <text x="600.0" y="439.5" fill="#6b7c8c" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">44m ago, </text>
 <text x="675.6" y="439.5" fill="#c8d0da" textLength="235.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Updated 9 list(s).          </text>
 <text x="910.8" y="439.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="12.0" y="457.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
-<text x="415.2" y="457.5" fill="#6b7c8c" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">││</text>
+<text x="12.0" y="457.5" fill="#6b7c8c" textLength="420.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">┌ Crawler IP ranges ────────────────────────────┐│</text>
 <text x="432.0" y="457.5" fill="#c8d0da" textLength="176.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Block SSH scanners: </text>
 <text x="608.4" y="457.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">3m ago, </text>
 <text x="675.6" y="457.5" fill="#c8d0da" textLength="235.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">due now                     </text>
 <text x="910.8" y="457.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="475.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="475.5" fill="#c8d0da" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Googlebot</text>
+<text x="104.4" y="475.5" fill="#8cc265" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ ALLOWED ] </text>
+<text x="213.6" y="475.5" fill="#6b7c8c" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">not fetched</text>
 <text x="415.2" y="475.5" fill="#6b7c8c" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">││</text>
 <text x="432.0" y="475.5" fill="#c8d0da" textLength="176.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Block web scanners: </text>
 <text x="608.4" y="475.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">3m ago, </text>
 <text x="675.6" y="475.5" fill="#c8d0da" textLength="235.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">due now                     </text>
 <text x="910.8" y="475.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="493.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="493.5" fill="#c8d0da" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Bingbot  </text>
+<text x="104.4" y="493.5" fill="#8cc265" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ ALLOWED ] </text>
+<text x="213.6" y="493.5" fill="#6b7c8c" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">not fetched</text>
 <text x="415.2" y="493.5" fill="#6b7c8c" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">││</text>
 <text x="432.0" y="493.5" fill="#c8d0da" textLength="226.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Block forged crawler UAs: </text>
 <text x="658.8" y="493.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">3m ago, </text>
 <text x="726.0" y="493.5" fill="#c8d0da" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">due now               </text>
 <text x="910.8" y="493.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="511.5" fill="#6b7c8c" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
+<text x="20.4" y="511.5" fill="#c8d0da" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> GPTBot   </text>
+<text x="104.4" y="511.5" fill="#e05561" textLength="109.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> [ BLOCKED ] </text>
+<text x="213.6" y="511.5" fill="#6b7c8c" textLength="92.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">not fetched</text>
 <text x="415.2" y="511.5" fill="#6b7c8c" textLength="16.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">││</text>
 <text x="432.0" y="511.5" fill="#c8d0da" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> Block probe paths: </text>
 <text x="600.0" y="511.5" fill="#6b7c8c" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">3m ago, </text>

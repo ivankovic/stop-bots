@@ -293,7 +293,8 @@ The Dashboard, the Firewall screen and the Blocks screen own everything that end
 
 - **Dashboard** (the default screen): system-wide category defaults (Scanners / Search bots /
   AI bots — Allowed or Blocked); host-wide geo-blocking (block or allow-list specific
-  countries); an "Automatic blocking" panel with an on/off switch for each detector and each
+  countries); a "Crawler IP ranges" panel (Googlebot, Bingbot and GPTBot's published
+  addresses, with how many and how old, `Enter` to download one); an "Automatic blocking" panel with an on/off switch for each detector and each
   third-party blocklist (a detector added by an upgrade arrives off, marked "new"); a
   "Firewall script" panel (how many rules a render would write, and whether they are applied,
   rendered and not applied, or changed); a "Scheduled" panel showing the internal cron's jobs
@@ -324,8 +325,9 @@ The Dashboard, the Firewall screen and the Blocks screen own everything that end
   discovered on disk (`r` scans for them), each with a live "up to date / stale / not found"
   status and actions to apply the current policy to one site or all of them. Changing any of
   those settings flips every applied site to `STALE`, which is your cue to re-apply. Opening a
-  site lets you override its category/bot policy, switch on any of the six request-shape
-  rules, and list paths exempt from blocking.
+  site lets you override its category policy, allow or block one bot on that site only
+  (searched by name, in the TUI and the console alike), switch on any of the six
+  request-shape rules, and list paths exempt from blocking.
 - **Blocks**: every firewall rule stored, and why it is there — its source (a detector, or
   added by hand in the TUI, the console or the CLI), when it was added, when it expires, and
   the log line that triggered it. `f` filters by source, `/` searches by address (an address
