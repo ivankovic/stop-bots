@@ -5,7 +5,9 @@
 //! source and opens its update-confirmation popup -> quit.
 
 mod common;
-use common::{generated_dir, path_with, scan_sites, seed_bots, writable_nginx_fixture};
+use common::{
+    generated_dir, network_tripwire, path_with, scan_sites, seed_bots, writable_nginx_fixture,
+};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -172,10 +174,22 @@ impl PtySession {
 /// A child left running after a panicking test would outlive the test
 /// binary and hold the pty open; kill it. Killing an already-exited child
 /// is a harmless error.
+///
+/// And then check that it downloaded nothing. Every session's HTTP goes
+/// to the [`common::NetworkTripwire`], and a TUI on a fresh database has
+/// scheduled downloads due at once — [`seed_cron_state`] is what stops
+/// them, and this is what notices if something else starts one.
 impl Drop for PtySession {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if !std::thread::panicking() {
+            assert_eq!(
+                network_tripwire().hits(),
+                0,
+                "the TUI under test tried to reach the network"
+            );
+        }
     }
 }
 
@@ -299,6 +313,7 @@ fn spawn_tui_cmd(db_path: &Path, extra_args: &[&str], fakebin: Option<&Path>) ->
     cmd.args(["--ssh-log", "tests/fixtures/logs/auth.log"]);
     cmd.args(extra_args);
     cmd.env("TERM", "xterm-256color");
+    network_tripwire().route(&mut cmd);
     cmd.env("STOP_BOTS_NGINX_CONF_D", generated_dir("conf.d"));
     cmd.env("STOP_BOTS_NGINX_DIR", generated_dir("managed"));
 
