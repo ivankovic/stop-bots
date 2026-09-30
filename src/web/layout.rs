@@ -185,10 +185,15 @@ impl Flash {
 /// The full page: head, header, tabs, flash, content.
 ///
 /// `csrf` is emitted as a meta tag as well as reaching the forms that need
-/// it. That gives htmx somewhere to read it from for requests it issues
-/// itself, and it means every authenticated page carries the token whether
-/// or not it happens to render a form — which is also what lets a test
-/// find it without seeding rows first.
+/// it, so every authenticated page carries the token whether or not it
+/// happens to render a form — which is what lets a test find it without
+/// seeding rows first. Inert: no script on the page reads it.
+///
+/// **No htmx, and no `hx-headers`.** htmx used to be loaded on every page
+/// and used by none, with `<body hx-headers>` attaching the token to any
+/// request it made. That would have turned any future HTML-injection bug
+/// into a CSRF-authorised action: an injected `hx-post` carries the token
+/// for free. Every mutating form carries [`csrf_field`] instead.
 pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Markup {
     html! {
         (DOCTYPE)
@@ -202,14 +207,13 @@ pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Marku
                 title { (tab.label()) " — stop-bots" }
                 meta name="csrf-token" content=(ctx.csrf);
                 link rel="stylesheet" href=(ctx.url("/assets/style.css"));
-                script src=(ctx.url("/assets/htmx.min.js")) defer {}
                 // Applied before first paint, so a dark-theme user does
                 // not get a white flash on every navigation.
                 script {
                     (maud::PreEscaped(THEME_BOOTSTRAP))
                 }
             }
-            body hx-headers=(format!(r#"{{"x-csrf-token": "{}"}}"#, ctx.csrf)) {
+            body {
                 header .top {
                     .brand {
                         strong { "stop-bots" }

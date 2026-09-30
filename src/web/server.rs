@@ -90,8 +90,7 @@ pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .route(&path("/login"), get(login_form).post(login_submit))
         .route(&path("/logout"), post(logout))
-        .route(&path("/assets/style.css"), get(stylesheet))
-        .route(&path("/assets/htmx.min.js"), get(htmx));
+        .route(&path("/assets/style.css"), get(stylesheet));
 
     let mut app = Router::new().merge(protected).merge(public);
 
@@ -269,9 +268,15 @@ async fn security_headers(request: Request, next: Next) -> Response {
     // clickjacking defence — a console that rewrites firewall rules must
     // never be framable. `form-action 'self'` keeps a would-be injected
     // form from posting the CSRF token somewhere else.
+    //
+    // `script-src` is the one inline script's hash and nothing else, not
+    // even `'self'`: the console loads no script file, so a script
+    // element pointing at any URL, this origin's included, is refused.
+    // No `connect-src` either (it falls back to `default-src 'none'`):
+    // nothing on these pages makes a request from script.
     let csp = format!(
-        "default-src 'none'; script-src 'self' {}; style-src 'self'; img-src 'self' data:; \
-         connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        "default-src 'none'; script-src {}; style-src 'self'; img-src 'self' data:; \
+         form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         layout::theme_script_hash()
     );
     if let Ok(value) = HeaderValue::from_str(&csp) {
@@ -351,16 +356,11 @@ async fn csrf_guard(State(state): State<AppState>, request: Request, next: Next)
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "form too large").into_response(),
     };
 
-    // The header first, so a request htmx issued itself is accepted
-    // without having to synthesise a form field; then the hidden input,
-    // which is what an ordinary form post carries.
-    let submitted = parts
-        .headers
-        .get("x-csrf-token")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-        .or_else(|| form_field(&bytes, "csrf"))
-        .unwrap_or_default();
+    // The hidden input every form carries, and nothing else. An
+    // `x-csrf-token` header used to be accepted too, for requests htmx
+    // made itself; with htmx gone nothing sends one, and a second place
+    // the token may come from is a second thing to get right.
+    let submitted = form_field(&bytes, "csrf").unwrap_or_default();
     if !auth::csrf_matches(&expected.csrf, &submitted) {
         return (
             StatusCode::FORBIDDEN,
@@ -596,13 +596,6 @@ async fn stylesheet() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         include_str!("assets/style.css"),
-    )
-}
-
-async fn htmx() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_str!("assets/htmx.min.js"),
     )
 }
 

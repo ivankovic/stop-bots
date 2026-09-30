@@ -249,7 +249,7 @@ async fn an_unauthenticated_request_is_sent_to_the_login_page() {
 async fn the_login_page_and_its_assets_are_reachable_without_a_session() {
     let (app, _password, _tmp) = app();
 
-    for path in ["/login", "/assets/style.css", "/assets/htmx.min.js"] {
+    for path in ["/login", "/assets/style.css"] {
         let response = app.clone().oneshot(get(path)).await.unwrap();
         assert_eq!(
             response.status(),
@@ -568,6 +568,59 @@ async fn the_csp_names_the_hash_of_the_one_inline_script() {
         csp.contains(&expected),
         "the theme toggle is inline and must be allowed by hash, not by 'unsafe-inline'.\nCSP: {csp}\nexpected to contain: {expected}"
     );
+}
+
+/// htmx was loaded on every page and used by none, and `<body hx-headers>`
+/// handed the CSRF token to any request it made: an injected `hx-post`
+/// would have been an authorised action. No page loads a script file now,
+/// nothing attaches the token outside a form, and the CSP allows the one
+/// inline script and no file at all, this origin's included.
+#[tokio::test]
+async fn no_page_loads_a_script_file_or_hands_out_the_token_outside_a_form() {
+    let (app, password, _tmp) = app();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    for path in [
+        "/login",
+        "/",
+        "/bots",
+        "/nginx",
+        "/firewall",
+        "/blocks",
+        "/help",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(with_cookie(get(path), &cookie))
+            .await
+            .unwrap();
+        let csp = response.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let script_src = csp
+            .split(';')
+            .map(str::trim)
+            .find(|directive| directive.starts_with("script-src"))
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            script_src,
+            format!("script-src {}", stop_bots::web::layout::theme_script_hash()),
+            "{path}: CSP was {csp}"
+        );
+
+        let html = body_string(response).await;
+        for needle in ["<script src", "hx-", "htmx", "x-csrf-token"] {
+            assert!(!html.contains(needle), "{path} carries {needle}:\n{html}");
+        }
+    }
+    let asset = app
+        .oneshot(get("/assets/htmx.min.js"))
+        .await
+        .unwrap()
+        .status();
+    assert_ne!(asset, StatusCode::OK, "the htmx asset is still served");
 }
 
 #[tokio::test]
@@ -2354,8 +2407,8 @@ async fn a_trusted_forwarded_address_keeps_one_clients_flood_off_another() {
     );
 }
 
-/// The detail panel is reached by a query parameter rather than an htmx
-/// fragment, so it has to survive an ordinary GET — including one typed
+/// The detail panel is reached by a query parameter rather than a
+/// script-loaded fragment, so it has to survive an ordinary GET — including one typed
 /// into the URL bar with an address that is not in the table.
 #[tokio::test]
 async fn inspecting_an_address_renders_its_detail_panel() {

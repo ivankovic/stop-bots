@@ -282,17 +282,12 @@ async fn web_screenshots(workspace: &Path, nginx_root: &Path, out: &Path) -> Res
         html_dir.join("style.css"),
         fetch(&app, &cookie, "/assets/style.css").await?,
     )?;
-    std::fs::write(
-        html_dir.join("htmx.min.js"),
-        fetch(&app, &cookie, "/assets/htmx.min.js").await?,
-    )?;
 
     let browser = find_browser();
     for (path, name, width, height) in WEB_PAGES {
         let html = fetch(&app, &cookie, path)
             .await?
             .replace(r#"href="/assets/style.css""#, r#"href="style.css""#)
-            .replace(r#"src="/assets/htmx.min.js""#, r#"src="htmx.min.js""#)
             // Light, explicitly: the browser's own theme must not decide.
             .replace(
                 r#"<html lang="en">"#,

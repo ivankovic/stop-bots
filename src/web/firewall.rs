@@ -43,7 +43,7 @@ pub struct Params {
     /// `all`, `pending` or `blocked` — the TUI's `f` key, as a link.
     pub filter: Option<String>,
     /// An address to show the detail panel for — the TUI's `i` key, as a
-    /// link. A query parameter rather than an htmx fragment so the panel
+    /// link. A query parameter rather than a script-loaded fragment so the panel
     /// survives a reload and can be linked to, the same shape `filter`
     /// already uses. Untrusted: it is whatever is in the URL bar, and
     /// `IpDetail::load` is what decides whether it is an address at all.

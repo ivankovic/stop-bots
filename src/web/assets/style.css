@@ -593,10 +593,6 @@ td.evidence {
 }
 @keyframes blink { 50% { opacity: 0; } }
 
-/* htmx swaps a row in place; a brief tint makes it obvious which one.
-   `live`, not the accent: that is what that colour is for. */
-.htmx-settling td { background: color-mix(in srgb, var(--live) 14%, transparent); }
-td { transition: background 240ms ease-out; }
 
 @media (prefers-reduced-motion: reduce) {
   td { transition: none; }
