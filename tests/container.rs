@@ -2374,22 +2374,34 @@ fn a_request_rule_that_refuses_curl_still_lets_the_console_through() {
     host.stop_bots("set-site-rule --site test.example --rule no-accept-language --enabled true");
     host.stop_bots("apply-blocks --root /etc/nginx/sites-enabled");
 
-    let status = |path: &str| {
-        host.run(&format!(
-            "curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:8080{path}"
-        ))
-        .1
-        .trim()
-        .to_string()
+    // Polled until it answers `want`: a reload is asynchronous, and an old
+    // worker can still answer the first request after one. Unpolled, this
+    // passed on podman and failed every try on CI's runner.
+    let status = |path: &str, want: &str| {
+        let mut got = String::new();
+        for _ in 0..50 {
+            got = host
+                .run(&format!(
+                    "curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:8080{path}"
+                ))
+                .1
+                .trim()
+                .to_string();
+            if got == want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        got
     };
     assert_eq!(
-        status("/"),
+        status("/", "403"),
         "403",
         "the rule is not in force on the site at all:\n{}",
         host.sh("cat /etc/nginx/sites-enabled/test-site.conf")
     );
     assert_eq!(
-        status("/stop-bots/login"),
+        status("/stop-bots/login", "200"),
         "200",
         "the console is locked out by the site's own rule:\n{}",
         host.sh("cat /etc/nginx/sites-enabled/test-site.conf")
