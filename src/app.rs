@@ -2080,7 +2080,7 @@ mod tests {
         // `reload_nginx: false` — no test here drives a NGINX apply
         // through `handle_key_event`, but this keeps it that way even if
         // one is added later, rather than relying on that staying true.
-        App::new(
+        let app = App::new(
             Db::open_in_memory().unwrap(),
             std::path::PathBuf::from("/etc/nginx"),
             false,
@@ -2096,7 +2096,15 @@ mod tests {
             // which nothing in these tests blocks.
             Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
         )
-        .unwrap()
+        .unwrap();
+        // The health probe asks the host itself — `systemctl`, `nft`,
+        // `docker ps` — so a test whose cron tick ran it read this
+        // machine's services and Docker socket. Marked just run; a test
+        // about the health job itself sets its own state.
+        app.db
+            .set_cron_last_run(CronJob::HealthCheck.id(), now_secs(), "skipped for test")
+            .unwrap();
+        app
     }
 
     /// Marks both download jobs just run, so that no test's cron check

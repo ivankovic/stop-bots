@@ -398,8 +398,14 @@ mod tests {
         std::fs::write(&ssh_log, "").unwrap();
         let db = Db::open_in_memory().unwrap();
         // Marked just-run so no test ever makes the three outbound
-        // crawler-range fetches. Every other job is local.
-        for job in [CronJob::UpdateIpRanges, CronJob::UpdateEverything] {
+        // crawler-range fetches, or runs the health probe — which asks the
+        // *host* (`systemctl`, `nft`, `docker ps`) and so made every tick
+        // test read this machine's services and Docker socket.
+        for job in [
+            CronJob::UpdateIpRanges,
+            CronJob::UpdateEverything,
+            CronJob::HealthCheck,
+        ] {
             db.set_cron_last_run(job.id(), now_secs(), "skipped for test")
                 .unwrap();
         }

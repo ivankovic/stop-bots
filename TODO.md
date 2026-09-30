@@ -18,6 +18,13 @@ list — which meant the open items below were unfindable inside it.
   a "Restart needed" row naming what this process is serving; the underlying
   fix is rebuilding the router in place, which nothing does yet.
 
+* **A few CLI tests read the host's SSH journal.** Those that pass no
+  `--ssh-log` fall back to `journalctl` on whatever machine runs them —
+  read-only, but not hermetic. `tests/common::stop_bots_bin` could put a
+  fake `journalctl` first on PATH; tests that set their own PATH would then
+  need to keep it. (The health probe's `systemctl`/`docker ps` calls from
+  unit tests, the worse case, are fixed.)
+
 ## Known gaps
 
 Deliberate omissions rather than oversights — each is a thing someone will
