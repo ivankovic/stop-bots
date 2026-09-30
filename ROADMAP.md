@@ -89,7 +89,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 - [x] **`stop-bots uninstall`** with `--dry-run`. It removes the injected site blocks, the
   managed `conf.d` files, the nft table or iptables chain, and both units. Today nothing
   removes any of them. **M**
-- [ ] **Memory and CPU bounded on a 1 GB VPS.** Each detector job re-reads and re-parses
+- [x] **Memory and CPU bounded on a 1 GB VPS.** Each detector job re-reads and re-parses
   the whole access log itself: about ten full reads a minute, at roughly twice the file
   size in memory each. The TUI starts them concurrently. The fixes:
   - read once per tick and share the text, as `batch` already does;
@@ -98,14 +98,14 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   - parse outside the web console's DB lock.
 
   www has a 72 MB log and 962 MB of RAM *(verified)*. **L**
-- [ ] **The journald fallback reads the whole sshd journal** each minute, on every Firewall
+- [x] **The journald fallback reads the whole sshd journal** each minute, on every Firewall
   page view and in every lockout check (`sshlog.rs:84`, *verified*). This is the default
   path on Debian 12+ and Fedora. Use `--since` plus a stored cursor. **S**
 - [x] **nftables sets instead of one rule per address.** www's table is 44,547 lines with
   no sets *(verified)*, so every new connection walks a linear chain. Use named interval
   sets per family and verdict. As a bonus, per-element `timeout` makes expiry happen in the
   kernel, which fixes the next item on the nft side. **M**
-- [ ] **Expiry that actually expires.**
+- [x] **Expiry that actually expires.**
   - An expired block is only deleted from the database; the kernel keeps it until someone
     applies again.
   - Detectors count over the whole log since the last rotation and ignore timestamps, so
@@ -177,10 +177,10 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   A host run only by `batch` can't switch off the injection detector today.
   Thresholds are hard-coded for the cron (`scanblock.rs:179`), and subnet escalation,
   which the README advertises, can't be set anywhere. **M**
-- [ ] **Say when a log doesn't parse.** A custom `log_format` parses to zero lines, and
+- [x] **Say when a log doesn't parse.** A custom `log_format` parses to zero lines, and
   health then reports OK "no requests recorded yet". Compare non-empty lines with parsed
   lines, warn below about half, and show one sample line. **S**
-- [ ] **Use the stored log paths everywhere.** `set-log-paths` is ignored by:
+- [x] **Use the stored log paths everywhere.** `set-log-paths` is ignored by:
   - `batch`;
   - the lockout guard;
   - the web Firewall page and the TUI SSH panel;
