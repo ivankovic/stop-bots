@@ -1320,9 +1320,13 @@ fn nginx_applied(db: &Db) -> Result<Check> {
 /// leaves the old code serving indefinitely.
 fn service_health(probe: &Probe) -> Check {
     let (level, detail, fix) = match (probe.unit_active, &probe.unit_binary) {
+        // The console is optional: a host run from the CLI and cron has no
+        // unit, and that is a complete setup, not an unknown one. Reported
+        // as UNKNOWN, it was the one thing `status` flagged after following
+        // the README's quick start to the letter.
         (None, _) => (
-            Level::Unknown,
-            "no systemd unit found for the console".to_string(),
+            Level::Ok,
+            "not installed (optional: `stop-bots install web` runs it as a service)".to_string(),
             None,
         ),
         (Some(false), _) => (
@@ -2901,9 +2905,10 @@ mod tests {
         );
     }
 
-    /// A host with no systemd at all is not a broken host.
+    /// A host with no console unit — run from the CLI and cron, or with no
+    /// systemd at all — is a complete setup, not a broken or unknown one.
     #[test]
-    fn no_unit_at_all_is_unknown_not_broken() {
+    fn no_console_unit_is_fine() {
         let report = assess(
             &db(),
             &Probe {
@@ -2912,7 +2917,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(check(&report, "service-health").level, Level::Unknown);
+        assert_eq!(check(&report, "service-health").level, Level::Ok);
     }
 
     /// The hour a real host spent reporting `SQLITE_FULL`, with the error
@@ -3157,7 +3162,7 @@ mod tests {
         .unwrap();
 
         let check = check(&report, "service-health");
-        assert_eq!(check.level, Level::Unknown);
+        assert_eq!(check.level, Level::Ok);
         assert_ne!(report.worst(), Level::Critical);
     }
 
