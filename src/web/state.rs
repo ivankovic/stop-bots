@@ -78,6 +78,10 @@ pub struct AppState {
     /// [`crate::db::location_notice`]. Set by `main.rs`, which is the only
     /// place that knows whether the path was chosen for the user.
     pub db_notice: Option<String>,
+    /// How long a request may take to arrive, and how many connections
+    /// may be open: see [`crate::web::server::serve_on`]. A field so that
+    /// a test can shorten the timeouts rather than wait them out.
+    pub limits: crate::web::server::ServeLimits,
 }
 
 impl AppState {
@@ -115,6 +119,7 @@ impl AppState {
             apply_for_real,
             firewall_out: None,
             db_notice: None,
+            limits: crate::web::server::ServeLimits::default(),
         }
     }
 

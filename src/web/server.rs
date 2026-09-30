@@ -29,12 +29,17 @@
 //! 2. **`Host` allowlist.** Rejects DNS-rebinding before anything reads a
 //!    cookie. Ahead of everything that does work, because it is the
 //!    cheapest check and the least conditional.
-//! 3. **Authentication.** Resolves the session cookie into an
+//! 3. **The body, read in full**, within a deadline and a size cap (see
+//!    [`body_deadline`]), and then the client's address resolved.
+//! 4. **Authentication.** Resolves the session cookie into an
 //!    [`Authenticated`], or redirects to `/login`.
-//! 4. **CSRF.** Only on state-changing methods, and only after the session
+//! 5. **CSRF.** Only on state-changing methods, and only after the session
 //!    is known, because the token being compared is the session's.
 //!
-//! Assets and the login endpoints sit outside 3 and 4 — a stylesheet
+//! Before any of them, [`serve_on`] bounds how long a request head may
+//! take to arrive and how many connections may be open.
+//!
+//! Assets and the login endpoints sit outside 4 and 5 — a stylesheet
 //! nobody can load makes the login page unreadable, and a login form
 //! cannot present a session token it does not have yet.
 
@@ -115,6 +120,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             client_address,
         ))
+        .layer(middleware::from_fn_with_state(state.clone(), body_deadline))
         .layer(middleware::from_fn_with_state(state.clone(), host_guard))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
@@ -129,17 +135,115 @@ pub async fn serve(state: AppState, addr: std::net::SocketAddr) -> anyhow::Resul
     // `crate::web::cron`. Started here rather than in `router` so that a
     // test driving the router directly never starts a background task.
     let cron = crate::web::cron::spawn(state.clone());
-    // `into_make_service_with_connect_info` is what puts the peer address
-    // where `client_address` can find it, and so what makes the
-    // anti-lockout guard able to recognise the browser that is asking.
-    let served = axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("the web server stopped: {e}"));
+    let limits = state.limits;
+    let served = serve_on(listener, router(state), limits).await;
     cron.abort();
     served
+}
+
+/// How much a client can hold of this server before it has finished
+/// sending a request. See [`serve_on`].
+#[derive(Debug, Clone, Copy)]
+pub struct ServeLimits {
+    /// From the moment the server is ready for a request line to the end
+    /// of the headers. Also how long an idle keep-alive connection lasts.
+    pub header_read_timeout: std::time::Duration,
+    /// From the end of the headers to the end of the body.
+    pub body_read_timeout: std::time::Duration,
+    /// Connections open at once. The next waits in the kernel's backlog.
+    pub max_connections: usize,
+    /// The most a connection may buffer of an unfinished request head.
+    pub max_header_bytes: usize,
+    /// The largest request body. Every form here is a few fields; there
+    /// is no upload.
+    pub max_body_bytes: usize,
+}
+
+impl Default for ServeLimits {
+    fn default() -> Self {
+        Self {
+            // Ten seconds is plenty for a person on a slow link, and not
+            // much for an attacker holding sockets open.
+            header_read_timeout: std::time::Duration::from_secs(10),
+            body_read_timeout: std::time::Duration::from_secs(10),
+            // An operator's browser opens six at most. Far below any
+            // descriptor limit the process runs under, so this is what
+            // runs out first, and it runs out without taking the
+            // descriptors the cron needs to read its logs.
+            max_connections: 128,
+            // hyper's default is about 400 KB per connection; a real
+            // request head here is a few hundred bytes plus the cookies.
+            max_header_bytes: 16 * 1024,
+            max_body_bytes: 64 * 1024,
+        }
+    }
+}
+
+/// Serves `app` on `listener`, with [`ServeLimits`].
+///
+/// A loop of its own rather than `axum::serve`, which gives hyper no timer
+/// and so no header read timeout, and accepts without limit. With
+/// `--expose`, 1,100 half-sent requests held open exhausted the process's
+/// file descriptors and stalled the detectors' log reads, each unfinished
+/// head holding about 390 KB. Now a head has [`ServeLimits::
+/// header_read_timeout`] to arrive and [`ServeLimits::max_header_bytes`]
+/// to fit in, a body has `body_read_timeout` (see [`body_deadline`]), and
+/// at most `max_connections` are open at once.
+///
+/// The handler itself has no deadline: an apply that has started must
+/// finish, not be abandoned half-way because it took a while.
+///
+/// The peer address goes into each request as axum's `ConnectInfo`, where
+/// [`client_address`] finds it — what makes the anti-lockout guard and the
+/// login throttle able to tell who is asking.
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    limits: ServeLimits,
+) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use tower::ServiceExt;
+
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    loop {
+        // A slot first, then the accept: past the cap, connections wait in
+        // the kernel's backlog rather than as descriptors in this process.
+        let slot = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| anyhow::anyhow!("the web server stopped: {e}"))?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(err) => {
+                // Out of descriptors, or a connection reset before it was
+                // accepted: nothing to do but try again shortly, rather
+                // than spin or stop serving.
+                eprintln!("stop-bots web: accept failed: {err}");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let app = app.clone();
+        tokio::spawn(async move {
+            let _slot = slot;
+            let service =
+                hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+                    let mut request = request.map(Body::new);
+                    request
+                        .extensions_mut()
+                        .insert(axum::extract::ConnectInfo(peer));
+                    app.clone().oneshot(request)
+                });
+            let mut http = hyper::server::conn::http1::Builder::new();
+            http.timer(TokioTimer::new())
+                .header_read_timeout(limits.header_read_timeout)
+                .max_buf_size(limits.max_header_bytes.max(8192));
+            // An error here is a client that went away or timed out:
+            // nothing for the server to do about it.
+            let _ = http.serve_connection(TokioIo::new(stream), service).await;
+        });
+    }
 }
 
 // ---- middleware ----
@@ -225,6 +329,39 @@ fn resolve_client(peer: Option<IpAddr>, forwarded: Option<&str>, trusted: bool) 
         .and_then(|entry| entry.trim().parse::<IpAddr>().ok())
         .map(|ip| ip.to_canonical())
         .or(peer)
+}
+
+/// Reads the request body within [`ServeLimits::body_read_timeout`], and
+/// no more than [`ServeLimits::max_body_bytes`] of it, before anything
+/// else looks at it.
+///
+/// The header read timeout ends when the headers do; without this, a
+/// client could send a `Content-Length` and then a byte a minute, and hold
+/// the connection and a handler as long as it liked. Buffering here also
+/// bounds the body for every handler at once, rather than each extractor's
+/// own default of megabytes. Every body is a small form post.
+async fn body_deadline(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let limits = state.limits;
+    match tokio::time::timeout(
+        limits.body_read_timeout,
+        axum::body::to_bytes(body, limits.max_body_bytes),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        Ok(Err(_)) => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "The request is too large.\n").into_response()
+        }
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            "The request took too long to arrive.\n",
+        )
+            .into_response(),
+    }
 }
 
 /// Refuses a request whose `Host` this server was not told to answer to.
@@ -1043,6 +1180,147 @@ mod tests {
         assert!(!page.contains("<form"), "page was:\n{page}");
         assert!(!page.contains("test-csrf"), "page was:\n{page}");
         assert!(page.contains("&lt;script&gt;boom"), "page was:\n{page}");
+    }
+
+    // ---- serve_on: the listener's own limits, over real loopback sockets ----
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn quick_limits(max_connections: usize) -> ServeLimits {
+        ServeLimits {
+            header_read_timeout: std::time::Duration::from_millis(100),
+            max_connections,
+            ..ServeLimits::default()
+        }
+    }
+
+    /// A server on an ephemeral loopback port, answering every request
+    /// with the peer address its handler was given.
+    async fn listening(limits: ServeLimits) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/",
+            get(
+                |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<
+                    std::net::SocketAddr,
+                >| async move { peer.ip().to_string() },
+            ),
+        );
+        tokio::spawn(serve_on(listener, app, limits));
+        addr
+    }
+
+    /// Reads until the server closes, or two seconds pass.
+    async fn read_all(stream: &mut tokio::net::TcpStream) -> String {
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_to_end(&mut out),
+        )
+        .await;
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    #[tokio::test]
+    async fn the_handler_is_told_the_peer_address() {
+        let addr = listening(quick_limits(4)).await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(REQUEST).await.unwrap();
+
+        let response = read_all(&mut stream).await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("127.0.0.1"), "{response}");
+    }
+
+    /// Half a request head, held open: 1,100 of these used to exhaust the
+    /// process's descriptors. The server hangs up once the head is late.
+    #[tokio::test]
+    async fn a_request_head_that_never_finishes_is_hung_up_on() {
+        let addr = listening(quick_limits(4)).await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: loc")
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+
+        let response = read_all(&mut stream).await;
+
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "still open after {waited:?}"
+        );
+        assert!(!response.contains("200"), "{response}");
+    }
+
+    /// Past the cap the next client waits in the backlog, and is served
+    /// as soon as a slot frees — here, when the idle one is hung up on.
+    #[tokio::test]
+    async fn past_the_connection_cap_the_next_client_waits_for_a_slot() {
+        let addr = listening(quick_limits(1)).await;
+        let _idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Let the server accept the idle one into the only slot.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let started = std::time::Instant::now();
+        let mut next = tokio::net::TcpStream::connect(addr).await.unwrap();
+        next.write_all(REQUEST).await.unwrap();
+
+        let response = read_all(&mut next).await;
+
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(60),
+            "served after {:?}, before the idle connection's slot was free",
+            started.elapsed()
+        );
+    }
+
+    /// The header timeout ends with the headers; a body sent a byte at a
+    /// time would otherwise hold a connection and a handler indefinitely.
+    #[tokio::test]
+    async fn a_body_that_never_finishes_is_refused() {
+        use tower::ServiceExt;
+
+        let mut state = state();
+        state.limits.body_read_timeout = std::time::Duration::from_millis(50);
+        let body = Body::from_stream(futures::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(body)
+            .unwrap();
+
+        let response = router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn a_body_past_the_cap_is_refused() {
+        use tower::ServiceExt;
+
+        let state = state();
+        let too_big = "a".repeat(state.limits.max_body_bytes + 1);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!("password={too_big}")))
+            .unwrap();
+
+        let response = router(state).oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]
