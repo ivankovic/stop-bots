@@ -759,6 +759,40 @@ mod tests {
         assert!(host.db.list_user_agent_stats().unwrap().is_empty());
     }
 
+    /// serde decodes a JSON log's `"\n"` to a real newline, and a newline
+    /// is how the stored evidence marks the observation that clears an
+    /// address. A client must not be able to spell it.
+    #[test]
+    fn a_json_user_agent_cannot_forge_the_observation_that_clears_an_address() {
+        let host = host();
+        let detector = Detector::RotatingUserAgent;
+        detector.set_enabled(&host.db, true).unwrap();
+        let agents = (0..20)
+            .map(|n| format!("Agent/{n}"))
+            .chain([r"\nclear".to_string()]);
+        for agent in agents {
+            append(
+                &host.access,
+                &format!(
+                    "{{\"remote_addr\":\"203.0.113.5\",\"status\":\"200\",\"request_uri\":\"/\",\
+                     \"http_user_agent\":\"{agent}\",\"time_iso8601\":\"{}\"}}\n",
+                    iso(now())
+                ),
+            );
+        }
+
+        run(&host.db, &[CronJob::Detect(detector)], &Flags::default()).unwrap();
+
+        let rows = host.db.evidence_rows(detector, 0, Rule::Once).unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| row.item != crate::evidence::Item::Clear),
+            "{rows:?}"
+        );
+        let outcome = crate::scanblock::run_detector(&host.db, detector, 1, now(), true).unwrap();
+        assert_eq!(outcome.newly_blocked, ["203.0.113.5"], "{outcome:?}");
+    }
+
     /// A console on its own host has no prefix to tell it by. A JSON log
     /// that records the host still can; the rest of the site is read.
     #[test]

@@ -89,12 +89,14 @@ pub enum Item {
 }
 
 impl Item {
-    /// A seen item, truncated to [`MAX_ITEM_CHARS`].
+    /// A seen item, truncated to [`MAX_ITEM_CHARS`], with every control
+    /// character replaced (see [`Self::key`] for why).
     pub fn seen(text: &str) -> Item {
-        match text.char_indices().nth(MAX_ITEM_CHARS) {
-            Some((at, _)) => Item::Seen(text[..at].to_string()),
-            None => Item::Seen(text.to_string()),
-        }
+        let text = match text.char_indices().nth(MAX_ITEM_CHARS) {
+            Some((at, _)) => &text[..at],
+            None => text,
+        };
+        Item::Seen(without_controls(text).into_owned())
     }
 
     /// The bucket `at` falls in.
@@ -102,11 +104,17 @@ impl Item {
         Item::Bucket(at.div_euclid(BUCKET_SECONDS) * BUCKET_SECONDS)
     }
 
-    /// How this is stored. A log line cannot contain a newline, so a
-    /// leading one marks the two kinds a client cannot spell.
+    /// How this is stored. A leading newline marks the two kinds a client
+    /// cannot spell, because a seen item's control characters are
+    /// replaced, here as well as in [`Self::seen`].
+    ///
+    /// The replacing is what makes that true. A combined-format line
+    /// cannot hold a newline, but a JSON one can: serde decodes `"\n"` in
+    /// a user agent to a real one, and a user agent of `"\nclear"` stored
+    /// as it came was read back as the observation that clears an address.
     pub fn key(&self) -> String {
         match self {
-            Item::Seen(text) => text.clone(),
+            Item::Seen(text) => without_controls(text).into_owned(),
             Item::Clear => "\nclear".to_string(),
             Item::Bucket(start) => format!("\nbucket {start}"),
         }
@@ -123,6 +131,19 @@ impl Item {
             Some(start) => Item::Bucket(start),
             None => Item::Seen(key.to_string()),
         }
+    }
+}
+
+/// `text` with each control character replaced by U+FFFD, borrowed when it
+/// has none, which is nearly always.
+fn without_controls(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(char::is_control) {
+        text.chars()
+            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
     }
 }
 

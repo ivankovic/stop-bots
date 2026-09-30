@@ -20,6 +20,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   (schema version 5: `console_logins`).
 - The Web Access panel's subdomain server block has `access_log off;`. Re-apply it
   from the panel to update an existing one.
+- A JSON log line can no longer forge the evidence that clears an address: a user
+  agent of `"\nclear"` was stored as that observation. Control characters in what a
+  line says are replaced before it is stored.
 
 ## [0.1.0-rc.1] — 2026-09-30
 
