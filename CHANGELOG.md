@@ -44,6 +44,22 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   still applies there.
 - `--root` outside `/etc/nginx` keeps generated files in `<root>/conf.d`, and
   never reads or writes the host's `/etc/nginx/conf.d`.
+- **The operator's own browser gets past a login flood.** A successful login sets a
+  90-day `stop_bots_remember` cookie (schema version 6); a login presenting it skips the
+  shared throttles. `web --set-password` forgets them all.
+- A throttle key shared by everyone behind an untrusted proxy has no backoff, only the
+  global limit; IPv6 clients are throttled by /64.
+- Web Access turns on `trust_forwarded_for`, and `secure_cookie` on a TLS site; a new
+  `web-proxy` health check warns about a proxied console that does not trust its proxy.
+- Argon2 runs outside the database lock.
+- Request heads and bodies have 10 s to arrive, and at most 128 connections are open.
+- The Firewall page shows 200 user agents a page, and links and acts on one by
+  reference: no client's text goes into a console URL.
+- A flash message is named in the URL by an id; `?flash=<text>` shows nothing.
+- htmx is removed, and the CSP allows no script file.
+- Direction overrides and zero-width characters in a user agent are shown as `\u{202E}`.
+- The login page no longer names the host, and errors before login say nothing of
+  their cause; `/nginx/<unknown id>` is a 404.
 
 ### Changed
 
