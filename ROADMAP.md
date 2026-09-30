@@ -200,7 +200,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 
 ### D. Explain every block
 
-- [ ] **Why is this address blocked?**
+- [x] **Why is this address blocked?**
   - `firewall_rules` has no source, reason or evidence.
   - Blocks from the four web-log detectors appear in neither UI: the Firewall screens list
     only SSH-log addresses, and rules themselves are CLI-only, by id.
