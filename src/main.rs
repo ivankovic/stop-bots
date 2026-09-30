@@ -1504,6 +1504,24 @@ impl From<BlockResponseArg> for stop_bots::db::BlockResponse {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // A one-shot command's output is often piped into something that stops
+    // reading early (`| head`). Rust ignores SIGPIPE, so the next write is
+    // an error, and `println!` turns that into a panic. Dying quietly, the
+    // default, is what every other command-line tool does. Not for the two
+    // long-running front-ends: they write to sockets and a terminal, where a
+    // peer going away is an error to handle, not the end of the process.
+    // Nothing a one-shot command runs writes to a child's stdin, which is
+    // the other place the signal could come from.
+    if !matches!(
+        cli.command,
+        None | Some(Command::Tui { .. }) | Some(Command::Web { .. })
+    ) {
+        // SAFETY: called before any thread this program starts writes to a
+        // pipe, and SIG_DFL is async-signal-safe to install.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     // Moved into whichever arm runs; only one does.
     let db = cli.db;
 

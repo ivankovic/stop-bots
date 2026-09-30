@@ -4512,3 +4512,59 @@ fn remove_firewall_rule_needs_an_id_or_a_source_and_names_the_sources() {
         .failure()
         .stderr(predicate::str::contains("ssh-scanners"));
 }
+
+/// `stop-bots list-bots | head -1` — a reader that stops early — used to
+/// end in a panic ("failed printing to stdout: Broken pipe", exit 101).
+/// A one-shot command now dies quietly of SIGPIPE, as every other
+/// command-line tool does.
+#[test]
+fn output_piped_into_a_reader_that_stops_early_is_not_a_panic() {
+    use std::io::{BufRead, BufReader, Read};
+    use std::os::unix::process::ExitStatusExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db.sqlite3");
+    let root = dir.path().join("nginx");
+    fs::create_dir_all(&root).unwrap();
+    // A dry run stores the built-in bot list — hundreds of rows, far more
+    // than a pipe holds, so the command is still writing when the reader
+    // goes away.
+    stop_bots(&[
+        "apply-blocks",
+        "--dry-run",
+        "--db",
+        db.to_str().unwrap(),
+        "--root",
+        root.to_str().unwrap(),
+    ]);
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("stop-bots"))
+        .args(["list-bots", "--db", db.to_str().unwrap()])
+        .env_remove("STOP_BOTS_DB")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    // The reader is gone; everything the command writes from here on hits
+    // a closed pipe.
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let status = child.wait().unwrap();
+
+    assert!(first.contains("NAME"), "first line was: {first:?}");
+    assert!(!stderr.contains("panicked"), "stderr was:\n{stderr}");
+    assert_ne!(status.code(), Some(101), "stderr was:\n{stderr}");
+    assert!(
+        status.success() || status.signal() == Some(libc::SIGPIPE),
+        "status was {status:?}, stderr:\n{stderr}"
+    );
+}
