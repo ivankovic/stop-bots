@@ -100,6 +100,7 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - **A render no longer changes what loads at boot.** It writes
   `/etc/stop-bots/firewall.next.nft` (or `.next.sh`); only an apply that succeeded
   copies it to `firewall.nft`, the file `stop-bots-firewall.service` loads.
+  `install firewall` now ends by pointing at `render-firewall --apply`.
 - **One lockout policy for every front-end.** No readable SSH log: the script is
   written, with a note, and not applied. A connected SSH client the rules would
   block: nothing is written or applied. `--force` overrides both.

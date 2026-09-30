@@ -723,8 +723,8 @@ pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
 
     // Not started. The script may not exist yet, and starting a unit that
     // loads firewall rules is the one step an operator should take after
-    // reading what it would load -- the same reason `render-firewall` does
-    // not apply what it writes.
+    // reading what it would load -- the same reason `render-firewall` only
+    // applies what it writes when asked to.
     if layout.real {
         steps.push("systemctl daemon-reload".to_string());
         steps.push(format!("systemctl enable {FIREWALL_UNIT}"));
@@ -738,9 +738,13 @@ pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
             layout.unit_dir.display()
         ));
     }
+    // `render-firewall --apply` rather than `nft -f <script>`: a script run
+    // by hand is enforced now but never becomes what this unit loads, and
+    // the one at `script` is only ever what was last applied.
     steps.push(format!(
-        "not started: run `{} {}` yourself once you have read it",
-        backend.apply_command(),
+        "not started: it loads {} at boot, which only an apply writes. Review the rules, \
+         then run `stop-bots render-firewall --apply`: it checks for a lockout, runs the \
+         script, and puts it there",
         script.display()
     ));
 
@@ -1388,6 +1392,21 @@ mod tests {
             steps.iter().any(|s| s.contains("skipping systemctl")),
             "steps: {steps:?}"
         );
+    }
+
+    /// The last step says how to get rules into the file the unit loads.
+    /// Running the script by hand enforces it now but never puts it there,
+    /// so the advice is the apply that does both.
+    #[test]
+    fn install_firewall_points_at_the_apply_not_at_running_the_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+
+        let steps = install_firewall(&layout, &Options::default()).unwrap();
+
+        let last = steps.iter().last().expect("at least one step");
+        assert!(last.contains("render-firewall --apply"), "steps: {steps:?}");
+        assert!(!last.contains("nft -f"), "steps: {steps:?}");
     }
 
     /// And on the real host, it does.
