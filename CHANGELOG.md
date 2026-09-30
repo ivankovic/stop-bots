@@ -61,9 +61,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The login page no longer names the host, and errors before login say nothing of
   their cause; `/nginx/<unknown id>` is a 404.
 - **The web console's unit is `ProtectSystem=strict`**: it can write its database,
-  `/etc/stop-bots`, the NGINX config and logs, and `/run`, and nothing else —
-  not `/etc/cron.d`, systemd units or binaries. Capabilities are cut to the six
-  it uses, and it gets `LimitNOFILE=16384` and `TasksMax=1024`.
+  `/etc/stop-bots`, the NGINX config, the log directories that config names, and
+  `/run`, and nothing else — not `/etc/cron.d`, systemd units or binaries.
+  Capabilities are cut to the six it uses, and it gets `LimitNOFILE=16384` and
+  `TasksMax=1024`. A site added later that logs elsewhere: re-run `install web`.
 - **The firewall boot unit is sandboxed too**: read-only, no `AF_UNIX` (so the
   script it loads cannot ask systemd for anything), network capabilities only.
 - Re-run `sudo stop-bots install web` and `install firewall` to get both; an

@@ -137,10 +137,11 @@ pub struct Layout {
     /// `/var/log/nginx`. Written, not only read: `nginx -t` opens every
     /// log the config names for writing, and fails on one it cannot.
     pub nginx_log_dir: PathBuf,
-    /// The access log the database stores (`set-log-paths`), if any.
-    /// NGINX writes it, so its directory is one more that `nginx -t` opens
-    /// a file in. Filled in by [`install_web`], like `nginx_root`.
-    pub access_log: Option<PathBuf>,
+    /// Every other directory NGINX writes a log in, which `nginx -t` opens
+    /// files in for the same reason: the stored access log's
+    /// (`set-log-paths`), and each one an `access_log` or `error_log` in the
+    /// config names. Filled in by [`install_web`]; see [`nginx_log_dirs`].
+    pub log_dirs: Vec<PathBuf>,
     /// `/run`. Writable for the service; see [`writable_paths`] for why
     /// the whole of it rather than the three files it uses there.
     pub run_dir: PathBuf,
@@ -209,7 +210,7 @@ impl Layout {
             nginx_dir: prefix.join("etc/nginx"),
             nginx_roots: Vec::new(),
             nginx_log_dir: prefix.join("var/log/nginx"),
-            access_log: None,
+            log_dirs: Vec::new(),
             run_dir: prefix.join("run"),
             ssh_log: None,
             systemd_marker: prefix.join("run/systemd/system"),
@@ -229,22 +230,33 @@ impl Layout {
         self.unit_dir.join(WEB_UNIT)
     }
 
-    /// This layout with the stored NGINX root added to `nginx_roots`, and
-    /// `access_log` filled in from the database at `db_path` if the caller
-    /// left it unset.
+    /// This layout with what the host says added: the NGINX root the
+    /// database stores, the stored access log's directory, and every log
+    /// directory the NGINX config names.
     ///
-    /// Read-only, and only if the database is there: `install web
-    /// --dry-run` promises to touch nothing, and `Db::open` would create
-    /// or migrate the file.
-    fn with_stored_settings(&self) -> Layout {
+    /// The database is read read-only, and only if it is there: `install
+    /// web --dry-run` promises to touch nothing, and `Db::open` would
+    /// create or migrate the file.
+    fn with_host_settings(&self) -> Layout {
         let mut layout = self.clone();
+        // A stored root inside /etc/nginx is given back already, and any
+        // other one only if it is `grantable`: the console writes this row.
         layout.nginx_roots.extend(
-            stored_setting_at(&self.db_path, crate::db::keys::NGINX_ROOT).map(PathBuf::from),
+            stored_setting_at(&self.db_path, crate::db::keys::NGINX_ROOT)
+                .map(PathBuf::from)
+                .filter(|root| root.starts_with(&self.nginx_dir) || grantable(root)),
         );
-        if layout.access_log.is_none() {
-            layout.access_log = stored_setting_at(&self.db_path, crate::db::keys::LOGS_ACCESS_PATH)
-                .map(PathBuf::from);
-        }
+        layout.log_dirs.extend(
+            stored_setting_at(&self.db_path, crate::db::keys::LOGS_ACCESS_PATH)
+                .as_deref()
+                .and_then(|log| Path::new(log).parent())
+                .filter(|dir| grantable(dir))
+                .map(Path::to_path_buf),
+        );
+        let roots: Vec<PathBuf> = std::iter::once(layout.nginx_dir.clone())
+            .chain(layout.nginx_roots.iter().cloned())
+            .collect();
+        layout.log_dirs.extend(nginx_log_dirs(&roots));
         layout
     }
 }
@@ -287,9 +299,9 @@ fn stored_setting_at(db_path: &Path, key: &str) -> Option<String> {
 /// - `/etc/nginx`, and the root the service manages if that is elsewhere:
 ///   the site files it injects blocks into and the `conf.d` files it
 ///   generates, including Web Access's;
-/// - `/var/log/nginx`, and the stored access log's directory: `nginx -t`
-///   opens every log the config names for writing, and fails the test on
-///   one it cannot open;
+/// - `/var/log/nginx`, and every other log directory ([`nginx_log_dirs`]):
+///   `nginx -t` opens every log the config names for writing, and fails the
+///   test on one it cannot open;
 /// - `/run`, whole. `nginx -t` creates `/run/nginx.pid`, and granting just
 ///   that file does not work: a grant is a bind mount of that one inode,
 ///   NGINX deletes and recreates the file whenever it restarts, and the
@@ -313,13 +325,7 @@ pub fn writable_paths(layout: &Layout) -> Vec<PathBuf> {
     ];
     candidates.extend(layout.nginx_roots.iter().cloned());
     candidates.push(layout.nginx_log_dir.clone());
-    candidates.extend(
-        layout
-            .access_log
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_path_buf),
-    );
+    candidates.extend(layout.log_dirs.iter().cloned());
     candidates.push(layout.run_dir.clone());
 
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -329,6 +335,133 @@ pub fn writable_paths(layout: &Layout) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+/// The directories the `access_log` and `error_log` directives under
+/// `roots` write in, other than ones this would never grant.
+///
+/// `nginx -t` opens every log the config names for writing, so a site
+/// logging to `/srv/www/example.com/logs` fails the console's test — and
+/// the apply is rolled back — unless the unit gives that directory back.
+/// Read from the config as it is at install time; a site added later that
+/// logs somewhere new needs `install web` run again, which replaces an
+/// unedited unit silently.
+///
+/// Only an absolute path, only the part before any `$variable`, and only
+/// a [`grantable`] one: whoever can edit the NGINX config must not be able
+/// to use this to have the next `install web` open `/etc` or `/usr` to
+/// the console.
+pub fn nginx_log_dirs(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        for file in config_files(root) {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for dir in log_dirs_in(&text) {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// Where a compromised console must never be given write access, and so
+/// no log directory may be in or above.
+const NEVER_WRITABLE: &[&str] = &[
+    "/etc",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/boot",
+    "/opt",
+    "/root",
+    "/home",
+    "/var/spool",
+    "/var/lib",
+    "/var/cache",
+    "/var/backups",
+    "/proc",
+    "/sys",
+    "/dev",
+];
+
+/// Whether a directory the console itself could have named — in its
+/// database or in the NGINX config it writes — may be given back to it.
+///
+/// Those two are exactly what a compromised console controls, so without
+/// this the next `install web` an operator runs would launder a stored
+/// root of `/etc` into `ReadWritePaths=-/etc`. A path the operator typed
+/// (`--root`) or a 0.0.x unit named is not checked: that is their call.
+fn grantable(dir: &Path) -> bool {
+    dir.is_absolute()
+        && dir.parent().is_some()
+        && !NEVER_WRITABLE.iter().any(|never| {
+            let never = Path::new(never);
+            dir.starts_with(never) || never.starts_with(dir)
+        })
+}
+
+/// The directories the log directives in one config file name.
+fn log_dirs_in(text: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or_default();
+        let mut words = line.split_whitespace();
+        while let Some(word) = words.next() {
+            if word != "access_log" && word != "error_log" {
+                continue;
+            }
+            let Some(target) = words.next() else { break };
+            let target = target.trim_end_matches(';').trim_matches(['"', '\'']);
+            // `/var/log/nginx/$host.log` writes somewhere in the part before
+            // the first variable; `off`, `syslog:` and `stderr` nowhere.
+            let dir = match target.find('$') {
+                Some(at) => target[..at]
+                    .rfind('/')
+                    .map(|slash| Path::new(&target[..=slash])),
+                None => Path::new(target).parent(),
+            };
+            let Some(dir) = dir else { continue };
+            if grantable(dir) {
+                dirs.push(dir.components().collect());
+            }
+        }
+    }
+    dirs
+}
+
+/// Every regular file under `root`, a few levels deep, without following
+/// a link to a directory — NGINX's own tree links `sites-enabled` into
+/// `sites-available`, whose files are listed anyway.
+fn config_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth < 4 {
+                pending.push((path, depth + 1));
+            } else if std::fs::metadata(&path)
+                .is_ok_and(|meta| meta.is_file() && meta.len() < 1 << 20)
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
 }
 
 /// One optional `ReadWritePaths=` entry: `-` and the path, quoted and
@@ -1023,7 +1156,7 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
 
     // The unit has to let the service write wherever the database says the
     // NGINX config and its logs are, not only the stock paths.
-    let unit = web_unit(&layout.with_stored_settings());
+    let unit = web_unit(&layout.with_host_settings());
     let unit_path = layout.unit_path();
     let existing = std::fs::read_to_string(&unit_path).ok();
 
@@ -2221,6 +2354,63 @@ mod tests {
         }
     }
 
+    /// `nginx -t` opens every log the config names, so a site logging
+    /// outside /var/log/nginx failed the console's apply until its
+    /// directory was given back. Only where it can be given back safely.
+    #[test]
+    fn the_log_directories_the_config_names_are_given_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sites-available")).unwrap();
+        std::fs::write(
+            dir.path().join("sites-available/a.conf"),
+            "server {\n\
+             \x20   access_log /srv/www/a/logs/access.log combined;\n\
+             \x20   error_log \"/srv/www/a/logs/error.log\" warn;\n\
+             \x20   access_log /var/log/nginx/$host.log;\n\
+             \x20   # access_log /srv/commented/out.log;\n\
+             \x20   access_log off; error_log syslog:server=unix:/dev/log;\n\
+             \x20   access_log /etc/cron.d/x; error_log /usr/lib/x.log;\n\
+             \x20   access_log /var/lib/x/y.log; access_log /var/$x/a.log;\n\
+             \x20   access_log relative/a.log;\n\
+             }\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            nginx_log_dirs(&[dir.path().to_path_buf()]),
+            vec![
+                PathBuf::from("/srv/www/a/logs"),
+                PathBuf::from("/var/log/nginx")
+            ]
+        );
+    }
+
+    /// The console writes its own database, so a root or a log path stored
+    /// there is one a compromised console chose. The next `install web`
+    /// must not turn it into a grant.
+    #[test]
+    fn a_stored_path_the_console_could_have_chosen_is_not_given_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        {
+            let db = crate::db::Db::open(&layout.db_path).unwrap();
+            db.set_text_setting(crate::db::keys::NGINX_ROOT, "/etc")
+                .unwrap();
+            db.set_text_setting(
+                crate::db::keys::LOGS_ACCESS_PATH,
+                "/var/spool/cron/crontabs/root",
+            )
+            .unwrap();
+        }
+
+        install_web(&layout, &Options::default()).unwrap();
+
+        let unit = std::fs::read_to_string(layout.unit_path()).unwrap();
+        for path in ["/etc/cron.d/x", "/var/spool/cron/crontabs/root"] {
+            assert!(!writable_in(&unit, path), "{path} was given back:\n{unit}");
+        }
+    }
+
     /// `--root` and a 0.0.x unit's `--root` are given back as well, before
     /// the database has been told about either.
     #[test]
@@ -2239,7 +2429,7 @@ mod tests {
             PathBuf::from("/etc/nginx/sites-enabled"),
             PathBuf::from("nginx"),
         ];
-        layout.access_log = Some(PathBuf::from("/var/log/nginx/access.log"));
+        layout.log_dirs = vec![PathBuf::from("/var/log/nginx/sites")];
 
         assert_eq!(writable_paths(&layout), writable_paths(&system_layout()));
     }
@@ -2266,7 +2456,7 @@ mod tests {
         };
         let (before, bytes) = (listing(), std::fs::read(&layout.db_path).unwrap());
 
-        let with = layout.with_stored_settings();
+        let with = layout.with_host_settings();
 
         assert_eq!(with.nginx_roots, vec![PathBuf::from("/srv/nginx")]);
         assert_eq!(listing(), before);

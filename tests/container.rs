@@ -2034,12 +2034,13 @@ fn the_console_cannot_write_cron_units_or_binaries() {
 /// WAL mode, the apply lock taken in the file every other stop-bots uses,
 /// and Web Access set up.
 ///
-/// Two things here are the ways a narrower sandbox broke during this
+/// Three things here are the ways a narrower sandbox broke during this
 /// change. NGINX is restarted after the console starts, which replaces
 /// `/run/nginx.pid` — the file `nginx -t` opens — and a grant of that file
-/// alone did not survive it. And the site file belongs to www-data, so
-/// rewriting it with its owner and mode kept takes CAP_CHOWN and
-/// CAP_FOWNER.
+/// alone did not survive it. The site logs outside /var/log/nginx, and
+/// `nginx -t` opens its log for writing. And the site file belongs to
+/// www-data, so rewriting it with its owner and mode kept takes CAP_CHOWN
+/// and CAP_FOWNER.
 #[test]
 fn the_console_under_its_unit_still_does_everything_it_is_for() {
     if !enabled() {
@@ -2048,8 +2049,16 @@ fn the_console_under_its_unit_still_does_everything_it_is_for() {
     let host = Host::start("stop-bots-sandboxed-console");
     let site = "/etc/nginx/sites-enabled/test-site.conf";
     host.sh(&format!(
-        "chown www-data:www-data {site} && chmod 0640 {site}"
+        "mkdir -p /srv/www/test/logs \
+         && sed -i 's|^    root |    access_log /srv/www/test/logs/access.log;\\n    root |' {site} \
+         && nginx -t && systemctl reload nginx \
+         && chown www-data:www-data {site} && chmod 0640 {site}"
     ));
+    assert!(
+        host.sh(&format!("cat {site}"))
+            .contains("/srv/www/test/logs"),
+        "the fixture did not move the site's log"
+    );
     let console = host.console();
     host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
     host.seed_bot("badbot", "BadBot");
