@@ -131,6 +131,140 @@ pub fn store_backend(db: &Db, backend: FirewallBackend) -> Result<()> {
     db.set_text_setting(BACKEND_KEY, backend.stored())
 }
 
+impl FirewallBackend {
+    /// The program that loads this backend's script: `nft` itself, or
+    /// `iptables-restore`, which every line of the iptables script runs
+    /// (the script's own interpreter, `sh`, is on every host).
+    pub fn program(self) -> &'static str {
+        match self {
+            FirewallBackend::Iptables => "iptables-restore",
+            FirewallBackend::Nftables => "nft",
+        }
+    }
+
+    /// The package that ships [`Self::program`] on Debian and Ubuntu.
+    fn package(self) -> &'static str {
+        match self {
+            FirewallBackend::Iptables => "iptables",
+            FirewallBackend::Nftables => "nftables",
+        }
+    }
+
+    fn other(self) -> FirewallBackend {
+        match self {
+            FirewallBackend::Iptables => FirewallBackend::Nftables,
+            FirewallBackend::Nftables => FirewallBackend::Iptables,
+        }
+    }
+}
+
+/// Which of the two backends this host can actually load a script with.
+///
+/// Both used to be offered everywhere, so a host with only one of them
+/// could pick the other, render happily, and learn at apply time from a
+/// spawn error ("No such file or directory") that named neither the tool
+/// nor the fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Installed {
+    pub nftables: bool,
+    pub iptables: bool,
+}
+
+impl Installed {
+    /// What this host has, looked for where an apply would look.
+    pub fn detect() -> Self {
+        Installed {
+            nftables: crate::host::is_installed(FirewallBackend::Nftables.program()),
+            iptables: crate::host::is_installed(FirewallBackend::Iptables.program()),
+        }
+    }
+
+    /// [`Self::detect`] over a given search path, for tests.
+    pub fn detect_in(path: Option<&std::ffi::OsStr>, fallbacks: &[&str]) -> Self {
+        let has = |b: FirewallBackend| crate::host::is_installed_in(b.program(), path, fallbacks);
+        Installed {
+            nftables: has(FirewallBackend::Nftables),
+            iptables: has(FirewallBackend::Iptables),
+        }
+    }
+
+    pub fn has(self, backend: FirewallBackend) -> bool {
+        match backend {
+            FirewallBackend::Iptables => self.iptables,
+            FirewallBackend::Nftables => self.nftables,
+        }
+    }
+
+    /// The backend a new database should render for: nftables if it is
+    /// here (sets, kernel expiry, allowlist geo mode), else iptables if
+    /// that is, else nothing to go on.
+    pub fn preferred(self) -> Option<FirewallBackend> {
+        if self.nftables {
+            Some(FirewallBackend::Nftables)
+        } else if self.iptables {
+            Some(FirewallBackend::Iptables)
+        } else {
+            None
+        }
+    }
+
+    /// "nftables", or "nftables (not installed)": how a backend is offered.
+    pub fn describe(self, backend: FirewallBackend) -> String {
+        if self.has(backend) {
+            backend.stored().to_string()
+        } else {
+            format!("{} (not installed)", backend.stored())
+        }
+    }
+
+    /// Refuses to run `backend`'s script on a host that lacks its program,
+    /// naming the program, the package and the other backend if that one
+    /// is here.
+    pub fn check(self, backend: FirewallBackend) -> Result<()> {
+        if self.has(backend) {
+            return Ok(());
+        }
+        let other = backend.other();
+        let instead = if self.has(other) {
+            format!(
+                ", or render for {} instead, which is installed (`stop-bots set-firewall-backend {}`)",
+                other.stored(),
+                other.stored()
+            )
+        } else {
+            String::new()
+        };
+        anyhow::bail!(
+            "{} is not installed, so the {} script cannot be applied. Install the `{}` package{instead}",
+            backend.program(),
+            backend.stored(),
+            backend.package(),
+        )
+    }
+}
+
+/// Stores the backend this host has, preferring nftables, for a database
+/// that has never chosen one and never written a script.
+///
+/// A new database on a host with only iptables used to default to
+/// nftables, so its first "Apply everything" failed. An existing one is
+/// left alone even with no backend stored: it has been rendering
+/// nftables all along, and an upgrade must not switch the file its boot
+/// unit loads. Returns what it stored, if anything.
+pub fn seed_backend(db: &Db, installed: Installed) -> Result<Option<FirewallBackend>> {
+    if db.get_text_setting(BACKEND_KEY)?.is_some()
+        || db.get_firewall_rendered_signature()?.is_some()
+        || db.get_firewall_applied_signature()?.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(backend) = installed.preferred() else {
+        return Ok(None);
+    };
+    store_backend(db, backend)?;
+    Ok(Some(backend))
+}
+
 /// Every synthetic (never persisted) `FirewallRule` derived from
 /// currently-blocked-by-default crawler IP-range sources and the current
 /// geo mode's selected countries — see [`Db::derived_firewall_entries`].
@@ -765,6 +899,7 @@ fn unsafe_script_directory(uid: u32, gid: u32, mode: u32, euid: u32, egid: u32) 
 /// console and a cron `batch` never run two scripts over the same table at
 /// once; a second one waits briefly, then says another is applying.
 pub fn apply_script(backend: FirewallBackend, out_path: &Path) -> Result<()> {
+    Installed::detect().check(backend)?;
     let _lock = crate::applylock::hold()?;
     let (program, args, what): (_, &[&str], _) = match backend {
         FirewallBackend::Iptables => (
@@ -1421,6 +1556,114 @@ fn sandbox_hint(stderr: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory holding a fake executable for each of `programs`, to
+    /// search as `PATH`.
+    fn fake_path(programs: &[&str]) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for program in programs {
+            let path = dir.path().join(program);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        dir
+    }
+
+    fn installed_with(programs: &[&str]) -> Installed {
+        let dir = fake_path(programs);
+        Installed::detect_in(Some(dir.path().as_os_str()), &[])
+    }
+
+    /// What is on `PATH` decides, and nftables wins a tie.
+    #[test]
+    fn the_preferred_backend_is_the_one_installed_nftables_first() {
+        for (programs, expected) in [
+            (
+                &["nft", "iptables-restore"][..],
+                Some(FirewallBackend::Nftables),
+            ),
+            (&["nft"][..], Some(FirewallBackend::Nftables)),
+            (&["iptables-restore"][..], Some(FirewallBackend::Iptables)),
+            (&[][..], None),
+        ] {
+            assert_eq!(
+                installed_with(programs).preferred(),
+                expected,
+                "with {programs:?} on PATH"
+            );
+        }
+    }
+
+    /// The refusal names the missing program, the package, and the other
+    /// backend only when that one is here to switch to.
+    #[test]
+    fn applying_with_a_missing_backend_is_refused_by_name() {
+        let only_iptables = installed_with(&["iptables-restore"]);
+
+        assert!(only_iptables.check(FirewallBackend::Iptables).is_ok());
+        let err = only_iptables
+            .check(FirewallBackend::Nftables)
+            .unwrap_err()
+            .to_string();
+        for needle in [
+            "nft is not installed",
+            "`nftables` package",
+            "set-firewall-backend iptables",
+        ] {
+            assert!(err.contains(needle), "no {needle:?} in: {err}");
+        }
+
+        let neither = installed_with(&[])
+            .check(FirewallBackend::Iptables)
+            .unwrap_err();
+        assert!(
+            !neither.to_string().contains("set-firewall-backend"),
+            "offered a backend that is not here either: {neither}"
+        );
+    }
+
+    #[test]
+    fn a_backend_that_is_not_installed_is_offered_as_such() {
+        let only_nft = installed_with(&["nft"]);
+
+        assert_eq!(only_nft.describe(FirewallBackend::Nftables), "nftables");
+        assert_eq!(
+            only_nft.describe(FirewallBackend::Iptables),
+            "iptables (not installed)"
+        );
+    }
+
+    /// A new database gets whichever backend this host has.
+    #[test]
+    fn a_new_database_renders_for_the_backend_that_is_installed() {
+        let db = Db::open_in_memory().unwrap();
+
+        let seeded = seed_backend(&db, installed_with(&["iptables-restore"])).unwrap();
+
+        assert_eq!(seeded, Some(FirewallBackend::Iptables));
+        assert_eq!(stored_backend(&db).unwrap(), FirewallBackend::Iptables);
+    }
+
+    /// A choice already made is kept, and so is the backend of a database
+    /// that has written a script with nothing stored: 0.0.x rendered
+    /// nftables by default, and an upgrade must not move the file its boot
+    /// unit loads.
+    #[test]
+    fn a_database_that_has_chosen_or_rendered_keeps_its_backend() {
+        let chosen = Db::open_in_memory().unwrap();
+        store_backend(&chosen, FirewallBackend::Nftables).unwrap();
+        let rendered = Db::open_in_memory().unwrap();
+        rendered.set_firewall_rendered_signature("x").unwrap();
+
+        for db in [chosen, rendered] {
+            assert_eq!(
+                seed_backend(&db, installed_with(&["iptables-restore"])).unwrap(),
+                None
+            );
+            assert_eq!(stored_backend(&db).unwrap(), FirewallBackend::Nftables);
+        }
+    }
 
     fn rule(address: &str, action: FirewallAction) -> FirewallRule {
         FirewallRule {

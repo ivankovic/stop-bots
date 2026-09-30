@@ -151,6 +151,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   next key press. It used to reach only the Dashboard.
 - One spelling for relative times ("5m ago"), category names ("Search bots",
   "AI bots") and the health strip's labels, in the CLI, the TUI and the console.
+- **Only an installed firewall backend is applied.** The TUI's render popup and
+  the console's backend list mark one whose `nft` or `iptables-restore` is
+  missing "not installed", and applying with it is refused, naming the package.
+- A new database renders for the backend this host has, preferring nftables. One
+  that has chosen, or has written a script, keeps its backend.
 
 ### Fixed
 

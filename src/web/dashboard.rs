@@ -71,6 +71,8 @@ struct View {
     /// The remembered backend, so the dropdown opens on the one this host
     /// actually renders for.
     firewall_backend: FirewallBackend,
+    /// Which backends this host can load a script with.
+    installed: crate::firewall::Installed,
     /// Sites the console could be mounted under, for Path mode's dropdown.
     /// Empty means "no sites scanned yet", which the panel has to say
     /// rather than render an empty select.
@@ -150,6 +152,7 @@ fn load(
             .to_string(),
         firewall_out: applied.display().to_string(),
         firewall_backend: crate::firewall::stored_backend(db)?,
+        installed: crate::firewall::Installed::detect(),
         sites: db
             .list_sites()?
             .into_iter()
@@ -712,7 +715,7 @@ fn firewall_panel(view: &View, ctx: &Ctx) -> Markup {
                             @for backend in [FirewallBackend::Nftables, FirewallBackend::Iptables] {
                                 option value=(backend.stored())
                                     selected[backend == view.firewall_backend] {
-                                    (backend.stored())
+                                    (view.installed.describe(backend))
                                 }
                             }
                         }

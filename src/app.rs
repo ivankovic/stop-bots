@@ -352,6 +352,7 @@ impl App {
         // repeat every startup — registration never touches an existing
         // row's `enabled` flag.
         crate::ipranges::reputation::register_all_reputation_sources(&app.db)?;
+        app.dashboard.installed = Some(crate::firewall::Installed::detect());
         app.refresh_all()?;
         Ok(app)
     }

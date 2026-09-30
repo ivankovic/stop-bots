@@ -68,6 +68,19 @@ pub fn program(name: &str) -> PathBuf {
     find_program(name, std::env::var_os("PATH").as_deref(), &SBIN_DIRS)
 }
 
+/// Whether the system program `name` is on this host: an executable
+/// `name` on `PATH` or in [`SBIN_DIRS`], found the way [`program`] would
+/// find it to run it.
+pub fn is_installed(name: &str) -> bool {
+    is_installed_in(name, std::env::var_os("PATH").as_deref(), &SBIN_DIRS)
+}
+
+/// [`is_installed`], with the search path given.
+pub fn is_installed_in(name: &str, path: Option<&OsStr>, fallbacks: &[&str]) -> bool {
+    // The bare name is what comes back when nothing was found.
+    find_program(name, path, fallbacks) != Path::new(name)
+}
+
 /// `PATH` for a child that itself runs system programs by name — the
 /// iptables script, whose every line is `iptables ...` — with whichever
 /// of [`SBIN_DIRS`] it lacks appended.
@@ -153,6 +166,22 @@ mod tests {
         let sbin_dir = sbin.path().to_str().unwrap();
 
         assert_eq!(find_program("nft", None, &[sbin_dir]), PathBuf::from("nft"));
+    }
+
+    /// Installed means found and executable, on `PATH` or in a fallback.
+    #[test]
+    fn a_program_is_installed_only_where_it_can_be_run() {
+        let path_dir = tempfile::tempdir().unwrap();
+        executable(path_dir.path(), "nft");
+        std::fs::write(path_dir.path().join("iptables-restore"), "").unwrap();
+        let path = Some(path_dir.path().as_os_str());
+
+        assert!(is_installed_in("nft", path, &[]));
+        assert!(
+            !is_installed_in("iptables-restore", path, &[]),
+            "not executable"
+        );
+        assert!(!is_installed_in("no-such-tool", path, &[]));
     }
 
     /// Found nowhere: the bare name, so spawning it fails exactly as it

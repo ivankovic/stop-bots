@@ -11,9 +11,6 @@ list — which meant the open items below were unfindable inside it.
   `~*` regex. The `BLOCKLIST` tag can therefore disagree with what actually gets
   blocked — and since the web UI arrived it says so on two screens rather than
   one, because both front-ends now read this from `crate::dynamic`.
-* **Recommend only the backend that is installed.** Nothing checks whether
-  `nft` or `iptables` exists before offering both. `health` now reports which
-  backend's live state it read, so the information is to hand.
 * **"Update everything" and the internal cron can fetch the same feeds at
   once.** `Job::UpdateEverything` and `Job::Cron(UpdateIpRanges)` are separate
   entries in `jobs_in_flight`, and `check_cron` keeps ticking while `u` runs —

@@ -1913,6 +1913,7 @@ async fn run_tui(
 ) -> Result<()> {
     let defaulted = db_path.is_none();
     let db = open_db(db_path)?;
+    stop_bots::firewall::seed_backend(&db, stop_bots::firewall::Installed::detect())?;
     let root = nginx::root(&db, root.as_deref())?;
     let notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
     let mut app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
@@ -3760,6 +3761,7 @@ async fn run_web(
     deprecated.warn();
     let defaulted = db_path.is_none();
     let db = open_db(db_path)?;
+    stop_bots::firewall::seed_backend(&db, stop_bots::firewall::Installed::detect())?;
     let root = nginx::root(&db, root.as_deref())?;
     let db_notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
 
@@ -4032,7 +4034,11 @@ fn firewall_target(
 ) -> Result<(stop_bots::firewall::FirewallBackend, PathBuf)> {
     let backend = match backend {
         Some(backend) => backend.into(),
-        None => stop_bots::firewall::stored_backend(db)?,
+        None => {
+            // A database that has never chosen: whichever this host has.
+            stop_bots::firewall::seed_backend(db, stop_bots::firewall::Installed::detect())?;
+            stop_bots::firewall::stored_backend(db)?
+        }
     };
     let out = out.unwrap_or_else(|| stop_bots::firewall::default_output_path(backend));
     Ok((backend, out))

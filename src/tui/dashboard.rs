@@ -235,7 +235,7 @@ enum Popup {
         row: ProtectionRow,
         selected: usize,
     },
-    /// Firewall rendering: select backend (0 = iptables, 1 = nftables),
+    /// Firewall rendering: select backend (0 = nftables, 1 = iptables),
     /// enter the output path, and optionally toggle `apply_after_write`
     /// (Space) so confirming with Enter also actually enforces the script
     /// (`firewall::apply_script`, gated by `App::apply_firewall`) instead of
@@ -265,6 +265,9 @@ enum Popup {
 
 #[derive(Debug, Default)]
 pub struct Dashboard {
+    /// Which firewall backends this host has, as `App` found at start-up;
+    /// `None` when nobody looked, which marks and refuses nothing.
+    pub installed: Option<crate::firewall::Installed>,
     site_count: usize,
     sources: Vec<Source>,
     scanner_default: Policy,
@@ -985,6 +988,12 @@ impl Dashboard {
                         })
                         .reversed(),
                         Span::from(" ]"),
+                        match self.installed {
+                            Some(installed) if !installed.has(popup_backend(backend_selected)) => {
+                                Span::from(" not installed").red()
+                            }
+                            _ => Span::from(""),
+                        },
                     ]),
                     Line::from(""),
                     Line::from(format!("Output: {}_", out_path)),
@@ -1733,17 +1742,25 @@ impl Dashboard {
                 else {
                     unreachable!("checked above")
                 };
-                let backend = match backend_selected {
-                    0 => crate::firewall::FirewallBackend::Nftables,
-                    _ => crate::firewall::FirewallBackend::Iptables,
-                };
+                let backend = popup_backend(backend_selected);
                 // Validate the path is not empty
-                if out_path.is_empty() {
+                let refusal = if out_path.is_empty() {
+                    Some("Enter an output path".to_string())
+                } else if apply_after_write {
+                    // Refused here, with the popup still open, rather than
+                    // by the apply after the script has been written.
+                    self.installed
+                        .and_then(|installed| installed.check(backend).err())
+                        .map(|err| format!("{err}. Untick \u{201c}apply after writing\u{201d} to only write it."))
+                } else {
+                    None
+                };
+                if let Some(error) = refusal {
                     self.popup = Some(Popup::RenderFirewall {
                         backend_selected,
                         out_path,
                         apply_after_write,
-                        error: Some("Enter an output path".to_string()),
+                        error: Some(error),
                     });
                     return Ok(KeyOutcome::Consumed);
                 }
@@ -1980,6 +1997,14 @@ fn protection_options(is_detector: bool) -> Vec<String> {
             }
         }))
         .collect()
+}
+
+/// The backend the render popup's row `selected` stands for.
+fn popup_backend(selected: usize) -> crate::firewall::FirewallBackend {
+    match selected {
+        0 => crate::firewall::FirewallBackend::Nftables,
+        _ => crate::firewall::FirewallBackend::Iptables,
+    }
 }
 
 fn policy_tag(policy: Policy) -> Span<'static> {
@@ -3384,6 +3409,84 @@ mod tests {
             other => panic!("expected a RenderFirewall outcome, got {other:?}"),
         }
         assert!(dashboard.popup.is_none());
+    }
+
+    /// On a host without `nft`, "apply after writing" with nftables is
+    /// refused while the popup is still open, and says what is missing —
+    /// rather than writing the script and then failing to spawn `nft`.
+    #[test]
+    fn applying_with_a_backend_that_is_not_installed_is_refused_in_the_popup() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.installed = Some(crate::firewall::Installed {
+            nftables: false,
+            iptables: true,
+        });
+        let popup = |apply_after_write| Popup::RenderFirewall {
+            backend_selected: 0,
+            out_path: "/tmp/fw.nft".to_string(),
+            apply_after_write,
+            error: None,
+        };
+
+        dashboard.popup = Some(popup(true));
+        let mut message = None;
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        match &dashboard.popup {
+            Some(Popup::RenderFirewall {
+                error: Some(error), ..
+            }) => assert!(error.contains("nft is not installed"), "error: {error}"),
+            other => panic!("the popup should stay open with an error, got {other:?}"),
+        }
+
+        // Only writing it is still fine: the script may be for another host.
+        dashboard.popup = Some(popup(false));
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert!(
+            matches!(outcome, KeyOutcome::RenderFirewall { apply: false, .. }),
+            "got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn the_render_popup_marks_a_backend_that_is_not_installed() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.installed = Some(crate::firewall::Installed {
+            nftables: false,
+            iptables: true,
+        });
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Char('F')), &db, &mut None)
+            .unwrap();
+
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &[],
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+
+        assert!(content.contains("not installed"), "content was:\n{content}");
     }
 
     #[test]
