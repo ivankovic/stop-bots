@@ -259,6 +259,15 @@ make integration-test
 CI runs it as its own job. Run it before a release, and before trusting any change to
 generated config.
 
+**Flakes are retried, and counted.** The suite races a real systemd, NGINX and SQLite,
+so `.config/nextest.toml` gives this binary, and only this one, two retries. CI runs it
+with `cargo nextest run --test container`: a test that passes on a retry is reported
+`FLAKY` in the log and the summary, and becomes a warning annotation on the run, so a
+test that keeps needing its retries shows up there rather than as a red job nobody can
+reproduce. Three failures in a row still fail. `make integration-test` uses plain
+`cargo test` for its streamed output and does not retry; `STOP_BOTS_CONTAINER_TESTS=1
+cargo nextest run --test container` locally behaves as CI does.
+
 ## CLI conventions
 
 The command line is part of the contract from 0.1 on, so these are decided once. The

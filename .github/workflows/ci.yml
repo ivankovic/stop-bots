@@ -89,6 +89,14 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # nextest rather than `cargo test`, for the retries in
+      # .config/nextest.toml: this suite races real services, and a test
+      # that passes on its second try is reported FLAKY instead of turning
+      # the job red. Each flake becomes a warning annotation below, so it
+      # is counted rather than lost.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       # The failure output is echoed back as workflow *annotations*, not
       # just left in the log. Job logs need admin on this repository,
       # while annotations are readable by anyone who can see the run — so
@@ -101,18 +109,33 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          if STOP_BOTS_CONTAINER_TESTS=1 cargo test --test container 2>&1 | tee /tmp/container.log; then
+          status=0
+          STOP_BOTS_CONTAINER_TESTS=1 cargo nextest run --test container \
+            --no-fail-fast --color never 2>&1 | tee /tmp/container.log || status=$?
+          # Only the summary nextest prints at the end: above it, every
+          # try of every test is reported as it happens.
+          sed -n '/^ *Summary \[/,$p' /tmp/container.log > /tmp/summary.log
+          # A test that failed and then passed on a retry, reported as
+          # `FLAKY 2/3 [...] stop-bots::container <name>`. Not a failure,
+          # but not nothing either: one warning each, with the test's name.
+          grep -E '^ +FLAKY ' /tmp/summary.log | while IFS= read -r line; do
+            echo "::warning::flaky test: ${line##* }"
+          done
+          if [ "$status" -eq 0 ]; then
             exit 0
           fi
           echo "::error::container suite failed"
           # GitHub keeps only the first handful of error annotations per
           # step, so this spends them on the two things worth having: the
-          # names of the tests that failed, then the panic text of the
-          # first one.
-          grep -E '^    [a-z_0-9]+$' /tmp/container.log | head -5 | while IFS= read -r line; do
-            echo "::error::failed test:${line}"
-          done
-          grep -A 8 '^---- ' /tmp/container.log | head -12 | while IFS= read -r line; do
+          # names of the tests that failed on every try, then the panic
+          # text of the first one.
+          # With retries the last try is `TRY 3 FAIL` (or `TMT`, timed
+          # out); without, a plain `FAIL`.
+          grep -E '^ +(TRY [0-9]+ )?(FAIL|TMT|TIMEOUT) \[' /tmp/summary.log | sed 's/.* //' \
+            | sort -u | head -5 | while IFS= read -r line; do
+              echo "::error::failed test: ${line}"
+            done
+          grep -A 8 'panicked at' /tmp/container.log | head -12 | while IFS= read -r line; do
             [ -n "$line" ] && echo "::error::${line}"
           done
           exit 1

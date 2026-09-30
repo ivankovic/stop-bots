@@ -156,7 +156,94 @@ fn host_image() -> String {
 /// showed up: four tests failing together, each passing alone.
 fn build_image() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(build_image_now);
+    ONCE.call_once(|| with_build_lock(|| build_unless_current(&image(), build_image_now)));
+}
+
+/// Builds `image` with `build` unless this run already built it from the
+/// same binary and Dockerfiles, which a marker in the target directory
+/// records.
+///
+/// Under nextest every test process gets here, one after another through
+/// [`with_build_lock`]. Rebuilding each time is all cache hits, but on a
+/// loaded machine a cached rebuild still costs seconds, and fifty-eight of
+/// them in a row spent the first tests' whole time budget waiting for the
+/// lock. The marker's key is the binary's and the build context's sizes
+/// and mtimes, so a rebuilt binary is never tested through a stale image,
+/// and the image has to still exist.
+fn build_unless_current(image: &str, build: fn()) {
+    let marker = format!(
+        "{}/container-image-{}.built",
+        env!("CARGO_TARGET_TMPDIR"),
+        image.replace([':', '/'], "_")
+    );
+    let key = build_key();
+    let exists = Command::new(runtime())
+        .args(["image", "inspect", image])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if exists && std::fs::read_to_string(&marker).ok().as_deref() == Some(key.as_str()) {
+        return;
+    }
+    build();
+    std::fs::write(&marker, key).expect("failed to record the image build");
+}
+
+/// What an image is built from, as sizes and mtimes: the binary under test
+/// and everything in the build context but the staged copy of it.
+fn build_key() -> String {
+    let stamp = |path: &std::path::Path| {
+        let meta = std::fs::metadata(path).expect("a build input is missing");
+        format!(
+            "{} {} {:?}\n",
+            path.display(),
+            meta.len(),
+            meta.modified().ok()
+        )
+    };
+    let mut key = stamp(std::path::Path::new(env!("CARGO_BIN_EXE_stop-bots")));
+    let ctx = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/container");
+    let mut inputs: Vec<_> = std::fs::read_dir(&ctx)
+        .expect("the build context is missing")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.file_name().is_some_and(|name| name != "stop-bots"))
+        .collect();
+    inputs.sort();
+    for path in inputs {
+        key.push_str(&stamp(&path));
+    }
+    key
+}
+
+/// Runs `f` holding an exclusive `flock` shared by every process of this
+/// checkout's test run.
+///
+/// The `Once`s here guard threads, and `cargo test` runs every test as a
+/// thread of one process. `cargo nextest` — which CI uses for this suite,
+/// for its retries — runs each test as a process of its own, where a
+/// `Once` guards nothing: every test would stage the binary and build the
+/// images at once, and one process's copy would truncate the binary under
+/// another's build. That is the race `stage_binary` describes, back through
+/// a door the `Once`s cannot close. Staging and building under this lock
+/// closes it for both runners. A rebuild after the first is all cache hits,
+/// so the cost is a second or so per test process.
+///
+/// In the target directory, so two checkouts (which already build under
+/// different `STOP_BOTS_CONTAINER_SUFFIX`es) do not wait for each other.
+fn with_build_lock<T>(f: impl FnOnce() -> T) -> T {
+    use std::os::fd::AsRawFd;
+    let path = concat!(env!("CARGO_TARGET_TMPDIR"), "/container-build.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .expect("failed to open the image build lock");
+    // SAFETY: a valid descriptor, owned by `file` until it drops below.
+    let locked = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(locked, 0, "failed to lock {path}");
+    let result = f();
+    drop(file);
+    result
 }
 
 /// The same, for the systemd image. A separate `Once` so a run that only
@@ -164,26 +251,30 @@ fn build_image() {
 fn build_host_image() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let ctx = stage_binary();
-        let out = Command::new(runtime())
-            .args([
-                "build",
-                "-q",
-                "-f",
-                &format!("{ctx}/Dockerfile.host"),
-                "-t",
-                &host_image(),
-                &ctx,
-            ])
-            .output()
-            .expect("failed to run the image build");
-        assert!(
-            out.status.success(),
-            "{} build (host image) failed:\n{}",
-            runtime(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        with_build_lock(|| build_unless_current(&host_image(), build_host_image_now))
     });
+}
+
+fn build_host_image_now() {
+    let ctx = stage_binary();
+    let out = Command::new(runtime())
+        .args([
+            "build",
+            "-q",
+            "-f",
+            &format!("{ctx}/Dockerfile.host"),
+            "-t",
+            &host_image(),
+            &ctx,
+        ])
+        .output()
+        .expect("failed to run the image build");
+    assert!(
+        out.status.success(),
+        "{} build (host image) failed:\n{}",
+        runtime(),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Copies the binary under test into the build context and returns the
@@ -296,18 +387,46 @@ impl Network {
         ipv6_subnet_for: Option<fn(usize) -> String>,
     ) -> Network {
         let name = &scoped(name);
-        let _ = Command::new(runtime())
-            .args(["network", "rm", name])
+        // A test killed at its time limit never ran its `Drop`s, so its
+        // containers are still attached and `network rm` refuses. Under
+        // nextest's retries the next try is exactly that case: it then
+        // failed with "network already exists" on every slice below.
+        // Podman's `-f` removes the attached containers too. Docker's only
+        // ignores a missing network, so there the leftovers are found and
+        // removed, but only when the plain removal was refused: listing
+        // containers by network is slow with many on the host.
+        let removed = Command::new(runtime())
+            .args(["network", "rm", "-f", name])
             .output();
+        let refused = removed
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stderr).contains("active endpoints"));
+        if refused {
+            if let Ok(out) = Command::new(runtime())
+                .args(["ps", "-aq", "--filter", &format!("network={name}")])
+                .output()
+            {
+                for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                    let _ = Command::new(runtime()).args(["rm", "-f", id]).output();
+                }
+            }
+            let _ = Command::new(runtime())
+                .args(["network", "rm", name])
+                .output();
+        }
 
         // Retry across slices rather than pick one and hope: a network
         // left behind by an aborted run still holds its pool, and the
         // failure ("Pool overlaps with other one on this address space")
         // names neither which network nor which test.
+        //
+        // Offset by the process id, because under nextest every test is a
+        // process of its own with its own `NEXT` starting at zero, and
+        // they would all try the same slice first.
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let mut last = String::new();
         for _ in 0..16 {
-            let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + std::process::id() as usize;
             let mut args = vec![
                 "network".to_string(),
                 "create".to_string(),

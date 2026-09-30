@@ -16,6 +16,22 @@ slow-timeout = { period = "1s", terminate-after = 15 }
 # returns at once without it), not excluded here — so when it *is* on,
 # each test boots a real container or a real systemd and needs a budget
 # to match, not the 300ms default that would kill all of them at 3s.
+#
+# Two retries, for this binary only. It races a real systemd, a real NGINX
+# and a real SQLite inside containers on a shared runner, and a test that
+# lost one of those races once is not a bug in the generated output. A test
+# that fails and then passes is reported FLAKY rather than hidden, in the
+# run's output and in the summary, and CI turns each one into a warning
+# annotation, so a flake is counted rather than forgotten. Three failures
+# in a row still fail the run. The unit and end-to-end binaries get no
+# retries: nothing in them races anything, so a flake there is a bug.
+#
+# Killed after ten minutes, not five. Nothing ran this binary under
+# nextest until the retries, so the old five was never tried; on a loaded
+# machine two tests that make dozens of requests (every block response,
+# every request-shape rule) took over five minutes on every try while
+# passing under `cargo test`, and a killed test should mean a hung one.
 [[profile.default.overrides]]
 filter = "binary(container)"
-slow-timeout = { period = "60s", terminate-after = 5 }
+slow-timeout = { period = "60s", terminate-after = 10 }
+retries = 2
