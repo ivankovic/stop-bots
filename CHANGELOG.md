@@ -175,7 +175,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - `render-firewall --out` no longer suggests running the file by hand, which would
   not survive a reboot; it points at `render-firewall --apply`.
 - The web Firewall page: a `BLOCKED` tag naming its detector no longer spills over
-  the address beside it. It is cut off at its column, with the whole tag as a tooltip.
+  the address beside it. The tag says `BLOCKED`, with the time left and the detector
+  on a line under it.
+- Time left on a block is rounded to the nearest day or hour. A five-day block read
+  "4d" a minute after it was made.
 
 - Messages that named the wrong key: "render the firewall (f)" (the key is `F`,
   and `a` applies) and "press s, then r" (NGINX is `n`).

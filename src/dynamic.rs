@@ -504,21 +504,27 @@ pub fn attempts_evidence(count: u64) -> String {
 }
 
 /// Formats a future Unix timestamp `expires_at` as a short "Nd"/"Nh"
-/// relative string for a `RowStatus::Blocked`'s "until" text — same
-/// rounding convention as `main.rs::format_expiry` (that one isn't
-/// reachable from the library crate, hence this small local twin).
+/// duration for a `RowStatus::Blocked`'s "for" text, the Blocks screens
+/// and `list-firewall-rules`.
+///
+/// Rounded to the *nearest* whole day (from 23½ hours up) or hour, never
+/// below one hour. It used to round down, which made a five-day block
+/// read "4d" a minute after it was made — beside a Dashboard that said
+/// the TTL was five days.
 pub fn format_until(expires_at: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let seconds_left = (expires_at - now).max(0);
-    let days = seconds_left / 86_400;
-    if days > 0 {
-        format!("{days}d")
+    format_duration_left(expires_at - now)
+}
+
+fn format_duration_left(seconds_left: i64) -> String {
+    let seconds_left = seconds_left.max(0);
+    if seconds_left >= 23 * 3_600 + 1_800 {
+        format!("{}d", ((seconds_left + 43_200) / 86_400).max(1))
     } else {
-        let hours = (seconds_left / 3_600).max(1);
-        format!("{hours}h")
+        format!("{}h", ((seconds_left + 1_800) / 3_600).max(1))
     }
 }
 
@@ -590,6 +596,22 @@ impl Live {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn time_left_rounds_to_the_nearest_day_or_hour() {
+        let table = [
+            ("a five-day block a minute old", 5 * 86_400 - 60, "5d"),
+            ("just over three days", 3 * 86_400 + 100, "3d"),
+            ("three and a half days", 3 * 86_400 + 43_200, "4d"),
+            ("23h40m reads as a day", 23 * 3_600 + 2_400, "1d"),
+            ("five hours", 5 * 3_600, "5h"),
+            ("an imminent expiry", 30, "1h"),
+            ("already past", -10, "1h"),
+        ];
+        for (what, seconds, expected) in table {
+            assert_eq!(format_duration_left(seconds), expected, "{what}");
+        }
+    }
 
     #[test]
     fn a_typed_entry_is_an_address_only_if_it_is_spelled_like_one() {

@@ -58,28 +58,28 @@
 <text x="20.4" y="187.5" fill="#c8d0da" textLength="226.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">▎198.51.100.230            </text>
 <text x="247.2" y="187.5" fill="#e05561" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">block  </text>
 <text x="306.0" y="187.5" fill="#c8d0da" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">Injection attempts    </text>
-<text x="490.8" y="187.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">  1m ago  for 6d    </text>
+<text x="490.8" y="187.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">  1m ago  for 7d    </text>
 <text x="658.8" y="187.5" fill="#c8d0da" textLength="252.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve" font-weight="bold">198.51.100.230 - - [10/Sep/202</text>
 <text x="910.8" y="187.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="20.4" y="205.5" fill="#c8d0da" textLength="226.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 203.0.113.9               </text>
 <text x="247.2" y="205.5" fill="#e05561" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">block  </text>
 <text x="306.0" y="205.5" fill="#c8d0da" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Probe paths           </text>
-<text x="490.8" y="205.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  1m ago  for 4d    </text>
+<text x="490.8" y="205.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  1m ago  for 5d    </text>
 <text x="658.8" y="205.5" fill="#c8d0da" textLength="252.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">203.0.113.9 - - [10/Sep/2025:0</text>
 <text x="910.8" y="205.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="20.4" y="223.5" fill="#c8d0da" textLength="226.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 198.51.100.17             </text>
 <text x="247.2" y="223.5" fill="#e05561" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">block  </text>
 <text x="306.0" y="223.5" fill="#c8d0da" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">SSH scanners          </text>
-<text x="490.8" y="223.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  1m ago  for 4d    </text>
+<text x="490.8" y="223.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  1m ago  for 5d    </text>
 <text x="658.8" y="223.5" fill="#c8d0da" textLength="252.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Sep 10 04:12:33 host sshd[2211</text>
 <text x="910.8" y="223.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="20.4" y="241.5" fill="#c8d0da" textLength="226.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> 192.0.2.44                </text>
 <text x="247.2" y="241.5" fill="#e05561" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">block  </text>
 <text x="306.0" y="241.5" fill="#c8d0da" textLength="184.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">SSH scanners          </text>
-<text x="490.8" y="241.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  1m ago  for 4d    </text>
+<text x="490.8" y="241.5" fill="#6b7c8c" textLength="168.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">  1m ago  for 5d    </text>
 <text x="658.8" y="241.5" fill="#c8d0da" textLength="252.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Sep 10 04:11:07 host sshd[2203</text>
 <text x="910.8" y="241.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">│</text>
 <text x="12.0" y="259.5" fill="#2ee6d6" textLength="907.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">└──────────────────────────────────────────────────────────────────────────────────────────────────────────┘</text>

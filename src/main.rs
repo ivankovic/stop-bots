@@ -2271,21 +2271,14 @@ fn rule_line(rule: &FirewallRule, now: i64) -> String {
     )
 }
 
-/// Renders a firewall rule's `expires_at` (Unix seconds, already known to
-/// be in the future — anything at or past `now` would have been pruned
-/// before `list_firewall_rules` returned it) as a short "expires in ..."
-/// string for `list-firewall-rules`. Rounds down to whole days once at
-/// least one has passed, otherwise whole hours — precision the admin
-/// scanning a rule list actually needs, not a countdown clock.
+/// Renders a firewall rule's `expires_at` as "expires in 5d" for
+/// `list-firewall-rules`, rounded the same way as every other screen that
+/// shows time left ([`stop_bots::dynamic::format_until`]).
 fn format_expiry(expires_at: i64) -> String {
-    let seconds_left = (expires_at - now_secs()).max(0);
-    let days = seconds_left / 86_400;
-    if days > 0 {
-        format!("expires in {days}d")
-    } else {
-        let hours = (seconds_left / 3_600).max(1);
-        format!("expires in {hours}h")
-    }
+    format!(
+        "expires in {}",
+        stop_bots::dynamic::format_until(expires_at)
+    )
 }
 
 fn now_secs() -> i64 {
@@ -4997,7 +4990,7 @@ mod tests {
     }
 
     #[test]
-    fn format_expiry_rounds_to_whole_days_once_at_least_one_has_passed() {
+    fn format_expiry_rounds_to_the_nearest_whole_day() {
         let expires_at = now_secs() + 3 * 86_400 + 100;
         assert_eq!(format_expiry(expires_at), "expires in 3d");
     }
