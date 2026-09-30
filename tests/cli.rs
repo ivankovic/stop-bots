@@ -4117,3 +4117,71 @@ fn a_database_from_a_newer_release_is_refused() {
             ))),
         );
 }
+
+/// The CLI answer to "why is this blocked, and undo all of it": a
+/// detector's block names the detector and the request, can be listed and
+/// removed by source, and stays removed when the detector runs again over
+/// the same log.
+#[test]
+fn a_detector_s_blocks_are_listed_and_removed_by_source_and_stay_removed() {
+    let fx = Fixture::new();
+    let log = fx.db.with_file_name("access.log");
+    fs::write(
+        &log,
+        "203.0.113.5 - - [28/Sep/2026:10:00:00 +0000] \"GET /.env HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n\
+         203.0.113.6 - - [28/Sep/2026:10:00:01 +0000] \"GET /.git/config HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n",
+    )
+    .unwrap();
+    let log = log.to_str().unwrap();
+    fx.run(&["block-probe-paths", "--access-log", log]);
+    fx.run(&["add-firewall-rule", "--address", "192.0.2.1"]);
+
+    fx.run(&["list-firewall-rules", "--source", "probe-paths"])
+        .stdout(predicate::str::contains(
+            "[probe-paths, added 1m ago]: \"GET /.env HTTP/1.1\" 404",
+        ))
+        .stdout(predicate::str::contains("192.0.2.1").not());
+
+    fx.run(&[
+        "remove-firewall-rule",
+        "--source",
+        "probe-paths",
+        "--dry-run",
+    ])
+    .stdout(predicate::str::contains("Would remove 2 firewall rule(s)"));
+    fx.run(&["remove-firewall-rule", "--source", "probe-paths"])
+        .stdout(predicate::str::contains(
+            "Removed 2 firewall rule(s) from probe-paths.",
+        ));
+
+    fx.run(&["block-probe-paths", "--access-log", log])
+        .stdout(predicate::str::contains("Left 2 alone: unblocked by hand"));
+    fx.run(&["list-firewall-rules"])
+        .stdout(predicate::str::contains("#3 Block 192.0.2.1 [cli"))
+        .stdout(predicate::str::contains("203.0.113").not());
+}
+
+/// A 0.0.x rule has no source, and says so rather than guessing one.
+#[test]
+fn a_rule_from_before_0_1_is_listed_and_removed_as_before_0_1() {
+    let fx = Fixture::new();
+    let conn = rusqlite::Connection::open(&fx.db).unwrap();
+    conn.execute_batch(include_str!("fixtures/db/db-0.0.15.sql"))
+        .unwrap();
+    drop(conn);
+
+    fx.run(&["list-firewall-rules", "--source", "before-0.1"])
+        .stdout(predicate::str::contains("#1 Block 203.0.113.7 [before-0.1"));
+    fx.run(&["remove-firewall-rule", "--source", "before-0.1"])
+        .stdout(predicate::str::contains("Removed 5 firewall rule(s)"));
+}
+
+#[test]
+fn remove_firewall_rule_needs_an_id_or_a_source_and_names_the_sources() {
+    let fx = Fixture::new();
+    fx.cmd(&["remove-firewall-rule"]).assert().failure();
+    fx.cmd(&["remove-firewall-rule", "--source", "nope"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ssh-scanners"));
+}

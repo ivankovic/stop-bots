@@ -32,6 +32,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   (the detector, or `cli`/`tui`/`web`) and the log line that triggered it,
   cleaned of control characters and capped at 300 bytes. Older rules read
   "before 0.1".
+- `list-firewall-rules` shows each rule's source, age, expiry and evidence,
+  newest first, and takes `--source`. `remove-firewall-rule --source <name>`
+  removes every rule from one source and prints the count; `--dry-run` only counts.
 - **Unblocking a detector's block sticks.** The detectors leave that address
   alone for as long as the block was meant to last, however long the log keeps
   the lines that earned it.
