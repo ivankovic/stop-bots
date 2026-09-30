@@ -270,6 +270,21 @@ pub fn allowed_host(host: &str, configured: &[String]) -> bool {
     configured.iter().any(|h| h.eq_ignore_ascii_case(name))
 }
 
+/// Whether this console is set up to be reached through a proxy: it has a
+/// path prefix, or it answers to a host name that is not loopback. Either
+/// is only there for a proxy's sake — both are what the Web Access panel
+/// records — and behind one, every request arrives from the proxy's
+/// address unless `web:trust_forwarded_for` says to believe its header.
+pub fn is_proxied(db: &crate::db::Db) -> Result<bool> {
+    let prefixed = db
+        .get_text_setting(BASE_PATH_KEY)?
+        .is_some_and(|raw| !raw.trim().trim_matches('/').is_empty());
+    let named = configured_hosts(db)?
+        .iter()
+        .any(|host| !allowed_host(host, &[]));
+    Ok(prefixed || named)
+}
+
 /// The `Host` values configured beyond the loopback ones.
 pub fn configured_hosts(db: &crate::db::Db) -> Result<Vec<String>> {
     Ok(db
@@ -519,6 +534,24 @@ mod tests {
         // truncated into one that happens to be allowed.
         let configured = vec!["admin.example.com".to_string()];
         assert!(!allowed_host("admin.example.com:evil", &configured));
+    }
+
+    #[test]
+    fn a_console_with_a_prefix_or_a_public_name_is_proxied() {
+        let db = Db::open_in_memory().unwrap();
+        assert!(!is_proxied(&db).unwrap(), "a fresh install");
+
+        db.set_text_setting(ALLOWED_HOSTS_KEY, "localhost, 127.0.0.1")
+            .unwrap();
+        assert!(!is_proxied(&db).unwrap(), "loopback names are not a proxy");
+
+        db.set_text_setting(ALLOWED_HOSTS_KEY, "admin.example.com")
+            .unwrap();
+        assert!(is_proxied(&db).unwrap());
+
+        db.set_text_setting(ALLOWED_HOSTS_KEY, "").unwrap();
+        db.set_text_setting(BASE_PATH_KEY, "/stop-bots").unwrap();
+        assert!(is_proxied(&db).unwrap());
     }
 
     #[test]

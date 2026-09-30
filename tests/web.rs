@@ -2292,6 +2292,177 @@ async fn an_unauthenticated_request_under_a_prefix_is_sent_to_the_prefixed_login
 
 // ---- login throttling ----
 
+/// A login post from one identifiable client. The throttle keys on the
+/// address, and a request with none at all shares the key everyone
+/// without one shares, which has no backoff of its own.
+fn login_attempt(body: &str) -> Request<Body> {
+    from_peer(post("/login", body), "198.51.100.20:5000")
+}
+
+/// A router whose login throttle runs on `config`, and a way to set up
+/// the database before it starts, for the tests that need the global
+/// bucket drained without running twenty Argon2 verifications to do it.
+fn app_throttled(
+    config: stop_bots::web::auth::ThrottleConfig,
+    setup: impl FnOnce(&Db),
+) -> (Router, String, tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    let db = Db::open(&db_path).unwrap();
+    let password = stop_bots::web::auth::generate_password().unwrap();
+    stop_bots::web::auth::set_password(&db, &password).unwrap();
+    setup(&db);
+    drop(db);
+    let mut state = AppState::new(
+        Db::open(&db_path).unwrap(),
+        tmp.path().join("nginx"),
+        None,
+        false,
+    );
+    state.login_throttle = std::sync::Arc::new(stop_bots::web::auth::LoginThrottle::new(config));
+    (server::router(state), password, tmp, db_path)
+}
+
+/// Every `Set-Cookie` on a response, name=value only.
+fn cookies_set(response: &Response) -> Vec<String> {
+    response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// The console behind the Web Access proxy, with `trust_forwarded_for`
+/// off: every request arrives from 127.0.0.1, attacker and operator alike.
+/// One attacker posting a wrong password each time `Retry-After` lapsed
+/// used to hold that shared key at the thirty-second ceiling, and the
+/// operator got 0 of 40 logins through with the right password.
+///
+/// A browser that has logged in before is remembered, and gets in with
+/// the right password whatever the shared limits say.
+#[tokio::test]
+async fn a_remembered_browser_logs_in_while_an_attacker_holds_the_shared_limits() {
+    let (app, password, _tmp, _db) = app_throttled(
+        stop_bots::web::auth::ThrottleConfig {
+            burst: 2.0,
+            refill_per_second: 0.001,
+            ..Default::default()
+        },
+        |db| {
+            db.set_text_setting(stop_bots::web::ALLOWED_HOSTS_KEY, "example.com")
+                .unwrap()
+        },
+    );
+    let through_proxy = |body: String, cookie: Option<&str>| {
+        let mut request = from_peer(post("/login", &body), "127.0.0.1:40000");
+        if let Some(cookie) = cookie {
+            request = with_cookie(request, cookie);
+        }
+        request
+    };
+
+    // The operator logged in last week, from this browser.
+    let first = app
+        .clone()
+        .oneshot(through_proxy(format!("password={password}"), None))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::SEE_OTHER);
+    let remembered = cookies_set(&first)
+        .into_iter()
+        .find(|c| c.starts_with("stop_bots_remember="))
+        .expect("a successful login remembers the browser");
+
+    // The attacker, through the same proxy, until refused.
+    let mut refused = false;
+    for i in 0..5 {
+        let status = app
+            .clone()
+            .oneshot(through_proxy(format!("password=wrong{i}"), None))
+            .await
+            .unwrap()
+            .status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "the shared limit should have tripped");
+
+    // A browser the console has not seen waits with the attacker...
+    let stranger = app
+        .clone()
+        .oneshot(through_proxy(format!("password={password}"), None))
+        .await
+        .unwrap();
+    assert_eq!(stranger.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // ...and the operator's does not.
+    let operator = app
+        .clone()
+        .oneshot(through_proxy(
+            format!("password={password}"),
+            Some(&remembered),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        operator.status(),
+        StatusCode::SEE_OTHER,
+        "the operator's own browser must get in whatever an attacker does"
+    );
+}
+
+/// The remembered-browser token only ever skips the throttle; it is not a
+/// credential. And `--set-password` forgets every one of them.
+#[tokio::test]
+async fn a_remembered_browser_still_needs_the_password_and_a_new_password_forgets_it() {
+    let (app, password, _tmp, db_path) = app_throttled(
+        stop_bots::web::auth::ThrottleConfig {
+            burst: 1.0,
+            refill_per_second: 0.001,
+            ..Default::default()
+        },
+        |_| {},
+    );
+    let first = app
+        .clone()
+        .oneshot(login_attempt(&format!("password={password}")))
+        .await
+        .unwrap();
+    let remembered = cookies_set(&first)
+        .into_iter()
+        .find(|c| c.starts_with("stop_bots_remember="))
+        .unwrap();
+
+    let wrong = app
+        .clone()
+        .oneshot(with_cookie(login_attempt("password=wrong"), &remembered))
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        cookies_set(&wrong).is_empty(),
+        "a wrong password opens nothing"
+    );
+
+    let new_password = stop_bots::web::auth::generate_password().unwrap();
+    stop_bots::web::auth::set_password(&Db::open(&db_path).unwrap(), &new_password).unwrap();
+
+    // The bucket was spent by the first login; only a remembered browser
+    // could get past it, and this one is no longer remembered.
+    let after = app
+        .oneshot(with_cookie(
+            login_attempt(&format!("password={new_password}")),
+            &remembered,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
 /// A run of wrong passwords eventually gets a 429 rather than another
 /// Argon2 verification.
 ///
@@ -2307,7 +2478,7 @@ async fn a_flood_of_login_attempts_is_refused_before_it_costs_a_hash() {
     for attempt in 0..40 {
         let response = app
             .clone()
-            .oneshot(post("/login", "password=wrong"))
+            .oneshot(login_attempt("password=wrong"))
             .await
             .unwrap();
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
@@ -2348,14 +2519,14 @@ async fn a_correct_password_still_works_after_a_few_typos() {
     for _ in 0..3 {
         let response = app
             .clone()
-            .oneshot(post("/login", "password=wrong"))
+            .oneshot(login_attempt("password=wrong"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     let response = app
-        .oneshot(post("/login", &format!("password={password}")))
+        .oneshot(login_attempt(&format!("password={password}")))
         .await
         .unwrap();
     assert_eq!(
@@ -2376,12 +2547,12 @@ async fn logging_in_successfully_resets_the_throttle() {
     let free = stop_bots::web::auth::ThrottleConfig::default().free_attempts;
     for _ in 0..free {
         app.clone()
-            .oneshot(post("/login", "password=wrong"))
+            .oneshot(login_attempt("password=wrong"))
             .await
             .unwrap();
     }
     app.clone()
-        .oneshot(post("/login", &format!("password={password}")))
+        .oneshot(login_attempt(&format!("password={password}")))
         .await
         .unwrap();
 
@@ -2390,7 +2561,7 @@ async fn logging_in_successfully_resets_the_throttle() {
     for attempt in 0..2 {
         let response = app
             .clone()
-            .oneshot(post("/login", "password=wrong"))
+            .oneshot(login_attempt("password=wrong"))
             .await
             .unwrap();
         assert_eq!(
@@ -2411,7 +2582,7 @@ async fn a_throttled_login_still_renders_the_login_form() {
     for _ in 0..40 {
         let response = app
             .clone()
-            .oneshot(post("/login", "password=wrong"))
+            .oneshot(login_attempt("password=wrong"))
             .await
             .unwrap();
         if response.status() == StatusCode::TOO_MANY_REQUESTS {

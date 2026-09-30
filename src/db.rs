@@ -29,6 +29,7 @@ mod blocks;
 pub mod evidence;
 pub mod keys;
 mod managed;
+mod remembered;
 pub mod schema;
 mod uapage;
 

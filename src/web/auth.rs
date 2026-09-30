@@ -62,6 +62,19 @@ pub const PASSWORD_HASH_KEY: &str = crate::db::keys::WEB_PASSWORD_HASH;
 /// Name of the session cookie.
 pub const SESSION_COOKIE: &str = "stop_bots_session";
 
+/// Name of the cookie that marks a browser this console has seen log in.
+/// See [`LoginKey::Remembered`].
+pub const REMEMBER_COOKIE: &str = "stop_bots_remember";
+
+/// How long a remembered browser stays remembered without logging in
+/// again: ninety days, refreshed by every login.
+pub const REMEMBER_MAX_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// How many remembered browsers are kept, most recently used first. A
+/// handful of the operator's own browsers; an eviction only means that
+/// browser waits its turn with everyone else until it logs in again.
+const REMEMBERED_BROWSERS_KEPT: usize = 32;
+
 /// How long a session lasts without being used.
 ///
 /// Eight hours rather than a token minute: this is an admin console, and
@@ -232,6 +245,9 @@ pub struct ThrottleConfig {
     /// Failures allowed before any delay is imposed. A fat-fingered
     /// paste should not cost the operator a wait.
     pub free_attempts: u32,
+    /// The same, for a remembered browser's own limit: smaller, because a
+    /// browser that has the password saved rarely needs more than one try.
+    pub remembered_free_attempts: u32,
     /// The delay after the first attempt past `free_attempts`; it doubles
     /// with each further failure.
     pub base_delay: Duration,
@@ -257,6 +273,7 @@ impl Default for ThrottleConfig {
             // generated and 144 bits wide, so nothing in this range makes
             // guessing more or less hopeless than it already is.
             free_attempts: 10,
+            remembered_free_attempts: 5,
             base_delay: Duration::from_secs(1),
             // Thirty seconds, not minutes. The ceiling exists for the
             // operator's sake, not the attacker's — see the note on
@@ -279,6 +296,42 @@ struct Failures {
     consecutive: u32,
     next_allowed: Instant,
     last_seen: Instant,
+}
+
+/// Who a login attempt is counted against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginKey {
+    /// A browser that presented a valid remembered-browser token: one this
+    /// console has seen log in, within [`REMEMBER_MAX_AGE`]. Keyed by the
+    /// token's digest.
+    ///
+    /// **Exempt from the per-address backoff and from the global bucket**,
+    /// with a small limit of its own instead. This is what keeps the
+    /// operator's own browser in, whatever an attacker does to the shared
+    /// limits: without it, one attacker posting a wrong password each time
+    /// `Retry-After` lapsed — about two requests a minute — held a shared
+    /// key at the thirty-second ceiling, and the operator got 0 of 40
+    /// logins through with the right password. The exemption costs little:
+    /// a token is only minted by a correct password, at most
+    /// [`REMEMBERED_BROWSERS_KEPT`] are valid at once, and each is limited.
+    Remembered(String),
+    /// A client this server can tell apart: its address, with IPv6 taken
+    /// as its /64 (see [`client_key`]). Per-client backoff and the global
+    /// bucket.
+    Client(String),
+    /// Everyone this server cannot tell apart: no address at all, or the
+    /// local proxy's address when the console is proxied and
+    /// `web:trust_forwarded_for` is off. The global bucket only.
+    ///
+    /// **No per-key backoff, on purpose.** A key everyone shares is a
+    /// global limit in disguise, and a far harsher one than the bucket:
+    /// the backoff let one wrong password every thirty seconds refuse
+    /// every login on the key, the operator's included. The bucket already
+    /// caps the Argon2 work anyone can cause, and to keep the operator out
+    /// through it an attacker has to spend its whole refill, two
+    /// verifications a second, sustained. The operator's own browser is
+    /// past both once remembered.
+    Shared,
 }
 
 /// Throttling for the login endpoint.
@@ -304,21 +357,30 @@ struct Failures {
 ///   127.0.0.1 unless `X-Forwarded-For` is trusted).
 /// - **Per-client exponential backoff** punishes a persistent guesser
 ///   that *can* be identified, and is what produces the "too many
-///   attempts" the operator sees.
+///   attempts" the operator sees. IPv6 clients are keyed by /64.
 ///
-/// **The honest cost, and what to do about it.** Any limiter on an
+/// **The honest cost, and what bounds it.** Any limiter on an
 /// unauthenticated endpoint lets a flood deny the legitimate user; that is
-/// inherent, not a flaw in this one. Where clients cannot be told apart
-/// they share a bucket, so a sustained attack delays the operator's own
-/// login by up to `max_delay` too.
+/// inherent, not a flaw in this one. It used to be worse than it had to
+/// be: clients that could not be told apart shared one backoff key, and
+/// one wrong password every thirty seconds held that key at the ceiling —
+/// measured, the operator got 0 of 40 logins through with the right
+/// password against about two attacker requests a minute.
 ///
-/// Three things bound that. The ceiling is thirty seconds rather than
-/// hours. The TUI and the CLI on the host are untouched by any of this,
-/// so the operator is never actually shut out of their own server. And —
-/// the one worth acting on — **behind a proxy, `web:trust_forwarded_for`
-/// is what lets this tell clients apart at all**: without it every request
-/// arrives from 127.0.0.1 and the attacker shares the operator's bucket;
-/// with it the attacker gets their own and the operator is unaffected.
+/// Four things bound it now (see [`LoginKey`]):
+///
+/// - **A remembered browser skips both limits.** A successful login sets a
+///   90-day cookie; a login presenting it has only a small limit of its
+///   own, so the operator's own browser always gets to try its password.
+/// - **A shared key has no backoff**, only the global bucket, which an
+///   attacker must drain at two verifications a second, sustained, to
+///   keep a new browser out.
+/// - **Behind a proxy, `web:trust_forwarded_for`** lets this tell clients
+///   apart at all. The Web Access panel turns it on for the proxy it
+///   writes, and the health report warns when a proxied console has it
+///   off.
+/// - The TUI and the CLI on the host are untouched by any of this, so the
+///   operator is never actually shut out of their own server.
 pub struct LoginThrottle {
     config: ThrottleConfig,
     state: Mutex<ThrottleState>,
@@ -327,6 +389,9 @@ pub struct LoginThrottle {
 #[derive(Debug)]
 struct ThrottleState {
     clients: HashMap<String, Failures>,
+    /// Remembered browsers' own failures, apart from `clients` so that
+    /// neither can evict or collide with the other.
+    remembered: HashMap<String, Failures>,
     tokens: f64,
     last_refill: Instant,
 }
@@ -342,6 +407,7 @@ impl LoginThrottle {
         Self {
             state: Mutex::new(ThrottleState {
                 clients: HashMap::new(),
+                remembered: HashMap::new(),
                 tokens: config.burst,
                 last_refill: Instant::now(),
             }),
@@ -349,36 +415,129 @@ impl LoginThrottle {
         }
     }
 
-    /// Whether to attempt a verification for `key` at all.
+    /// Whether to attempt a verification for `key` at all. See
+    /// [`LoginKey`] for which limits each kind of key is held to.
+    pub fn check_login(&self, key: &LoginKey) -> Result<(), Throttled> {
+        match key {
+            LoginKey::Remembered(token) => self.check_remembered(token),
+            LoginKey::Client(client) => self.check(client),
+            LoginKey::Shared => self.check_global(),
+        }
+    }
+
+    /// Records a wrong password against `key`.
+    pub fn record_login_failure(&self, key: &LoginKey) {
+        match key {
+            LoginKey::Remembered(token) => self.record_remembered(token, false),
+            LoginKey::Client(client) => self.record_failure(client),
+            // Nothing to push out: see `LoginKey::Shared`.
+            LoginKey::Shared => {}
+        }
+    }
+
+    /// Records the right password for `key`, ending its backoff.
+    pub fn record_login_success(&self, key: &LoginKey) {
+        match key {
+            LoginKey::Remembered(token) => self.record_remembered(token, true),
+            LoginKey::Client(client) => self.record_success(client),
+            LoginKey::Shared => {}
+        }
+    }
+
+    /// Whether to attempt a verification for the client `key`: its own
+    /// backoff, then the global bucket.
     ///
     /// `Ok(())` consumes a token — an accepted attempt costs one whether
     /// or not the password turns out to be right, because the cost being
     /// rationed is the hash, not the failure.
     pub fn check(&self, key: &str) -> Result<(), Throttled> {
         let now = Instant::now();
-        let mut state = self
-            .state
-            .lock()
-            .expect("the throttle map is never held across a panic");
+        let mut state = self.lock();
+        self.sweep(&mut state, now);
 
+        if let Some(throttled) = still_waiting(state.clients.get(key), now) {
+            return Err(throttled);
+        }
+        self.take_token(&mut state)
+    }
+
+    /// The global bucket alone, for [`LoginKey::Shared`].
+    fn check_global(&self) -> Result<(), Throttled> {
+        let now = Instant::now();
+        let mut state = self.lock();
+        self.sweep(&mut state, now);
+        self.take_token(&mut state)
+    }
+
+    /// A remembered browser's own backoff alone, for
+    /// [`LoginKey::Remembered`]: no global token is taken or needed.
+    fn check_remembered(&self, token: &str) -> Result<(), Throttled> {
+        let now = Instant::now();
+        let mut state = self.lock();
+        self.sweep(&mut state, now);
+        match still_waiting(state.remembered.get(token), now) {
+            Some(throttled) => Err(throttled),
+            None => Ok(()),
+        }
+    }
+
+    fn record_remembered(&self, token: &str, succeeded: bool) {
+        let now = Instant::now();
+        let mut state = self.lock();
+        if succeeded {
+            state.remembered.remove(token);
+            return;
+        }
+        // Bounded by the tokens that can be valid at once, but capped
+        // anyway rather than trusting that from here.
+        if state.remembered.len() >= self.config.max_clients
+            && !state.remembered.contains_key(token)
+        {
+            evict_oldest(&mut state.remembered);
+        }
+        let entry = state
+            .remembered
+            .entry(token.to_string())
+            .or_insert(Failures {
+                consecutive: 0,
+                next_allowed: now,
+                last_seen: now,
+            });
+        entry.consecutive = entry.consecutive.saturating_add(1);
+        entry.last_seen = now;
+        entry.next_allowed = now
+            + backoff(
+                entry.consecutive,
+                self.config.remembered_free_attempts,
+                self.config.base_delay,
+                self.config.max_delay,
+            );
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ThrottleState> {
+        self.state
+            .lock()
+            .expect("the throttle map is never held across a panic")
+    }
+
+    /// Refills the bucket for the time since the last call, and forgets
+    /// clients idle past the TTL.
+    fn sweep(&self, state: &mut ThrottleState, now: Instant) {
         let elapsed = now.saturating_duration_since(state.last_refill);
         state.tokens = (state.tokens + elapsed.as_secs_f64() * self.config.refill_per_second)
             .min(self.config.burst);
         state.last_refill = now;
 
+        let ttl = self.config.client_ttl;
         state
             .clients
-            .retain(|_, f| now.saturating_duration_since(f.last_seen) < self.config.client_ttl);
+            .retain(|_, f| now.saturating_duration_since(f.last_seen) < ttl);
+        state
+            .remembered
+            .retain(|_, f| now.saturating_duration_since(f.last_seen) < ttl);
+    }
 
-        if let Some(failures) = state.clients.get(key) {
-            if failures.next_allowed > now {
-                return Err(Throttled {
-                    retry_after: failures.next_allowed.saturating_duration_since(now),
-                    message: TOO_MANY,
-                });
-            }
-        }
-
+    fn take_token(&self, state: &mut ThrottleState) -> Result<(), Throttled> {
         if state.tokens < 1.0 {
             // How long until one token is back.
             let deficit = 1.0 - state.tokens;
@@ -407,14 +566,7 @@ impl LoginThrottle {
         // attacker grow this map without bound. Cheap because the cap is
         // small and this only runs when it is reached.
         if state.clients.len() >= self.config.max_clients && !state.clients.contains_key(key) {
-            if let Some(oldest) = state
-                .clients
-                .iter()
-                .min_by_key(|(_, f)| f.last_seen)
-                .map(|(k, _)| k.clone())
-            {
-                state.clients.remove(&oldest);
-            }
+            evict_oldest(&mut state.clients);
         }
 
         let free = self.config.free_attempts;
@@ -452,6 +604,77 @@ impl LoginThrottle {
 /// One message for every refusal: which limit tripped would tell a guesser
 /// how close they are to it.
 const TOO_MANY: &str = "Too many login attempts. Wait a moment and try again.";
+
+/// The refusal a key's own backoff makes, if it is still running.
+fn still_waiting(failures: Option<&Failures>, now: Instant) -> Option<Throttled> {
+    let failures = failures?;
+    (failures.next_allowed > now).then(|| Throttled {
+        retry_after: failures.next_allowed.saturating_duration_since(now),
+        message: TOO_MANY,
+    })
+}
+
+fn evict_oldest(map: &mut HashMap<String, Failures>) {
+    if let Some(oldest) = map
+        .iter()
+        .min_by_key(|(_, f)| f.last_seen)
+        .map(|(k, _)| k.clone())
+    {
+        map.remove(&oldest);
+    }
+}
+
+/// The throttle key for a client at `ip`.
+///
+/// An IPv4 address is its own key. An IPv6 address is keyed by its /64:
+/// a single host is routinely handed a whole /64, and SLAAC and privacy
+/// extensions let it pick a fresh address in it for every request, so a
+/// per-address key would give one attacker 2^64 fresh backoffs.
+pub fn client_key(ip: std::net::IpAddr) -> String {
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => {
+            let network = u128::from(v6) & !((1u128 << 64) - 1);
+            format!("{}/64", std::net::Ipv6Addr::from(network))
+        }
+    }
+}
+
+/// The digest a remembered-browser token is stored and throttled under.
+/// The token itself lives only in the browser's cookie, the way the
+/// password lives only in the operator's head: a copy of the database is
+/// not a way past the throttle.
+pub fn remember_token_hash(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Whether `token` is a browser this console remembers, as of `now`
+/// (Unix seconds).
+pub fn is_remembered(db: &Db, token: &str, now: i64) -> Result<bool> {
+    if token.is_empty() || token.len() > 128 {
+        return Ok(false);
+    }
+    db.is_remembered_browser(
+        &remember_token_hash(token),
+        now - REMEMBER_MAX_AGE.as_secs() as i64,
+    )
+}
+
+/// Remembers the browser that just logged in, returning the token its
+/// cookie should carry: `existing` if it presented a valid one, which is
+/// refreshed, or a new one.
+pub fn remember_browser(db: &Db, existing: Option<&str>, now: i64) -> Result<String> {
+    let token = match existing {
+        Some(token) => token.to_string(),
+        None => random_token()?,
+    };
+    db.remember_browser(&remember_token_hash(&token), now, REMEMBERED_BROWSERS_KEPT)?;
+    Ok(token)
+}
 
 /// The delay after `consecutive` failures.
 ///
@@ -500,7 +723,12 @@ pub fn set_password(db: &Db, password: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to hash the password: {e}"))?
         .to_string();
     db.set_text_setting(PASSWORD_HASH_KEY, &hash)
-        .context("failed to store the password hash")
+        .context("failed to store the password hash")?;
+    // A new password is a fresh start: no browser from before it keeps
+    // its way past the throttle, including one whose owner the password
+    // was rotated to shut out.
+    db.forget_remembered_browsers()?;
+    Ok(())
 }
 
 /// The stored password hash, which is what a session is bound to (see
@@ -524,7 +752,17 @@ pub fn verify_password(db: &Db, password: &str) -> Result<bool> {
     let Some(stored) = db.get_text_setting(PASSWORD_HASH_KEY)? else {
         return Ok(false);
     };
-    let parsed = PasswordHash::new(&stored)
+    verify_against(&stored, password)
+}
+
+/// Verifies `password` against `stored`, a PHC string already read.
+///
+/// No `Db`, so that the ~50 ms of Argon2 can run where the database is not
+/// locked: the console reads the hash, lets go, and verifies on the
+/// blocking pool. Verifying inside the lock stalled every other request
+/// for the length of each attempt.
+pub fn verify_against(stored: &str, password: &str) -> Result<bool> {
+    let parsed = PasswordHash::new(stored)
         .map_err(|e| anyhow::anyhow!("the stored password hash is unreadable: {e}"))?;
     Ok(Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
@@ -585,6 +823,7 @@ mod tests {
     fn fast_throttle() -> LoginThrottle {
         LoginThrottle::new(ThrottleConfig {
             free_attempts: 2,
+            remembered_free_attempts: 1,
             base_delay: Duration::from_millis(20),
             max_delay: Duration::from_millis(80),
             burst: 4.0,
@@ -772,9 +1011,130 @@ mod tests {
         );
     }
 
+    /// The attack this exists for: the shared key held at its ceiling, and
+    /// the global bucket drained. A remembered browser gets to try anyway.
+    #[test]
+    fn a_remembered_browser_is_let_through_whatever_the_shared_limits_say() {
+        let throttle = LoginThrottle::new(ThrottleConfig {
+            burst: 2.0,
+            refill_per_second: 0.0001,
+            ..fast_config()
+        });
+        for _ in 0..10 {
+            let _ = throttle.check_login(&LoginKey::Client("attacker".into()));
+            throttle.record_login_failure(&LoginKey::Client("attacker".into()));
+        }
+        assert!(throttle.check_login(&LoginKey::Shared).is_err(), "drained");
+
+        assert!(
+            throttle
+                .check_login(&LoginKey::Remembered("operator".into()))
+                .is_ok(),
+            "the operator's own browser must not wait on an attacker"
+        );
+    }
+
+    /// Exempt from the shared limits is not unlimited: a remembered token
+    /// someone got hold of still backs off on its own.
+    #[test]
+    fn a_remembered_browser_has_a_small_limit_of_its_own() {
+        let throttle = fast_throttle();
+        let key = LoginKey::Remembered("token-digest".into());
+        for _ in 0..3 {
+            let _ = throttle.check_login(&key);
+            throttle.record_login_failure(&key);
+        }
+        assert!(throttle.check_login(&key).is_err());
+        assert!(
+            throttle
+                .check_login(&LoginKey::Remembered("another".into()))
+                .is_ok(),
+            "one browser's typos are its own"
+        );
+
+        throttle.record_login_success(&key);
+        assert!(throttle.check_login(&key).is_ok());
+    }
+
+    /// A key everyone shares had the backoff too, and one wrong password
+    /// every thirty seconds kept every login on it refused. It has only
+    /// the global bucket now.
+    #[test]
+    fn failures_on_the_shared_key_impose_no_backoff() {
+        let throttle = fast_throttle();
+        for attempt in 0..3 {
+            assert!(
+                throttle.check_login(&LoginKey::Shared).is_ok(),
+                "attempt {attempt}"
+            );
+            throttle.record_login_failure(&LoginKey::Shared);
+        }
+        assert_eq!(throttle.tracked(), 0, "nothing is tracked for it");
+    }
+
+    /// A host is routinely handed a whole /64, and may use a fresh address
+    /// in it for every request.
+    #[test]
+    fn an_ipv6_client_is_keyed_by_its_64() {
+        let key = |text: &str| client_key(text.parse().unwrap());
+
+        assert_eq!(key("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+        assert_eq!(key("2001:db8:1:2:ffff:1:2:3"), "2001:db8:1:2::/64");
+        assert_ne!(key("2001:db8:1:3::1"), key("2001:db8:1:2::1"));
+        assert_eq!(key("203.0.113.5"), "203.0.113.5");
+        assert_eq!(key("::ffff:203.0.113.5"), "203.0.113.5");
+    }
+
+    #[test]
+    fn a_browser_is_remembered_by_a_token_whose_digest_alone_is_stored() {
+        let db = Db::open_in_memory().unwrap();
+        let token = remember_browser(&db, None, 1_000).unwrap();
+
+        assert!(is_remembered(&db, &token, 1_000).unwrap());
+        assert!(!is_remembered(&db, "a-made-up-token", 1_000).unwrap());
+        assert!(!is_remembered(&db, "", 1_000).unwrap());
+        let later = 1_000 + REMEMBER_MAX_AGE.as_secs() as i64 + 1;
+        assert!(
+            !is_remembered(&db, &token, later).unwrap(),
+            "unused for longer than the cookie lives"
+        );
+
+        let fresh = remember_browser(&db, None, 2_000).unwrap();
+        assert!(db
+            .is_remembered_browser(&remember_token_hash(&fresh), 0)
+            .unwrap());
+        assert!(
+            !db.is_remembered_browser(&fresh, 0).unwrap(),
+            "the token itself was stored"
+        );
+    }
+
+    #[test]
+    fn logging_in_again_keeps_the_same_token_and_its_life() {
+        let db = Db::open_in_memory().unwrap();
+        let token = remember_browser(&db, None, 1_000).unwrap();
+        let later = 1_000 + REMEMBER_MAX_AGE.as_secs() as i64 - 10;
+
+        assert_eq!(remember_browser(&db, Some(&token), later).unwrap(), token);
+        assert!(is_remembered(&db, &token, later + 100).unwrap());
+    }
+
+    /// A new password is a fresh start: no browser from before it keeps
+    /// its way past the throttle.
+    #[test]
+    fn setting_a_password_forgets_every_remembered_browser() {
+        let db = Db::open_in_memory().unwrap();
+        let token = remember_browser(&db, None, 1_000).unwrap();
+
+        set_password(&db, "a new one").unwrap();
+
+        assert!(!is_remembered(&db, &token, 1_000).unwrap());
+    }
+
     fn fast_config() -> ThrottleConfig {
         ThrottleConfig {
             free_attempts: 2,
+            remembered_free_attempts: 1,
             base_delay: Duration::from_millis(20),
             max_delay: Duration::from_millis(80),
             burst: 4.0,

@@ -384,26 +384,73 @@ async fn login_form(State(state): State<AppState>) -> Markup {
     layout::login_page(&state.base, None)
 }
 
+/// What a login attempt needs to know before it may cost a hash.
+struct LoginFacts {
+    /// The remembered-browser token the request presented, if it is one
+    /// this console remembers.
+    remembered: Option<String>,
+    /// `web:trust_forwarded_for`.
+    trusted: bool,
+    /// Whether the console is set up to be reached through a proxy.
+    proxied: bool,
+}
+
+/// Which limits a login attempt is held to: see [`auth::LoginKey`].
+///
+/// The loopback address is shared rather than a client's own when the
+/// console is proxied and the forwarded header is not believed: every
+/// proxied request arrives from it, attacker and operator alike.
+fn login_key(client: &ClientAddr, facts: &LoginFacts) -> auth::LoginKey {
+    if let Some(token) = &facts.remembered {
+        return auth::LoginKey::Remembered(auth::remember_token_hash(token));
+    }
+    match client.0 {
+        None => auth::LoginKey::Shared,
+        Some(ip) if ip.is_loopback() && facts.proxied && !facts.trusted => auth::LoginKey::Shared,
+        Some(ip) => auth::LoginKey::Client(auth::client_key(ip)),
+    }
+}
+
 async fn login_submit(
     State(state): State<AppState>,
     Extension(client): Extension<ClientAddr>,
+    headers: axum::http::HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    let now = unix_now();
+    let presented = headers
+        .get(header::COOKIE)
+        .and_then(|c| c.to_str().ok())
+        .and_then(|c| cookie_value(c, auth::REMEMBER_COOKIE));
+
+    // One indexed read and two settings, before any hashing: whether this
+    // browser is one the console remembers, and whether the address can
+    // tell this client from the others.
+    let facts = state
+        .with_db(move |db| {
+            let remembered = match presented {
+                Some(token) if auth::is_remembered(db, &token, now)? => Some(token),
+                _ => None,
+            };
+            anyhow::Ok(LoginFacts {
+                remembered,
+                trusted: db.get_bool_setting(crate::web::TRUST_FORWARDED_KEY, false)?,
+                proxied: crate::web::is_proxied(db)?,
+            })
+        })
+        .await;
+    let facts = match facts {
+        Ok(facts) => facts,
+        Err(err) => return unauthenticated_error("reading the login settings", &err),
+    };
+
     // Before the hash, not after. Verifying a password is ~50ms of CPU
     // and 19MB of Argon2 working memory; letting an unauthenticated
     // caller drive that as fast as they can post is a denial of service
     // against the host this tool exists to protect. A refusal here costs
     // a map lookup.
-    //
-    // Keyed by client address where there is one. Behind a proxy without
-    // `web:trust_forwarded_for` there is not, and everyone shares the
-    // "unknown" bucket — which is exactly why the global token bucket
-    // inside the throttle exists as well.
-    let key = client
-        .0
-        .map(|ip| ip.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    if let Err(throttled) = state.login_throttle.check(&key) {
+    let key = login_key(&client, &facts);
+    if let Err(throttled) = state.login_throttle.check_login(&key) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [(
@@ -415,54 +462,81 @@ async fn login_submit(
             .into_response();
     }
 
-    // The hash is read in the same call that verifies against it, so the
-    // session is bound to the password that was actually checked.
-    let password = form.password;
-    let verified = state
+    // The hash is read under the lock and verified outside it. Argon2
+    // inside `with_db` held the database against every other request for
+    // the length of each attempt, about 21 ms, and an attacker decides how
+    // many attempts there are.
+    let stored = match state.with_db(auth::current_credential).await {
+        Ok(stored) => stored,
+        Err(err) => return unauthenticated_error("reading the stored password hash", &err),
+    };
+    let verified = match stored.clone() {
+        // One message for a wrong password and for no password having
+        // been set: neither is worth confirming to whoever is guessing.
+        None => Ok(false),
+        Some(hash) => {
+            let password = form.password;
+            tokio::task::spawn_blocking(move || auth::verify_against(&hash, &password))
+                .await
+                .map_err(|e| anyhow::anyhow!("the password check failed to run: {e}"))
+                .and_then(|verified| verified)
+        }
+    };
+    let credential = match (verified, stored) {
+        (Ok(true), Some(credential)) => credential,
+        (Ok(_), _) => {
+            state.login_throttle.record_login_failure(&key);
+            return not_accepted(&state);
+        }
+        (Err(err), _) => return unauthenticated_error("checking a password", &err),
+    };
+
+    // Under the lock again: the session is bound to the hash that was
+    // verified, so if `--set-password` replaced it in between, this login
+    // proved the old password and gets nothing. Then the browser is
+    // remembered, for the next time the shared limits are against it.
+    let remembered = facts.remembered;
+    let verified_hash = credential.clone();
+    let outcome = state
         .with_db(move |db| {
-            let verified = auth::verify_password(db, &password)?;
-            let credential = auth::current_credential(db)?;
-            anyhow::Ok(credential.filter(|_| verified))
+            if auth::current_credential(db)?.as_deref() != Some(verified_hash.as_str()) {
+                return anyhow::Ok(None);
+            }
+            let token = auth::remember_browser(db, remembered.as_deref(), now)?;
+            let secure = db.get_bool_setting(crate::web::SECURE_COOKIE_KEY, false)?;
+            anyhow::Ok(Some((token, secure)))
         })
         .await;
+    let (token, secure) = match outcome {
+        Ok(Some(done)) => done,
+        Ok(None) => return not_accepted(&state),
+        Err(err) => return unauthenticated_error("recording a login", &err),
+    };
 
-    if let (Ok(Some(_)), Some(ip)) = (&verified, client.0) {
+    // The password was right and is still the stored one: this address
+    // logged in, so no detector blocks it for a week.
+    if let Some(ip) = client.0 {
         record_console_login(&state, ip).await;
     }
 
-    let secure = state
-        .with_db(|db| db.get_bool_setting(crate::web::SECURE_COOKIE_KEY, false))
-        .await
-        .unwrap_or(false);
-
-    match verified {
-        Ok(Some(credential)) => match state.sessions.create(&credential) {
-            Ok((id, _csrf)) => {
-                // The right password ends the backoff for this client, so
-                // the operator's next typo starts from zero.
-                state.login_throttle.record_success(&key);
-                (
-                    [(header::SET_COOKIE, session_cookie(&id, secure, &state.base))],
-                    Redirect::to(&state.base.url("/")),
-                )
-                    .into_response()
+    match state.sessions.create(&credential) {
+        Ok((id, _csrf)) => {
+            // The right password ends the backoff for this key, so the
+            // operator's next typo starts from zero.
+            state.login_throttle.record_login_success(&key);
+            let mut response = Redirect::to(&state.base.url("/")).into_response();
+            let cookies = response.headers_mut();
+            for cookie in [
+                session_cookie(&id, secure, &state.base),
+                remember_cookie(&token, secure, &state.base),
+            ] {
+                if let Ok(value) = HeaderValue::from_str(&cookie) {
+                    cookies.append(header::SET_COOKIE, value);
+                }
             }
-            Err(err) => internal_error(&err.to_string()),
-        },
-        // One message for a wrong password and for no password having been
-        // set: neither is worth confirming to whoever is guessing.
-        Ok(None) => {
-            state.login_throttle.record_failure(&key);
-            (
-                StatusCode::UNAUTHORIZED,
-                Html(
-                    layout::login_page(&state.base, Some("That password was not accepted."))
-                        .into_string(),
-                ),
-            )
-                .into_response()
+            response
         }
-        Err(err) => internal_error(&err.to_string()),
+        Err(err) => unauthenticated_error("opening a session", &err),
     }
 }
 
@@ -483,6 +557,24 @@ async fn record_console_login(state: &AppState, ip: IpAddr) {
     {
         eprintln!("stop-bots: could not record the console login from {ip}: {err:#}");
     }
+}
+
+/// The refusal for a wrong password.
+fn not_accepted(state: &AppState) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Html(
+            layout::login_page(&state.base, Some("That password was not accepted.")).into_string(),
+        ),
+    )
+        .into_response()
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Ends the session server-side, not merely in the browser.
@@ -522,6 +614,28 @@ fn session_cookie(id: &str, secure: bool, base: &BasePath) -> String {
     let mut cookie = format!(
         "{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path={}",
         base.cookie_path()
+    );
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// The `Set-Cookie` value that remembers this browser: see
+/// [`auth::LoginKey::Remembered`].
+///
+/// Scoped to the login path, so it goes with a login attempt and with
+/// nothing else: it is not a credential, and no other page has a use for
+/// it. `HttpOnly` and `SameSite=Strict` for the session cookie's reasons,
+/// and `Secure` under the same setting. Ninety days, refreshed by every
+/// login; logging out leaves it, because it is what gets the operator back
+/// in while someone is hammering the login form.
+fn remember_cookie(token: &str, secure: bool, base: &BasePath) -> String {
+    let mut cookie = format!(
+        "{}={token}; HttpOnly; SameSite=Strict; Path={}; Max-Age={}",
+        auth::REMEMBER_COOKIE,
+        base.url("/login"),
+        auth::REMEMBER_MAX_AGE.as_secs()
     );
     if secure {
         cookie.push_str("; Secure");
@@ -761,6 +875,61 @@ mod tests {
             "a Secure cookie is never stored over plain HTTP, so the default must not set it"
         );
         assert!(session_cookie("id", true, &BasePath::default()).contains("; Secure"));
+    }
+
+    #[test]
+    fn the_remembered_browser_cookie_goes_only_to_the_login_form() {
+        let cookie = remember_cookie("a-token", false, &BasePath::parse("/stop-bots").unwrap());
+        for flag in [
+            "stop_bots_remember=a-token",
+            "HttpOnly",
+            "SameSite=Strict",
+            "Path=/stop-bots/login",
+            "Max-Age=7776000",
+        ] {
+            assert!(cookie.contains(flag), "missing {flag} in: {cookie}");
+        }
+        assert!(!cookie.contains("Secure"), "{cookie}");
+        assert!(remember_cookie("t", true, &BasePath::default()).ends_with("; Secure"));
+    }
+
+    fn facts(remembered: bool, trusted: bool, proxied: bool) -> LoginFacts {
+        LoginFacts {
+            remembered: remembered.then(|| "a-token".to_string()),
+            trusted,
+            proxied,
+        }
+    }
+
+    #[test]
+    fn a_login_is_counted_against_whoever_can_be_told_apart() {
+        let local = ClientAddr(Some(ip("127.0.0.1")));
+        let remote = ClientAddr(Some(ip("2001:db8:1:2::7")));
+        let key = |client: &ClientAddr, facts: LoginFacts| login_key(client, &facts);
+
+        assert!(matches!(
+            key(&local, facts(true, false, true)),
+            auth::LoginKey::Remembered(_)
+        ));
+        assert_eq!(
+            key(&ClientAddr(None), facts(false, false, false)),
+            auth::LoginKey::Shared,
+            "no address at all"
+        );
+        assert_eq!(
+            key(&local, facts(false, false, true)),
+            auth::LoginKey::Shared,
+            "the proxy's own address, with its header not believed"
+        );
+        assert_eq!(
+            key(&local, facts(false, false, false)),
+            auth::LoginKey::Client("127.0.0.1".into()),
+            "not proxied: a local browser is itself"
+        );
+        assert_eq!(
+            key(&remote, facts(false, false, true)),
+            auth::LoginKey::Client("2001:db8:1:2::/64".into())
+        );
     }
 
     #[test]

@@ -49,7 +49,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 5;
+pub const CURRENT_VERSION: u32 = 6;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -127,6 +127,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         summary: "console_logins, the addresses the web console was logged in from",
         apply: v5_console_logins,
+    },
+    Migration {
+        summary: "remembered_browsers, the console's login-throttle exemption",
+        apply: v6_remembered_browsers,
     },
 ];
 
@@ -766,6 +770,23 @@ fn v5_console_logins(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE console_logins (
              address TEXT PRIMARY KEY,
              last_login INTEGER NOT NULL
+         );",
+    )
+}
+
+/// Version 6: the browsers the web console remembers.
+///
+/// A successful login sets a long-lived cookie holding a random token,
+/// and this table holds the token's SHA-256, never the token. A login
+/// presenting one is exempt from the throttle that an attacker's failed
+/// attempts drive, so the operator's own browser always gets to try its
+/// password (see `web::auth`). Starts empty; `--set-password` empties it.
+fn v6_remembered_browsers(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE remembered_browsers (
+             token_hash TEXT PRIMARY KEY,
+             created_at INTEGER NOT NULL,
+             last_used_at INTEGER NOT NULL
          );",
     )
 }
@@ -1555,12 +1576,43 @@ mod tests {
         migrate(&conn, None).unwrap();
 
         let db = Db { conn };
-        assert_eq!(version_of(&db), 5);
+        assert_eq!(version_of(&db), CURRENT_VERSION);
         assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
         assert_eq!(db.recent_ssh_login_ips().unwrap(), ["198.51.100.9"]);
         assert!(db.recent_console_logins(0).unwrap().is_empty());
         db.record_console_login("203.0.113.20".parse().unwrap(), 100)
             .unwrap();
         assert_eq!(db.recent_console_logins(0).unwrap(), ["203.0.113.20"]);
+    }
+
+    /// A version-5 database keeps its settings, including the password,
+    /// and gains an empty set of remembered browsers that can then be
+    /// written.
+    #[test]
+    fn a_version_5_database_keeps_its_password_and_gains_remembered_browsers() {
+        let conn = Connection::open_in_memory().unwrap();
+        for step in &MIGRATIONS[..5] {
+            (step.apply)(&conn).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, '$argon2id$stored')",
+            params![keys::WEB_PASSWORD_HASH],
+        )
+        .unwrap();
+
+        migrate(&conn, None).unwrap();
+
+        let db = Db { conn };
+        assert_eq!(version_of(&db), CURRENT_VERSION);
+        assert_eq!(
+            db.get_text_setting(keys::WEB_PASSWORD_HASH)
+                .unwrap()
+                .as_deref(),
+            Some("$argon2id$stored")
+        );
+        assert!(!db.is_remembered_browser("some-hash", 0).unwrap());
+        db.remember_browser("some-hash", 1_000, 32).unwrap();
+        assert!(db.is_remembered_browser("some-hash", 0).unwrap());
     }
 }
