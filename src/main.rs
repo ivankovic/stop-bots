@@ -3754,12 +3754,14 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     println!();
     println!("One thing that changes now that this runs as root: the internal cron's");
     println!(
-        "daily firewall render can write {}/firewall.nft,",
+        "daily firewall render writes {}/firewall.next.*, for review.",
         layout.output_dir.display()
     );
-    println!("which it could not before. That script is applied only when you ask: run it");
-    println!("yourself, use `stop-bots batch --apply` from a crontab, or switch on");
-    println!("`stop-bots set-auto-apply-firewall --enabled true`.");
+    println!("Nothing is enforced, or loaded at boot, until something applies it: \"Apply");
+    println!("everything\" in the console, `stop-bots render-firewall --apply`, `stop-bots");
+    println!(
+        "batch --apply` from a crontab, or `stop-bots set-auto-apply-firewall --enabled true`."
+    );
 
     Ok(())
 }
