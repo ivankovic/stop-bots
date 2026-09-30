@@ -4572,6 +4572,37 @@ fn output_piped_into_a_reader_that_stops_early_is_not_a_panic() {
     );
 }
 
+/// A `--root` outside the stock NGINX tree is a tree of its own: the
+/// http-context files go into its own `conf.d`, never the host's
+/// `/etc/nginx/conf.d`. `batch --root <scratch>` used to read the host's
+/// trust file from there, and an apply would have rewritten it.
+///
+/// No `STOP_BOTS_NGINX_CONF_D` here, unlike everywhere else: the override
+/// is what hid this.
+#[test]
+fn a_scratch_root_keeps_its_generated_files_inside_itself() {
+    let fx = Fixture::new();
+    fx.write_site("scratch.example");
+    let root = fx.nginx_root.to_str().unwrap();
+    let run = |args: &[&str]| {
+        fx.cmd(args)
+            .env_remove("STOP_BOTS_NGINX_CONF_D")
+            .assert()
+            .success()
+    };
+
+    run(&["scan-sites", "--root", root]);
+    run(&["trust", "--user-agent", "Pingdom.com_bot"]);
+    run(&["apply-blocks", "--root", root, "--no-reload"]);
+
+    let trust_file = fx.nginx_root.join("conf.d/stop-bots-trusted.conf");
+    assert!(
+        fs::read_to_string(&trust_file).is_ok_and(|body| body.contains("Pingdom")),
+        "the trust file is not inside the root, at {}",
+        trust_file.display()
+    );
+}
+
 /// A blocked user agent or an exempt path stored by an older release
 /// without today's checks is left out of the config, and `apply-blocks`
 /// says which. Here, an exemption with a backslash in it: `/x\|` was a

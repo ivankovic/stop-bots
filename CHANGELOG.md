@@ -42,6 +42,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The server block that serves the console (Web Access path mode) exempts the
   console's prefix, so a site rule cannot lock the operator out. `limit_req`
   still applies there.
+- `--root` outside `/etc/nginx` keeps generated files in `<root>/conf.d`, and
+  never reads or writes the host's `/etc/nginx/conf.d`.
 
 ### Changed
 

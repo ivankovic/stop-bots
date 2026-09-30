@@ -1084,15 +1084,33 @@ pub const CONF_D_DIR_ENV: &str = "STOP_BOTS_NGINX_CONF_D";
 /// Unchanged for a normal host install: [`root`] falls back to
 /// [`DEFAULT_ROOT`], whose `conf.d` exists, so this still resolves to
 /// [`CONF_D_DIR`].
+///
+/// **The stock `conf.d` only for a root inside the stock tree.** A root
+/// such as `/etc/nginx/sites-enabled` is a part of `/etc/nginx`, whose
+/// `conf.d` is the one its NGINX reads. Any other root is a tree of its
+/// own, and never reaches out of itself: `batch --root <scratch>` used to
+/// read, and would have rewritten or removed, the host's own
+/// `/etc/nginx/conf.d/stop-bots-trusted.conf`. Such a root without a
+/// `conf.d` gets `<root>/conf.d`, which a write creates.
 pub fn conf_d_dir(root: &Path) -> PathBuf {
     if let Some(dir) = std::env::var_os(CONF_D_DIR_ENV) {
         return PathBuf::from(dir);
     }
     let beside_the_sites = root.join("conf.d");
-    if beside_the_sites.is_dir() {
+    if beside_the_sites.is_dir() || !is_in_stock_tree(root) {
         return beside_the_sites;
     }
     PathBuf::from(CONF_D_DIR)
+}
+
+/// Whether `root` is [`DEFAULT_ROOT`] or a directory in it, as written: a
+/// `..` anywhere in it means it may lead anywhere, so it does not count.
+fn is_in_stock_tree(root: &Path) -> bool {
+    root.is_absolute()
+        && root.starts_with(DEFAULT_ROOT)
+        && !root
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
 }
 
 /// The generated `limit_req_zone` file.
@@ -6237,15 +6255,29 @@ mod tests {
         );
     }
 
-    /// And a root with no `conf.d` of its own keeps the stock path rather
-    /// than inventing one. The container suite scans
+    /// And a root inside the stock tree with no `conf.d` of its own keeps
+    /// the stock one rather than inventing one. The container suite scans
     /// `/etc/nginx/sites-enabled`, which `include sites-enabled/*` globs:
     /// a `conf.d` directory created in there is something NGINX tries to
     /// `pread()` as a config file, and it refuses to start.
     #[test]
-    fn a_root_without_a_conf_d_is_not_given_one() {
+    fn a_root_inside_the_stock_tree_uses_the_stock_conf_d() {
+        assert_eq!(
+            conf_d_dir(Path::new("/etc/nginx/sites-enabled")),
+            PathBuf::from(CONF_D_DIR)
+        );
+    }
+
+    /// Any other root is its own tree: `batch --root <scratch>` read the
+    /// host's own `/etc/nginx/conf.d/stop-bots-trusted.conf`, and an apply
+    /// there would have rewritten or removed it.
+    #[test]
+    fn a_root_outside_the_stock_tree_never_reaches_out_of_itself() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(conf_d_dir(dir.path()), PathBuf::from(CONF_D_DIR));
+        assert_eq!(conf_d_dir(dir.path()), dir.path().join("conf.d"));
+        // Nor by walking out of the stock tree with `..`.
+        let sneaky = Path::new("/etc/nginx/../../tmp/scratch");
+        assert_eq!(conf_d_dir(sneaky), sneaky.join("conf.d"));
     }
 
     /// A normal host install must be exactly as it was. `root` falls back
