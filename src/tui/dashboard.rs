@@ -143,6 +143,8 @@ enum Focus {
     #[default]
     Categories,
     Countries,
+    /// The three published crawler ranges, under Geo.
+    Crawlers,
     Protection,
 }
 
@@ -279,6 +281,10 @@ pub struct Dashboard {
     selected_countries: Vec<String>,
     fetched_countries: Vec<(String, i64, i64)>,
     countries_state: ListState,
+    /// Googlebot, Bingbot and GPTBot's published ranges: what each holds
+    /// and when it was fetched. Enter downloads one.
+    crawlers: Vec<crate::ipranges::CrawlerSource>,
+    crawlers_state: ListState,
     protection_state: ListState,
     /// The automatic-detection toggles, reloaded on every `refresh` — the
     /// panel only displays them; `crate::cron`'s jobs read the same values
@@ -350,6 +356,7 @@ impl Dashboard {
             .filter_map(|d| d.is_new_here(db).map(|new| new.then_some(d)).transpose())
             .collect::<Result<_>>()?;
         self.reputation = db.list_reputation_sources()?;
+        self.crawlers = ipranges::crawler_sources(db)?;
         self.auto_apply_firewall = db.get_auto_apply_firewall()?;
         self.cron_status = crate::cron::status(db)?;
         self.script_state = crate::firewall::script_state(db)?;
@@ -359,6 +366,9 @@ impl Dashboard {
         }
         if self.countries_state.selected().is_none() {
             self.countries_state.select(Some(0));
+        }
+        if self.crawlers_state.selected().is_none() {
+            self.crawlers_state.select(Some(0));
         }
         if self.protection_state.selected().is_none() {
             self.protection_state.select(Some(0));
@@ -457,6 +467,10 @@ impl Dashboard {
                     ("m", "mode"),
                 ],
             ),
+            Focus::Crawlers => (
+                "Crawler ranges",
+                vec![("\u{2191}\u{2193}", "move"), ("Enter", "download")],
+            ),
             Focus::Protection => (
                 "Automatic",
                 vec![
@@ -494,9 +508,10 @@ impl Dashboard {
             Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .areas(columns_area);
 
-        let [settings_area, geo_area, firewall_area] = Layout::vertical([
+        let [settings_area, geo_area, crawlers_area, firewall_area] = Layout::vertical([
             Constraint::Length(POLICY_ROWS as u16 + 2),
             Constraint::Min(4),
+            Constraint::Length(ipranges::IpRangeSourceKind::ALL.len() as u16 + 2),
             Constraint::Length(4),
         ])
         .areas(left);
@@ -510,6 +525,7 @@ impl Dashboard {
 
         self.render_categories(frame, settings_area, theme);
         self.render_geo(frame, geo_area, theme);
+        self.render_crawlers(frame, crawlers_area, theme);
         self.render_firewall(frame, firewall_area, theme);
         self.render_protection(frame, protection_area, theme, label_width, columns);
         self.render_cron(frame, cron_area, theme, running_jobs);
@@ -564,6 +580,44 @@ impl Dashboard {
             theme,
         );
         frame.render_stateful_widget(list, area, &mut self.countries_state);
+    }
+
+    /// One row per published crawler range: whether its category blocks
+    /// it — which is what decides whether these addresses reach the
+    /// firewall script — how many ranges it holds, and how old they are.
+    fn render_crawlers(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+        let items: Vec<ListItem> = self
+            .crawlers
+            .iter()
+            .map(|source| ListItem::new(self.crawler_row_line(source, theme)))
+            .collect();
+        let focused = self.focus == Focus::Crawlers;
+        let list = crate::tui::select_in(
+            List::new(items).block(crate::tui::panel("Crawler IP ranges", focused, theme)),
+            focused,
+            theme,
+        );
+        frame.render_stateful_widget(list, area, &mut self.crawlers_state);
+    }
+
+    fn crawler_row_line(
+        &self,
+        source: &crate::ipranges::CrawlerSource,
+        theme: Theme,
+    ) -> Line<'static> {
+        let fetched = match source.last_fetched_at {
+            Some(at) => Span::from(format!(
+                "{} \u{00b7} {}",
+                source.range_count,
+                crate::present::ago(at)
+            )),
+            None => Span::from("not fetched").fg(theme.dim()),
+        };
+        Line::from(vec![
+            Span::from(format!("{:<9}", source.short_name())),
+            policy_tag(self.category_default(source.kind.category())),
+            fetched,
+        ])
     }
 
     /// How wide one column of Automatic blocking rows has to be, and how
@@ -1169,8 +1223,9 @@ impl Dashboard {
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
             let forward = key.code == KeyCode::Tab;
             self.focus = match (self.focus, forward) {
-                (Focus::Categories, true) | (Focus::Protection, false) => Focus::Countries,
-                (Focus::Countries, true) | (Focus::Categories, false) => Focus::Protection,
+                (Focus::Categories, true) | (Focus::Crawlers, false) => Focus::Countries,
+                (Focus::Countries, true) | (Focus::Protection, false) => Focus::Crawlers,
+                (Focus::Crawlers, true) | (Focus::Categories, false) => Focus::Protection,
                 (Focus::Protection, true) | (Focus::Countries, false) => Focus::Categories,
             };
             match self.focus {
@@ -1179,6 +1234,9 @@ impl Dashboard {
                 }
                 Focus::Countries if self.countries_state.selected().is_none() => {
                     self.countries_state.select(Some(0));
+                }
+                Focus::Crawlers if self.crawlers_state.selected().is_none() => {
+                    self.crawlers_state.select(Some(0));
                 }
                 Focus::Protection if self.protection_state.selected().is_none() => {
                     self.protection_state.select(Some(0));
@@ -1244,8 +1302,8 @@ impl Dashboard {
                     // plus the fixed "+ Add a country" row at index 0, so
                     // its last index is `len()`, not `len() - 1`.
                     if self.countries_state.selected() == Some(self.selected_countries.len()) {
-                        self.focus = Focus::Protection;
-                        self.protection_state.select(Some(0));
+                        self.focus = Focus::Crawlers;
+                        self.crawlers_state.select(Some(0));
                     } else {
                         self.countries_state.select_next();
                     }
@@ -1255,13 +1313,45 @@ impl Dashboard {
                 }
                 _ => return Ok(KeyOutcome::Ignored),
             },
+            Focus::Crawlers => match key.code {
+                KeyCode::Esc => return Ok(KeyOutcome::Ignored),
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.crawlers_state.selected() == Some(0) {
+                        self.focus = Focus::Countries;
+                        self.countries_state
+                            .select(Some(self.selected_countries.len()));
+                    } else {
+                        self.crawlers_state.select_previous();
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.crawlers_state.selected().unwrap_or(0) + 1 >= self.crawlers.len() {
+                        self.focus = Focus::Protection;
+                        self.protection_state.select(Some(0));
+                    } else {
+                        self.crawlers_state.select_next();
+                    }
+                }
+                // A download, which `App` owns: the key handler stays free
+                // of network I/O, as it does for `u`.
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if let Some(source) = self
+                        .crawlers_state
+                        .selected()
+                        .and_then(|i| self.crawlers.get(i))
+                    {
+                        return Ok(KeyOutcome::RefreshCrawlerRanges(source.kind));
+                    }
+                }
+                _ => return Ok(KeyOutcome::Ignored),
+            },
             Focus::Protection => match key.code {
                 KeyCode::Esc => return Ok(KeyOutcome::Ignored),
                 KeyCode::Up | KeyCode::Char('k') => {
                     if self.protection_state.selected() == Some(0) {
-                        self.focus = Focus::Countries;
-                        self.countries_state
-                            .select(Some(self.selected_countries.len()));
+                        self.focus = Focus::Crawlers;
+                        self.crawlers_state
+                            .select(Some(self.crawlers.len().saturating_sub(1)));
                     } else {
                         self.protection_state.select_previous();
                     }
@@ -2861,6 +2951,88 @@ mod tests {
         assert!(content.contains("1 range(s)"), "content was:\n{content}");
     }
 
+    /// Every crawler gets a row — fetched or not, since the row is where
+    /// the first fetch is offered — with its range count and age, and the
+    /// policy its category gives those addresses.
+    #[test]
+    fn render_shows_every_crawler_range_with_its_count_and_age() {
+        let db = Db::open_in_memory().unwrap();
+        ipranges::store(
+            &db,
+            ipranges::IpRangeSourceKind::GptBot,
+            &["20.171.206.0/24".to_string(), "52.230.152.0/24".to_string()],
+        )
+        .unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+
+        let mut terminal = test_terminal();
+        terminal
+            .draw(|frame| {
+                dashboard.render(
+                    frame,
+                    frame.area(),
+                    Theme::Dark,
+                    &[],
+                    &std::collections::HashSet::new(),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect()
+            })
+            .collect();
+        let row = |name: &str| {
+            rows.iter()
+                .find(|row| row.contains(name))
+                .cloned()
+                .unwrap_or_else(|| panic!("no {name} row in:\n{}", rows.join("\n")))
+        };
+
+        assert!(
+            rows.iter().any(|r| r.contains("Crawler IP ranges")),
+            "{}",
+            rows.join("\n")
+        );
+        for (name, expected) in [
+            ("Googlebot", "[ ALLOWED ] not fetched"),
+            ("Bingbot", "[ ALLOWED ] not fetched"),
+            ("GPTBot", "[ BLOCKED ] 2 \u{00b7} just now"),
+        ] {
+            let row = row(name);
+            assert!(row.contains(expected), "{name}: {row}");
+        }
+    }
+
+    /// Enter on a crawler row hands its download to `App`, and Down walks
+    /// from the last country through the three crawlers.
+    #[test]
+    fn enter_on_a_crawler_row_asks_for_that_download() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.focus = Focus::Countries;
+        let mut message = None;
+        let mut press = |code| {
+            dashboard
+                .handle_key(KeyEvent::from(code), &db, &mut message)
+                .unwrap()
+        };
+
+        press(KeyCode::Down);
+        press(KeyCode::Down);
+        let outcome = press(KeyCode::Enter);
+
+        assert_eq!(
+            outcome,
+            KeyOutcome::RefreshCrawlerRanges(ipranges::IpRangeSourceKind::BingBot)
+        );
+    }
+
     #[test]
     fn m_key_opens_the_geo_mode_popup_at_the_current_mode() {
         let db = Db::open_in_memory().unwrap();
@@ -3621,7 +3793,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_flows_from_countries_into_the_protection_panel_and_back() {
+    fn focus_flows_from_the_crawler_ranges_into_the_protection_panel_and_back() {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
@@ -3630,7 +3802,8 @@ mod tests {
         assert_eq!(dashboard.protection_state.selected(), Some(0));
 
         press(&mut dashboard, &db, KeyCode::Up);
-        assert_eq!(dashboard.focus, Focus::Countries);
+        assert_eq!(dashboard.focus, Focus::Crawlers);
+        assert_eq!(dashboard.crawlers_state.selected(), Some(2));
     }
 
     #[test]

@@ -353,6 +353,10 @@ pub enum KeyOutcome {
     /// reason [`Self::UpdateSource`] does — the screen's key handler stays
     /// free of I/O, and its tests stay fast and offline.
     UpdateEverything,
+    /// Enter on one of the Dashboard's crawler ranges: download just that
+    /// one. A network round-trip, so `App` does it, for the reason
+    /// [`Self::UpdateEverything`] gives.
+    RefreshCrawlerRanges(crate::ipranges::IpRangeSourceKind),
     /// The Dashboard's `a` key: work out what "Apply everything" would
     /// change, and ask. Reading every site file and the SSH log is I/O, so
     /// `App` does it, and hands the answer back for the Dashboard's

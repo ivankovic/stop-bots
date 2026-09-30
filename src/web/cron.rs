@@ -337,6 +337,38 @@ pub async fn update_everything(state: &AppState, by: &'static str) -> anyhow::Re
     Ok(UpdateRun::Done { summary, all_ok })
 }
 
+/// What downloading one list came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneRun {
+    /// It ran: what landed, or why nothing did.
+    Done(Result<String, String>),
+    /// Another download held the lease, last renewed at `since`.
+    Busy { since: i64 },
+}
+
+/// Downloads one list and stores it, holding the download lease for the
+/// duration: the console's per-source refresh. It records no cron job —
+/// one source is not what either scheduled job means by "done".
+pub async fn update_one(
+    state: &AppState,
+    source: crate::refresh::Source,
+) -> anyhow::Result<OneRun> {
+    let claim = state.with_db(|db| crate::refresh::claim(db, now())).await?;
+    let lease = match claim {
+        crate::refresh::Claim::Granted(lease) => lease,
+        crate::refresh::Claim::Busy { since } => return Ok(OneRun::Busy { since }),
+    };
+    let fetched = crate::refresh::fetch(&source).await;
+    let outcome = state
+        .with_db(move |db| {
+            let stored = fetched.and_then(|raw| crate::refresh::store(db, &source, &raw));
+            crate::refresh::release(db, &lease)?;
+            Ok(stored.map_err(|err| format!("{err:#}")))
+        })
+        .await?;
+    Ok(OneRun::Done(outcome))
+}
+
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -376,7 +408,8 @@ mod tests {
         state
     }
 
-    /// The console's button, its weekly job and its crawler job all wait
+    /// The console's button, its weekly job, its crawler job and a single
+    /// source's refresh all wait
     /// for a download someone else holds — another process, or this one —
     /// rather than fetching the same feeds beside it. Nothing is fetched
     /// and nothing is recorded, so the jobs stay due for the next tick.
@@ -393,6 +426,9 @@ mod tests {
         assert!(matches!(run, UpdateRun::Busy { .. }), "{run:?}");
 
         update_ip_ranges(&state).await.unwrap();
+        let one = crate::refresh::Source::CrawlerRanges(crate::ipranges::IpRangeSourceKind::GptBot);
+        let run = update_one(&state, one).await.unwrap();
+        assert!(matches!(run, OneRun::Busy { .. }), "{run:?}");
         for job in [CronJob::UpdateIpRanges, CronJob::UpdateEverything] {
             let summary = state
                 .with_db(move |db| db.get_cron_last_summary(job.id()))

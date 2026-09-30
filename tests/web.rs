@@ -2528,6 +2528,90 @@ async fn update_everything_waits_for_a_download_already_running() {
     assert!(flash.contains("Another update"), "was: {flash}");
 }
 
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Refreshing one crawler's ranges waits for a download already out, the
+/// same as "Update everything" does — one download at a time, whichever
+/// button started it.
+#[tokio::test]
+async fn a_crawler_range_refresh_waits_for_a_download_already_running() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let other = Db::open(&db_path).unwrap();
+    stop_bots::refresh::claim(&other, now_secs()).unwrap();
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/crawler-ranges", "source=googlebot").await;
+
+    assert!(flash.contains("Another update"), "was: {flash}");
+    assert!(
+        other.list_ip_range_sources().unwrap().is_empty(),
+        "nothing should have been stored"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_crawler_is_refused_before_anything_is_fetched() {
+    let (app, password, _tmp, _db) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/crawler-ranges", "source=yandexbot").await;
+
+    assert_eq!(flash, "Unknown crawler: yandexbot");
+}
+
+/// The Dashboard lists every crawler's published ranges — fetched or not,
+/// since the row is where the first fetch is offered — with how many
+/// ranges each holds, when it was fetched, and a refresh button for it.
+#[tokio::test]
+async fn the_dashboard_shows_each_crawler_range_with_its_count_and_age() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+    stop_bots::ipranges::store(
+        &Db::open(&db_path).unwrap(),
+        stop_bots::ipranges::IpRangeSourceKind::GoogleBot,
+        &["66.249.64.0/19".to_string(), "66.249.96.0/20".to_string()],
+    )
+    .unwrap();
+
+    let body = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    let panel = body
+        .split_once("Crawler IP ranges")
+        .map(|(_, rest)| rest.split("</section>").next().unwrap_or(rest))
+        .unwrap_or_else(|| panic!("no crawler panel:\n{body}"));
+    let row = |name: &str| {
+        panel
+            .split("<tr>")
+            .find(|row| row.contains(&format!("<td>{name}</td>")))
+            .unwrap_or_else(|| panic!("no {name} row:\n{panel}"))
+            .to_string()
+    };
+    for (name, expected) in [
+        ("Googlebot", r#"<td class="num">2</td>"#),
+        ("Googlebot", "just now"),
+        ("Bingbot", "NEVER"),
+        ("GPTBot", "NEVER"),
+        ("GPTBot", r#"name="source" value="gptbot""#),
+    ] {
+        assert!(
+            row(name).contains(expected),
+            "{name} lacks {expected}:\n{}",
+            row(name)
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_dashboard_offers_update_everything_and_apply_everything() {
     let (app, password, _tmp, _db) = app_with_db();

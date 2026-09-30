@@ -36,7 +36,7 @@ use serde::Deserialize;
 
 /// A published crawler IP-range source. See this module's doc comment for
 /// why all three share one parser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IpRangeSourceKind {
     GoogleBot,
     BingBot,
@@ -157,6 +157,46 @@ pub fn too_broad_note(cidrs: &[String]) -> Option<String> {
         dropped.len(),
         dropped[..dropped.len().min(SHOWN)].join(", ")
     ))
+}
+
+/// One crawler source as both front-ends' Dashboards show it: how many
+/// ranges it holds and when it was last fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrawlerSource {
+    pub kind: IpRangeSourceKind,
+    pub range_count: i64,
+    /// `None` until the first successful fetch.
+    pub last_fetched_at: Option<i64>,
+}
+
+impl CrawlerSource {
+    /// "Googlebot" rather than "Googlebot IP ranges", for a row under a
+    /// title that already says what the rows are.
+    pub fn short_name(&self) -> &'static str {
+        let name = self.kind.name();
+        name.strip_suffix(" IP ranges").unwrap_or(name)
+    }
+}
+
+/// Every crawler source, in [`IpRangeSourceKind::ALL`] order, whether or
+/// not it has a row yet.
+///
+/// Built from the kinds rather than from `ip_range_sources`: a source is
+/// only registered once it has been fetched, and a Dashboard that listed
+/// only the fetched ones would offer no way to fetch the rest.
+pub fn crawler_sources(db: &Db) -> Result<Vec<CrawlerSource>> {
+    let stored = db.list_ip_range_sources()?;
+    Ok(IpRangeSourceKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let row = stored.iter().find(|s| s.id == kind.id());
+            CrawlerSource {
+                kind,
+                range_count: row.map_or(0, |s| s.range_count),
+                last_fetched_at: row.and_then(|s| s.last_fetched_at),
+            }
+        })
+        .collect())
 }
 
 /// Registers every known IP-range source in `db` that isn't there yet, same
@@ -433,6 +473,34 @@ mod tests {
             .unwrap();
         assert_eq!(source.range_count, 3);
         assert!(source.last_fetched_at.is_some());
+    }
+
+    /// A source that was never fetched still gets a row, with nothing in
+    /// it — that row is where the Dashboards offer the first fetch.
+    #[test]
+    fn crawler_sources_lists_every_kind_fetched_or_not() {
+        let db = Db::open_in_memory().unwrap();
+        store(
+            &db,
+            IpRangeSourceKind::BingBot,
+            &["157.55.39.0/24".to_string()],
+        )
+        .unwrap();
+
+        let sources = crawler_sources(&db).unwrap();
+
+        let summary: Vec<(&str, i64, bool)> = sources
+            .iter()
+            .map(|s| (s.short_name(), s.range_count, s.last_fetched_at.is_some()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("Googlebot", 0, false),
+                ("Bingbot", 1, true),
+                ("GPTBot", 0, false)
+            ]
+        );
     }
 
     #[test]

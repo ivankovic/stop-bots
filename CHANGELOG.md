@@ -12,6 +12,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 - **Per-site bot overrides in the web console**: a site's page searches the
   bots and allows or blocks one on that site only, as the TUI's site detail does.
+- **Crawler IP ranges on both Dashboards**: Googlebot, Bingbot and GPTBot, each
+  with its range count, when it was fetched, and a refresh (Enter in the TUI)
+  that waits for any other download, like "Update everything".
 - **A weekly "Update every list" job in the internal cron**, the same plan as
   "Update everything", at a week plus up to 12 hours' jitter.
 - `set-detector <name>` and `list-detectors`: switch, TTL and threshold for

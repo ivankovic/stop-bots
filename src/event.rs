@@ -76,6 +76,13 @@ pub enum AppEvent {
         source_id: String,
         result: Result<Vec<String>, String>,
     },
+    /// One crawler's ranges, downloaded from the Dashboard (see
+    /// `App::start_crawler_ranges_refresh`): the raw body, stored back on
+    /// the main thread, or why the download failed.
+    CrawlerRangesFetched {
+        kind: crate::ipranges::IpRangeSourceKind,
+        result: Result<String, String>,
+    },
     /// The internal cron's background fetch for the `UpdateIpRanges` job
     /// (see `crate::cron`) has finished. Carries each of the three crawler
     /// sources' fetch outcome (parsed CIDRs, or a stringified error) so

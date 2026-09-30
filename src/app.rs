@@ -78,6 +78,9 @@ pub enum Job {
     /// Downloading every list this host uses, one source at a time. See
     /// [`App::start_update_everything`].
     UpdateEverything,
+    /// Downloading one crawler's published ranges. See
+    /// [`App::start_crawler_ranges_refresh`].
+    RefreshCrawlerRanges(crate::ipranges::IpRangeSourceKind),
     /// Working out what "Apply everything" would change, before asking.
     /// See [`App::start_apply_preview`].
     PreviewApply,
@@ -98,6 +101,7 @@ impl Job {
             Job::ApplyWebAccess => "setting up NGINX for this console".to_string(),
             Job::CheckSiteStatuses => "checking site config".to_string(),
             Job::UpdateEverything => "downloading every list".to_string(),
+            Job::RefreshCrawlerRanges(kind) => format!("downloading {}", kind.name()),
             Job::PreviewApply => "working out what applying would change".to_string(),
         }
     }
@@ -223,6 +227,9 @@ pub struct App {
     /// The download lease the scheduled crawler-range update holds while
     /// its fetch is out. See [`crate::refresh::Lease`].
     ip_ranges_lease: Option<crate::refresh::Lease>,
+    /// The download lease a one-source crawler refresh holds while its
+    /// fetch is out — see [`App::start_crawler_ranges_refresh`].
+    crawler_refresh_lease: Option<crate::refresh::Lease>,
     /// Set while "Apply everything" is waiting on its NGINX half, so
     /// [`App::finish_site_apply`] knows to start the firewall half after
     /// it. The two are independent — whichever fails, the other still gets
@@ -365,6 +372,7 @@ impl App {
             firewall_out: None,
             update_all: None,
             ip_ranges_lease: None,
+            crawler_refresh_lease: None,
             apply_everything: false,
             cron_apply_nginx: false,
         };
@@ -535,6 +543,9 @@ impl App {
             }
             Event::App(AppEvent::EverythingSourceFetched { source, result }) => {
                 self.finish_update_everything_source(source, result)?
+            }
+            Event::App(AppEvent::CrawlerRangesFetched { kind, result }) => {
+                self.finish_crawler_ranges_refresh(kind, result)?
             }
             Event::App(AppEvent::WebAccessApplied { plan, result }) => {
                 self.finish_web_access(*plan, result)?
@@ -1457,6 +1468,65 @@ impl App {
         }
     }
 
+    /// Downloads one crawler's published ranges — Enter on a row of the
+    /// Dashboard's Crawler IP ranges panel, the TUI's `update-ip-ranges`.
+    ///
+    /// Under the download lease, like `u`: while "update everything", the
+    /// scheduled crawler job or another process's download is out it says
+    /// so and fetches nothing, and they in turn wait for this one. It
+    /// records no cron job — one source is not what the daily job means
+    /// by "done".
+    fn start_crawler_ranges_refresh(&mut self, kind: ipranges::IpRangeSourceKind) {
+        if self.crawler_refresh_lease.is_some() {
+            self.message = Some("Already downloading a crawler's ranges.".to_string());
+            return;
+        }
+        let lease = match crate::refresh::claim(&self.db, now_secs()) {
+            Ok(crate::refresh::Claim::Granted(lease)) => lease,
+            Ok(crate::refresh::Claim::Busy { since }) => {
+                self.message = Some(crate::refresh::Claim::busy_message(since));
+                return;
+            }
+            Err(err) => {
+                self.message = Some(format!("Could not start the download: {err:#}"));
+                return;
+            }
+        };
+        self.crawler_refresh_lease = Some(lease);
+        self.jobs_in_flight.insert(Job::RefreshCrawlerRanges(kind));
+        self.message = Some(format!("Downloading {}\u{2026}", kind.name()));
+        let sender = self.events.sender();
+        tokio::spawn(async move {
+            let source = crate::refresh::Source::CrawlerRanges(kind);
+            let result = crate::refresh::fetch(&source)
+                .await
+                .map_err(|err| format!("{err:#}"));
+            let _ = sender.send(Event::App(AppEvent::CrawlerRangesFetched { kind, result }));
+        });
+    }
+
+    /// Stores what [`Self::start_crawler_ranges_refresh`] downloaded, says
+    /// how it went and gives the lease back.
+    fn finish_crawler_ranges_refresh(
+        &mut self,
+        kind: ipranges::IpRangeSourceKind,
+        result: Result<String, String>,
+    ) -> Result<()> {
+        self.jobs_in_flight.remove(&Job::RefreshCrawlerRanges(kind));
+        let source = crate::refresh::Source::CrawlerRanges(kind);
+        let outcome = result.and_then(|raw| {
+            crate::refresh::store(&self.db, &source, &raw).map_err(|err| format!("{err:#}"))
+        });
+        if let Some(lease) = self.crawler_refresh_lease.take() {
+            crate::refresh::release(&self.db, &lease)?;
+        }
+        self.message = Some(match outcome {
+            Ok(summary) => format!("{}: {summary}.", kind.name()),
+            Err(err) => format!("{} update failed: {err}", kind.name()),
+        });
+        self.refresh()
+    }
+
     /// Works out what "Apply everything" would do, for the Dashboard to ask
     /// about before doing it: the site files that would change, the rules
     /// added and removed against the applied script, and the lockout
@@ -1800,6 +1870,10 @@ impl App {
                 self.start_update_everything(false);
                 return Ok(());
             }
+            KeyOutcome::RefreshCrawlerRanges(kind) => {
+                self.start_crawler_ranges_refresh(kind);
+                return Ok(());
+            }
             KeyOutcome::PreviewApplyEverything => {
                 self.start_apply_preview();
                 return Ok(());
@@ -2111,6 +2185,93 @@ mod tests {
         assert!(message.contains("Another update"), "was: {message}");
         assert!(app.update_all.is_none());
         assert!(!app.jobs_in_flight.contains(&Job::UpdateEverything));
+    }
+
+    /// Refreshing one crawler's ranges waits for a download someone else
+    /// holds, the same as `u` — nothing starts, and the message says why.
+    #[tokio::test]
+    async fn a_crawler_refresh_while_another_download_runs_fetches_nothing() {
+        let mut app = test_app();
+        crate::refresh::claim(&app.db, now_secs()).unwrap();
+
+        app.start_crawler_ranges_refresh(ipranges::IpRangeSourceKind::GoogleBot);
+
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("Another update"), "was: {message}");
+        assert!(app.crawler_refresh_lease.is_none());
+        assert!(!app.jobs_in_flight.contains(&Job::RefreshCrawlerRanges(
+            ipranges::IpRangeSourceKind::GoogleBot
+        )));
+    }
+
+    /// A finished crawler refresh stores what arrived, says so, and gives
+    /// the lease back so the next download can start. The daily crawler
+    /// job is left alone: one source is not all three.
+    #[tokio::test]
+    async fn a_finished_crawler_refresh_stores_the_ranges_and_frees_the_lease() {
+        let mut app = test_app();
+        let kind = ipranges::IpRangeSourceKind::GptBot;
+        let lease = match crate::refresh::claim(&app.db, now_secs()).unwrap() {
+            crate::refresh::Claim::Granted(lease) => lease,
+            busy => panic!("{busy:?}"),
+        };
+        app.crawler_refresh_lease = Some(lease);
+        app.jobs_in_flight.insert(Job::RefreshCrawlerRanges(kind));
+
+        app.finish_crawler_ranges_refresh(
+            kind,
+            Ok(r#"{"prefixes":[{"ipv4Prefix":"20.171.206.0/24"}]}"#.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            app.message.as_deref(),
+            Some("GPTBot IP ranges: 1 range(s).")
+        );
+        assert_eq!(
+            app.db.ip_ranges_for_source("gptbot").unwrap(),
+            vec!["20.171.206.0/24".to_string()]
+        );
+        assert!(!app
+            .jobs_in_flight
+            .contains(&Job::RefreshCrawlerRanges(kind)));
+        assert!(
+            matches!(
+                crate::refresh::claim(&app.db, now_secs()).unwrap(),
+                crate::refresh::Claim::Granted(_)
+            ),
+            "the lease was not given back"
+        );
+        assert_eq!(
+            app.db
+                .get_cron_last_run(CronJob::UpdateIpRanges.id())
+                .unwrap(),
+            None
+        );
+    }
+
+    /// A failed download is a message, and still frees the lease.
+    #[tokio::test]
+    async fn a_failed_crawler_refresh_says_so_and_frees_the_lease() {
+        let mut app = test_app();
+        let kind = ipranges::IpRangeSourceKind::BingBot;
+        let lease = match crate::refresh::claim(&app.db, now_secs()).unwrap() {
+            crate::refresh::Claim::Granted(lease) => lease,
+            busy => panic!("{busy:?}"),
+        };
+        app.crawler_refresh_lease = Some(lease);
+
+        app.finish_crawler_ranges_refresh(kind, Err("timed out".to_string()))
+            .unwrap();
+
+        assert_eq!(
+            app.message.as_deref(),
+            Some("Bingbot IP ranges update failed: timed out")
+        );
+        assert!(matches!(
+            crate::refresh::claim(&app.db, now_secs()).unwrap(),
+            crate::refresh::Claim::Granted(_)
+        ));
     }
 
     /// And the scheduled jobs wait for `u`'s run in the same process:

@@ -46,7 +46,7 @@ const LINES: [&str; MAX_LINES] = [
     "  :                  command palette: every action here by name, fuzzy-matched",
     "  Tab, Shift+Tab     next / previous panel on this screen",
     "  Up/Down, j/k       move selection (it also flows from one panel into the next)",
-    "  Enter              open or change the selected item;  Space toggles an on/off row",
+    "  Enter              open, change or download the selected item;  Space toggles an on/off row",
     "",
     "Dashboard",
     "  m / F              switch geo mode (Blocklist / Allowlist) / write the firewall script",

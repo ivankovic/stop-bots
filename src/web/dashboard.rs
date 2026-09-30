@@ -56,6 +56,8 @@ struct View {
     fetched_countries: Vec<(String, i64, i64)>,
     detectors: Vec<DetectorRow>,
     feeds: Vec<crate::db::ReputationSource>,
+    /// Googlebot, Bingbot and GPTBot's published ranges.
+    crawlers: Vec<crate::ipranges::CrawlerSource>,
     site_count: usize,
     sources_total: usize,
     sources_stale: usize,
@@ -143,6 +145,7 @@ fn load(
             })
             .collect::<anyhow::Result<_>>()?,
         feeds: db.list_reputation_sources()?,
+        crawlers: crate::ipranges::crawler_sources(db)?,
         site_count: db.list_sites()?.len(),
         sources_total: sources.len(),
         sources_stale,
@@ -209,6 +212,7 @@ fn body(view: &View, ctx: &Ctx) -> Markup {
                 (categories_panel(view, ctx))
                 (geo_panel(view, ctx))
                 (feeds_panel(view, ctx))
+                (crawlers_panel(view, ctx))
                 (firewall_panel(view, ctx))
                 (web_access_panel(view, ctx))
             }
@@ -637,6 +641,65 @@ fn feeds_panel(view: &View, ctx: &Ctx) -> Markup {
     )
 }
 
+// ---- crawler ranges ----
+
+fn category_policy(view: &View, category: Category) -> Policy {
+    match category {
+        Category::Scanner => view.scanner,
+        Category::Search => view.search,
+        Category::Ai => view.ai,
+    }
+}
+
+/// The three crawlers that publish their addresses. Not switches like the
+/// feeds above: a crawler's ranges are blocked exactly when its category
+/// is, and they are what tells a real Googlebot from a forged one either
+/// way — so the column says which way its category points, and the one
+/// action is a download.
+fn crawlers_panel(view: &View, ctx: &Ctx) -> Markup {
+    layout::panel(
+        "Crawler IP ranges",
+        Some("Blocked with the crawler's category; also how a forged crawler is told apart"),
+        html! {
+            table {
+                thead { tr {
+                    th { "Crawler" }
+                    th { "Category" }
+                    th .right { "Ranges" }
+                    th { "Last fetched" }
+                    th .right { "Action" }
+                } }
+                tbody {
+                    @for source in &view.crawlers {
+                        tr {
+                            td { (source.short_name()) }
+                            td {
+                                (policy_pill(category_policy(view, source.kind.category())))
+                                " "
+                                span .hint { (crate::present::category_label(source.kind.category())) }
+                            }
+                            td .num { (source.range_count) }
+                            td {
+                                @match source.last_fetched_at {
+                                    Some(at) => { (crate::present::ago(at)) }
+                                    None => { (layout::pill("NEVER", PillKind::Warn)) }
+                                }
+                            }
+                            td .right {
+                                form .inline method="post" action=(ctx.url("/crawler-ranges")) {
+                                    (layout::csrf_field(ctx))
+                                    input type="hidden" name="source" value=(source.kind.id());
+                                    button type="submit" { "Refresh" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    )
+}
+
 // ---- the firewall script ----
 
 /// The one artifact the Dashboard exists to produce: how many rules it
@@ -988,6 +1051,7 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
         .route(&base.url("/detector"), post(set_detector))
         .route(&base.url("/detector-ttl"), post(set_detector_ttl))
         .route(&base.url("/feed"), post(set_feed))
+        .route(&base.url("/crawler-ranges"), post(update_crawler_ranges))
         .route(&base.url("/render-firewall"), post(render_firewall))
         .route(
             &base.url("/auto-apply-firewall"),
@@ -1334,6 +1398,59 @@ async fn update_all(State(state): State<AppState>, _auth: Auth) -> Response {
             back_with(&state.base, "/", &summary, all_ok)
         }
         Ok(Ok(UpdateRun::Busy { since })) => back_with(
+            &state.base,
+            "/",
+            &crate::refresh::Claim::busy_message(since),
+            false,
+        ),
+        Ok(Err(err)) => back_with(&state.base, "/", &format!("{err:#}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("The download stopped unexpectedly: {err}"),
+            false,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+struct CrawlerForm {
+    source: String,
+}
+
+/// Downloads one crawler's published ranges — the console's
+/// `update-ip-ranges`. Under the download lease like "Update everything",
+/// and on a task of its own for the same reason.
+async fn update_crawler_ranges(
+    State(state): State<AppState>,
+    _auth: Auth,
+    Form(form): Form<CrawlerForm>,
+) -> Response {
+    use crate::web::cron::OneRun;
+    let Some(kind) = crate::ipranges::IpRangeSourceKind::from_id(&form.source) else {
+        return back_with(
+            &state.base,
+            "/",
+            &format!("Unknown crawler: {}", form.source),
+            false,
+        );
+    };
+    let task = state.clone();
+    let run = tokio::spawn(async move {
+        crate::web::cron::update_one(&task, crate::refresh::Source::CrawlerRanges(kind)).await
+    })
+    .await;
+    match run {
+        Ok(Ok(OneRun::Done(Ok(summary)))) => back_with(
+            &state.base,
+            "/",
+            &format!("{}: {summary}.", kind.name()),
+            true,
+        ),
+        Ok(Ok(OneRun::Done(Err(err)))) => {
+            back_with(&state.base, "/", &format!("{}: {err}", kind.name()), false)
+        }
+        Ok(Ok(OneRun::Busy { since })) => back_with(
             &state.base,
             "/",
             &crate::refresh::Claim::busy_message(since),
