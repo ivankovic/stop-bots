@@ -235,6 +235,10 @@ pub struct Probe {
     /// its control characters replaced (it is the client's text).
     #[serde(default)]
     pub access_log_unparsed_sample: Option<String>,
+    /// Of the public lines in [`Self::access_log_clients`], how many came
+    /// from a CDN's edge addresses. `None` when the log could not be read.
+    #[serde(default)]
+    pub access_log_cdn: Option<usize>,
 }
 
 /// How much of the access log a probe reads: its last 32 MB. Every
@@ -353,6 +357,7 @@ pub fn probe(
         access_log_clients: access_readable.then_some((survey.public, survey.counts.parsed)),
         access_log_lines: access_readable.then_some((survey.counts.lines, survey.counts.parsed)),
         access_log_unparsed_sample: survey.unparsed_sample.clone(),
+        access_log_cdn: access_readable.then_some(survey.cdn),
         nginx_home,
         managed_dir_in_container: container.as_ref().map(|name| {
             // `test -d` inside the container, at the path the generated
@@ -819,6 +824,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(log_sources(probe));
     checks.push(access_log_format(probe));
     checks.push(access_log_clients(probe));
+    if let Some(check) = cdn_edges(probe) {
+        checks.push(check);
+    }
     checks.push(ssh_login_allowlist(db)?);
     if let Some(check) = trusted_by_hand(db)? {
         checks.push(check);
@@ -1467,6 +1475,48 @@ fn access_log_clients(probe: &Probe) -> Check {
     }
 }
 
+/// Fewer public lines than this say nothing about who is in front of NGINX:
+/// a host that has served twelve requests may have had them all from one
+/// monitoring service that happens to run on Cloudflare Workers.
+const CDN_MIN_LINES: usize = 50;
+
+/// The share of public lines from CDN edges that means NGINX is behind the
+/// CDN. A site served through Cloudflare logs nothing *but* its edges; one
+/// served directly sees a few from Workers and Cloudflare's own crawlers.
+const CDN_MIN_SHARE: f64 = 0.5;
+
+/// Whether NGINX is logging a CDN's edges instead of its visitors.
+///
+/// Behind Cloudflare without `set_real_ip_from`, every client address in
+/// the log is an edge. The detectors skip edge addresses (blocking one
+/// blocks everyone routed through it), so on such a host they see nobody
+/// they are allowed to block, and every other check here still reads OK.
+///
+/// Absent when there is nothing to say, like its neighbours.
+fn cdn_edges(probe: &Probe) -> Option<Check> {
+    let (public, _) = probe.access_log_clients?;
+    let cdn = probe.access_log_cdn?;
+    if public < CDN_MIN_LINES || (cdn as f64) < public as f64 * CDN_MIN_SHARE {
+        return None;
+    }
+    Some(Check {
+        id: "cdn-edges",
+        title: "Clients arrive through a CDN",
+        level: Level::Warn,
+        detail: format!(
+            "{cdn} of {public} logged request(s) came from {}'s edge addresses \u{2014} the \
+             detectors never block those, so behind it they cannot block anyone",
+            crate::cdn::NAME
+        ),
+        fix: Some(format!(
+            "Tell NGINX to log the visitor's address, from the header {} adds, in the \
+             `http` block (ngx_http_realip_module): {}",
+            crate::cdn::NAME,
+            crate::cdn::real_ip_config()
+        )),
+    })
+}
+
 /// Below this share of lines parsed, the access log is mostly in a format
 /// the detectors cannot read. Not zero: a log that parses to nothing is
 /// the obvious case, but a custom `log_format` added beside the stock one
@@ -1890,6 +1940,7 @@ mod tests {
             access_log_clients: Some((40, 41)),
             access_log_lines: Some((41, 41)),
             access_log_unparsed_sample: None,
+            access_log_cdn: Some(0),
             // The ordinary host: NGINX is a unit here, and the two
             // container fields have nothing to answer. Every
             // container-arrangement test below states its own.
@@ -3444,6 +3495,59 @@ mod tests {
         object.remove("access_log_unparsed_sample");
         let probe: Probe = serde_json::from_value(stored).unwrap();
         assert_eq!(probe.access_log_lines, None);
+    }
+
+    /// A synthetic access log: `edge` lines from Cloudflare addresses and
+    /// `direct` lines from a documentation range, surveyed the way a probe
+    /// reads a real one.
+    fn cdn_probe(edge: usize, direct: usize) -> Probe {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        let line = |ip: String| {
+            format!("{ip} - - [28/Sep/2026:06:33:01 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"UA\"\n")
+        };
+        let text: String = (0..edge)
+            .map(|i| line(format!("172.70.{}.{}", i / 200, i % 200 + 1)))
+            .chain((0..direct).map(|i| line(format!("198.51.100.{}", i % 250 + 1))))
+            .collect();
+        std::fs::write(&log, text).unwrap();
+        let survey = access_log_sample(&log, 403).expect("readable");
+        Probe {
+            access_log_clients: Some((survey.public, survey.counts.parsed)),
+            access_log_cdn: Some(survey.cdn),
+            ..Probe::default()
+        }
+    }
+
+    /// Behind Cloudflare without `set_real_ip_from`, the log holds nothing
+    /// but edges, the detectors can block none of them, and every other
+    /// check reads OK. This is the one that says so, and says what to add.
+    #[test]
+    fn an_access_log_of_cdn_edges_is_reported_with_the_real_ip_fix() {
+        let probe = cdn_probe(180, 20);
+        assert_eq!(probe.access_log_cdn, Some(180));
+
+        let check = cdn_edges(&probe).expect("a warning");
+
+        assert_eq!(check.level, Level::Warn);
+        assert!(check.detail.contains("180 of 200"), "{}", check.detail);
+        let fix = check.fix.clone().unwrap_or_default();
+        for needle in [
+            "set_real_ip_from 173.245.48.0/20;",
+            "real_ip_header CF-Connecting-IP;",
+        ] {
+            assert!(fix.contains(needle), "no {needle:?} in: {fix}");
+        }
+        assert_eq!(crate::present::check_label(&check), "cdn");
+    }
+
+    /// A host served directly sees an edge now and then — Workers, or a
+    /// crawler hosted there — and a new host has too little to go on.
+    #[test]
+    fn a_few_edge_addresses_are_not_a_cdn_in_front() {
+        for (edge, direct, why) in [(10, 190, "mostly direct"), (20, 0, "too few lines")] {
+            assert!(cdn_edges(&cdn_probe(edge, direct)).is_none(), "{why}");
+        }
     }
 
     /// The probe's sample of a real file: counts, quoted line and all.

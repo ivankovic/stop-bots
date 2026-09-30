@@ -91,8 +91,7 @@ pub struct ScanBlockOutcome {
     /// known-crawler exclusion.
     pub candidates: usize,
     /// Of `candidates`, how many were skipped because they matched a known
-    /// crawler's published IP range. Always 0 for
-    /// [`block_ssh_scanners`], which has no such exclusion.
+    /// crawler's published IP range, or a CDN's edge (see [`crate::cdn`]).
     pub skipped_known_crawlers: usize,
     /// Whether the known-crawler exclusion had any ranges to check
     /// against — `false` means `update-ip-ranges` has never been run for
@@ -823,6 +822,13 @@ fn add_block_rules(
     ttl_days: i64,
     trigger: Trigger<'_>,
 ) -> Result<ScanBlockOutcome> {
+    // Never a CDN's edge, whichever detector found it: behind the CDN,
+    // blocking one blocks every visitor routed through it. Counted with
+    // the crawlers, the other published ranges nothing here blocks.
+    let (edges, kept): (Vec<_>, Vec<_>) = kept
+        .into_iter()
+        .partition(|(ip, _)| crate::cdn::is_edge(ip));
+    let skipped_known_crawlers = skipped_known_crawlers + edges.len();
     // One transaction for the whole pass: a first scan of a busy log can
     // block hundreds of addresses, and each insert (and the evidence it
     // spends) committed on its own was one fsync apiece -- two minutes on
@@ -1540,6 +1546,33 @@ mod tests {
         let rules = db.list_firewall_rules().unwrap();
         assert_eq!(rules[0].address, "203.0.113.9");
         assert!(rules[0].expires_at.is_some());
+    }
+
+    /// Behind Cloudflare, the address that asked for `/.env` is the edge
+    /// every other visitor comes through too. Blocking it would block them
+    /// all, so a detector leaves it alone and blocks the one that is not
+    /// an edge — in both families.
+    #[test]
+    fn a_detector_never_blocks_a_cdn_edge_address() {
+        let db = Db::open_in_memory().unwrap();
+        let log = [
+            probe_line("104.16.12.34", "/.env"),
+            probe_line("2606:4700::6810:1", "/.env"),
+            probe_line("203.0.113.9", "/.env"),
+        ]
+        .concat();
+
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+        assert_eq!(outcome.skipped_known_crawlers, 2, "{outcome:?}");
+        let blocked: Vec<String> = db
+            .list_firewall_rules()
+            .unwrap()
+            .into_iter()
+            .map(|rule| rule.address)
+            .collect();
+        assert_eq!(blocked, ["203.0.113.9"]);
     }
 
     #[test]

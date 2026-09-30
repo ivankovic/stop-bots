@@ -44,6 +44,8 @@ pub mod blocks;
 #[doc(hidden)]
 pub mod botlist;
 #[doc(hidden)]
+pub mod cdn;
+#[doc(hidden)]
 pub mod cron;
 #[doc(hidden)]
 pub mod db;

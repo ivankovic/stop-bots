@@ -1047,6 +1047,9 @@ pub struct Survey {
     /// Lines, not distinct addresses: one proxy in front of everything is
     /// exactly the case worth catching, and it has one address.
     pub public: usize,
+    /// Of `public`, lines from a CDN's edge addresses (see [`crate::cdn`]):
+    /// most of them means NGINX is logging the CDN, not the visitor.
+    pub cdn: usize,
     /// The first line that did not parse, as it is safe to show.
     pub unparsed_sample: Option<String>,
     turned_away: HashMap<String, (u64, u64)>,
@@ -1077,6 +1080,9 @@ impl Survey {
             return;
         }
         self.public += 1;
+        if crate::cdn::is_edge_addr(line.ip) {
+            self.cdn += 1;
+        }
         if line.user_agent.is_empty() || line.user_agent == "-" {
             return;
         }

@@ -86,6 +86,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "log-sources" => "logs",
         "access-log-format" => "log format",
         "access-log-clients" => "clients",
+        "cdn-edges" => "cdn",
         "nginx-deployment" => "runtime",
         "firewall-reaches-containers" => "containers",
         "ssh-login-allowlist" => "ssh",

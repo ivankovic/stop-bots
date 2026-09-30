@@ -156,6 +156,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   missing "not installed", and applying with it is refused, naming the package.
 - A new database renders for the backend this host has, preferring nftables. One
   that has chosen, or has written a script, keeps its backend.
+- **No detector blocks a Cloudflare edge address**, from a compiled-in copy of
+  Cloudflare's published ranges. `status` warns when most of the access log
+  comes from them, and gives the `set_real_ip_from` lines that fix it.
 
 ### Fixed
 
