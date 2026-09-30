@@ -4216,11 +4216,39 @@ fn render_firewall_follows_the_stored_backend() {
         "--ssh-log",
         "tests/fixtures/logs/auth.log",
     ])
-    .stdout(predicate::str::contains("run: sh "));
+    .stdout(predicate::str::contains("firewall.sh"));
     let written = fs::read_to_string(&script).unwrap();
     assert!(
         written.contains("-A STOP-BOTS -s 198.51.100.7 -j DROP"),
         "script was:\n{written}"
+    );
+}
+
+/// A script written with `--out` is not the one the boot unit loads, so
+/// running it by hand would last until the next reboot. The hint names
+/// the apply that does persist, not `nft -f` on the file.
+#[test]
+fn render_firewall_out_points_at_apply_not_a_hand_run() {
+    let fx = Fixture::new();
+    let script = fx.db.with_file_name("fw.out");
+    fx.run(&["add-firewall-rule", "--address", "198.51.100.7"]);
+    fx.run(&["set-firewall-backend", "--backend", "nftables"]);
+
+    let output = fx.run(&[
+        "render-firewall",
+        "--out",
+        script.to_str().unwrap(),
+        "--ssh-log",
+        "tests/fixtures/logs/auth.log",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.get_output().stdout).to_string();
+    assert!(
+        stdout.contains("stop-bots render-firewall --apply"),
+        "the hint does not name the apply:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("nft -f"),
+        "the hint still suggests running the file by hand:\n{stdout}"
     );
 }
 

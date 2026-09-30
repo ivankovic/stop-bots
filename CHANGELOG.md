@@ -167,6 +167,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Fixed
 
+- `render-firewall --out` no longer suggests running the file by hand, which would
+  not survive a reboot; it points at `render-firewall --apply`.
+
 - Messages that named the wrong key: "render the firewall (f)" (the key is `F`,
   and `a` applies) and "press s, then r" (NGINX is `n`).
 

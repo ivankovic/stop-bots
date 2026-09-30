@@ -4049,7 +4049,8 @@ fn firewall_target(
 ///
 /// Without `--out` the script goes beside the applied one — the file the
 /// boot unit loads — and `--apply` is what promotes it. With `--out` alone
-/// it goes where the operator said, which is theirs to run. With both,
+/// it goes where the operator said, to read; running it by hand would not
+/// survive a reboot, so the hint still points at `--apply`. With both,
 /// `--out` names the applied script, as it does for `batch`.
 fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<()> {
     use stop_bots::firewall::{ApplyStep, WriteStep};
@@ -4083,10 +4084,15 @@ fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<(
              Re-run with --force if you're sure."
         ),
         (WriteStep::Failed(err), _) => anyhow::bail!("{err}"),
+        // Running this file by hand would enforce it until the next boot
+        // and no longer: the boot unit loads the applied script, which only
+        // `--apply` replaces. So the hint names the apply, not `nft -f`.
         (WriteStep::Written, ApplyStep::NotAsked) if request.out.is_some() => println!(
-            "Wrote {} rule(s) to {rendered}. Not applied — review it, then run: {} {rendered}",
+            "Wrote {} rule(s) to {rendered}, which nothing loads at boot. Not applied — to \
+             apply them, run `stop-bots render-firewall --apply`: it checks for a lockout again, \
+             runs the script, and makes it the one loaded at boot ({}).",
             outcome.entries,
-            backend.apply_command(),
+            outcome.applied_path.display()
         ),
         (WriteStep::Written, ApplyStep::NotAsked) => println!(
             "Wrote {} rule(s) to {rendered}. Not applied — review it, then run \
