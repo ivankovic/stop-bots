@@ -763,12 +763,25 @@ pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
     // `render-firewall --apply` rather than `nft -f <script>`: a script run
     // by hand is enforced now but never becomes what this unit loads, and
     // the one at `script` is only ever what was last applied.
-    steps.push(format!(
-        "not started: it loads {} at boot, which only an apply writes. Review the rules, \
-         then run `stop-bots render-firewall --apply`: it checks for a lockout, runs the \
-         script, and puts it there",
-        script.display()
-    ));
+    //
+    // Which of the two things to say depends on whether an apply has
+    // already happened. The README's quick start runs `batch --apply`
+    // first, and telling that operator to go and apply what they just
+    // applied read as if their rules had not taken.
+    if layout.real && script.is_file() {
+        steps.push(format!(
+            "not started, and it need not be: {} holds the rules the last apply loaded, \
+             and from the next boot on this unit loads it",
+            script.display()
+        ));
+    } else {
+        steps.push(format!(
+            "not started: it loads {} at boot, which only an apply writes. Review the rules, \
+             then run `stop-bots render-firewall --apply`: it checks for a lockout, runs the \
+             script, and puts it there",
+            script.display()
+        ));
+    }
 
     Ok(steps)
 }
