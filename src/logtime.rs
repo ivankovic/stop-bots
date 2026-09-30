@@ -168,7 +168,11 @@ pub fn iso8601(text: &str) -> Option<i64> {
 /// syslog daemon that wrote the line did. `0` if it cannot say, which is
 /// right on the servers this runs on: they are nearly all on UTC.
 pub fn local_offset(utc: i64) -> i64 {
-    let time: libc::time_t = utc as libc::time_t;
+    // Typed by `localtime_r`'s parameter rather than by naming
+    // `libc::time_t`, which the libc crate deprecates on musl — the target
+    // the release binaries are built for — pending its move to 64 bits
+    // there. On every 64-bit target this is already an i64.
+    let time = utc as _;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     // SAFETY: both pointers are to live locals of the right type, and
     // `localtime_r` is the reentrant form that writes only into `tm`.
