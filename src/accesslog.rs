@@ -664,7 +664,8 @@ pub fn successful_user_agent_counts(log_text: &str) -> HashMap<String, u64> {
     let mut counts: HashMap<String, u64> = HashMap::new();
     for line in log_text.lines().filter_map(parse_line) {
         if counts_as_a_visit(&line) {
-            *counts.entry(line.user_agent).or_insert(0) += 1;
+            let user_agent = crate::db::stored_user_agent(&line.user_agent).to_string();
+            *counts.entry(user_agent).or_insert(0) += 1;
         }
     }
     counts
@@ -995,7 +996,15 @@ impl Observer {
         }
         if let Some(tally) = &mut self.user_agents {
             if counts_as_a_visit(&line) {
-                *tally.entry(line.user_agent.clone()).or_insert(0) += 1;
+                // Cut as it will be stored, so that two agents the table
+                // cannot tell apart are one entry here too.
+                let user_agent = crate::db::stored_user_agent(&line.user_agent);
+                match tally.get_mut(user_agent) {
+                    Some(count) => *count += 1,
+                    None => {
+                        tally.insert(user_agent.to_string(), 1);
+                    }
+                }
             }
         }
         if is_local_or_private(&line.ip) {
@@ -1676,6 +1685,22 @@ mod tests {
         let counts = successful_user_agent_counts(&log);
         assert_eq!(counts.get("Mozilla/5.0"), Some(&2));
         assert_eq!(counts.get("curl/8.0"), Some(&1));
+    }
+
+    /// Tallied as the stats will store them: two agents that agree on
+    /// their first 512 characters are one.
+    #[test]
+    fn the_scheduled_tally_cuts_a_long_user_agent_as_it_will_be_stored() {
+        let prefix = "x".repeat(crate::db::MAX_STORED_USER_AGENT_CHARS);
+        let mut observer = Observer::new(Watch::default()).counting_user_agents();
+        for tail in ["a", "b"] {
+            let line = line_with("203.0.113.5", 200, &format!("{prefix}{tail}"));
+            observer.line(&line, Clock::Ordinal(0));
+        }
+
+        let (_, user_agents, _) = observer.finish();
+
+        assert_eq!(user_agents, HashMap::from([(prefix, 2)]));
     }
 
     #[test]

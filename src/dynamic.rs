@@ -572,7 +572,13 @@ impl Live {
             }
         }
 
-        let blocked_uas: HashSet<String> = db.list_blocked_user_agents()?.into_iter().collect();
+        // As the stats cut them, so a user agent blocked whole still shows
+        // as blocked against its row.
+        let blocked_uas: HashSet<String> = db
+            .list_blocked_user_agents()?
+            .iter()
+            .map(|ua| crate::db::stored_user_agent(ua).to_string())
+            .collect();
         let bots = db.list_bots()?;
         let mut user_agents = build_ua_rows(
             db.list_user_agent_stats()?,

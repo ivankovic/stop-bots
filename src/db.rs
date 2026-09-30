@@ -717,6 +717,40 @@ pub fn validate_blocked_user_agent(user_agent: &str) -> Result<()> {
     Ok(())
 }
 
+/// The longest user agent `user_agent_stats` keeps, in characters.
+pub const MAX_STORED_USER_AGENT_CHARS: usize = 512;
+
+/// The most rows `user_agent_stats` holds. Chosen to sit far above what an
+/// ordinary host accumulates -- a real one held ~3,200 rows after two
+/// months -- so that reaching it means a rotating-user-agent flood.
+pub const USER_AGENT_STATS_MAX_ROWS: usize = 20_000;
+
+/// `user_agent` as `user_agent_stats` stores it: its first
+/// [`MAX_STORED_USER_AGENT_CHARS`] characters, cut on a character
+/// boundary, and shorter still if that would not fit in an NGINX pattern
+/// once escaped.
+///
+/// The second limit is what keeps a stored user agent blockable. Blocking
+/// one by hand stores the string as the stats have it, and NGINX matches
+/// it as an unanchored, escaped regex, so the cut prefix still matches the
+/// whole user agent it came from; but [`validate_blocked_user_agent`]
+/// refuses a pattern past [`crate::nginx::MAX_PATTERN_LEN`] bytes, and 512
+/// characters of `\` or of four-byte UTF-8 escape to more than that. It
+/// refuses one ending in `\` as well, so a cut never ends in one.
+pub fn stored_user_agent(user_agent: &str) -> &str {
+    let mut escaped = 0;
+    for (n, (at, c)) in user_agent.char_indices().enumerate() {
+        let width = c.len_utf8() + usize::from(is_regex_special(c));
+        if n == MAX_STORED_USER_AGENT_CHARS || escaped + width > crate::nginx::MAX_PATTERN_LEN {
+            // Not ending in a backslash either: a pattern cannot, and
+            // one the whole user agent did not end in is ours to avoid.
+            return user_agent[..at].trim_end_matches('\\');
+        }
+        escaped += width;
+    }
+    user_agent
+}
+
 fn validate_user_agent_fragment(user_agent: &str, what: &str) -> Result<String> {
     let user_agent = user_agent.trim();
     if user_agent.is_empty() {
@@ -2100,7 +2134,18 @@ impl Db {
 
     /// [`Self::record_user_agent_hits`] without its transaction, for a
     /// caller that is already inside one (see `Db::ingest`).
-    fn upsert_user_agent_hits(&self, counts: &HashMap<String, u64>, seen_at: i64) -> Result<()> {
+    ///
+    /// Each user agent is stored as [`stored_user_agent`] cuts it, and the
+    /// table is held to [`USER_AGENT_STATS_MAX_ROWS`] as it is written,
+    /// not only by the daily maintenance: a client picks its own user
+    /// agent, up to 8 KB of it, and a flood of distinct ones inside one
+    /// day was otherwise stored whole and shown whole by the Firewall
+    /// page.
+    pub(crate) fn upsert_user_agent_hits<'a>(
+        &self,
+        counts: impl IntoIterator<Item = (&'a String, &'a u64)>,
+        seen_at: i64,
+    ) -> Result<()> {
         let mut upsert = self.conn.prepare_cached(
             "INSERT INTO user_agent_stats (user_agent, hit_count, last_seen_at)
              VALUES (?1, ?2, ?3)
@@ -2109,9 +2154,43 @@ impl Db {
                 last_seen_at = excluded.last_seen_at",
         )?;
         for (user_agent, count) in counts {
-            upsert.execute(params![user_agent, *count as i64, seen_at])?;
+            upsert.execute(params![
+                stored_user_agent(user_agent),
+                *count as i64,
+                seen_at
+            ])?;
         }
+        self.cap_user_agent_stats(USER_AGENT_STATS_MAX_ROWS)?;
         Ok(())
+    }
+
+    /// Holds `user_agent_stats` to `max_rows`, dropping the least-hit rows
+    /// first and, among equally hit ones, the least recently seen.
+    ///
+    /// Least-hit here, where the daily prune
+    /// ([`Self::prune_user_agent_stats`]) drops the least recently seen:
+    /// this runs in the middle of a flood, when every row the flood adds
+    /// is as recent as a row can be, so recency alone would evict the
+    /// host's real visitors to make room for it. A flood's user agents are
+    /// seen once each; the agents worth keeping have been seen more.
+    fn cap_user_agent_stats(&self, max_rows: usize) -> Result<usize> {
+        let rows: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM user_agent_stats", [], |row| {
+                    row.get(0)
+                })?;
+        let cap = i64::try_from(max_rows).unwrap_or(i64::MAX);
+        if rows <= cap {
+            return Ok(0);
+        }
+        Ok(self.conn.execute(
+            "DELETE FROM user_agent_stats WHERE user_agent IN (
+                 SELECT user_agent FROM user_agent_stats
+                 ORDER BY hit_count DESC, last_seen_at DESC, user_agent ASC
+                 LIMIT -1 OFFSET ?1
+             )",
+            params![cap],
+        )?)
     }
 
     /// Every recorded user agent's accumulated hit count, most-seen first —
@@ -3531,15 +3610,20 @@ fn humans_only_allows(pattern: &str) -> bool {
 pub(crate) fn escape_for_nginx_regex(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
-        if matches!(
-            c,
-            '.' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '*' | '+' | '?' | '\\'
-        ) {
+        if is_regex_special(c) {
             escaped.push('\\');
         }
         escaped.push(c);
     }
     escaped
+}
+
+/// Whether [`escape_for_nginx_regex`] escapes `c`.
+fn is_regex_special(c: char) -> bool {
+    matches!(
+        c,
+        '.' | '^' | '$' | '|' | '(' | ')' | '[' | ']' | '{' | '}' | '*' | '+' | '?' | '\\'
+    )
 }
 
 #[cfg(test)]
@@ -5654,6 +5738,101 @@ mod tests {
 
         assert_eq!(db.get_access_log_offset("a.log").unwrap(), Some(10));
         assert_eq!(db.get_access_log_offset("b.log").unwrap(), Some(20));
+    }
+
+    #[test]
+    fn record_user_agent_hits_keeps_512_characters_of_a_user_agent() {
+        let db = Db::open_in_memory().unwrap();
+        let long = "é".repeat(8 * 1024);
+        let also_long = format!("{}different tail", "é".repeat(600));
+        let counts = HashMap::from([(long, 2), (also_long, 3)]);
+
+        db.record_user_agent_hits(&counts, 1000).unwrap();
+
+        let stats = db.list_user_agent_stats().unwrap();
+        assert_eq!(
+            stats.len(),
+            1,
+            "the same first 512 characters are one agent"
+        );
+        assert_eq!(stats[0].user_agent, "é".repeat(MAX_STORED_USER_AGENT_CHARS));
+        assert_eq!(stats[0].hit_count, 5);
+    }
+
+    /// Whatever the stats hold can be blocked from them: the cut prefix
+    /// always fits in an NGINX pattern once escaped, and an unanchored
+    /// pattern still matches the whole user agent it was cut from.
+    #[test]
+    fn a_stored_user_agent_can_always_be_blocked() {
+        for (what, user_agent) in [
+            ("backslashes", "a\\".repeat(600)),
+            ("regex syntax", "a.".repeat(600)),
+            ("four-byte characters", "🦀".repeat(600)),
+        ] {
+            let stored = stored_user_agent(&user_agent);
+            assert!(user_agent.starts_with(stored), "{what}");
+            assert!(
+                escape_for_nginx_regex(stored).len() <= crate::nginx::MAX_PATTERN_LEN,
+                "{what}: {} bytes escaped",
+                escape_for_nginx_regex(stored).len()
+            );
+            let db = Db::open_in_memory().unwrap();
+            db.block_user_agent(stored)
+                .unwrap_or_else(|err| panic!("{what}: {err:#}"));
+        }
+        assert_eq!(
+            stored_user_agent("curl/8.0"),
+            "curl/8.0",
+            "short is unchanged"
+        );
+    }
+
+    /// The cap holds as rows are written, not only at the daily prune, and
+    /// keeps the agents seen most over a flood of ones seen once.
+    #[test]
+    fn user_agent_stats_never_grow_past_their_cap() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_user_agent_hits(&HashMap::from([("Mozilla/5.0".to_string(), 50)]), 1000)
+            .unwrap();
+        let flood: HashMap<String, u64> = (0..USER_AGENT_STATS_MAX_ROWS)
+            .map(|n| (format!("flood/{n}"), 1))
+            .collect();
+
+        db.record_user_agent_hits(&flood, 2000).unwrap();
+
+        let rows: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM user_agent_stats", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows as usize, USER_AGENT_STATS_MAX_ROWS);
+        assert_eq!(
+            db.user_agent_stat("Mozilla/5.0")
+                .unwrap()
+                .map(|s| s.hit_count),
+            Some(50),
+            "the busy agent was evicted for the flood"
+        );
+    }
+
+    #[test]
+    fn capping_user_agent_stats_drops_the_least_hit_then_the_oldest() {
+        let db = Db::open_in_memory().unwrap();
+        for (agent, hits, seen) in [("busy", 9, 100), ("old", 1, 100), ("new", 1, 200)] {
+            db.record_user_agent_hits(&HashMap::from([(agent.to_string(), hits)]), seen)
+                .unwrap();
+        }
+
+        assert_eq!(db.cap_user_agent_stats(2).unwrap(), 1);
+
+        let left: Vec<String> = db
+            .list_user_agent_stats()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.user_agent)
+            .collect();
+        assert_eq!(left, ["busy", "new"]);
     }
 
     #[test]

@@ -23,6 +23,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - A JSON log line can no longer forge the evidence that clears an address: a user
   agent of `"\nclear"` was stored as that observation. Control characters in what a
   line says are replaced before it is stored.
+- The access stats keep the first 512 characters of a user agent, not up to 8 KB, and
+  hold to 20,000 rows as they are written, dropping the least-hit first, rather than
+  only at the daily prune.
 
 ## [0.1.0-rc.1] — 2026-09-30
 

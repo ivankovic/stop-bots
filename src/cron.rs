@@ -491,11 +491,11 @@ pub fn run_log_jobs(
 pub const USER_AGENT_STATS_MAX_AGE: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// The hard ceiling on `user_agent_stats` rows, enforced after the age
-/// window. Chosen to sit far above what an ordinary host accumulates — a
-/// real one held ~3,200 rows after two months — so that reaching it means
-/// a rotating-user-agent flood, which is the case the age window alone
-/// cannot contain.
-pub const USER_AGENT_STATS_MAX_ROWS: usize = 20_000;
+/// window here, and as rows are written too (see
+/// `Db::upsert_user_agent_hits`): a rotating-user-agent flood is the case
+/// the age window alone cannot contain, and it arrives between two daily
+/// runs of this.
+pub const USER_AGENT_STATS_MAX_ROWS: usize = crate::db::USER_AGENT_STATS_MAX_ROWS;
 
 /// Don't rewrite the whole database to reclaim less than this.
 const VACUUM_MIN_BYTES: u64 = 4 * 1024 * 1024;

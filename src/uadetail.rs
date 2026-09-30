@@ -178,10 +178,10 @@ impl UaDetail {
             status,
             hits: stat.as_ref().map(|s| s.hit_count.max(0) as u64),
             last_seen_at: stat.as_ref().map(|s| s.last_seen_at),
-            blocked_by_hand: db
-                .list_blocked_user_agents()?
-                .iter()
-                .any(|blocked| blocked == user_agent),
+            blocked_by_hand: db.list_blocked_user_agents()?.iter().any(|blocked| {
+                let stored = crate::db::stored_user_agent;
+                blocked == user_agent || stored(blocked) == stored(user_agent)
+            }),
             matches,
             self_declared_bot: looks_like_a_bot(user_agent),
         })
