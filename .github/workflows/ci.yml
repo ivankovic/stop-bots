@@ -230,6 +230,16 @@ jobs:
           cargo deb --no-build --no-strip \
             --target x86_64-unknown-linux-musl --output dist/
 
+      # For the `stranger` job below, which installs this exact package on
+      # a fresh Debian and Ubuntu. Not on pull requests, where that job
+      # does not run.
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        with:
+          name: stop-bots-deb
+          path: dist/*.deb
+          retention-days: 7
+
       - name: The binary must be static
         run: |
           binary=target/x86_64-unknown-linux-musl/release/stop-bots
@@ -299,6 +309,42 @@ jobs:
           # reports is the assertion here, not what it concludes.
           stop-bots status --quiet || true
           sudo apt-get remove -y stop-bots
+
+  # The README's quick start, as a stranger would follow it, on a fresh
+  # Debian 12 and a fresh Ubuntu 24.04 under real systemd: `apt install`
+  # of the package the `deb` job just built, then `status`, `batch`,
+  # `install firewall` and `uninstall all`, with blocking checked by
+  # packets from a second container. See `a_stranger_follows_the_quick_start`
+  # in tests/container.rs.
+  #
+  # On pushes to main and weekly, not on pull requests: it builds two
+  # images and boots two hosts, a few minutes a run, and what it finds is
+  # rarely one pull request's doing. The weekly run also downloads every
+  # list for real (STOP_BOTS_STRANGER_FETCH), as the quick start does; the
+  # push run uses the list compiled into the binary, so a feed that is
+  # down cannot turn a commit red.
+  stranger:
+    needs: deb
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: actions/download-artifact@v8
+        with:
+          name: stop-bots-deb
+          path: dist
+      - name: The quick start on Debian 12 and Ubuntu 24.04
+        env:
+          STOP_BOTS_CONTAINER_TESTS: "1"
+          STOP_BOTS_STRANGER_FETCH: ${{ github.event_name == 'schedule' && '1' || '' }}
+        run: |
+          STOP_BOTS_STRANGER_DEB="$(ls "$PWD"/dist/stop-bots_*.deb)" \
+            cargo nextest run --test container -E 'test(/stranger/)' --no-fail-fast
 
   # Catches the class of mistake that only surfaces at publish time: a bad
   # category slug, a missing required field, or a crate that packages fine but

@@ -64,6 +64,14 @@
 //! control that removes the directive under test and asserts the failure
 //! comes back. Without that control, a container where the sandbox
 //! silently did not apply would pass every one of them.
+//!
+//! ## And a stranger's host
+//!
+//! `Dockerfile.stranger` is a fresh Debian 12 or Ubuntu 24.04 with nothing
+//! of ours on it, for [`a_stranger_follows_the_quick_start`]: the README's
+//! quick start from `apt install` of the `.deb` to `uninstall all`. It
+//! needs a package, named by `STOP_BOTS_STRANGER_DEB`, and skips without
+//! one; `make stranger-test` builds one and runs it.
 
 use std::process::Command;
 
@@ -170,7 +178,7 @@ fn build_image() {
 /// lock. The marker's key is the binary's and the build context's sizes
 /// and mtimes, so a rebuilt binary is never tested through a stale image,
 /// and the image has to still exist.
-fn build_unless_current(image: &str, build: fn()) {
+fn build_unless_current(image: &str, build: impl FnOnce()) {
     let marker = format!(
         "{}/container-image-{}.built",
         env!("CARGO_TARGET_TMPDIR"),
@@ -800,6 +808,12 @@ impl Host {
 
     fn boot(name: &str) -> Host {
         build_host_image();
+        Host::boot_image(name, &host_image(), None)
+    }
+
+    /// Boots `image` as a host, on `network` if one is given. Every
+    /// systemd image here boots the same way; only what is in it differs.
+    fn boot_image(name: &str, image: &str, network: Option<&Network>) -> Host {
         let name = &scoped(name);
         // Leftover from a previous aborted run.
         let _ = Command::new(runtime()).args(["rm", "-f", name]).output();
@@ -854,7 +868,11 @@ impl Host {
             args.push("--tmpfs".to_string());
             args.push("/run/lock".to_string());
         }
-        args.push(host_image());
+        if let Some(network) = network {
+            args.push("--network".to_string());
+            args.push(network.name.clone());
+        }
+        args.push(image.to_string());
 
         let out = Command::new(runtime())
             .args(&args)
@@ -3706,4 +3724,378 @@ fn a_chain_written_by_0_0_15_is_taken_over_by_the_restore() {
             "{hook} should jump to STOP-BOTS exactly once:\n{jumps}"
         );
     }
+}
+
+// ---- the stranger test: the README's quick start, on a fresh host ----
+
+/// The two distributions the README names, each as a fresh server with
+/// NGINX and nftables from its own archive and nothing of ours on it. See
+/// `Dockerfile.stranger` for what "fresh" includes.
+#[derive(Clone, Copy)]
+enum Distro {
+    Debian12,
+    Ubuntu2404,
+}
+
+impl Distro {
+    fn slug(self) -> &'static str {
+        match self {
+            Distro::Debian12 => "debian-12",
+            Distro::Ubuntu2404 => "ubuntu-24.04",
+        }
+    }
+
+    /// The build arguments: the base image, and what that distribution's
+    /// cloud image has that the other's does not.
+    fn build_args(self) -> [&'static str; 4] {
+        match self {
+            Distro::Debian12 => ["--build-arg", "BASE=debian:12", "--build-arg", "EXTRA="],
+            Distro::Ubuntu2404 => [
+                "--build-arg",
+                "BASE=ubuntu:24.04",
+                "--build-arg",
+                "EXTRA=rsyslog",
+            ],
+        }
+    }
+
+    fn image(self) -> String {
+        tagged(&format!("stop-bots-stranger-{}", self.slug()))
+    }
+
+    /// Builds this distribution's image once per run, the way
+    /// [`build_host_image`] does the other.
+    fn build(self) {
+        static DEBIAN: std::sync::Once = std::sync::Once::new();
+        static UBUNTU: std::sync::Once = std::sync::Once::new();
+        let once = match self {
+            Distro::Debian12 => &DEBIAN,
+            Distro::Ubuntu2404 => &UBUNTU,
+        };
+        once.call_once(|| {
+            with_build_lock(|| build_unless_current(&self.image(), || self.build_now()))
+        });
+    }
+
+    fn build_now(self) {
+        let ctx = stage_binary();
+        let out = Command::new(runtime())
+            .args(["build", "-q", "-f", &format!("{ctx}/Dockerfile.stranger")])
+            .args(self.build_args())
+            .args(["-t", &self.image(), &ctx])
+            .output()
+            .expect("failed to run the image build");
+        assert!(
+            out.status.success(),
+            "{} build ({}) failed:\n{}",
+            runtime(),
+            self.slug(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// The `.deb` to install, from `STOP_BOTS_STRANGER_DEB`, or `None` with the
+/// reason printed.
+///
+/// A package rather than `CARGO_BIN_EXE_stop-bots`, for two reasons. The
+/// quick start installs a package, and the package is part of what a
+/// stranger meets: its dependencies, its man pages, where it puts the
+/// binary. And the binary this test run compiled links the build machine's
+/// glibc, which is newer than Debian 12's, so it would not even start
+/// there. The released package is static (musl), and only a package built
+/// the same way tests what ships. `make stranger-test` builds one and runs
+/// these; CI does the same in its `stranger` job.
+fn stranger_deb() -> Option<String> {
+    match std::env::var("STOP_BOTS_STRANGER_DEB") {
+        Ok(path) if !path.is_empty() => {
+            assert!(
+                std::path::Path::new(&path).is_file(),
+                "STOP_BOTS_STRANGER_DEB names {path}, which is not a file"
+            );
+            Some(path)
+        }
+        _ => {
+            eprintln!(
+                "skipping: the stranger test installs a .deb. Set STOP_BOTS_STRANGER_DEB to one \
+                 built for x86_64-unknown-linux-musl, or run `make stranger-test`."
+            );
+            None
+        }
+    }
+}
+
+/// Whether to run `batch --apply` exactly as the quick start writes it,
+/// which downloads every bot list and crawler range from the internet.
+///
+/// Off by default, so the suite stays hermetic: a feed that is down, or a
+/// runner without outbound access, would otherwise turn it red for a
+/// reason that is nobody's commit. Off, `batch` gets `--no-fetch` and
+/// blocks from the list compiled into the binary, which is what a host
+/// without outbound access runs anyway. CI's weekly run turns it on, which
+/// is where "the world changed" failures belong.
+///
+/// Not a URL override pointing the downloads at a local server: that would
+/// be a switch in the shipped binary that redirects where its blocklists
+/// come from, and it would test reqwest rather than this project (see
+/// "Coverage" in CONTRIBUTING.md).
+fn stranger_fetches() -> bool {
+    std::env::var_os("STOP_BOTS_STRANGER_FETCH").is_some_and(|value| !value.is_empty())
+}
+
+/// A user agent from the compiled-in scanner list, which the default
+/// policy blocks. From the built-in list rather than a downloaded one so
+/// that the hermetic run can block it.
+const SCANNER_UA: &str = "Mozilla/5.0 (compatible; ModatScanner/1.0)";
+const BROWSER_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0";
+
+impl Client {
+    /// The status code for `url`, `000` when nothing answered: the
+    /// stranger's host serves the distribution's default site, on port 80.
+    fn status_of(&self, url: &str, extra: &str) -> String {
+        let (_, stdout, _) = exec_in(
+            &self.name,
+            &format!("curl -s -o /dev/null -w '%{{http_code}}' {extra} {url}"),
+        );
+        stdout.trim().to_string()
+    }
+
+    /// [`Self::status_of`], polled until it is `want` or five seconds have
+    /// passed: a reload is asynchronous, and an old worker can still
+    /// answer the first request after one.
+    fn eventually(&self, url: &str, extra: &str, want: &str) -> String {
+        let mut got = String::new();
+        for _ in 0..50 {
+            got = self.status_of(url, extra);
+            if got == want {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        got
+    }
+}
+
+impl Host {
+    /// Runs one quick-start command as the README gives it, and returns
+    /// what it printed. A stranger has no reason to expect any of them to
+    /// fail, so a failure is the finding, with everything it said.
+    fn quick_start(&self, command: &str) -> String {
+        let (ok, stdout, stderr) = self.run(command);
+        let said = format!("{stdout}{stderr}");
+        assert!(ok, "`{command}` failed on a fresh host:\n{said}");
+        said
+    }
+
+    /// What `uninstall` promises to put back, read the same way each
+    /// time: every file under /etc/nginx by hash, the nft tables, the
+    /// units, and /etc/stop-bots.
+    fn footprint(&self) -> String {
+        self.sh("set -e\n\
+             find /etc/nginx -type f | sort | xargs sha256sum\n\
+             echo '-- nft'; nft list tables\n\
+             echo '-- units'; find /etc/systemd/system -name 'stop-bots*' | sort\n\
+             systemctl list-unit-files 'stop-bots*' --no-legend | sort\n\
+             echo '-- /etc/stop-bots'; ls -A /etc/stop-bots 2>/dev/null || true")
+    }
+}
+
+/// **A stranger, following only the README's quick start, from install to
+/// blocking to uninstall, on a fresh `distro`.**
+///
+/// Every command is the quick start's, run as it is written, in its order:
+///
+/// ```text
+/// apt install ./stop-bots_*.deb
+/// stop-bots status
+/// stop-bots batch --dry-run --diff
+/// stop-bots batch --apply
+/// stop-bots install firewall
+/// stop-bots status
+/// stop-bots uninstall all --dry-run
+/// stop-bots uninstall all
+/// ```
+///
+/// with one deviation, `--no-fetch` on `batch --apply` unless
+/// [`stranger_fetches`], and no other setup: no seeded bot, no site of
+/// ours, no `--root`, `--db`, `--ssh-log` or `--force`. Whatever the
+/// defaults find on a fresh host is what the test gets. As root, as `sudo`
+/// would run it; the container's shell already is.
+///
+/// "Blocking" is checked from a second container, from its own address:
+/// NGINX turns away a scanner's user agent and serves a browser, and a
+/// client that asks for `/.env` is blocked by the probe-path detector on
+/// the next pass and then dropped by nftables. After `install firewall`
+/// the table is deleted and the unit restarted, the way a boot loads it,
+/// and only what was applied comes back. After `uninstall all`, the host
+/// is as it was before the package was installed.
+fn a_stranger_follows_the_quick_start(distro: Distro) {
+    if !enabled() {
+        return;
+    }
+    let Some(deb) = stranger_deb() else {
+        return;
+    };
+    distro.build();
+    let tag = format!("stop-bots-stranger-{}", distro.slug());
+    let net = Network::create(&format!("{tag}-net"));
+    let host = Host::boot_image(&tag, &distro.image(), Some(&net));
+    let client = Client::start(&format!("{tag}-client"), &net);
+    let site = format!("http://{}/", host.name);
+    let scanner = format!("-A '{SCANNER_UA}'");
+    let fetch = if stranger_fetches() {
+        ""
+    } else {
+        " --no-fetch"
+    };
+
+    host.sh("systemctl start nginx.service");
+    let pristine = host.footprint();
+    assert_eq!(
+        client.eventually(&site, &scanner, "200"),
+        "200",
+        "a fresh NGINX should serve everyone"
+    );
+
+    // Installing it: the package, with no network, so a dependency it
+    // forgets to declare fails here rather than being fetched.
+    host.put(&deb, "/root/stop-bots.deb");
+    host.quick_start("DEBIAN_FRONTEND=noninteractive apt-get install -y /root/stop-bots.deb");
+    //
+    // The documentation is checked in dpkg's own list of what it
+    // installed, not on disk: Ubuntu's container and minimal cloud images
+    // tell dpkg to skip /usr/share/man, for every package alike.
+    assert_eq!(host.sh("command -v stop-bots").trim(), "/usr/bin/stop-bots");
+    let files = host.sh("dpkg -L stop-bots");
+    for path in [
+        "/usr/share/man/man1/stop-bots-batch.1.gz",
+        "/usr/share/bash-completion/completions/stop-bots",
+    ] {
+        assert!(
+            files.lines().any(|line| line == path),
+            "the package does not install {path}:\n{files}"
+        );
+    }
+
+    // Before anything: a first look, and the plan.
+    host.quick_start("stop-bots status");
+    let default_site = "sha256sum /etc/nginx/sites-available/default";
+    let untouched = host.sh(default_site);
+    let plan = host.quick_start("stop-bots batch --dry-run --diff");
+    for (what, needle) in [
+        (
+            "the SSH log the lockout check reads",
+            "lockout check passed",
+        ),
+        ("the block it would add", "+    # BEGIN stop-bots"),
+        ("a scanner the binary knows", "ModatScanner"),
+    ] {
+        assert!(
+            plan.contains(needle),
+            "the dry run does not show {what}:\n{plan}"
+        );
+    }
+    assert_eq!(
+        host.sh(default_site),
+        untouched,
+        "the dry run changed the site"
+    );
+
+    // Blocking.
+    let applied = host.quick_start(&format!("stop-bots batch --apply{fetch}"));
+    assert_eq!(
+        client.eventually(&site, &scanner, "403"),
+        "403",
+        "a scanner's user agent is still served. batch said:\n{applied}"
+    );
+    assert_eq!(
+        client.status_of(&site, &format!("-A '{BROWSER_UA}'")),
+        "200",
+        "a browser is no longer served"
+    );
+
+    client.status_of(&format!("{site}.env"), "");
+    let pass = host.quick_start(&format!("stop-bots batch --apply{fetch}"));
+    let prober = client.address();
+    let in_kernel = |address: &str| {
+        host.run(&format!(
+            "nft get element inet stop_bots block_v4 '{{ {address} }}'"
+        ))
+        .0
+    };
+    assert!(
+        in_kernel(&prober),
+        "the client that asked for /.env is not in the kernel's set. batch said:\n{pass}\n{}",
+        host.ruleset()
+    );
+    assert_eq!(
+        client.status_of(&site, "--max-time 5"),
+        "000",
+        "the prober is blocked and still reaches NGINX"
+    );
+
+    // Persistence: the unit loads what was applied, and nothing else.
+    let installed = host.quick_start("stop-bots install firewall");
+    assert!(
+        installed.contains("holds the rules the last apply loaded"),
+        "install firewall tells a host that has applied to go and apply:\n{installed}"
+    );
+    let status = host.quick_start("stop-bots status");
+    for level in ["[WARN]", "[CRITICAL]"] {
+        assert!(
+            !status.contains(level),
+            "the quick start ends with a {level}:\n{status}"
+        );
+    }
+    let unapplied = "203.0.113.99";
+    host.sh(&format!(
+        "stop-bots add-firewall-rule --address {unapplied}"
+    ));
+    host.sh("stop-bots render-firewall");
+    host.sh("nft delete table inet stop_bots");
+    host.sh("systemctl restart stop-bots-firewall.service");
+    assert!(
+        in_kernel(&prober),
+        "the applied rules did not come back with the unit:\n{}",
+        host.journal("stop-bots-firewall.service")
+    );
+    assert!(
+        !in_kernel(unapplied),
+        "the unit loaded a rule that was rendered and never applied"
+    );
+
+    // And back out.
+    let before = host.footprint();
+    let dry = host.quick_start("stop-bots uninstall all --dry-run");
+    assert_eq!(
+        host.footprint(),
+        before,
+        "the dry run changed something:\n{dry}"
+    );
+    let removed = host.quick_start("stop-bots uninstall all");
+    assert_eq!(
+        host.footprint(),
+        pristine,
+        "the host is not as it was before stop-bots. uninstall said:\n{removed}"
+    );
+    let (valid, out, err) = host.run("nginx -t");
+    assert!(
+        valid,
+        "NGINX does not load what uninstall left:\n{out}{err}"
+    );
+    assert_eq!(
+        client.eventually(&site, &scanner, "200"),
+        "200",
+        "the scanner, and the blocked prober, are still turned away"
+    );
+}
+
+#[test]
+fn a_stranger_on_debian_12_goes_from_install_to_blocking_to_uninstall() {
+    a_stranger_follows_the_quick_start(Distro::Debian12);
+}
+
+#[test]
+fn a_stranger_on_ubuntu_24_04_goes_from_install_to_blocking_to_uninstall() {
+    a_stranger_follows_the_quick_start(Distro::Ubuntu2404);
 }

@@ -1,7 +1,7 @@
 # Every target here is a name, not a file. Without this a directory named
 # `build` or `test` — both plausible — would make `make test` say
 # "up to date" and run nothing.
-.PHONY: help unit-test integration-test test hooks screenshots build deploy
+.PHONY: help unit-test integration-test stranger-test test hooks screenshots build deploy
 
 # `cargo nextest run` where it is installed, plain `cargo test` otherwise.
 # They run the same tests; nextest additionally enforces the per-test
@@ -28,6 +28,7 @@ STOP_BOTS_CONTAINER_RUNTIME ?= podman
 help:
 	@echo 'unit-test         everything that needs only a compiler (~20s)'
 	@echo 'integration-test  the container suite: needs a runtime + NET_ADMIN (~1min)'
+	@echo 'stranger-test     the README quick start on fresh Debian 12 and Ubuntu 24.04, from the .deb'
 	@echo 'test              both, unit first'
 	@echo 'hooks             install the pre-commit hook (fmt + clippy)'
 	@echo 'screenshots       regenerate docs/screenshots/ from seeded fiction'
@@ -56,6 +57,31 @@ integration-test:
 	STOP_BOTS_CONTAINER_TESTS=1 \
 	STOP_BOTS_CONTAINER_RUNTIME=$(STOP_BOTS_CONTAINER_RUNTIME) \
 	cargo test --test container -- --nocapture
+
+# The stranger test: the README's quick start, from `apt install` of the
+# package to `uninstall all`, on a fresh Debian 12 and a fresh Ubuntu 24.04
+# (see `a_stranger_follows_the_quick_start` in tests/container.rs).
+#
+# It installs a .deb built the way the release builds one, static against
+# musl, because the host's glibc build does not start on Debian 12. So it
+# needs what CI's `deb` job needs: the x86_64-unknown-linux-musl target,
+# `musl-gcc` (Debian's musl-tools) and cargo-deb. Point
+# CC_x86_64_unknown_linux_musl at another musl compiler if yours is
+# elsewhere. `STOP_BOTS_STRANGER_FETCH=1` runs `batch --apply` with real
+# downloads, as the quick start writes it; by default it is `--no-fetch`.
+CC_x86_64_unknown_linux_musl ?= musl-gcc
+export CC_x86_64_unknown_linux_musl
+STRANGER_DIR := target/stranger
+
+stranger-test:
+	cargo build --release --target x86_64-unknown-linux-musl
+	target/x86_64-unknown-linux-musl/release/stop-bots generate-docs --out target/assets
+	rm -rf $(STRANGER_DIR)
+	cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl --output $(STRANGER_DIR)/
+	STOP_BOTS_CONTAINER_TESTS=1 \
+	STOP_BOTS_CONTAINER_RUNTIME=$(STOP_BOTS_CONTAINER_RUNTIME) \
+	STOP_BOTS_STRANGER_DEB="$$(ls $(STRANGER_DIR)/stop-bots_*.deb)" \
+	cargo test --test container stranger -- --nocapture
 
 # Unit first: it is the one that fails for a plain mistake, and there is
 # no sense building containers to find out the code doesn't compile.

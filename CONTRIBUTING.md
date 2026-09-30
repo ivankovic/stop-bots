@@ -268,6 +268,33 @@ reproduce. Three failures in a row still fail. `make integration-test` uses plai
 `cargo test` for its streamed output and does not retry; `STOP_BOTS_CONTAINER_TESTS=1
 cargo nextest run --test container` locally behaves as CI does.
 
+### The stranger test
+
+Two tests in the same file follow the README's quick start on a fresh Debian 12 and a
+fresh Ubuntu 24.04 (`tests/container/Dockerfile.stranger`: systemd, an SSH server,
+and NGINX and nftables as `apt install` leaves them). They install the `.deb`, run
+every quick-start command as written, check blocking with packets from a second
+container, and end with `uninstall all` and a host identical to the one they started
+from. They install a package rather than the test binary because the package is part
+of what a stranger meets, and because a glibc build from a newer host does not start
+on Debian 12.
+
+```
+make stranger-test
+```
+
+builds the static package the way CI's `deb` job does (it needs `musl-gcc` and
+`cargo-deb`) and runs them. Two environment variables drive them:
+
+- `STOP_BOTS_STRANGER_DEB` names the `.deb` to install. Without it the two tests
+  skip, and say so.
+- `STOP_BOTS_STRANGER_FETCH=1` runs `batch --apply` with real downloads, exactly as
+  written. Without it, `batch` gets `--no-fetch` and blocks from the list compiled
+  into the binary, so a feed that is down cannot turn the suite red.
+
+CI runs them as the `stranger` job, on pushes to main and weekly; the weekly run sets
+`STOP_BOTS_STRANGER_FETCH`.
+
 ## CLI conventions
 
 The command line is part of the contract from 0.1 on, so these are decided once. The

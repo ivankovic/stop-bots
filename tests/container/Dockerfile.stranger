@@ -1,0 +1,51 @@
+# A fresh VPS, for the stranger test: stop-bots is not in this image.
+#
+# One file for both distributions the README names, picked by `BASE`:
+#
+#     podman build --build-arg BASE=debian:12   -f Dockerfile.stranger .
+#     podman build --build-arg BASE=ubuntu:24.04 -f Dockerfile.stranger .
+#
+# What is here is what a stranger's server has before they read the README,
+# and nothing else. A cloud image's baseline (systemd, an SSH server, curl
+# and the CA bundle), then NGINX and nftables exactly as `apt install`
+# leaves them: the default site on port 80, the distro's logrotate and log
+# format, `nginx.service` enabled. No site of ours, no /etc/stop-bots, no
+# hand-written config of any kind. The test installs the `.deb` itself, the
+# way the README says to, so a dependency the package forgets to declare is
+# missing here too.
+#
+# `EXTRA` is where the two baselines differ. Ubuntu's server and cloud
+# images ship rsyslog, so sshd logs to /var/log/auth.log; Debian 12's do
+# not, and the SSH log is the journal. The two are different code paths
+# for the lockout guard, and each distribution gets its own.
+ARG BASE=debian:12
+FROM ${BASE}
+ARG EXTRA=""
+
+# systemd checks this to decide it is containerised.
+ENV container=docker
+
+# Recommends on, as `apt install nginx` has them: a stranger does not pass
+# --no-install-recommends, and what it would have pulled in is part of the
+# host they get.
+RUN apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        systemd systemd-sysv dbus openssh-server curl ca-certificates ${EXTRA} && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx nftables && \
+    rm -rf /var/lib/apt/lists/*
+
+# The same boot trim as Dockerfile.host, and for the same reason: reach
+# `running` in seconds instead of waiting on getty and the network. The
+# services a VPS runs are enabled again by name below, so the trim cannot
+# quietly take one of them away.
+RUN find /etc/systemd/system /lib/systemd/system -path '*.wants/*' \
+        -not -name '*journald*' \
+        -not -name '*tmpfiles*' \
+        -not -name '*sysusers*' \
+        -delete && \
+    systemctl enable nginx.service ssh.service && \
+    if [ -e /lib/systemd/system/rsyslog.service ]; then systemctl enable rsyslog.service; fi
+
+STOPSIGNAL SIGRTMIN+3
+
+CMD ["/lib/systemd/systemd"]

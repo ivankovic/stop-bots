@@ -10,6 +10,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Added
 
+- **A stranger test**: the README's quick start, from `apt install` of the
+  `.deb` to `uninstall all`, on fresh Debian 12 and Ubuntu 24.04 containers
+  under systemd (`make stranger-test`; CI on pushes to main and weekly).
 - **Per-site bot overrides in the web console**: a site's page searches the
   bots and allows or blocks one on that site only, as the TUI's site detail does.
 - **Crawler IP ranges on both Dashboards**: Googlebot, Bingbot and GPTBot, each
