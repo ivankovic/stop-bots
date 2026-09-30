@@ -2853,8 +2853,8 @@ async fn inspecting_a_user_agent_that_is_not_there_still_renders() {
 async fn the_firewall_page_shows_one_page_of_a_flood_of_user_agents() {
     let (app, password, _tmp, db_path) = app_with_db();
     let (cookie, _csrf) = login(&app, &password).await;
-    let counts: std::collections::HashMap<String, u64> = (0..1_000u64)
-        .map(|i| (format!("flood-{i:04}/{}", "x".repeat(1_000)), 1 + i % 7))
+    let counts: std::collections::HashMap<String, u64> = (0..450u64)
+        .map(|i| (format!("flood-{i:04}/{}", "x".repeat(2_000)), 1 + i % 7))
         .collect();
     Db::open(&db_path)
         .unwrap()
@@ -2865,15 +2865,15 @@ async fn the_firewall_page_shows_one_page_of_a_flood_of_user_agents() {
 
     let rows = html.matches("inspect_ua=").count();
     assert_eq!(rows, stop_bots::dynamic::UA_PAGE_ROWS, "rows shown");
-    assert!(html.contains(" of 1000"), "no total shown");
+    assert!(html.contains(" of 450"), "no total shown");
     assert!(
-        html.len() < 2_000_000,
+        html.len() < 500_000,
         "a page of agents came to {} bytes",
         html.len()
     );
 
-    let next = page_text(&app, &cookie, "/firewall?filter=all&ua_page=5").await;
-    assert!(next.contains("User agents 801"), "page five:\n{next}");
+    let next = page_text(&app, &cookie, "/firewall?filter=all&ua_page=3").await;
+    assert!(next.contains("User agents 401"), "page three:\n{next}");
 }
 
 /// The complaint that started this: selecting a country told the operator
