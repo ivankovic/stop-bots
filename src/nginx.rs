@@ -2327,13 +2327,18 @@ fn console_prefix_in(content: &str, block: &ServerBlock) -> Option<String> {
     let tokens = lex(&content[start..end]).tokens;
     let at = tokens.iter().position(|(word, _)| word == "location")?;
     let (word, offset) = tokens.get(at + 1)?;
-    // Only the quoted form this tool writes; an `=` or `^~` modifier, or a
-    // bare word, is somebody's edit, and not a prefix to guess at.
-    if content[start + offset..].starts_with('"') {
-        let prefix = nginx_unquoted(word);
-        return is_stored_as_valid(&prefix, crate::db::validate_exempt_path).then_some(prefix);
-    }
-    None
+    // The quoted form this tool writes now, or the bare `location /prefix/`
+    // that versions before 0.0.13 wrote between the same markers — a host
+    // that set up Web Access then and never re-applied it still has that,
+    // and its operator needs the exemption as much. A modifier (`=`, `^~`,
+    // `~`) is somebody's edit and not a prefix to guess at: the validator
+    // refuses anything that does not start with `/`.
+    let prefix = if content[start + offset..].starts_with('"') {
+        nginx_unquoted(word)
+    } else {
+        word.clone()
+    };
+    is_stored_as_valid(&prefix, crate::db::validate_exempt_path).then_some(prefix)
 }
 
 /// Whether `value`, as stored, is exactly what `validate` would store:
@@ -7204,6 +7209,31 @@ server {
         let rest = text.split("if ($uri ~* ").nth(1).unwrap();
         let end = closing_quote(rest).unwrap();
         assert_eq!(nginx_unquoted(&rest[1..end]), r"^(/a\.b\+\(c\))");
+    }
+
+    /// A console `location` from before 0.0.13, unquoted, is still read as
+    /// the console's; an edited one with a modifier is not.
+    #[test]
+    fn a_console_location_written_before_it_was_quoted_is_exempt_too() {
+        // What 0.0.x wrote, and what a real host still carries.
+        let site = "server {\n    listen 443 ssl;\n    server_name example.com;\n    \
+            # BEGIN stop-bots console (DO NOT EDIT)\n    location /stop-bots/ {\n        \
+            proxy_pass http://127.0.0.1:8787;\n    }\n    # END stop-bots console\n}\n";
+        let blocks = parse_server_blocks(site);
+        assert_eq!(
+            console_prefix_in(site, &blocks[0]).as_deref(),
+            Some("/stop-bots/"),
+            "site was:\n{site}"
+        );
+        for edited in [
+            "location = /stop-bots/ {",
+            "location ^~ /stop-bots/ {",
+            "location ~ ^/x {",
+        ] {
+            let site = site.replace("location /stop-bots/ {", edited);
+            let blocks = parse_server_blocks(&site);
+            assert_eq!(console_prefix_in(&site, &blocks[0]), None, "{edited}");
+        }
     }
 
     /// The Web Access panel's path mode, then an apply: the block in the
