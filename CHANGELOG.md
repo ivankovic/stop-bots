@@ -48,6 +48,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - **Unblocking a detector's block sticks.** The detectors leave that address
   alone for as long as the block was meant to last, however long the log keeps
   the lines that earned it.
+- The TUI header and every web console page name the database when it is
+  not `/var/lib/stop-bots/db.sqlite3`; the non-root fallback says "Not
+  root: settings go to your user database, not the system one".
 
 ### Changed
 

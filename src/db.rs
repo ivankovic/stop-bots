@@ -1115,6 +1115,39 @@ fn not_yours(path: &Path, err: anyhow::Error, root: bool) -> anyhow::Error {
     )
 }
 
+/// Where the host's database lives: what `stop-bots install web` points
+/// the unit at, and what every root run without `--db` opens.
+pub const SYSTEM_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
+
+/// The one line both front-ends show when the database in use is not
+/// [`SYSTEM_PATH`], or `None` when it is (or when it is in memory).
+///
+/// It exists for the fallback. Without `--db`, a user who cannot create
+/// `/var/lib/stop-bots` gets a database under `~/.local/share` instead,
+/// and the note saying so went to stderr just before the TUI's alternate
+/// screen hid it. Everything set from then on went to a database the
+/// service and the root crontab never read, with nothing on screen to
+/// say so. `defaulted` is whether the path was chosen for the user (no
+/// `--db`, no `STOP_BOTS_DB`), which is what tells the fallback apart from
+/// a database someone asked for.
+pub fn location_notice(path: Option<&Path>, defaulted: bool) -> Option<String> {
+    let path = path?;
+    if path == Path::new(SYSTEM_PATH) {
+        return None;
+    }
+    Some(if defaulted {
+        format!(
+            "Not root: settings go to your user database, not the system one — {}",
+            path.display()
+        )
+    } else {
+        format!(
+            "Database {} — not the system one ({SYSTEM_PATH})",
+            path.display()
+        )
+    })
+}
+
 /// `settings` key for [`Db::get_humans_only`].
 pub const HUMANS_ONLY_KEY: &str = keys::HUMANS_ONLY;
 
@@ -3626,6 +3659,33 @@ mod tests {
         let err = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         let text = format!("{:#}", not_yours(Path::new("/nonexistent"), err, true));
         assert!(!text.contains("sudo"), "{text}");
+    }
+
+    #[test]
+    fn only_a_database_other_than_the_system_one_gets_a_notice() {
+        let user = Path::new("/home/me/.local/share/stop-bots/db.sqlite3");
+        for (what, path, defaulted, expected) in [
+            ("the system database", Some(Path::new(SYSTEM_PATH)), true, None),
+            ("in memory", None, true, None),
+            (
+                "the fallback",
+                Some(user),
+                true,
+                Some("Not root: settings go to your user database, not the system one — /home/me/.local/share/stop-bots/db.sqlite3"),
+            ),
+            (
+                "one asked for",
+                Some(Path::new("/tmp/x.db")),
+                false,
+                Some("Database /tmp/x.db — not the system one (/var/lib/stop-bots/db.sqlite3)"),
+            ),
+        ] {
+            assert_eq!(
+                location_notice(path, defaulted).as_deref(),
+                expected,
+                "{what}"
+            );
+        }
     }
 
     /// Storing a real-sized feed must not autocommit per row.

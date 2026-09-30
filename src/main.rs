@@ -24,7 +24,7 @@ use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule, RuleSourc
 use stop_bots::protection::Detector;
 use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
 
-const DEFAULT_DB_PATH: &str = "/var/lib/stop-bots/db.sqlite3";
+const DEFAULT_DB_PATH: &str = stop_bots::db::SYSTEM_PATH;
 
 /// Rejects `--threshold 0` at the command line.
 ///
@@ -1894,9 +1894,12 @@ async fn run_tui(
     no_reload: bool,
     ssh_log: Option<PathBuf>,
 ) -> Result<()> {
+    let defaulted = db_path.is_none();
     let db = open_db(db_path)?;
     let root = nginx::root(&db, root.as_deref())?;
-    let app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
+    let notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
+    let mut app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
+    app.db_notice = notice;
     let terminal = ratatui::init();
     // Not `?`: bailing here would skip the `restore` below and leave the
     // terminal in raw mode.
@@ -3752,8 +3755,10 @@ async fn run_web(
     use stop_bots::web::{self, auth, server, state::AppState};
 
     deprecated.warn();
+    let defaulted = db_path.is_none();
     let db = open_db(db_path)?;
     let root = nginx::root(&db, root.as_deref())?;
+    let db_notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
 
     // The same registration the TUI does on startup, and for the same
     // reason: `SourceKind::StopBotsExtras` is a list compiled into this
@@ -3880,6 +3885,7 @@ async fn run_web(
     // `None` unless the operator named a path: without one the destination
     // follows the backend, so an iptables render lands in `.sh`.
     state.firewall_out = firewall_out;
+    state.db_notice = db_notice;
     server::serve(state, addr).await
 }
 

@@ -491,6 +491,14 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
     if let Some(host) = crate::host::name() {
         brand.push(format!("  {host}").fg(theme.dim()));
     }
+    // Not the system database: the note that used to go to stderr, where
+    // the alternate screen hid it the moment the TUI started. On the brand
+    // line, which is otherwise mostly empty, rather than a line of its
+    // own: every screen's body is laid out to the row, and Help's is full.
+    if let Some(notice) = &app.db_notice {
+        brand.push("  \u{25b2} ".fg(Color::Yellow));
+        brand.push(notice.clone().fg(Color::Yellow));
+    }
     frame.render_widget(Paragraph::new(Line::from(brand)), brand_area);
     if let Some(busy) = busy_label(&app.jobs_in_flight) {
         let activity =
@@ -698,6 +706,59 @@ mod tests {
                 check.id
             );
         }
+    }
+
+    /// The whole screen as text, one line per row.
+    fn drawn(app: &mut App) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn app() -> App {
+        App::new(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/etc/nginx"),
+            false,
+            Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
+        )
+        .unwrap()
+    }
+
+    /// The fallback's note used to go to stderr, and the alternate screen
+    /// hid it at once. Now it is on the header's first line, on every
+    /// screen, and takes no row from the screen below it.
+    #[tokio::test]
+    async fn a_database_other_than_the_system_one_is_named_in_the_header() {
+        let mut app = app();
+        let notice = "Not root: settings go to your user database, not the system one";
+        app.db_notice = Some(notice.to_string());
+
+        for screen in [Screen::Dashboard, Screen::Nginx, Screen::Help] {
+            app.screen = screen;
+            let lines = drawn(&mut app);
+            assert!(
+                lines[0].contains(notice),
+                "{screen:?}:\n{}",
+                lines.join("\n")
+            );
+            assert!(lines[1].contains("Dashboard"), "{screen:?}: the tabs moved");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_system_database_gets_no_notice() {
+        let mut app = app();
+        let screen = drawn(&mut app).join("\n");
+        assert!(!screen.contains("system one"), "{screen}");
     }
 
     #[test]

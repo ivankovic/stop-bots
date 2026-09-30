@@ -54,6 +54,8 @@ pub struct Chrome {
     pub host: Option<String>,
     /// The last health report, if a probe has run.
     pub health: Option<crate::health::Report>,
+    /// That the database is not the system one, and which it is.
+    pub db_notice: Option<String>,
 }
 
 impl Ctx {
@@ -81,6 +83,7 @@ impl Ctx {
         ctx.chrome = Chrome {
             host: crate::host::name().map(str::to_string),
             health,
+            db_notice: state.db_notice.clone(),
         };
         ctx
     }
@@ -248,6 +251,9 @@ pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Marku
                                 button type="submit" { "Log out" }
                             }
                         }
+                    }
+                    @if let Some(notice) = &ctx.chrome.db_notice {
+                        p .db-notice role="status" { (notice) }
                     }
                     nav .tabs {
                         @for candidate in Tab::ALL {
@@ -557,6 +563,27 @@ mod tests {
             ),
             "was: {rendered}"
         );
+    }
+
+    /// A console started on a database other than the system one says so
+    /// on every page, as one line, and a page on the system one does not.
+    #[test]
+    fn the_header_names_a_database_other_than_the_system_one() {
+        let notice = "Database /tmp/x.db — not the system one (/var/lib/stop-bots/db.sqlite3)";
+        let mut ctx = Ctx::for_tests();
+        ctx.chrome.db_notice = Some(notice.to_string());
+
+        for tab in Tab::ALL {
+            let rendered = page(tab, &ctx, None, html! {}).into_string();
+            assert!(
+                rendered.contains(&format!(
+                    r#"<p class="db-notice" role="status">{notice}</p>"#
+                )),
+                "{tab:?}: {rendered}"
+            );
+        }
+        let plain = page(Tab::Dashboard, &Ctx::for_tests(), None, html! {}).into_string();
+        assert!(!plain.contains("db-notice"), "{plain}");
     }
 
     #[test]

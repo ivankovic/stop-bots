@@ -166,6 +166,17 @@ header.top {
 .brand .host { color: var(--fg-dim); font: 12px var(--mono); }
 .brand .spacer { flex: 1; }
 
+/* The database is not the system one: one line, in the warning colour,
+   between the brand and the tabs, on every screen. */
+.db-notice {
+  margin: 0 0 6px;
+  color: var(--warn);
+  font: 12px var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .cmdbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
 /* The health checks, one chip each: the TUI's status strip. */

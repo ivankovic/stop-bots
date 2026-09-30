@@ -131,6 +131,10 @@ pub struct App {
     /// The command palette, while it is open. See [`crate::tui::palette`].
     pub palette: Option<tui::palette::Palette>,
     pub db: Db,
+    /// Shown above the status strip when the database is not the system
+    /// one: see [`crate::db::location_notice`]. Set by `main.rs`, which is
+    /// the only place that knows whether the path was chosen for the user.
+    pub db_notice: Option<String>,
     pub dashboard: tui::dashboard::Dashboard,
     pub bot_settings: tui::bot_settings::BotSettings,
     pub nginx: tui::nginx::Nginx,
@@ -300,6 +304,7 @@ impl App {
             db_last_logged: None,
             palette: None,
             db,
+            db_notice: None,
             dashboard: tui::dashboard::Dashboard::default(),
             bot_settings: tui::bot_settings::BotSettings::default(),
             nginx: tui::nginx::Nginx::new(root),
