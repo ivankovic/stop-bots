@@ -117,6 +117,12 @@ pub const WEB_ALLOWED_HOSTS: &str = "web:allowed_hosts";
 /// The console's Argon2 PHC string. Only ever the hash.
 pub const WEB_PASSWORD_HASH: &str = "web:password_hash";
 
+// ---- downloads ----
+
+/// Who is downloading the lists right now, and since when: see
+/// `refresh::Lease`.
+pub const REFRESH_LEASE: &str = "refresh:lease";
+
 // ---- health ----
 
 /// The last health probe, as JSON.
@@ -167,6 +173,7 @@ pub const ALL: &[&str] = &[
     WEB_PASSWORD_HASH,
     HEALTH_PROBE,
     HEALTH_PROBE_AT,
+    REFRESH_LEASE,
 ];
 
 // ---- families: one key per detector, cron job or log file ----

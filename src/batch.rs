@@ -204,10 +204,34 @@ fn scan_sites(db: &Db, root: &Path) -> Result<String> {
 /// `&Db` across every `.await`, and `Db` is not `Sync`. `refresh::plan`
 /// now decides *what* to update and both front-ends drive the fetching in
 /// whatever order their runtime allows.
+///
+/// Holds the download lease (see [`refresh::Lease`]) while it runs. When a
+/// front-end's download holds it, this fetches nothing and says so as a
+/// step that did not fail: the lists are being updated, just not by this
+/// process, and a nightly run should not mail anyone over it.
 async fn update_lists(db: &Db) -> Vec<Step> {
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    };
+    let lease = match refresh::claim(db, now()) {
+        Ok(refresh::Claim::Granted(lease)) => lease,
+        Ok(refresh::Claim::Busy { since }) => {
+            return vec![Step::new(
+                "update lists",
+                Ok(format!("skipped: {}", refresh::Claim::busy_message(since))),
+            )]
+        }
+        Err(err) => return vec![Step::new("update lists", Err(err))],
+    };
     let plan = match refresh::plan(db) {
         Ok(plan) => plan,
-        Err(err) => return vec![Step::new("update lists", Err(err))],
+        Err(err) => {
+            let _ = refresh::release(db, &lease);
+            return vec![Step::new("update lists", Err(err))];
+        }
     };
 
     let mut outcomes = Vec::new();
@@ -217,11 +241,11 @@ async fn update_lists(db: &Db) -> Vec<Step> {
             Err(err) => Err(err),
         };
         outcomes.push((source, outcome.map_err(|err| format!("{err:#}"))));
+        let _ = refresh::renew(db, &lease, now());
     }
 
-    if refresh::crawler_ranges_all_succeeded(&outcomes) {
-        crate::cron::record_run(db, CronJob::UpdateIpRanges, "updated by batch run");
-    }
+    refresh::record(db, &outcomes, "by batch run");
+    let _ = refresh::release(db, &lease);
 
     outcomes
         .into_iter()

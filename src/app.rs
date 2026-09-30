@@ -220,6 +220,9 @@ pub struct App {
     /// one landed, while one-at-a-time keeps it to a single body and gives
     /// the message line something true to say throughout.
     update_all: Option<UpdateAllRun>,
+    /// The download lease the scheduled crawler-range update holds while
+    /// its fetch is out. See [`crate::refresh::Lease`].
+    ip_ranges_lease: Option<crate::refresh::Lease>,
     /// Set while "Apply everything" is waiting on its NGINX half, so
     /// [`App::finish_site_apply`] knows to start the firewall half after
     /// it. The two are independent — whichever fails, the other still gets
@@ -233,18 +236,37 @@ pub struct App {
     cron_apply_nginx: bool,
 }
 
-/// The state of one "Apply everything"/"Update everything"'s update half.
+/// The state of one "Update everything", pressed or scheduled.
 struct UpdateAllRun {
     /// Sources not yet fetched, in plan order, popped from the front.
     remaining: std::collections::VecDeque<crate::refresh::Source>,
-    /// How many stored cleanly so far.
-    done: usize,
-    /// `"<source>: <error>"` for each that did not, to report at the end.
-    failures: Vec<String>,
-    /// Every outcome so far, which is what
-    /// [`crate::refresh::crawler_ranges_all_succeeded`] needs to decide
-    /// whether the `UpdateIpRanges` job can be marked run.
+    /// Every outcome so far: what [`crate::refresh::record`] reports and
+    /// decides the crawler job from.
     outcomes: Vec<(crate::refresh::Source, Result<String, String>)>,
+    /// The download lease, renewed after each source and given back at the
+    /// end. `None` only in tests that build a run by hand.
+    lease: Option<crate::refresh::Lease>,
+    /// Whether the weekly job started it rather than `u`. A scheduled run
+    /// works in the background: it says nothing on the message line, and
+    /// its outcome goes to the Scheduled panel.
+    scheduled: bool,
+}
+
+impl UpdateAllRun {
+    fn job(&self) -> Job {
+        if self.scheduled {
+            Job::Cron(CronJob::UpdateEverything)
+        } else {
+            Job::UpdateEverything
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// Runs a downloaded body's parser on the blocking pool.
@@ -342,6 +364,7 @@ impl App {
             ssh_log,
             firewall_out: None,
             update_all: None,
+            ip_ranges_lease: None,
             apply_everything: false,
             cron_apply_nginx: false,
         };
@@ -786,6 +809,7 @@ impl App {
     fn run_cron_job(&mut self, job: CronJob) -> Result<()> {
         match job {
             CronJob::UpdateIpRanges => self.start_cron_update_ip_ranges(),
+            CronJob::UpdateEverything => self.start_update_everything(true),
             CronJob::Detect(_) | CronJob::RecordAccessStats | CronJob::RenderFirewall => {
                 self.start_cron_log_pass(vec![job])
             }
@@ -864,13 +888,25 @@ impl App {
     /// `Db`-isn't-`Sync` reasoning as `start_source_update`/
     /// `start_country_select`: storing happens back on the main thread in
     /// `finish_cron_update_ip_ranges`.
+    ///
+    /// Not while any download holds the lease — an "update everything" in
+    /// this process or another, which fetches these three as well: the job
+    /// stays due, and the next check asks again.
     fn start_cron_update_ip_ranges(&mut self) {
-        if !self
-            .jobs_in_flight
-            .insert(Job::Cron(CronJob::UpdateIpRanges))
+        if self.update_all.is_some()
+            || self
+                .jobs_in_flight
+                .contains(&Job::Cron(CronJob::UpdateIpRanges))
         {
             return;
         }
+        let Ok(crate::refresh::Claim::Granted(lease)) = crate::refresh::claim(&self.db, now_secs())
+        else {
+            return;
+        };
+        self.ip_ranges_lease = Some(lease);
+        self.jobs_in_flight
+            .insert(Job::Cron(CronJob::UpdateIpRanges));
         let sender = self.events.sender();
         tokio::spawn(async move {
             let results = crate::cron::fetch_ip_ranges().await;
@@ -890,7 +926,11 @@ impl App {
         self.jobs_in_flight
             .remove(&Job::Cron(CronJob::UpdateIpRanges));
 
-        crate::cron::store_ip_ranges(&self.db, results)?;
+        let stored = crate::cron::store_ip_ranges(&self.db, results);
+        if let Some(lease) = self.ip_ranges_lease.take() {
+            crate::refresh::release(&self.db, &lease)?;
+        }
+        stored?;
         self.refresh()?;
         Ok(())
     }
@@ -1281,31 +1321,56 @@ impl App {
     /// Downloads every list this host uses, one source at a time — the
     /// TUI's half of what `stop-bots batch` and the console's "Update
     /// everything" button do, through the same [`crate::refresh::plan`].
+    /// `scheduled` is the weekly job's run, which says nothing on the
+    /// message line.
     ///
     /// One source failing is reported and the rest still run: these are
     /// eight third parties, and a transient failure at one of them is not
     /// a reason to leave the other seven stale.
-    fn start_update_everything(&mut self) {
-        if self.jobs_in_flight.contains(&Job::UpdateEverything) {
-            self.message = Some("Already downloading every list.".to_string());
+    ///
+    /// **One download at a time, across every stop-bots.** A run holds the
+    /// download lease (see [`crate::refresh::Lease`]), so `u` while the
+    /// weekly job, the crawler-range job or another process's download is
+    /// out says so and fetches nothing, and the scheduled jobs wait for
+    /// `u`'s run in the same way.
+    fn start_update_everything(&mut self, scheduled: bool) {
+        if self.update_all.is_some() || self.jobs_in_flight.contains(&Job::UpdateEverything) {
+            if !scheduled {
+                self.message = Some("Already downloading every list.".to_string());
+            }
             return;
         }
 
         // Planning reads `Db`, so it happens here, on the main thread.
+        let lease = match crate::refresh::claim(&self.db, now_secs()) {
+            Ok(crate::refresh::Claim::Granted(lease)) => lease,
+            Ok(crate::refresh::Claim::Busy { since }) => {
+                if !scheduled {
+                    self.message = Some(crate::refresh::Claim::busy_message(since));
+                }
+                return;
+            }
+            Err(err) => {
+                self.message = Some(format!("Could not start the download: {err:#}"));
+                return;
+            }
+        };
         let plan = match crate::refresh::plan(&self.db) {
             Ok(plan) => plan,
             Err(err) => {
+                let _ = crate::refresh::release(&self.db, &lease);
                 self.message = Some(format!("Could not work out what to update: {err}"));
                 return;
             }
         };
-        self.jobs_in_flight.insert(Job::UpdateEverything);
-        self.update_all = Some(UpdateAllRun {
+        let run = UpdateAllRun {
             remaining: plan.into(),
-            done: 0,
-            failures: Vec::new(),
             outcomes: Vec::new(),
-        });
+            lease: Some(lease),
+            scheduled,
+        };
+        self.jobs_in_flight.insert(run.job());
+        self.update_all = Some(run);
         self.fetch_next_everything_source();
     }
 
@@ -1320,7 +1385,9 @@ impl App {
             return;
         };
 
-        self.message = Some(format!("Downloading {}\u{2026}", source.label()));
+        if !run.scheduled {
+            self.message = Some(format!("Downloading {}\u{2026}", source.label()));
+        }
         let sender = self.events.sender();
         // A runtime task rather than the blocking pool: `refresh::fetch`
         // is `async` all the way down, and it touches no `Db`.
@@ -1348,9 +1415,9 @@ impl App {
         // A run that was never started (or already finished) has nothing
         // to record. Reachable only if an event outlives its run, but
         // dropping it beats panicking on a live server.
-        if self.update_all.is_none() {
+        let Some(run) = self.update_all.as_mut() else {
             return Ok(());
-        }
+        };
 
         let outcome = match result {
             Ok(raw) => {
@@ -1358,12 +1425,10 @@ impl App {
             }
             Err(err) => Err(err),
         };
-        let run = self.update_all.as_mut().expect("checked above");
-        match &outcome {
-            Ok(_) => run.done += 1,
-            Err(err) => run.failures.push(format!("{}: {err}", source.label())),
-        }
         run.outcomes.push((source, outcome));
+        if let Some(lease) = &run.lease {
+            crate::refresh::renew(&self.db, lease, now_secs())?;
+        }
 
         self.fetch_next_everything_source();
         // Every source is a list something on screen counts or dates, so
@@ -1371,33 +1436,25 @@ impl App {
         self.refresh()
     }
 
-    /// Reports a finished "update everything" and clears its state.
+    /// Reports a finished "update everything", records it against the
+    /// cron jobs it covers, gives the lease back and clears its state.
     fn finish_update_everything(&mut self) {
-        self.jobs_in_flight.remove(&Job::UpdateEverything);
         let Some(run) = self.update_all.take() else {
             return;
         };
-
-        // Only when all three crawler sources worked, for the reason
-        // `refresh::crawler_ranges_all_succeeded` documents.
-        if crate::refresh::crawler_ranges_all_succeeded(&run.outcomes) {
-            crate::cron::record_run(
-                &self.db,
-                crate::cron::CronJob::UpdateIpRanges,
-                "updated from the Dashboard",
-            );
+        self.jobs_in_flight.remove(&run.job());
+        if let Some(lease) = &run.lease {
+            let _ = crate::refresh::release(&self.db, lease);
         }
-
-        self.message = Some(if run.failures.is_empty() {
-            format!("Updated {} list(s).", run.done)
+        let by = if run.scheduled {
+            "by the schedule"
         } else {
-            format!(
-                "Updated {} list(s). {} failed \u{2014} {}",
-                run.done,
-                run.failures.len(),
-                run.failures.join("; ")
-            )
-        });
+            "from the Dashboard"
+        };
+        let summary = crate::refresh::record(&self.db, &run.outcomes, by);
+        if !run.scheduled {
+            self.message = Some(summary);
+        }
     }
 
     /// Works out what "Apply everything" would do, for the Dashboard to ask
@@ -1740,7 +1797,7 @@ impl App {
                 return Ok(());
             }
             KeyOutcome::UpdateEverything => {
-                self.start_update_everything();
+                self.start_update_everything(false);
                 return Ok(());
             }
             KeyOutcome::PreviewApplyEverything => {
@@ -1968,6 +2025,16 @@ mod tests {
         .unwrap()
     }
 
+    /// Marks both download jobs just run, so that no test's cron check
+    /// reaches the network.
+    fn mark_downloads_run(app: &App) {
+        for job in [CronJob::UpdateIpRanges, CronJob::UpdateEverything] {
+            app.db
+                .set_cron_last_run(job.id(), now_secs(), "skipped for test")
+                .unwrap();
+        }
+    }
+
     /// The bottom row of the whole UI, as drawn.
     fn footer(app: &mut App) -> String {
         let mut terminal =
@@ -2028,6 +2095,92 @@ mod tests {
 
         let said: Vec<&str> = app.log.iter().map(|(_, text)| text.as_str()).collect();
         assert_eq!(said, ["Already downloading every list."; 2]);
+    }
+
+    /// `u` while another download holds the lease — the weekly job, the
+    /// crawler job, or another stop-bots — fetches nothing and says why.
+    #[tokio::test]
+    async fn u_while_another_download_runs_fetches_nothing_and_says_so() {
+        let mut app = test_app();
+        crate::refresh::claim(&app.db, now_secs()).unwrap();
+
+        app.handle_key_press(KeyEvent::from(KeyCode::Char('u')))
+            .unwrap();
+
+        let message = app.message.as_deref().unwrap_or_default();
+        assert!(message.contains("Another update"), "was: {message}");
+        assert!(app.update_all.is_none());
+        assert!(!app.jobs_in_flight.contains(&Job::UpdateEverything));
+    }
+
+    /// And the scheduled jobs wait for `u`'s run in the same process:
+    /// neither the weekly download nor the crawler job starts beside it.
+    #[tokio::test]
+    async fn the_scheduled_downloads_wait_for_one_started_by_hand() {
+        let mut app = test_app();
+        app.update_all = Some(UpdateAllRun {
+            remaining: std::collections::VecDeque::new(),
+            outcomes: Vec::new(),
+            lease: None,
+            scheduled: false,
+        });
+
+        app.run_cron_job(CronJob::UpdateEverything).unwrap();
+        app.run_cron_job(CronJob::UpdateIpRanges).unwrap();
+
+        assert!(!app
+            .jobs_in_flight
+            .contains(&Job::Cron(CronJob::UpdateEverything)));
+        assert!(!app
+            .jobs_in_flight
+            .contains(&Job::Cron(CronJob::UpdateIpRanges)));
+    }
+
+    /// The weekly run works in the background: its outcome goes to the
+    /// Scheduled panel, not over whatever the operator is doing.
+    #[tokio::test]
+    async fn a_scheduled_download_reports_to_the_schedule_not_the_message_line() {
+        let mut app = test_app();
+        let lease = match crate::refresh::claim(&app.db, now_secs()).unwrap() {
+            crate::refresh::Claim::Granted(lease) => lease,
+            busy => panic!("{busy:?}"),
+        };
+        app.jobs_in_flight
+            .insert(Job::Cron(CronJob::UpdateEverything));
+        app.update_all = Some(UpdateAllRun {
+            remaining: std::collections::VecDeque::new(),
+            outcomes: Vec::new(),
+            lease: Some(lease),
+            scheduled: true,
+        });
+
+        app.finish_update_everything_source(
+            crate::refresh::Source::Country("ru".to_string()),
+            Ok("5.8.0.0/19\n".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(app.message, None);
+        assert!(
+            !app.jobs_in_flight
+                .contains(&Job::Cron(CronJob::UpdateEverything)),
+            "{:?}",
+            app.jobs_in_flight
+        );
+        assert_eq!(
+            app.db
+                .get_cron_last_summary(CronJob::UpdateEverything.id())
+                .unwrap()
+                .as_deref(),
+            Some("Updated 1 list(s).")
+        );
+        assert!(
+            matches!(
+                crate::refresh::claim(&app.db, now_secs()).unwrap(),
+                crate::refresh::Claim::Granted(_)
+            ),
+            "the lease was not given back"
+        );
     }
 
     /// Types `text` into the open palette and presses Enter.
@@ -2478,12 +2631,16 @@ mod tests {
     #[tokio::test]
     async fn update_everything_names_a_failed_source_and_still_finishes() {
         let mut app = test_app();
+        let stored = |source| (source, Ok("1 range(s)".to_string()));
         app.jobs_in_flight.insert(Job::UpdateEverything);
         app.update_all = Some(UpdateAllRun {
             remaining: std::collections::VecDeque::new(),
-            done: 2,
-            failures: Vec::new(),
-            outcomes: Vec::new(),
+            outcomes: vec![
+                stored(crate::refresh::Source::Country("ru".to_string())),
+                stored(crate::refresh::Source::Country("cn".to_string())),
+            ],
+            lease: None,
+            scheduled: false,
         });
 
         app.finish_update_everything_source(
@@ -2523,9 +2680,9 @@ mod tests {
         app.jobs_in_flight.insert(Job::UpdateEverything);
         app.update_all = Some(UpdateAllRun {
             remaining: std::collections::VecDeque::new(),
-            done: 0,
-            failures: Vec::new(),
             outcomes: Vec::new(),
+            lease: None,
+            scheduled: false,
         });
 
         app.finish_update_everything_source(
@@ -2841,9 +2998,7 @@ mod tests {
     #[tokio::test]
     async fn a_freshly_constructed_app_runs_due_jobs_on_its_first_check() {
         let mut app = test_app();
-        app.db
-            .set_cron_last_run(CronJob::UpdateIpRanges.id(), now_secs(), "skipped for test")
-            .unwrap();
+        mark_downloads_run(&app);
 
         app.check_cron().unwrap();
         drain_background_work(&mut app).await;
@@ -2895,9 +3050,7 @@ mod tests {
     #[tokio::test]
     async fn check_cron_runs_every_due_synchronous_job() {
         let mut app = test_app();
-        app.db
-            .set_cron_last_run(CronJob::UpdateIpRanges.id(), now_secs(), "skipped for test")
-            .unwrap();
+        mark_downloads_run(&app);
         app.last_cron_check =
             std::time::Instant::now() - CRON_CHECK_INTERVAL - std::time::Duration::from_secs(1);
 
@@ -2932,9 +3085,7 @@ mod tests {
     #[tokio::test]
     async fn due_log_jobs_share_one_pass_and_a_pass_never_overlaps_another() {
         let mut app = test_app();
-        app.db
-            .set_cron_last_run(CronJob::UpdateIpRanges.id(), now_secs(), "skipped for test")
-            .unwrap();
+        mark_downloads_run(&app);
         let backdate = |app: &mut App| {
             app.last_cron_check =
                 std::time::Instant::now() - CRON_CHECK_INTERVAL - std::time::Duration::from_secs(1);
@@ -2981,9 +3132,7 @@ mod tests {
     #[tokio::test]
     async fn check_cron_is_throttled_against_rapid_repeated_ticks() {
         let mut app = test_app();
-        app.db
-            .set_cron_last_run(CronJob::UpdateIpRanges.id(), now_secs(), "skipped for test")
-            .unwrap();
+        mark_downloads_run(&app);
         app.last_cron_check =
             std::time::Instant::now() - CRON_CHECK_INTERVAL - std::time::Duration::from_secs(1);
 

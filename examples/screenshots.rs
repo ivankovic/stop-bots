@@ -705,6 +705,7 @@ fn seed_after_startup(db: &Db) -> Result<()> {
     }
     for (job_id, minutes_ago, summary) in [
         ("update_ip_ranges", 44, "4 sources, 21,904 ranges"),
+        ("update_everything", 44, "Updated 9 list(s)."),
         ("record_access_stats", 3, "8 user agents"),
         ("render_firewall", 44, "6,506 rules"),
         ("block_scanners", 3, "2 blocked"),

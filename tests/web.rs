@@ -2353,6 +2353,25 @@ async fn selecting_a_country_names_a_button_rather_than_a_cli_command() {
 /// 403s waiting to happen — and they belong in the header, on every
 /// screen, because they act on the whole host rather than on one list
 /// and are the TUI's `u` and `a`, which work from anywhere.
+/// "Update everything" while another download is out — the console's own
+/// weekly job, the TUI's, or a `batch` from cron — fetches nothing and
+/// says so, rather than asking the same feeds for the same files twice.
+#[tokio::test]
+async fn update_everything_waits_for_a_download_already_running() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let other = Db::open(&db_path).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    stop_bots::refresh::claim(&other, now).unwrap();
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/update-all", "").await;
+
+    assert!(flash.contains("Another update"), "was: {flash}");
+}
+
 #[tokio::test]
 async fn the_dashboard_offers_update_everything_and_apply_everything() {
     let (app, password, _tmp, _db) = app_with_db();

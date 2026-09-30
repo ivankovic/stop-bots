@@ -10,6 +10,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Added
 
+- **A weekly "Update every list" job in the internal cron**, the same plan as
+  "Update everything", at a week plus up to 12 hours' jitter.
 - `set-detector <name>` and `list-detectors`: switch, TTL and threshold for
   every detector, as the internal cron and `batch` use them.
 - `set-subnet-escalation`: IPv4 /24 escalation, previously unreachable.
@@ -156,6 +158,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   missing "not installed", and applying with it is refused, naming the package.
 - A new database renders for the backend this host has, preferring nftables. One
   that has chosen, or has written a script, keeps its backend.
+- **One download at a time, across every stop-bots.** "Update everything", the
+  cron's download jobs and `batch` share a lease in the database; a second one
+  says so and fetches nothing.
 - **No detector blocks a Cloudflare edge address**, from a compiled-in copy of
   Cloudflare's published ranges. `status` warns when most of the access log
   comes from them, and gives the `set_real_ip_from` lines that fix it.

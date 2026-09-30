@@ -1316,71 +1316,37 @@ async fn set_feed(
 }
 
 /// Downloads every list this host uses — the console's half of what
-/// `stop-bots batch` does, through the same `refresh::plan`.
+/// `stop-bots batch` does, through the same `refresh::plan`, and the same
+/// run as the console's weekly job (see [`crate::web::cron::update_everything`]).
 ///
-/// One source failing is reported and the rest still run: these are eight
-/// third parties, and a transient failure at one of them is not a reason to
-/// leave the other seven stale.
+/// On a task of its own: a browser that gives up waiting drops this
+/// handler, and a download dropped half-way would leave the lease held
+/// until it expires and the run unrecorded.
 async fn update_all(State(state): State<AppState>, _auth: Auth) -> Response {
-    let plan = match state.with_db(crate::refresh::plan).await {
-        Ok(plan) => plan,
-        Err(err) => {
-            return back_with(
-                &state.base,
-                "/",
-                &format!("Could not work out what to update: {err}"),
-                false,
-            )
+    use crate::web::cron::UpdateRun;
+    let task = state.clone();
+    let run = tokio::spawn(async move {
+        crate::web::cron::update_everything(&task, "from the console").await
+    })
+    .await;
+    match run {
+        Ok(Ok(UpdateRun::Done { summary, all_ok })) => {
+            back_with(&state.base, "/", &summary, all_ok)
         }
-    };
-
-    let mut done = 0;
-    let mut failures: Vec<String> = Vec::new();
-    let mut outcomes = Vec::new();
-    for source in plan {
-        // Fetch off the database lock, store on it — `Db` is not `Sync`,
-        // so nothing holding it can cross an `.await`.
-        let fetched = crate::refresh::fetch(&source).await;
-        let source_for_store = source.clone();
-        let outcome = match fetched {
-            Ok(raw) => state
-                .with_db(move |db| crate::refresh::store(db, &source_for_store, &raw))
-                .await
-                .map_err(|err| format!("{err:#}")),
-            Err(err) => Err(format!("{err:#}")),
-        };
-        match &outcome {
-            Ok(_) => done += 1,
-            Err(err) => failures.push(format!("{}: {err}", source.label())),
-        }
-        outcomes.push((source, outcome));
+        Ok(Ok(UpdateRun::Busy { since })) => back_with(
+            &state.base,
+            "/",
+            &crate::refresh::Claim::busy_message(since),
+            false,
+        ),
+        Ok(Err(err)) => back_with(&state.base, "/", &format!("{err:#}"), false),
+        Err(err) => back_with(
+            &state.base,
+            "/",
+            &format!("The download stopped unexpectedly: {err}"),
+            false,
+        ),
     }
-
-    // Only when all three crawler sources worked, for the reason
-    // `refresh::crawler_ranges_all_succeeded` documents.
-    if crate::refresh::crawler_ranges_all_succeeded(&outcomes) {
-        let _ = state
-            .with_db(|db| {
-                crate::cron::record_run(
-                    db,
-                    crate::cron::CronJob::UpdateIpRanges,
-                    "updated from the console",
-                );
-                anyhow::Ok(())
-            })
-            .await;
-    }
-
-    let message = if failures.is_empty() {
-        format!("Updated {done} list(s).")
-    } else {
-        format!(
-            "Updated {done} list(s). {} failed — {}",
-            failures.len(),
-            failures.join("; ")
-        )
-    };
-    back_with(&state.base, "/", &message, failures.is_empty())
 }
 
 /// Lines of diff the confirm page shows before it stops and says where the

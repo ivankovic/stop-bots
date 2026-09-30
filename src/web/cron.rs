@@ -108,6 +108,9 @@ pub async fn tick(state: &AppState) -> usize {
     for job in due.into_iter().filter(|j| !cron::is_log_job(*j)) {
         let result = match job {
             CronJob::UpdateIpRanges => update_ip_ranges(state).await,
+            CronJob::UpdateEverything => update_everything(state, "by the schedule")
+                .await
+                .map(|_| ()),
             CronJob::HealthCheck => health_check(state).await,
             CronJob::Maintenance => maintenance(state).await,
             CronJob::ApplyNginx => apply_nginx(state).await,
@@ -245,12 +248,100 @@ async fn health_check(state: &AppState) -> anyhow::Result<()> {
 ///
 /// The fetch holds no database handle at all — it is three round-trips to
 /// remote hosts, and the lock has no business being held across them.
+///
+/// Not while another download holds the lease (see
+/// [`crate::refresh::Lease`]): the job stays due and the next tick asks
+/// again, which costs one row read.
 async fn update_ip_ranges(state: &AppState) -> anyhow::Result<()> {
+    let claim = state.with_db(|db| crate::refresh::claim(db, now())).await?;
+    let crate::refresh::Claim::Granted(lease) = claim else {
+        return Ok(());
+    };
     let results = cron::fetch_ip_ranges().await;
     state
-        .with_db(move |db| cron::store_ip_ranges(db, results))
+        .with_db(move |db| {
+            let stored = cron::store_ip_ranges(db, results);
+            crate::refresh::release(db, &lease)?;
+            stored
+        })
         .await?;
     Ok(())
+}
+
+/// What one "update everything" came to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateRun {
+    /// It ran: the line to show, and whether every source worked.
+    Done { summary: String, all_ok: bool },
+    /// Another download held the lease, last renewed at `since`.
+    Busy { since: i64 },
+}
+
+/// Downloads every list this host uses, one source at a time, for the
+/// console's button and for its weekly job: fetched off the database lock,
+/// stored on it, holding the download lease throughout and renewing it
+/// after each source. `by` goes into the crawler job's summary.
+///
+/// One source failing is reported and the rest still run: these are
+/// eight third parties, and a transient failure at one of them is not a
+/// reason to leave the other seven stale.
+pub async fn update_everything(state: &AppState, by: &'static str) -> anyhow::Result<UpdateRun> {
+    let claimed = state
+        .with_db(|db| {
+            Ok(match crate::refresh::claim(db, now())? {
+                crate::refresh::Claim::Granted(lease) => Ok((lease, crate::refresh::plan(db))),
+                crate::refresh::Claim::Busy { since } => Err(since),
+            })
+        })
+        .await?;
+    let (lease, plan) = match claimed {
+        Ok(claimed) => claimed,
+        Err(since) => return Ok(UpdateRun::Busy { since }),
+    };
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(err) => {
+            let lease = lease.clone();
+            state
+                .with_db(move |db| crate::refresh::release(db, &lease))
+                .await?;
+            return Err(err.context("could not work out what to update"));
+        }
+    };
+
+    let mut outcomes = Vec::new();
+    for source in plan {
+        // Fetch off the database lock, store on it — `Db` is not `Sync`,
+        // so nothing holding it can cross an `.await`.
+        let fetched = crate::refresh::fetch(&source).await;
+        let for_store = source.clone();
+        let lease = lease.clone();
+        let outcome = state
+            .with_db(move |db| {
+                let stored = fetched.and_then(|raw| crate::refresh::store(db, &for_store, &raw));
+                crate::refresh::renew(db, &lease, now())?;
+                Ok(stored.map_err(|err| format!("{err:#}")))
+            })
+            .await?;
+        outcomes.push((source, outcome));
+    }
+
+    let all_ok = outcomes.iter().all(|(_, outcome)| outcome.is_ok());
+    let summary = state
+        .with_db(move |db| {
+            let summary = crate::refresh::record(db, &outcomes, by);
+            crate::refresh::release(db, &lease)?;
+            Ok(summary)
+        })
+        .await?;
+    Ok(UpdateRun::Done { summary, all_ok })
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 #[cfg(test)]
@@ -276,11 +367,39 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         // Marked just-run so no test ever makes the three outbound
         // crawler-range fetches. Every other job is local.
-        db.set_cron_last_run(CronJob::UpdateIpRanges.id(), now_secs(), "skipped for test")
-            .unwrap();
+        for job in [CronJob::UpdateIpRanges, CronJob::UpdateEverything] {
+            db.set_cron_last_run(job.id(), now_secs(), "skipped for test")
+                .unwrap();
+        }
         let mut state = AppState::new(db, PathBuf::from("/nonexistent"), Some(ssh_log), false);
         state.firewall_out = Some(dir.join("fw.nft"));
         state
+    }
+
+    /// The console's button, its weekly job and its crawler job all wait
+    /// for a download someone else holds — another process, or this one —
+    /// rather than fetching the same feeds beside it. Nothing is fetched
+    /// and nothing is recorded, so the jobs stay due for the next tick.
+    #[tokio::test]
+    async fn every_download_waits_while_another_holds_the_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_in(dir.path());
+        state
+            .with_db(|db| crate::refresh::claim(db, now()))
+            .await
+            .unwrap();
+
+        let run = update_everything(&state, "by the schedule").await.unwrap();
+        assert!(matches!(run, UpdateRun::Busy { .. }), "{run:?}");
+
+        update_ip_ranges(&state).await.unwrap();
+        for job in [CronJob::UpdateIpRanges, CronJob::UpdateEverything] {
+            let summary = state
+                .with_db(move |db| db.get_cron_last_summary(job.id()))
+                .await
+                .unwrap();
+            assert_eq!(summary.as_deref(), Some("skipped for test"), "{}", job.id());
+        }
     }
 
     #[tokio::test]

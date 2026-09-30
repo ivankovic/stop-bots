@@ -168,10 +168,222 @@ pub fn crawler_ranges_all_succeeded(outcomes: &[(Source, Result<String, String>)
         .all(|(_, outcome)| outcome.is_ok())
 }
 
+/// Records a finished "update everything" against the internal cron and
+/// returns the one line to show for it: "Updated 7 list(s).", and what
+/// failed.
+///
+/// Both jobs it covers are marked run: `UpdateEverything` always, so the
+/// weekly job does not repeat what someone just did by hand, and
+/// `UpdateIpRanges` only when every crawler source worked (see
+/// [`crawler_ranges_all_succeeded`]). `by` says who, for the latter's
+/// summary: "from the Dashboard", "by batch run".
+pub fn record(db: &Db, outcomes: &[(Source, Result<String, String>)], by: &str) -> String {
+    use crate::cron::{record_run, CronJob};
+    if crawler_ranges_all_succeeded(outcomes) {
+        record_run(db, CronJob::UpdateIpRanges, &format!("updated {by}"));
+    }
+    let failures: Vec<String> = outcomes
+        .iter()
+        .filter_map(|(source, outcome)| {
+            outcome
+                .as_ref()
+                .err()
+                .map(|err| format!("{}: {err}", source.label()))
+        })
+        .collect();
+    let done = outcomes.len() - failures.len();
+    let summary = if failures.is_empty() {
+        format!("Updated {done} list(s).")
+    } else {
+        format!(
+            "Updated {done} list(s). {} failed \u{2014} {}",
+            failures.len(),
+            failures.join("; ")
+        )
+    };
+    record_run(db, CronJob::UpdateEverything, &summary);
+    summary
+}
+
+// ---- one download at a time, across every stop-bots ----
+
+/// How long a download may go without a sign of life before another
+/// process may take over. Every holder renews after each source, and one
+/// source is bounded by [`crate::fetch::TIMEOUT`] plus its connect
+/// timeout — seventy seconds — so ten minutes only ever expires a holder
+/// that died.
+pub const LEASE_SECONDS: i64 = 10 * 60;
+
+/// The right to download lists, recorded in the database so that the TUI,
+/// the console and a `batch` from cron all see it.
+///
+/// "Update everything" and the internal cron's jobs used to fetch the same
+/// feeds at once: the TUI kept its own interlock per job, and the console
+/// had none at all between its button and its cron. Nothing corrupted
+/// (every store replaces), but it was duplicate traffic to the same third
+/// parties. A row rather than a lock file: every front-end already shares
+/// the database, a row outlives nothing it should not (it expires), and a
+/// process that dies holding it costs [`LEASE_SECONDS`] at most.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lease {
+    holder: String,
+}
+
+/// What asking for the [`Lease`] got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    Granted(Lease),
+    /// Someone else is downloading, and last renewed at `since`.
+    Busy {
+        since: i64,
+    },
+}
+
+impl Claim {
+    /// Why nothing was downloaded, for a front-end to say.
+    pub fn busy_message(since: i64) -> String {
+        format!(
+            "Another update is downloading the lists (last active {}); nothing was fetched twice.",
+            crate::present::ago(since)
+        )
+    }
+}
+
+/// The stored lease: when it was last renewed, and by whom.
+fn read_lease(db: &Db) -> Result<Option<(i64, String)>> {
+    Ok(db
+        .get_text_setting(crate::db::keys::REFRESH_LEASE)?
+        .and_then(|value| {
+            let (since, holder) = value.split_once(' ')?;
+            Some((since.parse().ok()?, holder.to_string()))
+        }))
+}
+
+/// Takes the lease as of `now`, unless someone else holds one they
+/// renewed within [`LEASE_SECONDS`]. The read and the write are one
+/// `BEGIN IMMEDIATE` transaction, so two processes cannot both be granted.
+pub fn claim(db: &Db, now: i64) -> Result<Claim> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    db.batch(|| {
+        if let Some((since, _)) = read_lease(db)? {
+            if now - since < LEASE_SECONDS {
+                return Ok(Claim::Busy { since });
+            }
+        }
+        let holder = format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        db.set_text_setting(crate::db::keys::REFRESH_LEASE, &format!("{now} {holder}"))?;
+        Ok(Claim::Granted(Lease { holder }))
+    })
+}
+
+/// Marks `lease` alive as of `now`. A lease that has since expired and
+/// been taken by someone else is left to them.
+pub fn renew(db: &Db, lease: &Lease, now: i64) -> Result<()> {
+    db.batch(|| {
+        if read_lease(db)?.is_some_and(|(_, holder)| holder == lease.holder) {
+            let value = format!("{now} {}", lease.holder);
+            db.set_text_setting(crate::db::keys::REFRESH_LEASE, &value)?;
+        }
+        Ok(())
+    })
+}
+
+/// Gives `lease` back, if it is still ours.
+pub fn release(db: &Db, lease: &Lease) -> Result<()> {
+    db.batch(|| {
+        if read_lease(db)?.is_some_and(|(_, holder)| holder == lease.holder) {
+            db.set_text_setting(crate::db::keys::REFRESH_LEASE, "")?;
+        }
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::ReputationSource;
+
+    const T: i64 = 1_790_000_000;
+
+    fn granted(claim: Claim) -> Lease {
+        match claim {
+            Claim::Granted(lease) => lease,
+            Claim::Busy { since } => panic!("refused, held since {since}"),
+        }
+    }
+
+    /// One download at a time: a second claim is refused, and says since
+    /// when, until the first gives the lease back.
+    #[test]
+    fn a_second_download_waits_until_the_first_releases_the_lease() {
+        let db = Db::open_in_memory().unwrap();
+        let first = granted(claim(&db, T).unwrap());
+
+        assert_eq!(claim(&db, T + 5).unwrap(), Claim::Busy { since: T });
+
+        release(&db, &first).unwrap();
+        granted(claim(&db, T + 6).unwrap());
+    }
+
+    /// A holder that died stops holding once it has gone quiet for
+    /// `LEASE_SECONDS`; one that keeps renewing keeps it.
+    #[test]
+    fn a_lease_lapses_only_when_its_holder_stops_renewing() {
+        let db = Db::open_in_memory().unwrap();
+        let alive = granted(claim(&db, T).unwrap());
+
+        renew(&db, &alive, T + LEASE_SECONDS - 10).unwrap();
+        assert!(matches!(
+            claim(&db, T + LEASE_SECONDS + 10).unwrap(),
+            Claim::Busy { .. }
+        ));
+
+        let taken_over = granted(claim(&db, T + 2 * LEASE_SECONDS).unwrap());
+        // The old holder waking up does not take it back, or free it.
+        renew(&db, &alive, T + 2 * LEASE_SECONDS + 1).unwrap();
+        release(&db, &alive).unwrap();
+        assert_eq!(
+            claim(&db, T + 2 * LEASE_SECONDS + 2).unwrap(),
+            Claim::Busy {
+                since: T + 2 * LEASE_SECONDS
+            }
+        );
+        release(&db, &taken_over).unwrap();
+    }
+
+    /// A finished run marks the weekly job done whatever happened, so it
+    /// does not repeat what someone just did by hand, and names what failed.
+    #[test]
+    fn a_finished_run_is_recorded_against_the_weekly_job() {
+        let db = Db::open_in_memory().unwrap();
+        let outcomes = vec![
+            (
+                Source::Country("ru".to_string()),
+                Ok("2 range(s)".to_string()),
+            ),
+            (
+                Source::Country("cn".to_string()),
+                Err("timed out".to_string()),
+            ),
+        ];
+
+        let summary = record(&db, &outcomes, "from the Dashboard");
+
+        assert_eq!(
+            summary,
+            "Updated 1 list(s). 1 failed \u{2014} country cn: timed out"
+        );
+        assert_eq!(
+            db.get_cron_last_summary(crate::cron::CronJob::UpdateEverything.id())
+                .unwrap()
+                .as_deref(),
+            Some(summary.as_str())
+        );
+    }
 
     fn feed(id: &str) -> ReputationSource {
         ReputationSource {

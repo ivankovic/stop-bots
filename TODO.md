@@ -11,13 +11,6 @@ list — which meant the open items below were unfindable inside it.
   `~*` regex. The `BLOCKLIST` tag can therefore disagree with what actually gets
   blocked — and since the web UI arrived it says so on two screens rather than
   one, because both front-ends now read this from `crate::dynamic`.
-* **"Update everything" and the internal cron can fetch the same feeds at
-  once.** `Job::UpdateEverything` and `Job::Cron(UpdateIpRanges)` are separate
-  entries in `jobs_in_flight`, and `check_cron` keeps ticking while `u` runs —
-  the `record_run` that would mark the job done only lands at the end. Nothing
-  corrupts (every store replaces), but it is duplicate traffic to three third
-  parties and two background jobs competing for one message line. Same in the
-  console, whose `/update-all` has no interlock with its own cron either.
 * **A changed path prefix needs a restart.** `BasePath` is read once when the
   router is built, so after Web Access mounts the console under `/stop-bots/`
   — from either front-end — the running console keeps generating links without

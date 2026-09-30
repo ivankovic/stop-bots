@@ -70,6 +70,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub enum CronJob {
     /// Refetches Googlebot/Bingbot/GPTBot's published CIDR ranges.
     UpdateIpRanges,
+    /// Downloads every list this host uses — the same plan as "Update
+    /// everything" (see [`crate::refresh`]) — once a week, so bot lists,
+    /// the enabled feeds and the selected countries do not go stale on a
+    /// host where nobody presses `u` and no `batch` runs.
+    UpdateEverything,
     /// One switchable log-analysis detector — see [`crate::protection::Detector`].
     /// Every detector shares this variant rather than adding its own, which
     /// is what stopped a new detector meaning three more match arms here.
@@ -95,7 +100,8 @@ pub enum CronJob {
 impl CronJob {
     /// Every job: the two fixed ones on either side of every detector.
     pub fn all() -> Vec<CronJob> {
-        std::iter::once(CronJob::UpdateIpRanges)
+        [CronJob::UpdateIpRanges, CronJob::UpdateEverything]
+            .into_iter()
             .chain(Detector::ALL.into_iter().map(CronJob::Detect))
             .chain([
                 CronJob::RecordAccessStats,
@@ -115,6 +121,7 @@ impl CronJob {
     pub fn id(self) -> &'static str {
         match self {
             CronJob::UpdateIpRanges => "update_ip_ranges",
+            CronJob::UpdateEverything => "update_everything",
             CronJob::Detect(detector) => detector.id(),
             CronJob::RecordAccessStats => "record_access_stats",
             CronJob::RenderFirewall => "render_firewall",
@@ -128,6 +135,7 @@ impl CronJob {
     pub fn label(self) -> &'static str {
         match self {
             CronJob::UpdateIpRanges => "Update crawler IP ranges",
+            CronJob::UpdateEverything => "Update every list",
             CronJob::Detect(detector) => detector.spec().job_label,
             CronJob::RecordAccessStats => "Record access-log stats",
             CronJob::RenderFirewall => "Render firewall script",
@@ -162,9 +170,35 @@ impl CronJob {
             // happened".
             CronJob::HealthCheck | CronJob::ApplyNginx => Duration::from_secs(60 * 60),
             CronJob::Detect(_) | CronJob::RecordAccessStats => Duration::from_secs(60),
+            CronJob::UpdateEverything => Duration::from_secs(7 * 24 * 60 * 60),
         }
     }
+
+    /// How long after a run at `last_run` this job is due again: its
+    /// [`Self::interval`], plus, for the weekly download, up to
+    /// [`UPDATE_JITTER`] more.
+    ///
+    /// The jitter is worked out from `last_run` rather than drawn at random
+    /// so that every front-end, and the Dashboard projecting the next run,
+    /// agree on it without storing it. It still moves: each run lands at a
+    /// different minute, so the week after lands somewhere else again, and
+    /// hosts that upgraded at the same moment drift apart instead of
+    /// asking the same feeds for the same files at the same time forever.
+    pub fn due_after(self, last_run: i64) -> Duration {
+        let jitter = match self {
+            CronJob::UpdateEverything => {
+                let mixed = (last_run as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32;
+                Duration::from_secs(mixed % UPDATE_JITTER.as_secs())
+            }
+            _ => Duration::ZERO,
+        };
+        self.interval() + jitter
+    }
 }
+
+/// The most the weekly download is pushed back past its week — see
+/// [`CronJob::due_after`].
+pub const UPDATE_JITTER: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// A job's persisted state, for the Dashboard's "Scheduled tasks" panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,10 +249,14 @@ const RENDER_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// nothing having happened until something else changes too.
 pub fn is_due(db: &Db, job: CronJob) -> Result<bool> {
     let Some(last_run) = db.get_cron_last_run(job.id())? else {
-        return Ok(true);
+        return Ok(match job {
+            CronJob::UpdateEverything => first_download_base(db)?
+                .is_some_and(|base| now() - base >= job.due_after(base).as_secs() as i64),
+            _ => true,
+        });
     };
     let elapsed = now() - last_run;
-    if elapsed >= job.interval().as_secs() as i64 {
+    if elapsed >= job.due_after(last_run).as_secs() as i64 {
         return Ok(true);
     }
     // Only asked of the one job that has this trigger, and only once the
@@ -245,21 +283,53 @@ pub fn is_due(db: &Db, job: CronJob) -> Result<bool> {
 /// the projected time and the due-check can never disagree about what
 /// [`CronJob::interval`] means.
 pub fn next_run_at(db: &Db, job: CronJob) -> Result<Option<i64>> {
+    let last_run = match db.get_cron_last_run(job.id())? {
+        Some(at) => Some(at),
+        None if job == CronJob::UpdateEverything => first_download_base(db)?,
+        None => None,
+    };
+    Ok(last_run.map(|last_run| last_run + job.due_after(last_run).as_secs() as i64))
+}
+
+/// What the weekly download counts from before it has ever run: when this
+/// host's oldest downloaded bot list was fetched, or `None` if it has
+/// fetched none.
+///
+/// Not "never run, so run now" like every other job. On a database that
+/// has fetched nothing, that would download every list the first time a
+/// front-end opened, which is the operator's first `u` to press, not the
+/// cron's; so the job waits for the first download and counts a week from
+/// it. On one upgraded from before the job existed, the lists are as old
+/// as their last fetch, and a month-old list is due at once. The built-in
+/// list is left out: it is stored at every start-up.
+fn first_download_base(db: &Db) -> Result<Option<i64>> {
     Ok(db
-        .get_cron_last_run(job.id())?
-        .map(|last_run| last_run + job.interval().as_secs() as i64))
+        .list_sources()?
+        .into_iter()
+        .filter(|source| source.id != crate::botlist::SourceKind::StopBotsExtras.id())
+        .filter_map(|source| source.last_fetched_at)
+        .min())
 }
 
 /// Every job that's currently due, in [`CronJob::all()`] order.
+///
+/// `UpdateIpRanges` is left out while `UpdateEverything` is due: the
+/// weekly download fetches the crawler ranges too, and records both jobs,
+/// so running the two would fetch those three files twice in one tick.
 pub fn due_jobs(db: &Db) -> Result<Vec<CronJob>> {
-    CronJob::all()
+    let due: Vec<CronJob> = CronJob::all()
         .into_iter()
         .filter_map(|job| match is_due(db, job) {
             Ok(true) => Some(Ok(job)),
             Ok(false) => None,
             Err(err) => Some(Err(err)),
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    let everything = due.contains(&CronJob::UpdateEverything);
+    Ok(due
+        .into_iter()
+        .filter(|job| !(everything && *job == CronJob::UpdateIpRanges))
+        .collect())
 }
 
 /// Every job's current state, for display — always all four, in
@@ -310,6 +380,7 @@ pub fn uses_ssh_log(job: CronJob) -> bool {
         CronJob::RenderFirewall => true,
         CronJob::RecordAccessStats
         | CronJob::UpdateIpRanges
+        | CronJob::UpdateEverything
         | CronJob::HealthCheck
         | CronJob::Maintenance
         | CronJob::ApplyNginx => false,
@@ -388,6 +459,9 @@ pub fn run_log_jobs(
             }
             CronJob::UpdateIpRanges => {
                 unreachable!("UpdateIpRanges is run via fetch_ip_ranges/store_ip_ranges")
+            }
+            CronJob::UpdateEverything => {
+                unreachable!("UpdateEverything is run through refresh's plan, fetch and store")
             }
             CronJob::HealthCheck => {
                 unreachable!("HealthCheck is run via health_check, which needs no log")
@@ -766,6 +840,65 @@ mod tests {
 
     fn test_db() -> Db {
         Db::open_in_memory().unwrap()
+    }
+
+    /// Weekly, pushed back by a jitter that stays inside its bound and
+    /// moves with the last run — so hosts that ran at the same moment once
+    /// do not keep asking the same feeds at the same moment every week.
+    #[test]
+    fn the_weekly_download_is_due_a_week_and_some_jitter_after_it_ran() {
+        let week = 7 * 24 * 60 * 60;
+        let mut seen = std::collections::HashSet::new();
+        for last_run in (0..50).map(|i| 1_790_000_000 + i * 3_607) {
+            let after = CronJob::UpdateEverything.due_after(last_run).as_secs();
+            assert!(
+                (week..week + UPDATE_JITTER.as_secs()).contains(&after),
+                "{after}s after {last_run}"
+            );
+            seen.insert(after);
+        }
+        assert!(seen.len() > 40, "the jitter barely moves: {seen:?}");
+        assert_eq!(
+            CronJob::UpdateIpRanges.due_after(1_790_000_000),
+            CronJob::UpdateIpRanges.interval(),
+            "no other job is jittered"
+        );
+    }
+
+    /// The Dashboard's projected next run and the due check read the same
+    /// jitter, so "next run" is never a time at which nothing happens.
+    #[test]
+    fn the_weekly_download_is_due_exactly_when_its_next_run_says() {
+        let db = test_db();
+        let job = CronJob::UpdateEverything;
+
+        let ran = now() - 6 * 24 * 60 * 60;
+        db.set_cron_last_run(job.id(), ran, "").unwrap();
+        assert!(!is_due(&db, job).unwrap(), "six days on");
+        assert!(next_run_at(&db, job).unwrap().unwrap() > now());
+
+        let ran = now() - 7 * 24 * 60 * 60 - UPDATE_JITTER.as_secs() as i64;
+        db.set_cron_last_run(job.id(), ran, "").unwrap();
+        assert!(is_due(&db, job).unwrap(), "a week and the whole jitter on");
+        assert!(next_run_at(&db, job).unwrap().unwrap() <= now());
+    }
+
+    /// The weekly download fetches the crawler ranges too, so the two are
+    /// never started in the same tick.
+    #[test]
+    fn the_crawler_job_is_not_run_beside_the_weekly_download() {
+        let db = test_db();
+        let week_ago = now() - 8 * 24 * 60 * 60;
+        db.set_cron_last_run(CronJob::UpdateEverything.id(), week_ago, "")
+            .unwrap();
+
+        let due = due_jobs(&db).unwrap();
+        assert!(due.contains(&CronJob::UpdateEverything));
+        assert!(!due.contains(&CronJob::UpdateIpRanges), "{due:?}");
+
+        db.set_cron_last_run(CronJob::UpdateEverything.id(), now(), "")
+            .unwrap();
+        assert!(due_jobs(&db).unwrap().contains(&CronJob::UpdateIpRanges));
     }
 
     /// The safety property the whole switch rests on: off means *nothing
@@ -1348,20 +1481,54 @@ mod tests {
     }
 
     #[test]
-    fn due_jobs_on_a_fresh_database_includes_every_job() {
+    fn due_jobs_on_a_fresh_database_includes_every_job_but_the_weekly_download() {
         let db = Db::open_in_memory().unwrap();
         let due = due_jobs(&db).unwrap();
-        assert_eq!(due.len(), CronJob::all().len());
+        assert_eq!(due.len(), CronJob::all().len() - 1);
+        assert!(!due.contains(&CronJob::UpdateEverything), "{due:?}");
+    }
+
+    /// Before its first run the weekly download counts from the oldest
+    /// list this host fetched: a fresh database, which has fetched nothing,
+    /// leaves the first download to the operator; an upgraded one whose
+    /// lists are a month old is due at once.
+    #[test]
+    fn the_weekly_download_first_counts_from_the_oldest_fetched_list() {
+        let db = test_db();
+        crate::botlist::register_all_sources(&db).unwrap();
+        assert!(!is_due(&db, CronJob::UpdateEverything).unwrap(), "fresh");
+        assert_eq!(next_run_at(&db, CronJob::UpdateEverything).unwrap(), None);
+
+        let mut source = db
+            .list_sources()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == crate::botlist::SourceKind::WellKnownBots.id())
+            .unwrap();
+        source.last_fetched_at = Some(now() - 2 * 24 * 60 * 60);
+        db.upsert_source(&source).unwrap();
+        assert!(
+            !is_due(&db, CronJob::UpdateEverything).unwrap(),
+            "two days old"
+        );
+
+        source.last_fetched_at = Some(now() - 30 * 24 * 60 * 60);
+        db.upsert_source(&source).unwrap();
+        assert!(
+            is_due(&db, CronJob::UpdateEverything).unwrap(),
+            "a month old"
+        );
     }
 
     #[test]
     fn due_jobs_excludes_a_job_that_just_ran() {
         let db = Db::open_in_memory().unwrap();
+        let before = due_jobs(&db).unwrap().len();
         db.set_cron_last_run(CronJob::UpdateIpRanges.id(), now(), "ran")
             .unwrap();
         let due = due_jobs(&db).unwrap();
         assert!(!due.contains(&CronJob::UpdateIpRanges));
-        assert_eq!(due.len(), CronJob::all().len() - 1);
+        assert_eq!(due.len(), before - 1);
     }
 
     #[test]
