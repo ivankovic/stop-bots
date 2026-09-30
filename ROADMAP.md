@@ -86,7 +86,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   inject into every site and run the firewall script as root, on one keypress. Show a
   summary (sites changed, rules added and removed, the guard's result) with a diff on
   request, and add `--dry-run` to `apply-blocks` and `batch`. **M**
-- [ ] **`stop-bots uninstall`** with `--dry-run`. It removes the injected site blocks, the
+- [x] **`stop-bots uninstall`** with `--dry-run`. It removes the injected site blocks, the
   managed `conf.d` files, the nft table or iptables chain, and both units. Today nothing
   removes any of them. **M**
 - [ ] **Memory and CPU bounded on a 1 GB VPS.** Each detector job re-reads and re-parses
@@ -131,11 +131,11 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 
   Today there is no version at all (`db.rs:1066–1413`), and an older binary silently
   reinterprets values it doesn't know. **M**
-- [ ] **Unit templates vs. user edits.** `install` treats "differs from what *this*
+- [x] **Unit templates vs. user edits.** `install` treats "differs from what *this*
   version would write" as "the user edited it". Every template change in a release
   therefore reads as an edit, and a re-install refuses without `--force`. Embed a template
   hash or version and compare against that. **S**
-- [ ] **Generated files carry the generator version** in their header, never in the
+- [x] **Generated files carry the generator version** in their header, never in the
   markers. **Freeze the marker strings.** Record what was written (in the database or a
   manifest) and clean up from that record, not from a hard-coded list of names. **S**
 - [x] **A defaults policy for upgrades.** v0.0.15 turned a new detector on for every
