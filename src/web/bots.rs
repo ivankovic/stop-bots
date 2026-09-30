@@ -143,7 +143,7 @@ fn sources_panel(view: &View, ctx: &Ctx) -> Markup {
                                 td .num { (source.bot_count) }
                                 td {
                                     @match source.last_fetched_at {
-                                        Some(at) => { (crate::web::dashboard::relative(at)) }
+                                        Some(at) => { (crate::present::ago(at)) }
                                         None => { (layout::pill("NEVER", PillKind::Warn)) }
                                     }
                                 }

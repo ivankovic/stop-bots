@@ -48,15 +48,12 @@
 //! immediately flips to `STALE` — which is exactly the feedback wanted,
 //! since nothing on disk changes until `a`/`A`.
 //!
-//! A failed apply opens a dismissible `alert` popup rather than relying on
-//! `App`'s shared `message` field: that field is only ever rendered by
-//! `Dashboard::render` (see `tui.rs`'s render dispatch), so a failure
-//! surfaced through it while sitting on this screen would be completely
-//! invisible — exactly why a real-world permission error here just looked
-//! like "nothing happened, still STALE". The alert also special-cases a
-//! permission-denied write (the single most likely real cause, since
-//! `/etc/nginx` is normally root-owned) with a "Try running as root"
-//! suggestion.
+//! A failed apply opens a dismissible `alert` popup as well as setting
+//! `App`'s shared `message`, which the footer shows on every screen. The
+//! footer has one line; a failure has one line per site that failed, and
+//! the popup is where they fit. It also special-cases a permission-denied
+//! write (the single most likely real cause, since `/etc/nginx` is
+//! normally root-owned) with a "Try running as root" suggestion.
 
 use crate::db::{BlockResponse, Db, Site};
 use crate::nginx::{self, SiteApplyStatus};

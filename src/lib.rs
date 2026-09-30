@@ -94,6 +94,8 @@ pub mod nftables;
 #[doc(hidden)]
 pub mod nginx;
 #[doc(hidden)]
+pub mod present;
+#[doc(hidden)]
 pub mod preview;
 #[doc(hidden)]
 pub mod protection;

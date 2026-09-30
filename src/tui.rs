@@ -562,38 +562,13 @@ fn status_line(app: &App) -> Line<'static> {
         };
         spans.push(mark.fg(colour));
         spans.push(" ".into());
-        let label = short_check_label(check.id);
+        let label = crate::present::check_label(check);
         spans.push(match check.level {
             Level::Ok | Level::Unknown => label.fg(theme.dim()),
             Level::Warn | Level::Critical => label.into(),
         });
     }
     Line::from(spans)
-}
-
-/// A one-word name for a health check, because the strip is one line and
-/// the checks' titles are sentences. Falls back to the id itself for a
-/// check this table has not heard of, which is still readable.
-fn short_check_label(id: &str) -> String {
-    match id {
-        "firewall-enforced" => "kernel",
-        "firewall-persists" => "reboot",
-        "script-fresh" => "script",
-        "nginx-applied" => "nginx",
-        "generated-files-reachable" => "files",
-        "turned-away-clients" => "refused",
-        "service-health" => "console",
-        "disk-room" => "disk",
-        "database-size" => "database",
-        "log-sources" => "logs",
-        "access-log-format" => "log format",
-        "access-log-clients" => "clients",
-        "nginx-deployment" => "runtime",
-        "ssh-login-allowlist" => "ssh",
-        "trusted" => "trusted",
-        other => other,
-    }
-    .to_string()
 }
 
 /// The footer: which panel the keys go to, then the keys of the active
@@ -612,6 +587,22 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         (None, Screen::Help) => ("Help", vec![("Esc", "back")]),
     };
     let mut spans: Vec<Span> = vec![panel.fg(theme.accent()).bold(), "  ".into()];
+    // The last thing that happened, on whatever screen is open, until the
+    // next key press brings the hints back. It used to reach only the
+    // Dashboard, so the outcome of a fetch started from Bot settings, or
+    // of an apply on NGINX, was on a screen nobody was looking at.
+    if let (Some(message), true, None) = (&app.message, app.message_in_footer, &app.palette) {
+        spans.push(
+            message
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+                .fg(theme.live()),
+        );
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        return;
+    }
     let globals: &[(&str, &str)] = match (&app.palette, app.screen) {
         (Some(_), _) | (None, Screen::Help) => &[],
         _ => &[
@@ -681,29 +672,6 @@ mod tests {
             assert_eq!(
                 busy_label(&several).as_deref(),
                 Some("Update crawler IP ranges (scheduled) (+2 more)")
-            );
-        }
-    }
-
-    /// Every check the report can produce needs a one-word name. The strip
-    /// is a single line across every screen, and an id falling through to
-    /// itself is both longer than its neighbours and in a different style
-    /// ("database-size" among "disk", "logs", "script"). The fallback
-    /// keeps that readable rather than correct, so without this nothing
-    /// notices a new check arriving without a label — which is exactly
-    /// what happened when the database-size check was added.
-    #[test]
-    fn every_health_check_has_a_short_label() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let report = crate::health::assess(&db, &crate::health::Probe::default()).unwrap();
-
-        assert!(!report.checks.is_empty(), "no checks to speak of");
-        for check in &report.checks {
-            assert_ne!(
-                short_check_label(check.id),
-                check.id,
-                "{} fell through to its own id",
-                check.id
             );
         }
     }

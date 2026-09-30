@@ -146,7 +146,16 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The TUI's render popup opens on the stored backend and its path, and remembers
   the backend it renders for, as the console does.
 
+
+- **The TUI's status message shows on every screen**, in the footer, until the
+  next key press. It used to reach only the Dashboard.
+- One spelling for relative times ("5m ago"), category names ("Search bots",
+  "AI bots") and the health strip's labels, in the CLI, the TUI and the console.
+
 ### Fixed
+
+- Messages that named the wrong key: "render the firewall (f)" (the key is `F`,
+  and `a` applies) and "press s, then r" (NGINX is `n`).
 
 - **A log in a format the detectors cannot read is reported.** `status` warns
   when under half the access log parses, quoting a line, instead of "no requests

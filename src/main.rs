@@ -1996,7 +1996,7 @@ fn run_status(
 
     println!("{}", report.headline());
     if let Some(at) = taken_at {
-        println!("(from a probe taken {})", format_age(at));
+        println!("(from a probe taken {})", stop_bots::present::ago(at));
     }
     println!();
 
@@ -2015,20 +2015,6 @@ fn run_status(
         anyhow::bail!("this host is not protected the way it is configured to be");
     }
     Ok(())
-}
-
-/// "3 minutes ago", for a probe's timestamp.
-fn format_age(taken_at: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let seconds = (now - taken_at).max(0);
-    match seconds {
-        0..=90 => "just now".to_string(),
-        91..=5400 => format!("{} minute(s) ago", seconds / 60),
-        _ => format!("{} hour(s) ago", seconds / 3600),
-    }
 }
 
 /// `batch`'s arguments as the command line gives them, before the two

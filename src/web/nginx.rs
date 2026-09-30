@@ -403,8 +403,8 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
                 table { tbody {
                     @for (category, label, current) in [
                         (Category::Scanner, "Scanners", detail.scanner),
-                        (Category::Search, "Search bots", detail.search),
-                        (Category::Ai, "AI bots", detail.ai),
+                        (Category::Search, crate::present::category_label(Category::Search), detail.search),
+                        (Category::Ai, crate::present::category_label(Category::Ai), detail.ai),
                     ] {
                         tr {
                             td { (label) }

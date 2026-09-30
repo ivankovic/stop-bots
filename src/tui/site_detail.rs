@@ -34,6 +34,7 @@
 
 use crate::db::{Bot, BotStatus, Category, Db, Policy, Site, SiteBotOverride};
 use crate::nginx::RequestRule;
+use crate::present::category_label;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -942,14 +943,6 @@ impl SiteDetail {
                 ))
             }
         }
-    }
-}
-
-fn category_label(category: Category) -> &'static str {
-    match category {
-        Category::Scanner => "Scanners",
-        Category::Search => "Search Bots",
-        Category::Ai => "AI Bots",
     }
 }
 

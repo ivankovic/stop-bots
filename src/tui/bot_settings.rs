@@ -48,7 +48,6 @@ use ratatui::{
     widgets::{Clear, List, ListItem, ListState, Paragraph},
     Frame,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Which panel keyboard input currently goes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -514,24 +513,11 @@ fn effective_policy(
     }
 }
 
-/// A short "updated Xs/Xm/Xh/Xd ago" (or "never updated") label.
+/// "updated 5m ago", or "never updated".
 fn humanize_age(last_fetched_at: Option<i64>) -> String {
-    let Some(last_fetched_at) = last_fetched_at else {
-        return "never updated".to_string();
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let age = (now - last_fetched_at).max(0);
-    if age < 60 {
-        format!("updated {age}s ago")
-    } else if age < 3600 {
-        format!("updated {}m ago", age / 60)
-    } else if age < 86400 {
-        format!("updated {}h ago", age / 3600)
-    } else {
-        format!("updated {}d ago", age / 86400)
+    match last_fetched_at {
+        Some(at) => format!("updated {}", crate::present::ago(at)),
+        None => "never updated".to_string(),
     }
 }
 
@@ -693,11 +679,12 @@ mod tests {
     #[test]
     fn humanize_age_handles_never_and_recent() {
         assert_eq!(humanize_age(None), "never updated");
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        assert_eq!(humanize_age(Some(now)), "updated 0s ago");
+        assert_eq!(humanize_age(Some(now)), "updated just now");
+        assert_eq!(humanize_age(Some(now - 120)), "updated 2m ago");
     }
 
     #[test]

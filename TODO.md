@@ -6,13 +6,6 @@ list — which meant the open items below were unfindable inside it.
 
 ## Worth doing next
 
-* **Show `App::message` somewhere other than the Dashboard.** It is only passed
-  to `Dashboard::render`, so a status line set by a Site settings apply or a Bot
-  settings fetch is invisible unless you happen to be on the Dashboard tab. Site
-  settings' *apply failure* path works around this with its own alert popup, one
-  screen at a time. The footer already renders global state (the in-flight job
-  spinner), which makes it the obvious home for the message too — one fix rather
-  than an alert popup per screen.
 * **`ua_matches_blocked_bot_patterns`** (`dynamic.rs`) does case-insensitive
   *substring* matching over `|`-split alternatives, while NGINX enforces a real
   `~*` regex. The `BLOCKLIST` tag can therefore disagree with what actually gets

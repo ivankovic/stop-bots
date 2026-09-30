@@ -247,7 +247,7 @@ fn health_panel(view: &View) -> Markup {
         Some(&format!(
             "{} \u{2014} checked {}",
             report.headline(),
-            age(*taken_at)
+            crate::present::ago(*taken_at)
         )),
         html! {
             @if attention.is_empty() {
@@ -290,16 +290,6 @@ fn level_pill(level: health::Level) -> Markup {
     layout::pill(level.tag(), kind)
 }
 
-/// "12 minutes ago", for the panel's subtitle.
-fn age(taken_at: i64) -> String {
-    let seconds = (now_secs() - taken_at).max(0);
-    match seconds {
-        0..=90 => "just now".to_string(),
-        91..=5400 => format!("{} minutes ago", seconds / 60),
-        _ => format!("{} hours ago", seconds / 3600),
-    }
-}
-
 // ---- system-wide category defaults ----
 
 fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
@@ -339,7 +329,7 @@ fn categories_panel(view: &View, ctx: &Ctx) -> Markup {
                 tbody {
                     @for (category, policy) in rows {
                         tr {
-                            td { (category_label(category)) }
+                            td { (crate::present::category_label(category)) }
                             td { (policy_pill(policy)) }
                             td .right {
                                 @if view.humans_only {
@@ -405,15 +395,6 @@ fn category_id(category: Category) -> &'static str {
         Category::Scanner => "scanner",
         Category::Search => "search",
         Category::Ai => "ai",
-    }
-}
-
-/// The name to put in a message about `category`.
-fn category_label(category: Category) -> &'static str {
-    match category {
-        Category::Scanner => "Scanners",
-        Category::Search => "Search bots",
-        Category::Ai => "AI bots",
     }
 }
 
@@ -976,7 +957,7 @@ fn jobs_panel(view: &View) -> Markup {
                             td { (status.job.label()) }
                             td .mono.nowrap {
                                 @match status.last_run {
-                                    Some(at) => { (relative(at)) }
+                                    Some(at) => { (crate::present::ago(at)) }
                                     None => { span .hint { "never" } }
                                 }
                             }
@@ -990,23 +971,6 @@ fn jobs_panel(view: &View) -> Markup {
             }
         },
     )
-}
-
-/// "3m ago", to the same rounding the TUI uses.
-pub(crate) fn relative(at: i64) -> String {
-    let delta = now_secs() - at;
-    if delta < 60 {
-        return "just now".to_string();
-    }
-    let minutes = delta / 60;
-    if minutes < 60 {
-        return format!("{minutes}m ago");
-    }
-    let hours = minutes / 60;
-    if hours < 24 {
-        return format!("{hours}h ago");
-    }
-    format!("{}d ago", hours / 24)
 }
 
 // ---- actions ----
@@ -1107,7 +1071,7 @@ async fn set_category(
             "/",
             &format!(
                 "{} are now {}. Apply on the NGINX screen to write it into the site configs.",
-                category_label(category),
+                crate::present::category_label(category),
                 policy_id(policy)
             ),
             true,
@@ -1899,15 +1863,6 @@ mod tests {
     fn the_button_offers_the_policy_you_do_not_have() {
         assert_eq!(flip(Policy::Blocked), Policy::Allowed);
         assert_eq!(flip(Policy::Allowed), Policy::Blocked);
-    }
-
-    #[test]
-    fn relative_times_round_the_way_the_tui_does() {
-        let now = now_secs();
-        assert_eq!(relative(now), "just now");
-        assert_eq!(relative(now - 90), "1m ago");
-        assert_eq!(relative(now - 3 * 3600), "3h ago");
-        assert_eq!(relative(now - 50 * 3600), "2d ago");
     }
 
     #[test]

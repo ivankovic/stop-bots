@@ -362,31 +362,10 @@ fn status_chips(report: Option<&crate::health::Report>) -> Markup {
                     Level::Warn | Level::Critical => "\u{25b2}",
                 };
                 span class=(class) title=(format!("{}: {}", check.title, check.detail)) {
-                    i { (mark) } (chip_label(check))
+                    i { (mark) } (crate::present::check_label(check))
                 }
             }
         }
-    }
-}
-
-/// The word a chip has room for. Keyed on the check's stable id, with the
-/// title as the fallback for a check added later.
-fn chip_label(check: &crate::health::Check) -> &'static str {
-    match check.id {
-        "firewall-enforced" => "kernel",
-        "firewall-persists" => "reboot",
-        "script-fresh" => "script",
-        "nginx-applied" => "nginx",
-        "service-health" => "service",
-        "disk-room" => "disk",
-        // Fell through to the title until the chips were audited for the
-        // two below; "Database size" is not a chip-sized word.
-        "database-size" => "database",
-        "log-sources" => "logs",
-        "access-log-format" => "log format",
-        "access-log-clients" => "clients",
-        "nginx-deployment" => "runtime",
-        _ => check.title,
     }
 }
 

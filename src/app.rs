@@ -121,6 +121,10 @@ pub struct App {
     /// The screen to return to when the Help screen is closed.
     before_help: Screen,
     pub message: Option<String>,
+    /// Whether the footer shows `message` in place of the key hints: from
+    /// the moment a message appears until the next key press, on whichever
+    /// screen is open. The Dashboard's Log keeps every message after that.
+    pub message_in_footer: bool,
     /// Every message the screens have produced, newest last, with the
     /// unix time it appeared: the Dashboard's Log panel. `message` is
     /// still what a screen writes to — this is `App` watching it, so the
@@ -300,6 +304,7 @@ impl App {
             screen: Screen::default(),
             before_help: Screen::default(),
             message: None,
+            message_in_footer: false,
             log: Vec::new(),
             db_last_logged: None,
             palette: None,
@@ -448,6 +453,7 @@ impl App {
                 self.log.remove(0);
             }
             self.db_last_logged.clone_from(&self.message);
+            self.message_in_footer = true;
         }
     }
 
@@ -460,7 +466,7 @@ impl App {
             Event::Crossterm(crossterm::event::Event::Key(key_event))
                 if key_event.kind == KeyEventKind::Press =>
             {
-                self.handle_key_event(key_event)?;
+                self.handle_key_press(key_event)?;
             }
             Event::Crossterm(_) => {}
             Event::App(AppEvent::Quit) => self.running = false,
@@ -688,7 +694,7 @@ impl App {
             Ok(cidrs) => match self.db.replace_reputation_ranges(&source_id, &cidrs) {
                 Ok(count) => {
                     self.message = Some(format!(
-                        "{name}: {count} range(s) stored — render the firewall (f) to apply"
+                        "{name}: {count} range(s) stored — apply (a) to enforce them"
                     ));
                 }
                 Err(err) => self.message = Some(format!("{name}: {err}")),
@@ -1619,6 +1625,23 @@ impl App {
         self.refresh()
     }
 
+    /// A key press, with what it does to the footer's message: any key
+    /// puts the key hints back, and a message the key itself produced
+    /// shows in their place — even one that reads the same as the last,
+    /// which is still news that the action ran again.
+    fn handle_key_press(&mut self, key: KeyEvent) -> Result<()> {
+        self.message_in_footer = false;
+        let previous = self.message.take();
+        let result = self.handle_key_event(key);
+        if self.message.is_none() {
+            self.message = previous;
+        } else {
+            // Logged again even if the text repeats the last message.
+            self.db_last_logged = None;
+        }
+        result
+    }
+
     fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
             self.events.send(AppEvent::Quit);
@@ -1942,6 +1965,68 @@ mod tests {
             Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
         )
         .unwrap()
+    }
+
+    /// The bottom row of the whole UI, as drawn.
+    fn footer(app: &mut App) -> String {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render(app, frame))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..120)
+            .map(|x| buffer[(x, 31)].symbol().to_string())
+            .collect()
+    }
+
+    /// A message used to reach only the Dashboard, so a fetch finishing
+    /// while the operator sat on Bot settings said nothing where they were
+    /// looking. It shows in the footer of whatever screen is open, until
+    /// the next key press brings the key hints back.
+    #[tokio::test]
+    async fn a_message_shows_in_the_footer_of_any_screen_until_the_next_key() {
+        let mut app = test_app();
+        app.screen = Screen::BotSettings;
+
+        // As a background job's `finish_` would.
+        app.message = Some("Stored 4 bot(s) from ai-robots-txt".to_string());
+        app.note_message();
+        assert!(
+            footer(&mut app).contains("Stored 4 bot(s)"),
+            "footer: {}",
+            footer(&mut app)
+        );
+
+        app.handle_key_press(KeyEvent::from(KeyCode::Down)).unwrap();
+        let after = footer(&mut app);
+        assert!(
+            !after.contains("Stored 4") && after.contains("help"),
+            "the hints did not come back: {after}"
+        );
+        assert_eq!(
+            app.message.as_deref(),
+            Some("Stored 4 bot(s) from ai-robots-txt"),
+            "a key that says nothing keeps the last message"
+        );
+    }
+
+    /// Pressing the same key twice is two actions, and the second says so
+    /// even though its message reads exactly like the first.
+    #[tokio::test]
+    async fn a_key_that_repeats_the_last_message_shows_it_again() {
+        let mut app = test_app();
+        app.jobs_in_flight.insert(Job::UpdateEverything);
+
+        for _ in 0..2 {
+            app.handle_key_press(KeyEvent::from(KeyCode::Char('u')))
+                .unwrap();
+            app.note_message();
+            assert!(app.message_in_footer, "the message was not shown");
+        }
+
+        let said: Vec<&str> = app.log.iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(said, ["Already downloading every list."; 2]);
     }
 
     /// Types `text` into the open palette and presses Enter.

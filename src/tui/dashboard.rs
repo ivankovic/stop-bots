@@ -17,7 +17,7 @@
  */
 
 //! The Dashboard: the default screen on app start. An overview of global
-//! settings (Scanners/Search Bots/AI Bots defaults, navigable and editable
+//! settings (Scanners/Search bots/AI bots defaults, navigable and editable
 //! via a popup, mirroring how Bot settings edits a single bot's override),
 //! host-wide geo-blocking (see "Geo-blocking" below), the detectors and
 //! feeds that block on their own, and what the rules become. Top user
@@ -109,6 +109,7 @@
 
 use crate::db::{Category, Db, GeoMode, Policy, Source};
 use crate::ipranges;
+use crate::present::category_label;
 use crate::protection::Detector;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
 use anyhow::Result;
@@ -727,7 +728,7 @@ impl Dashboard {
             .take(rows)
             .enumerate()
             .map(|(i, (at, text))| {
-                let when = format!(" {:<9}", format_relative_time(*at));
+                let when = format!(" {:<9}", crate::present::ago(*at));
                 if i == 0 {
                     Line::from(vec![when.fg(theme.live()), text.clone().into()])
                 } else {
@@ -1039,7 +1040,7 @@ impl Dashboard {
                 };
                 let site_label = match self.sites.get(site) {
                     Some(name) => format!("  < {name} >"),
-                    None => "  (no sites scanned yet — press s, then r)".to_string(),
+                    None => "  (no sites scanned yet — press n, then r)".to_string(),
                 };
 
                 let mut lines = vec![
@@ -1430,7 +1431,7 @@ impl Dashboard {
             return Ok(KeyOutcome::FetchReputationSource(source.id));
         }
         *message = Some(format!(
-            "{} on ({} range(s)) — render the firewall (f) to apply{warning}",
+            "{} on ({} range(s)) — apply (a) to enforce them{warning}",
             source.name, source.range_count
         ));
         Ok(KeyOutcome::Mutated)
@@ -1819,7 +1820,7 @@ impl Dashboard {
                 // no site to name, and the honest answer is to say so and
                 // leave the form open.
                 let Some(site) = self.sites.get(*site).cloned() else {
-                    *error = Some("No sites scanned yet — press s, then r.".to_string());
+                    *error = Some("No sites scanned yet — press n, then r.".to_string());
                     return Ok(KeyOutcome::Consumed);
                 };
                 let request = crate::webaccess::Request::Path {
@@ -1981,14 +1982,6 @@ fn protection_options(is_detector: bool) -> Vec<String> {
         .collect()
 }
 
-fn category_label(category: Category) -> &'static str {
-    match category {
-        Category::Scanner => "Scanners",
-        Category::Search => "Search Bots",
-        Category::Ai => "AI Bots",
-    }
-}
-
 fn policy_tag(policy: Policy) -> Span<'static> {
     match policy {
         Policy::Allowed => " [ ALLOWED ] ".green(),
@@ -2107,7 +2100,7 @@ const PROTECTION_TAG_WIDTH: u16 = 9;
 
 fn cron_status_line(status: &crate::cron::JobStatus, running: bool, theme: Theme) -> Line<'static> {
     let last_run = match status.last_run {
-        Some(t) => format_relative_time(t),
+        Some(t) => crate::present::ago(t),
         None => "never".to_string(),
     };
     // Deliberately compact (no fixed-width padding): the panel has no
@@ -2129,27 +2122,6 @@ fn cron_status_line(status: &crate::cron::JobStatus, running: bool, theme: Theme
             .into()
     });
     Line::from(line)
-}
-
-/// Formats a Unix timestamp `t` (assumed to be in the past) as a short
-/// "Nd"/"Nh"/"Nm"/"just now" relative-time string for the "Scheduled
-/// tasks" panel — coarser precision the further back `t` is, matching how
-/// `main.rs::format_expiry` rounds an upcoming expiry the same way.
-fn format_relative_time(t: i64) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let elapsed = (now - t).max(0);
-    if elapsed < 60 {
-        "just now".to_string()
-    } else if elapsed < 3_600 {
-        format!("{}m ago", elapsed / 60)
-    } else if elapsed < 86_400 {
-        format!("{}h ago", elapsed / 3_600)
-    } else {
-        format!("{}d ago", elapsed / 86_400)
-    }
 }
 
 fn is_stale(last_fetched_at: Option<i64>) -> bool {
@@ -2208,14 +2180,6 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64
-    }
-
-    #[test]
-    fn format_relative_time_rounds_to_the_coarsest_useful_unit() {
-        assert_eq!(format_relative_time(now_secs() - 30), "just now");
-        assert_eq!(format_relative_time(now_secs() - 5 * 60), "5m ago");
-        assert_eq!(format_relative_time(now_secs() - 3 * 3_600), "3h ago");
-        assert_eq!(format_relative_time(now_secs() - 2 * 86_400), "2d ago");
     }
 
     #[test]
