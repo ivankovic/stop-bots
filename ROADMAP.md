@@ -224,7 +224,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   - `TODO.md` quotes old line counts.
   - `CONTRIBUTING.md`'s module list is missing eight modules.
   - Two different coverage figures are quoted. **S**
-- [ ] **A stranger test.** A fresh Debian 12 and Ubuntu 24.04 VM (or a Podman container
+- [x] **A stranger test.** A fresh Debian 12 and Ubuntu 24.04 VM (or a Podman container
   with systemd), README only, start to "blocking" to `uninstall`. Automate as much as the
   container suite can hold. **M**
 - [ ] **A release candidate that soaks.** `0.1.0-rc.1` runs on www and the home server
