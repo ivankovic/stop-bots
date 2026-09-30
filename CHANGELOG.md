@@ -8,6 +8,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.1.0-rc.2] — 2026-09-30
+
+The findings of a security review of the web console, all fixed. The threat model: an
+attacker who can reach the console over HTTP, and can send anything to the sites
+stop-bots protects, but has no password and no local access. SQL and HTML output came
+out clean; what did not was the path from what an attacker writes into the access log
+to what the operator clicks, and the login throttle behind a proxy.
+
+Upgrading from rc.1: the database goes to schema version 6 (a copy is kept as
+`<db>.bak-v4`), and `sudo stop-bots install web` and `sudo stop-bots install firewall`
+replace their units without `--force`, to pick up the new sandboxes.
+
 ### Security
 
 - **The web console no longer gets its operator blocked.** Viewing an attacker's
@@ -1769,7 +1781,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.1...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.2...HEAD
+[0.1.0-rc.2]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.1...v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...v0.1.0-rc.1
 [0.0.15]: https://github.com/ivankovic/stop-bots/compare/v0.0.14...v0.0.15
 [0.0.14]: https://github.com/ivankovic/stop-bots/compare/v0.0.13...v0.0.14
