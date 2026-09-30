@@ -39,6 +39,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - Bot-list patterns PCRE would refuse (`[z-a]`, `{2,1}`, `{99999}`, unknown POSIX
   classes) are left out and counted in the fetch summary, instead of failing
   every apply.
+- The server block that serves the console (Web Access path mode) exempts the
+  console's prefix, so a site rule cannot lock the operator out. `limit_req`
+  still applies there.
 
 ### Changed
 

@@ -2031,6 +2031,57 @@ fn web_access_path_mode_serves_the_console_through_nginx() {
     );
 }
 
+/// The console's own `location` sits in a site's `server` block, and every
+/// check in the site's sentinel block runs before a `location` is chosen:
+/// a request-shape rule that refuses the operator's client locked them out
+/// of the one page that turns it off. The server that serves the console
+/// exempts its prefix, and the rest of the site stays blocked.
+#[test]
+fn a_request_rule_that_refuses_curl_still_lets_the_console_through() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-console-exempt");
+    let console = host.console();
+    host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    console.post(
+        "/web-access",
+        &[
+            ("mode", "path"),
+            ("site", "test.example"),
+            ("prefix", "/stop-bots/"),
+            ("host", ""),
+        ],
+    );
+    host.sh("systemctl restart stop-bots-web.service");
+    host.wait_for_console_at("/stop-bots");
+
+    // curl sends no Accept-Language.
+    host.stop_bots("set-site-rule --site test.example --rule no-accept-language --enabled true");
+    host.stop_bots("apply-blocks --root /etc/nginx/sites-enabled");
+
+    let status = |path: &str| {
+        host.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' http://127.0.0.1:8080{path}"
+        ))
+        .1
+        .trim()
+        .to_string()
+    };
+    assert_eq!(
+        status("/"),
+        "403",
+        "the rule is not in force on the site at all:\n{}",
+        host.sh("cat /etc/nginx/sites-enabled/test-site.conf")
+    );
+    assert_eq!(
+        status("/stop-bots/login"),
+        "200",
+        "the console is locked out by the site's own rule:\n{}",
+        host.sh("cat /etc/nginx/sites-enabled/test-site.conf")
+    );
+}
+
 /// The host allowlist is the DNS-rebinding guard, and `tests/web.rs`
 /// checks it against a `Host:` header it sets itself. This checks it
 /// against one a real client sent to a real listener.

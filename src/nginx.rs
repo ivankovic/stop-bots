@@ -2270,19 +2270,52 @@ fn effective_exempt_paths(config: &BlockConfig) -> (Vec<String>, &'static [&'sta
 /// Status checks go through here too, so a site whose rule is correctly
 /// omitted from its plain-HTTP block still reads as `UP TO DATE` rather
 /// than permanently `STALE`.
-fn for_block(config: &BlockConfig, block: &ServerBlock) -> BlockConfig {
-    if block.is_tls {
-        return config.clone();
+///
+/// It also widens one thing: a block that serves the console (the `Web
+/// Access` panel's path mode puts its `location` there) exempts the
+/// console's prefix, see [`console_prefix_in`].
+fn for_block(config: &BlockConfig, content: &str, block: &ServerBlock) -> BlockConfig {
+    let mut config = config.clone();
+    if !block.is_tls {
+        config.request_rules.retain(|rule| !rule.needs_tls());
     }
-    BlockConfig {
-        request_rules: config
-            .request_rules
-            .iter()
-            .copied()
-            .filter(|rule| !rule.needs_tls())
-            .collect(),
-        ..config.clone()
+    if let Some(prefix) = console_prefix_in(content, block) {
+        if !config.exempt_paths.contains(&prefix) {
+            config.exempt_paths.push(prefix);
+        }
     }
+    config
+}
+
+/// The prefix of the console `location` this tool wrote into `block`, if
+/// it wrote one — read from the block itself, so the exemption is always
+/// for the location that is really there, on the block it is really in.
+///
+/// **Why the console is exempt.** Every check in a sentinel block runs in
+/// NGINX's server rewrite phase, before a `location` is chosen, so the
+/// console's own `location` inherits every one of them: a blocked user
+/// agent, a request-shape rule, the operator's own browser. An operator who
+/// turned on "No Accept-Language" and uses a client that sends none was
+/// locked out of the one place they could turn it off. The console has its
+/// own login and throttle; the bot rules are for the site.
+///
+/// What this cannot exempt it from is `limit_req`. It is inherited by
+/// every `location` that has none of its own and cannot be switched off in
+/// one, and a `limit_req` there would need a zone of its own in `conf.d`.
+/// It refuses with a 429 for as long as the client exceeds the rate, and
+/// no longer, so it slows the console down rather than locking anyone out.
+fn console_prefix_in(content: &str, block: &ServerBlock) -> Option<String> {
+    let (start, end) = locate_console_block(content, block)?;
+    let tokens = lex(&content[start..end]).tokens;
+    let at = tokens.iter().position(|(word, _)| word == "location")?;
+    let (word, offset) = tokens.get(at + 1)?;
+    // Only the quoted form this tool writes; an `=` or `^~` modifier, or a
+    // bare word, is somebody's edit, and not a prefix to guess at.
+    if content[start + offset..].starts_with('"') {
+        let prefix = nginx_unquoted(word);
+        return is_stored_as_valid(&prefix, crate::db::validate_exempt_path).then_some(prefix);
+    }
+    None
 }
 
 /// Whether `value`, as stored, is exactly what `validate` would store:
@@ -2421,7 +2454,7 @@ fn locate_marked(
 /// any existing block. Idempotent: applying the same config twice yields
 /// identical output.
 fn apply_block(content: &str, block: &ServerBlock, config: &BlockConfig) -> String {
-    let new_block = block_text(&for_block(config, block));
+    let new_block = block_text(&for_block(config, content, block));
 
     match locate_existing_block(content, block) {
         Some((start, end)) => {
@@ -2890,10 +2923,9 @@ pub fn site_apply_status(
         .trust
         .as_ref()
         .and_then(|_| fs::read_to_string(trusted_conf_path(conf_d)).ok());
-    if matching
-        .iter()
-        .all(|block| current_block_text(&content, block) == block_text(&for_block(config, block)))
-        && trust_file_is_current(config, trust_on_disk.as_deref())
+    if matching.iter().all(|block| {
+        current_block_text(&content, block) == block_text(&for_block(config, &content, block))
+    }) && trust_file_is_current(config, trust_on_disk.as_deref())
     {
         SiteApplyStatus::UpToDate
     } else {
@@ -6327,7 +6359,7 @@ mod tests {
             open: 0,
             close: 0,
         };
-        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), &plain);
+        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), "", &plain);
 
         assert!(!narrowed.request_rules.contains(&RequestRule::Http1x));
         assert!(!narrowed.request_rules.contains(&RequestRule::OldTls));
@@ -6344,7 +6376,7 @@ mod tests {
             open: 0,
             close: 0,
         };
-        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), &tls);
+        let narrowed = for_block(&cfg_rules(&RequestRule::ALL), "", &tls);
         assert_eq!(narrowed.request_rules.len(), RequestRule::ALL.len());
     }
 
@@ -7128,6 +7160,46 @@ server {
         let rest = text.split("if ($uri ~* ").nth(1).unwrap();
         let end = closing_quote(rest).unwrap();
         assert_eq!(nginx_unquoted(&rest[1..end]), r"^(/a\.b\+\(c\))");
+    }
+
+    /// The Web Access panel's path mode, then an apply: the block in the
+    /// server that carries the console exempts the console's prefix, so a
+    /// rule that would refuse the operator's own client cannot lock them
+    /// out of the page that turns it off.
+    #[test]
+    fn the_server_that_serves_the_console_exempts_its_prefix() {
+        let with_console =
+            with_console_location(TWO_BLOCK_SITE, "example.com", "/stop-bots/", &upstream())
+                .unwrap();
+        let config = BlockConfig {
+            request_rules: vec![RequestRule::NoAcceptLanguage],
+            ..cfg(&["BadBot"])
+        };
+        let applied = blocks_for_file(&with_console, Path::new("site"), &[], &config).unwrap();
+        crate::golden::assert_golden("nginx-console-path-blocked.conf", &applied);
+
+        let blocks = parse_server_blocks(&applied);
+        let tls = blocks.iter().find(|b| b.is_tls).unwrap();
+        let plain = blocks.iter().find(|b| !b.is_tls).unwrap();
+        let tls_block = current_block_text(&applied, tls).unwrap();
+        assert!(
+            tls_block.contains(r#"if ($uri ~* "^(/stop-bots/|/\.well-known/)") {"#),
+            "the console's server must exempt it:\n{tls_block}"
+        );
+        // Only there: the redirect block serves no console.
+        let plain_block = current_block_text(&applied, plain).unwrap();
+        assert!(
+            !plain_block.contains("/stop-bots/"),
+            "a block without the console exempts nothing of it:\n{plain_block}"
+        );
+        // And the site reads as applied, not stale, with it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("site");
+        fs::write(&path, &applied).unwrap();
+        assert_eq!(
+            site_apply_status(&path, "example.com", &config, dir.path()),
+            SiteApplyStatus::UpToDate
+        );
     }
 
     /// What the render leaves out is named, so that it is not left out in
