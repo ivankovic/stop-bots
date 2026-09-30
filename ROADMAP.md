@@ -186,7 +186,7 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   - the web Firewall page and the TUI SSH panel;
   - the access-stats offset, which is keyed by the default path while the stored one is
     read. **S–M**
-- [ ] **Docs fit for a newcomer.**
+- [x] **Docs fit for a newcomer.**
   - A quick start near the top: APT install, `sudo stop-bots`, `u`, review, `a`,
     `install firewall` for persistence (not in the README today), then `status`.
   - Supported platforms, stated: Debian/Ubuntu, systemd, NGINX. Not Apache or Caddy.
