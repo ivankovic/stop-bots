@@ -10,6 +10,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Added
 
+- **Per-site bot overrides in the web console**: a site's page searches the
+  bots and allows or blocks one on that site only, as the TUI's site detail does.
 - **A weekly "Update every list" job in the internal cron**, the same plan as
   "Update everything", at a week plus up to 12 hours' jitter.
 - `set-detector <name>` and `list-detectors`: switch, TTL and threshold for

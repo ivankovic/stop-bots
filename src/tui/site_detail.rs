@@ -32,7 +32,9 @@
 //! nested-back-out shape `bot_settings.rs`'s `Focus::Search` already uses
 //! for its own Escape handling, one level deeper.
 
-use crate::db::{Bot, BotStatus, Category, Db, Policy, Site, SiteBotOverride};
+use crate::db::{
+    effective_bot_policy, Bot, BotStatus, Category, Db, Policy, Site, SiteBotOverride,
+};
 use crate::nginx::RequestRule;
 use crate::present::category_label;
 use crate::tui::{centered_rect, KeyOutcome, Theme};
@@ -950,36 +952,6 @@ fn policy_tag(policy: Policy) -> Span<'static> {
     match policy {
         Policy::Allowed => " [ ALLOWED ] ".green(),
         Policy::Blocked => " [ BLOCKED ] ".red(),
-    }
-}
-
-/// Mirrors `bot_settings.rs::effective_policy`, extended with a site
-/// override at the top: `ai`/`search`/`scanner` here are already the
-/// *effective* (site-override-or-global) values for this site, so this is
-/// otherwise identical to the global cascade.
-fn effective_bot_policy(
-    bot: &Bot,
-    site_override: Option<Policy>,
-    ai: Policy,
-    search: Policy,
-    scanner: Policy,
-) -> Policy {
-    if let Some(policy) = site_override {
-        return policy;
-    }
-    match bot.status {
-        BotStatus::Allowed => Policy::Allowed,
-        BotStatus::Blocked => Policy::Blocked,
-        BotStatus::Default => {
-            let blocked = (bot.is_ai && ai == Policy::Blocked)
-                || (bot.is_search_engine && search == Policy::Blocked)
-                || (bot.is_scanner && scanner == Policy::Blocked);
-            if blocked {
-                Policy::Blocked
-            } else {
-                Policy::Allowed
-            }
-        }
     }
 }
 

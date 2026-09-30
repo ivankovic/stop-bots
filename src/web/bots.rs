@@ -64,7 +64,26 @@ struct View {
 fn load(db: &Db, query: &str) -> anyhow::Result<View> {
     let bots = db.list_bots()?;
     let total = bots.len();
+    let (matches, truncated) = matching_bots(bots, query);
 
+    Ok(View {
+        sources: db.list_sources()?,
+        matches,
+        total,
+        truncated,
+        query: query.to_string(),
+        scanner: db.get_category_default(Category::Scanner)?,
+        search: db.get_category_default(Category::Search)?,
+        ai: db.get_category_default(Category::Ai)?,
+    })
+}
+
+/// The bots whose name, slug or user-agent pattern contains `query`
+/// (case-insensitive; all of them when it is blank), sorted by name and
+/// cut to [`MAX_RESULTS`] — and whether anything was cut. Shared with the
+/// site detail page's per-site overrides, so the two search boxes find
+/// the same bots for the same text.
+pub(crate) fn matching_bots(bots: Vec<Bot>, query: &str) -> (Vec<Bot>, bool) {
     let needle = query.trim().to_lowercase();
     let mut matches: Vec<Bot> = if needle.is_empty() {
         bots
@@ -80,17 +99,7 @@ fn load(db: &Db, query: &str) -> anyhow::Result<View> {
     matches.sort_by_key(|bot| bot.name.to_lowercase());
     let truncated = matches.len() > MAX_RESULTS;
     matches.truncate(MAX_RESULTS);
-
-    Ok(View {
-        sources: db.list_sources()?,
-        matches,
-        total,
-        truncated,
-        query: query.to_string(),
-        scanner: db.get_category_default(Category::Scanner)?,
-        search: db.get_category_default(Category::Search)?,
-        ai: db.get_category_default(Category::Ai)?,
-    })
+    (matches, truncated)
 }
 
 pub async fn page(
@@ -226,7 +235,7 @@ fn bots_panel(view: &View, ctx: &Ctx) -> Markup {
     )
 }
 
-fn categories_of(bot: &Bot) -> Markup {
+pub(crate) fn categories_of(bot: &Bot) -> Markup {
     html! {
         @if bot.is_scanner { (layout::pill("scanner", PillKind::Neutral)) " " }
         @if bot.is_search_engine { (layout::pill("search", PillKind::Neutral)) " " }

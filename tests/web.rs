@@ -1304,6 +1304,162 @@ async fn a_request_shape_rule_can_be_switched_on_for_one_site() {
     );
 }
 
+/// Seeds GPTBot — an AI crawler, blocked by the AI category's default —
+/// and returns its id.
+fn seed_gptbot(db_path: &std::path::Path) -> i64 {
+    let db = Db::open(db_path).unwrap();
+    db.upsert_bot(&stop_bots::db::NewBot {
+        slug: "gptbot".into(),
+        name: "GPTBot".into(),
+        is_ai: true,
+        is_search_engine: false,
+        is_scanner: false,
+        user_agent_pattern: "gptbot".into(),
+        source_id: "well-known-bots".into(),
+    })
+    .unwrap();
+    db.list_bots()
+        .unwrap()
+        .into_iter()
+        .find(|b| b.slug == "gptbot")
+        .unwrap()
+        .id
+}
+
+async fn page_text(app: &Router, cookie: &str, path: &str) -> String {
+    body_string(
+        app.clone()
+            .oneshot(with_cookie(get(path), cookie))
+            .await
+            .unwrap(),
+    )
+    .await
+}
+
+/// A bot can be allowed or blocked on one site from that site's page,
+/// the way the TUI's site detail does it: search, pick, and the override
+/// is stored for that site only, leaving the bot's global status alone.
+#[tokio::test]
+async fn a_bot_can_be_overridden_for_one_site_from_its_page() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
+    let site = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+    let bot = seed_gptbot(&db_path);
+
+    let found = page_text(&app, &cookie, &format!("/nginx/{site}?q=gpt")).await;
+    assert!(
+        found.contains("GPTBot") && found.contains(r#"name="bot""#),
+        "the search did not offer GPTBot:\n{found}"
+    );
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        &format!("/nginx/{site}/bot?q=gpt"),
+        &format!("bot={bot}&policy=allowed"),
+    )
+    .await;
+
+    assert_eq!(
+        flash,
+        "GPTBot on example.com: allowed. Apply to write it out."
+    );
+    let db = Db::open(&db_path).unwrap();
+    let stored: Vec<(i64, Policy)> = db
+        .site_bot_overrides(site)
+        .unwrap()
+        .into_iter()
+        .map(|o| (o.bot_id, o.policy))
+        .collect();
+    assert_eq!(stored, [(bot, Policy::Allowed)]);
+    assert_eq!(
+        db.list_bots().unwrap()[0].status,
+        BotStatus::Default,
+        "the global status must not move"
+    );
+}
+
+/// The redirect comes back to the search the form was posted from, so
+/// setting several bots in a row does not mean searching again each time.
+#[tokio::test]
+async fn setting_a_site_bot_override_returns_to_the_same_search() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
+    let site = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+    let bot = seed_gptbot(&db_path);
+
+    let response = app
+        .clone()
+        .oneshot(with_cookie(
+            post(
+                &format!("/nginx/{site}/bot?q=gpt%20bot"),
+                &format!("csrf={csrf}&bot={bot}&policy=blocked"),
+            ),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(
+        location.starts_with(&format!("/nginx/{site}?q=gpt%20bot&flash=")),
+        "was: {location}"
+    );
+}
+
+/// With no search, the panel lists the bots this site already overrides,
+/// each tagged as a site override — and "follow" removes one again.
+#[tokio::test]
+async fn a_site_s_bot_overrides_are_listed_until_cleared() {
+    let (app, password, tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    write_site(&tmp, "example.com");
+    act(&app, &cookie, &csrf, "/nginx/scan", "").await;
+    let site = Db::open(&db_path).unwrap().list_sites().unwrap()[0].id;
+    let bot = seed_gptbot(&db_path);
+    let path = format!("/nginx/{site}");
+
+    let before = page_text(&app, &cookie, &path).await;
+    assert!(
+        !before.contains("GPTBot"),
+        "listed before any override:\n{before}"
+    );
+
+    let set = format!("{path}/bot");
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        &set,
+        &format!("bot={bot}&policy=allowed"),
+    )
+    .await;
+    let listed = page_text(&app, &cookie, &path).await;
+    assert!(
+        listed.contains("GPTBot") && listed.contains("site override"),
+        "the override is not listed:\n{listed}"
+    );
+
+    act(
+        &app,
+        &cookie,
+        &csrf,
+        &set,
+        &format!("bot={bot}&policy=default"),
+    )
+    .await;
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .site_bot_overrides(site)
+        .unwrap()
+        .is_empty());
+}
+
 // ---- firewall ----
 
 #[tokio::test]

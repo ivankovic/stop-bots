@@ -36,7 +36,7 @@ use axum::{Form, Router};
 use maud::{html, Markup};
 use serde::Deserialize;
 
-use crate::db::{BlockResponse, Category, Db, Policy, Site};
+use crate::db::{BlockResponse, Bot, Category, Db, Policy, Site};
 use crate::nginx::{self, RequestRule, SiteApplyStatus};
 use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
@@ -320,9 +320,78 @@ struct Detail {
     rules: Vec<(RequestRule, bool)>,
     exemptions: Vec<String>,
     agent_exemptions: Vec<crate::db::AgentExemption>,
+    /// The per-bot overrides panel: what was searched for, and the bots it
+    /// shows — each with this site's override for it, if any, and what it
+    /// gets here once every tier is taken into account.
+    bot_query: String,
+    bots: Vec<SiteBot>,
+    bots_truncated: bool,
 }
 
-fn load_detail(db: &Db, id: i64) -> anyhow::Result<Detail> {
+/// One row of the per-bot overrides panel.
+struct SiteBot {
+    bot: Bot,
+    site_override: Option<Policy>,
+    effective: Policy,
+}
+
+/// The query string that brings a site's detail page back with `query`
+/// still in its search box — empty when there is none.
+fn bot_query_suffix(query: &str) -> String {
+    if query.is_empty() {
+        String::new()
+    } else {
+        format!("?q={}", crate::web::server::percent_encode(query))
+    }
+}
+
+/// The rows of the per-bot panel: the bots matching `query`, or, with no
+/// query, every bot this site overrides — the ones worth seeing without
+/// having to remember their names.
+fn site_bots(
+    db: &Db,
+    site_id: i64,
+    query: &str,
+    categories: [Option<Policy>; 3],
+) -> anyhow::Result<(Vec<SiteBot>, bool)> {
+    let overrides = db.site_bot_overrides(site_id)?;
+    let override_for = |bot: &Bot| {
+        overrides
+            .iter()
+            .find(|o| o.bot_id == bot.id)
+            .map(|o| o.policy)
+    };
+    let bots = db.list_bots()?;
+    let (bots, truncated) = if query.trim().is_empty() {
+        let overridden = bots
+            .into_iter()
+            .filter(|bot| override_for(bot).is_some())
+            .collect();
+        crate::web::bots::matching_bots(overridden, "")
+    } else {
+        crate::web::bots::matching_bots(bots, query)
+    };
+    let [scanner, search, ai] = categories;
+    let scanner = scanner.unwrap_or(db.get_category_default(Category::Scanner)?);
+    let search = search.unwrap_or(db.get_category_default(Category::Search)?);
+    let ai = ai.unwrap_or(db.get_category_default(Category::Ai)?);
+    let rows = bots
+        .into_iter()
+        .map(|bot| {
+            let site_override = override_for(&bot);
+            let effective =
+                crate::db::effective_bot_policy(&bot, site_override, ai, search, scanner);
+            SiteBot {
+                bot,
+                site_override,
+                effective,
+            }
+        })
+        .collect();
+    Ok((rows, truncated))
+}
+
+fn load_detail(db: &Db, id: i64, bot_query: &str) -> anyhow::Result<Detail> {
     let site = db
         .list_sites()?
         .into_iter()
@@ -337,11 +406,18 @@ fn load_detail(db: &Db, id: i64) -> anyhow::Result<Detail> {
         &nginx::conf_d_dir(&nginx::root(db, None)?),
     );
     let enabled = db.site_request_rules(site.id)?;
+    let scanner = db.get_site_category_override(site.id, Category::Scanner)?;
+    let search = db.get_site_category_override(site.id, Category::Search)?;
+    let ai = db.get_site_category_override(site.id, Category::Ai)?;
+    let (bots, bots_truncated) = site_bots(db, site.id, bot_query, [scanner, search, ai])?;
 
     Ok(Detail {
-        scanner: db.get_site_category_override(site.id, Category::Scanner)?,
-        search: db.get_site_category_override(site.id, Category::Search)?,
-        ai: db.get_site_category_override(site.id, Category::Ai)?,
+        scanner,
+        search,
+        ai,
+        bot_query: bot_query.to_string(),
+        bots,
+        bots_truncated,
         rules: RequestRule::ALL
             .into_iter()
             .map(|rule| (rule, enabled.iter().any(|id| id == rule.id())))
@@ -353,13 +429,23 @@ fn load_detail(db: &Db, id: i64) -> anyhow::Result<Detail> {
     })
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct DetailParams {
+    /// The per-bot panel's search text.
+    pub q: Option<String>,
+    #[serde(flatten)]
+    pub flash: FlashQuery,
+}
+
 pub async fn detail(
     State(state): State<AppState>,
     auth: Auth,
     UrlPath(id): UrlPath<i64>,
-    Query(flash): Query<FlashQuery>,
+    Query(params): Query<DetailParams>,
 ) -> Response {
-    let detail = match state.with_db(move |db| load_detail(db, id)).await {
+    let query = params.q.unwrap_or_default();
+    let flash = params.flash;
+    let detail = match state.with_db(move |db| load_detail(db, id, &query)).await {
         Ok(detail) => detail,
         Err(err) => return internal_error(&err.to_string()),
     };
@@ -441,6 +527,8 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
             },
         ))
 
+        (bot_overrides_panel(detail, ctx))
+
         (layout::panel(
             "Request-shape rules",
             Some("Each is off by default — one switch per rule, so you can tell which one broke something"),
@@ -512,6 +600,102 @@ fn detail_body(detail: &Detail, ctx: &Ctx) -> Markup {
     }
 }
 
+/// Per-bot overrides for this site: the TUI's site-detail bot search, and
+/// the global Bot settings page's per-bot select, scoped to one site.
+fn bot_overrides_panel(detail: &Detail, ctx: &Ctx) -> Markup {
+    let id = detail.site.id;
+    let suffix = bot_query_suffix(&detail.bot_query);
+    layout::panel(
+        "Bot overrides",
+        Some("Only for this site. Wins over the bot's global override and every category"),
+        html! {
+            .panel-body {
+                form .row method="get" action=(ctx.url(&format!("/nginx/{id}"))) {
+                    input type="text" name="q" value=(detail.bot_query)
+                        placeholder="Search by name or user-agent pattern" size="30";
+                    button type="submit" { "Search" }
+                    @if !detail.bot_query.is_empty() {
+                        a .button href=(ctx.url(&format!("/nginx/{id}"))) { "Clear" }
+                    }
+                }
+            }
+            @if detail.bots.is_empty() {
+                @if detail.bot_query.trim().is_empty() {
+                    (layout::empty("No bot is overridden on this site. Search to add one."))
+                } @else {
+                    (layout::empty("No bots match that search."))
+                }
+            } @else {
+                table {
+                    thead { tr {
+                        th { "Bot" }
+                        th { "Categories" }
+                        th { "Here" }
+                        th .right { "Override" }
+                    } }
+                    tbody {
+                        @for row in &detail.bots {
+                            tr {
+                                td {
+                                    (row.bot.name)
+                                    br;
+                                    span .hint .mono { (row.bot.user_agent_pattern) }
+                                }
+                                td { (crate::web::bots::categories_of(&row.bot)) }
+                                td {
+                                    @match row.effective {
+                                        Policy::Blocked => (layout::pill("BLOCKED", PillKind::Blocked)),
+                                        Policy::Allowed => (layout::pill("ALLOWED", PillKind::Allowed)),
+                                    }
+                                    " "
+                                    span .hint { (effective_source(row)) }
+                                }
+                                td .right {
+                                    form .inline method="post" action=(ctx.url(&format!("/nginx/{id}/bot{suffix}"))) {
+                                        (layout::csrf_field(ctx))
+                                        input type="hidden" name="bot" value=(row.bot.id);
+                                        select name="policy" data-autosubmit {
+                                            @for (value, text) in [
+                                                ("default", "Follow site & system"),
+                                                ("allowed", "Allow here"),
+                                                ("blocked", "Block here"),
+                                            ] {
+                                                @if override_id(row.site_override) == value {
+                                                    option value=(value) selected { (text) }
+                                                } @else {
+                                                    option value=(value) { (text) }
+                                                }
+                                            }
+                                        }
+                                        button type="submit" { "Set" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                @if detail.bots_truncated {
+                    .panel-body {
+                        p .hint { "Showing the first matches only. Narrow the search to see the rest." }
+                    }
+                }
+            }
+        },
+    )
+}
+
+/// Which tier decided a bot's policy on this site — the question the
+/// TUI answers with "(site override)" beside every row.
+fn effective_source(row: &SiteBot) -> &'static str {
+    if row.site_override.is_some() {
+        "site override"
+    } else if row.bot.status != crate::db::BotStatus::Default {
+        "global override"
+    } else {
+        "category"
+    }
+}
+
 fn category_id(category: Category) -> &'static str {
     match category {
         Category::Scanner => "scanner",
@@ -560,6 +744,7 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
         .route(&base.url("/nginx/apply-all"), post(apply_all))
         .route(&base.url("/nginx/{id}/category"), post(set_site_category))
         .route(&base.url("/nginx/{id}/rule"), post(set_site_rule))
+        .route(&base.url("/nginx/{id}/bot"), post(set_site_bot))
         .route(&base.url("/nginx/{id}/exempt-add"), post(add_exemption))
         .route(
             &base.url("/nginx/{id}/exempt-remove"),
@@ -874,6 +1059,71 @@ async fn set_site_category(
 }
 
 #[derive(Deserialize)]
+struct SiteBotForm {
+    bot: i64,
+    policy: String,
+}
+
+/// The search the form was posted from, so the page comes back to it.
+#[derive(Deserialize)]
+struct BackQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// Sets, or clears, one bot's override on one site.
+async fn set_site_bot(
+    State(state): State<AppState>,
+    _auth: Auth,
+    UrlPath(id): UrlPath<i64>,
+    Query(back): Query<BackQuery>,
+    Form(form): Form<SiteBotForm>,
+) -> Response {
+    let back = format!("/nginx/{id}{}", bot_query_suffix(&back.q));
+    let Some(policy) = override_from(&form.policy) else {
+        return back_with(&state.base, &back, "Unknown policy.", false);
+    };
+    let bot_id = form.bot;
+    let stored = state
+        .with_db(move |db| {
+            let site = db
+                .list_sites()?
+                .into_iter()
+                .find(|s| s.id == id)
+                .ok_or_else(|| anyhow::anyhow!("no site with id {id}"))?;
+            let bot = db
+                .list_bots()?
+                .into_iter()
+                .find(|b| b.id == bot_id)
+                .ok_or_else(|| anyhow::anyhow!("no bot with id {bot_id}"))?;
+            db.set_site_bot_override(id, bot_id, policy)?;
+            Ok((bot.name, site.server_name))
+        })
+        .await;
+    match stored {
+        Ok((bot, site)) => back_with(
+            &state.base,
+            &back,
+            &format!(
+                "{bot} on {site}: {}. Apply to write it out.",
+                match policy {
+                    None => "follows the site and system defaults",
+                    Some(Policy::Allowed) => "allowed",
+                    Some(Policy::Blocked) => "blocked",
+                }
+            ),
+            true,
+        ),
+        Err(err) => back_with(
+            &state.base,
+            &back,
+            &format!("Could not save that: {err}"),
+            false,
+        ),
+    }
+}
+
+#[derive(Deserialize)]
 struct RuleForm {
     rule: String,
     enabled: String,
@@ -1102,7 +1352,7 @@ mod tests {
         let db = seeded(tmp.path());
         let id = db.list_sites().unwrap()[0].id;
 
-        let detail = load_detail(&db, id).unwrap();
+        let detail = load_detail(&db, id, "").unwrap();
         assert_eq!(detail.rules.len(), RequestRule::ALL.len());
         assert!(
             detail.rules.iter().all(|(_, enabled)| !enabled),
@@ -1129,7 +1379,7 @@ mod tests {
             .unwrap();
         db.add_site_path_exemption(id, "/blog").unwrap();
 
-        let detail = load_detail(&db, id).unwrap();
+        let detail = load_detail(&db, id, "").unwrap();
         assert_eq!(detail.ai, Some(Policy::Blocked));
         assert_eq!(detail.exemptions, ["/blog"]);
 
@@ -1145,7 +1395,8 @@ mod tests {
         db.add_site_agent_exemption(id, "/remote.php/dav/", "okhttp")
             .unwrap();
 
-        let rendered = detail_body(&load_detail(&db, id).unwrap(), &Ctx::for_tests()).into_string();
+        let rendered =
+            detail_body(&load_detail(&db, id, "").unwrap(), &Ctx::for_tests()).into_string();
         for expected in ["only for okhttp", r#"name="user_agent" value="okhttp""#] {
             assert!(
                 rendered.contains(expected),
@@ -1154,10 +1405,60 @@ mod tests {
         }
     }
 
+    /// Each row says what the bot gets on this site and which tier decided
+    /// it: the site's own override beats the bot's global one, which beats
+    /// its categories.
+    #[test]
+    fn a_bot_row_names_the_tier_that_decided_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = seeded(tmp.path());
+        let id = db.list_sites().unwrap()[0].id;
+        crate::testing::seed_source(&db, "test-source");
+        for slug in ["pinned", "overridden", "plain"] {
+            db.upsert_bot(&crate::testing::new_bot(slug, "test-source"))
+                .unwrap();
+        }
+        db.set_bot_status("pinned", crate::db::BotStatus::Blocked)
+            .unwrap();
+        db.set_bot_status("overridden", crate::db::BotStatus::Blocked)
+            .unwrap();
+        let overridden = db
+            .list_bots()
+            .unwrap()
+            .into_iter()
+            .find(|b| b.slug == "overridden")
+            .unwrap();
+        db.set_site_bot_override(id, overridden.id, Some(Policy::Allowed))
+            .unwrap();
+
+        let rows: Vec<(String, Policy, &str)> = load_detail(&db, id, "e")
+            .unwrap()
+            .bots
+            .iter()
+            .map(|row| (row.bot.slug.clone(), row.effective, effective_source(row)))
+            .collect();
+
+        assert_eq!(
+            rows,
+            [
+                ("overridden".to_string(), Policy::Allowed, "site override"),
+                ("pinned".to_string(), Policy::Blocked, "global override"),
+            ]
+        );
+        // "plain" has no "e"; with no search, only the overridden one shows.
+        let unsearched: Vec<String> = load_detail(&db, id, "")
+            .unwrap()
+            .bots
+            .into_iter()
+            .map(|row| row.bot.slug)
+            .collect();
+        assert_eq!(unsearched, ["overridden"]);
+    }
+
     #[test]
     fn a_missing_site_is_an_error_rather_than_a_blank_page() {
         let db = Db::open_in_memory().unwrap();
-        assert!(load_detail(&db, 999).is_err());
+        assert!(load_detail(&db, 999, "").is_err());
     }
 
     #[test]
@@ -1165,6 +1466,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = seeded(tmp.path());
         let id = db.list_sites().unwrap()[0].id;
+        crate::testing::blocked_bot(&db, "badbot", "BadBot");
 
         for rendered in [
             body(
@@ -1173,7 +1475,13 @@ mod tests {
             )
             .into_string(),
             detail_body(
-                &load_detail(&db, id).unwrap(),
+                &load_detail(&db, id, "").unwrap(),
+                &Ctx::new("the-token", Default::default()),
+            )
+            .into_string(),
+            // With a search, so the per-bot forms are on the page too.
+            detail_body(
+                &load_detail(&db, id, "bad").unwrap(),
                 &Ctx::new("the-token", Default::default()),
             )
             .into_string(),

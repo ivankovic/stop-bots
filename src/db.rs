@@ -403,6 +403,39 @@ pub struct SiteBotOverride {
     pub policy: Policy,
 }
 
+/// What `bot` gets on one site: the site's own override for it if there
+/// is one, then its global override, then its categories — the per-bot
+/// view of [`Db::blocked_user_agent_patterns_for_site`]'s cascade, for the
+/// screens that show one bot at a time (the TUI's site detail and the
+/// console's). `ai`/`search`/`scanner` are already the *effective* values
+/// for the site: its category override if it has one, else the global
+/// default.
+pub fn effective_bot_policy(
+    bot: &Bot,
+    site_override: Option<Policy>,
+    ai: Policy,
+    search: Policy,
+    scanner: Policy,
+) -> Policy {
+    if let Some(policy) = site_override {
+        return policy;
+    }
+    match bot.status {
+        BotStatus::Allowed => Policy::Allowed,
+        BotStatus::Blocked => Policy::Blocked,
+        BotStatus::Default => {
+            let blocked = (bot.is_ai && ai == Policy::Blocked)
+                || (bot.is_search_engine && search == Policy::Blocked)
+                || (bot.is_scanner && scanner == Policy::Blocked);
+            if blocked {
+                Policy::Blocked
+            } else {
+                Policy::Allowed
+            }
+        }
+    }
+}
+
 /// What a firewall rule should do with matching traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FirewallAction {

@@ -636,15 +636,19 @@ pub type Auth = Extension<Authenticated>;
 /// did, and they are about to read it on screen.
 pub fn back_with(base: &BasePath, path: &str, message: &str, ok: bool) -> Response {
     let kind = if ok { "ok" } else { "err" };
+    // A `path` may carry a query of its own — a search to come back to.
+    let separator = if path.contains('?') { '&' } else { '?' };
     Redirect::to(&format!(
-        "{}?flash={}&kind={kind}",
+        "{}{separator}flash={}&kind={kind}",
         base.url(path),
         percent_encode(message)
     ))
     .into_response()
 }
 
-fn percent_encode(input: &str) -> String {
+/// Encodes `input` for a query string: everything but the unreserved
+/// characters.
+pub fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.as_bytes() {
         match byte {
