@@ -230,7 +230,7 @@ async fn login(app: &Router, password: &str) -> (String, String) {
 async fn an_unauthenticated_request_is_sent_to_the_login_page() {
     let (app, _password, _tmp) = app();
 
-    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/blocks", "/help"] {
         let response = app.clone().oneshot(get(path)).await.unwrap();
         assert_eq!(
             response.status(),
@@ -281,7 +281,7 @@ async fn a_correct_password_opens_a_session_that_reaches_every_screen() {
     let (app, password, _tmp) = app();
     let (cookie, _csrf) = login(&app, &password).await;
 
-    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/blocks", "/help"] {
         let response = app
             .clone()
             .oneshot(with_cookie(get(path), &cookie))
@@ -596,7 +596,7 @@ async fn no_page_uses_an_inline_event_handler() {
     let (app, password, _tmp) = app();
     let (cookie, _csrf) = login(&app, &password).await;
 
-    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/blocks", "/help"] {
         let response = app
             .clone()
             .oneshot(with_cookie(get(path), &cookie))
@@ -624,7 +624,7 @@ async fn every_screen_lays_its_panels_out_in_the_column_grid() {
     let (app, password, _tmp) = app();
     let (cookie, _csrf) = login(&app, &password).await;
 
-    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/blocks", "/help"] {
         let response = app
             .clone()
             .oneshot(with_cookie(get(path), &cookie))
@@ -880,7 +880,7 @@ async fn writing_the_firewall_script_produces_a_file_and_records_the_signature()
 
     Db::open(&db_path)
         .unwrap()
-        .block_address_permanently("192.0.2.10")
+        .block_address_permanently("192.0.2.10", stop_bots::db::RuleSource::Tui, None)
         .unwrap();
 
     // Beside the configured script, which is the applied one: writing
@@ -1815,7 +1815,7 @@ async fn under_a_prefix_the_screens_are_reachable_at_the_prefixed_paths() {
     );
     let cookie = session_cookie_from(&response);
 
-    for path in ["/", "/bots", "/nginx", "/firewall", "/help"] {
+    for path in ["/", "/bots", "/nginx", "/firewall", "/blocks", "/help"] {
         let response = app
             .clone()
             .oneshot(with_cookie(get_under(path), &cookie))
@@ -1863,7 +1863,8 @@ async fn no_url_on_any_page_escapes_the_prefix() {
         source_id: "well-known-bots".into(),
     })
     .unwrap();
-    db.block_address_permanently("192.0.2.9").unwrap();
+    db.block_address_permanently("192.0.2.9", stop_bots::db::RuleSource::Tui, None)
+        .unwrap();
     db.set_country_selected("CN", true).unwrap();
     drop(db);
     write_site(&tmp, "example.com");
@@ -2413,6 +2414,8 @@ async fn the_dashboard_reports_system_status_once_a_probe_exists() {
             address: "198.51.100.7".to_string(),
             port: None,
             action: stop_bots::db::FirewallAction::Block,
+            source: stop_bots::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         stop_bots::health::store_probe(
@@ -2575,7 +2578,7 @@ async fn apply_everything_asks_first_and_asking_changes_nothing() {
     let (cookie, _csrf) = login(&app, &password).await;
     Db::open(&db_path)
         .unwrap()
-        .block_address_permanently("192.0.2.10")
+        .block_address_permanently("192.0.2.10", stop_bots::db::RuleSource::Web, None)
         .unwrap();
 
     let home = body_string(
@@ -2794,4 +2797,175 @@ async fn the_dashboard_offers_a_web_access_panel() {
     for mode in ["Path on an existing site", "Its own subdomain"] {
         assert!(body.contains(mode), "missing mode {mode}");
     }
+}
+
+// ---- Blocks ----
+
+/// Seeds `count` detector blocks, half from each of two detectors, with
+/// evidence, in one transaction: the shape of a busy host's table.
+fn seed_blocks(db_path: &std::path::Path, count: u32) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute_batch("PRAGMA synchronous = OFF; BEGIN")
+        .unwrap();
+    {
+        let mut stmt = conn
+            .prepare(
+                "INSERT INTO firewall_rules
+                     (address, action, enabled, created_at, expires_at, source, evidence)
+                 VALUES (?1, 'block', 1, 1790000000, 4102444800, ?2, '\"GET /.env HTTP/1.1\" 404')",
+            )
+            .unwrap();
+        for i in 0..count {
+            let address = std::net::Ipv4Addr::from(0x0a00_0000 + i).to_string();
+            let source = if i % 2 == 0 {
+                "block_probe_paths"
+            } else {
+                "block_web_scanners"
+            };
+            stmt.execute(rusqlite::params![address, source]).unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+}
+
+async fn page_html(app: &Router, cookie: &str, path: &str) -> String {
+    let response = app
+        .clone()
+        .oneshot(with_cookie(get(path), cookie))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK, "{path}");
+    body_string(response).await
+}
+
+/// A detector's block, which no other page shows, with the request that
+/// earned it; and filtering, searching and paging all reach it.
+#[tokio::test]
+async fn the_blocks_page_shows_a_detector_s_block_and_why() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    seed_blocks(&db_path, 3);
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let html = page_html(&app, &cookie, "/blocks?source=probe-paths").await;
+    for needle in ["10.0.0.0", "10.0.0.2", "Probe paths", "GET /.env HTTP/1.1"] {
+        assert!(html.contains(needle), "{needle:?} missing:\n{html}");
+    }
+    assert!(
+        !html.contains("10.0.0.1<"),
+        "a web scanner's block, filtered out"
+    );
+
+    let searched = page_html(&app, &cookie, "/blocks?q=10.0.0.1").await;
+    assert!(searched.contains("Rules 1\u{2013}1 of 1"), "{searched}");
+}
+
+/// "Unblock all" is asked with the count, removes exactly that source,
+/// and refuses if the count changed after it was asked.
+#[tokio::test]
+async fn unblocking_all_from_a_source_removes_that_source_only() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    seed_blocks(&db_path, 4);
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let asked = page_html(&app, &cookie, "/blocks?source=web-scanners&confirm=1").await;
+    assert!(
+        asked.contains("Unblock all 2 rule(s) from Web scanners?"),
+        "{asked}"
+    );
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/blocks/unblock-all",
+        "source=web-scanners&expected=3",
+    )
+    .await;
+    assert!(flash.contains("Nothing was removed"), "{flash}");
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/blocks/unblock-all",
+        "source=web-scanners&expected=2",
+    )
+    .await;
+    assert!(
+        flash.contains("Removed 2 rule(s) from Web scanners"),
+        "{flash}"
+    );
+    let db = Db::open(&db_path).unwrap();
+    let left: Vec<String> = db
+        .list_firewall_rules()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.address)
+        .collect();
+    assert_eq!(left, ["10.0.0.0", "10.0.0.2"]);
+    assert_eq!(db.unblocked_addresses().unwrap().len(), 2, "remembered");
+}
+
+#[tokio::test]
+async fn unblocking_one_rule_returns_to_the_same_view() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    seed_blocks(&db_path, 2);
+    let (cookie, csrf) = login(&app, &password).await;
+    let id = Db::open(&db_path).unwrap().list_firewall_rules().unwrap()[0].id;
+
+    let response = app
+        .clone()
+        .oneshot(with_cookie(
+            post(
+                "/blocks/unblock",
+                &format!("csrf={csrf}&id={id}&source=probe-paths&page=1"),
+            ),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(
+        location.starts_with("/blocks?page=1&source=probe-paths&flash="),
+        "{location}"
+    );
+    assert_eq!(
+        Db::open(&db_path)
+            .unwrap()
+            .list_firewall_rules()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Fifty thousand rules is what a busy host with every detector on can
+/// hold. A page of them, the last page, a filtered page and a search all
+/// read one page's worth, not the table.
+#[tokio::test]
+async fn the_blocks_page_stays_fast_with_fifty_thousand_rules() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    seed_blocks(&db_path, 50_000);
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    for path in [
+        "/blocks",
+        "/blocks?page=500",
+        "/blocks?source=web-scanners&page=250",
+        "/blocks?q=10.0.195.80",
+    ] {
+        let started = std::time::Instant::now();
+        let html = page_html(&app, &cookie, path).await;
+        let took = started.elapsed();
+        assert!(took.as_millis() < 400, "{path} took {took:?}");
+        assert!(
+            html.matches("<tr>").count() <= 101,
+            "{path} rendered more than a page"
+        );
+    }
+    let last = page_html(&app, &cookie, "/blocks?page=500").await;
+    assert!(
+        last.contains("Rules 49901\u{2013}50000 of 50000"),
+        "the last page"
+    );
 }

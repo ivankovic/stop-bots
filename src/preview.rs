@@ -122,7 +122,8 @@ mod tests {
         )
         .unwrap();
         let db = Db::open_in_memory().unwrap();
-        db.block_address_permanently("192.0.2.9").unwrap();
+        db.block_address_permanently("192.0.2.9", crate::db::RuleSource::Tui, None)
+            .unwrap();
         crate::testing::blocked_bot(&db, "badbot", "BadBot");
         let run = FirewallRun::new(FirewallBackend::Nftables, dir.join("firewall.nft"))
             .apply(true)

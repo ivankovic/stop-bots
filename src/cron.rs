@@ -801,6 +801,8 @@ mod tests {
             address: "198.51.100.7".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         db.set_auto_apply_firewall(true).unwrap();
@@ -910,6 +912,8 @@ mod tests {
             address: "198.51.100.7".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -930,6 +934,8 @@ mod tests {
             address: "198.51.100.7".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         // Ran one minute ago and left no signature — exactly what a render
@@ -974,6 +980,8 @@ mod tests {
             address: "198.51.100.7".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         for job in CronJob::all() {
@@ -1187,6 +1195,8 @@ mod tests {
             address: "203.0.113.0/24".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 
@@ -1229,7 +1239,7 @@ mod tests {
         // The block lapses: pruned, as `list_firewall_rules` does once its
         // time is up.
         let id = db.list_firewall_rules().unwrap()[0].id;
-        db.remove_firewall_rule(id).unwrap();
+        db.let_firewall_rule_lapse(id);
         assert_eq!(
             pass(&db, dir.path(), &job)[0].1,
             "no probing IPs found",

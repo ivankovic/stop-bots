@@ -77,11 +77,13 @@ pub fn router(state: AppState) -> Router {
         .route(&path("/bots"), get(crate::web::bots::page))
         .route(&path("/nginx"), get(crate::web::nginx::page))
         .route(&path("/firewall"), get(crate::web::firewall::page))
+        .route(&path("/blocks"), get(crate::web::blocks::page))
         .route(&path("/help"), get(crate::web::help::page))
         .merge(crate::web::dashboard::actions(&state.base))
         .merge(crate::web::bots::actions(&state.base))
         .merge(crate::web::nginx::actions(&state.base))
         .merge(crate::web::firewall::actions(&state.base))
+        .merge(crate::web::blocks::actions(&state.base))
         .layer(middleware::from_fn_with_state(state.clone(), csrf_guard))
         .layer(middleware::from_fn_with_state(state.clone(), require_login));
 

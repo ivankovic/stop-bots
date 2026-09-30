@@ -466,7 +466,7 @@ fn inspect_ua_url(user_agent: &str, filter: Filter, ctx: &Ctx) -> String {
 /// Percent-encodes everything outside the unreserved set. Deliberately
 /// conservative and hand-rolled: one query parameter does not justify a
 /// dependency, and the only way to get this wrong is to be too permissive.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -767,6 +767,7 @@ fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
             form .inline method="post" action=(ctx.url("/firewall/block-address")) {
                 (layout::csrf_field(ctx))
                 input type="hidden" name="address" value=(row.address);
+                input type="hidden" name="attempts" value=(row.count);
                 button .danger type="submit" { "Block" }
             }
         },
@@ -919,6 +920,9 @@ async fn untrust(
 #[derive(Deserialize)]
 pub struct AddressForm {
     pub address: String,
+    /// How many failed logins the row showed, recorded as the block's
+    /// evidence. Only the Block button sends it.
+    pub attempts: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -962,8 +966,11 @@ async fn block_address(
     }
 
     let stored = address.clone();
+    let evidence = form.attempts.map(crate::dynamic::attempts_evidence);
     match state
-        .with_db(move |db| db.block_address_permanently(&stored))
+        .with_db(move |db| {
+            db.block_address_permanently(&stored, crate::db::RuleSource::Web, evidence.as_deref())
+        })
         .await
     {
         Ok(()) => back_with(
@@ -1156,7 +1163,10 @@ mod tests {
             status: RowStatus::Pending,
         };
         let blocked = SshRow {
-            status: RowStatus::Blocked { until: None },
+            status: RowStatus::Blocked {
+                until: None,
+                by: None,
+            },
             ..pending.clone()
         };
 

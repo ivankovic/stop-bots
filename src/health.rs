@@ -1927,6 +1927,8 @@ mod tests {
                 address: format!("198.51.100.{i}"),
                 port: None,
                 action: crate::db::FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             })
             .unwrap();
         }
@@ -2667,6 +2669,8 @@ mod tests {
             address: "198.51.100.0/24".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
 

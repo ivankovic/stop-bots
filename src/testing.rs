@@ -68,6 +68,9 @@ pub(crate) fn rule(address: &str, action: FirewallAction) -> FirewallRule {
         action,
         enabled: true,
         expires_at: None,
+        source: None,
+        created_at: None,
+        evidence: None,
     }
 }
 

@@ -502,6 +502,20 @@ label.field code { text-transform: none; letter-spacing: 0; }
 .seg a:last-child { border-right: none; }
 .seg a:hover { color: var(--fg); }
 .seg a.on { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
+/* Blocks has a segment per source that has rules: up to fourteen. */
+.seg.wrap { flex-wrap: wrap; }
+/* A panel across both columns of the grid, for a table too wide for one. */
+.cols .span-all { grid-column: 1 / -1; min-width: 0; }
+
+/* Blocks: seven columns, one of them the client's own text. The table
+   scrolls sideways on a phone rather than squeezing the evidence to a
+   letter per line. */
+.table-wide { overflow-x: auto; }
+td.evidence {
+  font: 12px var(--mono);
+  word-break: break-all;
+  min-width: 240px;
+}
 
 /* ---- messages ---- */
 

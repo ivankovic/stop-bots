@@ -19,7 +19,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
-use stop_bots::db::{Db, FirewallAction, NewFirewallRule};
+use stop_bots::blocks::SourceFilter;
+use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule, RuleSource};
 use stop_bots::protection::Detector;
 use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
 
@@ -217,13 +218,36 @@ enum Command {
     },
     /// List every trusted address and user agent
     ListTrusted,
-    /// List all stored firewall rules, with their ids
-    ListFirewallRules,
-    /// Remove a firewall rule by id
+    /// List every stored firewall rule: its id, where it came from and why.
+    ///
+    /// Each rule shows its source — the detector that added it, or `cli`,
+    /// `tui` or `web` for one added by hand — when it was added, when it
+    /// expires, and the log line that triggered it. Rules from before 0.1
+    /// have no source and show `before-0.1`. Newest first.
+    ListFirewallRules {
+        /// Only rules from this source: a detector's name (as `set-detector`
+        /// takes it), `cli`, `tui`, `web` or `before-0.1`
+        #[arg(long, value_parser = source_arg)]
+        source: Option<SourceFilter>,
+    },
+    /// Remove a firewall rule by id, or every rule from one source.
+    ///
+    /// Removing a detector's block also keeps that detector from adding
+    /// it straight back from the same log lines: it leaves the address
+    /// alone for as long as the block was meant to last. Trust the
+    /// address (`trust --address`) to exempt it for good.
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["id", "source"])))]
     RemoveFirewallRule {
         /// The rule's id, as `list-firewall-rules` shows it
         #[arg(long)]
-        id: i64,
+        id: Option<i64>,
+        /// Every rule from this source instead: a detector's name, `cli`,
+        /// `tui`, `web` or `before-0.1`
+        #[arg(long, value_parser = source_arg)]
+        source: Option<SourceFilter>,
+        /// Say how many rules --source would remove, and remove nothing
+        #[arg(long, requires = "source")]
+        dry_run: bool,
     },
     /// Switch a stored firewall rule off or back on, without deleting it.
     ///
@@ -1405,23 +1429,10 @@ impl DetectorArg {
         out
     };
 
-    /// Exhaustive on purpose: a detector added to `Detector::ALL` without
-    /// a command-line name is a compile error, not a detector `set-detector`
-    /// cannot reach.
+    /// The name `set-detector` and `--source` both take — one list, in
+    /// `blocks::detector_name`, so the two can never disagree.
     fn name(self) -> &'static str {
-        use stop_bots::protection::Detector as D;
-        match self.0 {
-            D::SshScanners => "ssh-scanners",
-            D::WebScanners => "web-scanners",
-            D::SpoofedCrawlers => "spoofed-crawlers",
-            D::ProbePaths => "probe-paths",
-            D::Injection => "injection",
-            D::Honeypot => "honeypot",
-            D::AssetRatio => "asset-ratio",
-            D::RotatingUserAgent => "rotating-ua",
-            D::RefererlessCrawl => "refererless",
-            D::RobotsTxt => "robots-txt",
-        }
+        stop_bots::blocks::detector_name(self.0)
     }
 }
 
@@ -1587,8 +1598,12 @@ async fn main() -> Result<()> {
             port,
             action,
         }) => add_firewall_rule(db, address, port, &action),
-        Some(Command::ListFirewallRules) => list_firewall_rules(db),
-        Some(Command::RemoveFirewallRule { id }) => remove_firewall_rule(db, id),
+        Some(Command::ListFirewallRules { source }) => list_firewall_rules(db, source),
+        Some(Command::RemoveFirewallRule {
+            id,
+            source,
+            dry_run,
+        }) => remove_firewall_rule(db, id, source, dry_run),
         Some(Command::SetFirewallRule { id, enabled }) => set_firewall_rule(db, id, enabled),
         Some(Command::RenderFirewall {
             backend,
@@ -2180,31 +2195,73 @@ fn add_firewall_rule(
         address,
         port,
         action,
+        source: RuleSource::Cli,
+        evidence: None,
     })?;
     println!("Added firewall rule #{id}");
     Ok(())
 }
 
-fn list_firewall_rules(db_path: Option<PathBuf>) -> Result<()> {
+/// A `--source` value: a source's name, its stored id, or `before-0.1`.
+fn source_arg(value: &str) -> Result<SourceFilter, String> {
+    SourceFilter::parse(value).ok_or_else(|| {
+        let names: Vec<&str> = RuleSource::stored_sources()
+            .into_iter()
+            .map(RuleSource::name)
+            .chain([stop_bots::blocks::LEGACY_NAME])
+            .collect();
+        format!("unknown source {value:?}; one of: {}", names.join(", "))
+    })
+}
+
+fn list_firewall_rules(db_path: Option<PathBuf>, source: Option<SourceFilter>) -> Result<()> {
     let db = open_db(db_path)?;
-    let rules = db.list_firewall_rules()?;
+    db.prune_expired_firewall_rules()?;
+    let query = stop_bots::db::BlockQuery {
+        source,
+        search: String::new(),
+    };
+    let rules = db.blocks_page(&query, 0, usize::MAX >> 1)?;
     if rules.is_empty() {
-        println!("No firewall rules stored.");
+        match source {
+            Some(source) => println!("No firewall rules from {}.", source.name()),
+            None => println!("No firewall rules stored."),
+        }
         return Ok(());
     }
-    for rule in rules {
-        let port = rule.port.map(|p| format!(":{p}")).unwrap_or_default();
-        let status = if rule.enabled { "" } else { " (disabled)" };
-        let expiry = rule
-            .expires_at
-            .map(|t| format!(" ({})", format_expiry(t)))
-            .unwrap_or_default();
-        println!(
-            "#{} {:?} {}{}{}{}",
-            rule.id, rule.action, rule.address, port, status, expiry
-        );
+    let now = now_secs();
+    for rule in &rules {
+        println!("{}", rule_line(rule, now));
     }
     Ok(())
+}
+
+/// One rule as `list-firewall-rules` prints it: what it does, then where
+/// it came from, then the evidence, which is last because it is the one
+/// part of unbounded length.
+fn rule_line(rule: &FirewallRule, now: i64) -> String {
+    let port = rule.port.map(|p| format!(":{p}")).unwrap_or_default();
+    let status = if rule.enabled { "" } else { " (disabled)" };
+    let expiry = rule
+        .expires_at
+        .map(|t| format!(" ({})", format_expiry(t)))
+        .unwrap_or_default();
+    let added = rule
+        .created_at
+        .map(|t| format!(", added {} ago", stop_bots::blocks::format_age(t, now)))
+        .unwrap_or_default();
+    let evidence = rule
+        .evidence
+        .as_deref()
+        .map(|line| format!(": {line}"))
+        .unwrap_or_default();
+    format!(
+        "#{} {:?} {}{port}{status}{expiry} [{}{added}]{evidence}",
+        rule.id,
+        rule.action,
+        rule.address,
+        stop_bots::blocks::source_name(rule.source)
+    )
 }
 
 /// Renders a firewall rule's `expires_at` (Unix seconds, already known to
@@ -2231,10 +2288,42 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
-fn remove_firewall_rule(db_path: Option<PathBuf>, id: i64) -> Result<()> {
+fn remove_firewall_rule(
+    db_path: Option<PathBuf>,
+    id: Option<i64>,
+    source: Option<SourceFilter>,
+    dry_run: bool,
+) -> Result<()> {
     let db = open_db(db_path)?;
-    db.remove_firewall_rule(id)?;
-    println!("Removed firewall rule #{id}");
+    match (id, source) {
+        (Some(id), _) => {
+            db.remove_firewall_rule(id)?;
+            println!("Removed firewall rule #{id}");
+        }
+        (None, Some(source)) => {
+            let count = db.remove_firewall_rules_from(source, dry_run)?;
+            let name = source.name();
+            if dry_run {
+                println!("Would remove {count} firewall rule(s) from {name} (dry run).");
+                return Ok(());
+            }
+            println!("Removed {count} firewall rule(s) from {name}.");
+            if count == 0 {
+                return Ok(());
+            }
+            if matches!(
+                source,
+                SourceFilter::Source(RuleSource::Detector(_)) | SourceFilter::Legacy
+            ) {
+                println!(
+                    "The detectors leave those addresses alone for as long as each block was \
+                     meant to last."
+                );
+            }
+        }
+        (None, None) => unreachable!("clap requires --id or --source"),
+    }
+    println!("Run `stop-bots render-firewall` and apply the script to put it in effect.");
     Ok(())
 }
 
@@ -4339,6 +4428,12 @@ fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
                 outcome.ttl_days
             );
         }
+    }
+    if outcome.skipped_unblocked > 0 {
+        println!(
+            "Left {} alone: unblocked by hand recently (trust an address to exempt it for good).",
+            outcome.skipped_unblocked
+        );
     }
     if outcome.newly_blocked.is_empty() {
         println!(

@@ -3492,6 +3492,8 @@ mod tests {
             address: "203.0.113.9".to_string(),
             port: None,
             action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
         })
         .unwrap();
         let signature = crate::firewall::rules_signature(&crate::firewall::all_rules(&db).unwrap());

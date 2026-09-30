@@ -592,7 +592,11 @@ impl Firewall {
                         row.address
                     ));
                 } else {
-                    db.block_address_permanently(&row.address)?;
+                    db.block_address_permanently(
+                        &row.address,
+                        crate::db::RuleSource::Tui,
+                        Some(&crate::dynamic::attempts_evidence(row.count)),
+                    )?;
                     *message = Some(format!(
                         "Permanently blocked {} — run render-firewall (then apply the script) to enforce it.",
                         row.address
@@ -1284,7 +1288,13 @@ mod tests {
 
         assert_eq!(screen.ua_rows.len(), 1);
         assert_eq!(screen.ua_rows[0].user_agent, "Mozilla/5.0");
-        assert_eq!(screen.ua_rows[0].status, RowStatus::Blocked { until: None });
+        assert_eq!(
+            screen.ua_rows[0].status,
+            RowStatus::Blocked {
+                until: None,
+                by: None
+            }
+        );
     }
 
     #[test]
@@ -1538,6 +1548,8 @@ mod tests {
                 address: "198.51.100.9".to_string(),
                 port: None,
                 action: FirewallAction::Block,
+                source: crate::db::RuleSource::Cli,
+                evidence: None,
             },
             3600,
         )
@@ -1546,7 +1558,10 @@ mod tests {
             ssh_rows: vec![SshRow {
                 address: "198.51.100.9".to_string(),
                 count: 3,
-                status: RowStatus::Blocked { until: Some(0) },
+                status: RowStatus::Blocked {
+                    until: Some(0),
+                    by: None,
+                },
             }],
             ..Default::default()
         };
@@ -1570,7 +1585,10 @@ mod tests {
             ua_rows: vec![UaRow {
                 user_agent: "curl/8.0".to_string(),
                 count: 2,
-                status: RowStatus::Blocked { until: None },
+                status: RowStatus::Blocked {
+                    until: None,
+                    by: None,
+                },
             }],
             focus: Focus::UserAgents,
             ..Default::default()
@@ -1641,12 +1659,18 @@ mod tests {
                 SshRow {
                     address: "198.51.100.9".to_string(),
                     count: 5,
-                    status: RowStatus::Blocked { until: Some(later) },
+                    status: RowStatus::Blocked {
+                        until: Some(later),
+                        by: None,
+                    },
                 },
                 SshRow {
                     address: "192.0.2.77".to_string(),
                     count: 12,
-                    status: RowStatus::Blocked { until: None },
+                    status: RowStatus::Blocked {
+                        until: None,
+                        by: None,
+                    },
                 },
                 SshRow {
                     address: "2001:db8::abcd".to_string(),
@@ -1702,15 +1726,27 @@ mod tests {
     fn the_tag_column_reserves_no_room_for_a_state_that_is_not_shown() {
         let timed = tag_column_width(
             [
-                RowStatus::Blocked { until: None },
+                RowStatus::Blocked {
+                    until: None,
+                    by: None,
+                },
                 RowStatus::Blocked {
                     until: Some(now_secs() + 86_400),
+                    by: None,
                 },
             ]
             .into_iter(),
         );
-        let untimed =
-            tag_column_width([RowStatus::Blocked { until: None }, RowStatus::Pending].into_iter());
+        let untimed = tag_column_width(
+            [
+                RowStatus::Blocked {
+                    until: None,
+                    by: None,
+                },
+                RowStatus::Pending,
+            ]
+            .into_iter(),
+        );
 
         assert!(
             untimed < timed,
@@ -1736,7 +1772,10 @@ mod tests {
                 SshRow {
                     address: "9.9.9.9".to_string(),
                     count: 5,
-                    status: RowStatus::Blocked { until: None },
+                    status: RowStatus::Blocked {
+                        until: None,
+                        by: None,
+                    },
                 },
             ],
             ..Default::default()
@@ -1792,7 +1831,10 @@ mod tests {
                 SshRow {
                     address: "203.0.113.5".to_string(),
                     count: 1,
-                    status: RowStatus::Blocked { until: None },
+                    status: RowStatus::Blocked {
+                        until: None,
+                        by: None,
+                    },
                 },
             ],
             filter: Filter::BlockedOnly,
@@ -1834,7 +1876,10 @@ mod tests {
                 SshRow {
                     address: "203.0.113.5".to_string(),
                     count: 1,
-                    status: RowStatus::Blocked { until: None },
+                    status: RowStatus::Blocked {
+                        until: None,
+                        by: None,
+                    },
                 },
             ],
             ..Default::default()
@@ -1970,7 +2015,11 @@ mod tests {
     fn blocklist_status_is_blocklist() {
         assert!(RowStatus::Blocklist.is_blocklist());
         assert!(!RowStatus::Pending.is_blocklist());
-        assert!(!RowStatus::Blocked { until: None }.is_blocklist());
+        assert!(!RowStatus::Blocked {
+            until: None,
+            by: None
+        }
+        .is_blocklist());
     }
     fn screen_with_one_ssh_row(status: RowStatus) -> Firewall {
         let mut screen = Firewall {
@@ -2135,7 +2184,13 @@ mod tests {
     #[test]
     fn the_user_agent_popup_shows_the_string_and_the_row_s_own_status() {
         let db = Db::open_in_memory().unwrap();
-        let mut screen = screen_with_one_ua_row("curl/8.0", RowStatus::Blocked { until: None });
+        let mut screen = screen_with_one_ua_row(
+            "curl/8.0",
+            RowStatus::Blocked {
+                until: None,
+                by: None,
+            },
+        );
         let mut message = None;
         screen
             .handle_key(KeyEvent::from(KeyCode::Char('i')), &db, &mut message)

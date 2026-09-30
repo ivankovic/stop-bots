@@ -49,7 +49,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 4;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -119,6 +119,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         summary: "log_evidence, what each detector has seen from each address",
         apply: v3_log_evidence,
+    },
+    Migration {
+        summary: "firewall_rules.source and .evidence, one row per rule, and unblocked_addresses",
+        apply: v4_explained_rules,
     },
 ];
 
@@ -684,6 +688,63 @@ fn v3_log_evidence(conn: &Connection) -> rusqlite::Result<()> {
             -- every detector.
             CREATE INDEX log_evidence_address ON log_evidence (address);
         ",
+    )
+}
+
+/// Version 4: every firewall rule says why it exists, and there is only
+/// one of each.
+///
+/// - `source` names the detector or front-end that wrote the rule, and
+///   `evidence` the log line that made it (see [`crate::blocks`]). A rule
+///   from before this version has neither, and says "before 0.1".
+///   `created_at` has always been there.
+/// - **Duplicates are merged, then refused.** The TUI, the console and
+///   `batch` each checked for a rule and then inserted one, so two of them
+///   racing wrote two rows for the same address, verdict and port. The
+///   rows are merged into the oldest one — its `created_at` is when the
+///   address was first blocked — which takes the latest expiry among them
+///   (none, if any of them was permanent) and stays enabled if any was:
+///   the rule keeps the longest life it had. Then a unique index makes a
+///   second row impossible; `Db::add_firewall_rule` upserts into it. The
+///   index is on `IFNULL(port, -1)` because SQLite treats every NULL as
+///   distinct, and "no port" is the common case.
+/// - `unblocked_addresses` records an operator removing a detector's
+///   block, so the next pass over the same log lines does not add it
+///   straight back (see [`crate::blocks`]). It starts empty.
+fn v4_explained_rules(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE firewall_rules ADD COLUMN source TEXT;
+         ALTER TABLE firewall_rules ADD COLUMN evidence TEXT;
+
+         UPDATE firewall_rules SET
+             expires_at = (
+                 SELECT CASE WHEN COUNT(*) > COUNT(d.expires_at) THEN NULL
+                             ELSE MAX(d.expires_at) END
+                 FROM firewall_rules d
+                 WHERE d.address = firewall_rules.address
+                   AND d.action = firewall_rules.action
+                   AND d.port IS firewall_rules.port),
+             enabled = (
+                 SELECT MAX(d.enabled) FROM firewall_rules d
+                 WHERE d.address = firewall_rules.address
+                   AND d.action = firewall_rules.action
+                   AND d.port IS firewall_rules.port)
+         WHERE id IN (
+             SELECT MIN(id) FROM firewall_rules
+             GROUP BY address, action, port HAVING COUNT(*) > 1);
+         DELETE FROM firewall_rules WHERE id NOT IN (
+             SELECT MIN(id) FROM firewall_rules GROUP BY address, action, port);
+
+         CREATE UNIQUE INDEX firewall_rules_one_per_rule
+             ON firewall_rules (address, action, IFNULL(port, -1));
+         CREATE INDEX firewall_rules_by_source ON firewall_rules (source);
+
+         CREATE TABLE unblocked_addresses (
+             address TEXT PRIMARY KEY,
+             source TEXT,
+             unblocked_at INTEGER NOT NULL,
+             until INTEGER NOT NULL
+         );",
     )
 }
 
@@ -1277,5 +1338,139 @@ mod tests {
         db.trust_address("192.0.2.77").unwrap();
         db.record_ssh_login_ips(&["192.0.2.8".to_string()]).unwrap();
         assert_eq!(db.recent_ssh_login_ips().unwrap(), ["192.0.2.8"]);
+    }
+
+    // ---- version 3: explained rules, one per rule ----
+
+    /// 0.0.15's own rules plus the duplicates its racing writers could
+    /// leave: the same Block three times over (two expiring, one never),
+    /// the same port-scoped Block twice, two expiring copies of one
+    /// detector block (one of them disabled), and an Allow for an address
+    /// that also has a Block.
+    fn with_duplicates(fixture: &str) -> String {
+        format!(
+            "{fixture}
+             INSERT INTO firewall_rules VALUES(6,'203.0.113.7',NULL,'block',1,1790590000,4102444800);
+             INSERT INTO firewall_rules VALUES(7,'198.51.100.0/24',22,'block',0,1790590000,NULL);
+             INSERT INTO firewall_rules VALUES(8,'198.51.100.23',NULL,'block',0,1790590000,4102449999);
+             INSERT INTO firewall_rules VALUES(9,'203.0.113.7',NULL,'block',1,1790590001,4102444801);
+             INSERT INTO firewall_rules VALUES(10,'198.51.100.23',NULL,'allow',1,1790590000,NULL);"
+        )
+    }
+
+    /// Merged into the oldest row, which keeps the longest life any copy
+    /// had: permanent beats any expiry, and a later expiry beats an
+    /// earlier one. A different verdict for the same address is a
+    /// different rule and stays.
+    #[test]
+    fn upgrading_merges_duplicate_rules_into_the_oldest_keeping_the_longest_life() {
+        let db = upgraded(&with_duplicates(DB_0_0_15));
+
+        let rules: Vec<_> = db
+            .list_firewall_rules()
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                (
+                    r.id,
+                    r.address,
+                    r.port,
+                    r.enabled,
+                    r.expires_at,
+                    r.created_at,
+                )
+            })
+            .collect();
+        let created = Some(1790588764);
+        assert_eq!(
+            rules,
+            [
+                (1, "203.0.113.7".into(), None, true, None, created),
+                (2, "198.51.100.0/24".into(), Some(22), true, None, created),
+                (3, "192.0.2.1".into(), None, true, None, created),
+                (
+                    4,
+                    "198.51.100.23".into(),
+                    None,
+                    true,
+                    Some(4102449999),
+                    created
+                ),
+                (
+                    5,
+                    "203.0.113.99".into(),
+                    None,
+                    true,
+                    Some(4102444800),
+                    created
+                ),
+                (
+                    10,
+                    "198.51.100.23".into(),
+                    None,
+                    true,
+                    None,
+                    Some(1790590000)
+                ),
+            ]
+        );
+    }
+
+    /// Every rule a 0.0.x release wrote says so, rather than being
+    /// credited to a source that did not write it.
+    #[test]
+    fn upgraded_rules_have_no_source_or_evidence() {
+        let db = upgraded(DB_0_0_15);
+        for rule in db.list_firewall_rules().unwrap() {
+            assert_eq!(
+                (rule.source, rule.evidence.as_deref()),
+                (None, None),
+                "{rule:?}"
+            );
+        }
+    }
+
+    /// The index is what stops the race for good, including for the
+    /// common "no port" case that a plain UNIQUE would let through,
+    /// because SQLite treats every NULL as distinct.
+    #[test]
+    fn after_upgrading_a_second_copy_of_a_rule_cannot_be_written() {
+        let db = upgraded(&with_duplicates(DB_0_0_15));
+        for (address, port) in [("203.0.113.7", None), ("198.51.100.0/24", Some(22))] {
+            let err = db
+                .conn
+                .execute(
+                    "INSERT INTO firewall_rules (address, port, action, enabled, created_at)
+                     VALUES (?1, ?2, 'block', 1, 1)",
+                    params![address, port],
+                )
+                .expect_err("a duplicate must be refused");
+            assert!(err.to_string().contains("UNIQUE"), "{address}: {err}");
+        }
+    }
+
+    /// A version-3 database — what 0.1 builds before this step wrote —
+    /// comes through with its rules, and gains the unblock record, empty.
+    #[test]
+    fn a_version_3_database_keeps_its_rules_and_gains_the_unblock_record() {
+        let conn = Connection::open_in_memory().unwrap();
+        v1_baseline(&conn).unwrap();
+        v2_managed_files(&conn).unwrap();
+        v3_log_evidence(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute(
+            "INSERT INTO firewall_rules (address, action, enabled, created_at)
+             VALUES ('203.0.113.7', 'block', 1, 5)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn, None).unwrap();
+
+        let db = Db { conn };
+        let rules = db.list_firewall_rules().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].created_at, Some(5));
+        assert!(db.unblocked_addresses().unwrap().is_empty());
     }
 }

@@ -32,6 +32,22 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   makes it the one loaded at boot.
 - `apply-blocks --dry-run` and `batch --dry-run` print what would change and change
   nothing; `--diff` adds a unified diff of every file.
+- **Every firewall rule says why it exists** (schema version 4): its source
+  (the detector, or `cli`/`tui`/`web`) and the log line that triggered it,
+  cleaned of control characters and capped at 300 bytes. Older rules read
+  "before 0.1".
+- **A Blocks screen** in the TUI (`5`, or `x`) and the web console (`/blocks`):
+  every stored rule with its source, age, expiry and evidence, filtered by
+  source, searched by address (an address finds the range that blocks it),
+  paged, with unblock per row and "unblock all from this source" behind a
+  confirmation that shows the count. The Firewall screens' `BLOCKED` tag
+  names the detector.
+- `list-firewall-rules` shows each rule's source, age, expiry and evidence,
+  newest first, and takes `--source`. `remove-firewall-rule --source <name>`
+  removes every rule from one source and prints the count; `--dry-run` only counts.
+- **Unblocking a detector's block sticks.** The detectors leave that address
+  alone for as long as the block was meant to last, however long the log keeps
+  the lines that earned it.
 
 ### Changed
 
@@ -117,6 +133,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - **A log in a format the detectors cannot read is reported.** `status` warns
   when under half the access log parses, quoting a line, instead of "no requests
   recorded yet".
+- **One row per firewall rule.** The TUI, the console and `batch` could race
+  into duplicate rules; upgrading merges them into the oldest (keeping the
+  longest expiry), and adding a rule that exists now extends it instead.
 - `SECURITY.md` said every detector is off by default; five are on. It now
   says which, and that blocking traffic you wanted is a matter of tuning.
 
