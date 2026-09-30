@@ -50,20 +50,19 @@ impl Db {
     }
 
     /// Whether `token_hash` is a browser remembered and used since
-    /// `used_since`. The ones that are not are deleted on the way, so an
-    /// expired row does not wait for anything else to clear it.
+    /// `used_since`.
+    ///
+    /// A read and nothing else: it runs for a login attempt before anyone
+    /// has proved anything, with whatever cookie the request carried. An
+    /// expired row is simply not found, and goes when [`Self::
+    /// remember_browser`] trims the table to the most recently used.
     pub fn is_remembered_browser(&self, token_hash: &str, used_since: i64) -> Result<bool> {
-        self.conn
-            .execute(
-                "DELETE FROM remembered_browsers WHERE last_used_at < ?1",
-                params![used_since],
-            )
-            .context("failed to expire remembered browsers")?;
         let found: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM remembered_browsers WHERE token_hash = ?1",
-                params![token_hash],
+                "SELECT COUNT(*) FROM remembered_browsers
+                 WHERE token_hash = ?1 AND last_used_at >= ?2",
+                params![token_hash, used_since],
                 |row| row.get(0),
             )
             .context("failed to look up a remembered browser")?;
@@ -92,10 +91,6 @@ mod tests {
         assert!(
             !db.is_remembered_browser("hash-a", 1_001).unwrap(),
             "unused since before the cutoff"
-        );
-        assert!(
-            !db.is_remembered_browser("hash-a", 0).unwrap(),
-            "an expired row is deleted, not merely skipped"
         );
     }
 
