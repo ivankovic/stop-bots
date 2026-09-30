@@ -466,7 +466,7 @@ fn inspect_ua_url(user_agent: &str, filter: Filter, ctx: &Ctx) -> String {
 /// Percent-encodes everything outside the unreserved set. Deliberately
 /// conservative and hand-rolled: one query parameter does not justify a
 /// dependency, and the only way to get this wrong is to be too permissive.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
         match byte {
@@ -1163,7 +1163,10 @@ mod tests {
             status: RowStatus::Pending,
         };
         let blocked = SshRow {
-            status: RowStatus::Blocked { until: None },
+            status: RowStatus::Blocked {
+                until: None,
+                by: None,
+            },
             ..pending.clone()
         };
 

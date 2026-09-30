@@ -41,7 +41,7 @@ const MAX_LINES: usize = 26;
 pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
     let lines = vec![
         Line::from("Navigation"),
-        Line::from("  1 2 3 4, d b f n   jump to a screen (Left/Right and h/l step through them)"),
+        Line::from("  1-5, d b f n x     jump to a screen (Left/Right and h/l step through them)"),
         Line::from("  :                  command palette: every action here by name, fuzzy-matched"),
         Line::from("  Tab, Shift+Tab     next / previous panel on this screen"),
         Line::from("  Up/Down, j/k       move selection (it also flows from one panel into the next)"),
@@ -53,6 +53,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
         Line::from("  w                  put this console behind NGINX (a subdomain, or a path on a site)"),
         Line::from(""),
         Line::from("Bot settings         /  searches the bots; type to filter, Enter opens, Esc leaves the box"),
+        Line::from("Blocks               every rule and why: f source, / address, Enter unblock, U all from source"),
         Line::from(""),
         Line::from("Firewall"),
         Line::from("  Enter / T          block or unblock the selected row / trust it, never to be blocked"),
@@ -64,8 +65,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: crate::tui::Theme) {
         Line::from("  Enter              open the selected site's category, request-rule and bot overrides"),
         Line::from(""),
         Line::from("Global"),
-        Line::from("  q, Esc             quit (from a screen: go back; from a popup: close it)"),
-        Line::from("  t / ?              toggle light/dark theme / toggle this help screen"),
+        Line::from("  q Esc / t / ?      quit, go back or close a popup / light/dark theme / toggle this help screen"),
     ];
     debug_assert!(lines.len() <= MAX_LINES);
     let paragraph = Paragraph::new(lines).block(crate::tui::panel("Help", true, theme));

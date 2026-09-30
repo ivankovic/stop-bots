@@ -51,11 +51,16 @@ use crate::{ipranges, sshlog};
 /// so "BLOCKED until 1d" read as though the block lifted at some moment
 /// called 1d. The word the sentence needed was the one that takes a
 /// length of time.
+///
+/// `by` names the detector that wrote the block, when one did: `BLOCKED
+/// for 4d by ssh-scanners` answers "who did this" on the row itself, and
+/// the Blocks screen has the rest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowStatus {
     Pending,
     Blocked {
         until: Option<i64>,
+        by: Option<crate::protection::Detector>,
     },
     Blocklist,
     /// Looks like a bot, and *no* bot list has a pattern for it — not
@@ -73,10 +78,16 @@ impl RowStatus {
     pub fn label(self) -> String {
         match self {
             RowStatus::Pending => "NOT BLOCKED".to_string(),
-            RowStatus::Blocked { until: None } => "BLOCKED".to_string(),
-            RowStatus::Blocked {
-                until: Some(expires_at),
-            } => format!("BLOCKED for {}", format_until(expires_at)),
+            RowStatus::Blocked { until, by } => {
+                let mut label = "BLOCKED".to_string();
+                if let Some(expires_at) = until {
+                    label.push_str(&format!(" for {}", format_until(expires_at)));
+                }
+                if let Some(detector) = by {
+                    label.push_str(&format!(" by {}", crate::blocks::detector_name(detector)));
+                }
+                label
+            }
             RowStatus::Blocklist => "BLOCKLIST".to_string(),
             RowStatus::Unknown => "UNKNOWN".to_string(),
             RowStatus::Trusted => "TRUSTED".to_string(),
@@ -168,7 +179,10 @@ pub fn build_ssh_rows(
         .map(|(address, count)| {
             // Manual blocks take precedence over blocklist
             let status = if let Some(until) = firewall_blocks.get(&address) {
-                RowStatus::Blocked { until: *until }
+                RowStatus::Blocked {
+                    until: *until,
+                    by: None,
+                }
             } else if ip_in_blocked_range(&address, blocked_ip_ranges) {
                 RowStatus::Blocklist
             } else {
@@ -206,7 +220,10 @@ pub fn build_ua_rows(
         .map(|stat| {
             // Manual blocks take precedence over blocklist
             let status = if blocked.contains(&stat.user_agent) {
-                RowStatus::Blocked { until: None }
+                RowStatus::Blocked {
+                    until: None,
+                    by: None,
+                }
             } else if ua_matches_blocked_bot_patterns(
                 &stat.user_agent,
                 bots,
@@ -518,11 +535,18 @@ impl Live {
     /// not available and the SSH half comes back empty, which is what the
     /// TUI shows while its background read is still in flight.
     pub fn load(db: &Db, ssh_log_text: Option<&str>) -> Result<Self> {
-        let firewall_blocks: HashMap<String, Option<i64>> = db
+        let blocks: Vec<_> = db
             .list_firewall_rules()?
             .into_iter()
             .filter(|rule| rule.action == FirewallAction::Block)
-            .map(|rule| (rule.address, rule.expires_at))
+            .collect();
+        let firewall_blocks: HashMap<String, Option<i64>> = blocks
+            .iter()
+            .map(|rule| (rule.address.clone(), rule.expires_at))
+            .collect();
+        let detectors: HashMap<&str, crate::protection::Detector> = blocks
+            .iter()
+            .filter_map(|rule| Some((rule.address.as_str(), rule.source?.detector()?)))
             .collect();
         let blocked_ip_ranges = db.blocked_ip_ranges()?;
         let ssh_counts = match ssh_log_text {
@@ -530,6 +554,11 @@ impl Live {
             None => HashMap::new(),
         };
         let mut ssh = build_ssh_rows(ssh_counts, &firewall_blocks, &blocked_ip_ranges);
+        for row in &mut ssh {
+            if let RowStatus::Blocked { by, .. } = &mut row.status {
+                *by = detectors.get(row.address.as_str()).copied();
+            }
+        }
         let trusted_addresses = db.list_trusted_addresses()?;
         for row in &mut ssh {
             if address_is_trusted(&row.address, &trusted_addresses) {
@@ -666,7 +695,13 @@ mod tests {
         let mut blocks = HashMap::new();
         blocks.insert("198.51.100.9".to_string(), None);
         let rows = build_ssh_rows(counts(&[("198.51.100.9", 3)]), &blocks, &[]);
-        assert_eq!(rows[0].status, RowStatus::Blocked { until: None });
+        assert_eq!(
+            rows[0].status,
+            RowStatus::Blocked {
+                until: None,
+                by: None
+            }
+        );
         assert_eq!(rows[0].status.label(), "BLOCKED");
     }
 
@@ -677,7 +712,10 @@ mod tests {
         let rows = build_ssh_rows(counts(&[("198.51.100.9", 3)]), &blocks, &[]);
         assert!(matches!(
             rows[0].status,
-            RowStatus::Blocked { until: Some(_) }
+            RowStatus::Blocked {
+                until: Some(_),
+                by: None
+            }
         ));
         // "for", not "until": `format_until` returns a duration, so the
         // preposition has to be the one that takes a length of time.
@@ -811,7 +849,13 @@ mod tests {
             Policy::Allowed,
             Policy::Blocked,
         );
-        assert_eq!(rows[0].status, RowStatus::Blocked { until: None });
+        assert_eq!(
+            rows[0].status,
+            RowStatus::Blocked {
+                until: None,
+                by: None
+            }
+        );
     }
 
     #[test]
@@ -842,7 +886,13 @@ mod tests {
         assert_eq!(rows[0].user_agent, "Mozilla/5.0");
         assert_eq!(rows[0].status, RowStatus::Pending);
         assert_eq!(rows[1].user_agent, "curl/8.0");
-        assert_eq!(rows[1].status, RowStatus::Blocked { until: None });
+        assert_eq!(
+            rows[1].status,
+            RowStatus::Blocked {
+                until: None,
+                by: None
+            }
+        );
     }
 
     #[test]
@@ -868,7 +918,13 @@ mod tests {
         );
         assert_eq!(rows[0].address, "192.168.1.5");
         // Manual block takes precedence over blocklist
-        assert_eq!(rows[0].status, RowStatus::Blocked { until: None });
+        assert_eq!(
+            rows[0].status,
+            RowStatus::Blocked {
+                until: None,
+                by: None
+            }
+        );
     }
 
     #[test]
@@ -943,6 +999,51 @@ mod tests {
             "Mozilla/5.0 (compatible; Googlebot/2.1)"
         );
         // Manual block takes precedence over blocklist
-        assert_eq!(rows[0].status, RowStatus::Blocked { until: None });
+        assert_eq!(
+            rows[0].status,
+            RowStatus::Blocked {
+                until: None,
+                by: None
+            }
+        );
+    }
+
+    /// The row itself says which detector blocked it; a block by hand
+    /// says nothing more than BLOCKED.
+    #[test]
+    fn a_detector_s_block_names_the_detector_on_the_row() {
+        let db = Db::open_in_memory().unwrap();
+        let log = "Failed password for root from 198.51.100.9 port 4444 ssh2\n\
+                   Failed password for root from 198.51.100.10 port 4444 ssh2\n";
+        db.add_firewall_rule_with_ttl(
+            &crate::db::NewFirewallRule {
+                address: "198.51.100.9".into(),
+                port: None,
+                action: FirewallAction::Block,
+                source: crate::db::RuleSource::Detector(crate::protection::Detector::SshScanners),
+                evidence: None,
+            },
+            5 * 86_400,
+        )
+        .unwrap();
+        db.block_address_permanently("198.51.100.10", crate::db::RuleSource::Tui, None)
+            .unwrap();
+
+        let live = Live::load(&db, Some(log)).unwrap();
+        let label = |address: &str| {
+            live.ssh
+                .iter()
+                .find(|row| row.address == address)
+                .unwrap()
+                .status
+                .label()
+        };
+
+        assert!(
+            label("198.51.100.9").ends_with(" by ssh-scanners"),
+            "{}",
+            label("198.51.100.9")
+        );
+        assert_eq!(label("198.51.100.10"), "BLOCKED");
     }
 }

@@ -21,6 +21,7 @@
 //! `src/tui/` — each one encapsulates its own state, key handling and
 //! rendering.
 
+pub mod blocks;
 pub mod bot_settings;
 pub mod dashboard;
 pub mod firewall;
@@ -202,7 +203,7 @@ pub fn select_in<'a>(list: List<'a>, focused: bool, theme: Theme) -> List<'a> {
 }
 
 /// The screens the TUI can show. Jumped to with the digit the tab bar
-/// shows (`1`–`4`, or the `d`/`b`/`f`/`n` aliases), stepped through with
+/// shows (`1`–`5`, or the `d`/`b`/`f`/`n`/`x` aliases), stepped through with
 /// Left/Right or their vim `h`/`l` aliases (see `App::handle_key_event`'s
 /// global fallback match — these only fire once the active screen itself
 /// has ignored the key), with Help reachable via `?` and the command
@@ -215,15 +216,20 @@ pub enum Screen {
     BotSettings,
     Firewall,
     Nginx,
+    /// Every stored firewall rule and why it is there. After NGINX rather
+    /// than beside Firewall so that the four digits people already know
+    /// keep their screens.
+    Blocks,
     Help,
 }
 
 impl Screen {
-    pub const TABS: [Screen; 4] = [
+    pub const TABS: [Screen; 5] = [
         Screen::Dashboard,
         Screen::BotSettings,
         Screen::Firewall,
         Screen::Nginx,
+        Screen::Blocks,
     ];
 
     /// The key that jumps straight to this screen, shown in the tab bar.
@@ -233,6 +239,7 @@ impl Screen {
             Screen::BotSettings => '2',
             Screen::Firewall => '3',
             Screen::Nginx => '4',
+            Screen::Blocks => '5',
             Screen::Help => '?',
         }
     }
@@ -243,6 +250,7 @@ impl Screen {
             Screen::BotSettings => "Bot settings",
             Screen::Firewall => "Firewall",
             Screen::Nginx => "NGINX",
+            Screen::Blocks => "Blocks",
             Screen::Help => "Help",
         }
     }
@@ -252,16 +260,18 @@ impl Screen {
             Screen::Dashboard => Screen::BotSettings,
             Screen::BotSettings => Screen::Firewall,
             Screen::Firewall => Screen::Nginx,
-            Screen::Nginx | Screen::Help => Screen::Dashboard,
+            Screen::Nginx => Screen::Blocks,
+            Screen::Blocks | Screen::Help => Screen::Dashboard,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            Screen::Dashboard => Screen::Nginx,
+            Screen::Dashboard => Screen::Blocks,
             Screen::BotSettings => Screen::Dashboard,
             Screen::Firewall => Screen::BotSettings,
             Screen::Nginx => Screen::Firewall,
+            Screen::Blocks => Screen::Nginx,
             Screen::Help => Screen::Dashboard,
         }
     }
@@ -443,6 +453,7 @@ pub fn render(app: &mut App, frame: &mut Frame) {
             .firewall
             .render(frame, body, app.theme, &app.jobs_in_flight),
         Screen::Nginx => app.nginx.render(frame, body, app.theme),
+        Screen::Blocks => app.blocks.render(frame, body, app.theme),
         Screen::Help => help::render(frame, body, app.theme),
     }
 
@@ -584,6 +595,7 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
         (None, Screen::BotSettings) => app.bot_settings.hints(),
         (None, Screen::Firewall) => app.firewall.hints(),
         (None, Screen::Nginx) => app.nginx.hints(),
+        (None, Screen::Blocks) => app.blocks.hints(),
         (None, Screen::Help) => ("Help", vec![("Esc", "back")]),
     };
     let mut spans: Vec<Span> = vec![panel.fg(theme.accent()).bold(), "  ".into()];
@@ -721,7 +733,8 @@ mod tests {
         assert_eq!(Screen::Dashboard.next(), Screen::BotSettings);
         assert_eq!(Screen::BotSettings.next(), Screen::Firewall);
         assert_eq!(Screen::Firewall.next(), Screen::Nginx);
-        assert_eq!(Screen::Nginx.next(), Screen::Dashboard);
+        assert_eq!(Screen::Nginx.next(), Screen::Blocks);
+        assert_eq!(Screen::Blocks.next(), Screen::Dashboard);
     }
 
     #[test]

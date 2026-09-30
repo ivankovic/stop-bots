@@ -2586,15 +2586,18 @@ impl Db {
     /// Deletes the firewall rule with the given id. Errors if no such rule
     /// exists. A detector's block is also recorded as unblocked by hand
     /// (see [`crate::blocks`]), so the next pass does not put it back.
-    pub fn remove_firewall_rule(&self, id: i64) -> Result<()> {
+    ///
+    /// Returns the rule as it was, for the caller to say what went.
+    pub fn remove_firewall_rule(&self, id: i64) -> Result<FirewallRule> {
         self.batch(|| {
             let rules = self.firewall_rules_where("id = ?1", params![id])?;
-            if rules.is_empty() {
+            let Some(rule) = rules.first().cloned() else {
                 anyhow::bail!("no firewall rule with id: {id}");
-            }
+            };
             self.conn
                 .execute("DELETE FROM firewall_rules WHERE id = ?1", params![id])?;
-            self.record_unblocks(&rules)
+            self.record_unblocks(&rules)?;
+            Ok(rule)
         })
     }
 

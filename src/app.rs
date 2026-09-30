@@ -131,6 +131,7 @@ pub struct App {
     pub bot_settings: tui::bot_settings::BotSettings,
     pub nginx: tui::nginx::Nginx,
     pub firewall: tui::firewall::Firewall,
+    pub blocks: tui::blocks::Blocks,
     /// When the internal cron last checked for due jobs — throttles the
     /// check against `Event::Tick`'s 30fps rate (see
     /// [`CRON_CHECK_INTERVAL`]).
@@ -382,6 +383,7 @@ impl App {
             bot_settings: tui::bot_settings::BotSettings::default(),
             nginx: tui::nginx::Nginx::new(root),
             firewall: tui::firewall::Firewall::default(),
+            blocks: tui::blocks::Blocks::default(),
             // Backdated by a full `CRON_CHECK_INTERVAL` so the very first
             // `Event::Tick` (a fraction of a second after startup, not up to
             // a minute later) already passes `check_cron`'s throttle check.
@@ -475,6 +477,7 @@ impl App {
                 self.firewall
                     .refresh(&self.db, self.ssh_log_text.as_deref())
             }
+            Screen::Blocks => self.blocks.refresh(&self.db),
             Screen::Help => Ok(()),
         }
     }
@@ -1683,6 +1686,7 @@ impl App {
             }
             Screen::Nginx => self.nginx.handle_key(key, &self.db, &mut self.message)?,
             Screen::Firewall => self.firewall.handle_key(key, &self.db, &mut self.message)?,
+            Screen::Blocks => self.blocks.handle_key(key, &self.db, &mut self.message)?,
             Screen::Help => unreachable!("handled above"),
         };
         match outcome {
@@ -1774,6 +1778,7 @@ impl App {
             KeyCode::Char('b' | '2') => self.screen = Screen::BotSettings,
             KeyCode::Char('f' | '3') => self.screen = Screen::Firewall,
             KeyCode::Char('n' | '4') => self.screen = Screen::Nginx,
+            KeyCode::Char('x' | '5') => self.screen = Screen::Blocks,
             // Left/Right and their vim h/l aliases cycle screens. Tab is
             // *not* among them any more: it always means "next panel on
             // this screen", so that it means one thing everywhere (it used
@@ -1807,6 +1812,11 @@ impl App {
             ),
             ("Go to Firewall", "3", Action::Screen(Screen::Firewall)),
             ("Go to NGINX", "4", Action::Screen(Screen::Nginx)),
+            (
+                "Go to Blocks: every firewall rule and why",
+                "5",
+                Action::Screen(Screen::Blocks),
+            ),
             ("Help: the key map", "?", Action::Screen(Screen::Help)),
             (
                 "Update everything: download every list",
@@ -1839,6 +1849,11 @@ impl App {
                 "Trust the selected row: never block it",
                 "T",
                 key(Screen::Firewall, 'T'),
+            ),
+            (
+                "Unblock all from the filtered source",
+                "U",
+                key(Screen::Blocks, 'U'),
             ),
             ("Rescan for NGINX sites", "r", key(Screen::Nginx, 'r')),
             ("Apply blocking to every site", "A", key(Screen::Nginx, 'A')),
@@ -2032,7 +2047,7 @@ mod tests {
         assert_eq!(app.screen, Screen::Dashboard);
 
         app.handle_key_event(KeyEvent::from(KeyCode::Left)).unwrap();
-        assert_eq!(app.screen, Screen::Nginx);
+        assert_eq!(app.screen, Screen::Blocks);
     }
 
     #[tokio::test]
@@ -2048,7 +2063,7 @@ mod tests {
         let mut app = test_app();
         app.handle_key_event(KeyEvent::from(KeyCode::Char('h')))
             .unwrap();
-        assert_eq!(app.screen, Screen::Nginx);
+        assert_eq!(app.screen, Screen::Blocks);
     }
 
     // ---- the `finish_` half of every network fetch ----
@@ -2299,7 +2314,7 @@ mod tests {
         let mut app = test_app();
         assert!(
             app.stale.is_empty(),
-            "startup loads all four, so nothing starts out stale"
+            "startup loads all five, so nothing starts out stale"
         );
 
         app.screen = Screen::Dashboard;
@@ -2307,9 +2322,12 @@ mod tests {
 
         assert_eq!(
             app.stale,
-            std::collections::HashSet::from(
-                [Screen::BotSettings, Screen::Nginx, Screen::Firewall,]
-            ),
+            std::collections::HashSet::from([
+                Screen::BotSettings,
+                Screen::Nginx,
+                Screen::Firewall,
+                Screen::Blocks,
+            ]),
             "every screen except the one being looked at"
         );
 

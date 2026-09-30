@@ -98,22 +98,24 @@ impl Ctx {
     }
 }
 
-/// Which tab is current. The same five the TUI has.
+/// Which tab is current. The same six the TUI has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Dashboard,
     Bots,
     Firewall,
     Nginx,
+    Blocks,
     Help,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 6] = [
         Tab::Dashboard,
         Tab::Bots,
         Tab::Firewall,
         Tab::Nginx,
+        Tab::Blocks,
         Tab::Help,
     ];
 
@@ -123,6 +125,7 @@ impl Tab {
             Tab::Bots => "/bots",
             Tab::Firewall => "/firewall",
             Tab::Nginx => "/nginx",
+            Tab::Blocks => "/blocks",
             Tab::Help => "/help",
         }
     }
@@ -137,6 +140,7 @@ impl Tab {
             Tab::Bots => "2",
             Tab::Firewall => "3",
             Tab::Nginx => "4",
+            Tab::Blocks => "5",
             Tab::Help => "?",
         }
     }
@@ -147,6 +151,7 @@ impl Tab {
             Tab::Bots => "Bot settings",
             Tab::Firewall => "Firewall",
             Tab::Nginx => "NGINX",
+            Tab::Blocks => "Blocks",
             Tab::Help => "Help",
         }
     }
@@ -458,7 +463,7 @@ const THEME_BOOTSTRAP: &str = r#"
   // The TUI's key map, for the same product in a browser: digits and
   // their mnemonics jump to a tab, `/` reaches the search box, `t` is
   // the theme. Only while nothing is being typed into.
-  var tabKeys = { '1': 0, 'd': 0, '2': 1, 'b': 1, '3': 2, 'f': 2, '4': 3, 'n': 3, '?': 4 };
+  var tabKeys = { '1': 0, 'd': 0, '2': 1, 'b': 1, '3': 2, 'f': 2, '4': 3, 'n': 3, '5': 4, 'x': 4, '?': 5 };
   document.addEventListener('keydown', function (event) {
     if (event.altKey || event.ctrlKey || event.metaKey) return;
     var target = event.target;

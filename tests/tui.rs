@@ -1304,3 +1304,38 @@ fn dashboard_render_popup_applies_the_script_through_nft() {
     send_key(&mut session, "q");
     session.exp_eof().unwrap();
 }
+
+/// Screen 5 lists a rule no other screen shows — one the CLI added — with
+/// its source, and unblocks it.
+#[test]
+fn the_blocks_screen_lists_a_rule_with_its_source_and_unblocks_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("db.sqlite3");
+    {
+        let db = stop_bots::db::Db::open(&db_path).unwrap();
+        db.add_firewall_rule(&stop_bots::db::NewFirewallRule {
+            address: "198.51.100.77".to_string(),
+            port: None,
+            action: stop_bots::db::FirewallAction::Block,
+            source: stop_bots::db::RuleSource::Cli,
+            evidence: None,
+        })
+        .unwrap();
+    }
+    let mut session = spawn_tui(&db_path);
+    session.exp_string("Dashboard").unwrap();
+
+    send_key(&mut session, "5");
+    session.exp_string("198.51.100.77").unwrap();
+    session.exp_string("(CLI)").unwrap();
+
+    send_key(&mut session, "\r");
+    // The screen says what happened on the Dashboard; here the row goes.
+    session.exp_string("stored.").unwrap();
+
+    send_key(&mut session, "q");
+    send_key(&mut session, "q");
+    session.exp_eof().unwrap();
+    let db = stop_bots::db::Db::open(&db_path).unwrap();
+    assert!(db.list_firewall_rules().unwrap().is_empty());
+}

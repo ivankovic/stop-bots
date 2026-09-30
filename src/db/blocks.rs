@@ -275,6 +275,21 @@ impl Db {
 }
 
 #[cfg(test)]
+impl Db {
+    /// A Block for `address` as a 0.0.x release wrote it: no source, no
+    /// evidence. For the screens' tests, which cannot reach the table.
+    pub(crate) fn insert_rule_from_before_0_1(&self, address: &str) {
+        self.conn
+            .execute(
+                "INSERT INTO firewall_rules (address, action, enabled, created_at)
+                 VALUES (?1, 'block', 1, ?2)",
+                params![address, now()],
+            )
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::NewFirewallRule;

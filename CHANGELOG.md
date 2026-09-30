@@ -32,6 +32,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   (the detector, or `cli`/`tui`/`web`) and the log line that triggered it,
   cleaned of control characters and capped at 300 bytes. Older rules read
   "before 0.1".
+- **A Blocks screen** in the TUI (`5`, or `x`) and the web console (`/blocks`):
+  every stored rule with its source, age, expiry and evidence, filtered by
+  source, searched by address (an address finds the range that blocks it),
+  paged, with unblock per row and "unblock all from this source" behind a
+  confirmation that shows the count. The Firewall screens' `BLOCKED` tag
+  names the detector.
 - `list-firewall-rules` shows each rule's source, age, expiry and evidence,
   newest first, and takes `--source`. `remove-firewall-rule --source <name>`
   removes every rule from one source and prints the count; `--dry-run` only counts.

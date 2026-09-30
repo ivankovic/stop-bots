@@ -47,6 +47,7 @@
 //! token and a `Host` allowlist rather than none of the three.
 
 pub mod auth;
+pub mod blocks;
 pub mod bots;
 pub mod cron;
 pub mod dashboard;
