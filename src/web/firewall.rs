@@ -431,7 +431,7 @@ fn body(
                                                 (shown)
                                             }
                                         }
-                                        td .right { (ua_action(row, ctx)) }
+                                        td .right { (ua_action(row, reference, ctx)) }
                                     }
                                 }
                             }
@@ -977,33 +977,65 @@ fn address_action(row: &SshRow, ctx: &Ctx) -> Markup {
     }
 }
 
-fn ua_action(row: &UaRow, ctx: &Ctx) -> Markup {
-    let entry = TrustedEntry::UserAgent(row.user_agent.clone());
+/// The buttons for one user-agent row.
+///
+/// Every form names the agent by its [`UaRef`], not its text: the string
+/// is whatever a client sent, as long as it liked, and carrying it twice
+/// per row in hidden fields was most of a 418 MB page. The handler looks
+/// the string up again, and says so if it has been pruned meanwhile.
+fn ua_action(row: &UaRow, reference: &UaRef, ctx: &Ctx) -> Markup {
+    let form = |path: &str, kind: bool, label: &str, danger: bool| {
+        html! {
+            form .inline method="post" action=(ctx.url(path)) {
+                (layout::csrf_field(ctx))
+                @if kind {
+                    input type="hidden" name="kind" value="user_agent";
+                }
+                input type="hidden" name="ua" value=(reference.to_string());
+                @if danger {
+                    button .danger type="submit" { (label) }
+                } @else {
+                    button type="submit" { (label) }
+                }
+            }
+        }
+    };
     match row.status {
-        RowStatus::Trusted => untrust_form(&entry, ctx),
+        RowStatus::Trusted => form("/firewall/untrust", true, "Untrust", false),
         RowStatus::Blocklist => html! {
             span .hint { "from a bot list" }
             " "
-            (trust_form(&entry, ctx))
+            (form("/firewall/trust", true, "Trust", false))
         },
-        RowStatus::Blocked { .. } => html! {
-            form .inline method="post" action=(ctx.url("/firewall/unblock-ua")) {
-                (layout::csrf_field(ctx))
-                input type="hidden" name="user_agent" value=(row.user_agent);
-                button type="submit" { "Unblock" }
-            }
-        },
+        RowStatus::Blocked { .. } => form("/firewall/unblock-ua", false, "Unblock", false),
         // Same action either way — the tag says why it is worth looking
         // at, the button does the same thing.
         RowStatus::Pending | RowStatus::Unknown => html! {
-            (trust_form(&entry, ctx))
+            (form("/firewall/trust", true, "Trust", false))
             " "
-            form .inline method="post" action=(ctx.url("/firewall/block-ua")) {
-                (layout::csrf_field(ctx))
-                input type="hidden" name="user_agent" value=(row.user_agent);
-                button .danger type="submit" { "Block" }
-            }
+            (form("/firewall/block-ua", false, "Block", true))
         },
+    }
+}
+
+/// The agent a row's form names by reference, if it is still tallied.
+fn referenced_agent(db: &crate::db::Db, reference: &str) -> anyhow::Result<Option<String>> {
+    match UaRef::parse(reference) {
+        Some(reference) => reference.resolve(db),
+        None => Ok(None),
+    }
+}
+
+/// What a flash says when a row's agent went between drawing and click.
+const AGENT_GONE: &str =
+    "That user agent is no longer counted, so nothing was changed. Reload to see the table now.";
+
+/// A trusted value as a message shows it: a user agent is a client's text,
+/// capped and with anything invisible written out.
+fn shown(entry: &TrustedEntry) -> String {
+    match entry {
+        TrustedEntry::Address(address) => address.clone(),
+        TrustedEntry::UserAgent(user_agent) => crate::uadetail::for_display(user_agent).0,
     }
 }
 
@@ -1024,20 +1056,39 @@ pub fn actions(base: &crate::web::BasePath) -> Router<AppState> {
 
 /// A trust or untrust request. `kind` is set by the row buttons, which
 /// know what they are trusting; the free-text field leaves it out and
-/// [`crate::dynamic::trust_typed`] decides.
+/// [`crate::dynamic::trust_typed`] decides. A user-agent row names its
+/// agent by `ua`, a [`UaRef`], rather than in `value`.
 #[derive(Deserialize)]
 pub struct TrustForm {
     pub kind: Option<String>,
+    #[serde(default)]
     pub value: String,
+    pub ua: Option<String>,
+}
+
+/// What a [`TrustForm`] asks about, once any reference in it is looked up.
+enum Subject {
+    Entry(TrustedEntry),
+    /// Free text, for [`crate::dynamic::trust_typed`] to decide.
+    Typed(String),
+    /// A reference to an agent no longer tallied.
+    Gone,
+    /// Nothing at all.
+    Nothing,
 }
 
 impl TrustForm {
-    fn entry(&self) -> Option<TrustedEntry> {
-        match self.kind.as_deref() {
-            Some("address") => Some(TrustedEntry::Address(self.value.clone())),
-            Some("user_agent") => Some(TrustedEntry::UserAgent(self.value.clone())),
-            _ => None,
-        }
+    fn subject(self, db: &crate::db::Db) -> anyhow::Result<Subject> {
+        Ok(match (self.kind.as_deref(), self.ua) {
+            (Some("user_agent"), Some(reference)) => match referenced_agent(db, &reference)? {
+                Some(user_agent) => Subject::Entry(TrustedEntry::UserAgent(user_agent)),
+                None => Subject::Gone,
+            },
+            (Some("address"), _) => Subject::Entry(TrustedEntry::Address(self.value)),
+            (Some("user_agent"), None) => Subject::Entry(TrustedEntry::UserAgent(self.value)),
+            _ if self.value.trim().is_empty() => Subject::Nothing,
+            _ => Subject::Typed(self.value),
+        })
     }
 }
 
@@ -1047,27 +1098,34 @@ async fn trust(
     Form(form): Form<TrustForm>,
 ) -> Response {
     let trusted = state
-        .with_db(move |db| match form.entry() {
-            Some(TrustedEntry::Address(address)) => {
-                db.trust_address(&address).map(TrustedEntry::Address)
-            }
-            Some(TrustedEntry::UserAgent(ua)) => {
-                db.trust_user_agent(&ua).map(TrustedEntry::UserAgent)
-            }
-            None => crate::dynamic::trust_typed(db, &form.value),
+        .with_db(move |db| {
+            Ok(match form.subject(db)? {
+                Subject::Entry(TrustedEntry::Address(address)) => {
+                    Some(db.trust_address(&address).map(TrustedEntry::Address)?)
+                }
+                Subject::Entry(TrustedEntry::UserAgent(ua)) => {
+                    Some(db.trust_user_agent(&ua).map(TrustedEntry::UserAgent)?)
+                }
+                Subject::Typed(value) => Some(crate::dynamic::trust_typed(db, &value)?),
+                // An empty field goes to `trust_typed` too, which says
+                // why it will not trust nothing.
+                Subject::Nothing => Some(crate::dynamic::trust_typed(db, "")?),
+                Subject::Gone => None,
+            })
         })
         .await;
     match trusted {
-        Ok(entry) => back_with(
+        Ok(Some(entry)) => back_with(
             &state,
             "/firewall",
             &format!(
                 "Trusting {} {}. Apply everything to put it in effect.",
                 entry.kind(),
-                entry.value()
+                shown(&entry)
             ),
             true,
         ),
+        Ok(None) => back_with(&state, "/firewall", AGENT_GONE, false),
         Err(err) => back_with(
             &state,
             "/firewall",
@@ -1082,32 +1140,39 @@ async fn untrust(
     _auth: Auth,
     Form(form): Form<TrustForm>,
 ) -> Response {
-    let Some(entry) = form.entry() else {
-        return back_with(&state, "/firewall", "Nothing to untrust.", false);
-    };
-    let removing = entry.clone();
-    match state
-        .with_db(move |db| crate::dynamic::untrust(db, &removing))
-        .await
-    {
-        Ok(true) => back_with(
+    let untrusted = state
+        .with_db(move |db| {
+            Ok(match form.subject(db)? {
+                Subject::Entry(entry) => {
+                    let removed = crate::dynamic::untrust(db, &entry)?;
+                    Some((entry, removed))
+                }
+                Subject::Gone => return Ok(Err(AGENT_GONE)),
+                Subject::Typed(_) | Subject::Nothing => None,
+            })
+            .map(|untrusted| untrusted.ok_or("Nothing to untrust."))
+        })
+        .await;
+    match untrusted {
+        Ok(Err(refusal)) => back_with(&state, "/firewall", refusal, false),
+        Ok(Ok((entry, true))) => back_with(
             &state,
             "/firewall",
             &format!(
                 "No longer trusting {} {}. Apply everything to put it in effect.",
                 entry.kind(),
-                entry.value()
+                shown(&entry)
             ),
             true,
         ),
         // The row said TRUSTED because a wider entry covers it; removing
         // the exact value removed nothing, and saying "done" would be a lie.
-        Ok(false) => back_with(
+        Ok(Ok((entry, false))) => back_with(
             &state,
             "/firewall",
             &format!(
                 "{} is trusted by a wider entry — remove that one from the Trusted panel.",
-                entry.value()
+                shown(&entry)
             ),
             false,
         ),
@@ -1128,9 +1193,23 @@ pub struct AddressForm {
     pub attempts: Option<u64>,
 }
 
+/// A block or unblock of one user agent: named by `ua`, a [`UaRef`], from
+/// a row, or given as `user_agent` text.
 #[derive(Deserialize)]
 pub struct UserAgentForm {
-    pub user_agent: String,
+    pub user_agent: Option<String>,
+    pub ua: Option<String>,
+}
+
+impl UserAgentForm {
+    /// The agent this names, or `None` for a reference to one no longer
+    /// tallied.
+    fn agent(self, db: &crate::db::Db) -> anyhow::Result<Option<String>> {
+        match self.ua {
+            Some(reference) => referenced_agent(db, &reference),
+            None => Ok(Some(self.user_agent.unwrap_or_default())),
+        }
+    }
 }
 
 /// Blocks an address, unless it covers the one asking, or every address.
@@ -1239,10 +1318,15 @@ async fn block_ua(
     _auth: Auth,
     Form(form): Form<UserAgentForm>,
 ) -> Response {
-    let ua = form.user_agent;
-    let stored = ua.clone();
-    match state.with_db(move |db| db.block_user_agent(&stored)).await {
-        Ok(()) => back_with(&state, "/firewall", "Blocked that user agent.", true),
+    let blocked = state
+        .with_db(move |db| match form.agent(db)? {
+            Some(ua) => db.block_user_agent(&ua).map(|()| true),
+            None => Ok(false),
+        })
+        .await;
+    match blocked {
+        Ok(true) => back_with(&state, "/firewall", "Blocked that user agent.", true),
+        Ok(false) => back_with(&state, "/firewall", AGENT_GONE, false),
         Err(err) => back_with(
             &state,
             "/firewall",
@@ -1257,13 +1341,15 @@ async fn unblock_ua(
     _auth: Auth,
     Form(form): Form<UserAgentForm>,
 ) -> Response {
-    let ua = form.user_agent;
-    let stored = ua.clone();
-    match state
-        .with_db(move |db| db.unblock_user_agent(&stored))
-        .await
-    {
-        Ok(()) => back_with(&state, "/firewall", "Unblocked that user agent.", true),
+    let unblocked = state
+        .with_db(move |db| match form.agent(db)? {
+            Some(ua) => db.unblock_user_agent(&ua).map(|()| true),
+            None => Ok(false),
+        })
+        .await;
+    match unblocked {
+        Ok(true) => back_with(&state, "/firewall", "Unblocked that user agent.", true),
+        Ok(false) => back_with(&state, "/firewall", AGENT_GONE, false),
         Err(err) => back_with(
             &state,
             "/firewall",
@@ -1417,7 +1503,12 @@ mod tests {
 
         for rendered in [
             address_action(&row, &Ctx::new("the-token", Default::default())).into_string(),
-            ua_action(&ua, &Ctx::new("the-token", Default::default())).into_string(),
+            ua_action(
+                &ua,
+                &UaRef::new(1, &ua.user_agent),
+                &Ctx::new("the-token", Default::default()),
+            )
+            .into_string(),
         ] {
             assert!(
                 rendered.contains(r#"name="csrf" value="the-token""#),
@@ -1552,21 +1643,36 @@ mod tests {
     }
 
     #[test]
-    fn a_hostile_user_agent_cannot_break_out_of_the_value_attribute() {
-        // Every string on this screen is attacker-supplied. The one that
-        // reaches an HTML attribute is the interesting case.
-        let ua = UaRow {
-            user_agent: r#"" autofocus onfocus="alert(1)"#.into(),
-            count: 1,
-            status: RowStatus::Pending,
-        };
-        let rendered = ua_action(&ua, &Ctx::for_tests()).into_string();
+    fn a_row_s_buttons_carry_a_reference_and_not_the_agent() {
+        // Every string on this screen is attacker-supplied, as long as the
+        // client liked. The buttons carry a fixed-size reference instead,
+        // for every state a row can be in.
+        let hostile = format!(r#"" autofocus onfocus="alert(1) {}"#, "A".repeat(4_000));
+        for status in [
+            RowStatus::Pending,
+            RowStatus::Unknown,
+            RowStatus::Blocklist,
+            RowStatus::Trusted,
+            RowStatus::Blocked {
+                until: None,
+                by: None,
+            },
+        ] {
+            let ua = UaRow {
+                user_agent: hostile.clone(),
+                count: 1,
+                status,
+            };
+            let reference = UaRef::new(7, &ua.user_agent);
+            let rendered = ua_action(&ua, &reference, &Ctx::for_tests()).into_string();
 
-        assert!(
-            !rendered.contains("onfocus=\"alert(1)"),
-            "the quote must be escaped, not closed: {rendered}"
-        );
-        assert!(rendered.contains("&quot;"), "was: {rendered}");
+            assert!(!rendered.contains("onfocus"), "{status:?}: {rendered}");
+            assert!(!rendered.contains("AAAA"), "{status:?}: {rendered}");
+            assert!(
+                rendered.contains(&format!(r#"name="ua" value="{reference}""#)),
+                "{status:?}: {rendered}"
+            );
+        }
     }
     #[test]
     fn percent_encode_escapes_everything_that_could_start_a_new_parameter() {
@@ -1725,10 +1831,10 @@ mod tests {
         )
         .into_string();
 
-        // Twice capped (title and text) plus the two hidden form values,
-        // which carry the stored string so the buttons act on it exactly.
+        // Capped in its title and its text, and not carried by the
+        // buttons at all: the page is smaller than the one agent.
         assert!(
-            rendered.len() < 4 * long.len(),
+            rendered.len() < long.len(),
             "rendered {} bytes for one {}-byte agent",
             rendered.len(),
             long.len()

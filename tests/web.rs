@@ -1607,6 +1607,62 @@ async fn blocking_and_unblocking_a_user_agent_round_trips() {
         .is_empty());
 }
 
+/// The table's buttons name the agent by reference. Pressing one acts on
+/// the exact string the row shows; pressing one for an agent pruned since
+/// the page was drawn changes nothing, and says so.
+#[tokio::test]
+async fn a_user_agent_row_s_buttons_act_on_the_agent_by_reference() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, csrf) = login(&app, &password).await;
+    let agent = "sqlmap/1.7 (' UNION SELECT 1--)";
+    let mut counts = std::collections::HashMap::new();
+    counts.insert(agent.to_string(), 5);
+    Db::open(&db_path)
+        .unwrap()
+        .record_user_agent_hits(&counts, 1_700_000_000)
+        .unwrap();
+
+    let page = page_text(&app, &cookie, "/firewall").await;
+    let reference = page
+        .split(r#"name="ua" value=""#)
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the row's buttons carry a reference")
+        .to_string();
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/firewall/block-ua",
+        &format!("ua={reference}"),
+    )
+    .await;
+    assert!(flash.contains("Blocked"), "flash was: {flash}");
+    assert_eq!(
+        Db::open(&db_path)
+            .unwrap()
+            .list_blocked_user_agents()
+            .unwrap(),
+        [agent]
+    );
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/firewall/trust",
+        "kind=user_agent&ua=999-0123456789abcdef",
+    )
+    .await;
+    assert!(flash.contains("no longer counted"), "flash was: {flash}");
+    assert!(Db::open(&db_path)
+        .unwrap()
+        .list_trusted_user_agents()
+        .unwrap()
+        .is_empty());
+}
+
 /// An empty user agent is a substring of every one: stored, it blocked
 /// every visitor of every site at the next apply.
 #[tokio::test]
