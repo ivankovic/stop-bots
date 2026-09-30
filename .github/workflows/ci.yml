@@ -108,7 +108,11 @@ jobs:
       - name: End-to-end against real nginx and nftables
         shell: bash
         run: |
-          set -o pipefail
+          # GitHub runs this as `bash -e -o pipefail`. `-e` has to go: a
+          # clean run has no FLAKY lines, and the grep that finds none
+          # exits 1, which ended a 61-of-61 run as a failure. pipefail
+          # stays, because the status worth keeping is cargo's, not tee's.
+          set +e -o pipefail
           status=0
           STOP_BOTS_CONTAINER_TESTS=1 cargo nextest run --test container \
             --no-fail-fast --color never 2>&1 | tee /tmp/container.log || status=$?
