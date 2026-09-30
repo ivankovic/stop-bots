@@ -30,6 +30,15 @@ The one route that needs nothing from you: `cargo deb` builds the package from
 `.github/workflows/release.yml` adds it to the repository served from the
 `gh-pages` branch at <https://ivankovic.github.io/stop-bots>.
 
+The man pages (one per verb) and the bash, zsh and fish completions are generated
+by the binary, so `cargo deb` needs them first; the release and CI jobs do this:
+
+```
+cargo build --release
+target/release/stop-bots generate-docs --out target/assets
+cargo deb --no-build
+```
+
 ```
 curl -fsSL https://ivankovic.github.io/stop-bots/key.gpg \
   | sudo tee /usr/share/keyrings/stop-bots.gpg > /dev/null

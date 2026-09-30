@@ -51,6 +51,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The TUI header and every web console page name the database when it is
   not `/var/lib/stop-bots/db.sqlite3`; the non-root fallback says "Not
   root: settings go to your user database, not the system one".
+- **Man pages and shell completions in the `.deb`**: `man stop-bots` and a
+  page per verb (`man stop-bots-batch`), plus bash, zsh and fish completions,
+  generated from `--help` by the hidden `stop-bots generate-docs --out <dir>`.
 
 ### Changed
 

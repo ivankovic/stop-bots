@@ -201,6 +201,9 @@ jobs:
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           cargo build --release --target x86_64-unknown-linux-musl
+          # The man pages and completions come from the binary's own clap
+          # definition, into the paths `[package.metadata.deb]` names.
+          target/x86_64-unknown-linux-musl/release/stop-bots generate-docs --out target/assets
           cargo deb --no-build --no-strip \
             --target x86_64-unknown-linux-musl --output dist/
 
@@ -236,11 +239,19 @@ jobs:
             || { echo "::error::the package does not install /usr/bin/stop-bots"; exit 1; }
           echo "$contents" | grep -q ' ./usr/share/doc/stop-bots/' \
             || { echo "::error::the package ships no documentation"; exit 1; }
+          echo "$contents" | grep -q ' ./usr/share/man/man1/stop-bots-batch.1.gz$' \
+            || { echo "::error::the package ships no per-verb man pages"; exit 1; }
+          for completion in usr/share/bash-completion/completions/stop-bots \
+              usr/share/zsh/vendor-completions/_stop-bots \
+              usr/share/fish/vendor_completions.d/stop-bots.fish; do
+            echo "$contents" | grep -q " ./$completion\$" \
+              || { echo "::error::the package does not ship $completion"; exit 1; }
+          done
 
       # `lintian` is what Debian itself would say about the package. Not
       # fatal: it flags things that are genuinely wrong for the archive and
-      # merely opinions for a third-party repository -- a missing man page,
-      # an unsigned changelog. Printed so a regression is visible, not
+      # merely opinions for a third-party repository -- an unsigned
+      # changelog, say. Printed so a regression is visible, not
       # enforced so an opinion can turn this red.
       - name: Lintian
         continue-on-error: true
@@ -255,6 +266,11 @@ jobs:
         run: |
           sudo apt-get install -y ./dist/*.deb
           stop-bots --version
+          # `man` finds the pages where it looks, not only where the
+          # listing above says they are.
+          command -v man >/dev/null || sudo apt-get install --no-install-recommends -y man-db
+          man -w stop-bots
+          man -w stop-bots-batch
           # `status` exits non-zero when a check is CRITICAL, which it will be
           # on a runner with no nginx and no rules applied. That it *runs* and
           # reports is the assertion here, not what it concludes.

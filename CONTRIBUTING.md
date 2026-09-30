@@ -343,6 +343,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- uninstall.rs   <- `stop-bots uninstall`: the host back as it was
         |- batch.rs       <- Batch mode: one unattended pass, for a real crontab
         |- cron.rs        <- The internal cron: which background jobs run how often
+        |- docs.rs        <- Man pages and shell completions for the `.deb` (hidden `generate-docs`)
         |- dynamic.rs     <- What is hitting the server now, shared by the TUI and web screens
         |- web.rs         <- Web UI: bind address, exposure policy, Host allowlist
         |- web/           <- One file per web screen, plus auth, state, layout and the router

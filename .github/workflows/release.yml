@@ -133,6 +133,13 @@ jobs:
           # wrong machine type — the way a cross-build goes wrong quietly.
           "$binary" --version
 
+      # From the binary's own clap definition, into the paths
+      # `[package.metadata.deb]` names: a man page per verb and the bash,
+      # zsh and fish completions. Run on the binary just built, which is
+      # why this is a step here and not a build script.
+      - name: Generate man pages and completions
+        run: target/${{ matrix.target }}/release/stop-bots generate-docs --out target/assets
+
       # `--no-build`, because the step above already built it — with
       # `--locked`, which cargo-deb's own build would not have used.
       # `--no-strip` because `[profile.release]` already sets `strip = true`,

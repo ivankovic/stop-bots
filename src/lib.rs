@@ -50,6 +50,8 @@ pub mod db;
 #[doc(hidden)]
 pub mod diff;
 #[doc(hidden)]
+pub mod docs;
+#[doc(hidden)]
 pub mod dynamic;
 #[doc(hidden)]
 pub mod event;

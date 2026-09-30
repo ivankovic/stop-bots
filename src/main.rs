@@ -1288,6 +1288,16 @@ enum Command {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
     },
+    /// Write the man pages and shell completions for packaging
+    ///
+    /// Hidden: the release pipeline runs it, and the `.deb` ships what it
+    /// writes. Not part of the command line people use.
+    #[command(hide = true)]
+    GenerateDocs {
+        /// The directory to write `man/` and `completions/` into
+        #[arg(long, value_name = "DIR")]
+        out: PathBuf,
+    },
     /// Start the TUI (also the default when run with no subcommand)
     Tui {
         #[arg(long, help = ROOT_HELP)]
@@ -1781,6 +1791,13 @@ async fn main() -> Result<()> {
         Some(Command::SetAutoApplyFirewall { enabled }) => set_auto_apply_firewall(db, enabled),
         Some(Command::SetHumansOnly { enabled }) => set_humans_only(db, enabled),
         Some(Command::ShowRobotsTxt) => show_robots_txt(db),
+        Some(Command::GenerateDocs { out }) => {
+            use clap::CommandFactory;
+            for path in stop_bots::docs::generate(Cli::command(), &out)? {
+                println!("{}", path.display());
+            }
+            Ok(())
+        }
     }
 }
 
@@ -4613,6 +4630,25 @@ mod tests {
             }
         }
         texts
+    }
+
+    /// The `.deb` ships a man page per verb. One missing is a verb
+    /// `man` knows nothing about; the packaging verb itself is hidden
+    /// from both `--help` and the pages.
+    #[test]
+    fn every_visible_verb_gets_a_man_page_and_generate_docs_is_not_one() {
+        let dir = tempfile::tempdir().unwrap();
+        stop_bots::docs::generate(Cli::command(), dir.path()).unwrap();
+
+        let page = |name: &str| dir.path().join(format!("man/{name}.1"));
+        assert!(page("stop-bots").is_file());
+        for command in subcommands().iter().filter(|c| !c.is_hide_set()) {
+            let name = format!("stop-bots-{}", command.get_name());
+            assert!(page(&name).is_file(), "no man page for `{name}`");
+        }
+        assert!(!page("stop-bots-generate-docs").exists());
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("generate-docs"), "{help}");
     }
 
     #[test]
