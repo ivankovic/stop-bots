@@ -426,6 +426,10 @@ async fn login_submit(
         })
         .await;
 
+    if let (Ok(Some(_)), Some(ip)) = (&verified, client.0) {
+        record_console_login(&state, ip).await;
+    }
+
     let secure = state
         .with_db(|db| db.get_bool_setting(crate::web::SECURE_COOKIE_KEY, false))
         .await
@@ -459,6 +463,25 @@ async fn login_submit(
                 .into_response()
         }
         Err(err) => internal_error(&err.to_string()),
+    }
+}
+
+/// Remembers that `ip` just logged in, so that no detector blocks it for
+/// a week (see `Db::recent_console_logins`). The console's pages carry
+/// what attackers sent, and behind NGINX a request for one goes into the
+/// access log the detectors read.
+///
+/// A failure is reported and the login goes ahead: the password was
+/// right, and the console's own lines are skipped by the detectors anyway.
+async fn record_console_login(state: &AppState, ip: IpAddr) {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    if let Err(err) = state
+        .with_db(move |db| db.record_console_login(ip, at))
+        .await
+    {
+        eprintln!("stop-bots: could not record the console login from {ip}: {err:#}");
     }
 }
 

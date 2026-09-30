@@ -449,6 +449,11 @@ pub fn run_log_jobs(
                 let connected = if applied.ssh.is_readable() {
                     let mut all = db.recent_ssh_login_ips()?;
                     all.extend(applied.logins.iter().cloned());
+                    // And whoever logged in to the web console: a render
+                    // that walls them out is as much a lockout.
+                    all.extend(
+                        db.recent_console_logins(now() - crate::db::CONSOLE_LOGIN_WINDOW_SECONDS)?,
+                    );
                     all.sort();
                     all.dedup();
                     Some(all)
@@ -1347,6 +1352,32 @@ mod tests {
         let summaries = pass(&db, dir.path(), &[CronJob::RenderFirewall]);
         assert!(summaries[0].1.starts_with("wrote "), "{summaries:?}");
         assert_eq!(db.recent_ssh_login_ips().unwrap(), ["203.0.113.5"]);
+    }
+
+    /// Whoever logged in to the web console is on the guard's list too: a
+    /// scheduled apply that would wall them out is refused.
+    #[test]
+    fn a_scheduled_apply_refuses_to_cut_off_a_console_login() {
+        let db = test_db();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.log"), "").unwrap();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.0/24".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
+        })
+        .unwrap();
+        db.set_auto_apply_firewall(true).unwrap();
+        db.record_console_login("198.51.100.10".parse().unwrap(), now())
+            .unwrap();
+
+        let summaries = pass(&db, dir.path(), &[CronJob::RenderFirewall]);
+
+        let summary = &summaries[0].1;
+        assert!(summary.starts_with("skipped"), "{summary}");
+        assert!(summary.contains("198.51.100.10"), "{summary}");
     }
 
     /// The whole loop end to end, through real files: a probe is blocked,

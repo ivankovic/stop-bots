@@ -2152,7 +2152,10 @@ pub fn console_server_block(host: &str, upstream: &std::net::SocketAddr) -> Stri
          server {{\n    \
          listen 80;\n    \
          listen [::]:80;\n    \
-         server_name {host};\n\n\
+         server_name {host};\n    \
+         # The console shows what attackers sent, and its requests carry it:\n    \
+         # logged where the detectors read, they would block its operator.\n    \
+         access_log off;\n\n\
          {}}}\n",
         crate::generated::generated_by(),
         console_location("/", upstream)

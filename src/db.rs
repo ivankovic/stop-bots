@@ -981,6 +981,10 @@ fn reject_an_overbroad_fetch(source: &str, addresses: &[String], max_v4_share: f
 /// used.
 pub const SSH_LOGIN_WINDOW_SECONDS: i64 = 7 * 24 * 60 * 60;
 
+/// How long a login to the web console keeps its address safe from the
+/// detectors: the same week as an SSH login, for the same reason.
+pub const CONSOLE_LOGIN_WINDOW_SECONDS: i64 = SSH_LOGIN_WINDOW_SECONDS;
+
 /// The columns [`firewall_rule_from_row`] reads, in its order.
 const FIREWALL_RULE_COLUMNS: &str =
     "id, address, port, action, enabled, expires_at, source, created_at, evidence";
@@ -2884,6 +2888,44 @@ impl Db {
             params![address, seconds],
         )?;
         Ok(())
+    }
+
+    // ---- web console login addresses ----
+
+    /// Records a successful login to the web console from `address`, at
+    /// `at`, refreshing it if the address is already stored. Rows older
+    /// than [`CONSOLE_LOGIN_WINDOW_SECONDS`] go at the same time, so the
+    /// table holds a week of logins and nothing more.
+    ///
+    /// Stored canonical (`::ffff:a.b.c.d` as `a.b.c.d`), the form the
+    /// detectors compare a block against.
+    pub fn record_console_login(&self, address: std::net::IpAddr, at: i64) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM console_logins WHERE last_login < ?1",
+            params![at - CONSOLE_LOGIN_WINDOW_SECONDS],
+        )?;
+        self.conn.execute(
+            "INSERT INTO console_logins (address, last_login) VALUES (?1, ?2)
+             ON CONFLICT(address) DO UPDATE SET
+                 last_login = max(last_login, excluded.last_login)",
+            params![address.to_canonical().to_string(), at],
+        )?;
+        Ok(())
+    }
+
+    /// Every address that logged in to the web console at or after
+    /// `since`, sorted.
+    ///
+    /// No detector blocks one of them, as none blocks an address with a
+    /// recent SSH login (see `scanblock`): the console shows its operator
+    /// what attackers sent, and a request for that page carries it.
+    pub fn recent_console_logins(&self, since: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT address FROM console_logins WHERE last_login >= ?1 ORDER BY address",
+        )?;
+        let rows = stmt.query_map(params![since], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to list recent console login addresses")
     }
 
     // ---- crawler IP-range sources ----

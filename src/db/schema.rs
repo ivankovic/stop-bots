@@ -49,7 +49,7 @@ use super::{keys, Category, GeoMode, Policy};
 /// Always equal to `MIGRATIONS.len()`; a test holds the two together, so
 /// adding a migration without bumping this (or the reverse) fails the
 /// build's tests rather than a user's upgrade.
-pub const CURRENT_VERSION: u32 = 4;
+pub const CURRENT_VERSION: u32 = 5;
 
 /// The generation of defaults this binary creates a database with.
 ///
@@ -123,6 +123,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         summary: "firewall_rules.source and .evidence, one row per rule, and unblocked_addresses",
         apply: v4_explained_rules,
+    },
+    Migration {
+        summary: "console_logins, the addresses the web console was logged in from",
+        apply: v5_console_logins,
     },
 ];
 
@@ -744,6 +748,24 @@ fn v4_explained_rules(conn: &Connection) -> rusqlite::Result<()> {
              source TEXT,
              unblocked_at INTEGER NOT NULL,
              until INTEGER NOT NULL
+         );",
+    )
+}
+
+/// Version 5: the addresses the web console was logged in from, and when
+/// last.
+///
+/// The console shows its operator what attackers sent, and a request for
+/// that page carries it, so an operator reading the console from behind
+/// the NGINX it protects looked like an attacker to the detectors. The
+/// console's own lines are no longer read (see `accesslog::Console`); this
+/// is the second half, as `ssh_login_ips` is for SSH: no detector blocks
+/// an address that logged in within the last week. It starts empty.
+fn v5_console_logins(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE console_logins (
+             address TEXT PRIMARY KEY,
+             last_login INTEGER NOT NULL
          );",
     )
 }
@@ -1511,5 +1533,34 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].created_at, Some(5));
         assert!(db.unblocked_addresses().unwrap().is_empty());
+    }
+
+    /// A version-4 database — what 0.1.0-rc.1 wrote — keeps its rules and
+    /// SSH logins, and gains the console's login record, empty.
+    #[test]
+    fn a_version_4_database_keeps_its_rules_and_gains_the_console_login_record() {
+        let conn = Connection::open_in_memory().unwrap();
+        for step in &MIGRATIONS[..4] {
+            (step.apply)(&conn).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO firewall_rules (address, action, enabled, created_at, source)
+                 VALUES ('203.0.113.7', 'block', 1, 5, 'cli');
+             INSERT INTO ssh_login_ips (address, seen_at)
+                 VALUES ('198.51.100.9', strftime('%s', 'now'));",
+        )
+        .unwrap();
+
+        migrate(&conn, None).unwrap();
+
+        let db = Db { conn };
+        assert_eq!(version_of(&db), 5);
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+        assert_eq!(db.recent_ssh_login_ips().unwrap(), ["198.51.100.9"]);
+        assert!(db.recent_console_logins(0).unwrap().is_empty());
+        db.record_console_login("203.0.113.20".parse().unwrap(), 100)
+            .unwrap();
+        assert_eq!(db.recent_console_logins(0).unwrap(), ["203.0.113.20"]);
     }
 }

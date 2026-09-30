@@ -159,6 +159,8 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
         referer,
         user_agent,
         time,
+        // The combined format does not log the `Host`.
+        host: None,
     })
 }
 
@@ -236,11 +238,14 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
             .or_else(|| {
                 json_field(obj, "time_local").and_then(|t| crate::logtime::nginx_time_local(&t))
             }),
+        // `$host` or `$http_host`, when the format logs either: what tells
+        // a subdomain console's lines apart (see [`Console`]).
+        host: json_field(obj, "host").or_else(|| json_field(obj, "http_host")),
     })
 }
 
 /// Every key [`parse_json_line`] reads.
-const JSON_FIELDS: [&str; 9] = [
+const JSON_FIELDS: [&str; 11] = [
     "remote_addr",
     "status",
     "request_uri",
@@ -250,6 +255,8 @@ const JSON_FIELDS: [&str; 9] = [
     "http_user_agent",
     "time_iso8601",
     "time_local",
+    "host",
+    "http_host",
 ];
 
 /// A JSON log line's top-level object, refused if it names any of
@@ -333,6 +340,9 @@ struct ParsedLine {
     /// one. `None` for a line that carries neither, which a JSON format is
     /// free to leave out.
     time: Option<i64>,
+    /// The `Host` the request was for, when the format logs it: a JSON
+    /// format's `host` or `http_host`. The combined format does not.
+    host: Option<String>,
 }
 
 /// Every IP with at least `threshold` *distinct* paths that returned 404
@@ -749,6 +759,9 @@ pub struct Watch {
     pub honeypot: String,
     /// [`crate::scanblock::crawler_claims`].
     pub claims: Vec<CrawlerClaim>,
+    /// Where this host's web console is served: its lines are the
+    /// operator's, and are not read at all (see [`Console`]).
+    pub console: Console,
 }
 
 impl Watch {
@@ -760,12 +773,142 @@ impl Watch {
             probe_paths: DEFAULT_PROBE_PATHS.iter().map(|p| p.to_string()).collect(),
             honeypot: crate::protection::HONEYPOT_PATH_DEFAULT.to_string(),
             claims: Vec::new(),
+            console: Console::default(),
         }
     }
 
     pub fn watches(&self, detector: Detector) -> bool {
         self.detectors.iter().any(|(d, _)| *d == detector)
     }
+}
+
+/// Where this host's web console is served, so that its own traffic is
+/// never read as evidence, nor tallied into the access stats.
+///
+/// Behind NGINX the console's requests go into the site's access log, from
+/// the operator's address, and the console shows the operator what the
+/// attackers sent: the Firewall page links a user agent's details as
+/// `?inspect_ua=<the user agent>`, and a search is `?q=<what was typed>`.
+/// Read as traffic, one look at a `${jndi:...}` user agent was a log4shell
+/// payload from the operator, and the injection detector blocked them for
+/// a week on that one line.
+///
+/// Two ways to recognise a console line, one per way the Web Access panel
+/// puts it behind NGINX:
+///
+/// - **Under a path prefix** (`web:base_path`, e.g. `/stop-bots`): the
+///   request path, normalised as NGINX normalises it before choosing a
+///   `location` (`%XX` decoded once, `//` merged, `.` and `..` resolved), is
+///   the prefix or under it. Normalised so that `/stop-bots/../.env`, which
+///   NGINX serves from the site and not the console, is still read.
+/// - **On its own host**, when there is no prefix: the line's `Host` is one
+///   of the console's configured names. Only a JSON format can say, since
+///   the combined one does not log the host, which is why the panel's
+///   subdomain server block has `access_log off`.
+///
+/// The prefix wins when there is one: the configured names then include
+/// the site's own, and matching on them would skip the whole site.
+///
+/// The cost is that nothing a client sends under the console's prefix is
+/// judged. What answers there is the console, which does nothing without
+/// a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Console {
+    /// The prefix's segments: `["stop-bots"]`, or none for the root.
+    prefix: Vec<String>,
+    /// The console's own host names, compared without a port and ignoring
+    /// case. Consulted only when there is no prefix.
+    hosts: Vec<String>,
+}
+
+impl Console {
+    /// A console under `prefix` (`""`, `/stop-bots`, `/stop-bots/`),
+    /// answering to `hosts` besides the loopback names.
+    pub fn new(prefix: &str, hosts: &[String]) -> Console {
+        Console {
+            prefix: prefix
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .map(str::to_string)
+                .collect(),
+            hosts: hosts.to_vec(),
+        }
+    }
+
+    /// Whether no line can be the console's: one at the root with no
+    /// configured name, which is a console on loopback.
+    pub fn is_empty(&self) -> bool {
+        self.prefix.is_empty() && self.hosts.is_empty()
+    }
+
+    /// Whether `line` was a request to the console.
+    fn serves(&self, line: &ParsedLine) -> bool {
+        if !self.prefix.is_empty() {
+            return path_segments(&line.path).starts_with(&self.prefix);
+        }
+        let Some(host) = line.host.as_deref() else {
+            return false;
+        };
+        let name = match host.rsplit_once(':') {
+            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+                name
+            }
+            _ => host,
+        };
+        let name = name.trim_start_matches('[').trim_end_matches(']');
+        self.hosts.iter().any(|h| h.eq_ignore_ascii_case(name))
+    }
+}
+
+/// The segments of `path` as NGINX matches a `location` against it: `%XX`
+/// decoded once, empty and `.` segments dropped, and `..` taking away the
+/// one before it. Not the `%u` forms [`crate::injection`] also decodes:
+/// NGINX does not, and a path read as the console's must be one NGINX
+/// sent there.
+fn path_segments(path: &str) -> Vec<String> {
+    let bytes = path.as_bytes();
+    let hex = |b: u8| (b as char).to_digit(16);
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                decoded.push((high * 16 + low) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    let mut segments: Vec<String> = Vec::new();
+    for segment in String::from_utf8_lossy(&decoded).split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment.to_string()),
+        }
+    }
+    segments
+}
+
+/// `log_text` without the console's lines (see [`Console`]), for a
+/// detector given a whole log to read, as the scheduled pass reads one.
+pub fn without_console<'a>(log_text: &'a str, console: &Console) -> std::borrow::Cow<'a, str> {
+    if console.is_empty() {
+        return std::borrow::Cow::Borrowed(log_text);
+    }
+    let mut kept = String::with_capacity(log_text.len());
+    for line in log_text.lines() {
+        if parse_line(line).is_some_and(|parsed| console.serves(&parsed)) {
+            continue;
+        }
+        kept.push_str(line);
+        kept.push('\n');
+    }
+    std::borrow::Cow::Owned(kept)
 }
 
 /// When a line happened, for the observer.
@@ -847,6 +990,9 @@ impl Observer {
             return;
         };
         self.counts.parsed += 1;
+        if self.watch.console.serves(&line) {
+            return;
+        }
         if let Some(tally) = &mut self.user_agents {
             if counts_as_a_visit(&line) {
                 *tally.entry(line.user_agent.clone()).or_insert(0) += 1;

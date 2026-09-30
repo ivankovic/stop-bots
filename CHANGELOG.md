@@ -8,6 +8,19 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Security
+
+- **The web console no longer gets its operator blocked.** Viewing an attacker's
+  user agent or searching for a payload put it in the access log from the operator's
+  address, and the injection detector blocked them for a week. No detector, and no
+  access stat, reads a request under the console's path prefix (`web:base_path`), or,
+  in a JSON log that records the host, one for a subdomain console's host.
+- Addresses that logged in to the web console in the last 7 days are never blocked by
+  a detector, as with SSH logins, and are on the scheduled apply's lockout check
+  (schema version 5: `console_logins`).
+- The Web Access panel's subdomain server block has `access_log off;`. Re-apply it
+  from the panel to update an existing one.
+
 ## [0.1.0-rc.1] — 2026-09-30
 
 The first release whose command line, database, generated files and paths are a

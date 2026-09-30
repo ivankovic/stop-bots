@@ -113,6 +113,12 @@ pub struct ScanBlockOutcome {
     /// reads `firewall_rules` directly, so it would show that address as
     /// blocked when it is not.
     pub skipped_ssh_logins: usize,
+    /// Of the candidates, how many were left alone because the web console
+    /// was logged in to from them inside the same window (see
+    /// [`crate::db::CONSOLE_LOGIN_WINDOW_SECONDS`]). The console shows its
+    /// operator what attackers sent, so its operator's requests can carry
+    /// exactly what the detectors look for.
+    pub skipped_console_logins: usize,
     /// Of the candidates, how many were left alone because they overlap an
     /// address an operator trusted by hand (see [`Db::trust_address`]).
     /// Not written for the reason [`Self::skipped_ssh_logins`] gives —
@@ -147,6 +153,7 @@ impl ScanBlockOutcome {
                 let reasons: Vec<&str> = [
                     (self.skipped_trusted > 0, "trusted"),
                     (self.skipped_ssh_logins > 0, "recent SSH logins"),
+                    (self.skipped_console_logins > 0, "recent console logins"),
                     (self.skipped_unblocked > 0, "unblocked by hand"),
                 ]
                 .into_iter()
@@ -319,6 +326,8 @@ pub fn block_web_scanners(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let candidates = accesslog::scanning_ips(log_text, threshold);
     excluding_known_crawlers(
         db,
@@ -397,6 +406,8 @@ pub fn block_spoofed_crawlers(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let claims = crawler_claims(db)?;
     let spoofed = accesslog::spoofed_crawler_ips(log_text, &claims);
     let found = spoofed.len();
@@ -441,6 +452,8 @@ pub fn block_robots_txt(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let candidates = accesslog::robots_txt_ips(log_text);
     let found = candidates.len();
     add_block_rules(
@@ -461,6 +474,8 @@ pub fn block_probe_paths(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let paths = crate::protection::probe_paths(db)?;
     let hits = accesslog::probe_path_ips(log_text, &paths);
     let found = hits.len();
@@ -491,6 +506,8 @@ pub fn block_injection(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let hits = accesslog::injection_ips(log_text);
     let found = hits.len();
     let candidates = hits
@@ -528,6 +545,8 @@ pub fn block_honeypot(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let path = crate::protection::honeypot_path(db)?;
     let hits = accesslog::probe_path_ips(log_text, &[path]);
     let found = hits.len();
@@ -556,6 +575,8 @@ pub fn block_asset_ratio(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let min_pages = crate::protection::threshold(
         db,
         crate::protection::ASSET_RATIO_MIN_PAGES,
@@ -579,6 +600,8 @@ pub fn block_rotating_ua(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let min_agents = crate::protection::threshold(
         db,
         crate::protection::ROTATING_UA_MIN,
@@ -602,6 +625,8 @@ pub fn block_refererless(
     log_text: &str,
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
+    let text = web_log(db, log_text)?;
+    let log_text: &str = &text;
     let min_paths = crate::protection::threshold(
         db,
         crate::protection::REFERERLESS_MIN_PATHS,
@@ -759,6 +784,15 @@ impl<'a> Trigger<'a> {
     }
 }
 
+/// An access log as the detectors read it: without the web console's own
+/// lines, which are the operator's (see [`accesslog::Console`]).
+fn web_log<'a>(db: &Db, log_text: &'a str) -> Result<std::borrow::Cow<'a, str>> {
+    Ok(accesslog::without_console(
+        log_text,
+        &crate::logscan::console(db)?,
+    ))
+}
+
 /// Candidates the detector said nothing more about.
 fn unhinted(addresses: Vec<String>) -> Vec<(String, Option<String>)> {
     addresses
@@ -879,6 +913,12 @@ fn add_block_rules_now(
         .iter()
         .filter_map(|ip| ip.parse().ok())
         .collect();
+    // And the web console, the same way and for the same week.
+    let console_logins: Vec<std::net::IpAddr> = db
+        .recent_console_logins(now_secs() - crate::db::CONSOLE_LOGIN_WINDOW_SECONDS)?
+        .iter()
+        .filter_map(|ip| ip.parse().ok())
+        .collect();
     let trusted = db.list_trusted_addresses()?;
     // Addresses an operator unblocked by hand. Matched exactly, since a
     // detector writes the same address for the same client every time,
@@ -922,6 +962,7 @@ fn add_block_rules_now(
     let mut newly_blocked = Vec::new();
     let mut already_covered = 0;
     let mut skipped_ssh_logins = 0;
+    let mut skipped_console_logins = 0;
     let mut skipped_trusted = 0;
     let mut skipped_unblocked = 0;
     for observed in kept {
@@ -944,6 +985,13 @@ fn add_block_rules_now(
             .any(|login| crate::ipranges::cidr_contains(&ip, *login))
         {
             skipped_ssh_logins += 1;
+            continue;
+        }
+        if console_logins
+            .iter()
+            .any(|login| crate::ipranges::cidr_contains(&ip, *login))
+        {
+            skipped_console_logins += 1;
             continue;
         }
         // Overlap, not containment one way: a trusted /28 inside the /24
@@ -1016,6 +1064,7 @@ fn add_block_rules_now(
         crawler_exclusion_active,
         already_covered,
         skipped_ssh_logins,
+        skipped_console_logins,
         skipped_trusted,
         skipped_unblocked,
         newly_blocked,
@@ -1230,6 +1279,7 @@ mod tests {
             crawler_exclusion_active: true,
             already_covered: 0,
             skipped_ssh_logins: 0,
+            skipped_console_logins: 0,
             skipped_trusted: 0,
             skipped_unblocked: 0,
             newly_blocked: vec![],
@@ -1436,6 +1486,7 @@ mod tests {
             crawler_exclusion_active: true,
             already_covered: 0,
             skipped_ssh_logins: 0,
+            skipped_console_logins: 0,
             skipped_trusted: 0,
             skipped_unblocked: 0,
             newly_blocked: vec![],
@@ -2318,5 +2369,142 @@ mod tests {
 
         assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
         assert_eq!(outcome.skipped_unblocked, 1);
+    }
+
+    // ---- the web console's operator ----
+
+    /// What the Firewall page's link to a user agent's details looks like
+    /// in the site's access log, from the operator's address, when the user
+    /// agent is a log4shell probe.
+    fn inspect_line(ip: &str, prefix: &str) -> String {
+        request_line(
+            ip,
+            &format!(
+                "GET {prefix}/firewall?filter=all&inspect_ua=%24%7Bjndi%3Aldap%3A%2F%2Fx%7D HTTP/2.0"
+            ),
+            "Mozilla/5.0",
+        )
+    }
+
+    fn console_under(db: &Db, prefix: &str) {
+        db.set_text_setting(crate::web::BASE_PATH_KEY, prefix)
+            .unwrap();
+    }
+
+    /// The reproduced report: looking at an attacker's user agent in the
+    /// console blocked the operator for a week.
+    #[test]
+    fn a_payload_under_the_console_s_prefix_blocks_nobody() {
+        let db = Db::open_in_memory().unwrap();
+        console_under(&db, "/stop-bots");
+        let log = [
+            inspect_line("198.51.100.10", "/stop-bots"),
+            request_line(
+                "198.51.100.10",
+                "GET /stop-bots/blocks?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E HTTP/2.0",
+                "Mozilla/5.0",
+            ),
+        ]
+        .concat();
+
+        let outcome = block_injection(&db, 7, &log, false).unwrap();
+
+        assert_eq!(outcome.candidates, 0, "{outcome:?}");
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// The prefix is the one stored, not `/stop-bots`: a console elsewhere
+    /// leaves `/stop-bots/` to the detectors like any other path.
+    #[test]
+    fn a_console_under_another_prefix_is_the_one_respected() {
+        let db = Db::open_in_memory().unwrap();
+        console_under(&db, "/admin/console");
+        let log = [
+            inspect_line("198.51.100.10", "/admin/console"),
+            inspect_line("203.0.113.9", "/stop-bots"),
+        ]
+        .concat();
+
+        let outcome = block_injection(&db, 7, &log, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.9"]);
+    }
+
+    /// NGINX resolves `..` before it picks a `location`, so these went to
+    /// the site, not the console, and are judged.
+    #[test]
+    fn a_path_that_only_passes_through_the_prefix_is_still_judged() {
+        let db = Db::open_in_memory().unwrap();
+        console_under(&db, "/stop-bots");
+        for path in [
+            "/stop-bots/../.env",
+            "/stop-bots/%2e%2e/.env",
+            "/stop-bots-x/.env",
+        ] {
+            let log = probe_line("203.0.113.9", path);
+            let outcome = block_probe_paths(&db, 7, &log, true).unwrap();
+            assert_eq!(outcome.newly_blocked, ["203.0.113.9"], "{path}");
+        }
+    }
+
+    /// An address the console was logged in to from is left alone by every
+    /// detector, as one that logged in over SSH is: whatever else it sent,
+    /// it is the operator's.
+    #[test]
+    fn a_console_login_address_is_not_blocked_by_any_detector() {
+        let db = Db::open_in_memory().unwrap();
+        seed_googlebot_ranges(&db);
+        let operator = "198.51.100.10";
+        let now = now_secs();
+        db.record_console_login(operator.parse().unwrap(), now - 3600)
+            .unwrap();
+        for detector in Detector::ALL {
+            match rule(&db, detector).unwrap() {
+                Rule::Once if detector == Detector::SpoofedCrawlers => observe(
+                    &db,
+                    detector,
+                    operator,
+                    Item::seen("Googlebot IP ranges"),
+                    now - 60,
+                    1,
+                ),
+                Rule::Once => observe(&db, detector, operator, Item::seen("/x"), now - 60, 1),
+                Rule::Distinct(n) => {
+                    for i in 0..n {
+                        let item = Item::seen(&format!("/page{i}"));
+                        observe(&db, detector, operator, item, now - 60, 1);
+                    }
+                }
+                Rule::AtLeast(n) => {
+                    let bucket = Item::bucket(now - 60);
+                    observe(&db, detector, operator, bucket, now - 60, n as u64);
+                }
+            }
+
+            let outcome = run_detector(&db, detector, 7, now, false).unwrap();
+
+            assert_eq!(outcome.candidates, 1, "{detector:?}: {outcome:?}");
+            assert!(
+                outcome.newly_blocked.is_empty(),
+                "{detector:?}: {outcome:?}"
+            );
+            assert_eq!(outcome.skipped_console_logins, 1, "{detector:?}");
+        }
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// A login more than a week ago protects nothing any more.
+    #[test]
+    fn a_console_login_older_than_a_week_protects_nothing() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        let long_ago = now - crate::db::CONSOLE_LOGIN_WINDOW_SECONDS - 60;
+        db.record_console_login("198.51.100.10".parse().unwrap(), long_ago)
+            .unwrap();
+        probe_at(&db, "198.51.100.10", now - 60);
+
+        let outcome = run_detector(&db, Detector::ProbePaths, 7, now, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["198.51.100.10"]);
     }
 }
