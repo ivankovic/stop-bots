@@ -26,6 +26,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The access stats keep the first 512 characters of a user agent, not up to 8 KB, and
   hold to 20,000 rows as they are written, dropping the least-hit first, rather than
   only at the daily prune.
+- The web console stores a log pass 5,000 rows at a time and lets its database go
+  between them: a 200,000-line pass held every request, `/login` included, for 7 s.
 
 ## [0.1.0-rc.1] — 2026-09-30
 

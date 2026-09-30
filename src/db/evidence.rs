@@ -19,10 +19,11 @@
 //! The stored half of [`crate::evidence`]: the `log_evidence` table, and
 //! the cursor that says how much of each log it already holds.
 //!
-//! The two are written together, in one transaction ([`Db::ingest`]),
-//! because they only mean something together. Evidence stored without its
-//! cursor would be counted again on the next read; a cursor stored without
-//! its evidence would lose those lines for good.
+//! The two only mean something together. Evidence stored without its
+//! cursor moving would be counted again by the next read, from the same
+//! lines; so the cursor moves first, in the same transaction as the check
+//! that nobody else moved it and the first chunk of the evidence, and the
+//! rest follows a chunk at a time ([`Ingest`]).
 
 use anyhow::{Context, Result};
 use rusqlite::{params, OptionalExtension};
@@ -51,52 +52,172 @@ pub struct Ingested<'a> {
     pub now: i64,
 }
 
+/// The most rows one step of an [`Ingest`] writes: evidence rows and user
+/// agents together. A step is one transaction under the web console's
+/// database lock, and a pass over 200,000 lines stored whole held that
+/// lock, `/login` included, for seven seconds.
+pub const INGEST_CHUNK: usize = 5_000;
+
+/// One read's findings, stored a chunk at a time, so that storing a large
+/// read does not hold the database for all of it.
+///
+/// **The first step claims the read.** In one `BEGIN IMMEDIATE`
+/// transaction it checks that the stored cursor is still the one the read
+/// started from, moves it to where the read stopped, records the logins
+/// and writes the first chunk. Another process that read the same lines
+/// (the console and a `batch` from cron, say) finds the cursor moved and
+/// stores nothing, so of two readers exactly one gets in and nothing is
+/// counted twice, however their steps interleave. Each later step writes
+/// the next chunk.
+///
+/// The cursor moves before the last chunk is written, so a process that
+/// stops between steps loses what it had not written yet rather than
+/// counting it twice on the next read. Losing a few lines' evidence can
+/// only make a count smaller, which is the side the detectors err on.
+pub struct Ingest {
+    source: String,
+    from: Option<String>,
+    to: Option<String>,
+    evidence: Vec<(Detector, String, Item, Tally)>,
+    user_agents: Vec<(String, u64)>,
+    logins: Vec<String>,
+    now: i64,
+    claim: Claim,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    NotYet,
+    Ours,
+    Theirs,
+}
+
+/// What one [`Ingest::step`] left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestStep {
+    /// There is more to write.
+    More,
+    /// Finished. `stored` is false when another process had already
+    /// claimed the same lines, and this stored nothing.
+    Done { stored: bool },
+}
+
+impl Ingest {
+    /// A read of `source` from cursor `from` to `to`, as [`Ingested`]
+    /// describes them, with what it found.
+    pub fn new(
+        source: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        evidence: Evidence,
+        user_agents: HashMap<String, u64>,
+        logins: Vec<String>,
+        now: i64,
+    ) -> Ingest {
+        Ingest {
+            source: source.to_string(),
+            from: from.map(str::to_string),
+            to: to.map(str::to_string),
+            evidence: evidence.into_rows(),
+            user_agents: user_agents.into_iter().collect(),
+            logins,
+            now,
+            claim: Claim::NotYet,
+        }
+    }
+
+    /// Writes the next chunk of at most `chunk` rows, claiming the read
+    /// first if this is the first step. One transaction.
+    pub fn step(&mut self, db: &Db, chunk: usize) -> Result<IngestStep> {
+        if self.claim == Claim::Theirs {
+            return Ok(IngestStep::Done { stored: false });
+        }
+        let chunk = chunk.max(1);
+        let claimed = db.batch(|| {
+            if self.claim == Claim::NotYet {
+                let stored = db.get_log_cursor(&self.source)?;
+                if stored != self.from {
+                    return Ok(false);
+                }
+                if let Some(to) = &self.to {
+                    db.set_raw_setting(&keys::log_cursor(&self.source), to)?;
+                }
+                db.record_ssh_login_ips(&self.logins)?;
+            }
+            let evidence = self.evidence.len().min(chunk);
+            let evidence = self.evidence.split_off(self.evidence.len() - evidence);
+            db.upsert_evidence(&evidence)?;
+            let agents = self.user_agents.len().min(chunk - evidence.len());
+            let agents = self.user_agents.split_off(self.user_agents.len() - agents);
+            if !agents.is_empty() {
+                db.upsert_user_agent_hits(agents.iter().map(|(a, n)| (a, n)), self.now)?;
+            }
+            Ok(true)
+        })?;
+        if !claimed {
+            self.claim = Claim::Theirs;
+            return Ok(IngestStep::Done { stored: false });
+        }
+        self.claim = Claim::Ours;
+        Ok(if self.evidence.is_empty() && self.user_agents.is_empty() {
+            IngestStep::Done { stored: true }
+        } else {
+            IngestStep::More
+        })
+    }
+}
+
 impl Db {
+    /// Adds `rows` onto what `log_evidence` holds.
+    fn upsert_evidence(&self, rows: &[(Detector, String, Item, Tally)]) -> Result<()> {
+        let mut upsert = self.conn.prepare_cached(
+            "INSERT INTO log_evidence
+                 (detector, address, item, count, first_seen, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(detector, address, item) DO UPDATE SET
+                 count = count + excluded.count,
+                 first_seen = min(first_seen, excluded.first_seen),
+                 last_seen = max(last_seen, excluded.last_seen)",
+        )?;
+        for (detector, address, item, tally) in rows {
+            upsert.execute(params![
+                detector.id(),
+                address,
+                item.key(),
+                tally.count as i64,
+                tally.first,
+                tally.last
+            ])?;
+        }
+        Ok(())
+    }
+
     /// Where the next read of `source` resumes, as stored.
     pub fn get_log_cursor(&self, source: &str) -> Result<Option<String>> {
         self.get_raw_setting(&keys::log_cursor(source))
     }
 
-    /// Stores one read's findings and its cursor, or nothing at all.
+    /// Stores one read's findings and moves its cursor, all at once.
     ///
     /// Returns `false`, having stored nothing, when the stored cursor is no
-    /// longer `read.from`: another process (the console and a `batch` from
-    /// cron, say) read the same lines first and has already stored them.
-    /// Storing them again would count every one of them twice. The check
-    /// and the write are one `BEGIN IMMEDIATE` transaction, so of two
-    /// readers exactly one gets in.
+    /// longer `read.from`: see [`Ingest`]. For a caller that has nothing
+    /// to gain from letting the database go between chunks; the web
+    /// console's cron steps an [`Ingest`] itself.
     pub fn ingest(&self, read: &Ingested) -> Result<bool> {
-        self.batch(|| {
-            let stored = self.get_log_cursor(read.source)?;
-            if stored.as_deref() != read.from {
-                return Ok(false);
+        let mut ingest = Ingest::new(
+            read.source,
+            read.from,
+            read.to,
+            read.evidence.clone(),
+            read.user_agents.clone(),
+            read.logins.to_vec(),
+            read.now,
+        );
+        loop {
+            if let IngestStep::Done { stored } = ingest.step(self, INGEST_CHUNK)? {
+                return Ok(stored);
             }
-            let mut upsert = self.conn.prepare_cached(
-                "INSERT INTO log_evidence
-                     (detector, address, item, count, first_seen, last_seen)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(detector, address, item) DO UPDATE SET
-                     count = count + excluded.count,
-                     first_seen = min(first_seen, excluded.first_seen),
-                     last_seen = max(last_seen, excluded.last_seen)",
-            )?;
-            for (detector, address, item, tally) in read.evidence.iter() {
-                upsert.execute(params![
-                    detector.id(),
-                    address,
-                    item.key(),
-                    tally.count as i64,
-                    tally.first,
-                    tally.last
-                ])?;
-            }
-            self.upsert_user_agent_hits(read.user_agents, read.now)?;
-            self.record_ssh_login_ips(read.logins)?;
-            if let Some(to) = read.to {
-                self.set_raw_setting(&keys::log_cursor(read.source), to)?;
-            }
-            Ok(true)
-        })
+        }
     }
 
     /// What `detector` has stored, seen at or after `since`, for every
@@ -347,5 +468,72 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].item, Item::seen("/.git/"));
+    }
+
+    fn many_paths(address: &str, n: usize) -> Evidence {
+        let mut evidence = Evidence::default();
+        for i in 0..n {
+            evidence.add(
+                Detector::WebScanners,
+                address.parse().unwrap(),
+                Item::seen(&format!("/p{i}")),
+                100,
+            );
+        }
+        evidence
+    }
+
+    fn ingest_of(evidence: Evidence, from: Option<&str>, to: &str) -> Ingest {
+        let agents = HashMap::from([("Mozilla/5.0".to_string(), 4), ("curl/8".to_string(), 1)]);
+        let logins = vec!["192.0.2.10".to_string()];
+        Ingest::new("log", from, Some(to), evidence, agents, logins, 1_000)
+    }
+
+    /// A chunked store ends where a whole one would: every row, the user
+    /// agents, the logins and the cursor.
+    #[test]
+    fn a_read_stored_a_chunk_at_a_time_stores_all_of_it_once() {
+        let db = Db::open_in_memory().unwrap();
+        let mut ingest = ingest_of(many_paths("203.0.113.5", 7), None, "c1");
+
+        let mut steps = 1;
+        while ingest.step(&db, 3).unwrap() == IngestStep::More {
+            steps += 1;
+        }
+
+        assert_eq!(steps, 3, "7 rows and 2 agents in chunks of 3");
+        assert_eq!(db.get_log_cursor("log").unwrap().as_deref(), Some("c1"));
+        let rows = db
+            .evidence_rows(Detector::WebScanners, 0, Rule::Once)
+            .unwrap();
+        assert_eq!(rows.len(), 7);
+        assert!(rows.iter().all(|r| r.tally.count == 1), "{rows:?}");
+        assert_eq!(db.list_user_agent_stats().unwrap().len(), 2);
+        assert_eq!(db.recent_ssh_login_ips().unwrap(), ["192.0.2.10"]);
+    }
+
+    /// The first step claims the lines by moving the cursor, so a second
+    /// reader of them stores nothing even while the first is part-way
+    /// through.
+    #[test]
+    fn a_second_reader_stores_nothing_while_the_first_is_part_way_through() {
+        let db = Db::open_in_memory().unwrap();
+        let mut first = ingest_of(many_paths("203.0.113.5", 5), None, "c1");
+        let mut second = ingest_of(many_paths("203.0.113.5", 5), None, "c1");
+
+        assert_eq!(first.step(&db, 2).unwrap(), IngestStep::More);
+        assert_eq!(
+            second.step(&db, 2).unwrap(),
+            IngestStep::Done { stored: false }
+        );
+        while first.step(&db, 2).unwrap() == IngestStep::More {}
+
+        let rows = db
+            .evidence_rows(Detector::WebScanners, 0, Rule::Once)
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|r| r.tally.count == 1), "{rows:?}");
+        let mozilla = db.user_agent_stat("Mozilla/5.0").unwrap().unwrap();
+        assert_eq!(mozilla.hit_count, 4, "counted once");
     }
 }

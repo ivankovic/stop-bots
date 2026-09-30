@@ -40,9 +40,10 @@
 //!   cannot, it is given none. Slow; on a blocking thread, outside the
 //!   lock. It streams a line at a time, so its memory is the evidence it
 //!   collects, not the file.
-//! - [`apply`] stores what the read found and where the next one resumes,
-//!   in one transaction per log (see `Db::ingest`), and prunes what has
-//!   fallen out of every window. Quick; back under the lock.
+//! - [`apply`] stores what the read found and where the next one resumes
+//!   (see `db::evidence::Ingest`), and prunes what has fallen out of every
+//!   window. Back under the lock; the web console takes it a chunk at a
+//!   time ([`store`]), so a large read does not hold it for all of it.
 //!
 //! Then each due job decides from the stored evidence: see
 //! `cron::run_log_jobs`.
@@ -64,7 +65,7 @@ use anyhow::Result;
 
 use crate::accesslog::{self, Clock, Counts, Watch};
 use crate::cron::CronJob;
-use crate::db::evidence::Ingested;
+use crate::db::evidence::{Ingest, IngestStep, INGEST_CHUNK};
 use crate::db::Db;
 use crate::evidence::Evidence;
 use crate::logread::{self, FileCursor};
@@ -477,8 +478,41 @@ pub struct Applied {
     pub access_counts: Counts,
 }
 
-/// Stores what `read` found. See the module docs.
+/// Stores what `read` found, all at once. See the module docs, and
+/// [`store`] for the form that lets the database go between chunks.
 pub fn apply(db: &Db, read: Read) -> Result<Applied> {
+    let mut storing = store(read);
+    loop {
+        if let Some(applied) = storing.step(db)? {
+            return Ok(applied);
+        }
+    }
+}
+
+/// Which log a [`Storing`] is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Log {
+    Access,
+    Ssh,
+}
+
+/// What a pass read, being stored one transaction at a time: each log's
+/// findings a chunk at a time (see [`Ingest`]), then the pruning. Holds no
+/// database, so the web console's cron can let the lock go between steps
+/// and a large pass does not keep every request, `/login` included,
+/// waiting for all of it.
+pub struct Storing {
+    applied: Applied,
+    pending: Vec<(Log, Ingest)>,
+    /// The access-stats tally, for when the access log's store is ours.
+    stats: crate::accessstats::AccessStatsOutcome,
+    /// The most rows a step writes.
+    chunk: usize,
+}
+
+/// Starts storing what `read` found. Nothing is written until
+/// [`Storing::step`].
+pub fn store(read: Read) -> Storing {
     let mut applied = Applied {
         now: read.now,
         access: Availability::NotRead,
@@ -487,26 +521,28 @@ pub fn apply(db: &Db, read: Read) -> Result<Applied> {
         stats: crate::accessstats::AccessStatsOutcome::default(),
         access_counts: Counts::default(),
     };
+    let mut pending = Vec::new();
+    let mut stats = crate::accessstats::AccessStatsOutcome::default();
 
     match read.access {
         None => {}
         Some(Outcome::Unavailable(tried)) => applied.access = Availability::Unavailable(tried),
         Some(Outcome::Read(log)) => {
-            let findings = &log.findings;
-            let stored = db.ingest(&Ingested {
-                source: &log.source,
-                from: log.from.as_deref(),
-                to: log.to.as_deref(),
-                evidence: &findings.evidence,
-                user_agents: &findings.user_agents,
-                logins: &[],
-                now: read.now,
-            })?;
-            if stored {
-                applied.stats = crate::accessstats::AccessStatsOutcome::of(&findings.user_agents);
-            }
+            let findings = log.findings;
+            stats = crate::accessstats::AccessStatsOutcome::of(&findings.user_agents);
             applied.access_counts = findings.counts;
-            applied.access = Availability::Read { stored };
+            pending.push((
+                Log::Access,
+                Ingest::new(
+                    &log.source,
+                    log.from.as_deref(),
+                    log.to.as_deref(),
+                    findings.evidence,
+                    findings.user_agents,
+                    Vec::new(),
+                    read.now,
+                ),
+            ));
         }
     }
 
@@ -514,32 +550,77 @@ pub fn apply(db: &Db, read: Read) -> Result<Applied> {
         None => {}
         Some(Outcome::Unavailable(tried)) => applied.ssh = Availability::Unavailable(tried),
         Some(Outcome::Read(log)) => {
-            let findings = &log.findings;
-            let stored = db.ingest(&Ingested {
-                source: &log.source,
-                from: log.from.as_deref(),
-                to: log.to.as_deref(),
-                evidence: &findings.evidence,
-                user_agents: &HashMap::new(),
-                logins: &findings.logins,
-                now: read.now,
-            })?;
+            let findings = log.findings;
             applied.logins = findings.logins.clone();
-            applied.ssh = Availability::Read { stored };
+            pending.push((
+                Log::Ssh,
+                Ingest::new(
+                    &log.source,
+                    log.from.as_deref(),
+                    log.to.as_deref(),
+                    findings.evidence,
+                    HashMap::new(),
+                    findings.logins,
+                    read.now,
+                ),
+            ));
         }
     }
 
-    // Whatever has fallen out of its detector's window can never count
-    // again. Every detector, on or off: one switched off keeps nothing
-    // longer than its window either.
-    db.batch(|| {
-        for detector in Detector::ALL {
-            let window = detector.window_seconds(db)?;
-            db.prune_evidence(detector, read.now - window)?;
+    // Stepped from the back.
+    pending.reverse();
+    Storing {
+        applied,
+        pending,
+        stats,
+        chunk: INGEST_CHUNK,
+    }
+}
+
+impl Storing {
+    /// Steps of at most `rows` rows, for a test that wants several without
+    /// a log of thousands of lines.
+    #[cfg(test)]
+    fn chunked(mut self, rows: usize) -> Storing {
+        self.chunk = rows;
+        self
+    }
+
+    /// Runs one transaction of the store: the next chunk of a log's
+    /// findings, or, once every log is stored, the pruning. `Some` with
+    /// what the pass stored when that was the last one.
+    pub fn step(&mut self, db: &Db) -> Result<Option<Applied>> {
+        if let Some((log, ingest)) = self.pending.last_mut() {
+            if let IngestStep::Done { stored } = ingest.step(db, self.chunk)? {
+                let log = *log;
+                self.pending.pop();
+                let read = Availability::Read { stored };
+                match log {
+                    Log::Access => {
+                        if stored {
+                            self.applied.stats = std::mem::take(&mut self.stats);
+                        }
+                        self.applied.access = read;
+                    }
+                    Log::Ssh => self.applied.ssh = read,
+                }
+            }
+            return Ok(None);
         }
-        Ok(())
-    })?;
-    Ok(applied)
+
+        // Whatever has fallen out of its detector's window can never count
+        // again. Every detector, on or off: one switched off keeps nothing
+        // longer than its window either.
+        let now = self.applied.now;
+        db.batch(|| {
+            for detector in Detector::ALL {
+                let window = detector.window_seconds(db)?;
+                db.prune_evidence(detector, now - window)?;
+            }
+            Ok(())
+        })?;
+        Ok(Some(self.applied.clone()))
+    }
 }
 
 /// A whole pass, for a caller with nothing to gain from splitting it: the
@@ -899,6 +980,45 @@ mod tests {
             .evidence_rows(Detector::ProbePaths, 0, Rule::Once)
             .unwrap();
         assert_eq!(rows[0].tally.count, 1);
+    }
+
+    /// Two readers of the same lines whose chunked stores interleave: the
+    /// first step of one claims the lines, and the other stores nothing,
+    /// whichever order their later steps run in.
+    #[test]
+    fn interleaved_chunked_stores_of_the_same_lines_count_them_once() {
+        let host = host();
+        let lines: String = (0..10)
+            .map(|n| {
+                format!(
+                    "203.0.113.9 - - [{}] \"GET / HTTP/1.1\" 200 1 \"-\" \"Agent/{n}\"\n",
+                    stamp(now())
+                )
+            })
+            .collect();
+        append(&host.access, &lines);
+        let jobs = [CronJob::RecordAccessStats];
+        let mut a = store(read(&plan(&host.db, &jobs, &Flags::default()).unwrap())).chunked(3);
+        let mut b = store(read(&plan(&host.db, &jobs, &Flags::default()).unwrap())).chunked(3);
+
+        let (mut done_a, mut done_b, mut steps) = (None, None, 0);
+        while done_a.is_none() || done_b.is_none() {
+            steps += 1;
+            if done_a.is_none() {
+                done_a = a.step(&host.db).unwrap();
+            }
+            if done_b.is_none() {
+                done_b = b.step(&host.db).unwrap();
+            }
+        }
+
+        assert!(steps > 2, "stored in one step: {steps}");
+        let (a, b) = (done_a.unwrap(), done_b.unwrap());
+        assert_eq!(a.access, Availability::Read { stored: true });
+        assert_eq!(b.access, Availability::Read { stored: false });
+        let stats = host.db.list_user_agent_stats().unwrap();
+        assert_eq!(stats.len(), 10);
+        assert!(stats.iter().all(|s| s.hit_count == 1), "counted twice");
     }
 
     /// The default path's old offset says nothing about another file.

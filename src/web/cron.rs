@@ -186,13 +186,27 @@ async fn run_log_jobs(state: &AppState, jobs: Vec<CronJob>) -> anyhow::Result<()
         .await
         .map_err(|err| anyhow::anyhow!("the log-reading thread panicked: {err}"))?;
 
+    // Stored one transaction at a time, letting the lock go between them:
+    // a large read stored whole kept every request waiting, `/login`
+    // included, for seconds. See `logscan::Storing`.
+    let mut storing = crate::logscan::store(read);
+    let applied = loop {
+        let (returned, done) = state
+            .with_db(move |db| {
+                let done = storing.step(db)?;
+                Ok((storing, done))
+            })
+            .await?;
+        storing = returned;
+        if let Some(applied) = done {
+            break applied;
+        }
+    };
+
     let out = state.firewall_out.clone();
     let apply = state.apply_for_real;
     state
-        .with_db(move |db| {
-            let applied = crate::logscan::apply(db, read)?;
-            cron::run_log_jobs(db, &jobs, &applied, out.as_deref(), apply)
-        })
+        .with_db(move |db| cron::run_log_jobs(db, &jobs, &applied, out.as_deref(), apply))
         .await?;
     Ok(())
 }

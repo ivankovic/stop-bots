@@ -202,6 +202,14 @@ impl Evidence {
         self.rows.len()
     }
 
+    /// Every row, given up for storing.
+    pub fn into_rows(self) -> Vec<(Detector, String, Item, Tally)> {
+        self.rows
+            .into_iter()
+            .map(|((detector, address, item), tally)| (detector, address.to_string(), item, tally))
+            .collect()
+    }
+
     /// Every row, for storing.
     pub fn iter(&self) -> impl Iterator<Item = (Detector, String, &Item, Tally)> + '_ {
         self.rows.iter().map(|((detector, address, item), tally)| {
