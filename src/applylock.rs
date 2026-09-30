@@ -97,12 +97,27 @@ impl std::fmt::Display for Busy {
 
 impl std::error::Error for Busy {}
 
+/// Where every process running as root takes the lock: the console's
+/// unit, a root crontab, the TUI and `sudo stop-bots` all meet here.
+///
+/// **One path for all of them, and it has to stay writable inside the
+/// console's sandbox**, or [`hold_at`] quietly proceeds unlocked there.
+/// The unit makes the filesystem read-only and lists `/run` among the
+/// paths it gives back (see `install::writable_paths`, and the test there
+/// that checks this path against the unit). `/run` is a tmpfs, so a lock
+/// file never outlives a boot.
+///
+/// Not a `RuntimeDirectory=` of the unit's own, which would narrow what
+/// the console may write in `/run`: the console needs all of `/run` for
+/// `nginx -t` anyway, and systemd removes a runtime directory when the
+/// unit stops — under a CLI that may be holding a lock file inside it,
+/// after which the next process locks a new file and two applies run.
+pub const ROOT_PATH: &str = "/run/stop-bots.lock";
+
 /// Where the lock lives.
 ///
-/// `/run/stop-bots.lock` for root, which is every process that can apply
-/// anything for real: the unit, a root crontab and `sudo stop-bots` all
-/// meet there. `/run` is a tmpfs, so a lock file never outlives a boot,
-/// and the unit's `ProtectSystem=yes` leaves it writable.
+/// [`ROOT_PATH`] for root, which is every process that can apply anything
+/// for real.
 ///
 /// Anyone else gets a path of their own — `$XDG_RUNTIME_DIR`, or the temp
 /// directory — because they cannot create files in `/run`, and because a
@@ -120,7 +135,7 @@ pub fn default_path() -> PathBuf {
 
 fn path_for(euid: u32, runtime_dir: Option<std::ffi::OsString>, temp: PathBuf) -> PathBuf {
     if euid == 0 {
-        return PathBuf::from("/run/stop-bots.lock");
+        return PathBuf::from(ROOT_PATH);
     }
     match runtime_dir.filter(|dir| !dir.is_empty()) {
         Some(dir) => PathBuf::from(dir).join("stop-bots.lock"),

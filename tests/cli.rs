@@ -3426,22 +3426,20 @@ fn install_web_writes_a_unit_and_a_password_under_a_prefix() {
     let unit = fs::read_to_string(tmp.path().join("etc/systemd/system/stop-bots-web.service"))
         .expect("no unit written");
     assert!(unit.contains(&format!("ExecStart={} web", binary.display())));
-    // Directive lines only: the unit's own comments name
-    // `ProtectSystem=full` to explain why it is not used, so a plain
-    // substring search finds it in the prose.
+    // Directive lines only: the unit's own comments name directives to
+    // explain them, so a plain substring search finds them in the prose.
     let directives: Vec<&str> = unit
         .lines()
         .map(str::trim)
         .filter(|line| !line.starts_with('#') && !line.is_empty())
         .collect();
-    assert!(
-        directives.contains(&"ProtectSystem=yes"),
-        "was: {directives:?}"
-    );
-    assert!(
-        !directives.contains(&"ProtectSystem=full"),
-        "full would make /etc read-only and break the first NGINX apply"
-    );
+    // Strict, with the NGINX config given back: without that line the
+    // first NGINX apply fails on a read-only /etc. Under the prefix, like
+    // every other path in the unit.
+    let nginx = format!("ReadWritePaths=-{}", tmp.path().join("etc/nginx").display());
+    for line in ["ProtectSystem=strict", nginx.as_str()] {
+        assert!(directives.contains(&line), "no {line}: {directives:?}");
+    }
     assert!(tmp.path().join("var/lib/stop-bots/db.sqlite3").exists());
     assert!(tmp.path().join("etc/stop-bots").is_dir());
 }
@@ -3503,6 +3501,41 @@ fn install_web_stores_the_proxy_settings() {
     assert!(db
         .get_bool_setting(stop_bots::web::SECURE_COOKIE_KEY, false)
         .unwrap());
+}
+
+/// `install web --root` is stored, as `set-nginx-commands --root` would
+/// store it, because the service reads the root from the database — and
+/// the unit lets the service write there. It used to be accepted and
+/// then ignored.
+#[test]
+fn install_web_stores_the_nginx_root_and_lets_the_service_write_it() {
+    let (tmp, binary) = fake_debian_root();
+    stop_bots_bin()
+        .args([
+            "install",
+            "web",
+            "--prefix",
+            tmp.path().to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+            "--root",
+            "/srv/nginx",
+        ])
+        .assert()
+        .success();
+
+    let db = stop_bots::db::Db::open(tmp.path().join("var/lib/stop-bots/db.sqlite3")).unwrap();
+    assert_eq!(
+        stop_bots::nginx::root(&db, None).unwrap(),
+        std::path::PathBuf::from("/srv/nginx")
+    );
+    let unit =
+        fs::read_to_string(tmp.path().join("etc/systemd/system/stop-bots-web.service")).unwrap();
+    assert!(
+        unit.lines()
+            .any(|line| line == "ReadWritePaths=-/srv/nginx"),
+        "unit was:\n{unit}"
+    );
 }
 
 /// `--dry-run` has to be trustworthy or nobody will use it on the one

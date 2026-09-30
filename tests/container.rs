@@ -1149,15 +1149,30 @@ impl Host {
     /// can prove its own teeth by removing a directive and watching the
     /// command fail.
     fn oneshot_under_web_sandbox(&self, probe: &str, command: &str, mangle: &str) -> bool {
+        self.oneshot_under_sandbox_of("stop-bots-web.service", probe, command, mangle)
+    }
+
+    /// [`Self::oneshot_under_web_sandbox`] for any unit `install` wrote.
+    ///
+    /// Its `Condition*` lines go too: the firewall unit's
+    /// `ConditionPathExists` would otherwise skip a probe whose script is
+    /// not there, and systemd counts a skipped start as a successful one.
+    fn oneshot_under_sandbox_of(
+        &self,
+        unit: &str,
+        probe: &str,
+        command: &str,
+        mangle: &str,
+    ) -> bool {
         self.sh(&format!(
             "set -e\n\
              sed -e 's|^ExecStart=.*|ExecStart={command}|' \
                  -e 's|^Type=.*|Type=oneshot|' \
                  -e 's|^Restart=.*||' \
+                 -e '/^Condition/d' \
                  /etc/systemd/system/{unit} {mangle} \
                  > /etc/systemd/system/{probe}.service\n\
              systemctl daemon-reload",
-            unit = "stop-bots-web.service",
         ));
         self.try_start(&format!("{probe}.service"))
     }
@@ -1288,6 +1303,15 @@ fn install_web_writes_a_unit_that_systemd_actually_starts() {
         high.parse::<u64>().is_ok(),
         "MemoryHigh is not a byte limit, so nothing throttles the console: {high}"
     );
+
+    // A descriptor per held connection: the default soft limit of 1024
+    // ran out at about 1,100 of them.
+    let limits = host.sh(&format!("grep 'Max open files' /proc/{pid}/limits"));
+    assert!(
+        limits.split_whitespace().nth(3) == Some("16384"),
+        "the console's soft descriptor limit is not 16384:\n{limits}"
+    );
+    assert_eq!(host.unit("stop-bots-web.service", "TasksMax"), "1024");
 }
 
 /// **The netlink bug, reproduced and then fixed, in one test.**
@@ -1401,11 +1425,11 @@ fn installing_from_a_hidden_directory_is_refused_before_systemd_can_fail() {
     );
 }
 
-/// The unit's own comment says `ProtectSystem=full` is deliberately absent
-/// because it would make `/etc` read-only and break the first apply "an
-/// hour after the unit started cleanly". That was a claim with nothing
-/// behind it. This runs a real apply through the real sandbox, and then
-/// through the stricter one, so the comment is a test result.
+/// `ProtectSystem=strict` makes `/etc` read-only, and the unit gives
+/// `/etc/nginx` back with `ReadWritePaths=`. Without that line the first
+/// apply fails "an hour after the unit started cleanly". This runs a real
+/// apply through the real sandbox, and then through the same sandbox with
+/// that one line taken out, so the line is a test result.
 #[test]
 fn the_sandbox_still_lets_the_service_rewrite_nginx_config() {
     if !enabled() {
@@ -1418,20 +1442,26 @@ fn the_sandbox_still_lets_the_service_rewrite_nginx_config() {
     let apply = format!("/usr/local/bin/stop-bots apply-blocks --root /etc/nginx/sites-enabled --no-reload --db {HOST_DB}");
 
     let strict = host.oneshot_under_web_sandbox(
-        "probe-protect-full",
+        "probe-without-etc-nginx",
         &apply,
-        "| sed -e 's/^ProtectSystem=.*/ProtectSystem=full/'",
+        "| sed -e '/^ReadWritePaths=-\\/etc\\/nginx$/d'",
     );
     assert!(
         !strict,
-        "ProtectSystem=full did not stop the apply, so the reason the unit gives for not using it is wrong"
+        "taking /etc/nginx out of ReadWritePaths did not stop the apply, so either \
+         the sandbox is not enforced or that line is not what allows it"
+    );
+    let journal = host.journal("probe-without-etc-nginx.service");
+    assert!(
+        journal.contains("Read-only file system"),
+        "the apply failed, but not on the read-only /etc/nginx:\n{journal}"
     );
 
-    let asgenerated = host.oneshot_under_web_sandbox("probe-protect-yes", &apply, "");
+    let asgenerated = host.oneshot_under_web_sandbox("probe-as-generated", &apply, "");
     assert!(
         asgenerated,
         "the generated sandbox blocks the apply it exists to allow. journal:\n{}",
-        host.journal("probe-protect-yes.service")
+        host.journal("probe-as-generated.service")
     );
     let applied = host.sh("cat /etc/nginx/sites-enabled/test-site.conf");
     assert!(
@@ -1677,10 +1707,38 @@ fn reinstalling_over_a_0_0_15_unit_upgrades_it_without_force() {
     if !enabled() {
         return;
     }
-    let host = Host::start("stop-bots-upgrade-unit");
+    reinstalling_upgrades(
+        "stop-bots-upgrade-unit",
+        "stop-bots-web-0.0.15.service",
+        "0.0.7 to 0.0.15",
+    );
+}
+
+/// The same from 0.1.0-rc.1, whose unit is recognised by its template
+/// hash, and whose `ProtectSystem=yes` gives way to the stricter sandbox.
+#[test]
+fn reinstalling_over_an_0_1_0_rc_1_unit_upgrades_it_without_force() {
+    if !enabled() {
+        return;
+    }
+    let host = reinstalling_upgrades(
+        "stop-bots-upgrade-rc1",
+        "stop-bots-web-0.1.0-rc.1.service",
+        "0.1.0-rc.1",
+    );
+    assert_eq!(
+        host.unit("stop-bots-web.service", "ProtectSystem"),
+        "strict"
+    );
+}
+
+/// Puts `fixture` where `install web` writes its unit, re-installs with
+/// no `--force`, and checks it was replaced and the console runs.
+fn reinstalling_upgrades(name: &str, fixture: &str, releases: &str) -> Host {
+    let host = Host::start(name);
     host.put(
         &format!(
-            "{}/tests/fixtures/units/stop-bots-web-0.0.15.service",
+            "{}/tests/fixtures/units/{fixture}",
             env!("CARGO_MANIFEST_DIR")
         ),
         "/etc/systemd/system/stop-bots-web.service",
@@ -1689,15 +1747,15 @@ fn reinstalling_over_a_0_0_15_unit_upgrades_it_without_force() {
     let (ok, stdout, stderr) = host.run("stop-bots install web");
 
     let said = format!("{stdout}{stderr}");
-    assert!(ok, "the 0.0.15 unit was taken for an edit:\n{said}");
+    assert!(ok, "the {releases} unit was taken for an edit:\n{said}");
     assert!(
-        said.contains("unedited since stop-bots 0.0.7 to 0.0.15"),
+        said.contains(&format!("unedited since stop-bots {releases}")),
         "{said}"
     );
+    let unit = host.sh("cat /etc/systemd/system/stop-bots-web.service");
     assert!(
-        host.sh("cat /etc/systemd/system/stop-bots-web.service")
-            .contains("# stop-bots-template: "),
-        "the unit was not replaced"
+        unit.contains("# stop-bots-template: ") && unit.contains("ProtectSystem=strict"),
+        "the unit was not replaced:\n{unit}"
     );
     assert_eq!(
         host.unit("stop-bots-web.service", "ActiveState"),
@@ -1705,6 +1763,7 @@ fn reinstalling_over_a_0_0_15_unit_upgrades_it_without_force() {
         "journal:\n{}",
         host.journal("stop-bots-web.service")
     );
+    host
 }
 
 /// `uninstall` puts the host back as it was: every site file byte for
@@ -1914,6 +1973,252 @@ fn the_generated_sandbox_lets_the_iptables_backend_reach_netlink() {
     assert!(
         host.sh("iptables -S STOP-BOTS").contains("203.0.113.11"),
         "the apply reported success but the rule is not in the live iptables chain"
+    );
+}
+
+/// **The security review's finding, closed for writes.** The console runs
+/// as root, and under `ProtectSystem=yes` a write it was tricked into could
+/// land in `/etc/cron.d` or a systemd unit — root again at the next cron
+/// minute or boot, outside any sandbox. Under the generated unit each of
+/// those is refused by the filesystem itself.
+///
+/// The control runs first: the same write under 0.1.0-rc.1's
+/// `ProtectSystem=yes` lands, so the refusals below are the sandbox and
+/// not the probe failing for some other reason.
+#[test]
+fn the_console_cannot_write_cron_units_or_binaries() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::installed("stop-bots-no-persistence");
+    // This image has no cron; the directories are what matter.
+    host.sh("mkdir -p /etc/cron.d /var/spool/cron/crontabs");
+
+    let loose = host.oneshot_under_web_sandbox(
+        "probe-cron-under-yes",
+        "/usr/bin/touch /etc/cron.d/stop-bots-probe",
+        "| sed -e 's/^ProtectSystem=.*/ProtectSystem=yes/'",
+    );
+    assert!(
+        loose && host.run("test -e /etc/cron.d/stop-bots-probe").0,
+        "the control did not write to /etc/cron.d, so the refusals below prove nothing. journal:\n{}",
+        host.journal("probe-cron-under-yes.service")
+    );
+    host.sh("rm /etc/cron.d/stop-bots-probe");
+
+    for (index, path) in [
+        "/etc/cron.d/stop-bots-probe",
+        "/var/spool/cron/crontabs/root",
+        "/etc/systemd/system/stop-bots-probe.service",
+        "/usr/local/bin/stop-bots-probe",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let probe = format!("probe-persist-{index}");
+        let wrote = host.oneshot_under_web_sandbox(&probe, &format!("/usr/bin/touch {path}"), "");
+        let journal = host.journal(&format!("{probe}.service"));
+        assert!(
+            !wrote && !host.run(&format!("test -e {path}")).0,
+            "the console's sandbox let it write {path}"
+        );
+        assert!(
+            journal.contains("Read-only file system"),
+            "{path} was refused, but not by the sandbox:\n{journal}"
+        );
+    }
+}
+
+/// And under that sandbox the console still does every job it has, through
+/// its own buttons: NGINX and the firewall applied, its database written in
+/// WAL mode, the apply lock taken in the file every other stop-bots uses,
+/// and Web Access set up.
+///
+/// Two things here are the ways a narrower sandbox broke during this
+/// change. NGINX is restarted after the console starts, which replaces
+/// `/run/nginx.pid` — the file `nginx -t` opens — and a grant of that file
+/// alone did not survive it. And the site file belongs to www-data, so
+/// rewriting it with its owner and mode kept takes CAP_CHOWN and
+/// CAP_FOWNER.
+#[test]
+fn the_console_under_its_unit_still_does_everything_it_is_for() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-sandboxed-console");
+    let site = "/etc/nginx/sites-enabled/test-site.conf";
+    host.sh(&format!(
+        "chown www-data:www-data {site} && chmod 0640 {site}"
+    ));
+    let console = host.console();
+    host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    host.seed_bot("badbot", "BadBot");
+    host.stop_bots("add-firewall-rule --address 203.0.113.80");
+    // A generated conf.d file, which the console records in its database
+    // before writing it.
+    host.stop_bots("set-rate-limit --enabled true");
+    host.sh("systemctl restart nginx && rm -f /run/stop-bots.lock");
+
+    let flash = console.post("/apply-all", &[]);
+
+    assert!(
+        host.ruleset().contains("203.0.113.80"),
+        "the firewall half did not reach the kernel. console said:\n{flash}"
+    );
+    let mut blocked = String::new();
+    for _ in 0..50 {
+        blocked = host
+            .sh("curl -s -o /dev/null -w '%{http_code}' -A 'BadBot/1.0' http://127.0.0.1:8080/");
+        if blocked.trim() == "403" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        blocked.trim(),
+        "403",
+        "the NGINX half did not take effect. console said:\n{flash}"
+    );
+    assert_eq!(
+        host.sh(&format!("stat -c '%U:%G %a' {site}")).trim(),
+        "www-data:www-data 640",
+        "the site file lost its owner or mode when the console rewrote it"
+    );
+
+    // The lock file holds the pid of whoever last took it: the console,
+    // in the same file the CLI and the TUI lock.
+    assert_eq!(
+        host.sh("cat /run/stop-bots.lock").trim(),
+        host.unit("stop-bots-web.service", "MainPID"),
+        "the console applied without taking the shared apply lock"
+    );
+
+    let sqlite = |sql: &str| host.sh(&format!("sqlite3 -cmd '.timeout 5000' {HOST_DB} \"{sql}\""));
+    assert_eq!(sqlite("PRAGMA journal_mode").trim(), "wal");
+    assert!(
+        host.run(&format!("test -e {HOST_DB}-wal")).0,
+        "the console's database has no write-ahead log beside it"
+    );
+    let recorded = sqlite("SELECT path FROM managed_files");
+    assert!(
+        recorded.contains("/etc/nginx/conf.d/stop-bots-limits.conf")
+            && host
+                .run("test -f /etc/nginx/conf.d/stop-bots-limits.conf")
+                .0,
+        "the console did not record and write its conf.d file. recorded:\n{recorded}"
+    );
+
+    let flash = console.post(
+        "/web-access",
+        &[
+            ("mode", "path"),
+            ("site", "test.example"),
+            ("prefix", "/stop-bots/"),
+            ("host", ""),
+        ],
+    );
+    let config = host.sh(&format!("cat {site}"));
+    assert!(
+        config.contains(r#"location "/stop-bots/""#),
+        "Web Access wrote no location block. console said:\n{flash}"
+    );
+    let (ok, out, err) = host.run("nginx -t");
+    assert!(ok, "Web Access left a config NGINX refuses:\n{out}{err}");
+
+    let journal = host.journal("stop-bots-web.service");
+    assert!(
+        !journal.contains("Read-only file system"),
+        "the console hit its sandbox somewhere:\n{journal}"
+    );
+}
+
+/// The boot unit runs, as root, a script the console writes. Under its
+/// sandbox that script can load rules and nothing else: it cannot write
+/// to `/etc/cron.d`, and it cannot ask systemd to — the escape the web
+/// console, which needs `systemctl`, still has.
+///
+/// The control proves the escape is real: the same sandbox with `AF_UNIX`
+/// put back lets `systemd-run` write where the sandbox itself cannot.
+#[test]
+fn the_boot_unit_can_load_rules_but_not_write_or_reach_systemd() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-boot-sandbox");
+    host.stop_bots("add-firewall-rule --address 203.0.113.90");
+    host.stop_bots("render-firewall --apply --force");
+    host.sh("stop-bots install firewall");
+    host.sh("mkdir -p /etc/cron.d && systemctl start dbus.socket dbus.service");
+    let unit = "stop-bots-firewall.service";
+    let escape = "/usr/bin/systemd-run --wait -q /usr/bin/touch /etc/cron.d/stop-bots-escaped";
+
+    let with_unix = host.oneshot_under_sandbox_of(
+        unit,
+        "probe-boot-with-unix",
+        escape,
+        "| sed -e 's/^RestrictAddressFamilies=.*/& AF_UNIX/'",
+    );
+    assert!(
+        with_unix && host.run("test -e /etc/cron.d/stop-bots-escaped").0,
+        "the control could not reach systemd, so the refusal below proves nothing. journal:\n{}",
+        host.journal("probe-boot-with-unix.service")
+    );
+    host.sh("rm /etc/cron.d/stop-bots-escaped");
+
+    let escaped = host.oneshot_under_sandbox_of(unit, "probe-boot-escape", escape, "");
+    assert!(
+        !escaped && !host.run("test -e /etc/cron.d/stop-bots-escaped").0,
+        "a script run by the boot unit had systemd write /etc/cron.d for it"
+    );
+    let wrote = host.oneshot_under_sandbox_of(
+        unit,
+        "probe-boot-write",
+        "/usr/bin/touch /etc/cron.d/stop-bots-probe",
+        "",
+    );
+    assert!(
+        !wrote && !host.run("test -e /etc/cron.d/stop-bots-probe").0,
+        "a script run by the boot unit wrote /etc/cron.d"
+    );
+
+    // And it still does its one job, the way a boot runs it.
+    host.sh("nft delete table inet stop_bots");
+    host.sh("systemctl restart stop-bots-firewall.service");
+    assert!(
+        host.run("nft get element inet stop_bots block_v4 '{ 203.0.113.90 }'")
+            .0,
+        "the hardened boot unit did not load the applied rules. journal:\n{}",
+        host.journal(unit)
+    );
+}
+
+/// The iptables boot unit is a shell script under the same sandbox, plus
+/// what iptables-legacy needs. It has to bring the chain back.
+#[test]
+fn the_iptables_boot_unit_restores_the_chain_under_its_sandbox() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-boot-iptables");
+    host.stop_bots("set-firewall-backend --backend iptables");
+    host.stop_bots("add-firewall-rule --address 203.0.113.91");
+    host.stop_bots("render-firewall --apply --force");
+    host.sh("stop-bots install firewall");
+
+    host.sh(
+        "iptables -D INPUT -j STOP-BOTS && iptables -D FORWARD -j STOP-BOTS \
+         && iptables -F STOP-BOTS && iptables -X STOP-BOTS && rm -f /run/xtables.lock",
+    );
+    let started = host.try_start("stop-bots-firewall.service");
+
+    assert!(
+        started,
+        "the iptables boot unit failed under its sandbox. journal:\n{}",
+        host.journal("stop-bots-firewall.service")
+    );
+    assert!(
+        host.sh("iptables -S STOP-BOTS").contains("203.0.113.91"),
+        "the unit ran but the chain did not come back"
     );
 }
 

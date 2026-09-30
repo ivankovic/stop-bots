@@ -60,6 +60,14 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - Direction overrides and zero-width characters in a user agent are shown as `\u{202E}`.
 - The login page no longer names the host, and errors before login say nothing of
   their cause; `/nginx/<unknown id>` is a 404.
+- **The web console's unit is `ProtectSystem=strict`**: it can write its database,
+  `/etc/stop-bots`, the NGINX config and logs, and `/run`, and nothing else —
+  not `/etc/cron.d`, systemd units or binaries. Capabilities are cut to the six
+  it uses, and it gets `LimitNOFILE=16384` and `TasksMax=1024`.
+- **The firewall boot unit is sandboxed too**: read-only, no `AF_UNIX` (so the
+  script it loads cannot ask systemd for anything), network capabilities only.
+- Re-run `sudo stop-bots install web` and `install firewall` to get both; an
+  unedited unit from 0.1.0-rc.1 or 0.0.x is replaced without `--force`.
 
 ### Changed
 
@@ -68,6 +76,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   operator (`u`, "Update everything", or `batch`) instead of fetching on the first tick.
 - Stored entries left out of the NGINX config are named: by `status` and the
   Dashboards (`skipped-entries`), on stderr by `apply-blocks`, and counted by `batch`.
+
+### Fixed
+
+- `install web --root` is stored, as `set-nginx-commands --root` would; it was
+  accepted and ignored.
 
 ## [0.1.0-rc.1] — 2026-09-30
 

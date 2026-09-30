@@ -3593,17 +3593,6 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
 
     let prefix = options.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
     let mut layout = Layout::under(&prefix, binary);
-    // `--root` has its own default and is absolute, so it replaces what the
-    // prefix produced rather than being joined onto it. Under a prefix that
-    // means the unit names the real path, which is right: a prefixed install
-    // is for reading the output, not running it.
-    // Not resolved from the database here, and not named in ExecStart: the
-    // running service reads the stored root itself. Opening a database would
-    // also break `install web --dry-run`, which is documented to print the
-    // plan and touch nothing -- including a database that may not exist yet.
-    if let Some(root) = options.root {
-        layout.nginx_root = root;
-    }
     // Stays `None` unless the operator passed `--ssh-log`, which is what
     // keeps the flag out of `ExecStart` and leaves the service free to find
     // the log itself. See `install::Layout::ssh_log`.
@@ -3624,6 +3613,12 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         .and_then(|text| install::legacy::web_unit(&text))
         .and_then(|unit| unit.root)
         .filter(|root| root != Path::new(nginx::DEFAULT_ROOT));
+
+    // Not named in ExecStart: the running service reads the stored root
+    // itself, so `--root` (or the old unit's) is stored below, as
+    // `set-nginx-commands --root` would. The unit only has to let the
+    // service write there; `install_web` adds the root already stored.
+    layout.nginx_roots = options.root.iter().chain(&legacy_root).cloned().collect();
 
     let mut steps = install::install_web(&layout, &opts)?;
 
@@ -3677,7 +3672,15 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
             "bind {addr} recorded in {}",
             layout.db_path.display()
         ));
-        if let Some(root) = &legacy_root {
+        if let Some(root) = &options.root {
+            // As given, like `set-nginx-commands --root`.
+            db.set_text_setting(nginx::NginxCommands::ROOT_KEY, &root.display().to_string())?;
+            steps.push(format!(
+                "NGINX root {} recorded in {}",
+                root.display(),
+                layout.db_path.display()
+            ));
+        } else if let Some(root) = &legacy_root {
             let key = nginx::NginxCommands::ROOT_KEY;
             if db.get_text_setting(key)?.is_none() {
                 db.set_text_setting(key, &root.to_string_lossy())?;

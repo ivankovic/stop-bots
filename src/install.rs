@@ -55,11 +55,24 @@
 //! dropping privilege would mean the web UI silently losing the ability to
 //! apply anything, which is worse than saying plainly what it needs.
 //!
-//! The hardening directives in the generated unit are the ones that
-//! survive that requirement. `ProtectSystem=full` would make `/etc`
-//! read-only and break writing NGINX config on the first apply, an hour
-//! after the unit started cleanly — so it is `ProtectSystem=yes`, which
-//! only covers `/usr` and `/boot`.
+//! What the unit can do is keep that root to the files it is for.
+//! `ProtectSystem=strict` makes the whole tree read-only, and
+//! `ReadWritePaths=` gives back exactly what the console writes — see
+//! [`writable_paths`]. The list has to be complete: a path missing from it
+//! is not a failed start but an apply that fails an hour later with "Read-only
+//! file system", so every entry is there because the container suite
+//! watched something fail without it.
+//!
+//! It is defence in depth, not a boundary against code running as the
+//! service: root that can reach systemd over D-Bus, which `systemctl reload
+//! nginx` needs, can ask systemd to start anything outside it, and NGINX
+//! itself runs as root on the config the console writes. What it does stop
+//! is a stray or tricked write landing in `/etc/cron.d`, a systemd unit or
+//! a binary — the persistent footholds.
+//!
+//! The firewall boot unit is sandboxed harder, because it needs less: it
+//! loads one script and has no business with systemd at all, so it gets no
+//! `AF_UNIX` and no capability beyond the network. See [`firewall_unit`].
 
 use std::path::{Path, PathBuf};
 
@@ -111,8 +124,26 @@ pub struct Layout {
     pub db_path: PathBuf,
     /// The `stop-bots` binary the unit's `ExecStart` will name.
     pub binary: PathBuf,
-    /// The NGINX config root to scan.
-    pub nginx_root: PathBuf,
+    /// `/etc/nginx`, the stock NGINX config root. Always writable by the
+    /// service, whatever root it manages: with no `conf.d` beside the
+    /// sites, the generated `conf.d` files go to `/etc/nginx/conf.d`.
+    pub nginx_dir: PathBuf,
+    /// Every other NGINX config root the service may manage: `--root`, the
+    /// one a 0.0.x unit named, and — added by [`install_web`] — the one
+    /// the database stores (`set-nginx-commands --root`). Only paths the
+    /// unit has to let the service write; the service itself reads the
+    /// stored root.
+    pub nginx_roots: Vec<PathBuf>,
+    /// `/var/log/nginx`. Written, not only read: `nginx -t` opens every
+    /// log the config names for writing, and fails on one it cannot.
+    pub nginx_log_dir: PathBuf,
+    /// The access log the database stores (`set-log-paths`), if any.
+    /// NGINX writes it, so its directory is one more that `nginx -t` opens
+    /// a file in. Filled in by [`install_web`], like `nginx_root`.
+    pub access_log: Option<PathBuf>,
+    /// `/run`. Writable for the service; see [`writable_paths`] for why
+    /// the whole of it rather than the three files it uses there.
+    pub run_dir: PathBuf,
     /// An explicit SSH log for the unit to name, or `None` to let the
     /// service find its own at runtime.
     ///
@@ -175,7 +206,11 @@ impl Layout {
             output_dir: prefix.join("etc/stop-bots"),
             db_path: prefix.join("var/lib/stop-bots/db.sqlite3"),
             binary,
-            nginx_root: prefix.join("etc/nginx"),
+            nginx_dir: prefix.join("etc/nginx"),
+            nginx_roots: Vec::new(),
+            nginx_log_dir: prefix.join("var/log/nginx"),
+            access_log: None,
+            run_dir: prefix.join("run"),
             ssh_log: None,
             systemd_marker: prefix.join("run/systemd/system"),
             debian_marker: prefix.join("etc/debian_version"),
@@ -193,6 +228,120 @@ impl Layout {
     pub fn unit_path(&self) -> PathBuf {
         self.unit_dir.join(WEB_UNIT)
     }
+
+    /// This layout with the stored NGINX root added to `nginx_roots`, and
+    /// `access_log` filled in from the database at `db_path` if the caller
+    /// left it unset.
+    ///
+    /// Read-only, and only if the database is there: `install web
+    /// --dry-run` promises to touch nothing, and `Db::open` would create
+    /// or migrate the file.
+    fn with_stored_settings(&self) -> Layout {
+        let mut layout = self.clone();
+        layout.nginx_roots.extend(
+            stored_setting_at(&self.db_path, crate::db::keys::NGINX_ROOT).map(PathBuf::from),
+        );
+        if layout.access_log.is_none() {
+            layout.access_log = stored_setting_at(&self.db_path, crate::db::keys::LOGS_ACCESS_PATH)
+                .map(PathBuf::from);
+        }
+        layout
+    }
+}
+
+/// One setting from the database at `db_path`, without creating,
+/// migrating or writing it. `None` for no database, no such row, an empty
+/// value, or a database this cannot read — in every one of those cases
+/// the service falls back to the stock paths, which the unit always
+/// allows.
+fn stored_setting_at(db_path: &Path, key: &str) -> Option<String> {
+    use rusqlite::OpenFlags;
+    if !db_path.is_file() {
+        return None;
+    }
+    // Not READ_ONLY, for the reason `uninstall` gives: a read-only
+    // connection to a WAL database creates `-wal` and `-shm` and then
+    // cannot delete them. Nor `Db::open`, which would migrate.
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    // A running console may be mid-write.
+    conn.busy_timeout(std::time::Duration::from_secs(5)).ok()?;
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+        row.get::<_, String>(0)
+    })
+    .ok()
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+/// Every path the web console writes, in the order the unit lists them.
+///
+/// What each one is for:
+///
+/// - the state directory: the database, and SQLite's `-wal` and `-shm`
+///   beside it, and the `.bak-v*` copy an upgrade makes there;
+/// - `/etc/stop-bots`: the firewall scripts and `nginx/` (`robots.txt`);
+/// - `/etc/nginx`, and the root the service manages if that is elsewhere:
+///   the site files it injects blocks into and the `conf.d` files it
+///   generates, including Web Access's;
+/// - `/var/log/nginx`, and the stored access log's directory: `nginx -t`
+///   opens every log the config names for writing, and fails the test on
+///   one it cannot open;
+/// - `/run`, whole. `nginx -t` creates `/run/nginx.pid`, and granting just
+///   that file does not work: a grant is a bind mount of that one inode,
+///   NGINX deletes and recreates the file whenever it restarts, and the
+///   next `nginx -t` fails on a read-only `/run` until the console is
+///   restarted too. `/run` is also where the apply lock is
+///   ([`crate::applylock`]) and where legacy `iptables` takes
+///   `xtables.lock`. It is a tmpfs, so nothing written there outlives a
+///   boot, and what it could otherwise offer is systemd, which the console
+///   reaches over D-Bus regardless.
+///
+/// Every one is optional (`-`): a missing path is skipped instead of
+/// failing the start with `226/NAMESPACE`, because the console is most
+/// worth reaching when something on the host is not where it should be.
+/// A path inside one already listed is left out, and so is a relative one,
+/// which systemd would reject.
+pub fn writable_paths(layout: &Layout) -> Vec<PathBuf> {
+    let mut candidates = vec![
+        layout.state_dir.clone(),
+        layout.output_dir.clone(),
+        layout.nginx_dir.clone(),
+    ];
+    candidates.extend(layout.nginx_roots.iter().cloned());
+    candidates.push(layout.nginx_log_dir.clone());
+    candidates.extend(
+        layout
+            .access_log
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf),
+    );
+    candidates.push(layout.run_dir.clone());
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for path in candidates {
+        if path.is_absolute() && !paths.iter().any(|listed| path.starts_with(listed)) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// One optional `ReadWritePaths=` entry: `-` and the path, quoted and
+/// escaped the way systemd parses that directive.
+///
+/// Not [`systemd_arg`]: this directive expands `%` specifiers but not `$`
+/// variables, so `$` stays as it is. Quoted as one word, dash included, so
+/// the dash is still the first character once systemd has unquoted it.
+/// Checked against systemd 257, which read `"-/srv/a b"`, `"-/srv/c\"d"`,
+/// `"-/srv/e\\f"`, `-/srv/p%%q` and `-/srv/d$x` back as the directories
+/// they name.
+fn read_write_path(path: &Path) -> String {
+    systemd_word(&format!("-{}", path.to_string_lossy()), false)
 }
 
 /// What the caller asked for, beyond the paths.
@@ -309,6 +458,11 @@ pub fn web_unit(layout: &Layout) -> String {
     }
     exec.push('\n');
 
+    let writable: String = writable_paths(layout)
+        .iter()
+        .map(|path| format!("ReadWritePaths={}\n", read_write_path(path)))
+        .collect();
+
     seal(&format!(
         "# {generated_by}, with `stop-bots install web`.\n\
          #\n\
@@ -339,14 +493,22 @@ pub fn web_unit(layout: &Layout) -> String {
          \n\
          # Runs as root, and has to: it rewrites this host's NGINX config, writes\n\
          # the firewall script, and runs `nginx -t` and `systemctl reload nginx`.\n\
-         # The directives below are the hardening that survives that. Notably\n\
-         # absent is ProtectSystem=full, which would make /etc read-only and break\n\
-         # the first apply — an hour after the unit started cleanly.\n\
+         # The directives below keep that root to those files. ProtectSystem=strict\n\
+         # makes everything read-only, and ReadWritePaths= gives back what the\n\
+         # console writes: its database, /etc/stop-bots, the NGINX config, the\n\
+         # NGINX logs (`nginx -t` opens them for writing), and /run (`nginx -t`\n\
+         # creates /run/nginx.pid, which NGINX replaces whenever it restarts, so\n\
+         # granting that one file stops working after the next restart). Cron,\n\
+         # the systemd units and every binary stay out of reach. `-`: a missing\n\
+         # path is skipped, rather than keeping the console from starting.\n\
          NoNewPrivileges=yes\n\
          PrivateTmp=yes\n\
-         ProtectSystem=yes\n\
+         ProtectSystem=strict\n\
+         {writable}\
          ProtectHome=yes\n\
+         PrivateDevices=yes\n\
          ProtectClock=yes\n\
+         ProtectHostname=yes\n\
          ProtectKernelTunables=yes\n\
          ProtectKernelModules=yes\n\
          ProtectKernelLogs=yes\n\
@@ -354,7 +516,16 @@ pub fn web_unit(layout: &Layout) -> String {
          RestrictSUIDSGID=yes\n\
          RestrictRealtime=yes\n\
          RestrictNamespaces=yes\n\
+         LockPersonality=yes\n\
+         MemoryDenyWriteExecute=yes\n\
          SystemCallArchitectures=native\n\
+         # CAP_NET_ADMIN and CAP_NET_RAW to load the firewall. CAP_DAC_OVERRIDE\n\
+         # because the logs it reads and `nginx -t` opens belong to www-data and\n\
+         # adm, not root. CAP_CHOWN and CAP_FOWNER because a site file keeps its\n\
+         # owner and mode when it is rewritten. CAP_NET_BIND_SERVICE for a console\n\
+         # bound below port 1024. Nothing else, and above all not CAP_SYS_ADMIN,\n\
+         # with which root can remount what ProtectSystem made read-only.\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_NET_BIND_SERVICE\n\
          # AF_UNIX for the dbus socket `systemctl reload nginx` talks over,\n\
          # AF_INET/AF_INET6 for the console itself and the list downloads,\n\
          # and AF_NETLINK because the console applies the firewall script:\n\
@@ -384,14 +555,19 @@ pub fn web_unit(layout: &Layout) -> String {
          # 256 MB and 512 MB on a 1 GB VPS, and more on a machine that has it.\n\
          MemoryHigh=25%\n\
          MemoryMax=50%\n\
+         # A descriptor per connection: the default soft limit of 1024 ran out\n\
+         # at about 1,100 held connections. TasksMax bounds threads and child\n\
+         # processes together, well above the 512 blocking threads tokio may use.\n\
+         LimitNOFILE=16384\n\
+         TasksMax=1024\n\
          \n\
-         # Three that `systemd-analyze security` will still flag, each on\n\
-         # purpose. User= — see above. CapabilityBoundingSet= — root's ability\n\
-         # to write a file it does not own *is* CAP_DAC_OVERRIDE, so trimming\n\
-         # the set is how you get a service that starts cleanly and cannot\n\
-         # write /etc/nginx an hour later. MemoryDenyWriteExecute= — safe for a\n\
-         # Rust binary with no JIT, but nobody has run this unit with it on,\n\
-         # and an untested sandbox directive is not hardening.\n\
+         # What this does not stop: root that can reach systemd over D-Bus, as\n\
+         # `systemctl reload nginx` must, can have systemd run anything outside\n\
+         # this sandbox, and NGINX runs as root on the config written here. It\n\
+         # turns a stray or tricked write into nothing; it is not a boundary\n\
+         # against code running as this service. Also absent on purpose: User=,\n\
+         # see above, and SystemCallFilter=, because the NGINX commands this runs\n\
+         # are the operator's (`docker exec ...`) and untested under a filter.\n\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
@@ -514,7 +690,12 @@ fn plan_unit(state: &Existing, path: &Path, force: bool, retry: &str) -> Result<
 /// ordinary path comes back unchanged, which keeps the golden unit the
 /// bytes it always was.
 fn systemd_arg(path: &Path) -> String {
-    let raw = path.to_string_lossy();
+    systemd_word(&path.to_string_lossy(), true)
+}
+
+/// `raw` as one word of a unit file line: quoted if it has to be, with
+/// `%` as `%%`, and `$` as `$$` where the directive expands variables.
+fn systemd_word(raw: &str, escape_dollar: bool) -> String {
     let needs_quotes = raw
         .chars()
         .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '\\'));
@@ -525,7 +706,7 @@ fn systemd_arg(path: &Path) -> String {
     for c in raw.chars() {
         match c {
             '%' => out.push_str("%%"),
-            '$' => out.push_str("$$"),
+            '$' if escape_dollar => out.push_str("$$"),
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
@@ -639,11 +820,6 @@ fn writable(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Writes the unit and the directories it depends on.
-///
-/// Does not run `systemctl` — that is [`activate`], kept separate so the
-/// filesystem half is testable without a service manager and so a
-/// `--dry-run` can describe both without a special case in either.
 /// The systemd unit that re-applies `script` at boot.
 ///
 /// `After=` names the two services whose rules this must not race. Docker
@@ -659,12 +835,40 @@ fn writable(dir: &Path) -> Result<()> {
 /// and a host rendering iptables has a `firewall.nft` that is stale or
 /// absent. A boot unit that always loaded that file restored the wrong
 /// rules, or none.
+///
+/// **Sandboxed harder than the console**, because whatever the script says
+/// runs as root at every boot, the console writes it, and loading rules is
+/// all it is for. No writes, no capability beyond the network, and no
+/// `AF_UNIX` — the socket family root would use to ask systemd to run
+/// something outside the sandbox. Under nftables that leaves a compromised
+/// script able to change the firewall and nothing else; `nft -f` has no
+/// way to run a command at all.
+///
+/// The iptables script is a shell script, and needs two concessions for
+/// `iptables-legacy`, which a host may have selected: it fails outright
+/// without `/run/xtables.lock`, which it cannot create once `/run` is
+/// read-only, so the unit creates it first, outside the sandbox (only
+/// creating it needs a writable `/run`; it opens an existing one read-only,
+/// and `flock` needs no more); and it runs `modprobe` itself
+/// when `ip_tables` is not loaded yet, early in a boot, so it keeps
+/// `CAP_SYS_MODULE`. `iptables-nft`, Debian's default, needs neither, but
+/// the unit cannot know which one `iptables` will be.
 pub fn firewall_unit(backend: crate::firewall::FirewallBackend, script: &Path) -> String {
-    let exec = match backend {
-        crate::firewall::FirewallBackend::Nftables => {
-            format!("/usr/sbin/nft -f {}", systemd_arg(script))
-        }
-        crate::firewall::FirewallBackend::Iptables => format!("/bin/sh {}", systemd_arg(script)),
+    let (exec, backend_sandbox) = match backend {
+        crate::firewall::FirewallBackend::Nftables => (
+            format!("/usr/sbin/nft -f {}", systemd_arg(script)),
+            "ProtectKernelModules=yes\n\
+             CapabilityBoundingSet=CAP_NET_ADMIN\n",
+        ),
+        crate::firewall::FirewallBackend::Iptables => (
+            format!("/bin/sh {}", systemd_arg(script)),
+            "# iptables-legacy refuses to run without its lock file and cannot\n\
+             # create one in a read-only /run, but only reads one that is there;\n\
+             # `+` creates it outside the sandbox. It also runs modprobe itself\n\
+             # when ip_tables is not loaded yet.\n\
+             ExecStartPre=+/usr/bin/touch /run/xtables.lock\n\
+             CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_MODULE\n",
+        ),
     };
     seal(&format!(
         "# {generated_by}, with `stop-bots install firewall`.\n\
@@ -689,6 +893,29 @@ pub fn firewall_unit(backend: crate::firewall::FirewallBackend, script: &Path) -
          Type=oneshot\n\
          RemainAfterExit=yes\n\
          ExecStart={exec}\n\
+         \n\
+         # The script runs as root at every boot and the console writes it, so\n\
+         # this may load rules and do nothing else: every path read-only, only\n\
+         # the capabilities loading rules takes, and no AF_UNIX, which is how\n\
+         # root would ask systemd to run something outside this sandbox.\n\
+         NoNewPrivileges=yes\n\
+         ProtectSystem=strict\n\
+         ProtectHome=yes\n\
+         PrivateTmp=yes\n\
+         PrivateDevices=yes\n\
+         ProtectClock=yes\n\
+         ProtectHostname=yes\n\
+         ProtectKernelTunables=yes\n\
+         ProtectKernelLogs=yes\n\
+         ProtectControlGroups=yes\n\
+         RestrictSUIDSGID=yes\n\
+         RestrictRealtime=yes\n\
+         RestrictNamespaces=yes\n\
+         LockPersonality=yes\n\
+         MemoryDenyWriteExecute=yes\n\
+         SystemCallArchitectures=native\n\
+         RestrictAddressFamilies=AF_NETLINK AF_INET AF_INET6\n\
+         {backend_sandbox}\
          \n\
          [Install]\n\
          WantedBy=multi-user.target\n",
@@ -786,10 +1013,17 @@ pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
     Ok(steps)
 }
 
+/// Writes the unit and the directories it depends on.
+///
+/// Does not run `systemctl` — that is [`activate`], kept separate so the
+/// filesystem half is testable without a service manager and so a
+/// `--dry-run` can describe both without a special case in either.
 pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
     preflight(layout, options)?;
 
-    let unit = web_unit(layout);
+    // The unit has to let the service write wherever the database says the
+    // NGINX config and its logs are, not only the stock paths.
+    let unit = web_unit(&layout.with_stored_settings());
     let unit_path = layout.unit_path();
     let existing = std::fs::read_to_string(&unit_path).ok();
 
@@ -963,9 +1197,9 @@ mod tests {
 
     /// The exact unit an operator gets. A golden rather than substring
     /// assertions because the failure that matters is a directive quietly
-    /// changing meaning — `ProtectSystem=yes` becoming `full` makes /etc
-    /// read-only and breaks the first NGINX apply, an hour after the unit
-    /// started cleanly.
+    /// changing meaning — a `ReadWritePaths=` line going missing leaves a
+    /// directory read-only and breaks the first apply that writes there, an
+    /// hour after the unit started cleanly.
     #[test]
     fn the_generated_unit_is_what_it_was() {
         crate::golden::assert_golden("stop-bots-web.service", &web_unit(&system_layout()));
@@ -1040,7 +1274,9 @@ mod tests {
             &layout.state_dir,
             &layout.output_dir,
             &layout.db_path,
-            &layout.nginx_root,
+            &layout.nginx_dir,
+            &layout.nginx_log_dir,
+            &layout.run_dir,
             &layout.systemd_marker,
             &layout.debian_marker,
         ] {
@@ -1809,6 +2045,318 @@ mod tests {
                 Path::new("/etc/stop-bots/firewall.nft"),
             ),
         );
+    }
+
+    /// The iptables variant differs in what it runs and in the two things
+    /// iptables-legacy needs from its sandbox.
+    #[test]
+    fn the_generated_iptables_firewall_unit_is_what_it_was() {
+        crate::golden::assert_golden(
+            "stop-bots-firewall-iptables.service",
+            &firewall_unit(
+                crate::firewall::FirewallBackend::Iptables,
+                Path::new("/etc/stop-bots/firewall.sh"),
+            ),
+        );
+    }
+
+    // ---- the sandbox ----
+
+    /// The unit's directive lines, comments and blank lines left out: the
+    /// comments name directives to explain them.
+    fn directives(unit: &str) -> Vec<&str> {
+        unit.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect()
+    }
+
+    /// What `ReadWritePaths=` gives back, as paths.
+    fn granted(unit: &str) -> Vec<PathBuf> {
+        directives(unit)
+            .iter()
+            .filter_map(|line| line.strip_prefix("ReadWritePaths="))
+            .map(|word| PathBuf::from(word.trim_start_matches('-')))
+            .collect()
+    }
+
+    fn writable_in(unit: &str, path: &str) -> bool {
+        granted(unit)
+            .iter()
+            .any(|dir| Path::new(path).starts_with(dir))
+    }
+
+    /// The point of `ProtectSystem=strict`: a write that lands in any of
+    /// these is root at the next boot, or the next cron minute, outside the
+    /// sandbox. The container suite checks the same against real systemd.
+    #[test]
+    fn the_unit_gives_back_nothing_that_would_outlive_the_service() {
+        let unit = web_unit(&system_layout());
+        assert!(directives(&unit).contains(&"ProtectSystem=strict"));
+        for path in [
+            "/etc/cron.d/x",
+            "/etc/crontab",
+            "/var/spool/cron/crontabs/root",
+            "/etc/systemd/system/x.service",
+            "/usr/lib/systemd/system/x.service",
+            "/etc/sudoers.d/x",
+            "/etc/ld.so.preload",
+            "/usr/local/bin/stop-bots",
+            "/root/.ssh/authorized_keys",
+            "/var/lib/dpkg/info/x.postinst",
+        ] {
+            assert!(!writable_in(&unit, path), "{path} is writable:\n{unit}");
+        }
+    }
+
+    /// And everything the console does write stays writable. Missing one is
+    /// not a failed start but an apply failing with "Read-only file
+    /// system" an hour later.
+    #[test]
+    fn the_unit_gives_back_everything_the_console_writes() {
+        let unit = web_unit(&system_layout());
+        for (what, path) in [
+            ("the database", "/var/lib/stop-bots/db.sqlite3"),
+            ("its write-ahead log", "/var/lib/stop-bots/db.sqlite3-wal"),
+            ("an upgrade's copy", "/var/lib/stop-bots/db.sqlite3.bak-v3"),
+            ("the firewall script", "/etc/stop-bots/firewall.nft"),
+            ("robots.txt", "/etc/stop-bots/nginx/robots.txt"),
+            ("a site file", "/etc/nginx/sites-available/default"),
+            ("a conf.d file", "/etc/nginx/conf.d/stop-bots-limits.conf"),
+            ("a log nginx -t opens", "/var/log/nginx/error.log"),
+            ("the pid file nginx -t creates", "/run/nginx.pid"),
+            ("legacy iptables' lock", "/run/xtables.lock"),
+            ("the apply lock", crate::applylock::ROOT_PATH),
+        ] {
+            assert!(
+                writable_in(&unit, path),
+                "{what} ({path}) is read-only:\n{unit}"
+            );
+        }
+    }
+
+    /// Without CAP_SYS_ADMIN in the bounding set, root in the sandbox
+    /// cannot remount what `ProtectSystem` made read-only.
+    #[test]
+    fn neither_unit_keeps_the_capability_that_undoes_the_sandbox() {
+        let units = [
+            web_unit(&system_layout()),
+            firewall_unit(
+                crate::firewall::FirewallBackend::Nftables,
+                Path::new("/etc/stop-bots/firewall.nft"),
+            ),
+            firewall_unit(
+                crate::firewall::FirewallBackend::Iptables,
+                Path::new("/etc/stop-bots/firewall.sh"),
+            ),
+        ];
+        for unit in &units {
+            let caps = directives(unit)
+                .into_iter()
+                .find_map(|line| line.strip_prefix("CapabilityBoundingSet="))
+                .unwrap_or_else(|| panic!("no bounding set in:\n{unit}"));
+            assert!(!caps.contains("CAP_SYS_ADMIN"), "{caps}");
+            assert!(
+                !caps.starts_with('~'),
+                "a deny list keeps everything else: {caps}"
+            );
+        }
+    }
+
+    /// The boot unit runs a script the console writes, as root, at every
+    /// boot. Without AF_UNIX it cannot ask systemd to run anything.
+    #[test]
+    fn the_boot_unit_cannot_reach_systemd() {
+        for backend in [
+            crate::firewall::FirewallBackend::Nftables,
+            crate::firewall::FirewallBackend::Iptables,
+        ] {
+            let unit = firewall_unit(backend, &crate::firewall::default_output_path(backend));
+            let families = directives(&unit)
+                .into_iter()
+                .find_map(|line| line.strip_prefix("RestrictAddressFamilies="))
+                .unwrap_or_else(|| panic!("no address families in:\n{unit}"));
+            assert!(!families.contains("AF_UNIX"), "{families}");
+            assert!(
+                directives(&unit).contains(&"ProtectSystem=strict"),
+                "{unit}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_file_descriptor_and_task_limits_are_set() {
+        let unit = web_unit(&system_layout());
+        for line in ["LimitNOFILE=16384", "TasksMax=1024"] {
+            assert!(directives(&unit).contains(&line), "no {line} in:\n{unit}");
+        }
+    }
+
+    /// A host whose NGINX lives elsewhere — in a container's bind mount —
+    /// stores that root. The console rewrites files there, so the unit has
+    /// to give it back, and the access log's directory with it.
+    #[test]
+    fn a_stored_nginx_root_and_access_log_are_writable_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        {
+            let db = crate::db::Db::open(&layout.db_path).unwrap();
+            db.set_text_setting(crate::db::keys::NGINX_ROOT, "/srv/nginx/conf")
+                .unwrap();
+            db.set_text_setting(
+                crate::db::keys::LOGS_ACCESS_PATH,
+                "/srv/nginx/logs/access.log",
+            )
+            .unwrap();
+        }
+
+        install_web(&layout, &Options::default()).unwrap();
+
+        let unit = std::fs::read_to_string(layout.unit_path()).unwrap();
+        for path in [
+            "/srv/nginx/conf/sites-enabled/a",
+            "/srv/nginx/logs/error.log",
+        ] {
+            assert!(writable_in(&unit, path), "{path} is read-only:\n{unit}");
+        }
+    }
+
+    /// `--root` and a 0.0.x unit's `--root` are given back as well, before
+    /// the database has been told about either.
+    #[test]
+    fn a_root_named_on_the_command_line_is_writable() {
+        let mut layout = system_layout();
+        layout.nginx_roots = vec![PathBuf::from("/opt/nginx")];
+
+        assert!(writable_in(&web_unit(&layout), "/opt/nginx/nginx.conf"));
+    }
+
+    /// One line per place, not per spelling of it.
+    #[test]
+    fn a_path_inside_one_already_given_back_or_relative_is_left_out() {
+        let mut layout = system_layout();
+        layout.nginx_roots = vec![
+            PathBuf::from("/etc/nginx/sites-enabled"),
+            PathBuf::from("nginx"),
+        ];
+        layout.access_log = Some(PathBuf::from("/var/log/nginx/access.log"));
+
+        assert_eq!(writable_paths(&layout), writable_paths(&system_layout()));
+    }
+
+    /// `install web --dry-run` promises to change nothing, and reading the
+    /// stored root must not migrate, create or leave anything beside the
+    /// database.
+    #[test]
+    fn reading_the_stored_root_changes_nothing_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        {
+            let db = crate::db::Db::open(&layout.db_path).unwrap();
+            db.set_text_setting(crate::db::keys::NGINX_ROOT, "/srv/nginx")
+                .unwrap();
+        }
+        let listing = || {
+            let mut names: Vec<_> = std::fs::read_dir(&layout.state_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let (before, bytes) = (listing(), std::fs::read(&layout.db_path).unwrap());
+
+        let with = layout.with_stored_settings();
+
+        assert_eq!(with.nginx_roots, vec![PathBuf::from("/srv/nginx")]);
+        assert_eq!(listing(), before);
+        assert_eq!(std::fs::read(&layout.db_path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn read_write_paths_are_quoted_the_way_systemd_reads_them() {
+        for (raw, word) in [
+            ("/etc/nginx", "-/etc/nginx"),
+            ("/srv/a b", "\"-/srv/a b\""),
+            ("/srv/c\"d", "\"-/srv/c\\\"d\""),
+            ("/srv/e\\f", "\"-/srv/e\\\\f\""),
+            ("/srv/p%q", "-/srv/p%%q"),
+            // Not expanded in this directive, unlike in ExecStart.
+            ("/srv/d$x", "-/srv/d$x"),
+        ] {
+            assert_eq!(read_write_path(Path::new(raw)), word, "{raw:?}");
+        }
+    }
+
+    // ---- upgrading from 0.1.0-rc.1 ----
+
+    /// rc.1's units carry the template hash, so they are recognised by it
+    /// rather than listed in `legacy`. These are the bytes rc.1 wrote, and
+    /// the hash they carry is checked here, not assumed.
+    #[test]
+    fn every_0_1_0_rc_1_unit_is_sealed_and_unedited() {
+        for fixture in [
+            include_str!("../tests/fixtures/units/stop-bots-web-0.1.0-rc.1.service"),
+            include_str!("../tests/fixtures/units/stop-bots-firewall-nftables-0.1.0-rc.1.service"),
+            include_str!("../tests/fixtures/units/stop-bots-firewall-iptables-0.1.0-rc.1.service"),
+        ] {
+            assert!(
+                is_sealed_and_unedited(fixture),
+                "not recognised:\n{fixture}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_0_1_0_rc_1_web_unit_is_upgraded_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::create_dir_all(&layout.unit_dir).unwrap();
+        std::fs::write(
+            layout.unit_path(),
+            include_str!("../tests/fixtures/units/stop-bots-web-0.1.0-rc.1.service"),
+        )
+        .unwrap();
+
+        let steps = install_web(&layout, &Options::default()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(layout.unit_path()).unwrap(),
+            web_unit(&layout)
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("unedited since stop-bots 0.1.0-rc.1")),
+            "steps: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn an_0_1_0_rc_1_firewall_unit_is_upgraded_without_force() {
+        assert_firewall_unit_upgrades(
+            include_str!("../tests/fixtures/units/stop-bots-firewall-nftables-0.1.0-rc.1.service"),
+            crate::firewall::FirewallBackend::Nftables,
+        );
+        assert_firewall_unit_upgrades(
+            include_str!("../tests/fixtures/units/stop-bots-firewall-iptables-0.1.0-rc.1.service"),
+            crate::firewall::FirewallBackend::Iptables,
+        );
+    }
+
+    /// An edit to an rc.1 unit is still refused: the hash is what tells.
+    #[test]
+    fn an_edited_0_1_0_rc_1_unit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::create_dir_all(&layout.unit_dir).unwrap();
+        let edited = include_str!("../tests/fixtures/units/stop-bots-web-0.1.0-rc.1.service")
+            .replace("ProtectSystem=yes", "ProtectSystem=full");
+        std::fs::write(layout.unit_path(), &edited).unwrap();
+
+        let err = install_web(&layout, &Options::default()).unwrap_err();
+
+        assert!(format!("{err:#}").contains("--force"), "was: {err:#}");
     }
 
     /// The unit's own comment named `web --save`, which is deprecated.

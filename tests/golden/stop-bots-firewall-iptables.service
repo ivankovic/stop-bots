@@ -15,12 +15,12 @@ Description=Apply the stop-bots firewall ruleset
 Documentation=https://github.com/ivankovic/stop-bots
 After=docker.service ufw.service network-online.target
 Wants=network-online.target
-ConditionPathExists=/etc/stop-bots/firewall.nft
+ConditionPathExists=/etc/stop-bots/firewall.sh
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/nft -f /etc/stop-bots/firewall.nft
+ExecStart=/bin/sh /etc/stop-bots/firewall.sh
 
 # The script runs as root at every boot and the console writes it, so
 # this may load rules and do nothing else: every path read-only, only
@@ -43,8 +43,12 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_NETLINK AF_INET AF_INET6
-ProtectKernelModules=yes
-CapabilityBoundingSet=CAP_NET_ADMIN
+# iptables-legacy refuses to run without its lock file and cannot
+# create one in a read-only /run, but only reads one that is there;
+# `+` creates it outside the sandbox. It also runs modprobe itself
+# when ip_tables is not loaded yet.
+ExecStartPre=+/usr/bin/touch /run/xtables.lock
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_MODULE
 
 [Install]
 WantedBy=multi-user.target

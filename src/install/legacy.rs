@@ -35,6 +35,13 @@
 //!   nftables one, and 0.0.13 added the iptables one beside it.
 //!
 //! **Frozen.** These are the bytes on real hosts; they never change.
+//!
+//! Nothing from 0.1.0-rc.1 on belongs here. Its units carry the hash, so
+//! they are recognised by it whatever their text — the rc.1 units are kept
+//! as fixtures in `tests/fixtures/units/` instead, and `install`'s tests
+//! check that each one still hashes to its marker and upgrades without
+//! `--force`. Listing them here as well would be a second way to recognise
+//! the same bytes, and the first place to look when the two disagreed.
 
 use std::path::PathBuf;
 
