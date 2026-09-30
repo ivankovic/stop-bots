@@ -195,6 +195,9 @@ contract: see "Versioning" in `RELEASING.md`. Upgrading from 0.0.x:
 
 ### Fixed
 
+- A pre-release's `.deb` is versioned `0.1.0~rc.1-1`, not `0.1.0.rc.1-1`, which
+  Debian sorted after `0.1.0-1`: a host that installed a release candidate would
+  never have upgraded to the release.
 - `status` on a host run from the CLI and cron reported "UNKNOWN: Console service";
   the console is optional, and not having one is now OK.
 - Piping a command's output into something that stops reading early (`| head`)

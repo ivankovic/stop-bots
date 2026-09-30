@@ -146,7 +146,11 @@ jobs:
       # and cargo-deb's stripping step shells out to a `strip` that does not
       # necessarily match the target.
       - name: Build .deb
-        run: cargo deb --no-build --no-strip --target ${{ matrix.target }} --output dist/
+        # `--deb-version` so a release candidate is `0.1.0~rc.1-1`, which
+        # sorts before `0.1.0-1`; see scripts/deb-version.sh.
+        run: >-
+          cargo deb --no-build --no-strip --deb-version "$(scripts/deb-version.sh)"
+          --target ${{ matrix.target }} --output dist/
 
       # The tarball stays, for the AUR `-bin` package and for anyone who would
       # rather not add a repository to their machine. Same binary as the .deb.

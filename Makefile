@@ -77,7 +77,7 @@ stranger-test:
 	cargo build --release --target x86_64-unknown-linux-musl
 	target/x86_64-unknown-linux-musl/release/stop-bots generate-docs --out target/assets
 	rm -rf $(STRANGER_DIR)
-	cargo deb --no-build --no-strip --target x86_64-unknown-linux-musl --output $(STRANGER_DIR)/
+	cargo deb --no-build --no-strip --deb-version "$$(scripts/deb-version.sh)" --target x86_64-unknown-linux-musl --output $(STRANGER_DIR)/
 	STOP_BOTS_CONTAINER_TESTS=1 \
 	STOP_BOTS_CONTAINER_RUNTIME=$(STOP_BOTS_CONTAINER_RUNTIME) \
 	STOP_BOTS_STRANGER_DEB="$$(ls $(STRANGER_DIR)/stop-bots_*.deb)" \

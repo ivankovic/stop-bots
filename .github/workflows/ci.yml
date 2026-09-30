@@ -231,8 +231,16 @@ jobs:
           # The man pages and completions come from the binary's own clap
           # definition, into the paths `[package.metadata.deb]` names.
           target/x86_64-unknown-linux-musl/release/stop-bots generate-docs --out target/assets
-          cargo deb --no-build --no-strip \
+          cargo deb --no-build --no-strip --deb-version "$(scripts/deb-version.sh)" \
             --target x86_64-unknown-linux-musl --output dist/
+          # The package's version is the one scripts/deb-version.sh derives,
+          # and a release candidate sorts before its release — cargo-deb's
+          # own `0.1.0.rc.1` sorted after `0.1.0`, so an RC install would
+          # never have upgraded.
+          expected="$(scripts/deb-version.sh)"
+          actual="$(dpkg-deb -f dist/*.deb Version)"
+          [ "$actual" = "$expected" ] || { echo "::error::.deb is $actual, expected $expected"; exit 1; }
+          dpkg --compare-versions "$(scripts/deb-version.sh 0.1.0-rc.1)" lt "$(scripts/deb-version.sh 0.1.0)"
 
       # For the `stranger` job below, which installs this exact package on
       # a fresh Debian and Ubuntu. Not on pull requests, where that job
