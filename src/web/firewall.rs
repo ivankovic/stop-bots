@@ -165,7 +165,7 @@ pub async fn page(
     render(
         Tab::Firewall,
         &ctx,
-        params.flash.into_flash(),
+        params.flash.into_flash(&state),
         body(
             &live,
             filter,
@@ -873,7 +873,7 @@ async fn trust(
         .await;
     match trusted {
         Ok(entry) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!(
                 "Trusting {} {}. Apply everything to put it in effect.",
@@ -883,7 +883,7 @@ async fn trust(
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!("Could not trust that: {err}"),
             false,
@@ -897,7 +897,7 @@ async fn untrust(
     Form(form): Form<TrustForm>,
 ) -> Response {
     let Some(entry) = form.entry() else {
-        return back_with(&state.base, "/firewall", "Nothing to untrust.", false);
+        return back_with(&state, "/firewall", "Nothing to untrust.", false);
     };
     let removing = entry.clone();
     match state
@@ -905,7 +905,7 @@ async fn untrust(
         .await
     {
         Ok(true) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!(
                 "No longer trusting {} {}. Apply everything to put it in effect.",
@@ -917,7 +917,7 @@ async fn untrust(
         // The row said TRUSTED because a wider entry covers it; removing
         // the exact value removed nothing, and saying "done" would be a lie.
         Ok(false) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!(
                 "{} is trusted by a wider entry — remove that one from the Trusted panel.",
@@ -926,7 +926,7 @@ async fn untrust(
             false,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!("Could not untrust that: {err}"),
             false,
@@ -968,7 +968,7 @@ async fn block_address(
 
     if crate::db::is_every_address(&address) {
         return back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!(
                 "Refusing to block {}: that is every address, which would take this host off \
@@ -979,7 +979,7 @@ async fn block_address(
         );
     }
     if let Some(reason) = would_lock_out(&client, &address) {
-        return back_with(&state.base, "/firewall", &reason, false);
+        return back_with(&state, "/firewall", &reason, false);
     }
 
     let stored = address.clone();
@@ -990,14 +990,9 @@ async fn block_address(
         })
         .await
     {
-        Ok(()) => back_with(
-            &state.base,
-            "/firewall",
-            &format!("Blocked {address}."),
-            true,
-        ),
+        Ok(()) => back_with(&state, "/firewall", &format!("Blocked {address}."), true),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!("Could not block {address}: {err}"),
             false,
@@ -1043,14 +1038,9 @@ async fn unblock_address(
     let address = form.address;
     let stored = address.clone();
     match state.with_db(move |db| db.unblock_address(&stored)).await {
-        Ok(()) => back_with(
-            &state.base,
-            "/firewall",
-            &format!("Unblocked {address}."),
-            true,
-        ),
+        Ok(()) => back_with(&state, "/firewall", &format!("Unblocked {address}."), true),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!("Could not unblock {address}: {err}"),
             false,
@@ -1066,9 +1056,9 @@ async fn block_ua(
     let ua = form.user_agent;
     let stored = ua.clone();
     match state.with_db(move |db| db.block_user_agent(&stored)).await {
-        Ok(()) => back_with(&state.base, "/firewall", "Blocked that user agent.", true),
+        Ok(()) => back_with(&state, "/firewall", "Blocked that user agent.", true),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!("Could not block that user agent: {err}"),
             false,
@@ -1087,9 +1077,9 @@ async fn unblock_ua(
         .with_db(move |db| db.unblock_user_agent(&stored))
         .await
     {
-        Ok(()) => back_with(&state.base, "/firewall", "Unblocked that user agent.", true),
+        Ok(()) => back_with(&state, "/firewall", "Unblocked that user agent.", true),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/firewall",
             &format!("Could not unblock that user agent: {err}"),
             false,

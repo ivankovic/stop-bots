@@ -108,44 +108,48 @@ async fn act(
         .unwrap_or_default()
         .to_string();
 
-    // The flash rides in the query string; decode enough of it to read.
-    let flash = location
-        .split_once("flash=")
-        .map(|(_, rest)| rest.split('&').next().unwrap_or_default().to_string())
-        .map(|raw| percent_decode(&raw))
-        .unwrap_or_default();
+    let flash = flash_shown(app, cookie, &location).await;
     (status, flash)
 }
 
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => {
-                match u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap(), 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        i += 3;
-                    }
-                    Err(_) => {
-                        out.push(bytes[i]);
-                        i += 1;
-                    }
-                }
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
+/// The message a redirect leaves for the page it lands on, read the way
+/// the operator reads it: by following the redirect. The URL itself
+/// carries only an opaque id, never the text.
+async fn flash_shown(app: &Router, cookie: &str, location: &str) -> String {
+    if !location.contains("flash=") {
+        return String::new();
     }
-    String::from_utf8_lossy(&out).into_owned()
+    let page = app
+        .clone()
+        .oneshot(with_cookie(get(location), cookie))
+        .await
+        .unwrap();
+    let html = body_string(page).await;
+    html.split(r#"<div class="flash "#)
+        .nth(1)
+        .and_then(|rest| rest.split_once('>'))
+        .and_then(|(_, rest)| rest.split("</div>").next())
+        .map(unescape_html)
+        .unwrap_or_default()
+}
+
+/// The flash of the redirect `response` is.
+async fn flash_of(app: &Router, cookie: &str, response: &Response) -> String {
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    flash_shown(app, cookie, &location).await
+}
+
+fn unescape_html(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
 }
 
 fn get(path: &str) -> Request<Body> {
@@ -1606,6 +1610,61 @@ async fn blocking_an_empty_user_agent_is_refused_with_a_reason() {
         .is_empty());
 }
 
+/// Trusting a user agent echoes the agent in the flash, and the agent is
+/// whatever a client sent. That text used to ride in the redirect's query
+/// string, so the operator's own next request carried an attacker's
+/// payload into NGINX's log, where the injection detector blocked them.
+/// The redirect names the message by id; the page still shows it.
+#[tokio::test]
+async fn a_message_about_client_text_never_puts_that_text_in_a_url() {
+    let (app, password, _tmp) = app();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let payload = "sqlmap' UNION SELECT password FROM users--";
+    let response = app
+        .clone()
+        .oneshot(with_cookie(
+            post(
+                "/firewall/trust",
+                &format!(
+                    "csrf={csrf}&kind=user_agent&value={}",
+                    server::percent_encode(payload)
+                ),
+            ),
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    let location = response.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    for needle in ["UNION", "sqlmap", "SELECT", "%27", "%20"] {
+        assert!(!location.contains(needle), "location was {location}");
+    }
+    let flash = flash_of(&app, &cookie, &response).await;
+    assert!(flash.contains(payload), "flash was: {flash}");
+}
+
+/// A link anyone can craft used to render its own text in the console's
+/// chrome, coloured as an error: `?flash=<text>&kind=err`.
+#[tokio::test]
+async fn a_crafted_flash_link_shows_nothing() {
+    let (app, password, _tmp) = app();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let html = page_text(
+        &app,
+        &cookie,
+        "/?flash=Your%20session%20expired.%20Log%20in%20at%20evil.example&kind=err",
+    )
+    .await;
+
+    assert!(!html.contains("evil.example"), "page was:\n{html}");
+    assert!(!html.contains(r#"class="flash"#), "page was:\n{html}");
+}
+
 /// The free-text field decides what it was given; the row buttons say.
 /// Either way the database ends up with the stored form, and the flash
 /// echoes it — a /24 typed with host bits set is not what was stored.
@@ -1737,12 +1796,9 @@ async fn blocking_the_address_you_are_connected_from_is_refused() {
         "203.0.113.5:44321",
     );
     let response = app.clone().oneshot(request).await.unwrap();
-    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    let flash = flash_of(&app, &cookie, &response).await;
 
-    assert!(
-        percent_decode(location).contains("lock you out"),
-        "location was: {location}"
-    );
+    assert!(flash.contains("lock you out"), "flash was: {flash}");
     assert!(
         Db::open(&db_path)
             .unwrap()
@@ -1792,8 +1848,8 @@ async fn block_from(peer: &str, address: &str) -> (String, usize) {
         with_cookie(post("/firewall/block-address", &body), &cookie),
         peer,
     );
-    let response = app.oneshot(request).await.unwrap();
-    let flash = percent_decode(response.headers()[header::LOCATION].to_str().unwrap());
+    let response = app.clone().oneshot(request).await.unwrap();
+    let flash = flash_of(&app, &cookie, &response).await;
     let stored = Db::open(&db_path)
         .unwrap()
         .list_firewall_rules()
@@ -1895,8 +1951,8 @@ async fn a_forwarded_address_is_only_believed_when_configured() {
         request
             .headers_mut()
             .insert("x-forwarded-for", "203.0.113.77".parse().unwrap());
-        let response = app.oneshot(request).await.unwrap();
-        percent_decode(response.headers()[header::LOCATION].to_str().unwrap())
+        let response = app.clone().oneshot(request).await.unwrap();
+        flash_of(&app, &cookie, &response).await
     };
 
     // Untrusted: the header is ignored, so the block goes through.
@@ -1951,8 +2007,8 @@ async fn only_the_address_the_proxy_appended_is_believed() {
             request
                 .headers_mut()
                 .insert("x-forwarded-for", forwarded.parse().unwrap());
-            let response = app.oneshot(request).await.unwrap();
-            percent_decode(response.headers()[header::LOCATION].to_str().unwrap())
+            let response = app.clone().oneshot(request).await.unwrap();
+            flash_of(&app, &cookie, &response).await
         }
     };
 

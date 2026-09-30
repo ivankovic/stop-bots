@@ -93,7 +93,12 @@ pub async fn page(
         Err(err) => return internal_error(&err.to_string()),
     };
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
-    render(Tab::Nginx, &ctx, flash.into_flash(), body(&view, &ctx))
+    render(
+        Tab::Nginx,
+        &ctx,
+        flash.into_flash(&state),
+        body(&view, &ctx),
+    )
 }
 
 fn body(view: &View, ctx: &Ctx) -> Markup {
@@ -453,7 +458,7 @@ pub async fn detail(
     render(
         Tab::Nginx,
         &ctx,
-        flash.into_flash(),
+        flash.into_flash(&state),
         detail_body(&detail, &ctx),
     )
 }
@@ -768,7 +773,7 @@ async fn set_block_response(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/nginx",
             &format!(
                 "Blocked requests now get {}. Apply to write it out.",
@@ -777,7 +782,7 @@ async fn set_block_response(
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/nginx",
             &format!("Could not save that: {err}"),
             false,
@@ -803,7 +808,7 @@ async fn set_auto_apply(
     let on = form.enabled == "1";
     match state.with_db(move |db| db.set_auto_apply(on)).await {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/nginx",
             if on {
                 "Auto-apply on. The internal cron will write these configs and reload NGINX \
@@ -814,7 +819,7 @@ async fn set_auto_apply(
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/nginx",
             &format!("Could not save that: {err}"),
             false,
@@ -830,7 +835,7 @@ async fn set_robots(
     let on = form.enabled == "1";
     match state.with_db(move |db| db.set_serve_robots_txt(on)).await {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/nginx",
             if on {
                 "robots.txt will be generated. Apply to write it out."
@@ -840,7 +845,7 @@ async fn set_robots(
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/nginx",
             &format!("Could not save that: {err}"),
             false,
@@ -862,7 +867,7 @@ async fn set_rate_limit(
 ) -> Response {
     if form.rps < 1 || form.burst < 1 {
         return back_with(
-            &state.base,
+            &state,
             "/nginx",
             "Rate and burst both have to be at least 1.",
             false,
@@ -879,7 +884,7 @@ async fn set_rate_limit(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/nginx",
             &format!(
                 "Rate limiting {} at {rps}/s with a burst of {burst}. Apply to write it out.",
@@ -888,7 +893,7 @@ async fn set_rate_limit(
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/nginx",
             &format!("Could not save that: {err}"),
             false,
@@ -909,13 +914,8 @@ async fn scan(State(state): State<AppState>, _auth: Auth) -> Response {
         .await;
 
     match found {
-        Ok(count) => back_with(
-            &state.base,
-            "/nginx",
-            &format!("Found {count} site(s)."),
-            true,
-        ),
-        Err(err) => back_with(&state.base, "/nginx", &format!("Scan failed: {err}"), false),
+        Ok(count) => back_with(&state, "/nginx", &format!("Found {count} site(s)."), true),
+        Err(err) => back_with(&state, "/nginx", &format!("Scan failed: {err}"), false),
     }
 }
 
@@ -960,12 +960,7 @@ async fn apply_one(
             };
             applied_message(&state, "/nginx", message, changed, reloaded)
         }
-        Err(err) => back_with(
-            &state.base,
-            "/nginx",
-            &format!("Apply failed: {err:#}"),
-            false,
-        ),
+        Err(err) => back_with(&state, "/nginx", &format!("Apply failed: {err:#}"), false),
     }
 }
 
@@ -989,12 +984,7 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
             outcome.changed > 0,
             outcome.reloaded,
         ),
-        Err(err) => back_with(
-            &state.base,
-            "/nginx",
-            &format!("Apply failed: {err:#}"),
-            false,
-        ),
+        Err(err) => back_with(&state, "/nginx", &format!("Apply failed: {err:#}"), false),
     }
 }
 
@@ -1017,7 +1007,7 @@ fn applied_message(
     } else {
         " Nothing changed, so NGINX was not reloaded."
     };
-    back_with(&state.base, back, &format!("{message}{note}"), true)
+    back_with(state, back, &format!("{message}{note}"), true)
 }
 
 #[derive(Deserialize)]
@@ -1036,7 +1026,7 @@ async fn set_site_category(
     let (Some(category), Some(policy)) =
         (category_from(&form.category), override_from(&form.policy))
     else {
-        return back_with(&state.base, &back, "Unknown category or policy.", false);
+        return back_with(&state, &back, "Unknown category or policy.", false);
     };
 
     match state
@@ -1044,17 +1034,12 @@ async fn set_site_category(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             &back,
             "Override saved. Apply to write it out.",
             true,
         ),
-        Err(err) => back_with(
-            &state.base,
-            &back,
-            &format!("Could not save that: {err}"),
-            false,
-        ),
+        Err(err) => back_with(&state, &back, &format!("Could not save that: {err}"), false),
     }
 }
 
@@ -1081,7 +1066,7 @@ async fn set_site_bot(
 ) -> Response {
     let back = format!("/nginx/{id}{}", bot_query_suffix(&back.q));
     let Some(policy) = override_from(&form.policy) else {
-        return back_with(&state.base, &back, "Unknown policy.", false);
+        return back_with(&state, &back, "Unknown policy.", false);
     };
     let bot_id = form.bot;
     let stored = state
@@ -1102,7 +1087,7 @@ async fn set_site_bot(
         .await;
     match stored {
         Ok((bot, site)) => back_with(
-            &state.base,
+            &state,
             &back,
             &format!(
                 "{bot} on {site}: {}. Apply to write it out.",
@@ -1114,12 +1099,7 @@ async fn set_site_bot(
             ),
             true,
         ),
-        Err(err) => back_with(
-            &state.base,
-            &back,
-            &format!("Could not save that: {err}"),
-            false,
-        ),
+        Err(err) => back_with(&state, &back, &format!("Could not save that: {err}"), false),
     }
 }
 
@@ -1137,7 +1117,7 @@ async fn set_site_rule(
 ) -> Response {
     let back = format!("/nginx/{id}");
     let Some(rule) = RequestRule::from_id(&form.rule) else {
-        return back_with(&state.base, &back, "Unknown request rule.", false);
+        return back_with(&state, &back, "Unknown request rule.", false);
     };
     let on = form.enabled == "1";
     let rule_id = rule.id().to_string();
@@ -1147,7 +1127,7 @@ async fn set_site_rule(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             &back,
             &format!(
                 "{} is now {}. Apply to write it out.",
@@ -1156,12 +1136,7 @@ async fn set_site_rule(
             ),
             true,
         ),
-        Err(err) => back_with(
-            &state.base,
-            &back,
-            &format!("Could not save that: {err}"),
-            false,
-        ),
+        Err(err) => back_with(&state, &back, &format!("Could not save that: {err}"), false),
     }
 }
 
@@ -1212,7 +1187,7 @@ async fn add_exemption(
     let path = form.path.trim().to_string();
     if !path.starts_with('/') {
         return back_with(
-            &state.base,
+            &state,
             &back,
             "A path exemption has to start with `/`.",
             false,
@@ -1233,13 +1208,13 @@ async fn add_exemption(
         .await;
     match result {
         Ok(done) => back_with(
-            &state.base,
+            &state,
             &back,
             &format!("{done}. Apply to write it out."),
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             &back,
             &format!("Could not add {path}: {err}"),
             false,
@@ -1269,9 +1244,9 @@ async fn remove_exemption(
         })
         .await;
     match result {
-        Ok(done) => back_with(&state.base, &back, &done, true),
+        Ok(done) => back_with(&state, &back, &done, true),
         Err(err) => back_with(
-            &state.base,
+            &state,
             &back,
             &format!("Could not remove {path}: {err}"),
             false,

@@ -116,7 +116,7 @@ pub async fn page(
     render(
         Tab::Bots,
         &ctx,
-        params.flash.into_flash(),
+        params.flash.into_flash(&state),
         body(&view, &ctx),
     )
 }
@@ -338,7 +338,7 @@ async fn set_status(
     Form(form): Form<StatusForm>,
 ) -> Response {
     let Some(status) = status_from(&form.status) else {
-        return back_with(&state.base, "/bots", "Unknown bot status.", false);
+        return back_with(&state, "/bots", "Unknown bot status.", false);
     };
     let slug = form.slug;
     let stored = slug.clone();
@@ -347,7 +347,7 @@ async fn set_status(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/bots",
             &format!(
                 "{slug} now: {}. Apply on the NGINX screen to write it out.",
@@ -356,7 +356,7 @@ async fn set_status(
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/bots",
             &format!("Could not change {slug}: {err}"),
             false,
@@ -383,7 +383,7 @@ async fn update_source(
 ) -> Response {
     let Some(kind) = SourceKind::from_id(&form.source) else {
         return back_with(
-            &state.base,
+            &state,
             "/bots",
             &format!("Unknown source: {}", form.source),
             false,
@@ -394,7 +394,7 @@ async fn update_source(
         Ok(raw) => raw,
         Err(err) => {
             return back_with(
-                &state.base,
+                &state,
                 "/bots",
                 &format!("Could not download {}: {err}", kind.name()),
                 false,
@@ -411,13 +411,13 @@ async fn update_source(
 
     match stored {
         Ok(count) => back_with(
-            &state.base,
+            &state,
             "/bots",
             &format!("{}: {count} bot(s).", kind.name()),
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/bots",
             &format!("Could not store {}: {err}", kind.name()),
             false,

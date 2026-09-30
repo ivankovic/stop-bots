@@ -643,23 +643,28 @@ pub fn render(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Res
 /// The `Authenticated` an inner handler is guaranteed to have.
 pub type Auth = Extension<Authenticated>;
 
-/// Shared by the action handlers: a flash message survives one redirect by
-/// riding in the query string.
+/// Shared by the action handlers: a redirect to `path` that shows
+/// `message` when it lands.
 ///
-/// A cookie would be the other way and is worse here: it needs a
-/// clear-on-read dance, it lands on every subsequent request until it is
-/// cleared, and the message is not secret — it is what the operator just
-/// did, and they are about to read it on screen.
-pub fn back_with(base: &BasePath, path: &str, message: &str, ok: bool) -> Response {
-    let kind = if ok { "ok" } else { "err" };
-    // A `path` may carry a query of its own — a search to come back to.
-    let separator = if path.contains('?') { '&' } else { '?' };
-    Redirect::to(&format!(
-        "{}{separator}flash={}&kind={kind}",
-        base.url(path),
-        percent_encode(message)
-    ))
-    .into_response()
+/// The message stays in this process and the URL names it by an opaque id
+/// — see [`crate::web::flash`] for why its text must not ride in the query
+/// string. A cookie would be the other way to carry it and is worse here:
+/// it needs a clear-on-read dance, and it lands on every subsequent
+/// request until it is cleared.
+pub fn back_with(state: &AppState, path: &str, message: &str, ok: bool) -> Response {
+    Redirect::to(&with_flash(&state.base.url(path), state, message, ok)).into_response()
+}
+
+/// `url` with a flash of `message` appended to its query. For a handler
+/// that builds its own return URL, as the Blocks page does to keep its
+/// filter and page.
+pub fn with_flash(url: &str, state: &AppState, message: &str, ok: bool) -> String {
+    let Some(id) = state.flashes.put(message, ok) else {
+        return url.to_string();
+    };
+    // A `url` may carry a query of its own — a search to come back to.
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}flash={id}")
 }
 
 /// Encodes `input` for a query string: everything but the unreserved
@@ -677,21 +682,17 @@ pub fn percent_encode(input: &str) -> String {
     out
 }
 
-/// The flash a redirect left in the query string.
+/// The flash a redirect named in the query string: an id, never the text.
 #[derive(Debug, Default, Deserialize)]
 pub struct FlashQuery {
     pub flash: Option<String>,
-    pub kind: Option<String>,
 }
 
 impl FlashQuery {
-    pub fn into_flash(self) -> Option<Flash> {
-        let text = self.flash?;
-        Some(if self.kind.as_deref() == Some("err") {
-            Flash::err(text)
-        } else {
-            Flash::ok(text)
-        })
+    /// The message the id names, if this process stored one under it.
+    /// Text typed into the URL names nothing and shows nothing.
+    pub fn into_flash(self, state: &AppState) -> Option<Flash> {
+        state.flashes.get(&self.flash?)
     }
 }
 
@@ -855,27 +856,73 @@ mod tests {
         assert_eq!(percent_decode(&percent_encode(message)), message);
     }
 
-    #[test]
-    fn a_flash_query_without_a_message_is_no_flash() {
-        assert!(FlashQuery::default().into_flash().is_none());
+    fn state() -> AppState {
+        AppState::new(
+            crate::db::Db::open_in_memory().unwrap(),
+            std::path::PathBuf::from("/nonexistent"),
+            None,
+            false,
+        )
+    }
+
+    fn location(response: &Response) -> String {
+        response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     #[test]
-    fn a_flash_query_kind_selects_the_colour() {
-        let ok = FlashQuery {
-            flash: Some("saved".into()),
-            kind: Some("ok".into()),
-        }
-        .into_flash()
-        .unwrap();
-        assert!(ok.ok);
+    fn a_flash_query_without_a_message_is_no_flash() {
+        assert!(FlashQuery::default().into_flash(&state()).is_none());
+    }
 
-        let err = FlashQuery {
-            flash: Some("nope".into()),
-            kind: Some("err".into()),
+    /// The spoof this closes: `?flash=<any text>&kind=err` used to render
+    /// that text in the console's chrome, coloured as an error.
+    #[test]
+    fn text_in_the_flash_parameter_is_not_shown() {
+        let query = FlashQuery {
+            flash: Some("Session expired. Log in again at evil.example".into()),
+        };
+        assert!(query.into_flash(&state()).is_none());
+    }
+
+    /// A message built from what a client sent — a user agent the
+    /// operator trusted, say — must not reach the operator's own request
+    /// line, where the injection detector reads it as theirs.
+    #[test]
+    fn a_redirect_carries_an_id_and_never_the_message() {
+        let state = state();
+        let response = back_with(
+            &state,
+            "/firewall",
+            "Trusting user agent ' UNION SELECT <script>",
+            false,
+        );
+        let location = location(&response);
+
+        let id = location
+            .strip_prefix("/firewall?flash=")
+            .unwrap_or_else(|| panic!("location was {location}"));
+        for needle in ["UNION", "script", "Trusting", "%"] {
+            assert!(!location.contains(needle), "location was {location}");
         }
-        .into_flash()
-        .unwrap();
-        assert!(!err.ok);
+        let shown = FlashQuery {
+            flash: Some(id.to_string()),
+        }
+        .into_flash(&state)
+        .expect("the id names the message");
+        assert_eq!(shown.text, "Trusting user agent ' UNION SELECT <script>");
+        assert!(!shown.ok, "the colour survives the redirect");
+    }
+
+    #[test]
+    fn a_return_url_with_a_query_of_its_own_keeps_it() {
+        let state = state();
+        let location = location(&back_with(&state, "/nginx/3?q=gpt%20bot", "Saved.", true));
+        assert!(
+            location.starts_with("/nginx/3?q=gpt%20bot&flash="),
+            "location was {location}"
+        );
     }
 }

@@ -75,7 +75,7 @@ pub async fn page(
     };
 
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
-    render(Tab::Help, &ctx, flash.into_flash(), body(&view))
+    render(Tab::Help, &ctx, flash.into_flash(&state), body(&view))
 }
 
 fn body(view: &View) -> Markup {

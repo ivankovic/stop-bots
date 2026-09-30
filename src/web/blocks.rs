@@ -155,7 +155,7 @@ pub async fn page(
     render(
         Tab::Blocks,
         &ctx,
-        params.flash.into_flash(),
+        params.flash.into_flash(&state),
         body(&view, &loaded, confirm, &ctx),
     )
 }
@@ -415,7 +415,7 @@ pub struct UnblockAllForm {
 }
 
 /// Back to `view`, with a flash.
-fn back_to(ctx_base: &crate::web::BasePath, view: &View, message: &str, ok: bool) -> Response {
+fn back_to(state: &AppState, view: &View, message: &str, ok: bool) -> Response {
     let mut url = format!("/blocks?page={}", view.page);
     if let Some(source) = view.source {
         url.push_str(&format!("&source={}", percent_encode(source.name())));
@@ -423,12 +423,13 @@ fn back_to(ctx_base: &crate::web::BasePath, view: &View, message: &str, ok: bool
     if !view.search.is_empty() {
         url.push_str(&format!("&q={}", percent_encode(&view.search)));
     }
-    url.push_str(&format!(
-        "&flash={}&kind={}",
-        percent_encode(message),
-        if ok { "ok" } else { "err" }
-    ));
-    Redirect::to(&ctx_base.url(&url)).into_response()
+    Redirect::to(&crate::web::server::with_flash(
+        &state.base.url(&url),
+        state,
+        message,
+        ok,
+    ))
+    .into_response()
 }
 
 async fn unblock(
@@ -446,10 +447,10 @@ async fn unblock(
                 message.push_str(" Its detector leaves it alone for now.");
             }
             message.push_str(" Apply everything to lift it on the host.");
-            back_to(&state.base, &view, &message, true)
+            back_to(&state, &view, &message, true)
         }
         Err(err) => back_to(
-            &state.base,
+            &state,
             &view,
             &format!("Could not remove that rule: {err}"),
             false,
@@ -463,7 +464,7 @@ async fn unblock_all(
     Form(form): Form<UnblockAllForm>,
 ) -> Response {
     let Some(source) = SourceFilter::parse(&form.source) else {
-        return back_to(&state.base, &View::default(), "No such source.", false);
+        return back_to(&state, &View::default(), "No such source.", false);
     };
     let view = View {
         source: Some(source),
@@ -485,7 +486,7 @@ async fn unblock_all(
         .await;
     match result {
         Ok(Ok(removed)) => back_to(
-            &state.base,
+            &state,
             &View::default(),
             &format!(
                 "Removed {removed} rule(s) from {}. Apply everything to lift them on the host.",
@@ -494,7 +495,7 @@ async fn unblock_all(
             true,
         ),
         Ok(Err(now)) => back_to(
-            &state.base,
+            &state,
             &view,
             &format!(
                 "{} has {now} rule(s) now, not the {expected} you confirmed. Nothing was removed; look again.",
@@ -503,7 +504,7 @@ async fn unblock_all(
             false,
         ),
         Err(err) => back_to(
-            &state.base,
+            &state,
             &view,
             &format!("Could not remove them: {err}"),
             false,

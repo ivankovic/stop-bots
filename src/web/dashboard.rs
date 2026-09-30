@@ -197,7 +197,12 @@ pub async fn page(
         Err(err) => return internal_error(&err.to_string()),
     };
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
-    render(Tab::Dashboard, &ctx, flash.into_flash(), body(&view, &ctx))
+    render(
+        Tab::Dashboard,
+        &ctx,
+        flash.into_flash(&state),
+        body(&view, &ctx),
+    )
 }
 
 fn body(view: &View, ctx: &Ctx) -> Markup {
@@ -989,7 +994,7 @@ async fn set_web_access(
                 Err(err) => format!("reload failed: {err:#}"),
             };
             back_with(
-                &state.base,
+                &state,
                 "/",
                 &format!(
                     "Wrote {} and recorded the host. NGINX {note}. Restart the console for a \
@@ -999,7 +1004,7 @@ async fn set_web_access(
                 true,
             )
         }
-        Err(err) => back_with(&state.base, "/", &format!("{err:#}"), false),
+        Err(err) => back_with(&state, "/", &format!("{err:#}"), false),
     }
 }
 
@@ -1090,7 +1095,7 @@ async fn set_humans_only(
     let on = form.enabled == "true";
     match state.with_db(move |db| db.set_humans_only(on)).await {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/",
             if on {
                 "Humans only is on: every catalogued bot is blocked except Let's Encrypt, and fetching /robots.txt now earns a one-day block. Apply on the NGINX screen to write it into the site configs."
@@ -1099,7 +1104,7 @@ async fn set_humans_only(
             },
             true,
         ),
-        Err(err) => back_with(&state.base, "/", &err.to_string(), false),
+        Err(err) => back_with(&state, "/", &err.to_string(), false),
     }
 }
 
@@ -1111,7 +1116,7 @@ async fn set_category(
     let (Some(category), Some(policy)) = (category_from(&form.category), policy_from(&form.policy))
     else {
         return back_with(
-            &state.base,
+            &state,
             "/",
             "That is not a category this tool knows.",
             false,
@@ -1134,7 +1139,7 @@ async fn set_category(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!(
                 "{} are now {}. Apply on the NGINX screen to write it into the site configs.",
@@ -1144,7 +1149,7 @@ async fn set_category(
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!("Could not save that: {err}"),
             false,
@@ -1165,12 +1170,12 @@ async fn set_geo_mode(
     let mode = match form.mode.as_str() {
         "allowlist" => GeoMode::Allowlist,
         "blocklist" => GeoMode::Blocklist,
-        _ => return back_with(&state.base, "/", "Unknown geo mode.", false),
+        _ => return back_with(&state, "/", "Unknown geo mode.", false),
     };
     match state.with_db(move |db| db.set_geo_mode(mode)).await {
-        Ok(()) => back_with(&state.base, "/", "Geo mode changed.", true),
+        Ok(()) => back_with(&state, "/", "Geo mode changed.", true),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!("Could not change the geo mode: {err}"),
             false,
@@ -1191,7 +1196,7 @@ async fn add_country(
     let code = form.country.trim().to_uppercase();
     if code.len() != 2 || !code.chars().all(|c| c.is_ascii_alphabetic()) {
         return back_with(
-            &state.base,
+            &state,
             "/",
             "A country is a two-letter ISO code, like CN or RU.",
             false,
@@ -1217,7 +1222,7 @@ async fn add_country(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!(
                 "Selected {code}. Press \u{201c}Update everything\u{201d} to download its \
@@ -1226,7 +1231,7 @@ async fn add_country(
             true,
         ),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!("Could not select {code}: {err}"),
             false,
@@ -1245,9 +1250,9 @@ async fn remove_country(
         .with_db(move |db| db.set_country_selected(&stored, false))
         .await
     {
-        Ok(()) => back_with(&state.base, "/", &format!("Removed {code}."), true),
+        Ok(()) => back_with(&state, "/", &format!("Removed {code}."), true),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!("Could not remove {code}: {err}"),
             false,
@@ -1267,7 +1272,7 @@ async fn set_detector(
     Form(form): Form<DetectorForm>,
 ) -> Response {
     let Some(detector) = Detector::from_id(&form.detector) else {
-        return back_with(&state.base, "/", "Unknown detector.", false);
+        return back_with(&state, "/", "Unknown detector.", false);
     };
     let enabled = form.enabled == "1";
     match state
@@ -1275,7 +1280,7 @@ async fn set_detector(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!(
                 "{} is now {}.",
@@ -1284,12 +1289,7 @@ async fn set_detector(
             ),
             true,
         ),
-        Err(err) => back_with(
-            &state.base,
-            "/",
-            &format!("Could not change that: {err}"),
-            false,
-        ),
+        Err(err) => back_with(&state, "/", &format!("Could not change that: {err}"), false),
     }
 }
 
@@ -1305,19 +1305,14 @@ async fn set_detector_ttl(
     Form(form): Form<TtlForm>,
 ) -> Response {
     let Some(detector) = Detector::from_id(&form.detector) else {
-        return back_with(&state.base, "/", "Unknown detector.", false);
+        return back_with(&state, "/", "Unknown detector.", false);
     };
     if form.days < 1 {
-        return back_with(
-            &state.base,
-            "/",
-            "A block has to last at least a day.",
-            false,
-        );
+        return back_with(&state, "/", "A block has to last at least a day.", false);
     }
     if form.days > crate::protection::MAX_TTL_DAYS {
         return back_with(
-            &state.base,
+            &state,
             "/",
             &format!(
                 "A block can last at most {} days.",
@@ -1332,17 +1327,12 @@ async fn set_detector_ttl(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!("{} now blocks for {days} day(s).", detector.spec().label),
             true,
         ),
-        Err(err) => back_with(
-            &state.base,
-            "/",
-            &format!("Could not change that: {err}"),
-            false,
-        ),
+        Err(err) => back_with(&state, "/", &format!("Could not change that: {err}"), false),
     }
 }
 
@@ -1365,17 +1355,12 @@ async fn set_feed(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!("{id} is now {}.", if enabled { "on" } else { "off" }),
             true,
         ),
-        Err(err) => back_with(
-            &state.base,
-            "/",
-            &format!("Could not change {id}: {err}"),
-            false,
-        ),
+        Err(err) => back_with(&state, "/", &format!("Could not change {id}: {err}"), false),
     }
 }
 
@@ -1394,18 +1379,16 @@ async fn update_all(State(state): State<AppState>, _auth: Auth) -> Response {
     })
     .await;
     match run {
-        Ok(Ok(UpdateRun::Done { summary, all_ok })) => {
-            back_with(&state.base, "/", &summary, all_ok)
-        }
+        Ok(Ok(UpdateRun::Done { summary, all_ok })) => back_with(&state, "/", &summary, all_ok),
         Ok(Ok(UpdateRun::Busy { since })) => back_with(
-            &state.base,
+            &state,
             "/",
             &crate::refresh::Claim::busy_message(since),
             false,
         ),
-        Ok(Err(err)) => back_with(&state.base, "/", &format!("{err:#}"), false),
+        Ok(Err(err)) => back_with(&state, "/", &format!("{err:#}"), false),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!("The download stopped unexpectedly: {err}"),
             false,
@@ -1429,7 +1412,7 @@ async fn update_crawler_ranges(
     use crate::web::cron::OneRun;
     let Some(kind) = crate::ipranges::IpRangeSourceKind::from_id(&form.source) else {
         return back_with(
-            &state.base,
+            &state,
             "/",
             &format!("Unknown crawler: {}", form.source),
             false,
@@ -1441,24 +1424,21 @@ async fn update_crawler_ranges(
     })
     .await;
     match run {
-        Ok(Ok(OneRun::Done(Ok(summary)))) => back_with(
-            &state.base,
-            "/",
-            &format!("{}: {summary}.", kind.name()),
-            true,
-        ),
+        Ok(Ok(OneRun::Done(Ok(summary)))) => {
+            back_with(&state, "/", &format!("{}: {summary}.", kind.name()), true)
+        }
         Ok(Ok(OneRun::Done(Err(err)))) => {
-            back_with(&state.base, "/", &format!("{}: {err}", kind.name()), false)
+            back_with(&state, "/", &format!("{}: {err}", kind.name()), false)
         }
         Ok(Ok(OneRun::Busy { since })) => back_with(
-            &state.base,
+            &state,
             "/",
             &crate::refresh::Claim::busy_message(since),
             false,
         ),
-        Ok(Err(err)) => back_with(&state.base, "/", &format!("{err:#}"), false),
+        Ok(Err(err)) => back_with(&state, "/", &format!("{err:#}"), false),
         Err(err) => back_with(
-            &state.base,
+            &state,
             "/",
             &format!("The download stopped unexpectedly: {err}"),
             false,
@@ -1636,7 +1616,7 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
         }
     }
 
-    back_with(&state.base, "/", &parts.join(". "), ok)
+    back_with(&state, "/", &parts.join(". "), ok)
 }
 
 /// Renders the firewall script, writes it, and runs it.
@@ -1755,7 +1735,7 @@ async fn set_auto_apply_firewall(
         .await
     {
         Ok(()) => back_with(
-            &state.base,
+            &state,
             "/",
             if on {
                 "Auto-apply on for the firewall. The daily render will run the script too \
@@ -1767,12 +1747,7 @@ async fn set_auto_apply_firewall(
             },
             true,
         ),
-        Err(err) => back_with(
-            &state.base,
-            "/",
-            &format!("Could not save that: {err}"),
-            false,
-        ),
+        Err(err) => back_with(&state, "/", &format!("Could not save that: {err}"), false),
     }
 }
 
@@ -1812,8 +1787,8 @@ async fn render_firewall(
     // the write-only one kept deriving its destination separately from the
     // backend it rendered for.
     match write_firewall(&state, form.apply.is_some()).await {
-        Ok(note) => back_with(&state.base, "/", &note, true),
-        Err(err) => back_with(&state.base, "/", &format!("{err:#}"), false),
+        Ok(note) => back_with(&state, "/", &note, true),
+        Err(err) => back_with(&state, "/", &format!("{err:#}"), false),
     }
 }
 

@@ -47,6 +47,9 @@ pub struct AppState {
     /// Failed-login throttling. Shared across requests, so it has to
     /// outlive any one of them.
     pub login_throttle: Arc<LoginThrottle>,
+    /// Messages waiting for the page an action redirects to. See
+    /// [`crate::web::flash`].
+    pub flashes: Arc<crate::web::flash::Flashes>,
     /// The path prefix this console is served under. Read once at
     /// startup: it is part of how the server is deployed, not something a
     /// request can change.
@@ -107,6 +110,7 @@ impl AppState {
             ssh_log,
             sessions: Arc::new(Sessions::default()),
             login_throttle: Arc::new(LoginThrottle::default()),
+            flashes: Arc::default(),
             base,
             apply_for_real,
             firewall_out: None,

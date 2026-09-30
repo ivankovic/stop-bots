@@ -545,7 +545,8 @@ pub fn generate_password() -> Result<String> {
     Ok(base64url(&bytes))
 }
 
-fn random_token() -> Result<String> {
+/// 256 random bits, base64url: a session id, a CSRF token, a flash id.
+pub(crate) fn random_token() -> Result<String> {
     let mut bytes = [0u8; TOKEN_BYTES];
     rand::rngs::SysRng
         .try_fill_bytes(&mut bytes)

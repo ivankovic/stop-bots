@@ -52,6 +52,7 @@ pub mod bots;
 pub mod cron;
 pub mod dashboard;
 pub mod firewall;
+pub mod flash;
 pub mod help;
 pub mod layout;
 pub mod nginx;
