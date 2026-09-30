@@ -8,6 +8,21 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.1.0-rc.1] — 2026-09-30
+
+The first release whose command line, database, generated files and paths are a
+contract: see "Versioning" in `RELEASING.md`. Upgrading from 0.0.x:
+
+- The first open copies the database to `<db>.bak-v0`, then upgrades it in place.
+  An older stop-bots will refuse the upgraded database; restore the copy to go back.
+- The first log pass reads the whole access log once, and keeps only what falls
+  inside each detector's window.
+- Renders now go to `firewall.next.*`; the script loaded at boot changes only when
+  something applies. Apply once after upgrading: the Dashboard says "not applied"
+  until you do.
+- `sudo stop-bots install web` (and `install firewall`) replaces an unedited unit
+  from any 0.0.x without `--force`, and the web unit gains resource limits.
+
 ### Added
 
 - **A stranger test**: the README's quick start, from `apt install` of the
@@ -1676,7 +1691,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.1...HEAD
+[0.1.0-rc.1]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...v0.1.0-rc.1
 [0.0.15]: https://github.com/ivankovic/stop-bots/compare/v0.0.14...v0.0.15
 [0.0.14]: https://github.com/ivankovic/stop-bots/compare/v0.0.13...v0.0.14
 [0.0.13]: https://github.com/ivankovic/stop-bots/compare/v0.0.12...v0.0.13
