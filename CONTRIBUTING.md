@@ -312,6 +312,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- db/keys.rs     <- Every `settings` key, spelled once
         |- db/managed.rs  <- The record of every generated file written, for cleaning up
         |- db/evidence.rs <- What the detectors have seen, and each log's read cursor
+        |- db/blocks.rs   <- The Blocks views' pages, removal by source, and unblocks by hand
         |- botlist/       <- One file per bot-list source parser
         |- fetch.rs       <- The one place an outbound HTTP request is made
         |- refresh.rs     <- "Update everything": every downloadable list as fetch-then-store
@@ -327,6 +328,8 @@ Some directories don't exist yet but should be created if the need arises.
         |- injection.rs   <- Recognising an exploit payload in a logged request
         |- accessstats.rs <- What one pass tallied into the access-log UA stats
         |- scanblock.rs   <- Shared CLI+cron logic for every detector's detect-and-block pass
+        |- blocks.rs      <- Why a rule exists: its source, its evidence line, and unblocks
+        |- trigger.rs     <- The log line behind a new block, when a whole log was read
         |- protection.rs  <- The detectors' on/off switches, their defaults, and why
         |- ipranges/      <- Crawler, country and third-party IP-range fetching/storage
         |- ipdetail.rs    <- Everything already known about one address (Firewall detail view)

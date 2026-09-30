@@ -1266,7 +1266,7 @@ mod tests {
         // The block lapses: pruned, as `list_firewall_rules` does once its
         // time is up.
         let id = db.list_firewall_rules().unwrap()[0].id;
-        db.remove_firewall_rule(id).unwrap();
+        db.let_firewall_rule_lapse(id);
         assert_eq!(
             pass(&db, dir.path(), &job)[0].1,
             "no probing IPs found",

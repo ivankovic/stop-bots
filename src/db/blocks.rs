@@ -278,6 +278,18 @@ impl Db {
 impl Db {
     /// A Block for `address` as a 0.0.x release wrote it: no source, no
     /// evidence. For the screens' tests, which cannot reach the table.
+    /// Lets rule `id` lapse now, the way its expiry would: pruned, and not
+    /// removed by an operator, which the detectors would then respect.
+    pub(crate) fn let_firewall_rule_lapse(&self, id: i64) {
+        self.conn
+            .execute(
+                "UPDATE firewall_rules SET expires_at = ?1 WHERE id = ?2",
+                params![now() - 1, id],
+            )
+            .unwrap();
+        self.prune_expired_firewall_rules().unwrap();
+    }
+
     pub(crate) fn insert_rule_from_before_0_1(&self, address: &str) {
         self.conn
             .execute(

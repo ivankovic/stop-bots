@@ -20,12 +20,17 @@
 //! detector has just decided to block.
 //!
 //! **This picks evidence; it never decides anything.** The detectors in
-//! `sshlog` and `accesslog` decide who is blocked. This reads the same log
-//! once more, only when a pass has blocked something new, and only for
-//! those addresses, to find the line worth showing beside the block: the
-//! request for `/.env`, the payload, the failed login. Its parsing is
-//! therefore deliberately lighter than theirs — at worst it shows a less
-//! telling line, or none, for an address they already judged.
+//! `sshlog` and `accesslog` decide who is blocked. When a whole log is at
+//! hand — the one-off `block-*` commands — this reads it once more, for
+//! the flagged addresses only, to find the line worth showing beside the
+//! block: the request for `/.env`, the payload, the failed login. Its
+//! parsing is therefore deliberately lighter than theirs — at worst it
+//! shows a less telling line, or none, for an address they already judged.
+//!
+//! The scheduled passes have no log text: they decide on stored evidence
+//! (`crate::evidence`), which keeps the item each line said — the path,
+//! the payload's name, the crawler claimed — and their blocks record that
+//! instead (`scanblock::evidence_line`).
 //!
 //! What it returns is the client's own text. [`crate::blocks::evidence_line`]
 //! cleans it up where it is stored.
