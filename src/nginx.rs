@@ -2917,6 +2917,15 @@ pub fn remove_everything(
     commands: Option<&NginxCommands>,
     dry_run: bool,
 ) -> Result<Removal> {
+    // The same lock every apply holds, from the first read of a site file
+    // to the reload: a console or a cron `batch` applying while this runs
+    // would otherwise write a block back into a file this has just read.
+    // A dry run writes nothing and takes nothing.
+    let _lock = if dry_run {
+        None
+    } else {
+        Some(crate::applylock::hold()?)
+    };
     let mut edits = Vec::new();
     let mut paths: Vec<PathBuf> = discover_sites(root)?
         .into_iter()
