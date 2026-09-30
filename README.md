@@ -170,8 +170,9 @@ running. For a server with no stop-bots process on it at all, see
 The first five are on in a new database:
 
 - **SSH and web scanners**: IPs with a pile of failed SSH logins, or many distinct 404'd
-  paths. Never an IP with a recent successful SSH login, or, for the web, one inside a known
-  crawler's published IP range.
+  paths. Never an IP with a recent successful SSH login or console login, or, for the web,
+  one inside a known crawler's published IP range. Requests to the console itself are never
+  counted by any detector, so inspecting an attack in the console cannot block you.
 - **Forged crawlers**: anything claiming to be Googlebot, Bingbot or GPTBot from an address
   that crawler's own operator doesn't publish. The cheapest common disguise there is. Inert
   until those lists have actually been fetched.
@@ -421,6 +422,13 @@ script, and runs `nginx -t` and `systemctl reload nginx`. It yields to the host:
 `Nice=10` with idle I/O priority, and systemd throttles it at a quarter of RAM and stops it at
 half.
 
+It is sandboxed with `ProtectSystem=strict`: it can write its database, `/etc/stop-bots`, the
+NGINX config root and the log directories that config names, and nothing else — not cron,
+not systemd units, not binaries. The limit is worth knowing: it still runs as root and must
+be able to ask systemd to reload NGINX, and anything that can do that can ask systemd for
+more. The sandbox stops a stray or tricked write, not code running as the service. If you
+later add a site that logs somewhere new, re-run `install web` so the unit grants it.
+
 Only Debian is checked for, because that is what has been tested; the unit is very likely
 correct on any systemd distribution, but the SSH log path it assumes is Debian's.
 
@@ -488,6 +496,8 @@ use the panel — the trailing-slash trap below is the mistake it exists to prev
 ```nginx
 server {
     server_name stopbots.example.com;
+    # Keeps the console's own requests out of the log the detectors read.
+    access_log off;
     location / {
         proxy_pass http://127.0.0.1:8787;
         proxy_set_header Host $host;
