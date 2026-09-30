@@ -86,8 +86,9 @@ sudo stop-bots install firewall
 sudo stop-bots status
 ```
 
-`batch --dry-run` downloads and scans nothing, so it shows what the database already holds:
-on a brand-new install, not much. `sudo stop-bots batch` without `--apply` does the downloads
+`batch --dry-run` downloads and scans nothing: on a brand-new install it shows the NGINX
+blocks from the bot list built into the binary, and no firewall rules yet, because nothing
+has been read from your logs. `sudo stop-bots batch` without `--apply` does the downloads
 and scans and writes the files for review without enforcing them. See
 [Unattended, from cron](#unattended-from-cron) for what `batch` does.
 
@@ -561,13 +562,18 @@ scan the logs, write the NGINX blocking rules and the firewall script.
 
 ```
 # One full pass a night. Refreshes the lists, scans the logs, applies both.
-0 4 * * * root /usr/bin/stop-bots batch --apply --ssh-log /var/log/auth.log
+0 4 * * * root /usr/bin/stop-bots batch --apply
 
 # And detection every ten minutes, without re-downloading lists that change weekly.
-*/10 * * * * root /usr/bin/stop-bots batch --apply --no-fetch --ssh-log /var/log/auth.log
+*/10 * * * * root /usr/bin/stop-bots batch --apply --no-fetch
 ```
 
 (`/usr/bin` is where the package puts it; `cargo install` puts it in `~/.cargo/bin`.)
+
+The SSH log is found on its own: `/var/log/auth.log` where rsyslog writes one (Ubuntu), the
+journal where it doesn't (Debian 12 and later). Name a file with `--ssh-log`, or store one
+with `set-log-paths`, only if yours is somewhere else — a named file that does not exist
+makes `--apply` refuse, because the lockout check cannot run.
 
 It says nothing when everything worked, so a healthy nightly run doesn't mail you. A failed
 step prints to stderr and sets a non-zero exit status, which is what makes cron tell you

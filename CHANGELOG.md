@@ -180,6 +180,13 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Fixed
 
+- `status` on a host run from the CLI and cron reported "UNKNOWN: Console service";
+  the console is optional, and not having one is now OK.
+- Piping a command's output into something that stops reading early (`| head`)
+  ended in a panic; it now ends quietly, like any other command-line tool.
+- The README's cron lines named `--ssh-log /var/log/auth.log`, which Debian 12
+  does not have, so `batch --apply` refused. The SSH log is found on its own.
+
 - `render-firewall --out` no longer suggests running the file by hand, which would
   not survive a reboot; it points at `render-firewall --apply`.
 - The web Firewall page: a `BLOCKED` tag naming its detector no longer spills over
