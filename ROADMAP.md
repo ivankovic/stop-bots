@@ -73,16 +73,16 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 
 ### A. Don't hurt the operator
 
-- [ ] **One firewall path.** Render → lockout guard → write → apply exists five times
+- [x] **One firewall path.** Render → lockout guard → write → apply exists five times
   (`app.rs:308`, `web/dashboard.rs:1466`, `cron.rs:710`, `batch.rs:405`,
   `main.rs:2909`). They handle "no SSH log readable" four different ways. That is the one
   path that can take a server off the network. Make it one function with a typed outcome,
   and leave each front-end only the message. **M**
-- [ ] **The boot unit loads only what was explicitly applied.** The internal cron rewrites
+- [x] **The boot unit loads only what was explicitly applied.** The internal cron rewrites
   `/etc/stop-bots/firewall.nft` even when the guard could not run (`cron.rs:741`), and
   `stop-bots-firewall.service` loads that file at boot. A reboot can therefore enforce
   rules nobody applied. The cron should write a staging file; only an apply promotes it. **S**
-- [ ] **Confirm and preview before "Apply everything".** `a` in the TUI and the web button
+- [x] **Confirm and preview before "Apply everything".** `a` in the TUI and the web button
   inject into every site and run the firewall script as root, on one keypress. Show a
   summary (sites changed, rules added and removed, the guard's result) with a diff on
   request, and add `--dry-run` to `apply-blocks` and `batch`. **M**
