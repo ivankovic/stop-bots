@@ -250,7 +250,7 @@ const RENDER_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub fn is_due(db: &Db, job: CronJob) -> Result<bool> {
     let Some(last_run) = db.get_cron_last_run(job.id())? else {
         return Ok(match job {
-            CronJob::UpdateEverything => first_download_base(db)?
+            CronJob::UpdateEverything | CronJob::UpdateIpRanges => first_download_base(db, job)?
                 .is_some_and(|base| now() - base >= job.due_after(base).as_secs() as i64),
             _ => true,
         });
@@ -285,30 +285,47 @@ pub fn is_due(db: &Db, job: CronJob) -> Result<bool> {
 pub fn next_run_at(db: &Db, job: CronJob) -> Result<Option<i64>> {
     let last_run = match db.get_cron_last_run(job.id())? {
         Some(at) => Some(at),
-        None if job == CronJob::UpdateEverything => first_download_base(db)?,
+        None if is_download(job) => first_download_base(db, job)?,
         None => None,
     };
     Ok(last_run.map(|last_run| last_run + job.due_after(last_run).as_secs() as i64))
 }
 
-/// What the weekly download counts from before it has ever run: when this
-/// host's oldest downloaded bot list was fetched, or `None` if it has
-/// fetched none.
+/// Whether `job` downloads something, and so waits for the operator's
+/// first download before it ever runs (see [`first_download_base`]).
+fn is_download(job: CronJob) -> bool {
+    matches!(job, CronJob::UpdateEverything | CronJob::UpdateIpRanges)
+}
+
+/// What a download job counts from before it has ever run: when this
+/// host's oldest downloaded list was fetched, or `None` if it has fetched
+/// none. For the weekly download, a bot list; for the daily crawler
+/// ranges, a bot list or one of the crawler range lists.
 ///
 /// Not "never run, so run now" like every other job. On a database that
-/// has fetched nothing, that would download every list the first time a
-/// front-end opened, which is the operator's first `u` to press, not the
-/// cron's; so the job waits for the first download and counts a week from
-/// it. On one upgraded from before the job existed, the lists are as old
-/// as their last fetch, and a month-old list is due at once. The built-in
-/// list is left out: it is stored at every start-up.
-fn first_download_base(db: &Db) -> Result<Option<i64>> {
-    Ok(db
+/// has fetched nothing, that would download the first time a front-end
+/// opened, which is the operator's first `u` (or "Update everything", or a
+/// `batch`) to press, not the cron's; so the job waits for the first
+/// download and counts its interval from it. On one upgraded from before
+/// the job existed, the lists are as old as their last fetch, and a
+/// month-old list is due at once. The built-in list is left out: it is
+/// stored at every start-up.
+fn first_download_base(db: &Db, job: CronJob) -> Result<Option<i64>> {
+    let bot_lists = db
         .list_sources()?
         .into_iter()
         .filter(|source| source.id != crate::botlist::SourceKind::StopBotsExtras.id())
         .filter_map(|source| source.last_fetched_at)
-        .min())
+        .min();
+    if job != CronJob::UpdateIpRanges {
+        return Ok(bot_lists);
+    }
+    let crawler_ranges = db
+        .list_ip_range_sources()?
+        .into_iter()
+        .filter_map(|source| source.last_fetched_at)
+        .min();
+    Ok(bot_lists.into_iter().chain(crawler_ranges).min())
 }
 
 /// Every job that's currently due, in [`CronJob::all()`] order.
@@ -894,8 +911,9 @@ mod tests {
     fn the_crawler_job_is_not_run_beside_the_weekly_download() {
         let db = test_db();
         let week_ago = now() - 8 * 24 * 60 * 60;
-        db.set_cron_last_run(CronJob::UpdateEverything.id(), week_ago, "")
-            .unwrap();
+        for job in [CronJob::UpdateEverything, CronJob::UpdateIpRanges] {
+            db.set_cron_last_run(job.id(), week_ago, "").unwrap();
+        }
 
         let due = due_jobs(&db).unwrap();
         assert!(due.contains(&CronJob::UpdateEverything));
@@ -1511,12 +1529,38 @@ mod tests {
         assert!(!is_due(&db, CronJob::Detect(Detector::WebScanners)).unwrap());
     }
 
+    /// A fresh database has downloaded nothing, and its first download is
+    /// the operator's to start, not the cron's first tick.
     #[test]
-    fn due_jobs_on_a_fresh_database_includes_every_job_but_the_weekly_download() {
+    fn due_jobs_on_a_fresh_database_includes_every_job_but_the_downloads() {
         let db = Db::open_in_memory().unwrap();
         let due = due_jobs(&db).unwrap();
-        assert_eq!(due.len(), CronJob::all().len() - 1);
+        assert_eq!(due.len(), CronJob::all().len() - 2, "{due:?}");
         assert!(!due.contains(&CronJob::UpdateEverything), "{due:?}");
+        assert!(!due.contains(&CronJob::UpdateIpRanges), "{due:?}");
+        assert_eq!(next_run_at(&db, CronJob::UpdateIpRanges).unwrap(), None);
+    }
+
+    /// Before its first run the daily crawler-range job counts from the
+    /// oldest list this host fetched, the crawler ranges included.
+    #[test]
+    fn the_crawler_job_first_counts_from_the_oldest_fetched_list() {
+        let fetched = |ago: i64| {
+            let db = test_db();
+            db.register_ip_range_source(&crate::db::IpRangeSource {
+                id: "googlebot".to_string(),
+                name: "Googlebot IP ranges".to_string(),
+                url: "https://example.invalid/googlebot.json".to_string(),
+                category: crate::db::Category::Search,
+                last_fetched_at: Some(now() - ago),
+                range_count: 1,
+            })
+            .unwrap();
+            is_due(&db, CronJob::UpdateIpRanges).unwrap()
+        };
+
+        assert!(!fetched(60), "fetched a minute ago");
+        assert!(fetched(2 * 24 * 60 * 60), "fetched two days ago");
     }
 
     /// Before its first run the weekly download counts from the oldest
@@ -1555,10 +1599,10 @@ mod tests {
     fn due_jobs_excludes_a_job_that_just_ran() {
         let db = Db::open_in_memory().unwrap();
         let before = due_jobs(&db).unwrap().len();
-        db.set_cron_last_run(CronJob::UpdateIpRanges.id(), now(), "ran")
+        db.set_cron_last_run(CronJob::Maintenance.id(), now(), "ran")
             .unwrap();
         let due = due_jobs(&db).unwrap();
-        assert!(!due.contains(&CronJob::UpdateIpRanges));
+        assert!(!due.contains(&CronJob::Maintenance));
         assert_eq!(due.len(), before - 1);
     }
 

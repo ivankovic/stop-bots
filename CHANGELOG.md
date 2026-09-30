@@ -29,6 +29,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The web console stores a log pass 5,000 rows at a time and lets its database go
   between them: a 200,000-line pass held every request, `/login` included, for 7 s.
 
+### Changed
+
+- The internal cron's daily crawler-range download waits for the first download, as
+  the weekly one does: a database that has never downloaded anything leaves it to the
+  operator (`u`, "Update everything", or `batch`) instead of fetching on the first tick.
+
 ## [0.1.0-rc.1] — 2026-09-30
 
 The first release whose command line, database, generated files and paths are a
