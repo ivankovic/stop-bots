@@ -88,7 +88,7 @@ impl std::fmt::Display for Busy {
         }
         write!(
             f,
-            " and has not finished; nothing was changed. Try again once it has \
+            " and has not finished; nothing was applied. Try again once it has \
              (the lock is {})",
             self.path.display()
         )

@@ -1024,6 +1024,26 @@ pub fn execute(prepared: Prepared, ssh_log: SshLog<'_>) -> FirewallOutcome {
     let may_write = guard.risks().is_empty() || run.force;
     let may_apply = guard.passed() || run.force;
 
+    // One apply at a time across processes, held from writing the script
+    // to copying it over the applied one: otherwise another apply's write
+    // can land between this one's write and its `nft -f`, and the kernel
+    // and the boot script end up with different rules. Only when this run
+    // will really apply; a render alone takes no lock. `apply_script`
+    // takes it again below, which on the same thread is free.
+    let will_apply = run.apply && may_apply && may_write && run.for_real && !run.dry_run;
+    let mut busy = None;
+    let _lock = if will_apply {
+        match crate::applylock::hold() {
+            Ok(lock) => Some(lock),
+            Err(err) => {
+                busy = Some(format!("{err:#}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let write = if !may_write {
         WriteStep::Refused
     } else if run.dry_run {
@@ -1048,6 +1068,8 @@ pub fn execute(prepared: Prepared, ssh_log: SshLog<'_>) -> FirewallOutcome {
         ApplyStep::NotForReal
     } else if run.dry_run {
         ApplyStep::Applied
+    } else if let Some(busy) = busy {
+        ApplyStep::Failed(busy)
     } else {
         match apply_script(run.backend, &run.rendered_path) {
             Err(err) => ApplyStep::Failed(format!("{err:#}")),
