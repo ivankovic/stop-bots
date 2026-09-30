@@ -59,6 +59,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Changed
 
+- **The README starts with a quick start** (install, the TUI path, the same from the
+  CLI, undo) and states the supported platforms: Debian and Ubuntu, systemd, NGINX.
+  Its screenshots show the Blocks screen.
+- The crates.io and `.deb` descriptions say "a TUI, web console and CLI".
+
 - **Re-installing over an unedited unit replaces it without `--force`**,
   including one any 0.0.x wrote. Units carry a `stop-bots-template` hash
   line; an edited one is still refused. A 0.0.1–0.0.6 unit's `--root` is

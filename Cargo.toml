@@ -13,7 +13,7 @@ authors = ["Marko Ivankovic <marko@ivankovic.me>"]
 # "or-later" to match the header on every source file, which grants
 # "version 3 of the License, or (at your option) any later version".
 license = "AGPL-3.0-or-later"
-description = "A TUI that helps you configure your server to stop bad bots and still allow good bots."
+description = "A TUI, web console and CLI that help you configure your server to stop bad bots and still allow good bots."
 repository = "https://github.com/ivankovic/stop-bots"
 homepage = "https://github.com/ivankovic/stop-bots"
 readme = "README.md"
@@ -62,11 +62,12 @@ license-file = ["LICENSE", "0"]
 section = "net"
 priority = "optional"
 extended-description = """\
-A TUI, a web UI and a CLI that help you configure your server to stop bad bots \
-without hiding behind a CDN. It classifies known bots by category and blocks \
-them in your NGINX config, and renders an nftables or iptables script that \
-blocks countries, datacenter ranges and addresses caught scanning your logs. \
-Nothing is applied without being asked."""
+A TUI, a web console and a CLI that help you configure your server to stop bad \
+bots without hiding behind a CDN. It classifies known bots by category and \
+blocks them in your NGINX config, and writes an nftables or iptables script \
+that blocks countries, datacenter ranges and addresses caught scanning your \
+logs, recording why each one is blocked. For Debian and Ubuntu with systemd \
+and NGINX. Nothing is applied without being asked."""
 
 # Empty, not "$auto". The release build targets musl and links statically, so
 # there is no libc6 to depend on -- which is the whole reason for that target:
