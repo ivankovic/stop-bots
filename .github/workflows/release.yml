@@ -186,10 +186,11 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
-          # Marked as a pre-release while the version is 0.0.x: cargo treats
+          # Marked as a pre-release while the version is 0.0.x — cargo treats
           # every 0.0.z bump as breaking, and the release page should say the
-          # same thing the version number does.
-          prerelease: ${{ startsWith(github.ref_name, 'v0.0.') }}
+          # same thing the version number does — and for a release candidate
+          # (`v0.1.0-rc.1`: any tag with a semver pre-release part).
+          prerelease: ${{ startsWith(github.ref_name, 'v0.0.') || contains(github.ref_name, '-') }}
 
   # Republishes the APT repository with this release added to it.
   #
@@ -198,8 +199,14 @@ jobs:
   # tarballs are where the AUR package expects them, and this job can be
   # re-run on its own to fix the repository. The other order would leave a
   # repository advertising a release that does not exist.
+  #
+  # Not for a release candidate. The repository has one channel, `stable`,
+  # and `apt upgrade` would move every host that uses it onto a build that
+  # is still being tried out. A candidate's .debs are on its GitHub release
+  # for anyone who wants one.
   apt:
     needs: release
+    if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
     steps:
       # The tagged tree, for scripts/build-apt-repo.sh and the landing page.
