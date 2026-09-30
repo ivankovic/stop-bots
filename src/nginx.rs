@@ -2917,6 +2917,18 @@ pub fn server_names_for(config_path: &Path, server_name: &str) -> Vec<String> {
         .unwrap_or_else(|| vec![server_name.to_string()])
 }
 
+/// Whether a `server` block declaring `server_name` in `config_path`
+/// terminates TLS — which is the block the console's `location` goes into
+/// when there is one (see `with_console_location`). `false` when the file
+/// cannot be read, which is the answer that turns nothing on.
+pub fn serves_tls(config_path: &Path, server_name: &str) -> bool {
+    fs::read_to_string(config_path).is_ok_and(|content| {
+        parse_server_blocks(&content)
+            .iter()
+            .any(|block| block.is_tls && block.names.iter().any(|name| name == server_name))
+    })
+}
+
 /// Compares what's actually written in `config_path` for `server_name`
 /// against `config` (the currently computed blocking rule for that site)
 /// without changing anything on disk.

@@ -844,6 +844,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     if let Some(check) = nginx_deployment(db, probe)? {
         checks.push(check);
     }
+    if let Some(check) = console_proxy(db)? {
+        checks.push(check);
+    }
 
     Ok(Report {
         checks,
@@ -1839,6 +1842,48 @@ fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
                 problems.join("; and ")
             ),
             fix: Some(fixes.join(". ")),
+        }
+    }))
+}
+
+/// Whether a console set up behind a proxy believes the proxy's word
+/// about who is asking.
+///
+/// "Set up behind a proxy" is what the Web Access panel records: a path
+/// prefix, or a host name to answer to other than loopback. Behind one,
+/// every request arrives from the proxy's own address, and without
+/// `web:trust_forwarded_for` the console takes that for the client. Then
+/// the login throttle has one key for everyone, so an attacker's failures
+/// are the operator's too, and the guard against blocking your own address
+/// compares against 127.0.0.1.
+///
+/// A warning, not critical: nothing is unprotected, but the console's own
+/// defences are working against the wrong address. Absent on a console
+/// that is not proxied, which is the default.
+fn console_proxy(db: &Db) -> Result<Option<Check>> {
+    if !crate::web::is_proxied(db)? {
+        return Ok(None);
+    }
+    let trusted = db.get_bool_setting(crate::web::TRUST_FORWARDED_KEY, false)?;
+    Ok(Some(if trusted {
+        Check {
+            id: "web-proxy",
+            title: "Console behind a proxy",
+            level: Level::Ok,
+            detail: "client addresses come from the proxy's X-Forwarded-For".to_string(),
+            fix: None,
+        }
+    } else {
+        Check {
+            id: "web-proxy",
+            title: "Console behind a proxy",
+            level: Level::Warn,
+            detail: "the console is set up behind a proxy but does not believe its \
+                     X-Forwarded-For, so every client is the proxy's address: one login \
+                     throttle for the operator and every attacker, and no way to stop you \
+                     blocking your own address"
+                .to_string(),
+            fix: Some("stop-bots set-web --trust-forwarded-for true".to_string()),
         }
     }))
 }
@@ -3028,6 +3073,53 @@ mod tests {
             !check.detail.contains("access log"),
             "was: {}",
             check.detail
+        );
+    }
+
+    #[test]
+    fn a_proxied_console_that_does_not_trust_the_proxy_is_warned_about() {
+        let db = db();
+        db.set_text_setting(crate::web::BASE_PATH_KEY, "/stop-bots")
+            .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+        let check = check(&report, "web-proxy");
+
+        assert_eq!(check.level, Level::Warn);
+        assert_eq!(
+            check.fix.as_deref(),
+            Some("stop-bots set-web --trust-forwarded-for true")
+        );
+    }
+
+    #[test]
+    fn a_console_named_by_a_public_host_counts_as_proxied_too() {
+        let db = db();
+        db.set_text_setting(crate::web::ALLOWED_HOSTS_KEY, "console.example.com")
+            .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+        assert_eq!(check(&report, "web-proxy").level, Level::Warn);
+
+        db.set_bool_setting(crate::web::TRUST_FORWARDED_KEY, true)
+            .unwrap();
+        let report = assess(&db, &healthy()).unwrap();
+        assert_eq!(check(&report, "web-proxy").level, Level::Ok);
+    }
+
+    /// The default install is loopback with no proxy, and has nothing to
+    /// say about one.
+    #[test]
+    fn a_console_that_is_not_proxied_gets_no_proxy_line() {
+        let db = db();
+        db.set_text_setting(crate::web::ALLOWED_HOSTS_KEY, "localhost")
+            .unwrap();
+
+        let report = assess(&db, &healthy()).unwrap();
+        assert!(
+            report.checks.iter().all(|c| c.id != "web-proxy"),
+            "{:?}",
+            report.checks
         );
     }
 

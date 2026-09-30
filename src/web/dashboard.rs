@@ -982,12 +982,12 @@ async fn set_web_access(
             let plan = crate::webaccess::plan(db, &request)?;
             let path = crate::webaccess::apply(&plan, &root)?;
             crate::webaccess::record(db, &plan)?;
-            anyhow::Ok(path)
+            anyhow::Ok((path, plan.recorded_note()))
         })
         .await;
 
     match written {
-        Ok(path) => {
+        Ok((path, recorded)) => {
             let reload = reload_nginx(&state).await;
             let note = match reload {
                 Ok(note) => note,
@@ -997,8 +997,8 @@ async fn set_web_access(
                 &state,
                 "/",
                 &format!(
-                    "Wrote {} and recorded the host. NGINX {note}. Restart the console for a \
-                     changed path prefix to take effect.",
+                    "Wrote {} and recorded the host. NGINX {note}. {recorded} Restart the \
+                     console for a changed path prefix to take effect.",
                     path.display()
                 ),
                 true,

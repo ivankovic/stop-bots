@@ -27,7 +27,9 @@
 //! - [`apply`] writes the config and runs `nginx -t`, touching no `Db`.
 //! - [`record`] stores the host name and path prefix the console must now
 //!   answer to — *after* the config validated, so a failed apply never
-//!   leaves the console expecting an address nothing serves.
+//!   leaves the console expecting an address nothing serves — and turns on
+//!   what a console behind that proxy needs: believing its
+//!   `X-Forwarded-For`, and a `Secure` cookie where the site serves TLS.
 //!
 //! Reloading is not in here. It is the one step that is already a shared
 //! `start_`/`finish_` pair in the TUI and a helper in the console, and
@@ -83,6 +85,11 @@ pub struct Plan {
     pub base_path: Option<BasePath>,
     /// Where NGINX will proxy to — this server's own bind address.
     pub upstream: SocketAddr,
+    /// Whether the console will be served over TLS once this is applied:
+    /// path mode on a site with an `ssl` server block. Never true in
+    /// subdomain mode, whose block is plain HTTP until certbot has run —
+    /// and it is only certbot that knows when that is.
+    pub tls: bool,
     /// How to test and reload NGINX on this host.
     pub commands: NginxCommands,
 }
@@ -107,6 +114,7 @@ pub fn plan(db: &Db, request: &Request) -> Result<Plan> {
                 base_path: None,
                 upstream,
                 commands,
+                tls: false,
             })
         }
         Request::Path { site, prefix } => {
@@ -133,7 +141,9 @@ pub fn plan(db: &Db, request: &Request) -> Result<Plan> {
             // Every name on the block this location is going into, not
             // just the one the database happens to store.
             let hosts = nginx::server_names_for(&config_path, &server_name);
+            let tls = nginx::serves_tls(&config_path, &server_name);
             Ok(Plan {
+                tls,
                 access: ConsoleAccess::Path {
                     prefix: prefix.url("/"),
                     config_path,
@@ -157,11 +167,24 @@ pub fn apply(plan: &Plan, root: &Path) -> Result<PathBuf> {
     nginx::apply_console_access(root, &plan.access, &plan.upstream, &plan.commands)
 }
 
-/// Records the address the console now answers to.
+/// Records the address the console now answers to, and what a console
+/// behind this proxy needs.
 ///
 /// Only ever called after [`apply`] returned `Ok`: a host allowlist naming
 /// somewhere nothing serves, or a prefix NGINX never got, is a setting
 /// that only makes the console harder to reach.
+///
+/// **`web:trust_forwarded_for`, always.** The `location` this wrote sets
+/// `X-Forwarded-For $proxy_add_x_forwarded_for`, and it used to leave the
+/// console not believing it: every proxied client was 127.0.0.1, so the
+/// login throttle had one key for everyone and an attacker's failures
+/// kept the operator out. The header is still only believed from a
+/// loopback peer, which is where this proxy connects from.
+///
+/// **`web:secure_cookie`, when the site serves TLS** ([`Plan::tls`]).
+/// Only turned on, never off: an operator who set it by hand keeps it.
+/// Not in subdomain mode, whose block is plain HTTP when written; its
+/// comment says to set it after running certbot.
 pub fn record(db: &Db, plan: &Plan) -> Result<()> {
     let mut hosts = crate::web::configured_hosts(db)?;
     let before = hosts.len();
@@ -178,7 +201,24 @@ pub fn record(db: &Db, plan: &Plan) -> Result<()> {
         // accepts the `/stop-bots` form `as_str` produces.
         db.set_text_setting(crate::web::BASE_PATH_KEY, prefix.as_str())?;
     }
+    db.set_bool_setting(crate::web::TRUST_FORWARDED_KEY, true)?;
+    if plan.tls {
+        db.set_bool_setting(crate::web::SECURE_COOKIE_KEY, true)?;
+    }
     Ok(())
+}
+
+impl Plan {
+    /// What [`record`] turns on besides the address, for the message a
+    /// front-end shows once it has.
+    pub fn recorded_note(&self) -> &'static str {
+        if self.tls {
+            "The console now believes the proxy's X-Forwarded-For, and its session cookie is \
+             HTTPS-only."
+        } else {
+            "The console now believes the proxy's X-Forwarded-For."
+        }
+    }
 }
 
 /// A cheap plausibility check on a host name, not a validator: it only has
@@ -394,6 +434,102 @@ mod tests {
             db.get_text_setting(crate::web::BASE_PATH_KEY).unwrap(),
             Some("/stop-bots".to_string())
         );
+    }
+
+    /// The proxy this writes sets `X-Forwarded-For`, and a console that
+    /// does not believe it sees every client as 127.0.0.1: one throttle
+    /// key for the operator and every attacker.
+    #[test]
+    fn recording_either_mode_trusts_the_proxy_s_forwarded_header() {
+        for request in [
+            Request::Subdomain {
+                host: "console.example.com".to_string(),
+            },
+            Request::Path {
+                site: "example.com".to_string(),
+                prefix: "/stop-bots/".to_string(),
+            },
+        ] {
+            let db = db();
+            db.upsert_site("example.com", "/nonexistent/example.conf")
+                .unwrap();
+            let plan = plan(&db, &request).unwrap();
+
+            record(&db, &plan).unwrap();
+
+            assert!(
+                db.get_bool_setting(crate::web::TRUST_FORWARDED_KEY, false)
+                    .unwrap(),
+                "{request:?}"
+            );
+        }
+    }
+
+    fn site_config(content: &str) -> (tempfile::TempDir, Db, Plan) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("example.conf");
+        std::fs::write(&config, content).unwrap();
+        let db = db();
+        db.upsert_site("example.com", config.to_str().unwrap())
+            .unwrap();
+        let plan = plan(
+            &db,
+            &Request::Path {
+                site: "example.com".to_string(),
+                prefix: "/stop-bots/".to_string(),
+            },
+        )
+        .unwrap();
+        (dir, db, plan)
+    }
+
+    /// Path mode on a site with a certificate puts the console behind
+    /// TLS, and a cookie without `Secure` would still go to `http://`.
+    #[test]
+    fn a_path_on_a_tls_site_makes_the_cookie_secure() {
+        let (_dir, db, plan) = site_config(
+            "server {\n    listen 80;\n    server_name example.com;\n    return 301 https://$host$request_uri;\n}\n\
+             server {\n    listen 443 ssl;\n    server_name example.com;\n}\n",
+        );
+        assert!(plan.tls);
+
+        record(&db, &plan).unwrap();
+
+        assert!(db
+            .get_bool_setting(crate::web::SECURE_COOKIE_KEY, false)
+            .unwrap());
+        assert!(plan.recorded_note().contains("HTTPS-only"));
+    }
+
+    /// Conservative: on a plain-HTTP site, or a subdomain before certbot,
+    /// a `Secure` cookie is never stored and the console could not keep
+    /// anyone logged in. And one set by hand is never turned off.
+    #[test]
+    fn a_plain_http_site_leaves_the_cookie_setting_as_it_was() {
+        let (_dir, db, plan) =
+            site_config("server {\n    listen 80;\n    server_name example.com;\n}\n");
+        assert!(!plan.tls);
+
+        record(&db, &plan).unwrap();
+        assert!(!db
+            .get_bool_setting(crate::web::SECURE_COOKIE_KEY, false)
+            .unwrap());
+
+        db.set_bool_setting(crate::web::SECURE_COOKIE_KEY, true)
+            .unwrap();
+        record(&db, &plan).unwrap();
+        assert!(db
+            .get_bool_setting(crate::web::SECURE_COOKIE_KEY, false)
+            .unwrap());
+
+        let subdomain = super::plan(
+            &db,
+            &Request::Subdomain {
+                host: "console.example.com".to_string(),
+            },
+        )
+        .unwrap();
+        assert!(!subdomain.tls, "plain HTTP until certbot has run");
     }
 
     /// Applying twice must not list the host twice, which is what a plain

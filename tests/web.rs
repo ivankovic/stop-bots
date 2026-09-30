@@ -3333,6 +3333,16 @@ async fn setting_up_path_access_writes_the_config_and_both_settings() {
             .contains(&"example.com".to_string()),
         "without this the proxied request's Host is refused"
     );
+    // The location sets X-Forwarded-For; without believing it, every
+    // proxied client is 127.0.0.1 and shares one login throttle.
+    assert!(db
+        .get_bool_setting(stop_bots::web::TRUST_FORWARDED_KEY, false)
+        .unwrap());
+    // The site's block is `listen 443 ssl`, so the console is behind TLS.
+    assert!(db
+        .get_bool_setting(stop_bots::web::SECURE_COOKIE_KEY, false)
+        .unwrap());
+    assert!(flash.contains("X-Forwarded-For"), "was: {flash}");
 }
 
 /// Mounting the console at the site root would take over the whole site.

@@ -1684,9 +1684,10 @@ impl App {
             Ok(path) => {
                 crate::webaccess::record(&self.db, &plan)?;
                 self.message = Some(format!(
-                    "Wrote {} and recorded the host. Restart the console for a changed path \
-                     prefix to take effect.",
-                    path.display()
+                    "Wrote {} and recorded the host. {} Restart the console for a changed \
+                     path prefix to take effect.",
+                    path.display(),
+                    plan.recorded_note()
                 ));
                 self.start_nginx_reload();
             }

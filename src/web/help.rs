@@ -126,6 +126,7 @@ fn body(view: &View) -> Markup {
                                 span .hint { " Only safe behind a proxy on this host. The last address in the header is the one believed." }
                             } @else {
                                 (layout::pill("NO", PillKind::Neutral))
+                                span .hint { " Behind a proxy this should be on, or every client is the proxy's address. Web Access turns it on for the proxy it writes." }
                             }
                         }
                     }

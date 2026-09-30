@@ -452,11 +452,12 @@ stop-bots set-web --bind 127.0.0.1:8787 --trust-forwarded-for true --secure-cook
 stores them the same way. Both stay set until you pass `false`.
 
 `--trust-forwarded-for` matters more than it looks. Without it every request behind a
-proxy arrives from `127.0.0.1`, so the console cannot tell one client from another — which
-means a flood of login attempts shares the same throttle bucket as you, and the guard that
-stops you blocking your own address has nothing to compare against. With it, both work
-per-client. The console believes only the last address in the header, the one the proxy
-itself added.
+proxy arrives from `127.0.0.1`, so the console cannot tell one client from another: the
+login throttle has one key for you and every attacker, and the guard that stops you
+blocking your own address has nothing to compare against. With it, both work per-client.
+The console believes only the last address in the header, the one the proxy itself added.
+The Web Access panel below turns it on for the proxy it writes, and the health report
+warns about a proxied console that has it off.
 
 ### Behind NGINX: a subdomain, or a path prefix
 
@@ -465,7 +466,10 @@ write the NGINX config, record the path prefix and add the host name to the allo
 three things that have to agree, because a missing prefix makes every link leave the
 `location` block and a missing host name makes every request a 403. Both validate with
 `nginx -t` before the config can take effect, roll it back if that fails, and record the
-new address only once it validated.
+new address only once it validated. Recording it also turns on `--trust-forwarded-for`,
+since the block it wrote sets that header, and `--secure-cookie` when path mode lands in a
+site's TLS block. A subdomain starts on plain HTTP, so after `certbot` run
+`stop-bots set-web --secure-cookie true` yourself.
 
 Two modes, and *path* is the default for a reason: it adds a `location` block to a site you
 already have, so the console inherits that site's certificate. A subdomain needs its own,
@@ -493,7 +497,7 @@ server {
 ```
 
 ```
-stop-bots set-web --allowed-hosts stopbots.example.com
+stop-bots set-web --allowed-hosts stopbots.example.com --trust-forwarded-for true
 ```
 
 **A path prefix works too**, but the console has to be told about it — it needs to
@@ -501,7 +505,7 @@ generate every link, form action, redirect and cookie path with the prefix alrea
 them, and it cannot guess:
 
 ```
-stop-bots set-web --base-path /stop-bots --allowed-hosts example.com
+stop-bots set-web --base-path /stop-bots --allowed-hosts example.com --trust-forwarded-for true
 ```
 
 ```nginx
@@ -539,7 +543,13 @@ Login attempts are throttled. Not because the password is guessable — it is ge
 144 bits — but because verifying one runs Argon2id, and letting an unauthenticated caller
 drive that as fast as they can post is a denial of service against the host this tool is
 supposed to be protecting. Ten wrong attempts are free; past that a client backs off
-exponentially.
+exponentially, to at most thirty seconds, and IPv6 clients are counted by their /64. A
+global limit caps the work everyone together can cause.
+
+A flood cannot keep you out of a browser you have logged in with before. A successful
+login sets a 90-day cookie that remembers the browser; a login from it skips both limits
+and has a small one of its own. It still needs the password. `stop-bots web
+--set-password` forgets every remembered browser.
 
 ## The CLI
 

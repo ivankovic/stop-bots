@@ -92,6 +92,7 @@ pub fn check_label(check: &Check) -> &'static str {
         "ssh-login-allowlist" => "ssh",
         "trusted" => "trusted",
         "skipped-entries" => "skipped",
+        "web-proxy" => "proxy",
         _ => check.title,
     }
 }
