@@ -287,6 +287,10 @@ pub fn page(tab: Tab, ctx: &Ctx, flash: Option<Flash>, content: Markup) -> Marku
 
 /// The login page, which has no chrome — no tabs to a UI you cannot reach
 /// yet, and no logout button.
+///
+/// Nor the host's name, which every other page shows. Anyone who can reach
+/// the console can load this page, and the kernel's host name is a fact
+/// about the network behind it that nobody needs before logging in.
 pub fn login_page(base: &BasePath, error: Option<&str>) -> Markup {
     html! {
         (DOCTYPE)
@@ -302,12 +306,7 @@ pub fn login_page(base: &BasePath, error: Option<&str>) -> Markup {
             body {
                 .login-wrap {
                     section .panel {
-                        h2 {
-                            "stop-bots"
-                            @if let Some(host) = crate::host::name() {
-                                span .hint { "@ " (host) }
-                            }
-                        }
+                        h2 { "stop-bots" }
                         .panel-body {
                             @if let Some(error) = error {
                                 .flash.err { (error) }
@@ -604,6 +603,18 @@ mod tests {
         )
         .into_string();
         assert!(err.contains(r#"class="flash err""#));
+    }
+
+    #[test]
+    fn the_login_page_does_not_name_the_host() {
+        let rendered = login_page(&BasePath::default(), None).into_string();
+        if let Some(host) = crate::host::name() {
+            assert!(
+                !rendered.contains(host),
+                "the login page names the host {host}:\n{rendered}"
+            );
+        }
+        assert!(!rendered.contains("@ "), "{rendered}");
     }
 
     #[test]

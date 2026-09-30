@@ -396,12 +396,11 @@ fn site_bots(
     Ok((rows, truncated))
 }
 
-fn load_detail(db: &Db, id: i64, bot_query: &str) -> anyhow::Result<Detail> {
-    let site = db
-        .list_sites()?
-        .into_iter()
-        .find(|s| s.id == id)
-        .ok_or_else(|| anyhow::anyhow!("no site with id {id}"))?;
+/// The site page's view, or `None` if no site has that id.
+fn load_detail(db: &Db, id: i64, bot_query: &str) -> anyhow::Result<Option<Detail>> {
+    let Some(site) = db.list_sites()?.into_iter().find(|s| s.id == id) else {
+        return Ok(None);
+    };
 
     let config = nginx::block_config_for_site(db, site.id)?;
     let status = nginx::site_apply_status(
@@ -416,7 +415,7 @@ fn load_detail(db: &Db, id: i64, bot_query: &str) -> anyhow::Result<Detail> {
     let ai = db.get_site_category_override(site.id, Category::Ai)?;
     let (bots, bots_truncated) = site_bots(db, site.id, bot_query, [scanner, search, ai])?;
 
-    Ok(Detail {
+    Ok(Some(Detail {
         scanner,
         search,
         ai,
@@ -431,7 +430,7 @@ fn load_detail(db: &Db, id: i64, bot_query: &str) -> anyhow::Result<Detail> {
         agent_exemptions: db.site_agent_exemptions(site.id)?,
         site,
         status,
-    })
+    }))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -451,7 +450,10 @@ pub async fn detail(
     let query = params.q.unwrap_or_default();
     let flash = params.flash;
     let detail = match state.with_db(move |db| load_detail(db, id, &query)).await {
-        Ok(detail) => detail,
+        Ok(Some(detail)) => detail,
+        // A site that was never scanned, or was removed by a rescan: the
+        // URL names nothing, which is a 404, not a server fault.
+        Ok(None) => return crate::web::server::not_found().await,
         Err(err) => return internal_error(&err.to_string()),
     };
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
@@ -1327,7 +1329,7 @@ mod tests {
         let db = seeded(tmp.path());
         let id = db.list_sites().unwrap()[0].id;
 
-        let detail = load_detail(&db, id, "").unwrap();
+        let detail = load_detail(&db, id, "").unwrap().unwrap();
         assert_eq!(detail.rules.len(), RequestRule::ALL.len());
         assert!(
             detail.rules.iter().all(|(_, enabled)| !enabled),
@@ -1354,7 +1356,7 @@ mod tests {
             .unwrap();
         db.add_site_path_exemption(id, "/blog").unwrap();
 
-        let detail = load_detail(&db, id, "").unwrap();
+        let detail = load_detail(&db, id, "").unwrap().unwrap();
         assert_eq!(detail.ai, Some(Policy::Blocked));
         assert_eq!(detail.exemptions, ["/blog"]);
 
@@ -1370,8 +1372,11 @@ mod tests {
         db.add_site_agent_exemption(id, "/remote.php/dav/", "okhttp")
             .unwrap();
 
-        let rendered =
-            detail_body(&load_detail(&db, id, "").unwrap(), &Ctx::for_tests()).into_string();
+        let rendered = detail_body(
+            &load_detail(&db, id, "").unwrap().unwrap(),
+            &Ctx::for_tests(),
+        )
+        .into_string();
         for expected in ["only for okhttp", r#"name="user_agent" value="okhttp""#] {
             assert!(
                 rendered.contains(expected),
@@ -1408,6 +1413,7 @@ mod tests {
 
         let rows: Vec<(String, Policy, &str)> = load_detail(&db, id, "e")
             .unwrap()
+            .unwrap()
             .bots
             .iter()
             .map(|row| (row.bot.slug.clone(), row.effective, effective_source(row)))
@@ -1423,6 +1429,7 @@ mod tests {
         // "plain" has no "e"; with no search, only the overridden one shows.
         let unsearched: Vec<String> = load_detail(&db, id, "")
             .unwrap()
+            .unwrap()
             .bots
             .into_iter()
             .map(|row| row.bot.slug)
@@ -1430,10 +1437,12 @@ mod tests {
         assert_eq!(unsearched, ["overridden"]);
     }
 
+    /// A missing site is nothing to show, not a fault: the handler turns
+    /// it into a 404 rather than a blank page or a 500.
     #[test]
-    fn a_missing_site_is_an_error_rather_than_a_blank_page() {
+    fn a_missing_site_is_none_rather_than_a_blank_page() {
         let db = Db::open_in_memory().unwrap();
-        assert!(load_detail(&db, 999, "").is_err());
+        assert!(load_detail(&db, 999, "").unwrap().is_none());
     }
 
     #[test]
@@ -1450,13 +1459,13 @@ mod tests {
             )
             .into_string(),
             detail_body(
-                &load_detail(&db, id, "").unwrap(),
+                &load_detail(&db, id, "").unwrap().unwrap(),
                 &Ctx::new("the-token", Default::default()),
             )
             .into_string(),
             // With a search, so the per-bot forms are on the page too.
             detail_body(
-                &load_detail(&db, id, "bad").unwrap(),
+                &load_detail(&db, id, "bad").unwrap().unwrap(),
                 &Ctx::new("the-token", Default::default()),
             )
             .into_string(),

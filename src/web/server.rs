@@ -241,7 +241,7 @@ async fn host_guard(State(state): State<AppState>, request: Request, next: Next)
 
     let configured = match state.with_db(crate::web::configured_hosts).await {
         Ok(hosts) => hosts,
-        Err(err) => return internal_error(&err.to_string()),
+        Err(err) => return unauthenticated_error("reading the allowed hosts", &err),
     };
 
     if !crate::web::allowed_host(&host, &configured) {
@@ -312,7 +312,7 @@ async fn require_login(
     // have rotated it. One indexed read, the same as `host_guard` makes.
     let credential = match state.with_db(auth::current_credential).await {
         Ok(credential) => credential,
-        Err(err) => return internal_error(&err.to_string()),
+        Err(err) => return unauthenticated_error("reading the stored password hash", &err),
     };
     let authenticated =
         session_id.and_then(|id| state.sessions.validate(&id, credential.as_deref()));
@@ -601,15 +601,16 @@ async fn stylesheet() -> impl IntoResponse {
 
 // ---- errors ----
 
-async fn not_found() -> Response {
+pub async fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "Not found\n").into_response()
 }
 
-/// A 500 that says what went wrong.
+/// A 500 that says what went wrong, for a logged-in operator.
 ///
 /// The audience for this UI is one operator with root on the box, who can
 /// read the same error out of the logs anyway; hiding it would only cost
-/// them a debugging round-trip.
+/// them a debugging round-trip. Only once they have logged in, though:
+/// before that, see [`unauthenticated_error`].
 ///
 /// A bare page rather than the console's own chrome. This is reached from
 /// places that have no session — the `Host` guard, the login check — so
@@ -628,6 +629,32 @@ pub fn internal_error(message: &str) -> Response {
             body {
                 h1 { "The request could not be completed." }
                 pre { (message) }
+            }
+        }
+    };
+    (StatusCode::INTERNAL_SERVER_ERROR, Html(page.into_string())).into_response()
+}
+
+/// A 500 for a request nobody has authenticated yet: a generic page, with
+/// the detail on the server's standard error, which systemd puts in the
+/// journal.
+///
+/// The `Host` guard, the session check and the login form run before
+/// anyone has proved who they are, and an `anyhow` chain says where the
+/// database is, what failed to parse and which setting it was reading.
+/// That is for the operator's log, not for whoever is probing the port.
+pub fn unauthenticated_error(doing: &str, err: &anyhow::Error) -> Response {
+    eprintln!("stop-bots web: {doing}: {err:#}");
+    let page = maud::html! {
+        (maud::DOCTYPE)
+        html lang="en" {
+            head {
+                meta charset="utf-8";
+                title { "Error — stop-bots" }
+            }
+            body {
+                h1 { "The request could not be completed." }
+                p { "The reason is in the server's log." }
             }
         }
     };
@@ -812,6 +839,24 @@ mod tests {
             "trusted, but this request did not come through a local proxy"
         );
         assert_eq!(resolve_client(None, header, true), None, "no peer at all");
+    }
+
+    /// Before login, an error says that it happened and nothing about why:
+    /// the chain names paths and settings, and the journal has it.
+    #[tokio::test]
+    async fn an_error_before_login_does_not_say_what_went_wrong() {
+        let err = anyhow::anyhow!("no such table: settings")
+            .context("failed to read /var/lib/stop-bots/db.sqlite3");
+        let response = unauthenticated_error("reading the allowed hosts", &err);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let page = String::from_utf8_lossy(&bytes);
+        for needle in ["settings", "/var/lib", "sqlite", "allowed hosts"] {
+            assert!(!page.contains(needle), "page was:\n{page}");
+        }
     }
 
     /// An error page is reached without a session, so it has none to put

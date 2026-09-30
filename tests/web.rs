@@ -1242,6 +1242,20 @@ async fn a_site_detail_page_renders_and_its_overrides_stick() {
         .is_empty());
 }
 
+/// A site id nobody has is a page that does not exist, not a server fault.
+#[tokio::test]
+async fn a_site_that_does_not_exist_is_a_404() {
+    let (app, password, _tmp) = app();
+    let (cookie, _csrf) = login(&app, &password).await;
+
+    let response = app
+        .oneshot(with_cookie(get("/nginx/999"), &cookie))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn an_exemption_that_is_not_a_path_is_refused() {
     let (app, password, tmp, db_path) = app_with_db();
