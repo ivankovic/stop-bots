@@ -2785,6 +2785,57 @@ fn a_batch_dry_run_with_diff_prints_every_change() {
         .stdout(predicate::str::contains("+    # BEGIN stop-bots"));
 }
 
+/// **A fresh host run by `batch --no-fetch` alone blocks the scanners the
+/// binary already knows.** The built-in list used to be stored only by
+/// the TUI and the web console, or as one of the downloads, so on a host
+/// without outbound access every step reported success and no user agent
+/// was blocked. Found by the stranger test in the container suite.
+#[test]
+fn batch_without_fetching_still_blocks_the_built_in_list() {
+    let fixture = Fixture::new();
+    let site = fixture.write_site("example.com");
+
+    fixture.batch(&[]).assert().success();
+
+    let config = fs::read_to_string(&site).unwrap();
+    assert!(
+        config.contains("ModatScanner"),
+        "a built-in scanner should be in the generated block:\n{config}"
+    );
+}
+
+/// And the dry run a stranger reads before that first run shows the same
+/// block, rather than "no file would change".
+#[test]
+fn a_batch_dry_run_on_a_fresh_host_shows_the_built_in_list() {
+    let fixture = Fixture::new();
+    let site = fixture.write_site("example.com");
+    let before = fs::read_to_string(&site).unwrap();
+
+    fixture
+        .batch(&["--dry-run", "--diff"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("+    # BEGIN stop-bots"))
+        .stdout(predicate::str::contains("ModatScanner"));
+
+    assert_eq!(fs::read_to_string(&site).unwrap(), before);
+}
+
+/// `apply-blocks` is the other way a CLI-only host writes NGINX config.
+#[test]
+fn apply_blocks_on_a_fresh_database_writes_the_built_in_list() {
+    let fixture = Fixture::new();
+    let site = fixture.write_site("example.com");
+    let root = fixture.nginx_root.to_str().unwrap();
+
+    fixture.run(&["scan-sites", "--root", root]);
+    fixture.run(&["apply-blocks", "--root", root, "--no-reload"]);
+
+    let config = fs::read_to_string(&site).unwrap();
+    assert!(config.contains("ModatScanner"), "config was:\n{config}");
+}
+
 #[test]
 fn apply_blocks_dry_run_lists_and_diffs_without_writing() {
     let fixture = Fixture::new();

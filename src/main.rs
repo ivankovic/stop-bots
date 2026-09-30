@@ -147,7 +147,8 @@ enum Command {
         /// left on.
         #[arg(long)]
         no_reload: bool,
-        /// Print which files would change, and change nothing
+        /// Print which files would change, and change nothing but storing
+        /// the bot list built into this binary
         #[arg(long)]
         dry_run: bool,
         /// With --dry-run, also print a unified diff of every file that
@@ -1171,7 +1172,10 @@ enum Command {
         /// Print what the NGINX and firewall steps would change — the
         /// files, the rules added and removed against the applied script,
         /// the lockout check's verdict — and change nothing: nothing is
-        /// downloaded, scanned, written, applied or recorded
+        /// downloaded, scanned, written, applied or recorded. The one
+        /// exception is the bot list built into this binary, which is
+        /// stored first, as every other command that renders NGINX config
+        /// does
         #[arg(long)]
         dry_run: bool,
         /// With --dry-run, also print a unified diff of every file that
@@ -2110,6 +2114,7 @@ async fn update_bot_lists(
 /// `--diff` how, through the functions the apply uses. Writes nothing.
 fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    botlist::register_all_sources(&db)?;
     let root = nginx::root(&db, root)?;
     let changes = nginx::preview_all_sites(&db, &root);
     println!("Dry run: nothing is written or reloaded.");
@@ -2129,6 +2134,9 @@ fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: boo
 /// because both would write to it.
 fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    // The run stores this first (see `batch::run`), so a preview without
+    // it would show a fresh host an NGINX plane with nothing to change.
+    botlist::register_all_sources(&db)?;
     let root = nginx::root(&db, request.root.as_deref())?;
     let (backend, out) = firewall_target(&db, request.backend, request.out)?;
     let run = stop_bots::firewall::FirewallRun::new(backend, out)
@@ -2159,6 +2167,10 @@ fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) ->
 
 fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    // The list compiled into this binary, stored as the TUI and the web
+    // console store it on start: on a host driven by the CLI alone,
+    // nothing else ever would.
+    botlist::register_all_sources(&db)?;
     let root = nginx::root(&db, root)?;
     // Tested, put back if the test fails, and reloaded only when something
     // actually changed on disk.

@@ -172,6 +172,7 @@ impl BatchReport {
 pub async fn run(db: &Db, options: &BatchOptions) -> BatchReport {
     let mut steps = Vec::new();
 
+    steps.push(Step::new("built-in bot list", store_built_in_list(db)));
     steps.push(Step::new("scan sites", scan_sites(db, &options.root)));
     if !options.no_fetch {
         steps.extend(update_lists(db).await);
@@ -184,6 +185,23 @@ pub async fn run(db: &Db, options: &BatchOptions) -> BatchReport {
     steps.push(render_and_apply_firewall(db, options));
 
     BatchReport { steps }
+}
+
+/// Stores the bot list compiled into this binary, as the TUI and the web
+/// console do when they start.
+///
+/// Its own step, not part of `update lists`, because it downloads nothing
+/// and so has to happen under `--no-fetch` too. It used to happen only as
+/// one of the downloads, so a host run by `batch --no-fetch` alone, which
+/// is what a host without outbound access runs, never had it: a fresh
+/// install then blocked no user agent at all, with every step reporting
+/// success.
+fn store_built_in_list(db: &Db) -> Result<String> {
+    crate::botlist::register_all_sources(db)?;
+    Ok(format!(
+        "{} bot(s) in the list built into this binary",
+        crate::botlist::stop_bots_extras::bots().len()
+    ))
 }
 
 fn scan_sites(db: &Db, root: &Path) -> Result<String> {

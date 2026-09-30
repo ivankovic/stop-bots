@@ -200,6 +200,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 - `--help`: `web`, `status`, `batch`, `set-log-paths`, `set-nginx-commands` and
   `set-block-response` showed another command's text or none. Every flag has help now.
+- **`batch` and `apply-blocks` store the bot list built into the binary.** On a
+  host run by the CLI alone, `batch --no-fetch` blocked no user agent at all, and
+  `batch --dry-run` showed a fresh host no NGINX change.
 
 ## [0.0.15] — 2026-09-27
 
