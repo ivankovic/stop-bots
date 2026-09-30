@@ -749,8 +749,10 @@ pub const USER_AGENT_STATS_MAX_ROWS: usize = 20_000;
 /// it as an unanchored, escaped regex, so the cut prefix still matches the
 /// whole user agent it came from; but [`validate_blocked_user_agent`]
 /// refuses a pattern past [`crate::nginx::MAX_PATTERN_LEN`] bytes, and 512
-/// characters of `\` or of four-byte UTF-8 escape to more than that. It
-/// refuses one ending in `\` as well, so a cut never ends in one.
+/// characters of four-byte UTF-8 escape to more than that. A cut never
+/// ends in `\` either. (A user agent with a backslash anywhere is refused
+/// as a block since `validate_blocked_user_agent` refused backslashes; the
+/// stats still keep it, and it can be trusted or read, not blocked.)
 pub fn stored_user_agent(user_agent: &str) -> &str {
     let mut escaped = 0;
     for (n, (at, c)) in user_agent.char_indices().enumerate() {
@@ -3679,9 +3681,9 @@ fn humans_only_allows(pattern: &str) -> bool {
 ///
 /// **PCRE's escaping, not NGINX's.** The result is the regex PCRE is to
 /// compile; putting it into a config file is a second step, with escapes of
-/// its own, which `nginx::nginx_quoted` takes. This used to be called
-/// `escape_for_nginx_regex` and its output written into the config as it
-/// was, and NGINX undid half of it: `\\` became `\` before PCRE saw it.
+/// its own, which `nginx::nginx_quoted` takes. Its output used to be
+/// written into the config as it was, under a name that said it was ready
+/// for NGINX, and NGINX undid half of it: `\\` became `\` before PCRE saw it.
 pub(crate) fn escape_regex_literal(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
@@ -3693,7 +3695,7 @@ pub(crate) fn escape_regex_literal(s: &str) -> String {
     escaped
 }
 
-/// Whether [`escape_for_nginx_regex`] escapes `c`.
+/// Whether [`escape_regex_literal`] escapes `c`.
 fn is_regex_special(c: char) -> bool {
     matches!(
         c,
@@ -5886,26 +5888,31 @@ mod tests {
         assert_eq!(stats[0].hit_count, 5);
     }
 
-    /// Whatever the stats hold can be blocked from them: the cut prefix
-    /// always fits in an NGINX pattern once escaped, and an unanchored
-    /// pattern still matches the whole user agent it was cut from.
+    /// Whatever the stats hold fits in an NGINX pattern once escaped, and
+    /// can be blocked from them unless it has a backslash, which a blocked
+    /// user agent may not: an unanchored pattern still matches the whole
+    /// user agent it was cut from.
     #[test]
     fn a_stored_user_agent_can_always_be_blocked() {
-        for (what, user_agent) in [
-            ("backslashes", "a\\".repeat(600)),
-            ("regex syntax", "a.".repeat(600)),
-            ("four-byte characters", "🦀".repeat(600)),
+        for (what, user_agent, blockable) in [
+            ("backslashes", "a\\".repeat(600), false),
+            ("regex syntax", "a.".repeat(600), true),
+            ("four-byte characters", "🦀".repeat(600), true),
         ] {
             let stored = stored_user_agent(&user_agent);
             assert!(user_agent.starts_with(stored), "{what}");
+            assert!(!stored.ends_with('\\'), "{what}");
             assert!(
-                escape_for_nginx_regex(stored).len() <= crate::nginx::MAX_PATTERN_LEN,
+                escape_regex_literal(stored).len() <= crate::nginx::MAX_PATTERN_LEN,
                 "{what}: {} bytes escaped",
-                escape_for_nginx_regex(stored).len()
+                escape_regex_literal(stored).len()
             );
             let db = Db::open_in_memory().unwrap();
-            db.block_user_agent(stored)
-                .unwrap_or_else(|err| panic!("{what}: {err:#}"));
+            assert_eq!(
+                db.block_user_agent(stored).is_ok(),
+                blockable,
+                "{what}: blocking it"
+            );
         }
         assert_eq!(
             stored_user_agent("curl/8.0"),
