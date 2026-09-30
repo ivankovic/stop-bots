@@ -392,7 +392,8 @@ pub fn pill(text: &str, kind: PillKind) -> Markup {
         PillKind::Warn => "pill warn",
         PillKind::Neutral => "pill neutral",
     };
-    html! { span class=(class) { (text) } }
+    // The title carries the whole tag where a narrow column cuts it off.
+    html! { span class=(class) title=(text) { (text) } }
 }
 
 #[derive(Debug, Clone, Copy)]

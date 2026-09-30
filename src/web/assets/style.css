@@ -381,6 +381,17 @@ td.wrap { word-break: break-all; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* A tag that names the detector ("blocked for 4d by ssh-scanners") is
+   wider than its column, and a nowrap pill spills over the address beside
+   it. Cut it off at the column instead; the address's detail panel shows
+   the whole tag. */
+.table-scroll td .pill {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  box-sizing: border-box;
+}
 
 /* Fixed layout needs its widths stated. Both scrollable tables share a
    shape — a count with its bar, a state tag, the long value, an action —
