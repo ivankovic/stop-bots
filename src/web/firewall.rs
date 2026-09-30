@@ -30,7 +30,7 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::db::Category;
-use crate::dynamic::{Filter, Live, RowStatus, SshRow, TrustedEntry, UaRow};
+use crate::dynamic::{Filter, Live, LiveInputs, RowStatus, SshRow, TrustedEntry, UaRow};
 use crate::ipdetail::{AddressKind, IpDetail};
 use crate::uadetail::UaDetail;
 use crate::web::layout::{self, Ctx, PillKind, Tab};
@@ -48,14 +48,104 @@ pub struct Params {
     /// already uses. Untrusted: it is whatever is in the URL bar, and
     /// `IpDetail::load` is what decides whether it is an address at all.
     pub inspect: Option<String>,
-    /// A user agent to show the detail panel for — the same idea as
-    /// `inspect`, and a separate parameter rather than a shared one
-    /// because the two resolve against different tables. Sharing it would
-    /// mean a stale link looking an address up as a user agent, which
-    /// answers a question nobody asked instead of failing.
+    /// A user agent to show the detail panel for, as a [`UaRef`] — never
+    /// the string itself. A separate parameter from `inspect` because the
+    /// two resolve against different tables; sharing it would mean a
+    /// stale link looking an address up as a user agent.
+    ///
+    /// **Why not the string.** It used to be: `?inspect_ua=<the agent>`.
+    /// A user agent is whatever a client sent, so an attacker's payload
+    /// went into the operator's own request line, NGINX logged it, and the
+    /// injection detector blocked the operator for the attacker's SQL.
     pub inspect_ua: Option<String>,
+    /// Which page of user agents, from 1: the table shows
+    /// [`crate::dynamic::UA_PAGE_ROWS`] at a time, most-seen first.
+    pub ua_page: Option<usize>,
     #[serde(flatten)]
     pub flash: FlashQuery,
+}
+
+/// How a console URL names one row of `user_agent_stats`: its row id and
+/// a digest of the string, `<id>-<16 hex digits>`.
+///
+/// Opaque on purpose — see [`Params::inspect_ua`]. The id finds the row in
+/// one indexed read; the digest is what makes a stale id harmless, since
+/// `VACUUM` may renumber the table and pruning deletes rows: a reference
+/// whose digest does not match the string now under that id names
+/// nothing, rather than another agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UaRef {
+    id: i64,
+    digest: String,
+}
+
+impl UaRef {
+    pub fn new(id: i64, user_agent: &str) -> Self {
+        Self {
+            id,
+            digest: ua_digest(user_agent),
+        }
+    }
+
+    /// Reads one back out of a URL. Anything that is not exactly the
+    /// shape [`Self::new`] writes is no reference at all.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (id, digest) = text.split_once('-')?;
+        let id = id.parse::<i64>().ok().filter(|id| *id > 0)?;
+        (digest.len() == 16 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then(|| Self {
+            id,
+            digest: digest.to_ascii_lowercase(),
+        })
+    }
+
+    /// Whether `user_agent` is the string this reference was made for.
+    pub fn names(&self, user_agent: &str) -> bool {
+        ua_digest(user_agent) == self.digest
+    }
+
+    /// The agent this names, if its row is still there and still holds
+    /// the same string.
+    pub fn resolve(&self, db: &crate::db::Db) -> anyhow::Result<Option<String>> {
+        Ok(db
+            .user_agent_stat_by_id(self.id)?
+            .map(|stat| stat.user_agent)
+            .filter(|user_agent| self.names(user_agent)))
+    }
+}
+
+impl std::fmt::Display for UaRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.id, self.digest)
+    }
+}
+
+/// The first 64 bits of the string's SHA-256, in hex: enough to tell one
+/// agent from another under the same id, and nothing an attacker chose.
+fn ua_digest(user_agent: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(user_agent.as_bytes())[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The user-agent table's page: which rows, the reference each is linked
+/// by, and where the page sits in the whole tally.
+pub struct UaTable {
+    /// One per row of `Live::user_agents`, in the same order.
+    pub refs: Vec<UaRef>,
+    /// From 1.
+    pub page: usize,
+    /// Every agent tallied, not only this page's.
+    pub total: usize,
+}
+
+/// What the user-agent detail panel shows: the agent, or the fact that the
+/// reference no longer names one.
+pub enum UaInspect {
+    Found(Box<UaDetail>),
+    /// Pruned since the link was drawn, or a stale or made-up reference.
+    Gone,
 }
 
 fn filter_from(name: Option<&str>) -> Filter {
@@ -81,7 +171,10 @@ pub async fn page(
 ) -> Response {
     let filter = filter_from(params.filter.as_deref());
     let inspect = params.inspect.clone();
-    let inspect_ua = params.inspect_ua.clone();
+    // A parameter that is not a reference is not looked up at all, and
+    // shows the same "no longer counted" panel a stale one does.
+    let inspect_ua = params.inspect_ua.as_deref().map(UaRef::parse);
+    let ua_page = params.ua_page.unwrap_or(1).max(1);
     let ssh_log = state.ssh_log.clone();
 
     // Where the log is comes from the database (`set-log-paths` used to be
@@ -109,58 +202,81 @@ pub async fn page(
         .await
         .unwrap_or_default();
 
-    let live = state
+    // The database's half only: one page of user agents and what their
+    // verdicts depend on, read in one call so the panels describe one
+    // moment. Matching those agents against every bot pattern, and
+    // parsing the log, happen below with the lock released — both used
+    // to run in here, and held the database against every other request
+    // for as long as the whole table took.
+    let offset = (ua_page - 1).saturating_mul(crate::dynamic::UA_PAGE_ROWS);
+    let loaded = state
         .with_db(move |db| {
-            let live = Live::load(db, text.as_deref())?;
-            // In the same closure as the row load, from the same read of
-            // the log: a detail panel assembled from a second, later read
-            // would describe a different moment than the table beside it.
+            let page = db.user_agent_stats_page(crate::dynamic::UA_PAGE_ROWS, offset)?;
+            let total = db.count_user_agent_stats()?;
+            let refs: Vec<UaRef> = page
+                .iter()
+                .map(|(id, stat)| UaRef::new(*id, &stat.user_agent))
+                .collect();
+            let inputs = LiveInputs::read(db, page.into_iter().map(|(_, stat)| stat).collect())?;
+            // Its status and the accounts it tried are filled in below,
+            // from the rows and the log.
             let detail = match &inspect {
-                Some(address) => {
-                    let status = live
-                        .ssh
-                        .iter()
-                        .find(|row| &row.address == address)
-                        .map(|row| row.status)
-                        .unwrap_or(RowStatus::Pending);
-                    // Scanned for this one address, from the same read of
-                    // the log the table came from. Nobody pays for it on a
-                    // page view that is not inspecting anything.
-                    let usernames = text
-                        .as_deref()
-                        .map(|t| crate::sshlog::failed_attempt_usernames_for(t, address))
-                        .unwrap_or_default();
-                    Some(crate::ipdetail::IpDetail::load(
-                        db, address, status, usernames,
-                    )?)
-                }
+                Some(address) => Some(IpDetail::load(db, address, RowStatus::Pending, Vec::new())?),
                 None => None,
             };
-            // Same bargain as the address detail above: assembled from
-            // the rows already loaded, so the panel and the table beside
-            // it describe one moment.
-            let ua_detail = match &inspect_ua {
-                Some(user_agent) => {
-                    let status = live
-                        .user_agents
-                        .iter()
-                        .find(|row| &row.user_agent == user_agent)
-                        .map(|row| row.status)
-                        .unwrap_or(RowStatus::Pending);
-                    Some(UaDetail::load(db, user_agent, status)?)
+            let ua_detail = match inspect_ua {
+                Some(Some(reference)) => match reference.resolve(db)? {
+                    Some(user_agent) => {
+                        let status = inputs.verdicts().status_of(&user_agent);
+                        UaInspect::Found(Box::new(UaDetail::load(db, &user_agent, status)?))
+                    }
+                    None => UaInspect::Gone,
                 }
+                .into(),
+                Some(None) => Some(UaInspect::Gone),
                 None => None,
             };
             let trusted = crate::dynamic::trusted_entries(db)?;
-            anyhow::Ok((live, detail, ua_detail, trusted))
+            anyhow::Ok((inputs, refs, total, detail, ua_detail, trusted))
         })
         .await;
-
-    let (live, detail, ua_detail, trusted) = match live {
+    let (inputs, refs, total, detail, ua_detail, trusted) = match loaded {
         Ok(loaded) => loaded,
         Err(err) => return internal_error(&err.to_string()),
     };
 
+    let classified = tokio::task::spawn_blocking(move || {
+        let live = inputs.classify(text.as_deref());
+        // From the same read of the log the table came from: a panel
+        // assembled from a second, later read would describe a different
+        // moment than the table beside it. Scanned for this one address
+        // only, so nobody pays for it on a view not inspecting anything.
+        let detail = detail.map(|mut detail| {
+            detail.status = live
+                .ssh
+                .iter()
+                .find(|row| row.address == detail.address)
+                .map(|row| row.status)
+                .unwrap_or(RowStatus::Pending);
+            detail.usernames = text
+                .as_deref()
+                .map(|t| crate::sshlog::failed_attempt_usernames_for(t, &detail.address))
+                .unwrap_or_default();
+            detail
+        });
+        (live, detail)
+    })
+    .await;
+    let (live, detail) = match classified {
+        Ok(classified) => classified,
+        Err(err) => return internal_error(&err.to_string()),
+    };
+
+    let table = UaTable {
+        refs,
+        page: ua_page,
+        total,
+    };
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
     render(
         Tab::Firewall,
@@ -168,6 +284,7 @@ pub async fn page(
         params.flash.into_flash(&state),
         body(
             &live,
+            &table,
             filter,
             detail.as_ref(),
             ua_detail.as_ref(),
@@ -179,9 +296,10 @@ pub async fn page(
 
 fn body(
     live: &Live,
+    table: &UaTable,
     filter: Filter,
     detail: Option<&IpDetail>,
-    ua_detail: Option<&UaDetail>,
+    ua_detail: Option<&UaInspect>,
     trusted: &[TrustedEntry],
     ctx: &Ctx,
 ) -> Markup {
@@ -190,14 +308,15 @@ fn body(
         .iter()
         .filter(|r| filter.matches(r.status))
         .collect();
-    let uas: Vec<&UaRow> = live
+    let uas: Vec<(&UaRow, &UaRef)> = live
         .user_agents
         .iter()
-        .filter(|r| filter.matches(r.status))
+        .zip(&table.refs)
+        .filter(|(r, _)| filter.matches(r.status))
         .collect();
 
     let ssh_max = ssh.iter().map(|r| r.count).max().unwrap_or(0);
-    let ua_max = uas.iter().map(|r| r.count).max().unwrap_or(0);
+    let ua_max = uas.iter().map(|(r, _)| r.count).max().unwrap_or(0);
 
     html! {
         (filter_bar(filter, ctx))
@@ -205,8 +324,10 @@ fn body(
         @if let Some(detail) = detail {
             (detail_panel(detail, filter, ctx))
         }
-        @if let Some(detail) = ua_detail {
-            (ua_detail_panel(detail, filter, ctx))
+        @match ua_detail {
+            Some(UaInspect::Found(detail)) => (ua_detail_panel(detail, filter, table.page, ctx)),
+            Some(UaInspect::Gone) => (ua_gone_panel(filter, table.page, ctx)),
+            None => {}
         }
 
         .cols {
@@ -266,10 +387,12 @@ fn body(
             Some("What is getting through, most-seen first"),
             html! {
                 @if uas.is_empty() {
-                    (layout::empty(if live.user_agents.is_empty() {
+                    (layout::empty(if live.user_agents.is_empty() && table.total == 0 {
                         "No access-log statistics recorded yet. Run `stop-bots record-access-stats`, or wait for the scheduled pass."
+                    } else if live.user_agents.is_empty() {
+                        "No user agents on this page."
                     } else {
-                        "No user agents match this filter."
+                        "No user agents on this page match this filter."
                     }))
                 } @else {
                     .table-scroll {
@@ -287,23 +410,25 @@ fn body(
                                 th .right { "Action" }
                             } }
                             tbody {
-                                @for row in &uas {
+                                @for (row, reference) in &uas {
+                                    @let (shown, _) = crate::uadetail::for_display(&row.user_agent);
                                     tr {
                                         // One line, truncated with an
                                         // ellipsis when it doesn't fit —
                                         // a wrapped user agent is three
                                         // rows tall and makes "twenty
                                         // rows" unpredictable. `title`
-                                        // keeps the whole string a hover
-                                        // away, and in the DOM.
+                                        // keeps the string a hover away,
+                                        // capped like the text: a client
+                                        // chose its length.
                                         td .num { (meter(row.count, ua_max)) }
                                         td { (status_pill(row.status)) }
-                                        td .mono title=(row.user_agent) {
+                                        td .mono title=(shown) {
                                             // The string itself is the
                                             // link, for the reason the
                                             // address is one above.
-                                            a href=(inspect_ua_url(&row.user_agent, filter, ctx)) {
-                                                (row.user_agent)
+                                            a href=(inspect_ua_url(reference, filter, table.page, ctx)) {
+                                                (shown)
                                             }
                                         }
                                         td .right { (ua_action(row, ctx)) }
@@ -313,6 +438,7 @@ fn body(
                         }
                     }
                 }
+                (ua_pager(table, live.user_agents.len(), filter, ctx))
             },
         ))
 
@@ -338,9 +464,12 @@ fn trusted_panel(trusted: &[TrustedEntry], ctx: &Ctx) -> Markup {
             } @else {
                 table { tbody {
                     @for entry in trusted {
+                        // Trusted from a row, a user agent is a client's
+                        // text: capped and made visible like the table's.
+                        @let (shown, _) = crate::uadetail::for_display(entry.value());
                         tr {
                             td .hint { (entry.kind()) }
-                            td .mono title=(entry.value()) { (entry.value()) }
+                            td .mono title=(shown) { (shown) }
                             td .right { (untrust_form(entry, ctx)) }
                         }
                     }
@@ -451,16 +580,52 @@ fn inspect_url(address: &str, filter: Filter, ctx: &Ctx) -> String {
 /// The link that opens the user-agent detail panel, alongside
 /// [`inspect_url`] rather than sharing it — see `Params::inspect_ua`.
 ///
-/// The percent-encoding matters more here than it does for an address: a
-/// user agent routinely contains `+`, `;` and `/`, and an attacker picks
-/// the string, so anything less than encoding the whole unreserved-set
-/// complement is a way to write a second query parameter.
-fn inspect_ua_url(user_agent: &str, filter: Filter, ctx: &Ctx) -> String {
+/// Names the agent by [`UaRef`], never by its text: nothing a client sent
+/// may end up in the operator's request line. Keeps the page, so closing
+/// the panel returns to the rows it was opened from.
+fn inspect_ua_url(reference: &UaRef, filter: Filter, page: usize, ctx: &Ctx) -> String {
     ctx.url(&format!(
-        "/firewall?filter={}&inspect_ua={}",
-        filter_name(filter),
-        percent_encode(user_agent)
+        "{}&inspect_ua={reference}",
+        ua_page_path(filter, page)
     ))
+}
+
+/// The Firewall screen at `filter`, on user-agent page `page`.
+fn ua_page_path(filter: Filter, page: usize) -> String {
+    if page <= 1 {
+        format!("/firewall?filter={}", filter_name(filter))
+    } else {
+        format!("/firewall?filter={}&ua_page={page}", filter_name(filter))
+    }
+}
+
+/// Where this page sits in the tally, and the way to the next and
+/// previous ones.
+fn ua_pager(table: &UaTable, shown: usize, filter: Filter, ctx: &Ctx) -> Markup {
+    let first = (table.page - 1) * crate::dynamic::UA_PAGE_ROWS;
+    let has_next = first + shown < table.total;
+    html! {
+        @if table.total > 0 {
+            .panel-body {
+                .row {
+                    span .hint {
+                        @if shown == 0 {
+                            "Past the last of " (table.total) " user agents."
+                        } @else {
+                            "User agents " (first + 1) "\u{2013}" (first + shown)
+                            " of " (table.total) ", most-seen first. The filter applies to this page."
+                        }
+                    }
+                    @if table.page > 1 {
+                        a .button href=(ctx.url(&ua_page_path(filter, table.page - 1))) { "Previous" }
+                    }
+                    @if has_next {
+                        a .button href=(ctx.url(&ua_page_path(filter, table.page + 1))) { "Next" }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Percent-encodes everything outside the unreserved set. Deliberately
@@ -631,8 +796,8 @@ fn detail_panel(detail: &IpDetail, filter: Filter, ctx: &Ctx) -> Markup {
 /// user agent is a string the client chose. Everything here is therefore
 /// phrased as what the lists on this host say, not as what the client is
 /// — see [`crate::uadetail`].
-fn ua_detail_panel(detail: &UaDetail, filter: Filter, ctx: &Ctx) -> Markup {
-    let close = ctx.url(&format!("/firewall?filter={}", filter_name(filter)));
+fn ua_detail_panel(detail: &UaDetail, filter: Filter, page: usize, ctx: &Ctx) -> Markup {
+    let close = ctx.url(&ua_page_path(filter, page));
     layout::panel(
         "About this user agent",
         Some("What the bot lists on this host say about this string — a client can claim anything"),
@@ -732,6 +897,27 @@ fn ua_detail_panel(detail: &UaDetail, filter: Filter, ctx: &Ctx) -> Markup {
                             }
                         }
                     }
+                }
+            }
+        },
+    )
+}
+
+/// The user-agent panel for a reference that names nothing: a row pruned
+/// between the table being drawn and the click, a link from before a
+/// `VACUUM`, or something typed into the URL bar.
+fn ua_gone_panel(filter: Filter, page: usize, ctx: &Ctx) -> Markup {
+    layout::panel(
+        "About this user agent",
+        None,
+        html! {
+            .panel-body {
+                .row {
+                    a .button href=(ctx.url(&ua_page_path(filter, page))) { "Close" }
+                }
+                p .hint {
+                    "That user agent is no longer counted. The tally is pruned on a schedule, "
+                    "so a row can go between the table being drawn and the click."
                 }
             }
         },
@@ -1240,6 +1426,20 @@ mod tests {
         }
     }
 
+    /// The table beside `live`: one reference per row, a single page.
+    fn table_for(live: &Live) -> UaTable {
+        UaTable {
+            refs: live
+                .user_agents
+                .iter()
+                .enumerate()
+                .map(|(i, row)| UaRef::new(i as i64 + 1, &row.user_agent))
+                .collect(),
+            page: 1,
+            total: live.user_agents.len(),
+        }
+    }
+
     fn live_with(ssh: usize, uas: usize) -> Live {
         Live {
             ssh: (0..ssh)
@@ -1267,8 +1467,10 @@ mod tests {
     /// the truncation has no width to truncate against.
     #[test]
     fn both_long_tables_are_wrapped_in_a_scroll_container() {
+        let live = live_with(40, 40);
         let rendered = body(
-            &live_with(40, 40),
+            &live,
+            &table_for(&live),
             Filter::All,
             None,
             None,
@@ -1302,7 +1504,16 @@ mod tests {
             }],
         };
 
-        let rendered = body(&live, Filter::All, None, None, &[], &Ctx::for_tests()).into_string();
+        let rendered = body(
+            &live,
+            &table_for(&live),
+            Filter::All,
+            None,
+            None,
+            &[],
+            &Ctx::for_tests(),
+        )
+        .into_string();
 
         assert!(
             rendered.contains(&format!(r#"title="{long}""#)),
@@ -1323,7 +1534,16 @@ mod tests {
             }],
         };
 
-        let rendered = body(&live, Filter::All, None, None, &[], &Ctx::for_tests()).into_string();
+        let rendered = body(
+            &live,
+            &table_for(&live),
+            Filter::All,
+            None,
+            None,
+            &[],
+            &Ctx::for_tests(),
+        )
+        .into_string();
 
         assert!(
             !rendered.contains(r#"onfocus="alert(1)"#),
@@ -1391,33 +1611,176 @@ mod tests {
 
     /// The user agent's cell is the link, the same shape the address
     /// column uses — the thing you want to know more about is the thing
-    /// you click.
+    /// you click. It names the row by reference.
     #[test]
     fn the_user_agent_cell_links_to_its_own_detail_panel() {
         let live = live_with(0, 1);
+        let table = table_for(&live);
 
-        let rendered = body(&live, Filter::All, None, None, &[], &Ctx::for_tests()).into_string();
+        let rendered = body(
+            &live,
+            &table,
+            Filter::All,
+            None,
+            None,
+            &[],
+            &Ctx::for_tests(),
+        )
+        .into_string();
 
+        let expected = format!("inspect_ua={}", table.refs[0]);
         assert!(
-            rendered.contains("inspect_ua=SomeCrawler%2F0.0"),
-            "no user-agent link: {rendered}"
+            rendered.contains(&expected),
+            "no link carrying {expected}: {rendered}"
         );
     }
 
-    /// A user agent routinely carries `+`, `;` and `/`, and the client
-    /// picks the string — anything less than encoding the whole
-    /// complement of the unreserved set is a way to write a second query
-    /// parameter.
+    /// The link used to carry the string, percent-encoded. A user agent is
+    /// a client's text, so the operator's own request line carried an
+    /// attacker's payload, and the injection detector blocked the operator
+    /// for it. The link carries a row id and a digest, and nothing else.
     #[test]
-    fn the_user_agent_link_encodes_a_string_that_could_forge_a_parameter() {
-        let url = inspect_ua_url("a&inspect=1.2.3.4", Filter::PendingOnly, &Ctx::for_tests());
+    fn a_user_agent_link_carries_nothing_the_client_sent() {
+        let hostile = "sqlmap/1.7 ' UNION SELECT 1-- <script>";
+        let url = inspect_ua_url(
+            &UaRef::new(42, hostile),
+            Filter::PendingOnly,
+            3,
+            &Ctx::for_tests(),
+        );
 
-        assert!(url.contains("filter=pending"), "url was: {url}");
-        assert!(!url.contains("&inspect=1.2.3.4"), "url was: {url}");
         assert!(
-            url.contains("inspect_ua=a%26inspect%3D1.2.3.4"),
+            url.starts_with("/firewall?filter=pending&ua_page=3&inspect_ua=42-"),
             "url was: {url}"
         );
+        for needle in ["sqlmap", "UNION", "%27", "%20", "script"] {
+            assert!(!url.contains(needle), "url was: {url}");
+        }
+    }
+
+    #[test]
+    fn a_reference_round_trips_and_only_names_its_own_string() {
+        let reference = UaRef::new(7, "curl/8.0");
+        let parsed = UaRef::parse(&reference.to_string()).unwrap();
+
+        assert_eq!(parsed, reference);
+        assert!(parsed.names("curl/8.0"));
+        assert!(
+            !parsed.names("curl/8.1"),
+            "a renumbered row holding another agent must not be taken for this one"
+        );
+        for bad in [
+            "",
+            "7",
+            "7-",
+            "x-0123456789abcdef",
+            "0-0123456789abcdef",
+            "7-0123",
+            "7-zzzzzzzzzzzzzzzz",
+        ] {
+            assert!(UaRef::parse(bad).is_none(), "{bad:?} parsed");
+        }
+    }
+
+    /// A reference is resolved by id, and the digest decides whether the
+    /// string now under that id is the one the link was drawn for.
+    #[test]
+    fn a_reference_resolves_to_its_agent_and_not_to_whatever_replaced_it() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let mut counts = std::collections::HashMap::new();
+        counts.insert("curl/8.0".to_string(), 3);
+        db.record_user_agent_hits(&counts, 1_000).unwrap();
+        let (id, _) = db.user_agent_stats_page(1, 0).unwrap().remove(0);
+
+        assert_eq!(
+            UaRef::new(id, "curl/8.0").resolve(&db).unwrap().as_deref(),
+            Some("curl/8.0")
+        );
+        assert_eq!(UaRef::new(id, "Googlebot").resolve(&db).unwrap(), None);
+        assert_eq!(UaRef::new(id + 1, "curl/8.0").resolve(&db).unwrap(), None);
+    }
+
+    /// Twenty thousand 4–8 KB agents made this page 418 MB. A row shows
+    /// at most the display cap of the string, in its text and its title.
+    #[test]
+    fn a_long_user_agent_is_capped_in_the_table() {
+        let long = format!("Mozilla/5.0 {}", "A".repeat(8_000));
+        let live = Live {
+            ssh: vec![],
+            user_agents: vec![UaRow {
+                user_agent: long.clone(),
+                count: 1,
+                status: RowStatus::Pending,
+            }],
+        };
+
+        let rendered = body(
+            &live,
+            &table_for(&live),
+            Filter::All,
+            None,
+            None,
+            &[],
+            &Ctx::for_tests(),
+        )
+        .into_string();
+
+        // Twice capped (title and text) plus the two hidden form values,
+        // which carry the stored string so the buttons act on it exactly.
+        assert!(
+            rendered.len() < 4 * long.len(),
+            "rendered {} bytes for one {}-byte agent",
+            rendered.len(),
+            long.len()
+        );
+        assert!(!rendered.contains(&format!(r#"title="{long}""#)));
+    }
+
+    #[test]
+    fn the_pager_says_where_the_page_sits_and_links_onward() {
+        let live = live_with(0, 3);
+        let mut table = table_for(&live);
+        table.page = 2;
+        table.total = 1_000;
+
+        let rendered = body(
+            &live,
+            &table,
+            Filter::BlockedOnly,
+            None,
+            None,
+            &[],
+            &Ctx::for_tests(),
+        )
+        .into_string();
+
+        for needle in [
+            "User agents 201\u{2013}203 of 1000",
+            r#"href="/firewall?filter=blocked""#,
+            r#"href="/firewall?filter=blocked&amp;ua_page=3""#,
+        ] {
+            assert!(rendered.contains(needle), "missing {needle}:\n{rendered}");
+        }
+    }
+
+    /// The last page has no Next, and the first no Previous.
+    #[test]
+    fn a_single_page_offers_no_paging() {
+        let live = live_with(0, 3);
+
+        let rendered = body(
+            &live,
+            &table_for(&live),
+            Filter::All,
+            None,
+            None,
+            &[],
+            &Ctx::for_tests(),
+        )
+        .into_string();
+
+        assert!(!rendered.contains(">Next<"), "{rendered}");
+        assert!(!rendered.contains(">Previous<"), "{rendered}");
     }
 
     /// A table pads its own cells to the panel's 14px gutter; prose and a
@@ -1432,6 +1795,7 @@ mod tests {
                 crate::uadetail::BotVerdict::BlockedByCategory,
             )]),
             Filter::All,
+            1,
             &Ctx::for_tests(),
         )
         .into_string();
@@ -1476,7 +1840,7 @@ mod tests {
             crate::uadetail::BotVerdict::BlockedByCategory,
         )]);
 
-        let rendered = ua_detail_panel(&detail, Filter::All, &Ctx::for_tests()).into_string();
+        let rendered = ua_detail_panel(&detail, Filter::All, 1, &Ctx::for_tests()).into_string();
 
         for needle in [
             "Googlebot",
@@ -1495,7 +1859,7 @@ mod tests {
     #[test]
     fn a_user_agent_no_list_knows_says_so_rather_than_showing_an_empty_table() {
         let rendered =
-            ua_detail_panel(&ua_detail(vec![]), Filter::All, &Ctx::for_tests()).into_string();
+            ua_detail_panel(&ua_detail(vec![]), Filter::All, 1, &Ctx::for_tests()).into_string();
 
         assert!(
             rendered.contains("calls itself a bot"),
@@ -1510,7 +1874,7 @@ mod tests {
         let mut detail = ua_detail(vec![]);
         detail.user_agent = "<script>alert(1)</script>".to_string();
 
-        let rendered = ua_detail_panel(&detail, Filter::All, &Ctx::for_tests()).into_string();
+        let rendered = ua_detail_panel(&detail, Filter::All, 1, &Ctx::for_tests()).into_string();
 
         assert!(!rendered.contains("<script>"), "rendered:\n{rendered}");
         assert!(rendered.contains("&lt;script&gt;"), "rendered:\n{rendered}");
@@ -1524,7 +1888,7 @@ mod tests {
         detail.hits = None;
         detail.last_seen_at = None;
 
-        let rendered = ua_detail_panel(&detail, Filter::All, &Ctx::for_tests()).into_string();
+        let rendered = ua_detail_panel(&detail, Filter::All, 1, &Ctx::for_tests()).into_string();
 
         assert!(
             rendered.contains("no longer counted"),

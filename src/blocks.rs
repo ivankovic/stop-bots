@@ -278,7 +278,7 @@ pub fn evidence_line(text: &str) -> Option<String> {
 
 /// The Unicode bidirectional formatting characters, which reorder what is
 /// drawn without being drawn themselves.
-fn is_direction_control(c: char) -> bool {
+pub(crate) fn is_direction_control(c: char) -> bool {
     matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 

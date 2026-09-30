@@ -2556,45 +2556,83 @@ async fn inspecting_a_user_agent_renders_its_detail_panel() {
     db.record_user_agent_hits(&counts, 1_700_000_000).unwrap();
     drop(db);
 
-    let encoded = "Mozilla%2F5.0%20%28compatible%3B%20Googlebot%2F2.1%3B%20\
-                   %2Bhttp%3A%2F%2Fwww.google.com%2Fbot.html%29"
-        .replace(char::is_whitespace, "");
-    let response = app
-        .clone()
-        .oneshot(with_cookie(
-            get(&format!("/firewall?filter=all&inspect_ua={encoded}")),
-            &cookie,
-        ))
-        .await
-        .unwrap();
-    let body = body_string(response).await;
+    // Followed from the table, the way the operator gets there: the link
+    // names the row, and carries nothing of the string.
+    let table = page_text(&app, &cookie, "/firewall?filter=all").await;
+    let link = table
+        .split(r#"href=""#)
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .find(|href| href.contains("inspect_ua="))
+        .expect("the user agent's cell links to its detail")
+        .replace("&amp;", "&");
+    for needle in ["Mozilla", "Googlebot", "google", "%2F"] {
+        assert!(!link.contains(needle), "the link carries {needle}: {link}");
+    }
+    let body = page_text(&app, &cookie, &link).await;
 
     assert!(body.contains("About this user agent"), "body was:\n{body}");
     assert!(body.contains("A second opinion"), "body was:\n{body}");
     assert!(body.contains("412"), "body was:\n{body}");
 }
 
-/// The parameter is whatever is in the URL bar, and unlike an address
-/// there is no such thing as a malformed user agent — a string no list
-/// has heard of must render a page saying so, not a 500 and not a blank
-/// panel.
+/// The parameter is whatever is in the URL bar. A reference to nothing —
+/// a stale one, or a string typed in — renders a page saying so, not a
+/// 500 and not a blank panel, and is never looked up as a user agent.
 #[tokio::test]
-async fn inspecting_a_user_agent_no_list_knows_still_renders() {
+async fn inspecting_a_user_agent_that_is_not_there_still_renders() {
     let (app, password, _tmp, _db) = app_with_db();
     let (cookie, _csrf) = login(&app, &password).await;
 
-    let response = app
-        .clone()
-        .oneshot(with_cookie(
-            get("/firewall?inspect_ua=%3Cscript%3Ealert(1)%3C%2Fscript%3E"),
-            &cookie,
-        ))
-        .await
-        .unwrap();
-    let body = body_string(response).await;
+    for parameter in [
+        "%3Cscript%3Ealert(1)%3C%2Fscript%3E",
+        "123-0123456789abcdef",
+        "Googlebot",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(with_cookie(
+                get(&format!("/firewall?inspect_ua={parameter}")),
+                &cookie,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{parameter}");
+        let body = body_string(response).await;
 
-    assert!(body.contains("About this user agent"), "body was:\n{body}");
-    assert!(!body.contains("<script>alert"), "body was:\n{body}");
+        assert!(body.contains("no longer counted"), "body was:\n{body}");
+        assert!(!body.contains("<script>alert"), "body was:\n{body}");
+    }
+}
+
+/// Twenty thousand distinct user agents made this page 418 MB and held
+/// the database for nine seconds. It shows one page of the most-seen,
+/// however many there are, and says how many there are.
+#[tokio::test]
+async fn the_firewall_page_shows_one_page_of_a_flood_of_user_agents() {
+    let (app, password, _tmp, db_path) = app_with_db();
+    let (cookie, _csrf) = login(&app, &password).await;
+    let counts: std::collections::HashMap<String, u64> = (0..1_000u64)
+        .map(|i| (format!("flood-{i:04}/{}", "x".repeat(1_000)), 1 + i % 7))
+        .collect();
+    Db::open(&db_path)
+        .unwrap()
+        .record_user_agent_hits(&counts, 1_700_000_000)
+        .unwrap();
+
+    let html = page_text(&app, &cookie, "/firewall").await;
+
+    let rows = html.matches("inspect_ua=").count();
+    assert_eq!(rows, stop_bots::dynamic::UA_PAGE_ROWS, "rows shown");
+    assert!(html.contains(" of 1000"), "no total shown");
+    assert!(
+        html.len() < 2_000_000,
+        "a page of agents came to {} bytes",
+        html.len()
+    );
+
+    let next = page_text(&app, &cookie, "/firewall?filter=all&ua_page=5").await;
+    assert!(next.contains("User agents 801"), "page five:\n{next}");
 }
 
 /// The complaint that started this: selecting a country told the operator

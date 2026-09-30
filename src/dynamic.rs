@@ -217,35 +217,42 @@ pub fn build_ua_rows(
 ) -> Vec<UaRow> {
     stats
         .into_iter()
-        .map(|stat| {
-            // Manual blocks take precedence over blocklist
-            let status = if blocked.contains(&stat.user_agent) {
-                RowStatus::Blocked {
-                    until: None,
-                    by: None,
-                }
-            } else if ua_matches_blocked_bot_patterns(
+        .map(|stat| UaRow {
+            status: ua_status(
                 &stat.user_agent,
+                blocked,
                 bots,
-                ai_policy,
-                search_policy,
-                scanner_policy,
-            ) {
-                RowStatus::Blocklist
-            } else if looks_like_a_bot(&stat.user_agent)
-                && !ua_matches_any_bot_pattern(&stat.user_agent, bots)
-            {
-                RowStatus::Unknown
-            } else {
-                RowStatus::Pending
-            };
-            UaRow {
-                user_agent: stat.user_agent,
-                count: stat.hit_count as u64,
-                status,
-            }
+                [ai_policy, search_policy, scanner_policy],
+            ),
+            user_agent: stat.user_agent,
+            count: stat.hit_count.max(0) as u64,
         })
         .collect()
+}
+
+/// One user agent's status, before trust: a manual block first, then a
+/// blocked list pattern, then "calls itself a bot and no list knows it".
+/// `policies` are the AI, search and scanner defaults, in that order.
+fn ua_status(
+    ua: &str,
+    blocked: &HashSet<String>,
+    bots: &[Bot],
+    policies: [Policy; 3],
+) -> RowStatus {
+    let [ai, search, scanner] = policies;
+    // Manual blocks take precedence over blocklist
+    if blocked.contains(ua) {
+        RowStatus::Blocked {
+            until: None,
+            by: None,
+        }
+    } else if ua_matches_blocked_bot_patterns(ua, bots, ai, search, scanner) {
+        RowStatus::Blocklist
+    } else if looks_like_a_bot(ua) && !ua_matches_any_bot_pattern(ua, bots) {
+        RowStatus::Unknown
+    } else {
+        RowStatus::Pending
+    }
 }
 
 /// Whether `ua` advertises itself as a bot.
@@ -528,6 +535,16 @@ fn format_duration_left(seconds_left: i64) -> String {
     }
 }
 
+/// How many user agents a Firewall screen shows at once: the most-seen
+/// ones, a page at a time.
+///
+/// `user_agent_stats` holds whatever strings clients chose to send, and a
+/// flood of distinct ones is cheap to make. Twenty thousand 4–8 KB agents
+/// made the console's Firewall page read every row, classify each against
+/// every bot pattern with the database locked for nine seconds, and send
+/// 418 MB of HTML. A page of this many is what a person reads anyway.
+pub const UA_PAGE_ROWS: usize = 200;
+
 /// Both panels' worth of rows, loaded together.
 pub struct Live {
     pub ssh: Vec<SshRow>,
@@ -535,67 +552,138 @@ pub struct Live {
 }
 
 impl Live {
-    /// Reads everything both panels need from `db`.
+    /// Reads everything both panels need from `db` and classifies it, with
+    /// the user-agent panel holding the [`UA_PAGE_ROWS`] most-seen agents.
     ///
     /// `ssh_log_text` is the log itself, already read. `None` means it was
     /// not available and the SSH half comes back empty, which is what the
     /// TUI shows while its background read is still in flight.
+    ///
+    /// The TUI's form, where `Db` lives on the thread that draws anyway. A
+    /// caller holding a lock others wait on calls [`LiveInputs::read`]
+    /// under it and [`LiveInputs::classify`] after letting go.
     pub fn load(db: &Db, ssh_log_text: Option<&str>) -> Result<Self> {
+        let page = db.user_agent_stats_page(UA_PAGE_ROWS, 0)?;
+        let stats = page.into_iter().map(|(_, stat)| stat).collect();
+        Ok(LiveInputs::read(db, stats)?.classify(ssh_log_text))
+    }
+}
+
+/// What [`Live`] is computed from: the database's half, read in one go and
+/// owning everything, so that the slow half — parsing the SSH log and
+/// matching every agent against every bot pattern — can run where the
+/// database is not locked.
+pub struct LiveInputs {
+    firewall_blocks: HashMap<String, Option<i64>>,
+    detectors: HashMap<String, crate::protection::Detector>,
+    blocked_ip_ranges: Vec<String>,
+    trusted_addresses: Vec<String>,
+    /// The user agents to classify, in display order: a page of them.
+    stats: Vec<UserAgentStat>,
+    ua: UaVerdicts,
+}
+
+/// Everything a user agent's [`RowStatus`] depends on.
+pub struct UaVerdicts {
+    blocked: HashSet<String>,
+    bots: Vec<Bot>,
+    ai: Policy,
+    search: Policy,
+    scanner: Policy,
+    trusted: Vec<String>,
+}
+
+impl UaVerdicts {
+    /// The status `user_agent` would have as a row: the same precedence
+    /// [`build_ua_rows`] applies, and trust over all of it.
+    pub fn status_of(&self, user_agent: &str) -> RowStatus {
+        if user_agent_is_trusted(user_agent, &self.trusted) {
+            return RowStatus::Trusted;
+        }
+        ua_status(
+            user_agent,
+            &self.blocked,
+            &self.bots,
+            [self.ai, self.search, self.scanner],
+        )
+    }
+}
+
+impl LiveInputs {
+    /// The database's half of [`Live`], for the user agents in `stats` —
+    /// a page from [`Db::user_agent_stats_page`], never the whole table.
+    /// Reads only; nothing here is proportional to the log or the bot list
+    /// times the agents.
+    pub fn read(db: &Db, stats: Vec<UserAgentStat>) -> Result<Self> {
         let blocks: Vec<_> = db
             .list_firewall_rules()?
             .into_iter()
             .filter(|rule| rule.action == FirewallAction::Block)
             .collect();
-        let firewall_blocks: HashMap<String, Option<i64>> = blocks
+        let firewall_blocks = blocks
             .iter()
             .map(|rule| (rule.address.clone(), rule.expires_at))
             .collect();
-        let detectors: HashMap<&str, crate::protection::Detector> = blocks
+        let detectors = blocks
             .iter()
-            .filter_map(|rule| Some((rule.address.as_str(), rule.source?.detector()?)))
+            .filter_map(|rule| Some((rule.address.clone(), rule.source?.detector()?)))
             .collect();
-        let blocked_ip_ranges = db.blocked_ip_ranges()?;
+        Ok(Self {
+            firewall_blocks,
+            detectors,
+            blocked_ip_ranges: db.blocked_ip_ranges()?,
+            trusted_addresses: db.list_trusted_addresses()?,
+            stats,
+            ua: UaVerdicts {
+                // As the stats cut them, so a user agent blocked whole
+                // still shows as blocked against its row.
+                blocked: db
+                    .list_blocked_user_agents()?
+                    .iter()
+                    .map(|ua| crate::db::stored_user_agent(ua).to_string())
+                    .collect(),
+                bots: db.list_bots()?,
+                ai: db.get_category_default(Category::Ai)?,
+                search: db.get_category_default(Category::Search)?,
+                scanner: db.get_category_default(Category::Scanner)?,
+                trusted: db.list_trusted_user_agents()?,
+            },
+        })
+    }
+
+    /// The verdicts a user agent outside the page can be classified by —
+    /// a detail view opened on one, say.
+    pub fn verdicts(&self) -> &UaVerdicts {
+        &self.ua
+    }
+
+    /// Both panels, classified. Touches no database.
+    pub fn classify(self, ssh_log_text: Option<&str>) -> Live {
         let ssh_counts = match ssh_log_text {
             Some(text) => sshlog::failed_attempt_counts(text),
             None => HashMap::new(),
         };
-        let mut ssh = build_ssh_rows(ssh_counts, &firewall_blocks, &blocked_ip_ranges);
+        let mut ssh = build_ssh_rows(ssh_counts, &self.firewall_blocks, &self.blocked_ip_ranges);
         for row in &mut ssh {
             if let RowStatus::Blocked { by, .. } = &mut row.status {
-                *by = detectors.get(row.address.as_str()).copied();
+                *by = self.detectors.get(&row.address).copied();
             }
-        }
-        let trusted_addresses = db.list_trusted_addresses()?;
-        for row in &mut ssh {
-            if address_is_trusted(&row.address, &trusted_addresses) {
+            if address_is_trusted(&row.address, &self.trusted_addresses) {
                 row.status = RowStatus::Trusted;
             }
         }
 
-        // As the stats cut them, so a user agent blocked whole still shows
-        // as blocked against its row.
-        let blocked_uas: HashSet<String> = db
-            .list_blocked_user_agents()?
-            .iter()
-            .map(|ua| crate::db::stored_user_agent(ua).to_string())
+        let user_agents = self
+            .stats
+            .into_iter()
+            .map(|stat| UaRow {
+                status: self.ua.status_of(&stat.user_agent),
+                user_agent: stat.user_agent,
+                count: stat.hit_count.max(0) as u64,
+            })
             .collect();
-        let bots = db.list_bots()?;
-        let mut user_agents = build_ua_rows(
-            db.list_user_agent_stats()?,
-            &blocked_uas,
-            &bots,
-            db.get_category_default(Category::Ai)?,
-            db.get_category_default(Category::Search)?,
-            db.get_category_default(Category::Scanner)?,
-        );
-        let trusted_uas = db.list_trusted_user_agents()?;
-        for row in &mut user_agents {
-            if user_agent_is_trusted(&row.user_agent, &trusted_uas) {
-                row.status = RowStatus::Trusted;
-            }
-        }
 
-        Ok(Self { ssh, user_agents })
+        Live { ssh, user_agents }
     }
 }
 
@@ -1034,6 +1122,69 @@ mod tests {
                 by: None
             }
         );
+    }
+
+    /// A flood of distinct user agents is cheap to send, and both Firewall
+    /// screens used to read and classify every one. They load a page of
+    /// the most-seen, whatever the table holds.
+    #[test]
+    fn the_firewall_screens_load_one_page_of_the_most_seen_user_agents() {
+        let db = Db::open_in_memory().unwrap();
+        let counts: HashMap<String, u64> = (0..(UA_PAGE_ROWS as u64 + 50))
+            .map(|i| (format!("agent-{i:04}"), i + 1))
+            .collect();
+        db.record_user_agent_hits(&counts, 1_000).unwrap();
+
+        let live = Live::load(&db, None).unwrap();
+
+        assert_eq!(live.user_agents.len(), UA_PAGE_ROWS);
+        assert_eq!(live.user_agents[0].user_agent, "agent-0249");
+        assert_eq!(live.user_agents[0].count, 250);
+    }
+
+    /// The verdict a detail view asks for one agent is the verdict its row
+    /// shows: one precedence, in one place.
+    #[test]
+    fn one_agent_s_status_agrees_with_its_row() {
+        let db = Db::open_in_memory().unwrap();
+        db.block_user_agent("curl/8.0").unwrap();
+        db.trust_user_agent("UptimeRobot").unwrap();
+        let agents = [
+            "curl/8.0",
+            "UptimeRobot/2.0",
+            "SomeNewBot/1.0",
+            "Mozilla/5.0",
+        ];
+        let counts: HashMap<String, u64> = agents.iter().map(|ua| (ua.to_string(), 1)).collect();
+        db.record_user_agent_hits(&counts, 1_000).unwrap();
+
+        let stats = db.list_user_agent_stats().unwrap();
+        let inputs = LiveInputs::read(&db, stats).unwrap();
+        let expected: Vec<(String, RowStatus)> = agents
+            .iter()
+            .map(|ua| (ua.to_string(), inputs.verdicts().status_of(ua)))
+            .collect();
+        let live = inputs.classify(None);
+
+        for (ua, status) in expected {
+            let row = live
+                .user_agents
+                .iter()
+                .find(|r| r.user_agent == ua)
+                .unwrap();
+            assert_eq!(row.status, status, "{ua}");
+        }
+        let status = |ua: &str| {
+            live.user_agents
+                .iter()
+                .find(|r| r.user_agent == ua)
+                .unwrap()
+                .status
+        };
+        assert!(status("curl/8.0").is_blocked());
+        assert_eq!(status("UptimeRobot/2.0"), RowStatus::Trusted);
+        assert_eq!(status("SomeNewBot/1.0"), RowStatus::Unknown);
+        assert_eq!(status("Mozilla/5.0"), RowStatus::Pending);
     }
 
     /// The row itself says which detector blocked it; a block by hand

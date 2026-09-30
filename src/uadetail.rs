@@ -250,8 +250,9 @@ fn verdict_for(bot: &Bot, policies: Policies) -> BotVerdict {
     }
 }
 
-/// `text` with every control character replaced by U+FFFD, for printing a
-/// client-chosen string — a user agent, a path, a username — to a terminal.
+/// `text` with every control character replaced by U+FFFD, and every
+/// invisible formatting character written out as `\u{200B}`, for showing a
+/// client-chosen string — a user agent, a path, a username — to a person.
 ///
 /// Uncapped, unlike [`for_display`]: the CLI's `list-*` commands print
 /// the whole string so an operator can copy it into `trust`. The
@@ -261,39 +262,101 @@ fn verdict_for(bot: &Bot, policies: Policies) -> BotVerdict {
 /// write or a title change straight into the operator's shell. C1 controls
 /// count too, since some terminals act on a lone `0x9b` as a CSI.
 ///
+/// The invisible ones are shown rather than dropped, because they are the
+/// point: a right-to-left override makes `Googlebot/2.1 (evil)` draw as
+/// something else, and a zero-width space makes two strings that look
+/// identical different. A browser escapes neither — both are text, not
+/// markup — so this is the only place they are caught. See
+/// [`is_invisible_format`].
+///
 /// Borrowed when there is nothing to replace, which is every real browser.
 pub fn printable(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.chars().any(char::is_control) {
-        std::borrow::Cow::Owned(text.chars().map(printable_char).collect())
+    if text
+        .chars()
+        .any(|c| c.is_control() || is_invisible_format(c))
+    {
+        let mut out = String::with_capacity(text.len());
+        for c in text.chars() {
+            push_printable(&mut out, c);
+        }
+        std::borrow::Cow::Owned(out)
     } else {
         std::borrow::Cow::Borrowed(text)
     }
 }
 
-fn printable_char(c: char) -> char {
+fn push_printable(out: &mut String, c: char) {
     if c.is_control() {
-        '\u{fffd}'
+        out.push('\u{fffd}');
+    } else if is_invisible_format(c) {
+        out.push_str(&format!("\\u{{{:X}}}", c as u32));
     } else {
-        c
+        out.push(c);
     }
 }
 
-/// The string as it is safe to draw: capped, and with control characters
-/// replaced.
+/// Characters that change how the text around them is drawn, or take up
+/// no room at all, without being drawn themselves.
+///
+/// The bidirectional controls [`crate::blocks`] already strips from what
+/// it stores, and then the rest of Unicode's format (`Cf`) category and
+/// the other zero-width or blank-looking characters a spoof would reach
+/// for: the zero-width space, joiners and word joiner, the byte-order
+/// mark, the soft hyphen, line and paragraph separators, the Hangul
+/// fillers, the invisible math operators and the tag characters. Not the
+/// variation selectors, which an emoji legitimately carries and which
+/// change nothing about the letters around them.
+pub fn is_invisible_format(c: char) -> bool {
+    crate::blocks::is_direction_control(c)
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061c}'
+                | '\u{06dd}'
+                | '\u{070f}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08e2}'
+                | '\u{115f}'..='\u{1160}'
+                | '\u{17b4}'..='\u{17b5}'
+                | '\u{180b}'..='\u{180f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{206f}'
+                | '\u{3164}'
+                | '\u{feff}'
+                | '\u{ffa0}'
+                | '\u{fff9}'..='\u{fffb}'
+                | '\u{110bd}'
+                | '\u{110cd}'
+                | '\u{13430}'..='\u{1343f}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0001}'
+                | '\u{e0020}'..='\u{e007f}'
+        )
+}
+
+/// The string as it is safe to draw: capped at [`MAX_USER_AGENT_CHARS`],
+/// with control characters replaced and invisible ones written out (see
+/// [`printable`]). The second value is whether the cap cut anything.
 ///
 /// Both halves matter and for different reasons. The cap keeps a client
-/// that sent two kilobytes from owning the whole popup. The replacement is
-/// because this reaches a TUI's alternate screen, where an escape sequence
-/// in the data repaints the terminal — the web UI's own escaping does
-/// nothing about that, and the string has passed through no sanitiser on
-/// the way in.
-fn for_display(user_agent: &str) -> (String, bool) {
-    let mut out: String = user_agent
-        .chars()
-        .take(MAX_USER_AGENT_CHARS)
-        .map(printable_char)
-        .collect();
-    let truncated = user_agent.chars().count() > MAX_USER_AGENT_CHARS;
+/// that sent two kilobytes from owning the whole popup, or a table row.
+/// The replacement is because this reaches a TUI's alternate screen, where
+/// an escape sequence in the data repaints the terminal, and a browser,
+/// where a direction override reorders what is drawn — the web UI's own
+/// escaping does nothing about either, and the string has passed through
+/// no sanitiser on the way in.
+pub fn for_display(user_agent: &str) -> (String, bool) {
+    let mut out = String::with_capacity(user_agent.len().min(MAX_USER_AGENT_CHARS * 4));
+    let mut taken = 0;
+    for c in user_agent.chars().take(MAX_USER_AGENT_CHARS) {
+        push_printable(&mut out, c);
+        taken += 1;
+    }
+    let truncated = taken == MAX_USER_AGENT_CHARS && user_agent.chars().nth(taken).is_some();
     if truncated {
         out.push('\u{2026}');
     }
@@ -523,6 +586,7 @@ mod tests {
             ("a\u{1b}]0;title\u{7}b", Some("a\u{fffd}]0;title\u{fffd}b")),
             ("a\u{9b}2Jb", Some("a\u{fffd}2Jb")),
             ("tab\there", Some("tab\u{fffd}here")),
+            ("naïve café 日本 🙂\u{fe0f}", None),
         ];
         for (input, replaced) in cases {
             let out = printable(input);
@@ -534,6 +598,43 @@ mod tests {
                 Some(expected) => assert_eq!(out, expected, "input was {input:?}"),
             }
         }
+    }
+
+    /// A right-to-left override makes a string draw in an order other than
+    /// the one it has, and a zero-width space makes two strings that look
+    /// the same different; a browser escapes neither. Both are written out
+    /// where the operator can see them.
+    #[test]
+    fn invisible_formatting_characters_are_written_out_not_drawn() {
+        for (input, expected) in [
+            (
+                "Googlebot/2.1\u{202e}lmth.tob",
+                "Googlebot/2.1\\u{202E}lmth.tob",
+            ),
+            ("Google\u{200b}bot", "Google\\u{200B}bot"),
+            ("\u{feff}curl/8", "\\u{FEFF}curl/8"),
+            ("a\u{2066}b\u{2069}c", "a\\u{2066}b\\u{2069}c"),
+            ("soft\u{ad}hyphen", "soft\\u{AD}hyphen"),
+            ("line\u{2028}break", "line\\u{2028}break"),
+            ("tag\u{e0041}", "tag\\u{E0041}"),
+        ] {
+            assert_eq!(printable(input), expected, "input was {input:?}");
+            assert_eq!(for_display(input).0, expected, "input was {input:?}");
+        }
+    }
+
+    /// The cap counts characters of what the client sent, so a string of
+    /// nothing but zero-width spaces still ends at the cap, written out.
+    #[test]
+    fn a_string_of_invisible_characters_is_capped_like_any_other() {
+        let (shown, truncated) = for_display(&"\u{200b}".repeat(4_000));
+        assert!(truncated);
+        assert_eq!(
+            shown.matches("\\u{200B}").count(),
+            MAX_USER_AGENT_CHARS,
+            "was: {shown}"
+        );
+        assert!(!for_display(&"a".repeat(MAX_USER_AGENT_CHARS)).1);
     }
 
     /// The cap is for display only — the lookups still use the string the

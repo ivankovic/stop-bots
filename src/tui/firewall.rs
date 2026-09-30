@@ -1154,11 +1154,13 @@ fn ssh_row_line(row: &SshRow, max: u64, tag_width: usize, theme: Theme) -> Line<
 }
 
 fn ua_row_line(row: &UaRow, max: u64, tag_width: usize, theme: Theme) -> Line<'static> {
+    // A client's text: capped, with control characters replaced and
+    // invisible ones written out, as the detail popup already draws it.
     row_line(
         row.count,
         max,
         row.status,
-        row.user_agent.clone(),
+        crate::uadetail::for_display(&row.user_agent).0,
         tag_width,
         theme,
     )

@@ -894,7 +894,13 @@ fn turned_away_clients(db: &Db, probe: &Probe) -> Result<Option<Check>> {
     let named: Vec<String> = regressions
         .iter()
         .take(3)
-        .map(|entry| format!("{} ({} refused)", entry.user_agent, entry.refused))
+        // The agent is a client's text, and this line is drawn in the
+        // console's header on every page: capped, and with anything
+        // invisible written out.
+        .map(|entry| {
+            let (shown, _) = crate::uadetail::for_display(&entry.user_agent);
+            format!("{shown} ({} refused)", entry.refused)
+        })
         .collect();
     let more = regressions.len().saturating_sub(named.len());
     let suffix = if more > 0 {

@@ -30,6 +30,7 @@ pub mod evidence;
 pub mod keys;
 mod managed;
 pub mod schema;
+mod uapage;
 
 pub use crate::blocks::RuleSource;
 pub use blocks::{BlockQuery, UNBLOCK_MIN_SECONDS};
