@@ -426,7 +426,8 @@ restarts the console, so a new unit takes effect.
 - **The console**, `stop-bots-web.service`, runs as the `stop-bots` user. It writes its
   database and nothing else, and reads no host file: `/var/log` is hidden from it, and it
   gets the two logs its detectors need from the helper. It holds no Linux capability, has no
-  access to netlink, so it cannot change the firewall, and cannot see systemd's sockets.
+  access to netlink, so it cannot change the firewall, sees `/run` read-only, and cannot see
+  systemd's sockets or D-Bus.
 - **The helper**, `stop-bots-helper.service`, runs as root. systemd starts it when the console
   first connects to `/run/stop-bots/helper.sock` (`stop-bots-helper.socket`). Only root and the
   `stop-bots` group can open that socket, and the helper also checks the user of each caller.
@@ -667,7 +668,9 @@ older moves the host settings — the NGINX commands and config root, and the lo
 of the database into `/etc/stop-bots/host.conf`, which only root can write. Before it changes
 the database's layout, stop-bots
 copies the database to `<db>.bak-v<N>` (mode 0600), where `N` is the old schema version. A
-database written by a newer stop-bots is refused rather than misread; run the newer one.
+database written by a newer stop-bots is refused rather than misread; run the newer one. The
+root helper never upgrades the database itself, because the console can write it: until a root
+command or `install web` has upgraded it, the helper refuses it and says so.
 
 An upgrade never switches a detector on. One added in a later release arrives off on an
 existing install, marked "new" in the Automatic blocking panel until you switch it either way.
