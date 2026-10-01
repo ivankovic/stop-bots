@@ -63,10 +63,20 @@ pub const PATH_ENV: &str = "STOP_BOTS_HOST_CONF";
 
 /// The file this process reads and writes.
 pub fn path() -> PathBuf {
-    std::env::var_os(PATH_ENV)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_PATH))
+    if let Some(path) = std::env::var_os(PATH_ENV).filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
+    if cfg!(test) {
+        // A unit test runs inside the library, with no environment of its
+        // own to point elsewhere, and must never read the host's settings:
+        // once stop-bots was installed on the machine running the tests,
+        // its /etc/stop-bots/host.conf decided whether `uninstall`'s tests
+        // passed. A path that never exists is "nothing set", as on CI.
+        return std::env::temp_dir()
+            .join(format!("stop-bots-unit-tests-{}", std::process::id()))
+            .join("host.conf");
+    }
+    PathBuf::from(DEFAULT_PATH)
 }
 
 const NGINX_TEST: &str = "nginx_test_command";

@@ -460,7 +460,8 @@ async fn a_configured_host_becomes_acceptable() {
     let db = Db::open(tmp.path().join("db.sqlite3")).unwrap();
     db.set_text_setting(stop_bots::web::ALLOWED_HOSTS_KEY, "admin.example.com")
         .unwrap();
-    let state = AppState::new(db, tmp.path().join("nginx"), None, false);
+    let mut state = AppState::new(db, tmp.path().join("nginx"), None, false);
+    state.host_conf = tmp.path().join("host.conf");
     let app = server::router(state);
 
     let request = Request::builder()
@@ -2390,6 +2391,9 @@ fn app_throttled(
         false,
     );
     state.login_throttle = std::sync::Arc::new(stop_bots::web::auth::LoginThrottle::new(config));
+    // The test's own, never the host's: on a machine that runs stop-bots,
+    // /etc/stop-bots/host.conf would otherwise decide what the console shows.
+    state.host_conf = tmp.path().join("host.conf");
     (server::router(state), password, tmp, db_path)
 }
 

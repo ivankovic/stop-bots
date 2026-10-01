@@ -316,6 +316,10 @@ fn spawn_tui_cmd(db_path: &Path, extra_args: &[&str], fakebin: Option<&Path>) ->
     network_tripwire().route(&mut cmd);
     cmd.env("STOP_BOTS_NGINX_CONF_D", generated_dir("conf.d"));
     cmd.env("STOP_BOTS_NGINX_DIR", generated_dir("managed"));
+    // Never the host's own settings: on a machine that runs stop-bots, its
+    // host.conf named a `docker exec` reload, and the apply tests waited on
+    // it until they were killed.
+    cmd.env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"));
 
     spawn_in_pty(cmd, 32, 100, Duration::from_millis(timeout_ms()))
 }
