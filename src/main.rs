@@ -912,7 +912,8 @@ enum Command {
     Web {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
-        /// SSH log to read for the Firewall screen.
+        /// SSH log to read for the Firewall screen and the detectors. Not
+        /// with --helper, which reads the one the host settings name.
         #[arg(long)]
         ssh_log: Option<PathBuf>,
         /// Where the console's "Write script" button and its internal cron
@@ -1244,7 +1245,8 @@ enum Command {
         /// Without it the service tries /var/log/auth.log, /var/log/secure
         /// and then journalctl, every time it reads — which is what works
         /// on a host that keeps sshd's output only in the journal. Naming
-        /// a path here disables that search for the life of the unit.
+        /// a path here disables that search. Stored as `set-log-paths
+        /// --ssh-log` would, for the helper that reads it.
         #[arg(long)]
         ssh_log: Option<PathBuf>,
         /// Install into this prefix instead of `/`. For inspecting the
@@ -3721,10 +3723,6 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
 
     let prefix = options.prefix.clone().unwrap_or_else(|| PathBuf::from("/"));
     let mut layout = Layout::under(&prefix, binary);
-    // Stays `None` unless the operator passed `--ssh-log`, which is what
-    // keeps the flag out of `ExecStart` and leaves the service free to find
-    // the log itself. See `install::Layout::ssh_log`.
-    layout.ssh_log = options.ssh_log;
 
     let opts = Options {
         dry_run: options.dry_run,
@@ -3837,6 +3835,19 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
                     host_path.display()
                 ));
             }
+        }
+        // The SSH log the helper reads, as `set-log-paths --ssh-log` stores
+        // it: the console is given no log, and reads none itself. Without
+        // the flag nothing is stored, and the helper finds the log on its
+        // own (auth.log, secure, then the journal).
+        if let Some(ssh_log) = &options.ssh_log {
+            host.ssh_log = Some(std::path::absolute(ssh_log)?);
+            host.save_to(&host_path)?;
+            steps.push(format!(
+                "SSH log {} recorded in {} (`set-log-paths --ssh-log`)",
+                ssh_log.display(),
+                host_path.display()
+            ));
         }
 
         if !web::auth::password_is_set(&db)? {
@@ -3996,19 +4007,22 @@ async fn run_web(
     } = run;
 
     // The helper takes nothing from the console but the operation: where
-    // NGINX is and where the script goes are root's to say, in the host
-    // settings. A flag that would be ignored is refused instead.
+    // NGINX is, where the script goes and which logs it reads are root's
+    // to say, in the host settings. A flag that would be ignored is
+    // refused instead.
     if helper.is_some() {
         for (given, flag) in [
             (root.is_some(), "--root"),
+            (ssh_log.is_some(), "--ssh-log"),
             (firewall_out.is_some(), "--firewall-out"),
             (no_apply, "--no-apply"),
         ] {
             if given {
                 anyhow::bail!(
-                    "{flag} cannot be combined with --helper: the helper does what needs root \
-                     with the host's own settings (`stop-bots set-nginx-commands`), and \
-                     takes none from the console"
+                    "{flag} cannot be combined with --helper: the helper does what needs root, \
+                     and reads the logs, with the host's own settings (`stop-bots \
+                     set-nginx-commands`, `stop-bots set-log-paths`), and takes none from \
+                     the console"
                 );
             }
         }

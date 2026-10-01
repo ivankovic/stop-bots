@@ -2316,48 +2316,145 @@ fn the_console_sandbox_holds_under_real_systemd() {
     }
 }
 
-/// The logs the detectors read are readable through the groups the unit
-/// adds, and only through them: NGINX's access log is `www-data:adm
-/// 0640`, the journal the `systemd-journal` group's.
+/// **The console reads no log of the host's.** Under its unit, as
+/// `stop-bots`, it cannot read the auth log (`root:adm 0640`), NGINX's
+/// access log (`www-data:adm 0640`), a log anyone may read, or the journal:
+/// neither other units' entries nor sshd's. The helper reads the two logs
+/// the detectors need for it. Each probe has its control: with the log
+/// groups the unit used to add, and `/var/log` no longer hidden, the same
+/// probe reads.
 #[test]
-fn the_console_reads_the_logs_through_its_units_groups() {
+fn the_console_can_read_no_log_of_the_hosts() {
     if !enabled() {
         return;
     }
-    let host = Host::units_installed("stop-bots-console-groups");
-    host.sh("echo '127.0.0.1 - - [01/Oct/2026:00:00:00 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"x\"' >> /var/log/nginx/access.log");
-    assert_eq!(
-        host.sh("stat -c '%U:%G %a' /var/log/nginx/access.log")
-            .trim(),
-        "www-data:adm 640",
-        "the fixture is not the log as Debian ships it"
+    let host = Host::units_installed("stop-bots-console-no-logs");
+    host.sh(
+        "echo '127.0.0.1 - - [01/Oct/2026:00:00:00 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"x\"' \
+         >> /var/log/nginx/access.log && \
+         echo 'Oct  1 00:00:00 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2' \
+         > /var/log/auth.log && chown root:adm /var/log/auth.log && chmod 640 /var/log/auth.log && \
+         echo 'readable by anyone' > /var/log/world.log && chmod 644 /var/log/world.log",
     );
+    // sshd's own unit, as far as the journal is concerned: what
+    // `journalctl -u ssh` returns.
+    host.sh("systemctl start dbus.socket dbus.service && systemd-run --wait --unit=ssh -p SyslogIdentifier=sshd \
+         /bin/echo 'Failed password for root from 203.0.113.79 port 1 ssh2'");
+    for (log, mode) in [
+        ("/var/log/nginx/access.log", "www-data:adm 640"),
+        ("/var/log/auth.log", "root:adm 640"),
+    ] {
+        assert_eq!(
+            host.sh(&format!("stat -c '%U:%G %a' {log}")).trim(),
+            mode,
+            "{log} is not as Debian ships it"
+        );
+    }
 
-    for (what, probe) in [
+    // Each succeeds only if it read something: an unprivileged
+    // `journalctl` that can see nothing still exits 0.
+    let journal = |filter: &str| {
+        format!(
+            "/bin/sh -c \"journalctl -q -n 1 {filter} -o cat > /var/lib/stop-bots/journal-probe \
+             && test -s /var/lib/stop-bots/journal-probe\""
+        )
+    };
+    let rows = [
         (
             "the NGINX access log",
-            "/bin/cat /var/log/nginx/access.log",
+            "/bin/cat /var/log/nginx/access.log".to_string(),
         ),
+        ("the auth log", "/bin/cat /var/log/auth.log".to_string()),
         (
-            "the journal",
-            "/bin/sh -c \"journalctl -q -n 1 _PID=1 -o cat > /var/lib/stop-bots/journal-probe && test -s /var/lib/stop-bots/journal-probe\"",
+            "a log anyone may read",
+            "/bin/cat /var/log/world.log".to_string(),
         ),
-    ] {
-        let name = format!("probe-groups-{}", what.len());
+        ("other units' journal", journal("_PID=1")),
+        ("sshd's journal", journal("-u ssh")),
+    ];
+    for (index, (what, probe)) in rows.iter().enumerate() {
+        let name = format!("probe-no-logs-{index}");
         assert!(
-            host.oneshot_under_web_sandbox(&name, probe, ""),
-            "the console cannot read {what}. journal:\n{}",
+            !host.oneshot_under_web_sandbox(&name, probe, ""),
+            "the console read {what}. journal:\n{}",
             host.journal(&format!("{name}.service"))
         );
-        let without = format!("{name}-without");
+        let with = format!("{name}-with-groups");
         assert!(
-            !host.oneshot_under_web_sandbox(
-                &without,
+            host.oneshot_under_web_sandbox(
+                &with,
                 probe,
-                "| sed -e '/^SupplementaryGroups=/d'"
+                "| sed -e '/^InaccessiblePaths=-\\/var\\/log/d' \
+                   -e '/^User=/a SupplementaryGroups=adm systemd-journal'"
             ),
-            "the console reads {what} without its unit's groups, so this proves nothing"
+            "{what} is unreadable even with the log groups, so this proves nothing. \
+             journal:\n{}",
+            host.journal(&format!("{with}.service"))
         );
+    }
+}
+
+/// Sends `request`, one line of the helper's protocol, to its socket as
+/// `user`, and returns the reply line, or `"<no connection>"`. Perl,
+/// because it is on every Debian and speaks to a Unix socket.
+fn ask_helper_with(host: &Host, user: &str, request: &str) -> String {
+    host.sh(&format!(
+        "cat > /run/ask-helper.pl <<'PERL'\n\
+         use IO::Socket::UNIX;\n\
+         my $s = IO::Socket::UNIX->new(Peer => '/run/stop-bots/helper.sock')\n\
+           or do {{ print '<no connection>'; exit 0 }};\n\
+         print $s q({request}), \"\\n\";\n\
+         my $reply = <$s>;\n\
+         print defined $reply ? $reply : '';\n\
+         PERL\n\
+         chmod 644 /run/ask-helper.pl"
+    ));
+    host.sh(&format!(
+        "/usr/sbin/runuser -u {user} -- perl /run/ask-helper.pl"
+    ))
+}
+
+/// **From the journal, the helper returns sshd's authentication lines and
+/// nothing else.** Three entries: a failed login from sshd's own unit; the
+/// same text from another program claiming to be sshd (`logger -t
+/// 'sshd[1]'`, which any local user can run); and another service's
+/// secret. Asked by the console's user for the SSH log, the helper — on
+/// a host with no auth.log, so reading the journal — returns the first
+/// alone.
+#[test]
+fn the_helper_returns_nothing_from_the_journal_but_sshds() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::installed("stop-bots-helper-journal");
+    host.wait_for_console();
+    // No SSH log named, and none to find: the journal it is.
+    host.sh(
+        "systemctl start dbus.socket dbus.service && stop-bots set-log-paths --ssh-log '' && rm -f /var/log/auth.log /var/log/secure && \
+         systemd-run --wait --unit=ssh -p SyslogIdentifier=sshd \
+           /bin/echo 'Failed password for root from 203.0.113.79 port 1 ssh2' && \
+         logger -t 'sshd[1]' 'Failed password for root from 203.0.113.80 port 1 ssh2' && \
+         systemd-run --wait --unit=other-service \
+           /bin/echo 'Accepted password for root from 203.0.113.81 port 1 ssh2 token=s3cr3t'",
+    );
+
+    let reply = ask_helper_with(
+        &host,
+        "stop-bots",
+        r#"{"ReadLog":{"log":"Ssh","cursors":[],"legacy_offset":null,"since":0,"max_bytes":4194304}}"#,
+    );
+
+    assert!(
+        reply.contains("203.0.113.79"),
+        "sshd's own line did not come back: {reply}\njournal:\n{}",
+        host.journal("stop-bots-helper.service")
+    );
+    for (what, needle) in [
+        ("a line another program logged as sshd", "203.0.113.80"),
+        ("another unit's entry", "203.0.113.81"),
+        ("another unit's secret", "s3cr3t"),
+    ] {
+        assert!(!reply.contains(needle), "{what} came back: {reply}");
     }
 }
 
@@ -2520,8 +2617,9 @@ fn uninstall_removes_the_consoles_user_only_with_purge() {
 // ---- the console and its helper, running ----
 
 /// The console `install web` starts is the `stop-bots` user's, holds no
-/// capability and can gain none, has its log groups, and runs under a
-/// syscall filter; the helper's socket is root's and the console group's.
+/// capability and can gain none, is in none of the log groups, and runs
+/// under a syscall filter; the helper's socket is root's and the console
+/// group's.
 /// Read from the running process, not the unit.
 #[test]
 fn the_installed_console_runs_as_its_own_user_with_nothing_of_roots() {
@@ -2556,12 +2654,19 @@ fn the_installed_console_runs_as_its_own_user_with_nothing_of_roots() {
     ] {
         assert_eq!(field(name), vec![want.to_string()], "{name}");
     }
-    let groups = field("Groups");
+    // The status line is empty without supplementary groups.
+    let groups: Vec<String> = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Groups:"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
     for group in ["adm", "systemd-journal"] {
         let gid = host.sh(&format!("getent group {group} | cut -d: -f3"));
         assert!(
-            groups.contains(&gid.trim().to_string()),
-            "the console is not in {group}: {groups:?}"
+            !groups.contains(&gid.trim().to_string()),
+            "the console is in {group}, which reads the host's logs: {groups:?}"
         );
     }
     assert_eq!(
@@ -2582,23 +2687,9 @@ fn the_installed_console_runs_as_its_own_user_with_nothing_of_roots() {
 const HELPER_PROBE_REQUEST: &str = r#""SiteStatuses""#;
 
 /// Sends [`HELPER_PROBE_REQUEST`] to the helper's socket as `user`, and
-/// returns what came back: the reply line, or `"<no connection>"`. Perl,
-/// because it is on every Debian and speaks to a Unix socket.
+/// returns what came back: see [`ask_helper_with`].
 fn ask_helper_as(host: &Host, user: &str) -> String {
-    host.sh(&format!(
-        "cat > /run/ask-helper.pl <<'PERL'\n\
-         use IO::Socket::UNIX;\n\
-         my $s = IO::Socket::UNIX->new(Peer => '/run/stop-bots/helper.sock')\n\
-           or do {{ print '<no connection>'; exit 0 }};\n\
-         print $s q({HELPER_PROBE_REQUEST}), \"\\n\";\n\
-         my $reply = <$s>;\n\
-         print defined $reply ? $reply : '';\n\
-         PERL\n\
-         chmod 644 /run/ask-helper.pl"
-    ));
-    host.sh(&format!(
-        "/usr/sbin/runuser -u {user} -- perl /run/ask-helper.pl"
-    ))
+    ask_helper_with(host, user, HELPER_PROBE_REQUEST)
 }
 
 /// **The peer check.** A user put in the socket's group can connect —
@@ -2638,14 +2729,13 @@ fn the_helper_refuses_a_peer_that_is_not_the_console() {
     );
 }
 
-/// **Detection still works with the console reading logs through its
-/// groups.** An access log of `www-data:adm 0640` with a request for
-/// `/.env` in it, and an auth log of `root:adm 0640` with a burst of
-/// failed logins: the console, which is neither, reads both through the
-/// groups its unit adds, and the detectors block both addresses on their
-/// first pass.
+/// **Detection still works, with the helper reading the logs.** An access
+/// log of `www-data:adm 0640` with a request for `/.env` in it, and an
+/// auth log of `root:adm 0640` with a burst of failed logins: the console,
+/// which can read neither, asks its helper for both, and the detectors
+/// block both addresses on their first pass.
 #[test]
-fn the_console_detects_from_logs_it_reads_through_its_groups() {
+fn the_console_detects_from_logs_it_reads_through_its_helper() {
     if !enabled() {
         return;
     }
@@ -2674,12 +2764,17 @@ fn the_console_detects_from_logs_it_reads_through_its_groups() {
         assert_eq!(
             host.sh(&format!("stat -c '%U:%G %a' {log}")).trim(),
             mode,
-            "{log} is not the console's to read but for its groups"
+            "{log} is not as Debian ships it"
         );
     }
 
     host.sh("stop-bots install web --ssh-log /var/log/auth.log");
     host.wait_for_console();
+    assert!(
+        host.sh("cat /etc/stop-bots/host.conf")
+            .contains("/var/log/auth.log"),
+        "install web did not store the SSH log for the helper"
+    );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     let mut rules = String::new();
@@ -2701,6 +2796,12 @@ fn the_console_detects_from_logs_it_reads_through_its_groups() {
         rules.contains("203.0.113.78"),
         "the auth log's guesser was not blocked:\n{rules}\njournal:\n{}",
         host.journal("stop-bots-web.service")
+    );
+    // And it was the helper that read them.
+    let helper = host.journal("stop-bots-helper.service");
+    assert!(
+        helper.contains("op=ReadLog") && helper.contains(&host.console_uid()),
+        "the helper read no log for the console:\n{helper}"
     );
 }
 

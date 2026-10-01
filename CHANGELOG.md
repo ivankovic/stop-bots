@@ -14,15 +14,17 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   system user and runs the console as it, with no capability, no write access outside
   its database, and systemd's sockets hidden. What needs root it asks of a new root
   helper, `stop-bots-helper.service`, started by `stop-bots-helper.socket`.
-- The console reads the logs through `SupplementaryGroups=adm systemd-journal` in its
-  unit; nothing is added to `/etc/group`.
+- **The console reads no host log.** Its unit has no log groups and hides `/var/log`
+  and `/run/log`. The helper reads the access log and sshd's lines of the SSH log for
+  it, 4 MB a request, and returns nothing else: no other line of `auth.log`, no other
+  unit's journal. The journal is read as `journalctl -o json`.
 - Root opening the console's database (the CLI, the TUI, the helper, `install web`,
   `uninstall`) follows no link in its directory, refuses a database or `-wal`/`-shm`
   that is a link or has a second name, and changes owners and modes only by descriptor.
 - `uninstall` deletes a file the database's record names only if it is a plain file
   in a `conf.d` or `/etc/stop-bots/nginx` that starts with the stop-bots header.
 - The root helper answers only root and the `stop-bots` user (`SO_PEERCRED`), and only
-  seven typed operations — never a command, a path or config text. It reads the NGINX
+  eight typed operations — never a command, a path or config text. It reads the NGINX
   commands, root and log paths from `/etc/stop-bots/host.conf`, finds sites on disk
   rather than where a database row says they are, removes a recorded generated file only
   inside this root's `conf.d` or `/etc/stop-bots/nginx`, and re-validates what it
@@ -45,7 +47,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   `sudo stop-bots` command after the upgrade (or `install web`) moves the stored values
   into it and deletes them from the database, once, and only from a database root owns.
 - `stop-bots web --helper <socket>` does everything that needs root through the helper;
-  it cannot be combined with `--root`, `--firewall-out` or `--no-apply`.
+  it cannot be combined with `--root`, `--ssh-log`, `--firewall-out` or `--no-apply`.
+  `install web --ssh-log` stores the path in `host.conf`, not in the unit.
 - `uninstall` keeps `/etc/stop-bots/host.conf` unless `--purge`, like the database.
 
 - Upgrading from rc.2: re-run `sudo stop-bots install web`. It replaces the unedited
@@ -58,8 +61,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - A copy taken before a schema upgrade (`.bak-v*`), and a database root creates in the
   console's directory, belong to the database's owner, not root.
 - `status` warns when the console runs as root, when it has no root helper, and when
-  its user cannot read a log it is set up to read (`console-account`,
-  `console-helper`, `console-log-access`).
+  the helper (or a console without one) cannot read a log it is set up to read
+  (`console-account`, `console-helper`, `console-log-access`).
 
 ## [0.1.0-rc.2] — 2026-09-30
 

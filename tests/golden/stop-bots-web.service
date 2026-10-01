@@ -34,10 +34,10 @@ RestartSec=5s
 # service runs as stop-bots, not as root.
 User=stop-bots
 Group=stop-bots
-# The logs the detectors read: /var/log/nginx and auth.log belong to adm,
-# the journal to systemd-journal. Here rather than in /etc/group, so the
-# membership holds for this service and nothing else running as stop-bots.
-SupplementaryGroups=adm systemd-journal
+# No log groups: the helper reads the two logs the detectors need and
+# returns only those lines, of the SSH log only sshd's. The rest of
+# /var/log and the journal is hidden, the world-readable parts too.
+InaccessiblePaths=-/var/log -/run/log
 
 # It writes its database and nothing else, holds no capability and can
 # gain none, cannot reach netlink to change the firewall, and cannot see
@@ -64,8 +64,8 @@ SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 CapabilityBoundingSet=
-# AF_UNIX for the helper's socket and journalctl, AF_INET/AF_INET6 for the
-# console itself and the list downloads.
+# AF_UNIX for the helper's socket, AF_INET/AF_INET6 for the console itself
+# and the list downloads.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
 # The database holds the console's password hash.

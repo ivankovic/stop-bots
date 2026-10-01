@@ -3603,6 +3603,57 @@ fn install_web_stores_the_nginx_root_and_lets_the_helper_write_it() {
     );
 }
 
+/// `install web --ssh-log` is stored where the helper reads the SSH log
+/// from, as `set-log-paths --ssh-log` would store it, and not handed to
+/// the console, which reads no log itself.
+#[test]
+fn install_web_stores_the_ssh_log_for_the_helper_not_the_console() {
+    let (tmp, binary) = fake_debian_root();
+    stop_bots_bin()
+        .args([
+            "install",
+            "web",
+            "--prefix",
+            tmp.path().to_str().unwrap(),
+            "--binary",
+            binary.to_str().unwrap(),
+            "--ssh-log",
+            "/srv/logs/auth.log",
+        ])
+        .assert()
+        .success();
+
+    let host =
+        stop_bots::hostconf::HostConf::load_from(&tmp.path().join("etc/stop-bots/host.conf"))
+            .unwrap();
+    assert_eq!(
+        host.ssh_log.as_deref(),
+        Some(std::path::Path::new("/srv/logs/auth.log"))
+    );
+    let unit =
+        fs::read_to_string(tmp.path().join("etc/systemd/system/stop-bots-web.service")).unwrap();
+    assert!(!unit.contains("--ssh-log"), "unit was:\n{unit}");
+}
+
+/// A console given the helper reads its logs through it, from the host
+/// settings; a log named on its command line would be ignored, so it is
+/// refused.
+#[test]
+fn a_console_with_a_helper_refuses_an_ssh_log_of_its_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    stop_bots_bin()
+        .args(["web", "--db"])
+        .arg(tmp.path().join("db.sqlite3"))
+        .args(["--helper"])
+        .arg(tmp.path().join("helper.sock"))
+        .args(["--ssh-log", "/var/log/auth.log"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--ssh-log cannot be combined with --helper",
+        ));
+}
+
 /// `--dry-run` has to be trustworthy or nobody will use it on the one
 /// command in this project that starts a daemon.
 #[test]

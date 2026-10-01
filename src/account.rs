@@ -19,27 +19,19 @@
 //! The account the web console runs as, and what that account can read.
 //!
 //! Since 0.1 the console is not root: it runs as the `stop-bots` system
-//! user, which `install web` creates, and reaches the logs through the
-//! groups its unit adds (`SupplementaryGroups=`), not through membership
-//! written into `/etc/group`. Two reasons for the unit rather than the
-//! group file: the membership then holds for the console and nothing else
-//! running as that user, and `uninstall` has nothing in `/etc/group` to
-//! undo.
+//! user, which `install web` creates. It reads no log of the host's
+//! either. Its unit gives it none of the log groups (`adm`,
+//! `systemd-journal`) and hides `/var/log` and the volatile journal, and
+//! the root helper reads the two logs the detectors need for it, returning
+//! only those lines (see [`crate::hostlog`]). With the groups, as before,
+//! a compromised console could read every log in `/var/log` and the whole
+//! system journal: sudo's commands, other services' output, every user's
+//! sessions.
 //!
-//! Which groups, on the two distributions the README names:
-//!
-//! - `adm` owns `/var/log/nginx/*.log` (`www-data:adm 0640`) and
-//!   `/var/log/auth.log` where rsyslog writes one (`root:adm` on Debian,
-//!   `syslog:adm` on Ubuntu), and is granted the journal by systemd's own
-//!   ACL on `/var/log/journal`.
-//! - `systemd-journal` owns the journal files themselves (`0640`). Named as
-//!   well because the ACL is something an operator can remove, and the
-//!   group is what `journalctl`'s own documentation says to use. Only if
-//!   the group exists: a unit naming a group that does not fails to start.
-//!
-//! [`readable_by`] answers "could the console read this?" from root, where
-//! simply trying would always succeed — honouring POSIX ACLs, because the
-//! journal's access for `adm` is one.
+//! [`readable_by`] answers "could this account read that?" from root,
+//! where simply trying would always succeed — honouring POSIX ACLs, which
+//! is how systemd grants the journal. The health check asks it about a
+//! console that runs without its helper, and so reads with its own access.
 
 use std::ffi::CString;
 use std::os::unix::fs::MetadataExt;
@@ -47,10 +39,6 @@ use std::path::Path;
 
 /// The console's user and group.
 pub const USER: &str = "stop-bots";
-
-/// The groups the console's unit adds for reading the logs, in the order
-/// the unit names them. See the module docs.
-pub const LOG_GROUPS: [&str; 2] = ["adm", "systemd-journal"];
 
 /// A user, as the passwd database has it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

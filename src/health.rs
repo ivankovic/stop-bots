@@ -249,10 +249,11 @@ pub struct Probe {
     /// `None` when no console unit is running.
     #[serde(default)]
     pub console_helper: Option<bool>,
-    /// The logs this host is configured to read that the running
-    /// console's process cannot — the access log, and the SSH log or the
-    /// journal. Asked from root, for the console's uid and groups, since
-    /// root itself can read everything.
+    /// The logs this host is configured to read that the running console
+    /// cannot get — the access log, and the SSH log or the journal. With
+    /// its helper, the ones the helper cannot read, since the helper reads
+    /// them for it; without one, the ones the console's own uid and groups
+    /// cannot read, asked from root, which itself can read everything.
     #[serde(default)]
     pub console_unreadable_logs: Vec<String>,
     /// The NGINX test and reload commands the host settings name, for
@@ -363,6 +364,24 @@ pub fn probe(
     let console = unit_active
         .filter(|active| *active)
         .and_then(|_| console_identity());
+    let console_helper = console.as_ref().map(|_| console_has_helper());
+    // Asked, not read: this used to read the whole log, which on a
+    // journald host was the whole sshd journal, once an hour.
+    let ssh_readable = paths.ssh(ssh_log).is_readable();
+    // Who reads the logs for the console: its root helper, which reads
+    // the host settings' logs as root does here; or, without one, the
+    // console itself, with its own account.
+    let console_unreadable_logs = match (&console, console_helper) {
+        (Some(_), Some(true)) => {
+            let ssh_readable = match ssh_log {
+                None => ssh_readable,
+                Some(_) => paths.ssh(None).is_readable(),
+            };
+            helper_unreadable_logs(paths, access_readable, ssh_readable)
+        }
+        (Some(who), _) => unreadable_logs(who, paths, ssh_log),
+        (None, _) => Vec::new(),
+    };
     let container = match &nginx_home {
         NginxHome::Container { name } => Some(name.clone()),
         _ => None,
@@ -380,16 +399,11 @@ pub fn probe(
         nftables_conf_flushes: nftables_conf_flushes(),
         unit_active,
         unit_binary: unit_binary(),
-        console_helper: console.as_ref().map(|_| console_has_helper()),
-        console_unreadable_logs: console
-            .as_ref()
-            .map(|who| unreadable_logs(who, paths, ssh_log))
-            .unwrap_or_default(),
+        console_helper,
+        console_unreadable_logs,
         console_identity: console,
         db_free_bytes: free_bytes(db_path),
-        // Asked, not read: this used to read the whole log, which on a
-        // journald host was the whole sshd journal, once an hour.
-        ssh_log_readable: Some(paths.ssh(ssh_log).is_readable()),
+        ssh_log_readable: Some(ssh_readable),
         access_log_readable: Some(access_readable),
         access_log_path: Some(paths.access_description(None)),
         access_log_clients: access_readable.then_some((survey.public, survey.counts.parsed)),
@@ -818,6 +832,29 @@ fn console_has_helper() -> bool {
     )
     .is_some_and(|state| state.trim() == "active");
     named && listening
+}
+
+/// The logs the host is set up to read that root, here, could not: what
+/// the console's helper, which reads them for it as root, cannot read
+/// either.
+fn helper_unreadable_logs(
+    paths: &crate::logpaths::LogPaths,
+    access_readable: bool,
+    ssh_readable: bool,
+) -> Vec<String> {
+    let mut logs = Vec::new();
+    if !access_readable {
+        logs.push(paths.access_description(None));
+    }
+    if !ssh_readable {
+        logs.push(match paths.ssh(None) {
+            crate::sshlog::SshSource::File(path) => path.display().to_string(),
+            crate::sshlog::SshSource::Search => {
+                "the SSH log (auth.log, secure, or sshd in the journal)".to_string()
+            }
+        });
+    }
+    logs
 }
 
 /// The logs the host is set up to read that `who` cannot read.
@@ -1557,37 +1594,61 @@ fn console_helper(probe: &Probe) -> Option<Check> {
     })
 }
 
-/// Whether the console, not being root, can read the logs this host is
-/// set up to read. [`log_sources`] asks the same as root, which reads
-/// everything; this is the console's own answer, and the one its
-/// detectors live by.
+/// Whether the console, not being root, gets the logs this host is set up
+/// to read: from its root helper, which reads them for it (the console's
+/// own account reads none), or, with no helper, with its own account.
+/// This is the answer its detectors live by.
 fn console_log_access(probe: &Probe) -> Option<Check> {
     let who = probe.console_identity.as_ref()?;
     if who.uid == 0 {
         return None;
     }
-    let (level, detail, fix) = if probe.console_unreadable_logs.is_empty() {
-        (
+    let unreadable = probe.console_unreadable_logs.join(" or ");
+    let through_helper = probe.console_helper == Some(true);
+    let (level, detail, fix) = match (through_helper, unreadable.is_empty()) {
+        (true, true) => (
             Level::Ok,
-            "the console can read every log it is set up to read".to_string(),
+            format!(
+                "the console reads the logs through {}, which can read every one it is set up \
+                 to read",
+                crate::install::HELPER_UNIT
+            ),
             None,
-        )
-    } else {
-        (
+        ),
+        (true, false) => (
             Level::Warn,
             format!(
-                "the console's account ({}) cannot read {} — the detectors that read it find \
-                 nothing",
-                crate::account::user_name(who.uid),
-                probe.console_unreadable_logs.join(" or ")
+                "the console reads the logs through {}, which cannot read {unreadable} — the \
+                 detectors that read it find nothing",
+                crate::install::HELPER_UNIT
             ),
             Some(
-                "re-run `sudo stop-bots install web`, which gives the console the adm and \
-                 systemd-journal groups; for a log owned by another group, `sudo setfacl -m \
-                 u:stop-bots:r <log>` (and `u:stop-bots:x` on each directory above it)"
+                "check where the log is and store it with `sudo stop-bots set-log-paths`"
                     .to_string(),
             ),
-        )
+        ),
+        (false, true) => (
+            Level::Ok,
+            format!(
+                "the console has no helper and reads the logs as {}, which can read every one \
+                 it is set up to read",
+                crate::account::user_name(who.uid)
+            ),
+            None,
+        ),
+        (false, false) => (
+            Level::Warn,
+            format!(
+                "the console has no helper, and its account ({}) cannot read {unreadable} — \
+                 the detectors that read it find nothing",
+                crate::account::user_name(who.uid)
+            ),
+            Some(
+                "re-run `sudo stop-bots install web`, which gives the console a root helper \
+                 that reads the logs for it"
+                    .to_string(),
+            ),
+        ),
     };
     Some(Check {
         id: "console-log-access",
@@ -2290,11 +2351,11 @@ mod tests {
         }
     }
 
-    /// The `stop-bots` user, with the two log groups its unit adds.
+    /// The `stop-bots` user, in its own group and no other.
     fn console_user() -> crate::account::Identity {
         crate::account::Identity {
             uid: 998,
-            gids: vec![998, 4, 101],
+            gids: vec![998],
         }
     }
 
@@ -2365,8 +2426,24 @@ mod tests {
         );
     }
 
+    /// As installed, the console reads its logs through the helper, and
+    /// the check says so.
     #[test]
-    fn a_log_the_console_cannot_read_is_named() {
+    fn the_console_s_logs_are_said_to_come_through_its_helper() {
+        let report = assess(&db(), &healthy()).unwrap();
+
+        let logs = check(&report, "console-log-access");
+        assert_eq!(logs.level, Level::Ok);
+        assert!(
+            logs.detail.contains(crate::install::HELPER_UNIT),
+            "{logs:?}"
+        );
+    }
+
+    /// A log the helper cannot read is named, and so is the helper: the
+    /// console's own account reads no log, so its groups are not the fix.
+    #[test]
+    fn a_log_the_helper_cannot_read_is_named() {
         let report = assess(
             &db(),
             &Probe {
@@ -2379,6 +2456,41 @@ mod tests {
         let logs = check(&report, "console-log-access");
         assert_eq!(logs.level, Level::Warn);
         assert!(logs.detail.contains("/srv/logs/access.log"), "{logs:?}");
+        assert!(
+            logs.detail.contains(crate::install::HELPER_UNIT),
+            "{logs:?}"
+        );
+        assert!(
+            logs.fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("set-log-paths")),
+            "{logs:?}"
+        );
+    }
+
+    /// Without its helper the console reads with its own account, and a
+    /// log that account cannot read is fixed by giving it the helper.
+    #[test]
+    fn without_a_helper_a_log_the_console_cannot_read_points_at_the_helper() {
+        let report = assess(
+            &db(),
+            &Probe {
+                console_helper: Some(false),
+                console_unreadable_logs: vec!["/var/log/auth.log".to_string()],
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        let logs = check(&report, "console-log-access");
+        assert_eq!(logs.level, Level::Warn);
+        assert!(logs.detail.contains("/var/log/auth.log"), "{logs:?}");
+        assert!(
+            logs.fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("install web") && fix.contains("helper")),
+            "{logs:?}"
+        );
     }
 
     /// No console running, nothing to say about it.

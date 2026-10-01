@@ -159,26 +159,6 @@ pub struct Layout {
     /// `/run`. Writable for the service; see [`writable_paths`] for why
     /// the whole of it rather than the three files it uses there.
     pub run_dir: PathBuf,
-    /// An explicit SSH log for the unit to name, or `None` to let the
-    /// service find its own at runtime.
-    ///
-    /// `None` is the default, and the important one. This used to be a
-    /// plain `PathBuf` defaulting to `/var/log/auth.log`, which baked a
-    /// guess about the host into `ExecStart` at install time — and Debian
-    /// 12 dropped rsyslog from default installs, so on a current Debian
-    /// host that guess names a file which does not exist. The service then
-    /// read nothing, found no SSH attempts, and said so as an empty panel
-    /// rather than an error, because an unreadable log is "could not
-    /// check", not "checked and clear".
-    ///
-    /// Passing no flag is not the same as passing this path. With no
-    /// `--ssh-log`, `sshlog::SshSource::Search` tries `/var/log/auth.log`
-    /// and `/var/log/secure`, *then* falls back to `journalctl`, which is
-    /// where a journald-only host keeps its sshd lines. An explicit path
-    /// deliberately skips that fallback — it means "read this, not whatever
-    /// you can find" — so it belongs in the unit only when an operator
-    /// asked for it.
-    pub ssh_log: Option<PathBuf>,
     /// Exists only under systemd. The documented way to detect it — a
     /// `systemctl` binary on `PATH` proves only that the package is
     /// installed, which is true inside a Docker container that is not
@@ -198,11 +178,6 @@ pub struct Layout {
     pub groupadd: PathBuf,
     /// The user and group the console runs as.
     pub user: String,
-    /// The groups the console's unit adds so it can read the logs. All of
-    /// [`crate::account::LOG_GROUPS`] here; [`install_web`] keeps only the
-    /// ones the host has, because a unit naming a missing group does not
-    /// start.
-    pub log_groups: Vec<String>,
     /// [`HELPER_SOCKET`], under the prefix.
     pub helper_socket: PathBuf,
     /// Whether this describes the running host rather than a staging tree,
@@ -238,14 +213,12 @@ impl Layout {
             nginx_log_dir: prefix.join("var/log/nginx"),
             log_dirs: Vec::new(),
             run_dir: prefix.join("run"),
-            ssh_log: None,
             systemd_marker: prefix.join("run/systemd/system"),
             debian_marker: prefix.join("etc/debian_version"),
             systemctl: PathBuf::from("systemctl"),
             useradd: crate::host::program("useradd"),
             groupadd: crate::host::program("groupadd"),
             user: crate::account::USER.to_string(),
-            log_groups: crate::account::LOG_GROUPS.map(String::from).to_vec(),
             helper_socket: prefix.join(HELPER_SOCKET.trim_start_matches('/')),
             // Derived, not a parameter: `main.rs` builds every layout —
             // prefixed or not — with `under`, so a flag a caller had to
@@ -270,13 +243,6 @@ impl Layout {
     /// create or migrate the file.
     fn with_host_settings(&self) -> Layout {
         let mut layout = self.clone();
-        // On the host, only the groups it has: `SupplementaryGroups=`
-        // naming a missing one fails the start with 216/GROUP.
-        if self.real {
-            layout
-                .log_groups
-                .retain(|name| crate::account::group(name).is_some());
-        }
         let (stored_root, stored_access_log) = self.stored_host_settings();
         // A stored root inside /etc/nginx is given back already, and any
         // other one only if it is `grantable`: a database row may have been
@@ -698,21 +664,13 @@ pub fn web_unit(layout: &Layout) -> String {
         systemd_arg(&layout.binary),
         systemd_arg(&layout.db_path),
     );
-    // Only when the operator named one. Omitting the flag is what leaves
-    // the service free to try the log files and then `journalctl`; naming
-    // a path here would pin it to that path forever, including on the
-    // hosts that do not have it. See `Layout::ssh_log`.
-    if let Some(path) = &layout.ssh_log {
-        exec.push_str(&format!(" --ssh-log {}", systemd_arg(path)));
-    }
+    // No `--ssh-log`: the helper reads the logs, from the host settings
+    // (`install web --ssh-log` stores it there), and takes no path from
+    // the console.
     exec.push_str(&format!(
         " --helper {}\n",
         systemd_arg(&layout.helper_socket)
     ));
-    let groups = match layout.log_groups.as_slice() {
-        [] => String::new(),
-        groups => format!("SupplementaryGroups={}\n", groups.join(" ")),
-    };
 
     seal(&format!(
         "{header}\
@@ -745,10 +703,10 @@ pub fn web_unit(layout: &Layout) -> String {
          # service runs as {user}, not as root.\n\
          User={user}\n\
          Group={user}\n\
-         # The logs the detectors read: /var/log/nginx and auth.log belong to adm,\n\
-         # the journal to systemd-journal. Here rather than in /etc/group, so the\n\
-         # membership holds for this service and nothing else running as {user}.\n\
-         {groups}\
+         # No log groups: the helper reads the two logs the detectors need and\n\
+         # returns only those lines, of the SSH log only sshd's. The rest of\n\
+         # /var/log and the journal is hidden, the world-readable parts too.\n\
+         InaccessiblePaths=-/var/log -/run/log\n\
          \n\
          # It writes its database and nothing else, holds no capability and can\n\
          # gain none, cannot reach netlink to change the firewall, and cannot see\n\
@@ -775,8 +733,8 @@ pub fn web_unit(layout: &Layout) -> String {
          SystemCallFilter=@system-service\n\
          SystemCallErrorNumber=EPERM\n\
          CapabilityBoundingSet=\n\
-         # AF_UNIX for the helper's socket and journalctl, AF_INET/AF_INET6 for the\n\
-         # console itself and the list downloads.\n\
+         # AF_UNIX for the helper's socket, AF_INET/AF_INET6 for the console itself\n\
+         # and the list downloads.\n\
          RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n\
          InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private\n\
          # The database holds the console's password hash.\n\
@@ -1835,38 +1793,40 @@ mod tests {
         }
     }
 
-    /// The unit must not name an SSH log unless asked to.
+    /// The unit names no SSH log: the helper reads it, from the host
+    /// settings, and takes no path from the console.
     ///
-    /// This is the regression that took a production host out quietly. The
-    /// unit used to carry `--ssh-log /var/log/auth.log` always, and on a
-    /// Debian 12 host — where rsyslog is no longer installed by default and
-    /// sshd logs only to the journal — that file does not exist. An
-    /// explicit path skips the `journalctl` fallback by design, so the
-    /// service read nothing: the console's SSH panel sat empty and the
-    /// brute-force detector, which runs inside that same service, found
-    /// nothing to block. Neither said anything was wrong, because an
-    /// unreadable log means "could not check".
+    /// It once took a production host out quietly. The unit carried
+    /// `--ssh-log /var/log/auth.log` always, and on a Debian 12 host —
+    /// where rsyslog is no longer installed by default and sshd logs only
+    /// to the journal — that file does not exist. An explicit path skips
+    /// the `journalctl` fallback by design, so the service read nothing.
     #[test]
-    fn the_unit_names_no_ssh_log_by_default() {
+    fn the_unit_names_no_ssh_log() {
         let unit = web_unit(&system_layout());
 
         assert!(
             !unit.contains("--ssh-log"),
-            "the unit pinned an SSH log nobody asked for; the service has to be \
-             free to fall back to journalctl. Unit was:\n{unit}"
+            "the console was handed an SSH log; the helper reads it. Unit was:\n{unit}"
         );
     }
 
-    /// The flag is still there for the host where the log really is
-    /// somewhere else — it just has to be asked for.
+    /// The console reads no log of the host's: it has none of the log
+    /// groups, and `/var/log` and the volatile journal are hidden from it.
     #[test]
-    fn an_explicit_ssh_log_still_reaches_the_unit() {
-        let mut layout = system_layout();
-        layout.ssh_log = Some(PathBuf::from("/srv/logs/auth.log"));
+    fn the_console_can_read_no_log_of_the_host_s() {
+        let unit = web_unit(&system_layout());
+        let directives = directives(&unit);
 
         assert!(
-            web_unit(&layout).contains("--ssh-log /srv/logs/auth.log"),
-            "an operator who named a log did not get it"
+            !directives
+                .iter()
+                .any(|d| d.starts_with("SupplementaryGroups=")),
+            "{directives:?}"
+        );
+        assert!(
+            directives.contains(&"InaccessiblePaths=-/var/log -/run/log"),
+            "{directives:?}"
         );
     }
 
@@ -2475,14 +2435,14 @@ mod tests {
         let mut layout = system_layout();
         layout.binary = PathBuf::from("/opt/stop bots/stop-bots");
         layout.db_path = PathBuf::from("/var/lib/100%/db.sqlite3");
-        layout.ssh_log = Some(PathBuf::from("/srv/a \"b\"\\c.log"));
+        layout.helper_socket = PathBuf::from("/run/a \"b\"\\c.sock");
 
         let unit = web_unit(&layout);
 
         let exec = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
         assert_eq!(
             exec,
-            r#"ExecStart="/opt/stop bots/stop-bots" web --db /var/lib/100%%/db.sqlite3 --ssh-log "/srv/a \"b\"\\c.log" --helper /run/stop-bots/helper.sock"#
+            r#"ExecStart="/opt/stop bots/stop-bots" web --db /var/lib/100%%/db.sqlite3 --helper "/run/a \"b\"\\c.sock""#
         );
     }
 
@@ -2884,7 +2844,7 @@ mod tests {
         for (what, line) in [
             ("its own user", "User=stop-bots"),
             ("its own group", "Group=stop-bots"),
-            ("the log groups", "SupplementaryGroups=adm systemd-journal"),
+            ("no host log", "InaccessiblePaths=-/var/log -/run/log"),
             ("no capability at all", "CapabilityBoundingSet="),
             ("none gained either", "NoNewPrivileges=yes"),
             (
@@ -2925,17 +2885,6 @@ mod tests {
         ] {
             assert!(lines.contains(&line), "no {line:?} in:\n{unit}");
         }
-    }
-
-    /// A unit naming a group the host lacks fails to start with
-    /// 216/GROUP; with neither group there is no line at all.
-    #[test]
-    fn only_the_log_groups_the_host_has_are_named() {
-        let mut layout = system_layout();
-        layout.log_groups = vec!["adm".to_string()];
-        assert!(directives(&web_unit(&layout)).contains(&"SupplementaryGroups=adm"));
-        layout.log_groups.clear();
-        assert!(!web_unit(&layout).contains("\nSupplementaryGroups="));
     }
 
     /// The helper is root and has no `User=`; it reaches the kernel's
