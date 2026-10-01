@@ -35,6 +35,7 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   replaces control characters (C0, DEL, C1) with `�` and writes bidi and zero-width
   characters out as `\u{…}`. A row the console wrote, or a log line, could set the title
   or the clipboard of root's terminal through `list-*`, `status`, `apply-blocks` and `batch`.
+- The TUI's `y` refuses to copy a value with such characters, and says why.
 
 ### Changed
 

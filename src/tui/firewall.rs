@@ -291,8 +291,13 @@ impl Firewall {
         let Some(value) = value else {
             return KeyOutcome::Consumed;
         };
-        crate::tui::copy_to_clipboard(&value);
-        *message = Some(format!("Copied \"{value}\" to the clipboard"));
+        *message = Some(match clipboard_refusal(&value) {
+            Some(refusal) => refusal,
+            None => {
+                crate::tui::copy_to_clipboard(&value);
+                format!("Copied \"{value}\" to the clipboard")
+            }
+        });
         KeyOutcome::Consumed
     }
 
@@ -1102,6 +1107,23 @@ fn trusted_refusal(value: &str) -> String {
     format!("{value} is trusted, so it cannot be blocked — press T to stop trusting it first.")
 }
 
+/// Why `y` copied nothing: `value` holds a character
+/// [`crate::present::terminal_safe`] would rewrite. A user agent is the
+/// client's choice, and a pasted newline runs whatever follows it in the
+/// operator's shell, a pasted ESC drives the terminal, and a pasted
+/// direction override makes the command line read as something it is
+/// not. Copying the rewritten form instead would put a string on the
+/// clipboard that matches nothing, so `trust` or a search with it would
+/// quietly do nothing.
+fn clipboard_refusal(value: &str) -> Option<String> {
+    match crate::present::terminal_safe(value) {
+        std::borrow::Cow::Borrowed(_) => None,
+        std::borrow::Cow::Owned(shown) => Some(format!(
+            "Not copied: \"{shown}\" holds control or invisible characters, which a paste would carry into your shell."
+        )),
+    }
+}
+
 /// The widest line in `lines`, for sizing a popup to its content.
 fn widest_line(lines: &[Line<'_>]) -> u16 {
     lines
@@ -1517,6 +1539,48 @@ mod tests {
             vec!["curl/8.0".to_string()]
         );
         assert!(message.unwrap().contains("curl/8.0"));
+    }
+
+    /// A value a paste could act on is not put on the clipboard; the
+    /// message says why, with the characters written out.
+    #[test]
+    fn y_refuses_a_user_agent_with_control_or_invisible_characters() {
+        let db = Db::open_in_memory().unwrap();
+        for hostile in [
+            "curl\nrm -rf /",
+            "a\u{1b}]0;PWNED\u{7}",
+            "Google\u{202e}tob",
+        ] {
+            let mut screen = Firewall {
+                ua_rows: vec![UaRow {
+                    user_agent: hostile.to_string(),
+                    count: 2,
+                    status: RowStatus::Pending,
+                }],
+                focus: Focus::UserAgents,
+                ..Default::default()
+            };
+            screen.ua_state.select(Some(0));
+
+            let (outcome, message) = press(&mut screen, &db, KeyCode::Char('y'));
+
+            assert_eq!(outcome, KeyOutcome::Consumed);
+            let message = message.unwrap();
+            assert!(
+                message.starts_with("Not copied"),
+                "for {hostile:?}: {message}"
+            );
+            assert_eq!(
+                crate::present::terminal_safe(&message),
+                message,
+                "the refusal itself carries the value raw: {message:?}"
+            );
+        }
+        assert_eq!(
+            clipboard_refusal("Mozilla/5.0 (X11; Linux) Firefox/128.0"),
+            None
+        );
+        assert_eq!(clipboard_refusal("2001:db8::1"), None);
     }
 
     /// A user agent too short to mean one client (an access log records
