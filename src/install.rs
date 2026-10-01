@@ -865,10 +865,12 @@ pub fn helper_unit(layout: &Layout) -> String {
          # because the logs it reads and `nginx -t` opens belong to www-data and\n\
          # adm, and the database to the console's user. CAP_CHOWN and CAP_FOWNER\n\
          # because a site file keeps its owner and mode when it is rewritten, and\n\
-         # because SQLite gives a -wal it creates to the database's owner. Nothing\n\
-         # else, and above all not CAP_SYS_ADMIN, with which root can remount what\n\
-         # ProtectSystem made read-only.\n\
-         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER\n\
+         # because SQLite gives a -wal it creates to the database's owner.\n\
+         # CAP_NET_BIND_SERVICE because `nginx -t` binds every `listen` address it\n\
+         # tests, and a site listens on 80 and 443. Nothing else, and above all not\n\
+         # CAP_SYS_ADMIN, with which root can remount what ProtectSystem made\n\
+         # read-only.\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_NET_BIND_SERVICE\n\
          # AF_UNIX for the console's requests, the D-Bus socket `systemctl reload\n\
          # nginx` talks over and a Docker socket for `docker exec`; AF_NETLINK\n\
          # because both `nft` and Debian's nft-backed `iptables` reach the kernel\n\

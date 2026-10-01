@@ -2766,6 +2766,48 @@ fn ask_helper_with(host: &Host, user: &str, request: &str) -> String {
     ))
 }
 
+/// **The helper applies NGINX to a site that listens on port 80.** `nginx
+/// -t` binds every `listen` address it tests, and a port under 1024 needs
+/// `CAP_NET_BIND_SERVICE` in the helper's bounding set. The suite's own
+/// site listens on 8080 only, which is how a helper that could not test a
+/// real site's config reached a real host before a test noticed. Asked by
+/// the console's user, as the console asks.
+#[test]
+fn the_helper_applies_nginx_to_a_site_on_port_80() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-helper-port-80");
+    host.sh("sed -i 's/listen 8080;/listen 8080;\\n    listen 80;/' \
+         /etc/nginx/sites-enabled/test-site.conf \
+         && nginx -t && systemctl reload nginx \
+         && systemctl start stop-bots-helper.socket");
+    assert!(
+        host.sh("cat /etc/nginx/sites-enabled/test-site.conf")
+            .contains("listen 80;"),
+        "the site does not listen on 80, so this proves nothing"
+    );
+    // Something to apply, so that the apply writes the site and runs
+    // `nginx -t` on it, rather than finding nothing to do.
+    host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    host.stop_bots("set-site-rule --site test.example --rule no-accept-language --enabled true");
+    let reply = ask_helper_with(
+        &host,
+        "stop-bots",
+        r#"{"ApplyNginx":{"site":null,"reload":true}}"#,
+    );
+    assert!(
+        reply.starts_with(r#"{"Ok""#),
+        "the helper could not apply NGINX to a site on 80: {reply}\njournal:\n{}",
+        host.journal("stop-bots-helper.service")
+    );
+    assert!(
+        host.sh("cat /etc/nginx/sites-enabled/test-site.conf")
+            .contains("# BEGIN stop-bots"),
+        "the helper said it applied, but the site has no block"
+    );
+}
+
 /// **From the journal, the helper returns sshd's authentication lines and
 /// nothing else.** Three entries: a failed login from sshd's own unit; the
 /// same text from another program claiming to be sshd (`logger -t
