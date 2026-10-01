@@ -800,6 +800,21 @@ impl Host {
         host
     }
 
+    /// [`Host::start`] with `install web --no-start`: the user, the
+    /// database and the three units in place, nothing running. For the
+    /// tests about what the units' sandboxes allow, which run their own
+    /// probes under them and need no console.
+    fn units_installed(name: &str) -> Host {
+        let host = Host::start(name);
+        host.sh("stop-bots install web --no-start");
+        host
+    }
+
+    /// The `stop-bots` user's uid, as the host has it.
+    fn console_uid(&self) -> String {
+        self.sh("id -u stop-bots").trim().to_string()
+    }
+
     /// Runs `stop-bots` on the host against the installed console's
     /// database.
     fn stop_bots(&self, args: &str) -> String {
@@ -1094,7 +1109,11 @@ impl Host {
             .unwrap_or_else(|| panic!("no password in the installer output:\n{out}"))
             .to_string();
         self.wait_for_console();
+        self.login(&password)
+    }
 
+    /// Logs into the running console with `password`.
+    fn login(&self, password: &str) -> Console {
         // A cookie jar, so the session survives across calls exactly as it
         // would in a browser.
         let login = self.sh(&format!(
@@ -1136,12 +1155,13 @@ impl Host {
     }
 
     /// Runs `command` as a oneshot unit carrying **the generated web
-    /// unit's own sandbox**, and returns whether it succeeded.
+    /// unit's own sandbox** — as the console's user, with the console's
+    /// groups — and returns whether it succeeded.
     ///
     /// The unit is derived from `/etc/systemd/system/stop-bots-web.service`
-    /// as `install web` wrote it — every `Protect*`, `Restrict*` and
-    /// `Private*` line is carried over verbatim, and only `ExecStart` and
-    /// `Type` are replaced. That is the whole point: a hand-written unit
+    /// as `install web` wrote it — every `User=`, `Protect*`, `Restrict*`
+    /// and `Private*` line is carried over verbatim, and only `ExecStart`
+    /// and `Type` are replaced. That is the whole point: a hand-written unit
     /// listing the directives this test expects would pass forever,
     /// including on the day the generated one stops emitting one of them.
     ///
@@ -1152,11 +1172,21 @@ impl Host {
         self.oneshot_under_sandbox_of("stop-bots-web.service", probe, command, mangle)
     }
 
+    /// The same under the root helper's sandbox, which is where applying
+    /// happens since the console stopped being root.
+    fn oneshot_under_helper_sandbox(&self, probe: &str, command: &str, mangle: &str) -> bool {
+        self.oneshot_under_sandbox_of("stop-bots-helper.service", probe, command, mangle)
+    }
+
     /// [`Self::oneshot_under_web_sandbox`] for any unit `install` wrote.
     ///
     /// Its `Condition*` lines go too: the firewall unit's
     /// `ConditionPathExists` would otherwise skip a probe whose script is
     /// not there, and systemd counts a skipped start as a successful one.
+    ///
+    /// The command goes into the unit from a file (`sed`'s `r`) rather
+    /// than through a substitution, so it may hold `&`, `|` and quotes;
+    /// systemd still splits it, so `$` has to be `$$`.
     fn oneshot_under_sandbox_of(
         &self,
         unit: &str,
@@ -1165,8 +1195,11 @@ impl Host {
         mangle: &str,
     ) -> bool {
         self.sh(&format!(
+            "cat > /run/{probe}.exec <<'STOP_BOTS_PROBE'\nExecStart={command}\nSTOP_BOTS_PROBE"
+        ));
+        self.sh(&format!(
             "set -e\n\
-             sed -e 's|^ExecStart=.*|ExecStart={command}|' \
+             sed -e '/^ExecStart=/{{r /run/{probe}.exec' -e 'd;}}' \
                  -e 's|^Type=.*|Type=oneshot|' \
                  -e 's|^Restart=.*||' \
                  -e '/^Condition/d' \
@@ -1314,7 +1347,8 @@ fn install_web_writes_a_unit_that_systemd_actually_starts() {
     assert_eq!(host.unit("stop-bots-web.service", "TasksMax"), "1024");
 }
 
-/// **The netlink bug, reproduced and then fixed, in one test.**
+/// **The netlink bug, reproduced and then fixed, in one test.** Under the
+/// root helper's unit since 0.1, which is what applies the firewall now.
 ///
 /// `nft` and Debian's nft-backed `iptables` reach the kernel over a
 /// netlink socket. The generated unit used to write
@@ -1332,7 +1366,7 @@ fn the_generated_sandbox_lets_the_firewall_reach_netlink() {
     if !enabled() {
         return;
     }
-    let host = Host::installed("stop-bots-netlink");
+    let host = Host::units_installed("stop-bots-netlink");
 
     host.stop_bots("add-firewall-rule --address 203.0.113.9");
     // `batch --apply` rather than a bespoke verb: it is the only thing
@@ -1347,7 +1381,7 @@ fn the_generated_sandbox_lets_the_firewall_reach_netlink() {
 
     // First the control: strip AF_NETLINK back out, and the apply must
     // fail the way the real host did.
-    let without = host.oneshot_under_web_sandbox(
+    let without = host.oneshot_under_helper_sandbox(
         "probe-without-netlink",
         &apply,
         "| sed -e 's/ AF_NETLINK//'",
@@ -1365,7 +1399,7 @@ fn the_generated_sandbox_lets_the_firewall_reach_netlink() {
 
     // Then the unit as generated: the same command, through the same
     // sandbox, has to work.
-    let with = host.oneshot_under_web_sandbox("probe-with-netlink", &apply, "");
+    let with = host.oneshot_under_helper_sandbox("probe-with-netlink", &apply, "");
     assert!(
         with,
         "the generated unit's sandbox blocks the firewall apply. journal:\n{}",
@@ -1411,8 +1445,11 @@ fn installing_from_a_hidden_directory_is_refused_before_systemd_can_fail() {
     // Now prove the danger is real rather than folklore: install properly,
     // then run the /root copy through the sandbox the generated unit
     // actually sets. This is the failure the check above exists to stop.
-    host.sh("stop-bots install web");
-    let ran = host.oneshot_under_web_sandbox("probe-root-binary", "/root/stop-bots --version", "");
+    // The helper's unit: it is root, so only `ProtectHome=` can be what
+    // hides /root from it; the console's user could not enter /root anyway.
+    host.sh("stop-bots install web --no-start");
+    let ran =
+        host.oneshot_under_helper_sandbox("probe-root-binary", "/root/stop-bots --version", "");
     assert!(
         !ran,
         "the generated unit does not hide /root, so the preflight refusal guards nothing"
@@ -1425,8 +1462,8 @@ fn installing_from_a_hidden_directory_is_refused_before_systemd_can_fail() {
     );
 }
 
-/// `ProtectSystem=strict` makes `/etc` read-only, and the unit gives
-/// `/etc/nginx` back with `ReadWritePaths=`. Without that line the first
+/// `ProtectSystem=strict` makes `/etc` read-only, and the helper's unit
+/// gives `/etc/nginx` back with `ReadWritePaths=`. Without that line the first
 /// apply fails "an hour after the unit started cleanly". This runs a real
 /// apply through the real sandbox, and then through the same sandbox with
 /// that one line taken out, so the line is a test result.
@@ -1435,13 +1472,13 @@ fn the_sandbox_still_lets_the_service_rewrite_nginx_config() {
     if !enabled() {
         return;
     }
-    let host = Host::installed("stop-bots-protectsystem");
+    let host = Host::units_installed("stop-bots-protectsystem");
 
     host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
     host.seed_bot("badbot", "BadBot");
     let apply = format!("/usr/local/bin/stop-bots apply-blocks --root /etc/nginx/sites-enabled --no-reload --db {HOST_DB}");
 
-    let strict = host.oneshot_under_web_sandbox(
+    let strict = host.oneshot_under_helper_sandbox(
         "probe-without-etc-nginx",
         &apply,
         "| sed -e '/^ReadWritePaths=-\\/etc\\/nginx$/d'",
@@ -1457,7 +1494,7 @@ fn the_sandbox_still_lets_the_service_rewrite_nginx_config() {
         "the apply failed, but not on the read-only /etc/nginx:\n{journal}"
     );
 
-    let asgenerated = host.oneshot_under_web_sandbox("probe-as-generated", &apply, "");
+    let asgenerated = host.oneshot_under_helper_sandbox("probe-as-generated", &apply, "");
     assert!(
         asgenerated,
         "the generated sandbox blocks the apply it exists to allow. journal:\n{}",
@@ -1732,6 +1769,21 @@ fn reinstalling_over_an_0_1_0_rc_1_unit_upgrades_it_without_force() {
     );
 }
 
+/// And from 0.1.0-rc.2, whose console ran as root: replaced without
+/// `--force`, by a unit whose console is the `stop-bots` user's.
+#[test]
+fn reinstalling_over_an_0_1_0_rc_2_unit_upgrades_it_without_force() {
+    if !enabled() {
+        return;
+    }
+    let host = reinstalling_upgrades(
+        "stop-bots-upgrade-rc2-unit",
+        "stop-bots-web-0.1.0-rc.2.service",
+        "0.1.0-rc.2",
+    );
+    assert_eq!(host.unit("stop-bots-web.service", "User"), "stop-bots");
+}
+
 /// Puts `fixture` where `install web` writes its unit, re-installs with
 /// no `--force`, and checks it was replaced and the console runs.
 fn reinstalling_upgrades(name: &str, fixture: &str, releases: &str) -> Host {
@@ -1895,7 +1947,7 @@ fn the_database_is_not_readable_by_other_users() {
     if !enabled() {
         return;
     }
-    let host = Host::installed("stop-bots-perms");
+    let host = Host::units_installed("stop-bots-perms");
 
     // The property that matters is reachability, not the mode digits:
     // `install web` chmods the *directory* to 0700 and leaves the file at
@@ -1924,6 +1976,15 @@ fn the_database_is_not_readable_by_other_users() {
         "600",
         "the database holding the password hash is readable beyond its owner"
     );
+    // And that owner is the console's user, not root: the console is not
+    // root, and has to be able to open what it serves.
+    for path in ["/var/lib/stop-bots", "/var/lib/stop-bots/db.sqlite3"] {
+        assert_eq!(
+            host.sh(&format!("stat -c %U:%G {path}")).trim(),
+            "stop-bots:stop-bots",
+            "{path} is not the console's"
+        );
+    }
 }
 
 /// `systemd-analyze verify` is systemd's own parser. A directive this
@@ -1935,19 +1996,26 @@ fn systemd_itself_accepts_every_directive_in_the_generated_unit() {
     if !enabled() {
         return;
     }
-    let host = Host::installed("stop-bots-verify");
+    let host = Host::units_installed("stop-bots-verify");
 
-    let (ok, stdout, stderr) =
-        host.run("systemd-analyze verify /etc/systemd/system/stop-bots-web.service");
-    let output = format!("{stdout}{stderr}");
-    assert!(
-        ok,
-        "systemd-analyze verify rejected the generated unit:\n{output}"
-    );
-    assert!(
-        !output.to_lowercase().contains("unknown"),
-        "systemd did not recognise something in the unit:\n{output}"
-    );
+    for unit in [
+        "stop-bots-web.service",
+        "stop-bots-helper.socket",
+        "stop-bots-helper.service",
+    ] {
+        let (ok, stdout, stderr) = host.run(&format!(
+            "systemd-analyze verify /etc/systemd/system/{unit}"
+        ));
+        let output = format!("{stdout}{stderr}");
+        assert!(
+            ok,
+            "systemd-analyze verify rejected the generated {unit}:\n{output}"
+        );
+        assert!(
+            !output.to_lowercase().contains("unknown"),
+            "systemd did not recognise something in {unit}:\n{output}"
+        );
+    }
 }
 
 /// Debian's `iptables` is nft-backed, so it reaches the kernel over
@@ -1959,12 +2027,12 @@ fn the_generated_sandbox_lets_the_iptables_backend_reach_netlink() {
     if !enabled() {
         return;
     }
-    let host = Host::installed("stop-bots-iptables-sandbox");
+    let host = Host::units_installed("stop-bots-iptables-sandbox");
 
     host.stop_bots("add-firewall-rule --address 203.0.113.11");
     let apply = format!("/usr/local/bin/stop-bots batch --apply --force --no-fetch --backend iptables --root /etc/nginx/sites-enabled --out /etc/stop-bots/firewall.sh --db {HOST_DB}");
 
-    let ran = host.oneshot_under_web_sandbox("probe-iptables", &apply, "");
+    let ran = host.oneshot_under_helper_sandbox("probe-iptables", &apply, "");
     assert!(
         ran,
         "the generated sandbox blocks an iptables apply. journal:\n{}",
@@ -1976,25 +2044,26 @@ fn the_generated_sandbox_lets_the_iptables_backend_reach_netlink() {
     );
 }
 
-/// **The security review's finding, closed for writes.** The console runs
-/// as root, and under `ProtectSystem=yes` a write it was tricked into could
-/// land in `/etc/cron.d` or a systemd unit — root again at the next cron
-/// minute or boot, outside any sandbox. Under the generated unit each of
-/// those is refused by the filesystem itself.
+/// **The security review's finding, closed for writes**, for the one
+/// process that is still root. The root helper writes the NGINX config and
+/// the firewall script, and under `ProtectSystem=yes` a write it was
+/// tricked into could land in `/etc/cron.d` or a systemd unit — root again
+/// at the next cron minute or boot, outside any sandbox. Under the
+/// generated unit each of those is refused by the filesystem itself.
 ///
 /// The control runs first: the same write under 0.1.0-rc.1's
 /// `ProtectSystem=yes` lands, so the refusals below are the sandbox and
 /// not the probe failing for some other reason.
 #[test]
-fn the_console_cannot_write_cron_units_or_binaries() {
+fn the_helper_cannot_write_cron_units_or_binaries() {
     if !enabled() {
         return;
     }
-    let host = Host::installed("stop-bots-no-persistence");
+    let host = Host::units_installed("stop-bots-no-persistence");
     // This image has no cron; the directories are what matter.
     host.sh("mkdir -p /etc/cron.d /var/spool/cron/crontabs");
 
-    let loose = host.oneshot_under_web_sandbox(
+    let loose = host.oneshot_under_helper_sandbox(
         "probe-cron-under-yes",
         "/usr/bin/touch /etc/cron.d/stop-bots-probe",
         "| sed -e 's/^ProtectSystem=.*/ProtectSystem=yes/'",
@@ -2016,11 +2085,12 @@ fn the_console_cannot_write_cron_units_or_binaries() {
     .enumerate()
     {
         let probe = format!("probe-persist-{index}");
-        let wrote = host.oneshot_under_web_sandbox(&probe, &format!("/usr/bin/touch {path}"), "");
+        let wrote =
+            host.oneshot_under_helper_sandbox(&probe, &format!("/usr/bin/touch {path}"), "");
         let journal = host.journal(&format!("{probe}.service"));
         assert!(
             !wrote && !host.run(&format!("test -e {path}")).0,
-            "the console's sandbox let it write {path}"
+            "the helper's sandbox let it write {path}"
         );
         assert!(
             journal.contains("Read-only file system"),
@@ -2029,10 +2099,820 @@ fn the_console_cannot_write_cron_units_or_binaries() {
     }
 }
 
-/// And under that sandbox the console still does every job it has, through
-/// its own buttons: NGINX and the firewall applied, its database written in
-/// WAL mode, the apply lock taken in the file every other stop-bots uses,
-/// and Web Access set up.
+// ---- the console, as the `stop-bots` user ----
+
+/// **The console is not root, and its unit says so twice.** It cannot
+/// write the three places a write would become root: the NGINX config a
+/// root master loads, the firewall script the boot unit runs, and cron.
+/// `ProtectSystem=strict` refuses each with "Read-only file system"; with
+/// the sandbox taken away the account still refuses it, with "Permission
+/// denied". The account is the boundary; the sandbox is a second wall.
+///
+/// And what it is for, it can still write: its database's directory.
+#[test]
+fn the_console_cannot_write_nginx_config_the_firewall_script_or_cron() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-writes");
+    host.sh("mkdir -p /etc/cron.d");
+
+    for (index, path) in [
+        "/etc/nginx/conf.d/stop-bots-probe.conf",
+        "/etc/stop-bots/firewall.nft",
+        "/etc/cron.d/stop-bots-probe",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let touch = format!("/usr/bin/touch {path}");
+        for (how, mangle, refusal) in [
+            ("its unit", "", "Read-only file system"),
+            (
+                "its account alone",
+                "| sed -e '/^ProtectSystem=/d' -e '/^ReadWritePaths=/d'",
+                "Permission denied",
+            ),
+        ] {
+            let probe = format!("probe-console-write-{index}-{}", refusal.len());
+            let wrote = host.oneshot_under_web_sandbox(&probe, &touch, mangle);
+            let journal = host.journal(&format!("{probe}.service"));
+            assert!(
+                !wrote && !host.run(&format!("test -e {path}")).0,
+                "under {how} the console wrote {path}"
+            );
+            assert!(
+                journal.contains(refusal),
+                "{path} was refused under {how}, but not with {refusal:?}:\n{journal}"
+            );
+        }
+    }
+
+    assert!(
+        host.oneshot_under_web_sandbox(
+            "probe-console-own-directory",
+            "/usr/bin/touch /var/lib/stop-bots/probe",
+            "",
+        ),
+        "the console cannot write its own directory. journal:\n{}",
+        host.journal("probe-console-own-directory.service")
+    );
+}
+
+/// The console cannot load firewall rules, or even list them: it has no
+/// capability and no netlink. The control is the same command with root,
+/// `CAP_NET_ADMIN` and `AF_NETLINK` given back, which creates the table —
+/// so the refusal is the unit, not a broken probe.
+#[test]
+fn the_console_cannot_touch_the_firewall() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-nft");
+    let add = "/usr/sbin/nft add table inet stop_bots_probe";
+    let table = "nft list table inet stop_bots_probe";
+
+    assert!(
+        !host.oneshot_under_web_sandbox("probe-console-nft-add", add, ""),
+        "the console added an nft table"
+    );
+    assert!(!host.run(table).0, "the table is there");
+    assert!(
+        !host.oneshot_under_web_sandbox("probe-console-nft-list", "/usr/sbin/nft list ruleset", ""),
+        "the console listed the ruleset"
+    );
+
+    let as_root = host.oneshot_under_web_sandbox(
+        "probe-console-nft-as-root",
+        add,
+        "| sed -e '/^User=/d' -e '/^Group=/d' \
+           -e 's/^CapabilityBoundingSet=.*/CapabilityBoundingSet=CAP_NET_ADMIN/' \
+           -e 's/^RestrictAddressFamilies=.*/& AF_NETLINK/'",
+    );
+    assert!(
+        as_root && host.run(table).0,
+        "the control could not add the table either, so the refusal proves nothing. journal:\n{}",
+        host.journal("probe-console-nft-as-root.service")
+    );
+}
+
+/// **The escape the old console had, closed.** Root that can reach systemd
+/// can have it run anything outside every sandbox, and the rc.2 console,
+/// root because it ran `systemctl reload nginx`, could. From the console's
+/// unit now, `systemd-run` is refused: it is not root, so polkit refuses
+/// it, and its unit hides systemd's sockets besides.
+///
+/// Three runs of the same command. As root with the sockets visible —
+/// the control — it writes `/etc/cron.d`. As the console's user with the
+/// sockets visible it is refused: the account alone holds. As generated,
+/// refused.
+#[test]
+fn systemd_run_is_refused_to_the_console() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-escape");
+    host.sh("mkdir -p /etc/cron.d && systemctl start dbus.socket dbus.service");
+    let escape = "/usr/bin/systemd-run --wait -q /usr/bin/touch /etc/cron.d/stop-bots-escaped";
+    let escaped = || host.run("test -e /etc/cron.d/stop-bots-escaped").0;
+
+    let as_root = host.oneshot_under_web_sandbox(
+        "probe-escape-as-root",
+        escape,
+        "| sed -e '/^User=/d' -e '/^Group=/d' -e '/^InaccessiblePaths=/d'",
+    );
+    assert!(
+        as_root && escaped(),
+        "the control could not reach systemd, so the refusals below prove nothing. journal:\n{}",
+        host.journal("probe-escape-as-root.service")
+    );
+    host.sh("rm /etc/cron.d/stop-bots-escaped");
+
+    for (how, probe, mangle) in [
+        (
+            "with systemd's sockets visible",
+            "probe-escape-unhidden",
+            "| sed -e '/^InaccessiblePaths=/d'",
+        ),
+        ("as generated", "probe-escape", ""),
+    ] {
+        let ran = host.oneshot_under_web_sandbox(probe, escape, mangle);
+        assert!(
+            !ran && !escaped(),
+            "{how}, the console had systemd run a command for it"
+        );
+    }
+}
+
+/// The console's sandbox, directive by directive, under the systemd that
+/// will run it. Each row is a probe that does what the directive forbids:
+/// refused under the unit as generated, and let through once that one
+/// line is removed — so a directive systemd ignores, misspelt, too new
+/// for it, or not applied in this container, fails here.
+///
+/// The probes call system calls by number through Perl, which every
+/// Debian has; the numbers are x86_64's.
+#[test]
+fn the_console_sandbox_holds_under_real_systemd() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-sandbox");
+    if host.sh("uname -m").trim() != "x86_64" {
+        eprintln!("skipping: the probes call system calls by their x86_64 numbers");
+        return;
+    }
+    host.sh("systemctl start dbus.socket dbus.service");
+    // PTRACE_TRACEME is allowed to anyone below Yama's scope 3.
+    let ptrace_allowed = host.sh("cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0");
+
+    let mut rows = vec![
+        (
+            "memory both writable and executable",
+            "MemoryDenyWriteExecute=",
+            // mmap(NULL, 4096, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS)
+            r#"/usr/bin/perl -e "exit(syscall(9, 0, 4096, 7, 34, -1, 0) == -1 ? 1 : 0)""#,
+        ),
+        (
+            "a capability in its bounding set",
+            "CapabilityBoundingSet=",
+            r#"/bin/sh -c "grep -q '^CapBnd:.0000000000000000' /proc/self/status && exit 1; exit 0""#,
+        ),
+        (
+            "systemd over D-Bus",
+            "InaccessiblePaths=",
+            "/usr/bin/systemctl show -p Version --value",
+        ),
+        (
+            "systemd's private socket",
+            "InaccessiblePaths=",
+            // Root's 0700 socket, which this user could not use anyway;
+            // hidden, it is a node of mode 0.
+            r#"/bin/sh -c "stat -c %%a /run/systemd/private | grep -qvx 0""#,
+        ),
+    ];
+    if ptrace_allowed.trim() != "3" {
+        rows.push((
+            "a system call outside @system-service (ptrace)",
+            "SystemCallFilter=",
+            r#"/usr/bin/perl -e "exit(syscall(101, 0, 0, 0, 0) == -1 ? 1 : 0)""#,
+        ));
+    }
+    for (index, (what, directive, probe)) in rows.into_iter().enumerate() {
+        let generated = format!("probe-sandbox-{index}");
+        assert!(
+            !host.oneshot_under_web_sandbox(&generated, probe, ""),
+            "the console's unit allowed {what}. journal:\n{}",
+            host.journal(&format!("{generated}.service"))
+        );
+        let without = format!("probe-sandbox-{index}-without");
+        assert!(
+            host.oneshot_under_web_sandbox(&without, probe, &format!("| sed -e '/^{directive}/d'")),
+            "{what} is refused even without {directive}, so this row proves nothing. journal:\n{}",
+            host.journal(&format!("{without}.service"))
+        );
+    }
+}
+
+/// The logs the detectors read are readable through the groups the unit
+/// adds, and only through them: NGINX's access log is `www-data:adm
+/// 0640`, the journal the `systemd-journal` group's.
+#[test]
+fn the_console_reads_the_logs_through_its_units_groups() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-groups");
+    host.sh("echo '127.0.0.1 - - [01/Oct/2026:00:00:00 +0000] \"GET / HTTP/1.1\" 200 1 \"-\" \"x\"' >> /var/log/nginx/access.log");
+    assert_eq!(
+        host.sh("stat -c '%U:%G %a' /var/log/nginx/access.log")
+            .trim(),
+        "www-data:adm 640",
+        "the fixture is not the log as Debian ships it"
+    );
+
+    for (what, probe) in [
+        (
+            "the NGINX access log",
+            "/bin/cat /var/log/nginx/access.log",
+        ),
+        (
+            "the journal",
+            "/bin/sh -c \"journalctl -q -n 1 _PID=1 -o cat > /var/lib/stop-bots/journal-probe && test -s /var/lib/stop-bots/journal-probe\"",
+        ),
+    ] {
+        let name = format!("probe-groups-{}", what.len());
+        assert!(
+            host.oneshot_under_web_sandbox(&name, probe, ""),
+            "the console cannot read {what}. journal:\n{}",
+            host.journal(&format!("{name}.service"))
+        );
+        let without = format!("{name}-without");
+        assert!(
+            !host.oneshot_under_web_sandbox(
+                &without,
+                probe,
+                "| sed -e '/^SupplementaryGroups=/d'"
+            ),
+            "the console reads {what} without its unit's groups, so this proves nothing"
+        );
+    }
+}
+
+// ---- root and the console's database ----
+
+/// **Root opening the console's database leaves it the console's.** The
+/// CLI, the TUI and the helper are root, and the database is the console
+/// user's. SQLite is meant to give a `-wal` and `-shm` it creates as root
+/// to the database file's owner; this checks that it does rather than
+/// assuming it, because a root-owned `-wal` would leave the console unable
+/// to open its own database. And the copy an upgrade takes before it
+/// migrates goes to that owner too.
+#[test]
+fn root_opening_the_consoles_database_leaves_it_the_consoles() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-db-owner");
+    let owner = |path: &str| {
+        host.sh(&format!("stat -c '%U:%G %a' {path}"))
+            .trim()
+            .to_string()
+    };
+    assert_eq!(owner(HOST_DB), "stop-bots:stop-bots 600");
+    assert_eq!(owner("/var/lib/stop-bots"), "stop-bots:stop-bots 700");
+
+    // A root process holding the database open and writing, with nobody
+    // else: a console run by hand as root, as rc.2's unit ran one.
+    host.sh(&format!(
+        "systemd-run --unit=root-holder /usr/local/bin/stop-bots web --db {HOST_DB} \
+         --bind 127.0.0.1:8799 --no-apply"
+    ));
+    for side in ["-wal", "-shm"] {
+        assert!(
+            host.wait_for_file(&format!("{HOST_DB}{side}")),
+            "the root console made no {side}. journal:\n{}",
+            host.journal("root-holder.service")
+        );
+        assert_eq!(
+            owner(&format!("{HOST_DB}{side}")),
+            "stop-bots:stop-bots 600",
+            "SQLite left the {side} it created as root to root"
+        );
+    }
+    host.sh("systemctl stop root-holder.service");
+
+    // An upgrade: a 0.0.15 database that is the console's, migrated by a
+    // root CLI run.
+    let old = "/var/lib/stop-bots/old.sqlite3";
+    host.put(
+        &format!(
+            "{}/tests/fixtures/db/db-0.0.15.sql",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+        "/var/lib/stop-bots/old.sql",
+    );
+    host.sh(&format!(
+        "sqlite3 {old} < /var/lib/stop-bots/old.sql && chown stop-bots:stop-bots {old} \
+         && chmod 600 {old}"
+    ));
+    host.sh(&format!("stop-bots list-detectors --db {old}"));
+    assert_eq!(
+        owner(&format!("{old}.bak-v0")),
+        "stop-bots:stop-bots 600",
+        "the copy root took before upgrading is root's"
+    );
+    assert_eq!(owner(old), "stop-bots:stop-bots 600");
+    // And the console's user opens both, as the console would.
+    host.sh(&format!(
+        "/usr/sbin/runuser -u stop-bots -- stop-bots list-detectors --db {old} \
+         && /usr/sbin/runuser -u stop-bots -- stop-bots list-detectors --db {HOST_DB}"
+    ));
+}
+
+/// **The console's directory is the console's, so root follows nothing in
+/// it.** A compromised console can put a link where its database's
+/// `-wal` would be, pointing at a root file, or replace the database
+/// itself with a link to a file root would then create. Root — the CLI,
+/// `install web` — refuses either, and the targets are untouched.
+#[test]
+fn root_follows_no_link_the_console_leaves_beside_its_database() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-db-links");
+    let canary = "/etc/stop-bots-canary";
+    host.sh(&format!(
+        "echo 'root:x:0:0:root:/root:/bin/sh' > {canary} && chmod 644 {canary} && mkdir -p /etc/cron.d"
+    ));
+    let canary_state = || {
+        host.sh(&format!(
+            "stat -c '%U:%G %a' {canary} && sha256sum {canary}"
+        ))
+    };
+    let before = canary_state();
+    let as_console = |cmd: &str| host.sh(&format!("/usr/sbin/runuser -u stop-bots -- {cmd}"));
+
+    as_console(&format!("ln -sf {canary} {HOST_DB}-wal"));
+    for command in [
+        format!("stop-bots trust --address 192.0.2.5 --db {HOST_DB}"),
+        "stop-bots install web --no-start".to_string(),
+    ] {
+        let (ok, stdout, stderr) = host.run(&command);
+        let said = format!("{stdout}{stderr}");
+        assert!(!ok, "`{command}` went through a link to {canary}:\n{said}");
+        assert!(
+            said.contains("symbolic link"),
+            "`{command}` failed, but not on the link:\n{said}"
+        );
+    }
+    assert_eq!(canary_state(), before, "a file the link pointed at changed");
+
+    as_console(&format!(
+        "rm {HOST_DB}-wal && mv {HOST_DB} /var/lib/stop-bots/kept.sqlite3 \
+         && ln -s /etc/cron.d/stop-bots-planted {HOST_DB}"
+    ));
+    let (ok, stdout, stderr) = host.run(&format!("stop-bots list-detectors --db {HOST_DB}"));
+    assert!(
+        !ok,
+        "root opened a database through a link:\n{stdout}{stderr}"
+    );
+    assert!(
+        !host.run("test -e /etc/cron.d/stop-bots-planted").0,
+        "root created the file the console's link pointed at"
+    );
+}
+
+/// `uninstall --purge` removes the console's user and group with the
+/// database they own; without it, both stay.
+#[test]
+fn uninstall_removes_the_consoles_user_only_with_purge() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-uninstall-user");
+    assert!(host.run("id stop-bots").0, "install web made no user");
+
+    let kept = host.sh("stop-bots uninstall");
+    assert!(
+        host.run("id stop-bots").0,
+        "uninstall without --purge removed the user:\n{kept}"
+    );
+    assert!(kept.contains("stop-bots user"), "{kept}");
+
+    let purged = host.sh("stop-bots uninstall --purge");
+    assert!(
+        !host.run("id stop-bots").0,
+        "--purge left the user:\n{purged}"
+    );
+    assert!(
+        !host.run("getent group stop-bots").0,
+        "--purge left the group:\n{purged}"
+    );
+    assert!(
+        !host.run("test -e /var/lib/stop-bots").0,
+        "--purge left the database directory:\n{purged}"
+    );
+}
+
+// ---- the console and its helper, running ----
+
+/// The console `install web` starts is the `stop-bots` user's, holds no
+/// capability and can gain none, has its log groups, and runs under a
+/// syscall filter; the helper's socket is root's and the console group's.
+/// Read from the running process, not the unit.
+#[test]
+fn the_installed_console_runs_as_its_own_user_with_nothing_of_roots() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::installed("stop-bots-console-account");
+    host.wait_for_console();
+    let pid = host.unit("stop-bots-web.service", "MainPID");
+    let status = host.sh(&format!("cat /proc/{pid}/status"));
+    let field = |name: &str| -> Vec<String> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("no {name} in:\n{status}"))
+            .split_whitespace()
+            .map(String::from)
+            .collect()
+    };
+    let uid = host.console_uid();
+    assert!(
+        field("Uid").iter().all(|id| *id == uid),
+        "the console is not the stop-bots user: {:?}",
+        field("Uid")
+    );
+    for (name, want) in [
+        ("CapBnd", "0000000000000000"),
+        ("CapEff", "0000000000000000"),
+        ("CapPrm", "0000000000000000"),
+        ("NoNewPrivs", "1"),
+        ("Seccomp", "2"),
+    ] {
+        assert_eq!(field(name), vec![want.to_string()], "{name}");
+    }
+    let groups = field("Groups");
+    for group in ["adm", "systemd-journal"] {
+        let gid = host.sh(&format!("getent group {group} | cut -d: -f3"));
+        assert!(
+            groups.contains(&gid.trim().to_string()),
+            "the console is not in {group}: {groups:?}"
+        );
+    }
+    assert_eq!(
+        host.sh("stat -c '%U:%G %a' /run/stop-bots/helper.sock")
+            .trim(),
+        "root:stop-bots 660"
+    );
+    assert_eq!(
+        host.unit("stop-bots-helper.socket", "ActiveState"),
+        "active"
+    );
+}
+
+/// The request a test sends the helper, when the bytes do not matter but
+/// the answer does. PRIVSEP-CORE: one well-formed request of the core's
+/// protocol, for something that changes nothing.
+const HELPER_PROBE_REQUEST: &str = r#"{"op":"NginxCheck"}"#;
+
+/// Sends [`HELPER_PROBE_REQUEST`] to the helper's socket as `user`, and
+/// returns what came back: the reply line, or `"<no connection>"`. Perl,
+/// because it is on every Debian and speaks to a Unix socket.
+fn ask_helper_as(host: &Host, user: &str) -> String {
+    host.sh(&format!(
+        "cat > /run/ask-helper.pl <<'PERL'\n\
+         use IO::Socket::UNIX;\n\
+         my $s = IO::Socket::UNIX->new(Peer => '/run/stop-bots/helper.sock')\n\
+           or do {{ print '<no connection>'; exit 0 }};\n\
+         print $s q({HELPER_PROBE_REQUEST}), \"\\n\";\n\
+         my $reply = <$s>;\n\
+         print defined $reply ? $reply : '';\n\
+         PERL\n\
+         chmod 644 /run/ask-helper.pl"
+    ));
+    host.sh(&format!(
+        "/usr/sbin/runuser -u {user} -- perl /run/ask-helper.pl"
+    ))
+}
+
+/// **The peer check.** A user put in the socket's group can connect —
+/// the socket's mode lets it — and the helper still refuses it, because
+/// it checks every peer's uid. The console's user, sending the same bytes,
+/// gets an answer.
+#[test]
+fn the_helper_refuses_a_peer_that_is_not_the_console() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::installed("stop-bots-helper-peer");
+    host.wait_for_console();
+    host.sh("useradd --create-home --shell /bin/sh --groups stop-bots snoop");
+
+    let console = ask_helper_as(&host, "stop-bots");
+    let snoop = ask_helper_as(&host, "snoop");
+
+    assert!(
+        !console.trim().is_empty() && console != "<no connection>",
+        "the console's own user got no answer: {console:?}. journal:\n{}",
+        host.journal("stop-bots-helper.service")
+    );
+    assert_ne!(
+        snoop, "<no connection>",
+        "the socket refused the connection itself, so the peer check was never reached"
+    );
+    assert_ne!(
+        snoop, console,
+        "a user in the socket's group got the console's answer"
+    );
+    let snoop_uid = host.sh("id -u snoop");
+    let journal = host.journal("stop-bots-helper.service");
+    assert!(
+        journal.contains(snoop_uid.trim()),
+        "the helper did not log the refused peer's uid:\n{journal}"
+    );
+}
+
+/// **Detection still works with the console reading logs through its
+/// groups.** An access log of `www-data:adm 0640` with a request for
+/// `/.env` in it, and an auth log of `root:adm 0640` with a burst of
+/// failed logins: the console, which is neither, reads both through the
+/// groups its unit adds, and the detectors block both addresses on their
+/// first pass.
+#[test]
+fn the_console_detects_from_logs_it_reads_through_its_groups() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-console-detects");
+    host.sh(
+        "now=$(date +'%d/%b/%Y:%H:%M:%S %z') && \
+         echo \"203.0.113.77 - - [$now] \\\"GET /.env HTTP/1.1\\\" 404 0 \\\"-\\\" \\\"curl/8\\\"\" \
+           >> /var/log/nginx/access.log",
+    );
+    let mut auth = String::new();
+    for attempt in 0..25 {
+        auth.push_str(&format!(
+            "$(date +'%b %e %H:%M:%S') host sshd[{}]: Failed password for root from 203.0.113.78 port {} ssh2\n",
+            1000 + attempt,
+            40000 + attempt
+        ));
+    }
+    host.sh(&format!(
+        "printf '%s' \"{auth}\" > /var/log/auth.log && chown root:adm /var/log/auth.log \
+         && chmod 640 /var/log/auth.log"
+    ));
+    for (log, mode) in [
+        ("/var/log/nginx/access.log", "www-data:adm 640"),
+        ("/var/log/auth.log", "root:adm 640"),
+    ] {
+        assert_eq!(
+            host.sh(&format!("stat -c '%U:%G %a' {log}")).trim(),
+            mode,
+            "{log} is not the console's to read but for its groups"
+        );
+    }
+
+    host.sh("stop-bots install web --ssh-log /var/log/auth.log");
+    host.wait_for_console();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut rules = String::new();
+    while std::time::Instant::now() < deadline {
+        rules = host
+            .run_uncontended(&format!("stop-bots list-firewall-rules --db {HOST_DB}"))
+            .1;
+        if rules.contains("203.0.113.77") && rules.contains("203.0.113.78") {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    assert!(
+        rules.contains("203.0.113.77"),
+        "the access log's prober was not blocked:\n{rules}\njournal:\n{}",
+        host.journal("stop-bots-web.service")
+    );
+    assert!(
+        rules.contains("203.0.113.78"),
+        "the auth log's guesser was not blocked:\n{rules}\njournal:\n{}",
+        host.journal("stop-bots-web.service")
+    );
+}
+
+/// **The upgrade from 0.1.0-rc.2.** A host as rc.2 left it — its unit, a
+/// console running as root, the NGINX commands and root in the database,
+/// and the database root's — runs `install web`, and comes out with the
+/// console running as `stop-bots`, the database the console's, the host
+/// settings in `/etc/stop-bots/host.conf` and gone from the database, and
+/// the console still applying, through its helper.
+#[test]
+fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-upgrade-rc2");
+    host.put(
+        &format!(
+            "{}/tests/fixtures/units/stop-bots-web-0.1.0-rc.2.service",
+            env!("CARGO_MANIFEST_DIR")
+        ),
+        "/etc/systemd/system/stop-bots-web.service",
+    );
+    // rc.2's database, as rc.2's root console and CLI made it.
+    host.sh(&format!(
+        "mkdir -p -m 700 /var/lib/stop-bots && stop-bots scan-sites --root /etc/nginx/sites-enabled --db {HOST_DB}"
+    ));
+    host.sh(&format!(
+        "sqlite3 {HOST_DB} \"INSERT OR REPLACE INTO settings (key, value) VALUES \
+           ('nginx:test_command', 'nginx -t'), \
+           ('nginx:reload_command', 'systemctl reload nginx'), \
+           ('nginx:root', '/etc/nginx')\""
+    ));
+    host.seed_bot("badbot", "BadBot");
+    host.sh("systemctl daemon-reload && systemctl enable --now stop-bots-web.service");
+    host.wait_for_console();
+    let user_of_console = || {
+        let pid = host.unit("stop-bots-web.service", "MainPID");
+        host.sh(&format!("ps -o user= -p {pid}")).trim().to_string()
+    };
+    assert_eq!(
+        user_of_console(),
+        "root",
+        "the fixture is not rc.2's root console"
+    );
+
+    let out = host.sh("stop-bots install web");
+
+    assert!(
+        out.contains("unedited since stop-bots 0.1.0-rc.2"),
+        "the rc.2 unit was not recognised:\n{out}"
+    );
+    host.wait_for_console();
+    assert_eq!(
+        user_of_console(),
+        "stop-bots",
+        "the console still runs as root after the upgrade:\n{out}"
+    );
+    for path in [HOST_DB, "/var/lib/stop-bots"] {
+        assert!(
+            host.sh(&format!("stat -c %U:%G {path}"))
+                .trim()
+                .starts_with("stop-bots:stop-bots"),
+            "{path} is not the console's"
+        );
+    }
+    // PRIVSEP-CORE: the keys `hostconf` writes.
+    let conf = host.sh("cat /etc/stop-bots/host.conf");
+    assert!(
+        conf.contains("systemctl reload nginx"),
+        "the reload command did not reach host.conf:\n{conf}"
+    );
+    let left = host.sh(&format!(
+        "sqlite3 {HOST_DB} \"SELECT count(*) FROM settings WHERE key IN \
+           ('nginx:test_command', 'nginx:reload_command', 'nginx:root')\""
+    ));
+    assert_eq!(
+        left.trim(),
+        "0",
+        "the host settings are still in the database"
+    );
+
+    let password = host
+        .sh(&format!("stop-bots web --set-password --db {HOST_DB}"))
+        .lines()
+        .find_map(|line| line.strip_prefix("New password: "))
+        .expect("no new password")
+        .trim()
+        .to_string();
+    let console = host.login(&password);
+    let flash = console.post("/apply-all", &[]);
+    let mut blocked = String::new();
+    for _ in 0..50 {
+        blocked = host
+            .sh("curl -s -o /dev/null -w '%{http_code}' -A 'BadBot/1.0' http://127.0.0.1:8080/");
+        if blocked.trim() == "403" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(
+        blocked.trim(),
+        "403",
+        "the upgraded console could not apply. console said:\n{flash}\nhelper:\n{}",
+        host.journal("stop-bots-helper.service")
+    );
+}
+
+/// **The helper treats the database as hostile.** Rows a compromised
+/// console could write, written as its user straight into its database:
+/// NGINX commands and a root, a record of a "generated" file that is
+/// `/etc/stop-bots-canary`, a link in its own directory to that file, a
+/// site whose path is in `/etc/cron.d`, and the rc.2 hostile user agents.
+/// "Apply everything" through the console then runs none of the commands,
+/// deletes and writes nothing outside the NGINX config and
+/// `/etc/stop-bots`, and turns away exactly the hostile agents' clients.
+#[test]
+fn the_helper_ignores_what_a_compromised_console_wrote_in_the_database() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::start("stop-bots-hostile-db");
+    let console = host.console();
+    host.stop_bots("scan-sites --root /etc/nginx/sites-enabled");
+    host.seed_bot("badbot", "BadBot");
+    let canary = "/etc/stop-bots-canary";
+    host.sh(&format!(
+        "echo 'root:x:0:0:root:/root:/bin/sh' > {canary} && mkdir -p /etc/cron.d"
+    ));
+    host.sh(&format!(
+        "/usr/sbin/runuser -u stop-bots -- ln -s {canary} /var/lib/stop-bots/stop-bots-limits.conf"
+    ));
+
+    let mut sql = String::from(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES \
+           ('nginx:test_command', 'touch /run/stop-bots-pwned-test'), \
+           ('nginx:reload_command', 'touch /run/stop-bots-pwned-reload'), \
+           ('nginx:root', '/etc');\n\
+         INSERT OR REPLACE INTO managed_files (path, kind) VALUES \
+           ('/etc/stop-bots-canary', 'limits'), \
+           ('/var/lib/stop-bots/stop-bots-limits.conf', 'limits');\n\
+         UPDATE sites SET config_path = '/etc/cron.d/stop-bots-site';\n",
+    );
+    for (user_agent, _) in HOSTILE_USER_AGENTS {
+        sql.push_str(&format!(
+            "INSERT INTO blocked_user_agents (user_agent, blocked_at) VALUES ('{}', 0);\n",
+            user_agent.replace('\'', "''")
+        ));
+    }
+    host.sh(&format!(
+        "cat > /run/hostile.sql <<'SQL'\n{sql}SQL\n\
+         chmod 644 /run/hostile.sql && \
+         /usr/sbin/runuser -u stop-bots -- sqlite3 -cmd '.timeout 5000' {HOST_DB} < /run/hostile.sql"
+    ));
+    host.sh("touch /run/stop-bots-before && sleep 1");
+
+    let flash = console.post("/apply-all", &[]);
+
+    for pwned in ["/run/stop-bots-pwned-test", "/run/stop-bots-pwned-reload"] {
+        assert!(
+            !host.run(&format!("test -e {pwned}")).0,
+            "the helper ran a command the database named. console said:\n{flash}"
+        );
+    }
+    assert!(
+        host.run(&format!("test -f {canary}")).0,
+        "the helper deleted a file the database's record named"
+    );
+    assert!(
+        !host.run("test -e /etc/cron.d/stop-bots-site").0,
+        "the helper wrote where a site row said"
+    );
+    let changed = host.sh("find / -xdev -newer /run/stop-bots-before -type f \
+           -not -path '/proc/*' -not -path '/sys/*' -not -path '/run/*' -not -path '/tmp/*' \
+           -not -path '/var/log/*' -not -path '/var/lib/stop-bots/*' \
+           -not -path '/etc/nginx/*' -not -path '/etc/stop-bots/*' \
+           -not -path '/var/lib/systemd/*' -not -path '/var/cache/*' 2>/dev/null || true");
+    assert_eq!(
+        changed.trim(),
+        "",
+        "the apply changed files outside the NGINX config and /etc/stop-bots"
+    );
+    let applied = host.sh("cat /etc/nginx/sites-enabled/test-site.conf");
+    assert!(
+        applied.contains("BEGIN stop-bots"),
+        "the site found on disk was not applied. console said:\n{flash}"
+    );
+    let (ok, out, err) = host.run("nginx -t");
+    assert!(ok, "the hostile rows broke the config:\n{out}{err}");
+
+    let status = |user_agent: &str| {
+        host.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' -A {} http://127.0.0.1:8080/",
+            sh_quoted(user_agent)
+        ))
+        .1
+        .trim()
+        .to_string()
+    };
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    for (user_agent, near_miss) in HOSTILE_USER_AGENTS {
+        assert_eq!(status(user_agent), "403", "{user_agent:?} was served");
+        if let Some(near_miss) = near_miss {
+            assert_eq!(status(near_miss), "200", "{near_miss:?} was refused");
+        }
+    }
+    assert_eq!(
+        status("Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"),
+        "200"
+    );
+}
+
+/// And split in two the console still does every job it has, through its
+/// own buttons and its root helper: NGINX and the firewall applied, its
+/// database written in WAL mode, the apply lock taken in the file every
+/// other stop-bots uses, and Web Access set up.
 ///
 /// Three things here are the ways a narrower sandbox broke during this
 /// change. NGINX is restarted after the console starts, which replaces
@@ -2094,12 +2974,13 @@ fn the_console_under_its_unit_still_does_everything_it_is_for() {
         "the site file lost its owner or mode when the console rewrote it"
     );
 
-    // The lock file holds the pid of whoever last took it: the console,
-    // in the same file the CLI and the TUI lock.
+    // The lock file holds the pid of whoever last took it: the helper,
+    // which applies for the console, in the same file the CLI and the TUI
+    // lock — and never the console, which is not root.
     assert_eq!(
         host.sh("cat /run/stop-bots.lock").trim(),
-        host.unit("stop-bots-web.service", "MainPID"),
-        "the console applied without taking the shared apply lock"
+        host.unit("stop-bots-helper.service", "MainPID"),
+        "the helper applied without taking the shared apply lock"
     );
 
     let sqlite = |sql: &str| host.sh(&format!("sqlite3 -cmd '.timeout 5000' {HOST_DB} \"{sql}\""));
@@ -2134,11 +3015,13 @@ fn the_console_under_its_unit_still_does_everything_it_is_for() {
     let (ok, out, err) = host.run("nginx -t");
     assert!(ok, "Web Access left a config NGINX refuses:\n{out}{err}");
 
-    let journal = host.journal("stop-bots-web.service");
-    assert!(
-        !journal.contains("Read-only file system"),
-        "the console hit its sandbox somewhere:\n{journal}"
-    );
+    for unit in ["stop-bots-web.service", "stop-bots-helper.service"] {
+        let journal = host.journal(unit);
+        assert!(
+            !journal.contains("Read-only file system"),
+            "{unit} hit its sandbox somewhere:\n{journal}"
+        );
+    }
 }
 
 /// The boot unit runs, as root, a script the console writes. Under its
