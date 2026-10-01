@@ -8,6 +8,23 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.1.0-rc.3] — 2026-10-01
+
+**The web console no longer runs as root.** Under rc.2, code running in the console
+was root on the host however it was sandboxed: it could ask systemd for anything over
+D-Bus, and it wrote the NGINX config that NGINX's root master loads. Now the console
+runs as its own `stop-bots` user, reads no host file and can write only its database.
+A small root helper, reached over a socket only root and that user can open, does each
+privileged action from a fixed list and treats the database as hostile. The split was
+reviewed by trying to get from code running as the console to root; what that found is
+fixed below.
+
+Upgrading from rc.2: run `sudo stop-bots install web`. It creates the `stop-bots` user,
+moves the NGINX commands, the NGINX root and the log paths out of the database into
+`/etc/stop-bots/host.conf` (which only root can write), hands the database to the new
+user, writes the console's, the helper's and the socket's units, and restarts the
+console. `set-nginx-commands` and `set-log-paths` now need `sudo`.
+
 ### Security
 
 - **The web console no longer runs as root.** `install web` creates a `stop-bots`
@@ -1858,7 +1875,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.2...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.3...HEAD
+[0.1.0-rc.3]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.2...v0.1.0-rc.3
 [0.1.0-rc.2]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.1...v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...v0.1.0-rc.1
 [0.0.15]: https://github.com/ivankovic/stop-bots/compare/v0.0.14...v0.0.15
