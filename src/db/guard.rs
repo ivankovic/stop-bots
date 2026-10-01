@@ -166,7 +166,17 @@ pub fn with_companions(path: &Path) -> Vec<PathBuf> {
 /// its plan — and that run as root on the console's directory all the
 /// same.
 pub fn open_connection(path: &Path, flags: OpenFlags) -> Result<Connection> {
-    let (path, flags) = match Guard::here(path) {
+    open_connection_guarded(path, flags, Guard::here(path))
+}
+
+/// [`open_connection`] with the guard given, so a test can take the
+/// guarded path without being root.
+pub fn open_connection_guarded(
+    path: &Path,
+    flags: OpenFlags,
+    guard: Option<Guard>,
+) -> Result<Connection> {
+    let (path, flags) = match guard {
         Some(guard) => {
             guard.check(path)?;
             (
@@ -176,8 +186,46 @@ pub fn open_connection(path: &Path, flags: OpenFlags) -> Result<Connection> {
         }
         None => (path.to_path_buf(), flags),
     };
-    Connection::open_with_flags(&path, flags)
-        .with_context(|| format!("failed to open {}", path.display()))
+    let conn = Connection::open_with_flags(&path, flags)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    if guard.is_some() {
+        harden(&conn, &path)?;
+    }
+    Ok(conn)
+}
+
+/// Makes `conn` safe to use on a file another user can write.
+///
+/// The file's schema is the other user's to write as well, and SQLite
+/// runs what a schema says: a trigger fires inside this connection, as
+/// this process, on the statement that matches it — `AFTER INSERT ON
+/// settings` on the first setting a root CLI stores. So:
+///
+/// - triggers and views off, and `trusted_schema` off, which keeps the
+///   schema from calling any function with a side effect. This schema has
+///   neither triggers nor views; one in the file was put there by
+///   somebody else;
+/// - defensive mode, which refuses the statements that can corrupt a
+///   database file deliberately (`writable_schema` and the like), and
+///   `cell_size_check`, which checks pages for the malformations a crafted
+///   file would carry.
+///
+/// Migrations run under these settings; nothing in them needs a trigger,
+/// a view or the schema's trust.
+pub fn harden(conn: &Connection, path: &Path) -> Result<()> {
+    use rusqlite::config::DbConfig;
+    for (config, on) in [
+        (DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true),
+        (DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false),
+        (DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false),
+        (DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false),
+    ] {
+        conn.set_db_config(config, on)
+            .with_context(|| format!("failed to harden the connection to {}", path.display()))?;
+    }
+    conn.pragma_update(None, "cell_size_check", true)
+        .with_context(|| format!("failed to harden the connection to {}", path.display()))?;
+    Ok(())
 }
 
 /// Opens `path` without following a link, for changing its owner or mode
@@ -298,6 +346,35 @@ mod tests {
                 .unwrap()
                 .join("db.sqlite3")
         );
+    }
+
+    /// The raw readers `install web` and `uninstall` use: guarded, a
+    /// planted trigger does not fire; unguarded — the control — it does.
+    #[test]
+    fn a_guarded_raw_connection_runs_no_planted_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "BEGIN;
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+                 CREATE TABLE fired (what TEXT);
+                 CREATE TRIGGER planted AFTER INSERT ON settings
+                   BEGIN INSERT INTO fired VALUES ('insert'); END;
+                 COMMIT;",
+            )
+            .unwrap();
+        let fired = |guard: Option<Guard>, key: &str| -> i64 {
+            let conn = open_connection_guarded(&path, OpenFlags::default(), guard).unwrap();
+            conn.execute("INSERT INTO settings VALUES (?1, 'x')", [key])
+                .unwrap();
+            conn.query_row("SELECT count(*) FROM fired", [], |row| row.get(0))
+                .unwrap()
+        };
+
+        assert_eq!(fired(Some(me()), "a"), 0, "a planted trigger ran as root");
+        assert_eq!(fired(None, "b"), 1, "the control did not fire either");
     }
 
     #[test]

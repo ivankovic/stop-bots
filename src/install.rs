@@ -180,6 +180,9 @@ pub struct Layout {
     pub user: String,
     /// [`HELPER_SOCKET`], under the prefix.
     pub helper_socket: PathBuf,
+    /// The host settings file of this tree: the host's own
+    /// ([`crate::hostconf::path`]), or the one under `--prefix`.
+    pub host_conf: PathBuf,
     /// Whether this describes the running host rather than a staging tree,
     /// i.e. whether the prefix was `/`.
     ///
@@ -220,6 +223,11 @@ impl Layout {
             groupadd: crate::host::program("groupadd"),
             user: crate::account::USER.to_string(),
             helper_socket: prefix.join(HELPER_SOCKET.trim_start_matches('/')),
+            host_conf: if prefix == Path::new("/") {
+                crate::hostconf::path()
+            } else {
+                prefix.join(crate::hostconf::DEFAULT_PATH.trim_start_matches('/'))
+            },
             // Derived, not a parameter: `main.rs` builds every layout —
             // prefixed or not — with `under`, so a flag a caller had to
             // remember to set would have been `false` on the one path
@@ -272,13 +280,8 @@ impl Layout {
     /// ([`crate::hostconf`]); from the database's rows only while there is
     /// no host settings file yet, which is a database from before it.
     fn stored_host_settings(&self) -> (Option<String>, Option<String>) {
-        let host_conf = if self.real {
-            crate::hostconf::path()
-        } else {
-            self.output_dir.join("host.conf")
-        };
-        if std::fs::symlink_metadata(&host_conf).is_ok() {
-            let host = crate::hostconf::HostConf::load_from(&host_conf).unwrap_or_default();
+        if std::fs::symlink_metadata(&self.host_conf).is_ok() {
+            let host = crate::hostconf::HostConf::load_from(&self.host_conf).unwrap_or_default();
             let text = |path: Option<PathBuf>| path.map(|path| path.display().to_string());
             return (text(host.nginx_root), text(host.access_log));
         }
@@ -686,12 +689,18 @@ pub fn web_unit(layout: &Layout) -> String {
          # Wants rather than Requires for NGINX: the console is most worth looking\n\
          # at when NGINX is down, so it must not be stopped along with it. Requires\n\
          # for the helper's socket: without it the console can show, not apply.\n\
-         After=network-online.target nginx.service {HELPER_SOCKET_UNIT}\n\
+         # After D-Bus, without wanting it: see ExecStartPre= below.\n\
+         After=network-online.target nginx.service {HELPER_SOCKET_UNIT} dbus.socket dbus.service\n\
          Wants=network-online.target\n\
          Requires={HELPER_SOCKET_UNIT}\n\
          \n\
          [Service]\n\
          Type=exec\n\
+         # As root (`+`), and nothing else: D-Bus's directory, made if D-Bus has\n\
+         # not made it yet, so that InaccessiblePaths= below has it to hide. A\n\
+         # path that is not there when the console starts is not hidden, and\n\
+         # D-Bus started after the console would otherwise be reachable from it.\n\
+         ExecStartPre=+/bin/mkdir -p -m 0755 /run/dbus\n\
          ExecStart={exec}\
          Restart=on-failure\n\
          RestartSec=5s\n\
@@ -716,6 +725,10 @@ pub fn web_unit(layout: &Layout) -> String {
          PrivateTmp=yes\n\
          ProtectSystem=strict\n\
          ReadWritePaths={state}\n\
+         # Said outright: ProtectSystem=strict alone has been seen to leave /run\n\
+         # writable once ProtectKernelTunables= or ProtectControlGroups= add a\n\
+         # mount under it. Connecting to the helper's socket needs no write.\n\
+         ReadOnlyPaths=/run\n\
          ProtectHome=yes\n\
          PrivateDevices=yes\n\
          ProtectClock=yes\n\
@@ -736,7 +749,9 @@ pub fn web_unit(layout: &Layout) -> String {
          # AF_UNIX for the helper's socket, AF_INET/AF_INET6 for the console itself\n\
          # and the list downloads.\n\
          RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n\
-         InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private\n\
+         # D-Bus's directory rather than its socket, which comes and goes with\n\
+         # D-Bus while the console runs; the directory stays.\n\
+         InaccessiblePaths=-/run/dbus -/run/systemd/private\n\
          # The database holds the console's password hash.\n\
          UMask=0077\n\
          \n\
@@ -1332,8 +1347,29 @@ struct PlannedUnit {
 /// database there — so a database root creates is the console's from the
 /// start (see [`crate::db::guard`]), and [`secure_database`] only has to
 /// hand over what an earlier, root-run release left.
+///
+/// Before anything is handed over, the host settings are moved out of an
+/// existing database into the host settings file ([`move_host_settings`]):
+/// once the directory is the console's, its rows are not trusted, and
+/// would be deleted rather than moved.
 pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
+    install_web_from(layout, options, &layout.db_path)
+}
+
+/// [`install_web`], moving the host settings out of the database at
+/// `settings_db` (`--db`) rather than the layout's.
+pub fn install_web_from(layout: &Layout, options: &Options, settings_db: &Path) -> Result<Steps> {
     preflight(layout, options)?;
+
+    // First, while the database and its directory are still whoever's
+    // they were — root's, on an upgrade from 0.1.0-rc.2. The hand-over
+    // below makes them the console's, and from then on `hostconf` will
+    // not take a row from them: an operator's NGINX commands, root and
+    // log paths would be deleted instead of moved.
+    let mut steps = Steps::new();
+    if !options.dry_run {
+        steps.extend(move_host_settings(settings_db, &layout.host_conf)?);
+    }
 
     // The helper's unit has to let it write wherever the database says the
     // NGINX config and its logs are, not only the stock paths.
@@ -1363,7 +1399,6 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
         units.push(PlannedUnit { path, text, state });
     }
 
-    let mut steps = Steps::new();
     let account = ensure_service_account(layout, options, &mut steps)?;
 
     for (dir, mode, owned) in [
@@ -1413,6 +1448,31 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
         }
     }
 
+    Ok(steps)
+}
+
+/// Moves the host settings out of the database at `db_path`, if there is
+/// one, into `host_conf`, and writes `host_conf` either way, so that from
+/// here on its existence says "migrated" (see [`crate::hostconf`]).
+///
+/// Trusts the database only if it and its directory belong to this
+/// process's user — root, on a host; the user staging a `--prefix` tree,
+/// which is the only place such a run can write. Run before the
+/// directory is handed to the console, which is what makes it
+/// untrusted.
+fn move_host_settings(db_path: &Path, host_conf: &Path) -> Result<Steps> {
+    let mut steps = Steps::new();
+    if std::fs::symlink_metadata(host_conf).is_ok() {
+        return Ok(steps);
+    }
+    if db_path.is_file() {
+        let db = crate::db::Db::open(db_path)?;
+        // SAFETY: no preconditions; reads the process's own credentials.
+        let me = unsafe { libc::geteuid() };
+        let migrated = crate::hostconf::move_settings(&db, host_conf, me)?;
+        steps.extend(migrated.note(host_conf));
+    }
+    crate::hostconf::ensure_written_at(host_conf)?;
     Ok(steps)
 }
 
@@ -1587,7 +1647,14 @@ fn hand_over(path: &Path, account: crate::account::Account, mode: u32) -> Result
 /// of it. Every change goes through [`hand_over`], for the reason it
 /// gives. Called after the installer's own writes, because the database
 /// has to exist.
-pub fn secure_database(path: &Path, account: Option<crate::account::Account>) -> Result<()> {
+///
+/// A copy that is not a plain file with one name — a link, a FIFO, a
+/// directory, a hard link — is skipped, without being followed, and named
+/// in what this returns. stop-bots made none of those, so the console's
+/// user did, and refusing the whole install over a name in its own
+/// directory would let it block every upgrade. The database and its
+/// companions are still refused: SQLite opens those.
+pub fn secure_database(path: &Path, account: Option<crate::account::Account>) -> Result<Steps> {
     for file in database_files(path) {
         match account {
             Some(account) => hand_over(&file, account, 0o600)?,
@@ -1603,16 +1670,60 @@ pub fn secure_database(path: &Path, account: Option<crate::account::Account>) ->
             }
         }
     }
-    Ok(())
+    let mut skipped = Steps::new();
+    for copy in backup_copies(path) {
+        let file = match open_plain_copy(&copy) {
+            Ok(file) => file,
+            Err(why) => {
+                skipped.push(format!(
+                    "warning: left {} as it is: {why}, which no copy stop-bots makes is",
+                    copy.display()
+                ));
+                continue;
+            }
+        };
+        if let Some(account) = account {
+            std::os::unix::fs::fchown(&file, Some(account.uid), Some(account.gid))
+                .with_context(|| format!("giving {} to uid {}", copy.display(), account.uid))?;
+        }
+        crate::db::guard::fchmod(&file, 0o600)
+            .with_context(|| format!("setting mode 0600 on {}", copy.display()))?;
+    }
+    Ok(skipped)
 }
 
-/// The database at `path`, its SQLite companions and the copies upgrades
-/// kept beside it, as far as they exist.
+/// The pre-upgrade copy at `path`, opened without following a link or
+/// waiting on a FIFO, if it is a plain file with one name; otherwise what
+/// it is instead.
+fn open_plain_copy(path: &Path) -> std::result::Result<std::fs::File, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let file = match crate::db::guard::open_nofollow(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Err("it is gone"),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return Err("it is a symbolic link"),
+        Err(_) => return Err("it could not be opened"),
+    };
+    match file.metadata() {
+        Ok(meta) if !meta.is_file() => Err("it is not a regular file"),
+        Ok(meta) if meta.nlink() > 1 => Err("it has another name (a hard link)"),
+        Ok(_) => Ok(file),
+        Err(_) => Err("it could not be read"),
+    }
+}
+
+/// The database at `path` and its SQLite companions, as far as they
+/// exist.
 fn database_files(path: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = crate::db::guard::with_companions(path)
+    crate::db::guard::with_companions(path)
         .into_iter()
         .filter(|file| std::fs::symlink_metadata(file).is_ok())
-        .collect();
+        .collect()
+}
+
+/// Every name beside the database at `path` that starts like a copy an
+/// upgrade kept (`.bak-v*`), whatever it is.
+fn backup_copies(path: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return files;
     };
@@ -2843,6 +2954,10 @@ mod tests {
         let lines = directives(&unit);
         for (what, line) in [
             ("its own user", "User=stop-bots"),
+            (
+                "D-Bus's directory there to hide",
+                "ExecStartPre=+/bin/mkdir -p -m 0755 /run/dbus",
+            ),
             ("its own group", "Group=stop-bots"),
             ("no host log", "InaccessiblePaths=-/var/log -/run/log"),
             ("no capability at all", "CapabilityBoundingSet="),
@@ -2853,8 +2968,9 @@ mod tests {
             ),
             (
                 "systemd's sockets hidden",
-                "InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private",
+                "InaccessiblePaths=-/run/dbus -/run/systemd/private",
             ),
+            ("/run read-only", "ReadOnlyPaths=/run"),
             ("W^X", "MemoryDenyWriteExecute=yes"),
             ("a syscall filter", "SystemCallFilter=@system-service"),
             ("the helper's socket", "Requires=stop-bots-helper.socket"),
@@ -2930,6 +3046,46 @@ mod tests {
         ] {
             assert!(writable_in(&unit, path), "{path} is read-only:\n{unit}");
         }
+    }
+
+    /// **The upgrade from rc.2 keeps the operator's host settings.** They
+    /// are moved out of the database before its directory is handed to the
+    /// console: once it is the console's, its rows are deleted, not moved.
+    /// So the move comes first among the steps, ahead of every hand-over,
+    /// and the rows are in the host settings file afterwards, not lost.
+    #[test]
+    fn the_host_settings_are_moved_before_anything_is_handed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::create_dir_all(&layout.state_dir).unwrap();
+        {
+            let db = crate::db::Db::open(&layout.db_path).unwrap();
+            db.set_text_setting(
+                crate::db::keys::NGINX_RELOAD_COMMAND,
+                "/usr/sbin/nginx -s reload",
+            )
+            .unwrap();
+        }
+
+        let steps = install_web(&layout, &Options::default()).unwrap();
+
+        let moved = steps
+            .iter()
+            .position(|step| step.contains(crate::db::keys::NGINX_RELOAD_COMMAND))
+            .unwrap_or_else(|| panic!("no step moved the settings: {steps:#?}"));
+        let handed = steps
+            .iter()
+            .position(|step| step.starts_with("give "))
+            .unwrap_or_else(|| panic!("no hand-over step: {steps:#?}"));
+        assert!(moved < handed, "handed over before moving: {steps:#?}");
+        let conf = std::fs::read_to_string(&layout.host_conf).unwrap();
+        assert!(conf.contains("/usr/sbin/nginx -s reload"), "{conf}");
+        let db = crate::db::Db::open(&layout.db_path).unwrap();
+        assert_eq!(
+            db.get_text_setting(crate::db::keys::NGINX_RELOAD_COMMAND)
+                .unwrap(),
+            None
+        );
     }
 
     /// `nginx -t` opens every log the config names, so a site logging
@@ -3430,5 +3586,52 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{err:#}").contains("not a plain file"), "{err:#}");
+    }
+
+    /// **A name the console plants among the copies does not stop an
+    /// upgrade.** A link, a FIFO, a directory and a hard link, each named
+    /// like a pre-upgrade copy: each is skipped with a warning naming it,
+    /// none is followed or changed, and the real copy beside them is still
+    /// made private.
+    #[test]
+    fn a_planted_copy_is_skipped_with_a_warning_not_followed() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, "").unwrap();
+        let shadow = dir.path().join("shadow");
+        std::fs::write(&shadow, "root:*:\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let named = |suffix: &str| dir.path().join(format!("db.sqlite3.bak-v{suffix}"));
+        std::os::unix::fs::symlink(&shadow, named("99")).unwrap();
+        crate::testing::mkfifo(&named("98"));
+        std::fs::create_dir(named("97")).unwrap();
+        let other = dir.path().join("other");
+        std::fs::write(&other, "").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&other, named("96")).unwrap();
+        let real = named("5");
+        std::fs::write(&real, "").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mine = std::fs::metadata(&db).unwrap();
+        let account = crate::account::Account {
+            uid: mine.uid(),
+            gid: mine.gid(),
+        };
+
+        let warnings = secure_database(&db, Some(account)).unwrap();
+
+        for suffix in ["99", "98", "97", "96"] {
+            let name = named(suffix).display().to_string();
+            assert!(
+                warnings.iter().any(|line| line.contains(&name)),
+                "no warning for {name}: {warnings:#?}"
+            );
+        }
+        assert_eq!(warnings.len(), 4, "{warnings:#?}");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o777;
+        assert_eq!(mode(&shadow), 0o640, "the link's target was changed");
+        assert_eq!(mode(&other), 0o644, "the hard link's file was changed");
+        assert_eq!(mode(&real), 0o600, "the real copy was not made private");
     }
 }

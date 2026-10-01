@@ -38,6 +38,27 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   characters out as `\u{…}`. A row the console wrote, or a log line, could set the title
   or the clipboard of root's terminal through `list-*`, `status`, `apply-blocks` and `batch`.
 - The TUI's `y` refuses to copy a value with such characters, and says why.
+- A generated file the database's record names is used only by a path with no link in
+  it, and only through its directory, held open from the check on: removed, read and
+  put back after a refused test by `openat`/`unlinkat`/`renameat`, never by path.
+  This covers applies, previews, the TUI and `uninstall`. A FIFO there is not read.
+- The trust file gets each trusted address trimmed, as it was validated.
+- Root opening the console's database (every CLI verb, the TUI, `install`, `uninstall`)
+  runs no trigger or view in it: defensive mode on, triggers, views and
+  `trusted_schema` off, as the helper already had.
+- The root helper never upgrades the database: one at another schema version is
+  refused until `sudo stop-bots install web` (or any root command) upgrades it. It also
+  refuses a database with a second name (a hard link).
+- `install web` moves the host settings into `host.conf` before it hands the database's
+  directory to the console. The other order deleted an rc.2 host's NGINX commands, root
+  and log paths instead of moving them.
+- `install web` skips, with a warning, a `.bak-v*` beside the database that is a link,
+  not a regular file, or a hard link, without following it, instead of failing the
+  upgrade half way.
+- The console's unit makes `/run` read-only outright (`ReadOnlyPaths=/run`), which
+  `ProtectSystem=strict` alone did not under `ProtectKernelTunables=`. It hides
+  `/run/dbus` rather than the socket, made first by a root `ExecStartPre=` if D-Bus has
+  not made it, so D-Bus started after the console is out of its reach too.
 
 ### Changed
 

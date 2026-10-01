@@ -1117,8 +1117,9 @@ pub struct ApplyPlan {
     pub managed_writes: Vec<(PathBuf, String)>,
     /// Empty except for `ApplyAll`, and applied only if every site
     /// succeeded — see [`nginx::remove_unused_managed_files`] for why the
-    /// ordering is load-bearing rather than tidy.
-    pub managed_removals: Vec<PathBuf>,
+    /// ordering is load-bearing rather than tidy. Each held through its
+    /// directory, as [`nginx::unused_managed_files`] checked it.
+    pub managed_removals: Vec<nginx::DirFile>,
     pub sites: Vec<PlannedSite>,
     pub every_site: bool,
     /// The NGINX root, which a symlinked site file may only point into.
@@ -1168,10 +1169,8 @@ pub struct ApplyOutcome {
 pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     let snapshot = nginx::Snapshot::of_apply(
         &plan.root,
-        plan.managed_writes
-            .iter()
-            .map(|(path, _)| path.clone())
-            .chain(plan.managed_removals.iter().cloned()),
+        plan.managed_writes.iter().map(|(path, _)| path.clone()),
+        &plan.managed_removals,
         plan.sites.iter().map(|site| site.config_path.as_path()),
     );
     // Same ordering as the CLI's apply: a managed file has to exist before
@@ -1286,10 +1285,10 @@ pub fn preview_apply(plan: &ApplyPlan) -> Vec<nginx::FileChange> {
             }),
     );
 
-    for path in &plan.managed_removals {
-        if let Ok(before) = std::fs::read_to_string(path) {
+    for file in &plan.managed_removals {
+        if let Some(before) = file.read_to_string() {
             changes.push(nginx::FileChange {
-                path: path.clone(),
+                path: file.path().to_path_buf(),
                 before: Some(before),
                 after: None,
             });

@@ -54,6 +54,8 @@ pub mod db;
 #[doc(hidden)]
 pub mod diff;
 #[doc(hidden)]
+pub mod dirfd;
+#[doc(hidden)]
 pub mod docs;
 #[doc(hidden)]
 pub mod dynamic;

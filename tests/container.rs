@@ -1209,6 +1209,64 @@ impl Host {
         ));
         self.try_start(&format!("{probe}.service"))
     }
+
+    /// Runs `script` with `sh` **as the console's own unit**:
+    /// `stop-bots-web.service` exactly as `install web` wrote it, with a
+    /// drop-in that replaces only its `ExecStart=` (and makes it a oneshot
+    /// that is not restarted). Every other line is the real unit's, so
+    /// nothing a copy could get wrong stands between the probe and what is
+    /// under test. Returns whether the script exited 0, and what it
+    /// printed.
+    ///
+    /// `background` starts it without waiting, for a probe that has to
+    /// be running while the test changes something on the host; then
+    /// [`Self::console_probe_result`] collects it.
+    fn probe_in_console_unit(&self, probe: &str, script: &str) -> (bool, String) {
+        self.start_console_probe(probe, script, false);
+        self.console_probe_result(probe)
+    }
+
+    fn start_console_probe(&self, probe: &str, script: &str, background: bool) {
+        // The output goes where the console may write: its own directory.
+        self.sh(&format!(
+            "cat > /run/{probe}.sh <<'STOP_BOTS_PROBE'\n\
+             exec > /var/lib/stop-bots/{probe}.out 2>&1\n\
+             {script}\n\
+             STOP_BOTS_PROBE\n\
+             chmod 644 /run/{probe}.sh\n\
+             rm -f /var/lib/stop-bots/{probe}.out /var/lib/stop-bots/{probe}.status\n\
+             mkdir -p /etc/systemd/system/stop-bots-web.service.d\n\
+             cat > /etc/systemd/system/stop-bots-web.service.d/zz-probe.conf <<'STOP_BOTS_PROBE'\n\
+             [Service]\n\
+             Type=oneshot\n\
+             Restart=no\n\
+             ExecStart=\n\
+             ExecStart=/bin/sh -c '/bin/sh /run/{probe}.sh; echo $$? > /var/lib/stop-bots/{probe}.status'\n\
+             STOP_BOTS_PROBE\n\
+             systemctl daemon-reload\n\
+             systemctl reset-failed stop-bots-web.service 2>/dev/null || true"
+        ));
+        let block = if background { "--no-block " } else { "" };
+        self.sh(&format!("systemctl start {block}stop-bots-web.service"));
+    }
+
+    /// Waits for the probe [`Self::start_console_probe`] started to
+    /// finish, takes the drop-in away again, and returns what it did.
+    fn console_probe_result(&self, probe: &str) -> (bool, String) {
+        let status = format!("/var/lib/stop-bots/{probe}.status");
+        assert!(
+            self.wait_for_file(&status),
+            "the probe {probe} never finished. journal:\n{}",
+            self.journal("stop-bots-web.service")
+        );
+        let code = self.sh(&format!("cat {status}"));
+        let out = self.run(&format!("cat /var/lib/stop-bots/{probe}.out")).1;
+        self.sh(
+            "rm /etc/systemd/system/stop-bots-web.service.d/zz-probe.conf \
+             && systemctl daemon-reload",
+        );
+        (code.trim() == "0", out)
+    }
 }
 
 /// A logged-in session against the console running inside a [`Host`].
@@ -2316,6 +2374,300 @@ fn the_console_sandbox_holds_under_real_systemd() {
     }
 }
 
+/// The D-Bus call every probe of the bus makes: harmless, and answered to
+/// any user who can reach the bus at all.
+const PING_SYSTEMD: &str =
+    "busctl --system call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+     org.freedesktop.DBus.Peer Ping";
+
+/// **`/run` is read-only to the console, and D-Bus out of its reach,
+/// whichever starts first.** `ProtectSystem=strict` alone left `/run`
+/// writable here (`ProtectKernelTunables=` and `ProtectControlGroups=`
+/// mount under it); the unit says `ReadOnlyPaths=/run`. And
+/// `InaccessiblePaths=` hides nothing that is not there when the console
+/// starts, so D-Bus started after it would have been reachable; the unit
+/// hides D-Bus's directory, made first if need be.
+///
+/// Inside the real unit: `/run/lock` — which anyone may write outside it,
+/// the control — and `/run` are read-only; and the bus, reachable from
+/// outside as the console's user, is not reachable from inside, with
+/// D-Bus started before the console and with D-Bus started while it runs.
+#[test]
+fn the_console_sees_run_read_only_and_no_bus_whichever_starts_first() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-run");
+    let as_console = |cmd: &str| {
+        host.run(&format!("/usr/sbin/runuser -u stop-bots -- {cmd}"))
+            .0
+    };
+    assert!(
+        as_console("touch /run/lock/stop-bots-control"),
+        "the console's user cannot write /run/lock even outside its unit, so the check below \
+         proves nothing"
+    );
+
+    // D-Bus after the console: not running, its directory not there.
+    host.sh("systemctl stop dbus.socket dbus.service; rm -rf /run/dbus");
+    host.start_console_probe(
+        "probe-bus-later",
+        &format!(
+            "while [ ! -e /var/lib/stop-bots/go ]; do sleep 0.1; done\n\
+             {PING_SYSTEMD} && exit 0\n\
+             exit 1"
+        ),
+        true,
+    );
+    host.sh("systemctl start dbus.socket dbus.service");
+    assert!(
+        as_console(PING_SYSTEMD),
+        "the console's user cannot reach the bus even outside its unit, so the checks below \
+         prove nothing"
+    );
+    host.sh("touch /var/lib/stop-bots/go && chown stop-bots: /var/lib/stop-bots/go");
+    let (reached, said) = host.console_probe_result("probe-bus-later");
+    assert!(
+        !reached,
+        "the console reached D-Bus started after it:\n{said}"
+    );
+
+    // D-Bus before the console, as on a host that boots with it.
+    let (reached, said) = host.probe_in_console_unit("probe-bus-first", PING_SYSTEMD);
+    assert!(!reached, "the console reached D-Bus:\n{said}");
+
+    for path in ["/run/stop-bots-probe", "/run/lock/stop-bots-probe"] {
+        let (wrote, said) = host.probe_in_console_unit("probe-run", &format!("touch {path}"));
+        assert!(
+            !wrote && !host.run(&format!("test -e {path}")).0,
+            "the console wrote {path}"
+        );
+        assert!(
+            said.contains("Read-only file system"),
+            "{path} was refused, but not by the sandbox:\n{said}"
+        );
+    }
+}
+
+/// **Every way up from the console's user, tried from inside its unit.**
+/// Each row is what code running as the console would try next to become
+/// root or to outlive it, and each is refused. Where the account alone
+/// would allow it, the row's control proves it: the same command, as the
+/// console's user but outside the unit, works — so `NoNewPrivileges=`,
+/// `ProtectSystem=` or the hidden bus is what refuses it, not a broken
+/// probe. `sudo` is given to the console's user and root's password is
+/// emptied for the purpose.
+#[test]
+fn the_console_unit_refuses_every_way_up() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-ways-up");
+    host.sh("systemctl start dbus.socket dbus.service \
+         && echo 'stop-bots ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/stop-bots-probe \
+         && chmod 440 /etc/sudoers.d/stop-bots-probe && passwd -d root >/dev/null");
+    let present = |program: &str| host.run(&format!("command -v {program}")).0;
+    let as_console = |cmd: &str| {
+        host.run(&format!(
+            "cd /var/lib/stop-bots && /usr/sbin/runuser -u stop-bots -- /bin/sh -c {}",
+            sh_quoted(cmd)
+        ))
+        .0
+    };
+    let escaped = "/etc/stop-bots-escaped";
+
+    // (what, program it needs, the attempt, whether the account alone
+    // allows it, so the control must succeed)
+    let rows: Vec<(&str, &str, String, bool)> = vec![
+        ("sudo", "sudo", format!("sudo -n touch {escaped}"), true),
+        (
+            "su",
+            "su",
+            format!("su -c 'touch {escaped}' root < /dev/null"),
+            true,
+        ),
+        ("pkexec", "pkexec", format!("pkexec touch {escaped}"), false),
+        (
+            "a crontab, as `crontab -e` writes it",
+            "crontab",
+            "echo '* * * * * true' | crontab -".to_string(),
+            true,
+        ),
+        (
+            "an at job",
+            "at",
+            "echo true | at now + 1 hour".to_string(),
+            true,
+        ),
+        (
+            "systemd-run",
+            "systemd-run",
+            format!("systemd-run --wait -q /usr/bin/touch {escaped}"),
+            false,
+        ),
+        (
+            "a call to systemd's manager",
+            "busctl",
+            PING_SYSTEMD.to_string(),
+            true,
+        ),
+        ("writing /etc", "touch", format!("touch {escaped}"), false),
+        (
+            "writing /etc/nginx",
+            "touch",
+            "touch /etc/nginx/stop-bots-probe.conf".to_string(),
+            false,
+        ),
+        (
+            "writing /etc/stop-bots",
+            "touch",
+            "touch /etc/stop-bots/stop-bots-probe".to_string(),
+            false,
+        ),
+        (
+            "writing /usr/local/bin",
+            "touch",
+            "touch /usr/local/bin/stop-bots-probe".to_string(),
+            false,
+        ),
+        (
+            "a hard link to a root file in its directory",
+            "ln",
+            "ln /etc/stop-bots/host.conf /var/lib/stop-bots/host.conf.link".to_string(),
+            false,
+        ),
+        (
+            "writing /run",
+            "touch",
+            "touch /run/lock/stop-bots-probe".to_string(),
+            true,
+        ),
+    ];
+    let mut tried = 0;
+    for (index, (what, program, attempt, control)) in rows.iter().enumerate() {
+        // pkexec comes with polkit, which this image does not have.
+        if !present(program) {
+            continue;
+        }
+        tried += 1;
+        if *control {
+            assert!(
+                as_console(attempt),
+                "{what} fails as the console's user even outside its unit, so this row proves \
+                 nothing"
+            );
+            // Undo what the control did, so the probe starts from the same
+            // place.
+            host.sh(&format!(
+                "rm -f {escaped} /run/lock/stop-bots-probe; crontab -u stop-bots -r 2>/dev/null; \
+                 for job in $(atq 2>/dev/null | cut -f1); do atrm $job; done; true"
+            ));
+        }
+        let (worked, said) = host.probe_in_console_unit(&format!("probe-up-{index}"), attempt);
+        assert!(
+            !worked,
+            "from inside its unit the console managed {what}:\n{said}"
+        );
+    }
+    assert!(tried >= rows.len() - 1, "only {tried} rows ran");
+    for (left, what) in [
+        (escaped, "a root command ran"),
+        (
+            "/var/spool/cron/crontabs/stop-bots",
+            "a crontab was written",
+        ),
+        ("/etc/nginx/stop-bots-probe.conf", "/etc/nginx was written"),
+        (
+            "/etc/stop-bots/stop-bots-probe",
+            "/etc/stop-bots was written",
+        ),
+        (
+            "/usr/local/bin/stop-bots-probe",
+            "/usr/local/bin was written",
+        ),
+        ("/var/lib/stop-bots/host.conf.link", "a hard link was made"),
+        ("/run/lock/stop-bots-probe", "/run was written"),
+    ] {
+        assert!(!host.run(&format!("test -e {left}")).0, "{what}: {left}");
+    }
+    assert_eq!(
+        host.sh("atq 2>/dev/null | wc -l").trim(),
+        "0",
+        "an at job was queued"
+    );
+}
+
+/// **A trigger the console plants runs nowhere as root.** Written as the
+/// console's user straight into its database: one trigger on every write
+/// to `settings`. Root CLI runs that write a setting then store theirs,
+/// and the trigger's table stays empty. The control is the console's user
+/// writing a setting the same way, which fires it.
+#[test]
+fn a_trigger_the_console_plants_does_not_fire_in_a_root_cli_run() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-planted-trigger");
+    host.sh(&format!(
+        "cat > /run/plant.sql <<'SQL'\n\
+         CREATE TABLE fired (what TEXT);\n\
+         CREATE TRIGGER planted_insert AFTER INSERT ON settings\n\
+           BEGIN INSERT INTO fired VALUES ('insert'); END;\n\
+         CREATE TRIGGER planted_update AFTER UPDATE ON settings\n\
+           BEGIN INSERT INTO fired VALUES ('update'); END;\n\
+         SQL\n\
+         chmod 644 /run/plant.sql && \
+         /usr/sbin/runuser -u stop-bots -- sqlite3 {HOST_DB} < /run/plant.sql"
+    ));
+    let fired = || {
+        host.sh(&format!("sqlite3 {HOST_DB} 'SELECT count(*) FROM fired'"))
+            .trim()
+            .to_string()
+    };
+
+    host.stop_bots("set-auto-apply --enabled true");
+    host.stop_bots("trust --address 192.0.2.5");
+    assert_eq!(fired(), "0", "a planted trigger ran in a root CLI run");
+
+    host.sh(&format!(
+        "/usr/sbin/runuser -u stop-bots -- sqlite3 {HOST_DB} \
+         \"INSERT OR REPLACE INTO settings (key, value) VALUES ('probe', 'x')\""
+    ));
+    assert_ne!(fired(), "0", "the control did not fire either");
+}
+
+/// **A link the console names like a pre-upgrade copy does not stop an
+/// upgrade.** `install web` skips it, says so, follows nothing, and
+/// finishes.
+#[test]
+fn a_planted_copy_beside_the_database_does_not_stop_install_web() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-planted-copy");
+    let canary = "/etc/stop-bots-canary";
+    host.sh(&format!("echo secret > {canary} && chmod 600 {canary}"));
+    host.sh(&format!(
+        "/usr/sbin/runuser -u stop-bots -- ln -s {canary} {HOST_DB}.bak-v99"
+    ));
+
+    let (ok, stdout, stderr) = host.run("stop-bots install web --no-start");
+
+    assert!(
+        ok,
+        "install web failed over the planted copy:\n{stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("{HOST_DB}.bak-v99")),
+        "it did not say it skipped it:\n{stdout}"
+    );
+    assert_eq!(
+        host.sh(&format!("stat -c '%U %a' {canary}")).trim(),
+        "root 600",
+        "the link's target was handed over"
+    );
+}
+
 /// **The console reads no log of the host's.** Under its unit, as
 /// `stop-bots`, it cannot read the auth log (`root:adm 0640`), NGINX's
 /// access log (`www-data:adm 0640`), a log anyone may read, or the journal:
@@ -2824,10 +3176,15 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
         ),
         "/etc/systemd/system/stop-bots-web.service",
     );
-    // rc.2's database, as rc.2's root console and CLI made it.
+    // rc.2's database, as rc.2's root console and CLI made it. Every root
+    // CLI run comes before the rows below: this release's CLI moves them
+    // into host.conf, and no root command may run between them and
+    // `install web`, or the test exercises that move instead of the
+    // upgrade's.
     host.sh(&format!(
         "mkdir -p -m 700 /var/lib/stop-bots && stop-bots scan-sites --root /etc/nginx/sites-enabled --db {HOST_DB}"
     ));
+    host.seed_bot("badbot", "BadBot");
     // Not the defaults, so that what reaches host.conf is these.
     host.sh(&format!(
         "sqlite3 {HOST_DB} \"INSERT OR REPLACE INTO settings (key, value) VALUES \
@@ -2835,11 +3192,10 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
            ('nginx:reload_command', '/usr/sbin/nginx -s reload'), \
            ('nginx:root', '/etc/nginx')\""
     ));
-    // rc.2 had no host settings file. The `scan-sites` above is this
-    // release's, and as root it made one, before there was anything to
-    // move into it; an rc.2 host has the rows and no file.
+    // rc.2 had no host settings file. The root commands above are this
+    // release's, and made one, before there was anything to move into
+    // it; an rc.2 host has the rows and no file.
     host.sh("rm -f /etc/stop-bots/host.conf");
-    host.seed_bot("badbot", "BadBot");
     host.sh("systemctl daemon-reload && systemctl enable --now stop-bots-web.service");
     host.wait_for_console();
     let user_of_console = || {
