@@ -8,6 +8,17 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Security
+
+- Root opening the console's database (the CLI, the TUI, the helper, `install web`,
+  `uninstall`) follows no link in its directory, refuses a database or `-wal`/`-shm`
+  that is a link or has a second name, and changes owners and modes only by descriptor.
+
+### Changed
+
+- A copy taken before a schema upgrade (`.bak-v*`), and a database root creates in the
+  console's directory, belong to the database's owner, not root.
+
 ## [0.1.0-rc.2] — 2026-09-30
 
 The findings of a security review of the web console, all fixed. The threat model: an

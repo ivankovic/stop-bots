@@ -269,7 +269,11 @@ fn backup(conn: &Connection, path: &Path, version: u32) -> Result<()> {
             .mode(0o600)
             .open(&target)
         {
-            Ok(_) => break,
+            Ok(file) => {
+                give_to_owner_of(&file, path)
+                    .with_context(|| format!("failed to hand over {}", target.display()))?;
+                break;
+            }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 n += 1;
                 let mut name = base.as_os_str().to_owned();
@@ -300,6 +304,23 @@ fn backup(conn: &Connection, path: &Path, version: u32) -> Result<()> {
         .and_then(|file| file.sync_all())
         .with_context(|| format!("failed to write {} to disk", target.display()))?;
     Ok(())
+}
+
+/// Gives `copy` the owner of the database at `db`, when this is root.
+///
+/// Root upgrading the console's database — `sudo stop-bots` after an
+/// upgrade, before the console has restarted — would otherwise leave a
+/// root-owned copy in the console's directory, which the console could
+/// then neither read nor remove. Through the descriptor, not the name,
+/// which in that directory is the console's to change.
+fn give_to_owner_of(copy: &std::fs::File, db: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: no preconditions; reads the process's own credentials.
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    let owner = std::fs::symlink_metadata(db)?;
+    std::os::unix::fs::fchown(copy, Some(owner.uid()), Some(owner.gid()))
 }
 
 /// Version 1: the schema every 0.0.x release converged on, as one step

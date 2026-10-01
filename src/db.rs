@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod blocks;
 pub mod evidence;
+pub mod guard;
 pub mod keys;
 mod managed;
 mod remembered;
@@ -1145,9 +1146,15 @@ pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
 /// Existing files are tightened because the installs this was written for
 /// already have a 0644 database. Only this user's own, though: root opening
 /// someone else's database with `--db` has no business changing who else
-/// may read it.
-fn make_private(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+/// may read it — nor the console's, which since 0.1 is its own user's.
+///
+/// Every change goes through a descriptor opened with `O_NOFOLLOW`, never
+/// by path: under a [`guard::Guard`] the names in this directory are
+/// another user's to choose, and `chmod` by path follows a link. One that
+/// root creates there is given to that user, the directory's owner, or the
+/// console could not open its own database.
+fn make_private(path: &Path, guard: Option<guard::Guard>) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     match std::fs::OpenOptions::new()
         .write(true)
@@ -1155,20 +1162,26 @@ fn make_private(path: &Path) -> std::io::Result<()> {
         .mode(0o600)
         .open(path)
     {
-        Ok(_) => return Ok(()),
+        Ok(file) => {
+            if let Some(guard) = guard {
+                std::os::unix::fs::fchown(&file, Some(guard.uid), Some(guard.gid))?;
+            }
+            return Ok(());
+        }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(err) => return Err(err),
     }
     // SAFETY: no preconditions; reads the process's own credentials.
     let euid = unsafe { libc::geteuid() };
-    for suffix in ["", "-wal", "-shm", "-journal"] {
-        let mut file = path.as_os_str().to_owned();
-        file.push(suffix);
-        let Ok(meta) = std::fs::metadata(&file) else {
+    for file in guard::with_companions(path) {
+        // A link, or anything this cannot open, is not this user's to
+        // tighten; the guard has already refused one where it matters.
+        let Ok(Some(file)) = guard::open_nofollow(&file) else {
             continue;
         };
-        if meta.is_file() && meta.uid() == euid && meta.mode() & 0o077 != 0 {
-            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
+        let meta = file.metadata()?;
+        if meta.is_file() && meta.nlink() == 1 && meta.uid() == euid && meta.mode() & 0o077 != 0 {
+            guard::fchmod(&file, 0o600)?;
         }
     }
     Ok(())
@@ -1230,7 +1243,8 @@ fn not_yours(path: &Path, err: anyhow::Error, root: bool) -> anyhow::Error {
     crate::hint::with(
         err,
         &format!(
-            "{} belongs to another user — root, if `stop-bots install` set this host up. \
+            "{} belongs to another user — the console's own `stop-bots` user, if \
+             `stop-bots install web` set this host up. \
              Run it with sudo, or pass `--db <path>` to use a database of your own.",
             path.display()
         ),
@@ -1298,10 +1312,29 @@ impl Db {
                     .map_err(|err| not_yours(path, err, crate::hint::is_root()))?;
             }
         }
-        make_private(path)
+        Self::open_guarded(path, guard::Guard::here(path))
+    }
+
+    /// [`Db::open`] once the directory exists, with `guard` saying whether
+    /// this is root in another user's directory (see [`guard`]). Separate
+    /// so a test can take that path without being root.
+    fn open_guarded(path: &Path, guard: Option<guard::Guard>) -> Result<Self> {
+        let resolved;
+        let (path, flags) = match guard {
+            Some(guard) => {
+                guard.check(path)?;
+                resolved = guard.resolve(path)?;
+                (
+                    resolved.as_path(),
+                    rusqlite::OpenFlags::default() | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+                )
+            }
+            None => (path, rusqlite::OpenFlags::default()),
+        };
+        make_private(path, guard)
             .with_context(|| format!("failed to secure database: {}", path.display()))
             .map_err(|err| not_yours(path, err, crate::hint::is_root()))?;
-        let conn = Connection::open(path)
+        let conn = Connection::open_with_flags(path, flags)
             .with_context(|| format!("failed to open database: {}", path.display()))
             .map_err(|err| not_yours(path, err, crate::hint::is_root()))?;
         conn.busy_timeout(BUSY_TIMEOUT)
@@ -3858,6 +3891,86 @@ mod tests {
             assert!(side.exists(), "{} was not created", side.display());
             assert_eq!(mode_of(&side), 0o600, "{suffix}");
         }
+    }
+
+    /// The directory's owner, standing in for the console's user: the
+    /// guard is root's, but its refusals do not need root to be seen.
+    fn console_guard(dir: &Path) -> guard::Guard {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(dir).unwrap();
+        guard::Guard {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        }
+    }
+
+    /// The attack the guard exists for: a compromised console links its
+    /// database to a file that does not exist yet, and root — the CLI, or
+    /// the helper — would create a database there with the console's rows
+    /// in it. Refused, and nothing created.
+    #[test]
+    fn root_does_not_follow_a_link_the_console_left_for_its_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cron.d-x");
+        let path = dir.path().join("db.sqlite3");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let opened = Db::open_guarded(&path, Some(console_guard(dir.path())));
+
+        assert!(opened.is_err(), "opened a database through a link");
+        assert!(!target.exists(), "created the file the link points at");
+    }
+
+    /// The same for the write-ahead log: a write would land in the link's
+    /// target.
+    #[test]
+    fn root_does_not_write_through_a_link_the_console_left_for_its_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        drop(Db::open(&path).unwrap());
+        std::fs::remove_file(dir.path().join("db.sqlite3-wal")).ok();
+        let target = dir.path().join("passwd");
+        std::fs::write(&target, "root:x:0:0\n").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("db.sqlite3-wal")).unwrap();
+
+        let opened = Db::open_guarded(&path, Some(console_guard(dir.path())));
+        if let Ok(db) = opened {
+            let _ = db.set_text_setting("probe", "x");
+        }
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "root:x:0:0\n");
+    }
+
+    /// And with nothing planted, the guarded open is an ordinary one.
+    #[test]
+    fn a_guarded_open_of_an_ordinary_database_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+
+        let db = Db::open_guarded(&path, Some(console_guard(dir.path()))).unwrap();
+        db.set_text_setting("probe", "x").unwrap();
+
+        assert_eq!(db.get_text_setting("probe").unwrap().as_deref(), Some("x"));
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// Tightening a mode goes through a descriptor that does not follow a
+    /// link, so a `-shm` linked to someone else's file leaves that file's
+    /// mode alone.
+    #[test]
+    fn tightening_does_not_follow_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        std::fs::write(&path, "").unwrap();
+        let target = dir.path().join("public");
+        std::fs::write(&target, "").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("db.sqlite3-shm")).unwrap();
+
+        make_private(&path, None).unwrap();
+
+        assert_eq!(mode_of(&target), 0o644);
     }
 
     /// A database in a directory this user cannot enter is the state
