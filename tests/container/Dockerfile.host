@@ -15,9 +15,12 @@ FROM debian:13
 # systemd checks this to decide it is containerised.
 ENV container=docker
 
+# sudo, cron and at are not stop-bots': the suite tries each from inside
+# the console's unit, and a refusal of a program that is not there proves
+# nothing.
 RUN apt-get update -qq && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-        systemd systemd-sysv dbus \
+        systemd systemd-sysv dbus sudo cron at \
         nginx nftables iptables curl ca-certificates sqlite3 && \
     rm -rf /var/lib/apt/lists/*
 

@@ -2449,6 +2449,154 @@ fn the_console_sees_run_read_only_and_no_bus_whichever_starts_first() {
     }
 }
 
+/// **Every way up from the console's user, tried from inside its unit.**
+/// Each row is what code running as the console would try next to become
+/// root or to outlive it, and each is refused. Where the account alone
+/// would allow it, the row's control proves it: the same command, as the
+/// console's user but outside the unit, works — so `NoNewPrivileges=`,
+/// `ProtectSystem=` or the hidden bus is what refuses it, not a broken
+/// probe. `sudo` is given to the console's user and root's password is
+/// emptied for the purpose.
+#[test]
+fn the_console_unit_refuses_every_way_up() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-ways-up");
+    host.sh("systemctl start dbus.socket dbus.service \
+         && echo 'stop-bots ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/stop-bots-probe \
+         && chmod 440 /etc/sudoers.d/stop-bots-probe && passwd -d root >/dev/null");
+    let present = |program: &str| host.run(&format!("command -v {program}")).0;
+    let as_console = |cmd: &str| {
+        host.run(&format!(
+            "cd /var/lib/stop-bots && /usr/sbin/runuser -u stop-bots -- /bin/sh -c {}",
+            sh_quoted(cmd)
+        ))
+        .0
+    };
+    let escaped = "/etc/stop-bots-escaped";
+
+    // (what, program it needs, the attempt, whether the account alone
+    // allows it, so the control must succeed)
+    let rows: Vec<(&str, &str, String, bool)> = vec![
+        ("sudo", "sudo", format!("sudo -n touch {escaped}"), true),
+        (
+            "su",
+            "su",
+            format!("su -c 'touch {escaped}' root < /dev/null"),
+            true,
+        ),
+        ("pkexec", "pkexec", format!("pkexec touch {escaped}"), false),
+        (
+            "a crontab, as `crontab -e` writes it",
+            "crontab",
+            "echo '* * * * * true' | crontab -".to_string(),
+            true,
+        ),
+        (
+            "an at job",
+            "at",
+            "echo true | at now + 1 hour".to_string(),
+            true,
+        ),
+        (
+            "systemd-run",
+            "systemd-run",
+            format!("systemd-run --wait -q /usr/bin/touch {escaped}"),
+            false,
+        ),
+        (
+            "a call to systemd's manager",
+            "busctl",
+            PING_SYSTEMD.to_string(),
+            true,
+        ),
+        ("writing /etc", "touch", format!("touch {escaped}"), false),
+        (
+            "writing /etc/nginx",
+            "touch",
+            "touch /etc/nginx/stop-bots-probe.conf".to_string(),
+            false,
+        ),
+        (
+            "writing /etc/stop-bots",
+            "touch",
+            "touch /etc/stop-bots/stop-bots-probe".to_string(),
+            false,
+        ),
+        (
+            "writing /usr/local/bin",
+            "touch",
+            "touch /usr/local/bin/stop-bots-probe".to_string(),
+            false,
+        ),
+        (
+            "a hard link to a root file in its directory",
+            "ln",
+            "ln /etc/stop-bots/host.conf /var/lib/stop-bots/host.conf.link".to_string(),
+            false,
+        ),
+        (
+            "writing /run",
+            "touch",
+            "touch /run/lock/stop-bots-probe".to_string(),
+            true,
+        ),
+    ];
+    let mut tried = 0;
+    for (index, (what, program, attempt, control)) in rows.iter().enumerate() {
+        // pkexec comes with polkit, which this image does not have.
+        if !present(program) {
+            continue;
+        }
+        tried += 1;
+        if *control {
+            assert!(
+                as_console(attempt),
+                "{what} fails as the console's user even outside its unit, so this row proves \
+                 nothing"
+            );
+            // Undo what the control did, so the probe starts from the same
+            // place.
+            host.sh(&format!(
+                "rm -f {escaped} /run/lock/stop-bots-probe; crontab -u stop-bots -r 2>/dev/null; \
+                 for job in $(atq 2>/dev/null | cut -f1); do atrm $job; done; true"
+            ));
+        }
+        let (worked, said) = host.probe_in_console_unit(&format!("probe-up-{index}"), attempt);
+        assert!(
+            !worked,
+            "from inside its unit the console managed {what}:\n{said}"
+        );
+    }
+    assert!(tried >= rows.len() - 1, "only {tried} rows ran");
+    for (left, what) in [
+        (escaped, "a root command ran"),
+        (
+            "/var/spool/cron/crontabs/stop-bots",
+            "a crontab was written",
+        ),
+        ("/etc/nginx/stop-bots-probe.conf", "/etc/nginx was written"),
+        (
+            "/etc/stop-bots/stop-bots-probe",
+            "/etc/stop-bots was written",
+        ),
+        (
+            "/usr/local/bin/stop-bots-probe",
+            "/usr/local/bin was written",
+        ),
+        ("/var/lib/stop-bots/host.conf.link", "a hard link was made"),
+        ("/run/lock/stop-bots-probe", "/run was written"),
+    ] {
+        assert!(!host.run(&format!("test -e {left}")).0, "{what}: {left}");
+    }
+    assert_eq!(
+        host.sh("atq 2>/dev/null | wc -l").trim(),
+        "0",
+        "an at job was queued"
+    );
+}
+
 /// The logs the detectors read are readable through the groups the unit
 /// adds, and only through them: NGINX's access log is `www-data:adm
 /// 0640`, the journal the `systemd-journal` group's.
