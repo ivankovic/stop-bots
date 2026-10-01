@@ -80,6 +80,8 @@ pub mod host;
 #[doc(hidden)]
 pub mod hostconf;
 #[doc(hidden)]
+pub mod hostlog;
+#[doc(hidden)]
 pub mod injection;
 #[doc(hidden)]
 pub mod install;

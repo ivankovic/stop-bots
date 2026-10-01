@@ -85,6 +85,14 @@ pub const MAX_CONNECTIONS: usize = 8;
 /// The largest reply a client reads. A preview's diff is cut long before.
 const MAX_REPLY: u64 = 32 * 1024 * 1024;
 
+// A log read's reply is the largest: at most a chunk and a line of log,
+// which JSON makes at most six times longer (a control character is
+// `\u00XX`). A reply cut short would never be read, and the log behind it
+// never got past.
+const _: () = assert!(
+    6 * (crate::hostlog::MAX_CHUNK + crate::logread::MAX_LINE as u64) + 64 * 1024 < MAX_REPLY
+);
+
 /// How the helper is set up. Nothing here comes from a request.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -314,9 +322,14 @@ impl Server {
             // operation opens its own database, so nothing is left
             // half-done for the next to trip over.
             let _turn = turn;
-            let answer = crate::db::Db::open_untrusted(&server.config.db_path)
-                .and_then(|db| crate::privileged::execute(&server.config.settings, &db, op))
-                .map_err(|err| format!("{err:#}"));
+            let settings = &server.config.settings;
+            let answer = if op.uses_db() {
+                crate::db::Db::open_untrusted(&server.config.db_path)
+                    .and_then(|db| crate::privileged::execute(settings, &db, op))
+            } else {
+                crate::privileged::execute(settings, &crate::privileged::NoDb, op)
+            }
+            .map_err(|err| format!("{err:#}"));
             let _ = done.send(answer);
         });
         match result.recv_timeout(self.config.op_deadline) {

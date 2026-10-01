@@ -179,7 +179,10 @@ async fn run_log_jobs(state: &AppState, jobs: Vec<CronJob>) -> anyhow::Result<()
     let plan = state
         .with_db(move |db| crate::logscan::plan(db, &planned, &flags))
         .await?;
-    let read = tokio::task::spawn_blocking(move || crate::logscan::read(&plan))
+    // Through the console's privileged way to the logs: the helper, under
+    // the service, since the console's own user can read none of them.
+    let reader = state.privileged();
+    let read = tokio::task::spawn_blocking(move || crate::logscan::read(&plan, &reader))
         .await
         .map_err(|err| anyhow::anyhow!("the log-reading thread panicked: {err}"))?;
 

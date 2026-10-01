@@ -26,7 +26,8 @@
 //! database. Once the console runs as its own unprivileged user, a row it
 //! wrote must not decide what a root process executes, so these live in a
 //! file only root can write. The console reads it to show the values and
-//! to find the logs it reads itself; nothing it does can change it.
+//! to know which cursors to offer for a log read (the helper reads the
+//! logs, from this file); nothing it does can change it.
 //!
 //! The format is one `key = value` per line, `#` comments and blank lines
 //! ignored. An unknown key or a line that is not `key = value` is an

@@ -68,9 +68,9 @@ use crate::cron::CronJob;
 use crate::db::evidence::{Ingest, IngestStep, INGEST_CHUNK};
 use crate::db::Db;
 use crate::evidence::Evidence;
-use crate::logread::{self, FileCursor};
+use crate::hostlog::{self, source_key, Chunk, Cursor, LogReader, Request, Sources};
 use crate::protection::Detector;
-use crate::sshlog::{self, Located, SshSource};
+use crate::sshlog::{self, SshSource};
 
 /// The logs a pass may read: flags from the command line, which win over
 /// the stored paths (see [`crate::logpaths`]).
@@ -83,6 +83,22 @@ pub struct Flags {
     pub stored: crate::logpaths::LogPaths,
 }
 
+impl Flags {
+    /// Where these say the logs are, for reading them in process.
+    pub fn sources(&self) -> Sources {
+        Sources::new(
+            &self.stored,
+            self.access_log.as_deref(),
+            self.ssh_log.as_deref(),
+        )
+    }
+}
+
+/// The most requests one pass makes of one log: a gigabyte of it. What a
+/// log grows by faster than that is read by the next pass, from where this
+/// one stopped.
+const MAX_REQUESTS: usize = 256;
+
 /// What a pass will read, resolved from the database. Holds no handle to
 /// it, so it can go to another thread.
 #[derive(Debug, Clone)]
@@ -90,15 +106,15 @@ pub struct Plan {
     now: i64,
     access: Option<AccessPlan>,
     ssh: Option<SshPlan>,
-    /// `journalctl`, except in tests.
-    journalctl: PathBuf,
+    /// Where the flags say the logs are: what a pass that reads them in
+    /// process reads (see [`Plan::sources`]).
+    sources: Sources,
 }
 
 #[derive(Debug, Clone)]
 struct AccessPlan {
-    path: PathBuf,
     /// The cursor as stored, which the store compares against.
-    stored: Option<String>,
+    cursor: Option<Cursor>,
     /// Where 0.0.x's access-stats tally stopped, for a log with no cursor
     /// yet: the first read starts there rather than counting the whole
     /// file into `user_agent_stats` a second time.
@@ -108,9 +124,8 @@ struct AccessPlan {
 
 #[derive(Debug, Clone)]
 struct SshPlan {
-    source: SshSource,
     /// The stored cursor of every place the SSH log might turn out to be.
-    stored: HashMap<String, Option<String>>,
+    cursors: Vec<Cursor>,
     /// The oldest a failed login may be and still count, when the SSH
     /// detector is on.
     cutoff: Option<i64>,
@@ -118,8 +133,6 @@ struct SshPlan {
     /// whole the first time (logrotate bounds it); the journal is bounded
     /// by nothing, and every login in the anti-lockout window is wanted.
     look_back: i64,
-    /// Where [`SshSource::Search`] looks before the journal.
-    search: Vec<PathBuf>,
 }
 
 impl Plan {
@@ -128,9 +141,16 @@ impl Plan {
         self.access.is_some() || self.ssh.is_some()
     }
 
+    /// The logs the flags it was planned with name, to [`read`] them in
+    /// process: the CLI's and the TUI's reader, which run as root. The web
+    /// console reads through [`crate::privileged::Privileged`] instead.
+    pub fn sources(&self) -> &Sources {
+        &self.sources
+    }
+
     /// Reads the journal with `program` instead of `journalctl`.
     pub fn with_journalctl(mut self, program: &Path) -> Plan {
-        self.journalctl = program.to_path_buf();
+        self.sources.journalctl = program.to_path_buf();
         self
     }
 }
@@ -159,23 +179,21 @@ fn wants_ssh_log(job: CronJob) -> bool {
 /// Works out what a pass over `jobs` reads.
 pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
     let now = now();
-    let paths = &flags.stored;
+    let sources = flags.sources();
 
     let mut wants_access = false;
     for job in jobs {
         wants_access |= wants_access_log(db, *job)?;
     }
     let access = if wants_access {
-        let path = paths.access_path(flags.access_log.as_deref());
-        let source = source_key(&path);
+        let source = source_key(&sources.access);
         let stored = db.get_log_cursor(&source)?;
         let legacy_offset = match stored {
             Some(_) => None,
-            None => legacy_offset(db, &path)?,
+            None => legacy_offset(db, &sources.access)?,
         };
         Some(AccessPlan {
-            path,
-            stored,
+            cursor: stored.map(|at| Cursor { source, at }),
             legacy_offset,
             watch: watch(db, now)?,
         })
@@ -184,30 +202,24 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
     };
 
     let ssh = if jobs.iter().any(|job| wants_ssh_log(*job)) {
-        let source = paths.ssh(flags.ssh_log.as_deref());
-        let search: Vec<PathBuf> = sshlog::DEFAULT_LOG_PATHS
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        let mut candidates: Vec<String> = match &source {
+        let mut candidates: Vec<String> = match &sources.ssh {
             SshSource::File(path) => vec![source_key(path)],
-            SshSource::Search => search.iter().map(|p| source_key(p)).collect(),
+            SshSource::Search => sources.search.iter().map(|p| source_key(p)).collect(),
         };
         candidates.push(sshlog::JOURNAL_SOURCE.to_string());
-        let mut stored = HashMap::new();
-        for key in candidates {
-            let cursor = db.get_log_cursor(&key)?;
-            stored.insert(key, cursor);
+        let mut cursors = Vec::new();
+        for source in candidates {
+            if let Some(at) = db.get_log_cursor(&source)? {
+                cursors.push(Cursor { source, at });
+            }
         }
         let detector = Detector::SshScanners;
         let window = detector.window_seconds(db)?;
         let cutoff = detector.is_enabled(db)?.then_some(now - window);
         Some(SshPlan {
-            source,
-            stored,
+            cursors,
             cutoff,
             look_back: window.max(crate::db::SSH_LOGIN_WINDOW_SECONDS),
-            search,
         })
     } else {
         None
@@ -217,7 +229,7 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
         now,
         access,
         ssh,
-        journalctl: PathBuf::from("journalctl"),
+        sources,
     })
 }
 
@@ -267,11 +279,6 @@ fn legacy_offset(db: &Db, path: &Path) -> Result<Option<u64>> {
     db.get_access_log_offset(&path.to_string_lossy())
 }
 
-/// The key a file's cursor is stored under: its path, as given.
-fn source_key(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
 /// What one read of one log came to.
 #[derive(Debug, Clone)]
 pub enum Outcome<T> {
@@ -313,44 +320,102 @@ pub struct Read {
     pub ssh: Option<Outcome<SshFindings>>,
 }
 
-/// Reads what `plan` asks for. Blocking, and deliberately without a `Db`:
-/// see the module docs.
-pub fn read(plan: &Plan) -> Read {
+/// Reads what `plan` asks for, through `reader`: [`Plan::sources`] in
+/// process, or the console's [`crate::privileged::Privileged`]. Blocking,
+/// and deliberately without a `Db`: see the module docs.
+pub fn read(plan: &Plan, reader: &dyn LogReader) -> Read {
     Read {
         now: plan.now,
         access: plan
             .access
             .as_ref()
-            .map(|access| read_access(access, plan.now)),
-        ssh: plan
-            .ssh
-            .as_ref()
-            .map(|ssh| read_ssh(ssh, plan.now, &plan.journalctl)),
+            .map(|access| read_access(access, plan.now, reader)),
+        ssh: plan.ssh.as_ref().map(|ssh| read_ssh(ssh, plan.now, reader)),
     }
 }
 
-fn read_access(plan: &AccessPlan, now: i64) -> Outcome<AccessFindings> {
-    let tried = plan.path.display().to_string();
-    let start = match (&plan.stored, plan.legacy_offset) {
-        (Some(stored), _) => FileCursor::decode(stored),
-        (None, Some(offset)) => logread::cursor_at(&plan.path, offset).ok(),
-        (None, None) => None,
+/// Where following one log to its end got.
+struct Followed {
+    source: String,
+    from: Option<String>,
+    to: Option<String>,
+    amount: u64,
+}
+
+/// Asks `reader` for `request`, and again from where each reply stopped,
+/// until the log has no more (or [`MAX_REQUESTS`]), handing each chunk to
+/// `each`. `Err` with what was tried when nothing could be read.
+///
+/// A failure after the first chunk ends the read where it got to, which
+/// the next pass carries on from; so does a log that turns out to be
+/// another one part-way (rotated away, or the search found a different
+/// file), which the next pass starts on.
+fn follow(
+    reader: &dyn LogReader,
+    mut request: Request,
+    each: &mut dyn FnMut(&Chunk),
+) -> Result<Followed, String> {
+    let mut followed: Option<Followed> = None;
+    for _ in 0..MAX_REQUESTS {
+        let chunk = match reader.read_log(&request) {
+            Ok(hostlog::Reply::Read(chunk)) => chunk,
+            Ok(hostlog::Reply::Unavailable(tried)) if followed.is_none() => return Err(tried),
+            Err(err) if followed.is_none() => return Err(format!("{err:#}")),
+            Ok(hostlog::Reply::Unavailable(_)) | Err(_) => break,
+        };
+        let so_far = followed.get_or_insert_with(|| Followed {
+            source: chunk.source.clone(),
+            from: chunk.from.clone(),
+            to: None,
+            amount: 0,
+        });
+        if so_far.source != chunk.source {
+            break;
+        }
+        each(&chunk);
+        so_far.to = chunk.to.clone();
+        so_far.amount += chunk.amount;
+        if !chunk.more {
+            break;
+        }
+        request.cursors = chunk.next().into_iter().collect();
+        request.legacy_offset = None;
+    }
+    followed.ok_or_else(|| "nothing was asked for".to_string())
+}
+
+fn read_access(plan: &AccessPlan, now: i64, reader: &dyn LogReader) -> Outcome<AccessFindings> {
+    let request = Request {
+        legacy_offset: plan.legacy_offset,
+        ..Request::new(hostlog::Log::Access, plan.cursor.iter().cloned().collect())
     };
-    // On a first read nothing dates an undated line, which may be months
-    // old: it counts for nothing. After that, a line that was not there
-    // last pass is from since then.
-    let undated = start.is_some().then_some(now);
-    let mut observer = accesslog::Observer::new(plan.watch.clone()).counting_user_agents();
-    let clock = Clock::Logged { now, undated };
-    let result = logread::read_from(&plan.path, start, &mut |line| observer.line(line, clock));
-    match result {
+    let mut reading: Option<(accesslog::Observer, Clock)> = None;
+    let followed = follow(reader, request, &mut |chunk| {
+        let (observer, clock) = reading.get_or_insert_with(|| {
+            // On a first read nothing dates an undated line, which may be
+            // months old: it counts for nothing. After that, a line that
+            // was not there last pass is from since then.
+            let undated = chunk.resumed.then_some(now);
+            (
+                accesslog::Observer::new(plan.watch.clone()).counting_user_agents(),
+                Clock::Logged { now, undated },
+            )
+        });
+        for line in chunk.lines.split_terminator('\n') {
+            observer.line(line, *clock);
+        }
+    });
+    match followed {
         Ok(done) => {
-            let (evidence, user_agents, counts) = observer.finish();
+            let (evidence, user_agents, counts) = match reading {
+                Some((observer, _)) => observer.finish(),
+                None => Default::default(),
+            };
             Outcome::Read(LogRead {
-                source: source_key(&plan.path),
-                from: plan.stored.clone(),
-                to: Some(done.cursor.encode()),
-                amount: done.bytes,
+                source: done.source,
+                from: done.from,
+                to: done.to,
+                amount: done.amount,
                 findings: AccessFindings {
                     evidence,
                     user_agents,
@@ -358,93 +423,42 @@ fn read_access(plan: &AccessPlan, now: i64) -> Outcome<AccessFindings> {
                 },
             })
         }
-        Err(_) => Outcome::Unavailable(tried),
+        Err(tried) => Outcome::Unavailable(tried),
     }
 }
 
-/// The stored form of a journal cursor.
-const JOURNAL_CURSOR_PREFIX: &str = "journal ";
-
-/// What an unreadable journal is reported as.
-const JOURNAL_TRIED: &str = "journald (units sshd and ssh)";
-
-/// The cursor of the newest sshd entry in the journal, if there is one.
-fn newest_journal_cursor(journalctl: &Path) -> Option<String> {
-    let query = logread::JournalQuery {
-        program: journalctl,
-        units: sshlog::journal_units(),
-        after_cursor: None,
-        since: None,
-        last: Some(1),
+fn read_ssh(plan: &SshPlan, now: i64, reader: &dyn LogReader) -> Outcome<SshFindings> {
+    let request = Request {
+        since: Some(now - plan.look_back),
+        ..Request::new(hostlog::Log::Ssh, plan.cursors.clone())
     };
-    logread::read_journal(&query, &mut |_| {}).ok()?.cursor
-}
-
-fn read_ssh(plan: &SshPlan, now: i64, journalctl: &Path) -> Outcome<SshFindings> {
-    match plan.source.locate_among(&plan.search) {
-        Located::File(path) => {
-            let source = source_key(&path);
-            let stored = plan.stored.get(&source).cloned().flatten();
-            let start = stored.as_deref().and_then(FileCursor::decode);
-            let mut observer =
-                sshlog::Observer::new(plan.cutoff, now, start.is_some().then_some(now));
-            match logread::read_from(&path, start, &mut |line| observer.line(line)) {
-                Ok(done) => {
-                    let (evidence, logins, _) = observer.finish();
-                    Outcome::Read(LogRead {
-                        source,
-                        from: stored,
-                        to: Some(done.cursor.encode()),
-                        amount: done.bytes,
-                        findings: SshFindings { evidence, logins },
-                    })
-                }
-                Err(_) => Outcome::Unavailable(path.display().to_string()),
-            }
+    let mut observer: Option<sshlog::Observer> = None;
+    let followed = follow(reader, request, &mut |chunk| {
+        let observer = observer.get_or_insert_with(|| {
+            sshlog::Observer::new(plan.cutoff, now, chunk.resumed.then_some(now))
+        });
+        for line in chunk.lines.split_terminator('\n') {
+            observer.line(line);
         }
-        Located::Journal => {
-            let source = sshlog::JOURNAL_SOURCE.to_string();
-            let stored = plan.stored.get(&source).cloned().flatten();
-            let after = stored
-                .as_deref()
-                .and_then(|s| s.strip_prefix(JOURNAL_CURSOR_PREFIX));
-            let query = logread::JournalQuery {
-                program: journalctl,
-                units: sshlog::journal_units(),
-                after_cursor: after,
-                since: Some(now - plan.look_back),
-                last: None,
+    });
+    match followed {
+        Ok(done) => {
+            let (evidence, logins) = match observer {
+                Some(observer) => {
+                    let (evidence, logins, _) = observer.finish();
+                    (evidence, logins)
+                }
+                None => Default::default(),
             };
-            // Every entry `short-iso` prints is dated, so an undated line
-            // is not one journald wrote.
-            let mut observer = sshlog::Observer::new(plan.cutoff, now, None);
-            let done = match logread::read_journal(&query, &mut |line| observer.line(line)) {
-                Ok(done) => done,
-                Err(_) => return Outcome::Unavailable(JOURNAL_TRIED.to_string()),
-            };
-            // A first read that found nothing in the look-back: a quiet
-            // host, or a journal this user cannot see. The newest entry,
-            // however old, tells the two apart, and its cursor is where the
-            // next read starts.
-            let cursor = match (&done.cursor, after) {
-                (None, None) => newest_journal_cursor(journalctl),
-                (cursor, _) => cursor.clone(),
-            };
-            // Readable is "it answered, and has at some point had something
-            // to say": an unprivileged journalctl succeeds with nothing, and
-            // that must not read as a log with no logins in it.
-            if cursor.is_none() && after.is_none() {
-                return Outcome::Unavailable(JOURNAL_TRIED.to_string());
-            }
-            let (evidence, logins, _) = observer.finish();
             Outcome::Read(LogRead {
-                source,
-                from: stored.clone(),
-                to: cursor.map(|cursor| format!("{JOURNAL_CURSOR_PREFIX}{cursor}")),
-                amount: done.lines as u64,
+                source: done.source,
+                from: done.from,
+                to: done.to,
+                amount: done.amount,
                 findings: SshFindings { evidence, logins },
             })
         }
+        Err(tried) => Outcome::Unavailable(tried),
     }
 }
 
@@ -630,7 +644,8 @@ impl Storing {
 /// CLI, and `batch`.
 pub fn run(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Applied> {
     let plan = plan(db, jobs, flags)?;
-    apply(db, read(&plan))
+    let read = read(&plan, plan.sources());
+    apply(db, read)
 }
 
 #[cfg(test)]
@@ -690,6 +705,11 @@ mod tests {
             auth,
             flags,
         }
+    }
+
+    /// Reads what `plan` asks for in process, from the logs its flags name.
+    fn read_here(plan: &Plan) -> Read {
+        read(plan, plan.sources())
     }
 
     fn pass(host: &Host) -> Applied {
@@ -759,7 +779,7 @@ mod tests {
             &host.flags,
         )
         .unwrap();
-        let read = read(&plan);
+        let read = read_here(&plan);
         let Some(Outcome::Read(log)) = &read.access else {
             panic!("the log is there");
         };
@@ -977,8 +997,8 @@ mod tests {
         let first = plan(&host.db, &jobs, &host.flags).unwrap();
         let second = plan(&host.db, &jobs, &host.flags).unwrap();
 
-        let a = apply(&host.db, read(&first)).unwrap();
-        let b = apply(&host.db, read(&second)).unwrap();
+        let a = apply(&host.db, read_here(&first)).unwrap();
+        let b = apply(&host.db, read_here(&second)).unwrap();
 
         assert_eq!(a.access, Availability::Read { stored: true });
         assert_eq!(b.access, Availability::Read { stored: false });
@@ -1005,8 +1025,8 @@ mod tests {
             .collect();
         append(&host.access, &lines);
         let jobs = [CronJob::RecordAccessStats];
-        let mut a = store(read(&plan(&host.db, &jobs, &host.flags).unwrap())).chunked(3);
-        let mut b = store(read(&plan(&host.db, &jobs, &host.flags).unwrap())).chunked(3);
+        let mut a = store(read_here(&plan(&host.db, &jobs, &host.flags).unwrap())).chunked(3);
+        let mut b = store(read_here(&plan(&host.db, &jobs, &host.flags).unwrap())).chunked(3);
 
         let (mut done_a, mut done_b, mut steps) = (None, None, 0);
         while done_a.is_none() || done_b.is_none() {
@@ -1061,23 +1081,13 @@ mod tests {
         );
     }
 
-    /// A stand-in `journalctl` that records its arguments and prints one
-    /// failed login and a cursor.
-    fn fake_journalctl(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("journalctl");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\n\
-                 echo '{} host sshd[1]: Failed password for root from 203.0.113.50 port 1 ssh2'\n\
-                 echo '-- cursor: s=next'\n",
-                iso(now() - 60)
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    /// A plan for `jobs` that finds the SSH log in the journal, read with
+    /// the `journalctl` in `dir`: no file the search could find, whatever
+    /// the machine running this has in /var/log.
+    fn journal_plan(db: &Db, jobs: &[CronJob], dir: &Path) -> Plan {
+        let mut plan = plan(db, jobs, &Flags::default()).unwrap();
+        plan.sources.search = vec![dir.join("no-auth.log")];
+        plan.with_journalctl(&dir.join("journalctl"))
     }
 
     /// The journal is read from a stored cursor after the first time, and
@@ -1085,29 +1095,29 @@ mod tests {
     #[test]
     fn the_journal_is_read_from_its_cursor_and_first_only_as_far_back_as_needed() {
         let dir = tempfile::tempdir().unwrap();
-        let program = fake_journalctl(dir.path());
+        crate::testing::fake_journalctl(
+            dir.path(),
+            &format!(
+                "echo '{}'",
+                crate::testing::journal_entry(
+                    "s=next",
+                    now() - 60,
+                    "Failed password for root from 203.0.113.50 port 1 ssh2"
+                )
+            ),
+        );
         let db = Db::open_in_memory().unwrap();
         let jobs = [CronJob::Detect(Detector::SshScanners)];
-        let journal_plan = |db: &Db| {
-            let mut plan = plan(db, &jobs, &Flags::default()).unwrap();
-            // No file the search could find, so the journal is what it
-            // finds, whatever the machine running this has in /var/log.
-            if let Some(ssh) = &mut plan.ssh {
-                ssh.search = vec![dir.path().join("no-auth.log")];
-            }
-            plan.with_journalctl(&program)
-        };
 
-        let first = apply(&db, read(&journal_plan(&db))).unwrap();
-        let second = apply(&db, read(&journal_plan(&db))).unwrap();
+        let first = apply(&db, read_here(&journal_plan(&db, &jobs, dir.path()))).unwrap();
+        let second = apply(&db, read_here(&journal_plan(&db, &jobs, dir.path()))).unwrap();
 
         assert!(first.ssh.is_readable() && second.ssh.is_readable());
-        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
-        let calls: Vec<&str> = calls.lines().collect();
+        let calls = crate::testing::journalctl_calls(dir.path());
         assert!(calls[0].contains("--since=@"), "{}", calls[0]);
         assert!(calls[1].contains("--after-cursor=s=next"), "{}", calls[1]);
         for call in &calls {
-            assert!(call.contains("-o short-iso"), "{call}");
+            assert!(call.contains("-o json"), "{call}");
         }
     }
 
@@ -1116,52 +1126,90 @@ mod tests {
     /// read starts after the newest entry, not from the look-back again.
     #[test]
     fn a_quiet_journal_is_readable_and_is_read_from_its_newest_entry_on() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let program = dir.path().join("journalctl");
-        std::fs::write(
-            &program,
-            "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls\"\n\
-             case \"$*\" in *--lines=1*) echo '-- cursor: s=newest' ;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testing::fake_journalctl(
+            dir.path(),
+            &format!(
+                "case \"$*\" in *--lines=1*) echo '{}' ;; esac",
+                crate::testing::journal_entry("s=newest", 1_000_000_000, "Server listening")
+            ),
+        );
         let db = Db::open_in_memory().unwrap();
         let jobs = [CronJob::RenderFirewall];
-        let journal_plan = |db: &Db| {
-            let mut plan = plan(db, &jobs, &Flags::default()).unwrap();
-            if let Some(ssh) = &mut plan.ssh {
-                ssh.search = vec![dir.path().join("no-auth.log")];
-            }
-            plan.with_journalctl(&program)
-        };
 
-        let first = apply(&db, read(&journal_plan(&db))).unwrap();
-        apply(&db, read(&journal_plan(&db))).unwrap();
+        let first = apply(&db, read_here(&journal_plan(&db, &jobs, dir.path()))).unwrap();
+        apply(&db, read_here(&journal_plan(&db, &jobs, dir.path()))).unwrap();
 
         assert!(first.ssh.is_readable(), "{:?}", first.ssh);
-        let calls = std::fs::read_to_string(dir.path().join("calls")).unwrap();
-        let last = calls.lines().last().unwrap();
-        assert!(last.contains("--after-cursor=s=newest"), "{calls}");
+        let calls = crate::testing::journalctl_calls(dir.path());
+        let last = calls.last().unwrap();
+        assert!(last.contains("--after-cursor=s=newest"), "{calls:?}");
     }
 
     /// And a journal with nothing from sshd in it at all -- which is what
     /// an unprivileged `journalctl` shows -- is not.
     #[test]
     fn an_empty_journal_is_unavailable() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let program = dir.path().join("journalctl");
-        std::fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::testing::fake_journalctl(dir.path(), "exit 0");
         let db = Db::open_in_memory().unwrap();
-        let mut plan = plan(&db, &[CronJob::RenderFirewall], &Flags::default()).unwrap();
-        if let Some(ssh) = &mut plan.ssh {
-            ssh.search = vec![dir.path().join("no-auth.log")];
-        }
 
-        let applied = apply(&db, read(&plan.with_journalctl(&program))).unwrap();
+        let plan = journal_plan(&db, &[CronJob::RenderFirewall], dir.path());
+        let applied = apply(&db, read_here(&plan)).unwrap();
 
         assert!(!applied.ssh.is_readable(), "{:?}", applied.ssh);
+    }
+
+    /// A first read of a log larger than one request is many requests,
+    /// and comes to the same evidence and statistics as one read of it
+    /// all, stored once with one cursor.
+    #[test]
+    fn a_log_read_in_many_requests_is_the_same_as_one_read() {
+        struct Small<'a>(&'a Sources);
+        impl LogReader for Small<'_> {
+            fn read_log(&self, request: &Request) -> anyhow::Result<hostlog::Reply> {
+                let mut request = request.clone();
+                request.max_bytes = 500;
+                self.0.read_log(&request)
+            }
+        }
+        let (whole, chunked) = (host(), host());
+        for host in [&whole, &chunked] {
+            for n in 0..40 {
+                append(&host.access, &probe(&format!("203.0.113.{n}"), now() - n));
+            }
+            append(&host.auth, &failed("203.0.113.50").repeat(30));
+        }
+        let jobs = [
+            CronJob::Detect(Detector::ProbePaths),
+            CronJob::Detect(Detector::SshScanners),
+            CronJob::RecordAccessStats,
+        ];
+
+        let one = plan(&whole.db, &jobs, &whole.flags).unwrap();
+        let one = apply(&whole.db, read(&one, one.sources())).unwrap();
+        let many = plan(&chunked.db, &jobs, &chunked.flags).unwrap();
+        let many = apply(&chunked.db, read(&many, &Small(many.sources()))).unwrap();
+
+        assert_eq!(probers(&chunked.db), probers(&whole.db));
+        assert_eq!(probers(&chunked.db).len(), 40);
+        let ssh = |db: &Db| {
+            db.evidence_rows(Detector::SshScanners, 0, Rule::Once)
+                .unwrap()
+        };
+        assert_eq!(
+            format!("{:?}", ssh(&chunked.db)),
+            format!("{:?}", ssh(&whole.db))
+        );
+        assert_eq!(
+            (many.access_counts.lines, many.stats.total_hits),
+            (one.access_counts.lines, one.stats.total_hits)
+        );
+        // Both stopped at the end, so a second pass reads nothing more.
+        let again = plan(&chunked.db, &jobs, &chunked.flags).unwrap();
+        let Some(Outcome::Read(log)) = read(&again, again.sources()).access else {
+            panic!("the log is there");
+        };
+        assert_eq!(log.amount, 0);
     }
 }

@@ -45,7 +45,20 @@
 //! line in one `write`, so an unterminated one is a line still arriving,
 //! and reading half of it would count the half as a line of its own.
 //!
+//! ## How much one read takes
+//!
+//! [`read_chunk`] stops after a budget of bytes, at a line boundary, and
+//! says whether there is more; the cursor it returns is where the next
+//! read picks up, in the rotated copy if that is where it stopped. That is
+//! what lets the root helper serve a large log a piece at a time, each
+//! piece bounded in time and in memory (see [`crate::hostlog`]). A line
+//! longer than [`MAX_LINE`] is read past rather than held: no log this
+//! project reads writes one, and holding it would let one line take as
+//! much memory as it likes.
+//!
 //! journald has cursors of its own, which [`read_journal`] passes through.
+//! It is read as JSON, which carries each entry's cursor, so that a read
+//! can stop after any entry and say where the next one starts.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
@@ -109,25 +122,36 @@ fn head_digest(file: &mut File, len: u64) -> io::Result<Option<u64>> {
     Ok(Some(hash))
 }
 
+/// The longest line a read hands on, in bytes. A longer one is read past
+/// and not handed on: see the module docs.
+pub const MAX_LINE: usize = 64 * 1024;
+
 /// What one incremental read of a file did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileRead {
     /// Where the next read resumes.
     pub cursor: FileCursor,
-    /// Whether there was no cursor to resume from, so the whole file was
-    /// read.
+    /// Whether there was no cursor to resume from, so the file was read
+    /// from its start.
     pub first: bool,
     /// Whether the file had been rotated or truncated since the cursor.
     pub rotated: bool,
     /// Bytes read, the rotated copy's remainder included.
     pub bytes: u64,
+    /// Whether the read stopped at its budget rather than at the end, so
+    /// there may be more to read from [`Self::cursor`].
+    pub more: bool,
 }
 
 /// Reads every complete line of `path` that `from` has not seen, calling
-/// `visit` with each. See the module docs for how a rotation is handled.
-pub fn read_from(
+/// `visit` with each, and stops at the first line boundary at or after
+/// `budget` bytes. The cursor it returns resumes the read exactly there,
+/// in the rotated copy if that is where the budget ran out. See the module
+/// docs for how a rotation is handled.
+pub fn read_chunk(
     path: &Path,
     from: Option<FileCursor>,
+    budget: u64,
     visit: &mut dyn FnMut(&str),
 ) -> io::Result<FileRead> {
     let mut file = File::open(path)?;
@@ -146,14 +170,27 @@ pub fn read_from(
                 (0, true)
             }
         }
-        Some(cursor) => {
-            bytes += drain_rotated_copy(path, cursor, visit);
-            (0, true)
-        }
+        Some(cursor) => match drain_rotated_copy(path, cursor, budget, visit) {
+            // The budget ran out in the copy: the next read carries on
+            // there, with the copy's own cursor.
+            Drained::Partly(cursor, read) => {
+                return Ok(FileRead {
+                    cursor,
+                    first: false,
+                    rotated: true,
+                    bytes: read,
+                    more: true,
+                })
+            }
+            Drained::Finished(read) => {
+                bytes += read;
+                (0, true)
+            }
+        },
         None => (0, false),
     };
 
-    let end = stream(&mut file, start, true, visit)?;
+    let (end, more) = stream(&mut file, start, true, budget.saturating_sub(bytes), visit)?;
     bytes += end - start;
     let head_len = end.min(HEAD_BYTES);
     let head = head_digest(&mut file, head_len)?.unwrap_or_default();
@@ -168,6 +205,7 @@ pub fn read_from(
         first: from.is_none(),
         rotated,
         bytes,
+        more,
     })
 }
 
@@ -188,40 +226,56 @@ pub fn cursor_at(path: &Path, offset: u64) -> io::Result<FileCursor> {
     })
 }
 
+/// How far [`drain_rotated_copy`] got.
+enum Drained {
+    /// To the end of the copy, or there was no copy to read: this many
+    /// bytes.
+    Finished(u64),
+    /// This many bytes, and then the budget ran out; the cursor is where
+    /// in the copy the next read carries on.
+    Partly(FileCursor, u64),
+}
+
 /// The rest of a rotated file, if logrotate left it at `<path>.1` and it
-/// is the one `cursor` was reading. Best effort: a copy that is not there,
-/// or is not that file, means the lines are gone, which is what happened
-/// to them before this existed too.
-fn drain_rotated_copy(path: &Path, cursor: FileCursor, visit: &mut dyn FnMut(&str)) -> u64 {
+/// is the one `cursor` was reading, as far as `budget` goes. Best effort:
+/// a copy that is not there, or is not that file, means the lines are
+/// gone, which is what happened to them before this existed too.
+fn drain_rotated_copy(
+    path: &Path,
+    cursor: FileCursor,
+    budget: u64,
+    visit: &mut dyn FnMut(&str),
+) -> Drained {
     let mut name = path.as_os_str().to_owned();
     name.push(".1");
     let rotated = PathBuf::from(name);
     let Ok(mut file) = File::open(&rotated) else {
-        return 0;
+        return Drained::Finished(0);
     };
     let Ok(meta) = file.metadata() else {
-        return 0;
+        return Drained::Finished(0);
     };
     if meta.dev() != cursor.dev
         || meta.ino() != cursor.ino
         || meta.len() < cursor.offset
         || head_digest(&mut file, cursor.head_len).ok().flatten() != Some(cursor.head)
     {
-        return 0;
+        return Drained::Finished(0);
     }
     // Complete lines and the last one too: nothing will ever be appended
     // to a rotated file, so an unterminated line there is as whole as it
     // will get.
-    stream(&mut file, cursor.offset, false, visit)
-        .map(|end| end - cursor.offset)
-        .unwrap_or(0)
-}
-
-/// Every line of `path`, the last one too whether or not it has a newline.
-/// For the readers that want the whole file once rather than what is new.
-pub fn read_whole(path: &Path, visit: &mut dyn FnMut(&str)) -> io::Result<()> {
-    let mut file = File::open(path)?;
-    stream(&mut file, 0, false, visit).map(|_| ())
+    match stream(&mut file, cursor.offset, false, budget, visit) {
+        Ok((end, true)) => Drained::Partly(
+            FileCursor {
+                offset: end,
+                ..cursor
+            },
+            end - cursor.offset,
+        ),
+        Ok((end, false)) => Drained::Finished(end - cursor.offset),
+        Err(_) => Drained::Finished(0),
+    }
 }
 
 /// Every line in the last `max_bytes` of `path`, starting at the first
@@ -231,7 +285,7 @@ pub fn read_tail(path: &Path, max_bytes: u64, visit: &mut dyn FnMut(&str)) -> io
     let mut file = File::open(path)?;
     let len = file.metadata()?.len();
     if len <= max_bytes {
-        return stream(&mut file, 0, false, visit).map(|_| ());
+        return stream(&mut file, 0, false, u64::MAX, visit).map(|_| ());
     }
     // Start one byte early, so a tail that begins exactly on a line
     // boundary keeps its first line, and drop everything up to the first
@@ -240,47 +294,83 @@ pub fn read_tail(path: &Path, max_bytes: u64, visit: &mut dyn FnMut(&str)) -> io
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(file);
     let mut skipped = Vec::new();
-    let partial = reader.read_until(b'\n', &mut skipped)? as u64;
-    stream_reader(reader, start + partial, false, visit).map(|_| ())
+    let (partial, _) = next_line(&mut reader, &mut skipped)?;
+    stream_reader(reader, start + partial as u64, false, u64::MAX, visit).map(|_| ())
 }
 
-/// Reads lines from `start`, returning the offset just past the last line
-/// read. With `complete_only`, an unterminated last line is not read, and
-/// the offset stays before it.
+/// Reads lines from `start` until `budget` bytes have been read, and
+/// returns the offset just past the last line read and whether the budget
+/// stopped it. With `complete_only`, an unterminated last line is not
+/// read, and the offset stays before it.
 fn stream(
     file: &mut File,
     start: u64,
     complete_only: bool,
+    budget: u64,
     visit: &mut dyn FnMut(&str),
-) -> io::Result<u64> {
+) -> io::Result<(u64, bool)> {
     file.seek(SeekFrom::Start(start))?;
-    stream_reader(BufReader::new(file), start, complete_only, visit)
+    stream_reader(BufReader::new(file), start, complete_only, budget, visit)
 }
 
 fn stream_reader<R: Read>(
     mut reader: BufReader<R>,
     start: u64,
     complete_only: bool,
+    budget: u64,
     visit: &mut dyn FnMut(&str),
-) -> io::Result<u64> {
+) -> io::Result<(u64, bool)> {
     let mut offset = start;
     let mut line = Vec::with_capacity(512);
     loop {
-        line.clear();
-        let read = reader.read_until(b'\n', &mut line)?;
-        if read == 0 {
-            return Ok(offset);
+        if offset - start >= budget {
+            return Ok((offset, true));
         }
-        let terminated = line.last() == Some(&b'\n');
-        if !terminated && complete_only {
-            return Ok(offset);
+        line.clear();
+        let (read, terminated) = next_line(&mut reader, &mut line)?;
+        if read == 0 || (!terminated && complete_only) {
+            return Ok((offset, false));
         }
         offset += read as u64;
         let body = line.strip_suffix(b"\n").unwrap_or(&line);
         let body = body.strip_suffix(b"\r").unwrap_or(body);
+        // Held only as far as `MAX_LINE` and a little, so this is a line
+        // that was longer, and is passed over.
+        if read > line.len() || body.len() > MAX_LINE {
+            continue;
+        }
         // Lossy, one line at a time: the bytes are the client's, and one
         // that is not UTF-8 must not make the rest of the file unreadable.
         visit(&String::from_utf8_lossy(body));
+    }
+}
+
+/// Reads one line, its newline included, into `line`, but keeps no more
+/// of it than [`MAX_LINE`] and its line ending: a longer line is consumed
+/// whole and held only that far. Returns the bytes consumed and whether
+/// the line ended in a newline.
+fn next_line<R: BufRead>(reader: &mut R, line: &mut Vec<u8>) -> io::Result<(usize, bool)> {
+    let mut consumed = 0;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        if available.is_empty() {
+            return Ok((consumed, false));
+        }
+        let (take, ends) = match available.iter().position(|&b| b == b'\n') {
+            Some(at) => (at + 1, true),
+            None => (available.len(), false),
+        };
+        let room = (MAX_LINE + 2).saturating_sub(line.len());
+        line.extend_from_slice(&available[..take.min(room)]);
+        reader.consume(take);
+        consumed += take;
+        if ends {
+            return Ok((consumed, true));
+        }
     }
 }
 
@@ -297,6 +387,8 @@ pub struct JournalQuery<'a> {
     pub since: Option<i64>,
     /// Only the newest this many entries.
     pub last: Option<usize>,
+    /// Stop after the entry that takes the lines read to this many bytes.
+    pub max_bytes: Option<u64>,
 }
 
 impl<'a> JournalQuery<'a> {
@@ -306,9 +398,11 @@ impl<'a> JournalQuery<'a> {
             args.push("-u".to_string());
             args.push(unit.to_string());
         }
-        // `short-iso`, not `cat`: `cat` drops the timestamp, and a window
-        // needs it. The message is the same either way.
-        args.extend(["-o", "short-iso", "--no-pager", "-q", "--show-cursor"].map(String::from));
+        // JSON, not `short-iso`: every entry carries its own cursor, so a
+        // read can stop after any of them. Each is printed as `short-iso`
+        // would print it (see `journal_line`); `cat` would drop the time,
+        // and a window needs it.
+        args.extend(["-o", "json", "--no-pager", "-q"].map(String::from));
         if let Some(cursor) = self.after_cursor {
             args.push(format!("--after-cursor={cursor}"));
         } else if let Some(since) = self.since {
@@ -328,10 +422,14 @@ pub struct JournalRead {
     pub cursor: Option<String>,
     /// How many entries were read.
     pub lines: usize,
+    /// Whether [`JournalQuery::max_bytes`] stopped the read before the
+    /// journal ran out.
+    pub more: bool,
 }
 
-/// Streams the entries `query` matches through `visit`. An error when
-/// `journalctl` could not be run or said it failed.
+/// Streams the entries `query` matches through `visit`, each as one
+/// `short-iso` line. An error when `journalctl` could not be run or said
+/// it failed.
 pub fn read_journal(query: &JournalQuery, visit: &mut dyn FnMut(&str)) -> io::Result<JournalRead> {
     let mut child = Command::new(query.program)
         .args(query.args())
@@ -343,22 +441,158 @@ pub fn read_journal(query: &JournalQuery, visit: &mut dyn FnMut(&str)) -> io::Re
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("journalctl gave no output pipe"))?;
+    let budget = query.max_bytes.unwrap_or(u64::MAX);
     let mut cursor = None;
     let mut lines = 0;
-    let streamed = stream_reader(BufReader::new(stdout), 0, false, &mut |line| {
-        if let Some(found) = line.strip_prefix("-- cursor: ") {
-            cursor = Some(found.trim().to_string());
-        } else if !line.starts_with("-- ") {
-            lines += 1;
-            visit(line);
+    let mut bytes = 0u64;
+    let mut more = false;
+    let mut reader = BufReader::new(stdout);
+    let mut raw = Vec::with_capacity(1024);
+    let streamed = loop {
+        if bytes >= budget {
+            more = true;
+            break Ok(());
         }
-    });
+        raw.clear();
+        // Counted as JSON, which is longer than the line it becomes, so
+        // the budget bounds both the work and what is handed on.
+        match next_line(&mut reader, &mut raw) {
+            Ok((0, _)) => break Ok(()),
+            Ok((read, _)) => bytes += read as u64,
+            Err(err) => break Err(err),
+        }
+        // An entry is one line of JSON; one longer than a line may be is
+        // not one this reads, and one that does not parse is not one
+        // journald wrote.
+        let Some(entry) = (raw.len() <= MAX_LINE)
+            .then(|| serde_json::from_slice::<JournalEntry>(&raw).ok())
+            .flatten()
+        else {
+            // Still a place in the journal, if its cursor can be read: a
+            // run of such entries longer than the budget must not keep the
+            // next read starting before all of them.
+            if let Some(skipped) = leading_cursor(&raw) {
+                cursor = Some(skipped);
+            }
+            continue;
+        };
+        let line = entry.line();
+        lines += 1;
+        visit(&line);
+        cursor = Some(entry.cursor);
+    };
+    if more {
+        // Stopped early on purpose: what it had left to say is unwanted.
+        let _ = child.kill();
+        let _ = child.wait();
+        streamed?;
+        return Ok(JournalRead {
+            cursor,
+            lines,
+            more,
+        });
+    }
     let status = child.wait()?;
     streamed?;
     if !status.success() {
         return Err(io::Error::other(format!("journalctl exited with {status}")));
     }
-    Ok(JournalRead { cursor, lines })
+    Ok(JournalRead {
+        cursor,
+        lines,
+        more,
+    })
+}
+
+/// The cursor of an entry of `journalctl -o json` that is not read
+/// whole: the first field `journalctl` prints, so it is there even in the
+/// part of a long entry that is kept.
+fn leading_cursor(raw: &[u8]) -> Option<String> {
+    // `{"__CURSOR":"…"`, or with spaces around the colon, as older
+    // versions print it.
+    let text = String::from_utf8_lossy(&raw[..raw.len().min(1024)]);
+    let rest = text.trim_start().strip_prefix('{')?.trim_start();
+    let rest = rest.strip_prefix("\"__CURSOR\"")?.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start().strip_prefix('"')?;
+    let cursor = &rest[..rest.find('"')?];
+    cursor
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'=' || b == b';')
+        .then(|| cursor.to_string())
+}
+
+/// One entry of `journalctl -o json`: the fields a `short-iso` line is
+/// made of, and the entry's cursor.
+#[derive(serde::Deserialize)]
+struct JournalEntry {
+    #[serde(rename = "__CURSOR")]
+    cursor: String,
+    #[serde(rename = "__REALTIME_TIMESTAMP")]
+    realtime: Option<serde_json::Value>,
+    #[serde(rename = "_HOSTNAME")]
+    hostname: Option<serde_json::Value>,
+    #[serde(rename = "SYSLOG_IDENTIFIER")]
+    identifier: Option<serde_json::Value>,
+    #[serde(rename = "_COMM")]
+    comm: Option<serde_json::Value>,
+    #[serde(rename = "_PID")]
+    pid: Option<serde_json::Value>,
+    #[serde(rename = "SYSLOG_PID")]
+    syslog_pid: Option<serde_json::Value>,
+    #[serde(rename = "MESSAGE")]
+    message: Option<serde_json::Value>,
+}
+
+impl JournalEntry {
+    /// The entry as `journalctl -o short-iso` prints it, in UTC:
+    /// `2026-09-28T06:33:01+0000 host sshd[123]: <message>`. The tag is
+    /// the identifier, or the command, and the pid, as `short-iso` takes
+    /// them.
+    ///
+    /// A line break in the message is a space here. The message is partly
+    /// the client's (sshd logs the username it was sent), and a newline in
+    /// it must not become a second line that reads as sshd's own.
+    fn line(&self) -> String {
+        let text = |field: &Option<serde_json::Value>| field.as_ref().and_then(journal_text);
+        let at = text(&self.realtime)
+            .and_then(|micros| micros.parse::<i64>().ok())
+            .map(|micros| {
+                let (y, mo, d, h, mi, s) = crate::logtime::civil(micros.div_euclid(1_000_000));
+                format!("{y}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}+0000")
+            })
+            .unwrap_or_default();
+        let host = text(&self.hostname).unwrap_or_default();
+        let tag = text(&self.identifier)
+            .or_else(|| text(&self.comm))
+            .unwrap_or_default();
+        let pid = text(&self.pid)
+            .or_else(|| text(&self.syslog_pid))
+            .map(|pid| format!("[{pid}]"))
+            .unwrap_or_default();
+        let message = text(&self.message).unwrap_or_default();
+        let line = format!("{at} {host} {tag}{pid}: {message}");
+        line.replace(['\n', '\r'], " ")
+    }
+}
+
+/// A journal field's text: a string as it is, bytes (which is how JSON
+/// carries a value that is not UTF-8) decoded lossily, and the first of a
+/// field that appears more than once.
+fn journal_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Array(items) if items.iter().all(|item| item.is_u64()) => {
+            let bytes: Vec<u8> = items
+                .iter()
+                .filter_map(|item| item.as_u64())
+                .map(|byte| byte as u8)
+                .collect();
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        serde_json::Value::Array(items) => items.first().and_then(journal_text),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -368,7 +602,10 @@ mod tests {
 
     fn lines_of(path: &Path, from: Option<FileCursor>) -> (Vec<String>, FileRead) {
         let mut lines = Vec::new();
-        let read = read_from(path, from, &mut |line| lines.push(line.to_string())).unwrap();
+        let read = read_chunk(path, from, u64::MAX, &mut |line| {
+            lines.push(line.to_string())
+        })
+        .unwrap();
         (lines, read)
     }
 
@@ -511,80 +748,232 @@ mod tests {
         assert_eq!(lines, ["bbbb", "cccc"], "exactly on a boundary");
     }
 
-    /// A stand-in for `journalctl` that prints what it was asked, then two
-    /// entries and a cursor, the way the real one does.
-    fn fake_journalctl(dir: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join("journalctl");
-        std::fs::write(
-            &path,
-            "#!/bin/sh\n\
-             echo \"$@\" > \"$(dirname \"$0\")/args\"\n\
-             echo '2026-09-28T06:33:01+0000 host sshd[1]: Failed password for root from 203.0.113.5 port 1 ssh2'\n\
-             echo '2026-09-28T06:33:02+0000 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2'\n\
-             echo '-- cursor: s=abc;i=2'\n",
+    /// A file read a budget at a time is the same lines as read whole, and
+    /// each read stops at the first line boundary past its budget.
+    #[test]
+    fn a_file_read_in_chunks_is_the_same_lines_as_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        let lines: Vec<String> = (0..50).map(|n| format!("line {n}")).collect();
+        append(&log, &(lines.join("\n") + "\n"));
+
+        let mut seen = Vec::new();
+        let mut cursor = None;
+        let mut reads = 0;
+        loop {
+            let read =
+                read_chunk(&log, cursor, 20, &mut |line| seen.push(line.to_string())).unwrap();
+            reads += 1;
+            assert!(
+                read.bytes < 20 + 8,
+                "{} bytes past a 20-byte budget",
+                read.bytes
+            );
+            cursor = Some(read.cursor);
+            if !read.more {
+                break;
+            }
+        }
+
+        assert_eq!(seen, lines);
+        assert!(reads > 10, "read in {reads} chunks");
+    }
+
+    /// A rotation found half-way through the old file's remainder: the
+    /// copy is finished a chunk at a time, then the new file is read, and
+    /// no line is lost or read twice.
+    #[test]
+    fn a_rotated_copy_is_finished_in_chunks_before_the_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        append(&log, "seen\n");
+        let (_, read) = lines_of(&log, None);
+        let late: Vec<String> = (0..20).map(|n| format!("late {n}")).collect();
+        append(&log, &(late.join("\n") + "\n"));
+        std::fs::rename(&log, dir.path().join("access.log.1")).unwrap();
+        append(&log, "fresh\n");
+
+        let mut seen = Vec::new();
+        let mut cursor = Some(read.cursor);
+        loop {
+            let read =
+                read_chunk(&log, cursor, 30, &mut |line| seen.push(line.to_string())).unwrap();
+            cursor = Some(read.cursor);
+            if !read.more {
+                break;
+            }
+        }
+
+        let mut expected = late.clone();
+        expected.push("fresh".to_string());
+        assert_eq!(seen, expected);
+    }
+
+    /// One line longer than any log writes is read past, not held, and
+    /// the lines around it are read as ever.
+    #[test]
+    fn an_overlong_line_is_passed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("access.log");
+        append(
+            &log,
+            &format!("before\n{}\nafter\n", "x".repeat(MAX_LINE + 10)),
+        );
+
+        let (lines, read) = lines_of(&log, None);
+
+        assert_eq!(lines, ["before", "after"]);
+        assert_eq!(read.cursor.offset, std::fs::metadata(&log).unwrap().len());
+    }
+
+    const SEP_28: i64 = 1_790_577_181;
+
+    fn sshd_entries(dir: &Path) -> PathBuf {
+        use crate::testing::journal_entry;
+        crate::testing::fake_journalctl(
+            dir,
+            &format!(
+                "echo '{}'\necho '{}'\n",
+                journal_entry(
+                    "s=abc;i=1",
+                    SEP_28,
+                    "Failed password for root from 203.0.113.5 port 1 ssh2"
+                ),
+                journal_entry(
+                    "s=abc;i=2",
+                    SEP_28 + 1,
+                    "Accepted publickey for m from 192.0.2.10 port 2 ssh2"
+                ),
+            ),
         )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+    }
+
+    fn query(program: &Path) -> JournalQuery<'_> {
+        JournalQuery {
+            program,
+            units: &["ssh", "sshd"],
+            after_cursor: None,
+            since: None,
+            last: None,
+            max_bytes: None,
+        }
     }
 
     #[test]
-    fn a_journal_read_keeps_the_timestamps_and_returns_the_cursor() {
+    fn a_journal_read_prints_entries_as_short_iso_and_returns_the_cursor() {
         let dir = tempfile::tempdir().unwrap();
-        let program = fake_journalctl(dir.path());
+        let program = sshd_entries(dir.path());
         let mut lines = Vec::new();
         let read = read_journal(
             &JournalQuery {
-                program: &program,
-                units: &["ssh", "sshd"],
                 after_cursor: Some("s=prev"),
-                since: None,
-                last: None,
+                ..query(&program)
             },
             &mut |line| lines.push(line.to_string()),
         )
         .unwrap();
 
         assert_eq!(read.cursor.as_deref(), Some("s=abc;i=2"));
-        assert_eq!(read.lines, 2);
-        assert!(lines[0].starts_with("2026-09-28T06:33:01"), "{lines:?}");
-        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
-        for needle in [
-            "-o short-iso",
-            "--show-cursor",
-            "--after-cursor=s=prev",
-            "-u ssh -u sshd",
-        ] {
+        assert_eq!((read.lines, read.more), (2, false));
+        assert_eq!(
+            lines[0],
+            "2026-09-28T06:33:01+0000 host sshd[1]: Failed password for root from 203.0.113.5 \
+             port 1 ssh2"
+        );
+        let args = crate::testing::journalctl_calls(dir.path()).join("\n");
+        for needle in ["-o json", "--after-cursor=s=prev", "-u ssh -u sshd"] {
             assert!(args.contains(needle), "{needle:?} not in {args}");
         }
-        assert!(!args.contains("-o cat"), "{args}");
+    }
+
+    /// A budget stops the read after an entry, and the cursor is that
+    /// entry's: where the next read starts.
+    #[test]
+    fn a_journal_read_stops_at_its_budget_with_that_entry_s_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = sshd_entries(dir.path());
+        let mut lines = Vec::new();
+        let read = read_journal(
+            &JournalQuery {
+                max_bytes: Some(1),
+                ..query(&program)
+            },
+            &mut |line| lines.push(line.to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(read.cursor.as_deref(), Some("s=abc;i=1"));
+        assert_eq!((read.lines, read.more), (1, true));
+        assert_eq!(lines.len(), 1);
+    }
+
+    /// sshd logs the username a client sends. A newline in it must not
+    /// make a second line, which could read as sshd's own.
+    #[test]
+    fn a_newline_in_a_journal_message_does_not_start_a_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let forged = "Invalid user x\n2026-09-28T06:33:01+0000 host sshd[1]: Accepted publickey \
+                      for m from 192.0.2.66 port 2 ssh2 from 203.0.113.5 port 1";
+        let program = crate::testing::fake_journalctl(
+            dir.path(),
+            &format!(
+                "printf '%s\\n' '{}'",
+                crate::testing::journal_entry("s=1", SEP_28, forged)
+            ),
+        );
+        let mut lines = Vec::new();
+        read_journal(&query(&program), &mut |line| lines.push(line.to_string())).unwrap();
+
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            crate::sshlog::parse_accepted_ips(&lines.join("\n")).is_empty(),
+            "{lines:?}"
+        );
+    }
+
+    /// An entry too long to read is passed over, but its cursor is still
+    /// where the next read starts: a run of them must not hold every read
+    /// before it.
+    #[test]
+    fn an_overlong_journal_entry_is_passed_over_but_moves_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = crate::testing::fake_journalctl(
+            dir.path(),
+            &format!(
+                "echo '{}'\necho '{}'\n",
+                crate::testing::journal_entry(
+                    "s=1",
+                    SEP_28,
+                    "Failed password for root from 203.0.113.5 port 1 ssh2"
+                ),
+                crate::testing::journal_entry("s=2", SEP_28, &"x".repeat(MAX_LINE + 1)),
+            ),
+        );
+        let mut lines = Vec::new();
+        let read =
+            read_journal(&query(&program), &mut |line| lines.push(line.to_string())).unwrap();
+
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(read.cursor.as_deref(), Some("s=2"));
+        assert_eq!(
+            leading_cursor(br#"{ "__CURSOR" : "s=3;i=4", "MESSAGE" : "x"#).as_deref(),
+            Some("s=3;i=4"),
+            "as older journalctl prints it"
+        );
     }
 
     #[test]
     fn a_first_journal_read_asks_only_for_its_window() {
         let query = JournalQuery {
-            program: Path::new("journalctl"),
-            units: &["ssh"],
-            after_cursor: None,
             since: Some(1_790_577_181),
-            last: None,
+            ..query(Path::new("journalctl"))
         };
         assert!(query.args().contains(&"--since=@1790577181".to_string()));
     }
 
     #[test]
     fn a_journal_that_cannot_be_run_is_an_error() {
-        let result = read_journal(
-            &JournalQuery {
-                program: Path::new("/nonexistent/journalctl"),
-                units: &["ssh"],
-                after_cursor: None,
-                since: None,
-                last: None,
-            },
-            &mut |_| {},
-        );
+        let result = read_journal(&query(Path::new("/nonexistent/journalctl")), &mut |_| {});
         assert!(result.is_err());
     }
 }

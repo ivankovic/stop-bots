@@ -212,3 +212,44 @@ pub(crate) fn iso_time(at: i64) -> String {
     let (y, mo, d, h, mi, s) = crate::logtime::civil(at);
     format!("{y}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}+0000")
 }
+
+/// One entry as `journalctl -o json` prints it, from sshd at `at`,
+/// saying `message`, with `cursor` as its cursor, which comes first.
+pub(crate) fn journal_entry(cursor: &str, at: i64, message: &str) -> String {
+    let rest = serde_json::json!({
+        "__REALTIME_TIMESTAMP": (at * 1_000_000).to_string(),
+        "_HOSTNAME": "host",
+        "SYSLOG_IDENTIFIER": "sshd",
+        "_PID": "1",
+        "_SYSTEMD_UNIT": "ssh.service",
+        "MESSAGE": message,
+    })
+    .to_string();
+    format!(
+        "{{\"__CURSOR\":{},{}",
+        serde_json::Value::from(cursor),
+        &rest[1..]
+    )
+}
+
+/// A stand-in for `journalctl` in `dir`, which appends the arguments of
+/// each call to `dir/calls` and then runs `body`: typically an `echo` of a
+/// [`journal_entry`] or two.
+pub(crate) fn fake_journalctl(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+    let path = dir.join("journalctl");
+    write_script(
+        &path,
+        &format!("echo \"$@\" >> \"$(dirname \"$0\")/calls\"\n{body}"),
+    );
+    path
+}
+
+/// The arguments of every call a [`fake_journalctl`] in `dir` received,
+/// one call a line.
+pub(crate) fn journalctl_calls(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(String::from)
+        .collect()
+}

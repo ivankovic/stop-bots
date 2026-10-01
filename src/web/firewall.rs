@@ -175,22 +175,18 @@ pub async fn page(
     // shows the same "no longer counted" panel a stale one does.
     let inspect_ua = params.inspect_ua.as_deref().map(UaRef::parse);
     let ua_page = params.ua_page.unwrap_or(1).max(1);
-    let ssh_log = state.ssh_log.clone();
-
-    // Where the log is comes from the host settings (`set-log-paths` used
-    // to be ignored here). This console reads it itself, with its own
-    // user's access: off the async runtime -- on a host with no readable
-    // auth.log it runs `journalctl` -- and outside the database lock,
-    // which it used to hold against every other request for as long as
-    // the whole journal took to print.
-    let source = state.host().log_paths().ssh(ssh_log.as_deref());
-    let text =
-        tokio::task::spawn_blocking(move || match source.read(crate::sshlog::recent_since()) {
-            crate::sshlog::LogSource::Found(text) => Some(text),
-            crate::sshlog::LogSource::Unavailable => None,
-        })
-        .await
-        .unwrap_or_default();
+    // sshd's authentication lines, which under the service the root
+    // helper reads for this console: from the log the host settings name
+    // (`set-log-paths`), or the one it finds. Off the async runtime -- on a
+    // host with no readable auth.log it runs `journalctl` -- and outside
+    // the database lock, which it used to hold against every other request
+    // for as long as the whole journal took to print.
+    let reader = state.privileged();
+    let text = tokio::task::spawn_blocking(move || {
+        crate::hostlog::ssh_since(&reader, crate::sshlog::recent_since())
+    })
+    .await
+    .unwrap_or_default();
 
     // The database's half only: one page of user agents and what their
     // verdicts depend on, read in one call so the panels describe one

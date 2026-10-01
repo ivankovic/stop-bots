@@ -991,7 +991,7 @@ impl App {
         }
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
-            let read = crate::logscan::read(&plan);
+            let read = crate::logscan::read(&plan, plan.sources());
             let _ = sender.send(Event::App(AppEvent::CronLogRead {
                 jobs,
                 read: Box::new(read),

@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use common::{block_a_bot, own_uid, write_script, HelperHost, HELPER_SITE};
+use stop_bots::hostlog::{Log, LogReader, Request};
 use stop_bots::privileged::{Op, Privileged, Reply, WebAccessMode};
 
 /// Sends `bytes` as they are and returns the helper's answer, raw.
@@ -697,4 +698,239 @@ async fn a_hostile_pattern_row_writes_nothing_of_its_own() {
     for smuggled in ["error_log", "return 200", "/tmp/pwned"] {
         assert!(!written.contains(smuggled), "{smuggled} landed:\n{written}");
     }
+}
+
+// ---- the logs, read through the helper ----
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// `at` as NGINX's `$time_local` writes it, in UTC.
+fn nginx_stamp(at: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (y, mo, d, h, mi, s) = stop_bots::logtime::civil(at);
+    format!(
+        "{d:02}/{}/{y}:{h:02}:{mi:02}:{s:02} +0000",
+        MONTHS[mo as usize - 1]
+    )
+}
+
+/// A host whose access log has a prober for each of `probers` addresses,
+/// and whose auth log has a burst of failed logins from 203.0.113.78, a
+/// login from 198.51.100.4, and a sudo line: all minutes old.
+fn with_logs(host: &HelperHost, probers: usize) {
+    let stamp = nginx_stamp(now() - 120);
+    let (y, mo, d, h, mi, s) = stop_bots::logtime::civil(now() - 120);
+    let iso = format!("{y}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}+0000");
+    let access: String = (0..probers)
+        .map(|n| {
+            format!(
+                "203.0.113.{n} - - [{stamp}] \"GET /.env HTTP/1.1\" 404 0 \"-\" \"curl/8\"\n\
+                 192.0.2.{n} - - [{stamp}] \"GET / HTTP/1.1\" 200 9 \"-\" \"Mozilla/5.0\"\n"
+            )
+        })
+        .collect();
+    std::fs::write(host.dir.path().join("access.log"), access).unwrap();
+    let mut auth = format!("{iso} host sudo[7]: marko : COMMAND=/bin/cat /etc/shadow\n");
+    for attempt in 0..25 {
+        auth.push_str(&format!(
+            "{iso} host sshd[{attempt}]: Failed password for root from 203.0.113.78 port 1 ssh2\n"
+        ));
+    }
+    auth.push_str(&format!(
+        "{iso} host sshd[99]: Accepted publickey for m from 198.51.100.4 port 2 ssh2\n"
+    ));
+    std::fs::write(host.dir.path().join("auth.log"), auth).unwrap();
+}
+
+/// One log pass over `host`, read through `reader`, and the detectors'
+/// decisions on it: the addresses blocked, and those seen logging in.
+fn detect(host: &HelperHost, reader: &dyn LogReader) -> (Vec<String>, Vec<String>) {
+    use stop_bots::cron::CronJob;
+    use stop_bots::protection::Detector;
+    let db = host.open_db();
+    let jobs = [
+        CronJob::Detect(Detector::ProbePaths),
+        CronJob::Detect(Detector::SshScanners),
+        CronJob::RecordAccessStats,
+    ];
+    let flags = stop_bots::logscan::Flags {
+        stored: stop_bots::hostconf::HostConf::load_from(&host.host_conf)
+            .unwrap()
+            .log_paths(),
+        ..Default::default()
+    };
+    let plan = stop_bots::logscan::plan(&db, &jobs, &flags).unwrap();
+    let applied = stop_bots::logscan::apply(&db, stop_bots::logscan::read(&plan, reader)).unwrap();
+    assert!(applied.access.is_readable(), "{:?}", applied.access);
+    assert!(applied.ssh.is_readable(), "{:?}", applied.ssh);
+    stop_bots::cron::run_log_jobs(&db, &jobs, &applied, Some(&host.firewall), false).unwrap();
+    let mut blocked: Vec<String> = db
+        .list_firewall_rules()
+        .unwrap()
+        .into_iter()
+        .map(|rule| rule.address)
+        .collect();
+    blocked.sort();
+    (blocked, applied.logins)
+}
+
+/// **The detectors decide the same, whoever reads the log.** Two identical
+/// hosts, one read in process as a console running as root reads it, one
+/// through the helper as the service reads it: the same addresses are
+/// blocked, the same logins recorded.
+#[test]
+fn the_detectors_decide_the_same_reading_in_process_or_through_the_helper() {
+    let (local, remote) = (HelperHost::new(), HelperHost::new());
+    with_logs(&local, 40);
+    with_logs(&remote, 40);
+    let socket = remote.serve();
+
+    let here = detect(&local, &local.local());
+    let there = detect(&remote, &helper(&socket));
+
+    assert_eq!(here, there);
+    let (blocked, logins) = there;
+    assert!(blocked.contains(&"203.0.113.39".to_string()), "{blocked:?}");
+    assert!(blocked.contains(&"203.0.113.78".to_string()), "{blocked:?}");
+    assert_eq!(logins, ["198.51.100.4"]);
+}
+
+/// Asks `reader` for `log` from the start, `max` bytes at a time, until it
+/// says there is no more; returns every line and how many requests it took.
+fn read_all(reader: &dyn LogReader, log: Log, max: u64) -> (String, usize) {
+    let mut request = Request {
+        max_bytes: max,
+        since: Some(0),
+        ..Request::new(log, Vec::new())
+    };
+    let (mut lines, mut requests) = (String::new(), 0);
+    loop {
+        requests += 1;
+        let Ok(stop_bots::hostlog::Reply::Read(chunk)) = reader.read_log(&request) else {
+            panic!("the log could not be read");
+        };
+        lines.push_str(&chunk.lines);
+        if !chunk.more {
+            return (lines, requests);
+        }
+        request.cursors = chunk.next().into_iter().collect();
+    }
+}
+
+/// A piece at a time through the helper is the same lines as in process,
+/// and of the auth log only sshd's: not the sudo line beside them.
+#[test]
+fn a_log_read_through_the_helper_a_piece_at_a_time_is_the_same_lines() {
+    let host = HelperHost::new();
+    with_logs(&host, 20);
+    let socket = host.serve();
+
+    for log in [Log::Access, Log::Ssh] {
+        let (here, _) = read_all(&host.local(), log, u64::MAX);
+        let (there, requests) = read_all(&helper(&socket), log, 300);
+        assert_eq!(here, there, "{log:?}");
+        assert!(requests > 3, "{log:?} took {requests} requests");
+    }
+    let (ssh, _) = read_all(&helper(&socket), Log::Ssh, u64::MAX);
+    assert_eq!(ssh.lines().count(), 26, "{ssh}");
+    assert!(!ssh.contains("sudo"), "{ssh}");
+}
+
+/// A log read names a log, not a file: a path in the request is a field
+/// the operation does not have, and the request is refused unread.
+#[test]
+fn a_log_read_that_names_a_path_is_refused() {
+    let host = HelperHost::new();
+    let socket = host.serve();
+
+    let answer = raw(
+        &socket,
+        br#"{"ReadLog":{"log":"Access","cursors":[],"legacy_offset":null,"since":null,"max_bytes":100,"path":"/etc/shadow"}}"#,
+    );
+
+    assert!(answer.contains("unknown field"), "answer was: {answer}");
+}
+
+/// **A first pass over a large log through the helper costs about what it
+/// costs in process.** A 100 MB access log, read and parsed by one log pass
+/// in process and then through the helper, which serves it 4 MB a request.
+/// A benchmark, so not run by default:
+///
+/// ```text
+/// cargo test --release --test helper -- --ignored --nocapture a_100_mb_log
+/// ```
+#[test]
+#[ignore = "a benchmark: 100 MB of log, seconds in a release build"]
+fn a_100_mb_log_through_the_helper_is_within_twice_in_process() {
+    use stop_bots::cron::CronJob;
+    use stop_bots::protection::Detector;
+    let stamp = nginx_stamp(now() - 600);
+    let mut log = String::with_capacity(101 << 20);
+    let mut n = 0u32;
+    while log.len() < 100 << 20 {
+        let (path, status) = match n % 50 {
+            0 => ("/.env", 404),
+            1 => ("/wp-login.php", 404),
+            _ => ("/articles/some-post-about-something?page=2", 200),
+        };
+        log.push_str(&format!(
+            "198.51.{}.{} - - [{stamp}] \"GET {path} HTTP/1.1\" {status} 5123 \
+             \"https://example.com/\" \"Mozilla/5.0 (X11; Linux x86_64; rv:{}.0) \
+             Gecko/20100101 Firefox/{}.0\"\n",
+            (n / 250) % 250,
+            n % 250,
+            100 + n % 40,
+            100 + n % 40
+        ));
+        n += 1;
+    }
+    let (local, remote) = (HelperHost::new(), HelperHost::new());
+    for host in [&local, &remote] {
+        std::fs::write(host.dir.path().join("access.log"), &log).unwrap();
+    }
+    let socket = remote.serve();
+    let jobs = [
+        CronJob::Detect(Detector::ProbePaths),
+        CronJob::RecordAccessStats,
+    ];
+    let pass = |host: &HelperHost, reader: &dyn LogReader| {
+        let db = host.open_db();
+        let flags = stop_bots::logscan::Flags {
+            stored: stop_bots::hostconf::HostConf::load_from(&host.host_conf)
+                .unwrap()
+                .log_paths(),
+            ..Default::default()
+        };
+        let plan = stop_bots::logscan::plan(&db, &jobs, &flags).unwrap();
+        let started = std::time::Instant::now();
+        let read = stop_bots::logscan::read(&plan, reader);
+        let took = started.elapsed();
+        let Some(stop_bots::logscan::Outcome::Read(access)) = &read.access else {
+            panic!("the log was not read");
+        };
+        (took, access.amount, access.findings.counts.parsed)
+    };
+
+    let (here, bytes, parsed) = pass(&local, &local.local());
+    let (there, bytes_there, parsed_there) = pass(&remote, &helper(&socket));
+
+    assert_eq!((bytes, parsed), (bytes_there, parsed_there));
+    let ratio = there.as_secs_f64() / here.as_secs_f64();
+    stop_bots::say_err!(
+        "{} MB, {parsed} lines: in process {:.2}s ({:.0} MB/s), through the helper {:.2}s \
+         ({:.0} MB/s), {ratio:.2}x",
+        bytes >> 20,
+        here.as_secs_f64(),
+        (bytes >> 20) as f64 / here.as_secs_f64(),
+        there.as_secs_f64(),
+        (bytes >> 20) as f64 / there.as_secs_f64(),
+    );
+    assert!(ratio < 2.0, "through the helper took {ratio:.2}x as long");
 }

@@ -109,6 +109,11 @@ pub enum Op {
         host: String,
         reload: bool,
     },
+    /// Reads a piece of the access log or of sshd's authentication lines,
+    /// from where an earlier read stopped: see [`crate::hostlog`]. Which
+    /// file, or the journal, is the host settings' to say; the request
+    /// names only the log.
+    ReadLog(crate::hostlog::Request),
 }
 
 /// The two ways Web Access can serve the console.
@@ -129,7 +134,14 @@ impl Op {
             Op::Preview { .. } => "Preview",
             Op::Firewall { .. } => "Firewall",
             Op::WebAccess { .. } => "WebAccess",
+            Op::ReadLog(_) => "ReadLog",
         }
+    }
+
+    /// Whether it needs the database. A log read does not, and the helper
+    /// does not open it for one.
+    pub fn uses_db(&self) -> bool {
+        !matches!(self, Op::ReadLog(_))
     }
 
     /// The site it is about, if it names one: the one parameter the helper
@@ -142,9 +154,10 @@ impl Op {
         }
     }
 
-    /// Whether it only looks: what a read-only console still does itself.
+    /// Whether it only looks: what a read-only console still does itself,
+    /// with its own user's access.
     pub fn only_reads(&self) -> bool {
-        matches!(self, Op::Probe | Op::SiteStatuses)
+        matches!(self, Op::Probe | Op::SiteStatuses | Op::ReadLog(_))
     }
 }
 
@@ -165,6 +178,7 @@ pub enum Reply {
     Preview(crate::preview::Summary),
     Firewall(FirewallReport),
     WebAccess(WebAccessReport),
+    Log(crate::hostlog::Reply),
 }
 
 /// What a firewall run came to, in the words a front-end shows.
@@ -244,6 +258,16 @@ pub trait DbAccess {
 impl DbAccess for Db {
     fn with<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
         f(self)
+    }
+}
+
+/// No database, for an operation that needs none ([`Op::uses_db`]): the
+/// helper does not open it to read a log.
+pub struct NoDb;
+
+impl DbAccess for NoDb {
+    fn with<T>(&self, _: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
+        bail!("this operation is not given the database")
     }
 }
 
@@ -401,6 +425,14 @@ pub fn execute(settings: &Settings, db: &impl DbAccess, op: Op) -> Result<Reply>
                 note: plan.recorded_note().to_string(),
                 reloaded,
             }))
+        }
+        // Rows: none, and no database is opened for it. The log is the
+        // host settings', or what autodetection finds, as for the root
+        // CLI; the request chooses only where in it to start.
+        Op::ReadLog(request) => {
+            let sources =
+                crate::hostlog::Sources::new(&host.log_paths(), None, settings.ssh_log.as_deref());
+            Ok(Reply::Log(crate::hostlog::read(&sources, &request)))
         }
     }
 }
@@ -566,6 +598,26 @@ impl Privileged {
     }
 }
 
+/// The console's way to its logs: in process when it is root, or with its
+/// own access when it is read-only, and otherwise through the helper,
+/// which is the only one of the three that can read them under the
+/// console's unit. Blocking: call it from a blocking thread.
+impl crate::hostlog::LogReader for Privileged {
+    fn read_log(&self, request: &crate::hostlog::Request) -> Result<crate::hostlog::Reply> {
+        let op = Op::ReadLog(request.clone());
+        let reply = match self {
+            Privileged::Local(local) | Privileged::ReadOnly(local) => {
+                execute(&local.settings, &*local.db, op)?
+            }
+            Privileged::Helper(socket) => crate::helper::call(socket, &op)?,
+        };
+        match reply {
+            Reply::Log(reply) => Ok(reply),
+            other => Err(unexpected(&other)),
+        }
+    }
+}
+
 async fn run_local(local: &Arc<Local>, op: Op) -> Result<Reply> {
     let local = Arc::clone(local);
     tokio::task::spawn_blocking(move || execute(&local.settings, &*local.db, op))
@@ -583,6 +635,7 @@ fn unexpected(reply: &Reply) -> anyhow::Error {
         Reply::Preview(_) => "Preview",
         Reply::Firewall(_) => "Firewall",
         Reply::WebAccess(_) => "WebAccess",
+        Reply::Log(_) => "Log",
     };
     anyhow!("the helper answered with a {kind} reply, which is not what was asked for")
 }

@@ -363,6 +363,7 @@ Some directories don't exist yet but should be created if the need arises.
         |- logpaths.rs    <- Where this host's SSH and access logs are, remembered
         |- logscan.rs     <- One pass over the logs: plan, read (no Db), store
         |- logread.rs     <- Reading a log a line at a time, from where the last read stopped
+        |- hostlog.rs     <- The two logs the detectors read, a bounded piece per request (the helper's too)
         |- logtime.rs     <- When a log line says it happened
         |- evidence.rs    <- What each detector counts, and the one decision over it
         |- sshlog.rs      <- SSH log parsing and scan detection

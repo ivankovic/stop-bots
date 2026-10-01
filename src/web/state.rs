@@ -40,7 +40,8 @@ pub struct AppState {
     db: Arc<Mutex<Db>>,
     /// The NGINX config root to scan, as given on the command line.
     pub nginx_root: PathBuf,
-    /// The SSH log to read, if one was specified.
+    /// The SSH log to read, if one was specified: in process only. A
+    /// console with the helper reads the one the host settings name.
     pub ssh_log: Option<PathBuf>,
     /// Live sessions.
     pub sessions: Arc<Sessions>,
@@ -83,9 +84,9 @@ pub struct AppState {
     /// a test can shorten the timeouts rather than wait them out.
     pub limits: crate::web::server::ServeLimits,
     /// The host settings file ([`crate::hostconf`]): read for what the
-    /// Help page shows and for the logs this console reads itself, and by
-    /// an in-process executor for everything else. A field so a test can
-    /// point it at a file of its own.
+    /// Help page shows and for which log cursors to offer, and by an
+    /// in-process executor for everything else, the logs included. A field
+    /// so a test can point it at a file of its own.
     pub host_conf: PathBuf,
     /// How this console does what needs root: see [`Privilege`].
     pub privilege: Privilege,

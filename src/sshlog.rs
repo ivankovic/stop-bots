@@ -111,36 +111,15 @@ impl SshSource {
     /// those calls; it is read from `since` on. Either way only the lines
     /// [`parse_auth_line`] reads are kept, which on a busy host is a small
     /// part of the log and is all any of these readers look at.
+    ///
+    /// Read in process, with this process's access, through
+    /// [`crate::hostlog`]: the same reads the web console asks its helper
+    /// for.
     pub fn read(&self, since: i64) -> LogSource {
-        match self.locate() {
-            Located::File(path) => {
-                let mut text = String::new();
-                match crate::logread::read_whole(&path, &mut |line| keep_auth(&mut text, line)) {
-                    Ok(()) => LogSource::Found(text),
-                    Err(_) => LogSource::Unavailable,
-                }
-            }
-            Located::Journal => self.read_journal_with(Path::new("journalctl"), since),
-        }
-    }
-
-    /// The journal half of [`Self::read`], with `journalctl` named, so a
-    /// test can stand one in.
-    fn read_journal_with(&self, journalctl: &Path, since: i64) -> LogSource {
-        let query = crate::logread::JournalQuery {
-            program: journalctl,
-            units: SSHD_UNIT_NAMES,
-            after_cursor: None,
-            since: Some(since),
-            last: None,
-        };
-        let mut text = String::new();
-        // Nothing at all from journald is how an unprivileged `journalctl`
-        // answers, so it is "could not read", as it always was, rather than
-        // "read, and nobody logged in".
-        match crate::logread::read_journal(&query, &mut |line| keep_auth(&mut text, line)) {
-            Ok(read) if read.lines > 0 => LogSource::Found(text),
-            _ => LogSource::Unavailable,
+        let sources = crate::hostlog::Sources::ssh_only(self.clone());
+        match crate::hostlog::ssh_since(&sources, since) {
+            Some(text) => LogSource::Found(text),
+            None => LogSource::Unavailable,
         }
     }
 
@@ -156,6 +135,7 @@ impl SshSource {
                     after_cursor: None,
                     since: None,
                     last: Some(1),
+                    max_bytes: None,
                 };
                 crate::logread::read_journal(&query, &mut |_| {}).is_ok_and(|read| read.lines > 0)
             }
@@ -174,12 +154,11 @@ pub fn recent_since() -> i64 {
     now - crate::db::SSH_LOGIN_WINDOW_SECONDS
 }
 
-/// Appends `line` to `text` if it is one [`parse_auth_line`] reads.
-fn keep_auth(text: &mut String, line: &str) {
-    if parse_auth_line(line).is_some() {
-        text.push_str(line);
-        text.push('\n');
-    }
+/// Whether `line` is one of sshd's authentication lines: one
+/// [`parse_auth_line`] reads, and so one of the only lines of the SSH log
+/// anything here looks at.
+pub fn is_auth_line(line: &str) -> bool {
+    parse_auth_line(line).is_some()
 }
 
 /// The units whose journal is the SSH log, for [`crate::logscan`].
@@ -1197,29 +1176,30 @@ Jun 12 01:00:01 h sshd[2]: Accepted publickey for marko from 198.51.100.1 port 2
     /// to be read whole on every Firewall page view and every guard.
     #[test]
     fn a_whole_read_of_the_journal_asks_only_for_its_window() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let program = dir.path().join("journalctl");
-        std::fs::write(
-            &program,
-            "#!/bin/sh\necho \"$@\" > \"$(dirname \"$0\")/args\"\n\
-             echo '2026-09-28T06:00:01+0000 host sshd[1]: Accepted publickey for m from 192.0.2.10 port 2 ssh2'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let search = SshSource::Search;
-        assert_eq!(
-            search.locate_among(&[dir.path().join("no-auth.log")]),
-            Located::Journal
+        let program = crate::testing::fake_journalctl(
+            dir.path(),
+            &format!(
+                "echo '{}'",
+                crate::testing::journal_entry(
+                    "s=1",
+                    SEP_28,
+                    "Accepted publickey for m from 192.0.2.10 port 2 ssh2"
+                )
+            ),
         );
+        let sources = crate::hostlog::Sources {
+            search: vec![dir.path().join("no-auth.log")],
+            journalctl: program,
+            ..crate::hostlog::Sources::ssh_only(SshSource::Search)
+        };
 
-        let LogSource::Found(text) = search.read_journal_with(&program, 1_790_000_000) else {
+        let Some(text) = crate::hostlog::ssh_since(&sources, 1_790_000_000) else {
             panic!("the fake journal answered");
         };
 
         assert!(text.contains("192.0.2.10"), "{text}");
-        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
-        assert!(args.contains("--since=@1790000000"), "{args}");
-        assert!(args.contains("-o short-iso"), "{args}");
+        let calls = crate::testing::journalctl_calls(dir.path());
+        assert!(calls[0].contains("--since=@1790000000"), "{calls:?}");
     }
 }
