@@ -199,7 +199,9 @@ fn parse_acl(bytes: &[u8]) -> Option<Vec<AclEntry>> {
     }
     Some(
         entries
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .map(|entry| {
                 (
                     u16::from_le_bytes([entry[0], entry[1]]),
