@@ -2724,10 +2724,11 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
     host.sh(&format!(
         "mkdir -p -m 700 /var/lib/stop-bots && stop-bots scan-sites --root /etc/nginx/sites-enabled --db {HOST_DB}"
     ));
+    // Not the defaults, so that what reaches host.conf is these.
     host.sh(&format!(
         "sqlite3 {HOST_DB} \"INSERT OR REPLACE INTO settings (key, value) VALUES \
-           ('nginx:test_command', 'nginx -t'), \
-           ('nginx:reload_command', 'systemctl reload nginx'), \
+           ('nginx:test_command', '/usr/sbin/nginx -t'), \
+           ('nginx:reload_command', '/usr/sbin/nginx -s reload'), \
            ('nginx:root', '/etc/nginx')\""
     ));
     host.seed_bot("badbot", "BadBot");
@@ -2765,10 +2766,12 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
     }
     // PRIVSEP-CORE: the keys `hostconf` writes.
     let conf = host.sh("cat /etc/stop-bots/host.conf");
-    assert!(
-        conf.contains("systemctl reload nginx"),
-        "the reload command did not reach host.conf:\n{conf}"
-    );
+    for command in ["/usr/sbin/nginx -t", "/usr/sbin/nginx -s reload"] {
+        assert!(
+            conf.contains(command),
+            "{command:?} did not reach host.conf:\n{conf}"
+        );
+    }
     let left = host.sh(&format!(
         "sqlite3 {HOST_DB} \"SELECT count(*) FROM settings WHERE key IN \
            ('nginx:test_command', 'nginx:reload_command', 'nginx:root')\""

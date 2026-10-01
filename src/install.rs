@@ -1416,7 +1416,14 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
         // will be 0755.
         if !options.dry_run {
             match account.filter(|_| owned) {
-                Some(account) => hand_over(dir, account, mode)?,
+                // Resolved first: the directory's own name is in /var/lib,
+                // which is root's, so a link there is the operator's, and
+                // only what is inside the directory is the console's.
+                Some(account) => {
+                    let dir = std::fs::canonicalize(dir)
+                        .with_context(|| format!("resolving {}", dir.display()))?;
+                    hand_over(&dir, account, mode)?
+                }
                 None => set_mode(dir, mode)?,
             }
         }
