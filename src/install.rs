@@ -1677,7 +1677,14 @@ fn hand_over(path: &Path, account: crate::account::Account, mode: u32) -> Result
 /// of it. Every change goes through [`hand_over`], for the reason it
 /// gives. Called after the installer's own writes, because the database
 /// has to exist.
-pub fn secure_database(path: &Path, account: Option<crate::account::Account>) -> Result<()> {
+///
+/// A copy that is not a plain file with one name — a link, a FIFO, a
+/// directory, a hard link — is skipped, without being followed, and named
+/// in what this returns. stop-bots made none of those, so the console's
+/// user did, and refusing the whole install over a name in its own
+/// directory would let it block every upgrade. The database and its
+/// companions are still refused: SQLite opens those.
+pub fn secure_database(path: &Path, account: Option<crate::account::Account>) -> Result<Steps> {
     for file in database_files(path) {
         match account {
             Some(account) => hand_over(&file, account, 0o600)?,
@@ -1693,16 +1700,60 @@ pub fn secure_database(path: &Path, account: Option<crate::account::Account>) ->
             }
         }
     }
-    Ok(())
+    let mut skipped = Steps::new();
+    for copy in backup_copies(path) {
+        let file = match open_plain_copy(&copy) {
+            Ok(file) => file,
+            Err(why) => {
+                skipped.push(format!(
+                    "warning: left {} as it is: {why}, which no copy stop-bots makes is",
+                    copy.display()
+                ));
+                continue;
+            }
+        };
+        if let Some(account) = account {
+            std::os::unix::fs::fchown(&file, Some(account.uid), Some(account.gid))
+                .with_context(|| format!("giving {} to uid {}", copy.display(), account.uid))?;
+        }
+        crate::db::guard::fchmod(&file, 0o600)
+            .with_context(|| format!("setting mode 0600 on {}", copy.display()))?;
+    }
+    Ok(skipped)
 }
 
-/// The database at `path`, its SQLite companions and the copies upgrades
-/// kept beside it, as far as they exist.
+/// The pre-upgrade copy at `path`, opened without following a link or
+/// waiting on a FIFO, if it is a plain file with one name; otherwise what
+/// it is instead.
+fn open_plain_copy(path: &Path) -> std::result::Result<std::fs::File, &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let file = match crate::db::guard::open_nofollow(path) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Err("it is gone"),
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => return Err("it is a symbolic link"),
+        Err(_) => return Err("it could not be opened"),
+    };
+    match file.metadata() {
+        Ok(meta) if !meta.is_file() => Err("it is not a regular file"),
+        Ok(meta) if meta.nlink() > 1 => Err("it has another name (a hard link)"),
+        Ok(_) => Ok(file),
+        Err(_) => Err("it could not be read"),
+    }
+}
+
+/// The database at `path` and its SQLite companions, as far as they
+/// exist.
 fn database_files(path: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = crate::db::guard::with_companions(path)
+    crate::db::guard::with_companions(path)
         .into_iter()
         .filter(|file| std::fs::symlink_metadata(file).is_ok())
-        .collect();
+        .collect()
+}
+
+/// Every name beside the database at `path` that starts like a copy an
+/// upgrade kept (`.bak-v*`), whatever it is.
+fn backup_copies(path: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
     let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
         return files;
     };
@@ -3569,5 +3620,52 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{err:#}").contains("not a plain file"), "{err:#}");
+    }
+
+    /// **A name the console plants among the copies does not stop an
+    /// upgrade.** A link, a FIFO, a directory and a hard link, each named
+    /// like a pre-upgrade copy: each is skipped with a warning naming it,
+    /// none is followed or changed, and the real copy beside them is still
+    /// made private.
+    #[test]
+    fn a_planted_copy_is_skipped_with_a_warning_not_followed() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, "").unwrap();
+        let shadow = dir.path().join("shadow");
+        std::fs::write(&shadow, "root:*:\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let named = |suffix: &str| dir.path().join(format!("db.sqlite3.bak-v{suffix}"));
+        std::os::unix::fs::symlink(&shadow, named("99")).unwrap();
+        crate::testing::mkfifo(&named("98"));
+        std::fs::create_dir(named("97")).unwrap();
+        let other = dir.path().join("other");
+        std::fs::write(&other, "").unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::hard_link(&other, named("96")).unwrap();
+        let real = named("5");
+        std::fs::write(&real, "").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mine = std::fs::metadata(&db).unwrap();
+        let account = crate::account::Account {
+            uid: mine.uid(),
+            gid: mine.gid(),
+        };
+
+        let warnings = secure_database(&db, Some(account)).unwrap();
+
+        for suffix in ["99", "98", "97", "96"] {
+            let name = named(suffix).display().to_string();
+            assert!(
+                warnings.iter().any(|line| line.contains(&name)),
+                "no warning for {name}: {warnings:#?}"
+            );
+        }
+        assert_eq!(warnings.len(), 4, "{warnings:#?}");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o777;
+        assert_eq!(mode(&shadow), 0o640, "the link's target was changed");
+        assert_eq!(mode(&other), 0o644, "the hard link's file was changed");
+        assert_eq!(mode(&real), 0o600, "the real copy was not made private");
     }
 }

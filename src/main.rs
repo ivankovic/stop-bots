@@ -3846,7 +3846,7 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         // database, its companions and any pre-upgrade copies become the
         // console's: on an upgrade from 0.1.0-rc.2 they are root's.
         let account = install::service_account(&layout);
-        install::secure_database(&layout.db_path, account)?;
+        steps.extend(install::secure_database(&layout.db_path, account)?);
         if account.is_some() {
             steps.push(format!(
                 "gave {} and the copies beside it to {}, mode 0600",

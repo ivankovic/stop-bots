@@ -50,6 +50,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - `install web` moves the host settings into `host.conf` before it hands the database's
   directory to the console. The other order deleted an rc.2 host's NGINX commands, root
   and log paths instead of moving them.
+- `install web` skips, with a warning, a `.bak-v*` beside the database that is a link,
+  not a regular file, or a hard link, without following it, instead of failing the
+  upgrade half way.
 
 ### Changed
 
