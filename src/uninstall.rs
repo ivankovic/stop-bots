@@ -796,7 +796,14 @@ fn remove_dir_if_empty(plan: &Plan, options: &Options, report: &mut Report, dir:
         })
         .unwrap_or_default();
     left.sort();
-    if left.is_empty() {
+    // The host settings file is stop-bots' own, kept on purpose without
+    // `--purge` and already named among what is left in place; it is
+    // neither something "stop-bots did not write" nor a reason to say so.
+    let keeps_host_conf = left.iter().any(|name| dir.join(name) == plan.host_conf);
+    left.retain(|name| dir.join(name) != plan.host_conf);
+    if left.is_empty() && keeps_host_conf {
+        // Nothing to report: the directory stays for the file kept in it.
+    } else if left.is_empty() {
         report.step(options, format!("remove {}", dir.display()), || {
             std::fs::remove_dir(dir).with_context(|| format!("failed to remove {}", dir.display()))
         });
@@ -1409,6 +1416,27 @@ mod tests {
         assert!(mine.exists());
         assert!(
             report.kept.iter().any(|k| k.contains("notes.txt")),
+            "{:#?}",
+            report.kept
+        );
+    }
+
+    /// The host settings file stays without `--purge`, as the report's
+    /// "left in place" says, and is not then called somebody else's file.
+    #[test]
+    fn a_kept_host_conf_is_not_called_somebody_elses() {
+        let staged = Staged::new();
+        let rel = crate::hostconf::DEFAULT_PATH.trim_start_matches('/');
+        let host_conf = staged.write(rel, "# stop-bots host settings\n");
+        assert_eq!(
+            host_conf, staged.plan.host_conf,
+            "the test stages the wrong file"
+        );
+
+        let report = run(&staged.plan, Target::All, &Options::default());
+        assert!(host_conf.exists(), "host.conf went without --purge");
+        assert!(
+            !report.kept.iter().any(|k| k.contains("did not write")),
             "{:#?}",
             report.kept
         );

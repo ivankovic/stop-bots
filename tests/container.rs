@@ -5928,10 +5928,23 @@ fn a_stranger_follows_the_quick_start(distro: Distro) {
         "the dry run changed something:\n{dry}"
     );
     let removed = host.quick_start("stop-bots uninstall all");
+    // Without `--purge`, the README says, the database and the host
+    // settings file stay: what the operator set is not thrown away by a
+    // plain uninstall. Everything else is as it was.
+    assert_eq!(
+        host.footprint(),
+        format!("{pristine}host.conf\n"),
+        "the host is not as it was before stop-bots, bar host.conf. uninstall said:\n{removed}"
+    );
+    assert!(
+        !removed.contains("did not write"),
+        "uninstall called a file of its own somebody else's:\n{removed}"
+    );
+    let purged = host.quick_start("stop-bots uninstall all --purge");
     assert_eq!(
         host.footprint(),
         pristine,
-        "the host is not as it was before stop-bots. uninstall said:\n{removed}"
+        "--purge left something behind. It said:\n{purged}"
     );
     let (valid, out, err) = host.run("nginx -t");
     assert!(
