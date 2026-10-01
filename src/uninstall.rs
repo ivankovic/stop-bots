@@ -20,8 +20,10 @@
 //!
 //! Everything stop-bots puts on a host, and how each is taken back:
 //!
-//! - **The two units** (`stop-bots-web.service`, `stop-bots-firewall.service`):
-//!   stopped, disabled, deleted, then `systemctl daemon-reload`.
+//! - **The units**: the console's (`stop-bots-web.service`), its root
+//!   helper's (`stop-bots-helper.socket` and `.service`) and the firewall's
+//!   boot unit (`stop-bots-firewall.service`): stopped, disabled, deleted,
+//!   then `systemctl daemon-reload`.
 //! - **The live firewall rules**: the nft table `inet stop_bots`, and the
 //!   iptables `STOP-BOTS` chain with every jump into it, for IPv4 and IPv6 —
 //!   whichever exist, all of them if several do.
@@ -31,12 +33,14 @@
 //!   refuses it, then reloaded — `nginx::remove_everything`.
 //! - **The firewall scripts** in `/etc/stop-bots`, and the directory once
 //!   it is empty.
-//! - **The database** and its `.bak-v*` copies only with `--purge`.
+//! - **The database** and its `.bak-v*` copies only with `--purge`, and
+//!   with them the `stop-bots` user and group that own them.
 //!
 //! ## The order, and why
 //!
-//! **The units go first**, because the web console is the one thing that
-//! would put the rest back: its internal cron re-applies the NGINX blocks
+//! **The units go first**, the console before its helper, because the
+//! web console is the one thing that would put the rest back: its
+//! internal cron re-applies the NGINX blocks
 //! and re-renders the firewall script every few minutes, so anything
 //! removed while it runs can be back before this command ends. And the
 //! firewall unit reloads the rules at boot; disabled first, a reboot in
@@ -62,7 +66,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::install::{FIREWALL_UNIT, WEB_UNIT};
+use crate::install::{FIREWALL_UNIT, HELPER_SOCKET_UNIT, HELPER_UNIT, WEB_UNIT};
 use crate::nginx::{self, NginxCommands};
 
 /// What to remove. `All` is everything, and the only one that touches
@@ -74,7 +78,7 @@ pub enum Target {
     Nginx,
     /// The live rules, the boot unit and the scripts.
     Firewall,
-    /// The web console's unit.
+    /// The web console's unit and its helper's.
     Web,
     All,
 }
@@ -137,6 +141,11 @@ pub struct Plan {
     /// The database, kept unless `--purge`.
     pub db_path: PathBuf,
     pub systemctl: PathBuf,
+    /// `userdel` and `groupdel`, for `--purge`.
+    pub userdel: PathBuf,
+    pub groupdel: PathBuf,
+    /// The console's user and group, removed with `--purge`.
+    pub user: String,
     pub nft: PathBuf,
     /// `iptables` and `ip6tables`.
     pub iptables: Vec<PathBuf>,
@@ -198,6 +207,9 @@ impl Plan {
             },
             db_path,
             systemctl: crate::host::program("systemctl"),
+            userdel: crate::host::program("userdel"),
+            groupdel: crate::host::program("groupdel"),
+            user: crate::account::USER.to_string(),
             nft: crate::host::program("nft"),
             iptables: vec![
                 crate::host::program("iptables"),
@@ -226,7 +238,7 @@ struct Stored {
 
 impl Stored {
     fn read(db_path: &Path) -> Result<Stored> {
-        use rusqlite::{Connection, OpenFlags, OptionalExtension};
+        use rusqlite::{OpenFlags, OptionalExtension};
 
         if !db_path.is_file() {
             return Ok(Stored::default());
@@ -236,7 +248,10 @@ impl Stored {
         // create the `-wal` and `-shm` files and then cannot delete them,
         // so a dry run would leave two new files beside the database.
         // Nor `Db::open`, which would upgrade the schema.
-        let conn = Connection::open_with_flags(
+        //
+        // Guarded, too: uninstall is root, and the directory is the
+        // console's (see `db::guard`).
+        let conn = crate::db::guard::open_connection(
             db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
@@ -266,6 +281,10 @@ impl Stored {
         } else {
             Vec::new()
         };
+        // PRIVSEP-HOOK(hostconf): the root and the two commands come from
+        // /etc/stop-bots/host.conf once the core's `hostconf` lands. Rows
+        // the console can write must not choose what this root process
+        // runs or which tree it rewrites.
         Ok(Stored {
             root: setting(NginxCommands::ROOT_KEY)?,
             test: setting(NginxCommands::TEST_KEY)?,
@@ -348,7 +367,12 @@ pub fn run(plan: &Plan, target: Target, options: &Options) -> Report {
     // 1. The units, so nothing puts back what the steps below remove.
     let mut removed_a_unit = false;
     if target.web() {
+        // The console first, so nothing asks the helper for anything; then
+        // the socket, so nothing starts the helper again; then the helper,
+        // which has no `[Install]` of its own to disable.
         removed_a_unit |= remove_unit(plan, options, &mut report, WEB_UNIT);
+        removed_a_unit |= remove_unit(plan, options, &mut report, HELPER_SOCKET_UNIT);
+        removed_a_unit |= remove_unit(plan, options, &mut report, HELPER_UNIT);
     } else if plan.unit_dir.join(WEB_UNIT).exists() {
         report.kept.push(format!(
             "{WEB_UNIT} is still installed, and its internal cron re-applies the NGINX \
@@ -393,8 +417,47 @@ pub fn run(plan: &Plan, target: Target, options: &Options) -> Report {
     if target == Target::All {
         remove_dir_if_empty(plan, options, &mut report, &plan.output_dir);
         database(plan, options, &mut report);
+        account(plan, options, &mut report);
     }
     report
+}
+
+/// The console's user and group: removed with `--purge`, which removes
+/// what they own, and kept otherwise, with the database they own. Only on
+/// the host; a `--prefix` tree has no user database of its own.
+fn account(plan: &Plan, options: &Options, report: &mut Report) {
+    let user = plan.user.as_str();
+    if !plan.host {
+        return;
+    }
+    let has_user = crate::account::user(user).is_some();
+    let has_group = crate::account::group(user).is_some();
+    if !has_user && !has_group {
+        return;
+    }
+    if !options.purge {
+        report.kept.push(format!(
+            "the {user} user and group, which own the database. `--purge` removes them too."
+        ));
+        return;
+    }
+    if has_user {
+        report.step(options, format!("userdel {user}"), || {
+            run_program(&plan.userdel, &[user]).map(|_| ())
+        });
+    }
+    // `userdel` removes the user's own group with it, where it was made
+    // with the user; one that is still there afterwards is removed here.
+    let group_left = if options.dry_run {
+        has_group
+    } else {
+        crate::account::group(user).is_some()
+    };
+    if group_left {
+        report.step(options, format!("groupdel {user}"), || {
+            run_program(&plan.groupdel, &[user]).map(|_| ())
+        });
+    }
 }
 
 /// Stops, disables and deletes `unit`, if its file is there. Returns
@@ -407,13 +470,17 @@ fn remove_unit(plan: &Plan, options: &Options, report: &mut Report, unit: &str) 
     }
     if plan.host {
         // Stopped before it is disabled, and each on its own: an operator
-        // reading a failure needs to know which half happened.
+        // reading a failure needs to know which half happened. The helper
+        // is started by its socket and never enabled, so there is nothing
+        // to disable.
         report.step(options, format!("systemctl stop {unit}"), || {
             systemctl(plan, &["stop", unit])
         });
-        report.step(options, format!("systemctl disable {unit}"), || {
-            systemctl(plan, &["disable", unit])
-        });
+        if unit != HELPER_UNIT {
+            report.step(options, format!("systemctl disable {unit}"), || {
+                systemctl(plan, &["disable", unit])
+            });
+        }
     }
     remove_file_step(plan, options, report, &path);
     true
@@ -510,14 +577,19 @@ fn jumps_into(listing: &str, chain: &str) -> Vec<Vec<String>> {
 /// The generated files NGINX may read, wherever they may be: the
 /// record's, and each known name in each `conf.d` it may have gone to.
 fn generated_nginx_files(plan: &Plan) -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = plan.recorded.clone();
+    let console = nginx::console_site_path(&plan.nginx_root);
+    let mut files: Vec<PathBuf> = plan
+        .recorded
+        .iter()
+        .filter(|path| is_recorded_file_ours(path, &plan.managed_dir))
+        .cloned()
+        .collect();
     for conf_d in &plan.conf_d_dirs {
         files.push(nginx::untrusted_rate_limit_conf_path(conf_d));
         files.push(nginx::rate_limit_conf_path(conf_d));
         files.push(nginx::trusted_conf_path(conf_d));
     }
     files.push(plan.managed_dir.join("robots.txt"));
-    let console = nginx::console_site_path(&plan.nginx_root);
     if nginx::is_console_site_file(&console) {
         files.push(console);
     }
@@ -526,6 +598,41 @@ fn generated_nginx_files(plan: &Plan) -> Vec<PathBuf> {
     // The order a removal must go in; see `nginx::ManagedKind`.
     files.sort_by_key(|path| nginx::ManagedKind::of(path));
     files
+}
+
+/// Whether a path the database's record names is a file stop-bots
+/// generated.
+///
+/// The record is a table the console writes, and the console is not
+/// root: a row naming `/etc/passwd`, or a link in `conf.d` pointing at it,
+/// must not have this root process delete it. So it has to be a plain
+/// file, not a link, opening with this project's own header, and either a
+/// `stop-bots*` file in a `conf.d` — any `conf.d`, because finding the
+/// files an old NGINX root left behind is what the record is for — or a
+/// file in `managed_dir`.
+fn is_recorded_file_ours(path: &Path, managed_dir: &Path) -> bool {
+    use std::io::{BufRead, Read};
+    let plain = std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_file());
+    let dir = path
+        .parent()
+        .and_then(|dir| std::fs::canonicalize(dir).ok());
+    let named = path
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("stop-bots"));
+    let placed = dir.is_some_and(|dir| {
+        (named && dir.file_name().is_some_and(|name| name == "conf.d"))
+            || std::fs::canonicalize(managed_dir).is_ok_and(|managed| managed == dir)
+    });
+    let headed = || {
+        let Ok(Some(file)) = crate::db::guard::open_nofollow(path) else {
+            return false;
+        };
+        let mut first = String::new();
+        std::io::BufReader::new(file.take(4096))
+            .read_line(&mut first)
+            .is_ok_and(|_| first.starts_with("# Generated by stop-bots"))
+    };
+    plain && placed && headed()
 }
 
 fn remove_nginx(plan: &Plan, options: &Options, report: &mut Report) {
@@ -754,6 +861,11 @@ mod tests {
             std::fs::create_dir_all(&plan.unit_dir).unwrap();
             let mut staged = Staged { dir, plan };
             staged.plan.systemctl = staged.fake("systemctl", "exit 0");
+            // Never the host's own: a machine running these tests may well
+            // have a `stop-bots` user.
+            staged.plan.userdel = staged.fake("userdel", "exit 0");
+            staged.plan.groupdel = staged.fake("groupdel", "exit 0");
+            staged.plan.user = "stop-bots-test-no-such-user".to_string();
             // No table, and no chain, until a test says otherwise.
             staged.plan.nft = staged.fake("nft", "[ \"$1\" = list ] && exit 1\nexit 0");
             staged.plan.iptables = vec![staged.fake(
@@ -834,6 +946,8 @@ mod tests {
     fn everything_goes_in_the_safe_order() {
         let staged = Staged::new();
         staged.write("etc/systemd/system/stop-bots-web.service", "unit");
+        staged.write("etc/systemd/system/stop-bots-helper.socket", "unit");
+        staged.write("etc/systemd/system/stop-bots-helper.service", "unit");
         staged.write("etc/systemd/system/stop-bots-firewall.service", "unit");
         let mut plan = staged.plan.clone();
         plan.nft = staged.fake("nft", "exit 0");
@@ -851,6 +965,14 @@ mod tests {
         };
         assert!(
             position("systemctl stop stop-bots-web.service")
+                < position("systemctl stop stop-bots-helper.socket")
+        );
+        assert!(
+            position("systemctl stop stop-bots-helper.socket")
+                < position("systemctl stop stop-bots-helper.service")
+        );
+        assert!(
+            position("systemctl stop stop-bots-helper.service")
                 < position("nft delete table inet stop_bots")
         );
         assert!(
@@ -863,9 +985,106 @@ mod tests {
         assert!(!staged
             .path("etc/systemd/system/stop-bots-web.service")
             .exists());
-        assert!(!staged
-            .path("etc/systemd/system/stop-bots-firewall.service")
-            .exists());
+        for unit in [
+            "stop-bots-firewall.service",
+            "stop-bots-helper.socket",
+            "stop-bots-helper.service",
+        ] {
+            assert!(
+                !staged.path(&format!("etc/systemd/system/{unit}")).exists(),
+                "{unit} was left"
+            );
+        }
+        // The helper is started by its socket and never enabled.
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == "systemctl disable stop-bots-helper.service"),
+            "{calls:#?}"
+        );
+    }
+
+    /// `--purge` removes what owns the database along with it: the
+    /// console's user and its group. Without it both stay, and say so.
+    #[test]
+    fn the_consoles_user_goes_only_with_purge() {
+        let staged = Staged::new();
+        let mut plan = staged.plan.clone();
+        // A user that exists, standing in for the console's; the fakes
+        // remove nothing.
+        // SAFETY: no preconditions; reads the process's own credentials.
+        plan.user = crate::account::user_name(unsafe { libc::geteuid() });
+        let has_group = crate::account::group(&plan.user).is_some();
+
+        let kept = run(&plan, Target::All, &Options::default());
+        assert!(
+            !staged
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("userdel")),
+            "{:#?}",
+            staged.calls()
+        );
+        assert!(
+            kept.kept.iter().any(|k| k.contains(&plan.user)),
+            "{:#?}",
+            kept.kept
+        );
+
+        let purged = run(
+            &plan,
+            Target::All,
+            &Options {
+                purge: true,
+                ..Options::default()
+            },
+        );
+        assert_eq!(purged.failures(), 0, "{purged:#?}");
+        let calls = staged.calls();
+        assert!(
+            calls.contains(&format!("userdel {}", plan.user)),
+            "{calls:#?}"
+        );
+        // The fake removed nothing, so the group is still there to remove.
+        assert_eq!(
+            calls.contains(&format!("groupdel {}", plan.user)),
+            has_group,
+            "{calls:#?}"
+        );
+    }
+
+    /// The record is the console's to write, and the console is not
+    /// root: a row naming a file that is not one of ours, or a link that
+    /// is named like one, must not have uninstall delete it.
+    #[test]
+    fn a_recorded_path_that_is_not_ours_is_not_deleted() {
+        let staged = Staged::new();
+        let mut plan = staged.plan.clone();
+        let passwd = staged.write("etc/passwd", "root:x:0:0::/root:/bin/sh\n");
+        let headed_elsewhere = staged.write(
+            "etc/cron.d/stop-bots-job",
+            "# Generated by stop-bots.\n* * * * * root true\n",
+        );
+        let link = staged.path("etc/nginx/conf.d/stop-bots-evil.conf");
+        std::os::unix::fs::symlink(&passwd, &link).unwrap();
+        let unheaded = staged.write("etc/nginx/conf.d/stop-bots-site.conf", "server {}\n");
+        plan.recorded = vec![
+            passwd.clone(),
+            headed_elsewhere.clone(),
+            link.clone(),
+            unheaded.clone(),
+        ];
+
+        let report = run(&plan, Target::Nginx, &Options::default());
+
+        assert_eq!(report.failures(), 0, "{report:#?}");
+        for file in [&passwd, &headed_elsewhere, &unheaded] {
+            assert!(file.exists(), "{} was deleted", file.display());
+        }
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the link was deleted"
+        );
     }
 
     #[test]

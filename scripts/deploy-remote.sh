@@ -21,6 +21,13 @@ unit="$2"
 chmod 755 "$path.new"
 mv "$path.new" "$path"
 
+# The console's root helper runs the same binary, started by its socket. One
+# already running keeps serving the old build until it is restarted; one
+# that is not running starts the new build at the console's next request.
+if systemctl cat stop-bots-helper.service >/dev/null 2>&1; then
+    systemctl try-restart stop-bots-helper.service
+fi
+
 if systemctl cat "$unit" >/dev/null 2>&1; then
     # Restart if the unit is *enabled*, try-restart if it merely exists.
     # The distinction matters in both directions. `try-restart` alone does

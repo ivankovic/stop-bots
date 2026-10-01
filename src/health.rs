@@ -239,6 +239,22 @@ pub struct Probe {
     /// from a CDN's edge addresses. `None` when the log could not be read.
     #[serde(default)]
     pub access_log_cdn: Option<usize>,
+    /// Who the running console is, as the kernel has it: the effective
+    /// uid and every group its process holds. `None` when no console unit
+    /// is running, or it could not be read.
+    #[serde(default)]
+    pub console_identity: Option<crate::account::Identity>,
+    /// Whether the running console was handed the root helper's socket
+    /// (`--helper` in its `ExecStart`) and that socket is listening.
+    /// `None` when no console unit is running.
+    #[serde(default)]
+    pub console_helper: Option<bool>,
+    /// The logs this host is configured to read that the running
+    /// console's process cannot — the access log, and the SSH log or the
+    /// journal. Asked from root, for the console's uid and groups, since
+    /// root itself can read everything.
+    #[serde(default)]
+    pub console_unreadable_logs: Vec<String>,
 }
 
 /// How much of the access log a probe reads: its last 32 MB. Every
@@ -332,6 +348,10 @@ pub fn probe(
     let access_readable = sample.is_some();
     let survey = sample.unwrap_or_default();
     let nginx_home = nginx_home();
+    let unit_active = unit_is_active();
+    let console = unit_active
+        .filter(|active| *active)
+        .and_then(|_| console_identity());
     let container = match &nginx_home {
         NginxHome::Container { name } => Some(name.clone()),
         _ => None,
@@ -346,8 +366,14 @@ pub fn probe(
         stray_generated_files: stray_generated_files(conf_d, Path::new(crate::nginx::CONF_D_DIR)),
         firewall_persists: firewall_persists(backend),
         nftables_conf_flushes: nftables_conf_flushes(),
-        unit_active: unit_is_active(),
+        unit_active,
         unit_binary: unit_binary(),
+        console_helper: console.as_ref().map(|_| console_has_helper()),
+        console_unreadable_logs: console
+            .as_ref()
+            .map(|who| unreadable_logs(who, paths, ssh_log))
+            .unwrap_or_default(),
+        console_identity: console,
         db_free_bytes: free_bytes(db_path),
         // Asked, not read: this used to read the whole log, which on a
         // journald host was the whole sshd journal, once an hour.
@@ -727,6 +753,89 @@ fn unit_is_active() -> Option<bool> {
     }
 }
 
+/// The running console's uid and groups, from its process's
+/// `/proc/<pid>/status` — what it actually holds, which is what decides
+/// what it can read, whatever its unit says.
+fn console_identity() -> Option<crate::account::Identity> {
+    let pid = run(
+        "systemctl",
+        &["show", crate::install::WEB_UNIT, "-p", "MainPID", "--value"],
+    )?;
+    let pid: u32 = pid.trim().parse().ok().filter(|pid| *pid != 0)?;
+    parse_proc_status(&std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?)
+}
+
+/// The effective uid and gid, and the supplementary groups, out of a
+/// `/proc/<pid>/status`.
+fn parse_proc_status(status: &str) -> Option<crate::account::Identity> {
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name))
+            .map(|rest| {
+                rest.split_whitespace()
+                    .filter_map(|word| word.parse::<u32>().ok())
+                    .collect::<Vec<u32>>()
+            })
+    };
+    // Real, effective, saved and filesystem: the second is the one the
+    // kernel checks a read against (strictly the fourth, which follows it).
+    let uid = *field("Uid:")?.get(1)?;
+    let gid = *field("Gid:")?.get(1)?;
+    let mut gids = vec![gid];
+    for group in field("Groups:").unwrap_or_default() {
+        if !gids.contains(&group) {
+            gids.push(group);
+        }
+    }
+    Some(crate::account::Identity { uid, gids })
+}
+
+/// Whether the console's unit hands it the helper's socket, and the
+/// socket is listening. A console without one shows the host and applies
+/// nothing.
+fn console_has_helper() -> bool {
+    let named = run(
+        "systemctl",
+        &["show", crate::install::WEB_UNIT, "-p", "ExecStart"],
+    )
+    .is_some_and(|shown| shown.contains(" --helper "));
+    let listening = run_allowing_failure(
+        "systemctl",
+        &["is-active", crate::install::HELPER_SOCKET_UNIT],
+    )
+    .is_some_and(|state| state.trim() == "active");
+    named && listening
+}
+
+/// The logs the host is set up to read that `who` cannot read.
+fn unreadable_logs(
+    who: &crate::account::Identity,
+    paths: &crate::logpaths::LogPaths,
+    ssh_log: Option<&Path>,
+) -> Vec<String> {
+    let mut logs = vec![paths.access_path(None)];
+    match paths.ssh(ssh_log).locate() {
+        crate::sshlog::Located::File(path) => logs.push(path),
+        crate::sshlog::Located::Journal => logs.extend(system_journal()),
+    }
+    logs.into_iter()
+        .filter(|log| crate::account::readable_by(log, who) == Some(false))
+        .map(|log| log.display().to_string())
+        .collect()
+}
+
+/// The system journal's active file, persistent or volatile, which is
+/// what `journalctl` has to open to read sshd's lines.
+fn system_journal() -> Option<PathBuf> {
+    ["/var/log/journal", "/run/log/journal"]
+        .iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.filter_map(|entry| entry.ok()))
+        .map(|entry| entry.path().join("system.journal"))
+        .find(|file| file.is_file())
+}
+
 fn unit_binary() -> Option<PathBuf> {
     let shown = run(
         "systemctl",
@@ -819,6 +928,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(nginx_applied(db)?);
     checks.push(generated_files_reachable(probe));
     checks.push(service_health(probe));
+    checks.extend(console_account(probe));
+    checks.extend(console_helper(probe));
+    checks.extend(console_log_access(probe));
     checks.push(disk_room(probe));
     checks.push(database_size(db)?);
     checks.push(log_sources(probe));
@@ -1361,6 +1473,112 @@ fn service_health(probe: &Probe) -> Check {
         detail,
         fix,
     }
+}
+
+/// Whether the console runs as root, which since 0.1 it need not: a
+/// console running as root is a compromise of the host away from anyone
+/// who gets code running in it. Said only when a console is running.
+fn console_account(probe: &Probe) -> Option<Check> {
+    let who = probe.console_identity.as_ref()?;
+    let (level, detail, fix) = if who.uid == 0 {
+        (
+            Level::Warn,
+            "the console runs as root, so whoever compromises it has this host".to_string(),
+            Some(
+                "re-run `sudo stop-bots install web` to drop its privileges: it runs the \
+                 console as the stop-bots user, with a root helper for what needs root"
+                    .to_string(),
+            ),
+        )
+    } else {
+        (
+            Level::Ok,
+            format!("runs as {}, not root", crate::account::user_name(who.uid)),
+            None,
+        )
+    };
+    Some(Check {
+        id: "console-account",
+        title: "Console's account",
+        level,
+        detail,
+        fix,
+    })
+}
+
+/// Whether a console that is not root has the root helper to ask. Without
+/// it the console can show everything and apply nothing. Not asked of a
+/// console running as root, which does its own applying — and is
+/// [`console_account`]'s warning.
+fn console_helper(probe: &Probe) -> Option<Check> {
+    let who = probe.console_identity.as_ref()?;
+    if who.uid == 0 {
+        return None;
+    }
+    let (level, detail, fix) = match probe.console_helper? {
+        true => (
+            Level::Ok,
+            format!("asks {} for what needs root", crate::install::HELPER_UNIT),
+            None,
+        ),
+        false => (
+            Level::Warn,
+            "the console has no root helper, so it can show this host but apply nothing"
+                .to_string(),
+            Some(format!(
+                "sudo systemctl enable --now {}, or re-run `sudo stop-bots install web`",
+                crate::install::HELPER_SOCKET_UNIT
+            )),
+        ),
+    };
+    Some(Check {
+        id: "console-helper",
+        title: "Console's root helper",
+        level,
+        detail,
+        fix,
+    })
+}
+
+/// Whether the console, not being root, can read the logs this host is
+/// set up to read. [`log_sources`] asks the same as root, which reads
+/// everything; this is the console's own answer, and the one its
+/// detectors live by.
+fn console_log_access(probe: &Probe) -> Option<Check> {
+    let who = probe.console_identity.as_ref()?;
+    if who.uid == 0 {
+        return None;
+    }
+    let (level, detail, fix) = if probe.console_unreadable_logs.is_empty() {
+        (
+            Level::Ok,
+            "the console can read every log it is set up to read".to_string(),
+            None,
+        )
+    } else {
+        (
+            Level::Warn,
+            format!(
+                "the console's account ({}) cannot read {} — the detectors that read it find \
+                 nothing",
+                crate::account::user_name(who.uid),
+                probe.console_unreadable_logs.join(" or ")
+            ),
+            Some(
+                "re-run `sudo stop-bots install web`, which gives the console the adm and \
+                 systemd-journal groups; for a log owned by another group, `sudo setfacl -m \
+                 u:stop-bots:r <log>` (and `u:stop-bots:x` on each directory above it)"
+                    .to_string(),
+            ),
+        )
+    };
+    Some(Check {
+        id: "console-log-access",
+        title: "Logs the console can read",
+        level,
+        detail,
+        fix,
+    })
 }
 
 fn disk_room(probe: &Probe) -> Check {
@@ -2047,7 +2265,148 @@ mod tests {
             managed_dir_in_container: None,
             container_shares_host_network: None,
             firewall_covers_forward: Some(true),
+            // The console as `install web` leaves it since 0.1.
+            console_identity: Some(console_user()),
+            console_helper: Some(true),
+            console_unreadable_logs: Vec::new(),
         }
+    }
+
+    /// The `stop-bots` user, with the two log groups its unit adds.
+    fn console_user() -> crate::account::Identity {
+        crate::account::Identity {
+            uid: 998,
+            gids: vec![998, 4, 101],
+        }
+    }
+
+    /// The three things a console can be that the split was meant to
+    /// prevent, each its own warning with its own fix — and a console as
+    /// installed raises none of them.
+    #[test]
+    fn a_console_as_installed_raises_none_of_the_privilege_warnings() {
+        let report = assess(&db(), &healthy()).unwrap();
+        for id in ["console-account", "console-helper", "console-log-access"] {
+            assert_eq!(check(&report, id).level, Level::Ok, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_console_running_as_root_is_a_warning_that_says_how_to_drop_it() {
+        let report = assess(
+            &db(),
+            &Probe {
+                console_identity: Some(crate::account::Identity {
+                    uid: 0,
+                    gids: vec![0],
+                }),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        let account = check(&report, "console-account");
+        assert_eq!(account.level, Level::Warn);
+        assert!(
+            account
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("sudo stop-bots install web")),
+            "{account:?}"
+        );
+        // A root console applies for itself; the other two are not its
+        // problems, and one warning is enough.
+        for id in ["console-helper", "console-log-access"] {
+            assert!(
+                report.checks.iter().all(|check| check.id != id),
+                "{id} as well: {:#?}",
+                report.checks
+            );
+        }
+    }
+
+    #[test]
+    fn a_console_without_its_helper_is_a_warning() {
+        let report = assess(
+            &db(),
+            &Probe {
+                console_helper: Some(false),
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        let helper = check(&report, "console-helper");
+        assert_eq!(helper.level, Level::Warn);
+        assert!(
+            helper
+                .fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains(crate::install::HELPER_SOCKET_UNIT)),
+            "{helper:?}"
+        );
+    }
+
+    #[test]
+    fn a_log_the_console_cannot_read_is_named() {
+        let report = assess(
+            &db(),
+            &Probe {
+                console_unreadable_logs: vec!["/srv/logs/access.log".to_string()],
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        let logs = check(&report, "console-log-access");
+        assert_eq!(logs.level, Level::Warn);
+        assert!(logs.detail.contains("/srv/logs/access.log"), "{logs:?}");
+    }
+
+    /// No console running, nothing to say about it.
+    #[test]
+    fn no_running_console_means_no_privilege_checks() {
+        let report = assess(
+            &db(),
+            &Probe {
+                console_identity: None,
+                console_helper: None,
+                ..healthy()
+            },
+        )
+        .unwrap();
+
+        for id in ["console-account", "console-helper", "console-log-access"] {
+            assert!(report.checks.iter().all(|check| check.id != id), "{id}");
+        }
+    }
+
+    /// The effective ids, not the real ones, and every group the process
+    /// holds.
+    #[test]
+    fn a_process_status_gives_its_effective_ids_and_groups() {
+        let status = "Name:\tstop-bots\n\
+                      Uid:\t998\t997\t998\t997\n\
+                      Gid:\t996\t995\t996\t995\n\
+                      Groups:\t4 101 \n";
+
+        assert_eq!(
+            parse_proc_status(status),
+            Some(crate::account::Identity {
+                uid: 997,
+                gids: vec![995, 4, 101],
+            })
+        );
+        assert_eq!(parse_proc_status("Name:\tx\n"), None);
+    }
+
+    /// A probe stored before these fields existed still parses, and says
+    /// nothing about the console's account.
+    #[test]
+    fn a_probe_from_before_the_split_still_parses() {
+        let probe: Probe = serde_json::from_str(r#"{"unit_active":true}"#).unwrap();
+        assert_eq!(probe.console_identity, None);
+        assert!(probe.console_unreadable_logs.is_empty());
     }
 
     /// Alias for [`check`], for tests that bind a local named `check`.

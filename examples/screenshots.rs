@@ -159,6 +159,11 @@ async fn main() -> Result<()> {
             managed_dir_in_container: None,
             container_shares_host_network: None,
             firewall_covers_forward: Some(true),
+            // Left unasked, so the strip in the screenshots is the one it
+            // was: a console as installed adds three OK lines, nothing more.
+            console_identity: None,
+            console_helper: None,
+            console_unreadable_logs: Vec::new(),
         },
     )?;
 

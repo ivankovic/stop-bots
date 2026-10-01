@@ -1194,6 +1194,11 @@ enum Command {
     /// --dry-run prints the whole plan without touching anything. Start
     /// there.
     ///
+    /// `install web` creates the `stop-bots` system user, gives it the
+    /// database, and writes three units: the console, which runs as that
+    /// user, and the root helper's socket and service, which do what needs
+    /// root on the console's behalf.
+    ///
     /// `install web` takes the console settings `set-web` does and stores
     /// them the same way, because the service it starts reads them from
     /// the database.
@@ -1262,15 +1267,16 @@ enum Command {
     },
     /// Remove stop-bots from this host and put it back as it was.
     ///
-    /// Stops and removes both units, deletes the live nft table or
+    /// Stops and removes every unit it installed, deletes the live nft table or
     /// iptables chain, takes the injected blocks out of every NGINX site
     /// (tested with `nginx -t`, put back if that fails, then reloaded),
     /// and deletes the generated NGINX files and firewall scripts. Every
     /// step is reported, a failed one does not stop the rest, and any
     /// failure makes the exit status non-zero.
     ///
-    /// The database is kept, with every setting and rule, unless --purge
-    /// is given; the output says where it is. Needs root, except with
+    /// The database is kept, with every setting and rule, and so is the
+    /// `stop-bots` user that owns it, unless --purge is given; the output
+    /// says where it is. Needs root, except with
     /// --prefix. Run it with --dry-run first.
     Uninstall {
         /// What to remove: `nginx`, `firewall`, `web`, or `all` (the
@@ -1280,8 +1286,8 @@ enum Command {
         /// Print every step and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Also delete the database and the copies upgrades kept of it.
-        /// Only with `all`.
+        /// Also delete the database and the copies upgrades kept of it,
+        /// and the `stop-bots` user and group. Only with `all`.
         #[arg(long)]
         purge: bool,
         /// Remove from this prefix instead of `/`, as `install --prefix`
@@ -1340,7 +1346,7 @@ enum UninstallTarget {
     /// The live nft table or iptables chain, the boot unit and the
     /// firewall scripts.
     Firewall,
-    /// The web console's unit.
+    /// The web console's unit and its root helper's socket and service.
     Web,
     /// All of the above, and /etc/stop-bots once it is empty.
     All,
@@ -3701,8 +3707,31 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
             steps.push("a console password is already set, keeping it".to_string());
         }
 
-        // After the writes, and while the path is still to hand.
-        install::secure_database(&layout.db_path)?;
+        // PRIVSEP-HOOK(hostconf): move the host settings — the NGINX test
+        // and reload commands, the NGINX root and the log paths — out of
+        // the database into /etc/stop-bots/host.conf here, with the core's
+        // migration, once `hostconf` lands. Here: as root, after this
+        // run's own `--root` is stored, and before the console that could
+        // rewrite those rows is restarted as its own user.
+
+        // After the writes, and while the path is still to hand. The
+        // database, its companions and any pre-upgrade copies become the
+        // console's: on an upgrade from 0.1.0-rc.2 they are root's.
+        let account = install::service_account(&layout);
+        install::secure_database(&layout.db_path, account)?;
+        if account.is_some() {
+            steps.push(format!(
+                "gave {} and the copies beside it to {}, mode 0600",
+                layout.db_path.display(),
+                layout.user
+            ));
+        }
+    } else {
+        steps.push(format!(
+            "give {} and the copies beside it to {}, mode 0600",
+            layout.db_path.display(),
+            layout.user
+        ));
     }
 
     // Only now, with the database written and closed, is it safe to start
@@ -3764,9 +3793,17 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         println!("    ssh -L 8787:127.0.0.1:8787 <this-host>");
     }
     println!();
-    println!("One thing that changes now that this runs as root: the internal cron's");
     println!(
-        "daily firewall render writes {}/firewall.next.*, for review.",
+        "The console runs as the {} user. What needs root -- the NGINX config, the",
+        layout.user
+    );
+    println!(
+        "firewall -- it asks of {}, which systemd starts when it",
+        stop_bots::install::HELPER_UNIT
+    );
+    println!("is first needed. The internal cron's daily firewall render writes");
+    println!(
+        "{}/firewall.next.*, for review.",
         layout.output_dir.display()
     );
     println!("Nothing is enforced, or loaded at boot, until something applies it: \"Apply");

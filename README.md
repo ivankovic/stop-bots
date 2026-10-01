@@ -408,29 +408,59 @@ reloads and runs neither.
 sudo stop-bots install web
 ```
 
-Writes `/etc/systemd/system/stop-bots-web.service`, creates `/var/lib/stop-bots` (0700 — it
-holds the console's password hash) and `/etc/stop-bots`, generates a password if there isn't
-one, and enables and starts the unit.
+Creates the `stop-bots` system user, gives it `/var/lib/stop-bots` (0700 — it holds the
+console's password hash) and the database in it (0600), creates `/etc/stop-bots`, writes three
+systemd units, generates a password if there isn't one, and enables and starts them.
 
 **`--dry-run` prints the whole plan and changes nothing.** `--prefix <dir>` writes the same tree
-somewhere you can read it without root. Re-running it replaces a unit it wrote, from any
-version, as long as you have not edited it; if you have, the installer stops and says so
-rather than replacing your edit, and `--force` replaces it anyway.
+somewhere you can read it without root, and creates no user. Re-running it replaces the units
+it wrote, from any version, as long as you have not edited them; if you have, the installer
+stops and says so rather than replacing your edit, and `--force` replaces it anyway. It
+restarts the console, so a new unit takes effect.
 
-The service runs as **root**, because the console rewrites `/etc/nginx`, writes the firewall
-script, and runs `nginx -t` and `systemctl reload nginx`. It yields to the host: it runs at
-`Nice=10` with idle I/O priority, and systemd throttles it at a quarter of RAM and stops it at
-half.
+**Two processes, and only one of them is root:**
 
-It is sandboxed with `ProtectSystem=strict`: it can write its database, `/etc/stop-bots`, the
-NGINX config root and the log directories that config names, and nothing else — not cron,
-not systemd units, not binaries. The limit is worth knowing: it still runs as root and must
-be able to ask systemd to reload NGINX, and anything that can do that can ask systemd for
-more. The sandbox stops a stray or tricked write, not code running as the service. If you
-later add a site that logs somewhere new, re-run `install web` so the unit grants it.
+- **The console**, `stop-bots-web.service`, runs as the `stop-bots` user. It reads the NGINX
+  and SSH logs through the `adm` and `systemd-journal` groups, which its unit adds (nothing is
+  added to `/etc/group`), and writes its database and nothing else. It holds no Linux
+  capability, has no access to netlink, so it cannot change the firewall, and cannot see
+  systemd's sockets.
+- **The helper**, `stop-bots-helper.service`, runs as root. systemd starts it when the console
+  first connects to `/run/stop-bots/helper.sock` (`stop-bots-helper.socket`). Only root and the
+  `stop-bots` group can open that socket, and the helper also checks the user of each caller.
+  It writes the NGINX config and the firewall script, and runs `nginx -t`, the NGINX reload
+  and `nft`. It accepts a fixed set of requests: apply NGINX, apply the firewall, set up Web
+  Access, find the sites, check the host's health. No request contains a path, a command or
+  config text. The NGINX commands, the NGINX config root and the log paths come from
+  `/etc/stop-bots/host.conf`, which only root can write, not from the database.
 
-Only Debian is checked for, because that is what has been tested; the unit is very likely
-correct on any systemd distribution, but the SSH log path it assumes is Debian's.
+**What someone who takes over the console can do, and what they cannot.** If an attacker gets
+code running in the console, they have the `stop-bots` user and what it can reach:
+
+- They can do what a logged-in operator can do: change the blocking policy, block or unblock
+  any address, and apply. The detectors run in the console, so they can also make it block or
+  unblock anything.
+- They can read what the console reads: the logs, and the database with the password hash.
+- They cannot get root through the console. They cannot write to `/etc`, cron, systemd units
+  or binaries, cannot ask systemd to start anything, and cannot choose what the helper runs or
+  which files it writes or deletes. The helper treats the database as hostile: it finds the
+  sites to change on disk, checks again everything it writes from the database, and deletes
+  only the files stop-bots generated.
+
+The helper has the sandbox the console had before 0.1: `ProtectSystem=strict`, with write
+access only to the database, `/etc/stop-bots`, the NGINX config root, the log directories that
+config names (`nginx -t` opens them for writing) and `/run`. This stops a write to cron,
+systemd units or binaries that the helper was tricked into. It does not stop code that runs as
+the helper: that code is root, and root that can ask systemd to reload NGINX can ask it for
+more. If you later add a site that logs somewhere new, re-run `install web` so the helper's
+unit grants it.
+
+Both processes yield to the host: they run at `Nice=10` with idle I/O priority, and systemd
+throttles each at a quarter of RAM and stops it at half. `sudo stop-bots status` warns if the
+console runs as root, if it has no helper, or if its user cannot read a log it must read.
+
+Only Debian is checked for, because that is what has been tested; the units are very likely
+correct on any systemd distribution, but the SSH log path the console assumes is Debian's.
 
 ### Exposing it
 
