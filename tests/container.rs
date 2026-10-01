@@ -1539,11 +1539,11 @@ fn replacing_the_binary_and_restarting_runs_the_new_one() {
     // alone, which is also why the old process keeps serving old code
     // until something restarts it.
     host.sh("cp /usr/local/bin/stop-bots /usr/local/bin/stop-bots.real");
-    host.sh("printf '#!/bin/sh\\ntouch /run/new-build-ran\\nexec /usr/local/bin/stop-bots.real \"$@\"\\n' > /usr/local/bin/stop-bots.new");
+    host.sh("printf '#!/bin/sh\\ntouch /var/lib/stop-bots/new-build-ran\\nexec /usr/local/bin/stop-bots.real \"$@\"\\n' > /usr/local/bin/stop-bots.new");
     host.sh("chmod 755 /usr/local/bin/stop-bots.new");
     host.sh("mv /usr/local/bin/stop-bots.new /usr/local/bin/stop-bots");
     assert!(
-        !host.run("test -e /run/new-build-ran").0,
+        !host.run("test -e /var/lib/stop-bots/new-build-ran").0,
         "the marker exists before the restart, so it proves nothing"
     );
 
@@ -1561,7 +1561,7 @@ fn replacing_the_binary_and_restarting_runs_the_new_one() {
         host.journal("stop-bots-web.service")
     );
     assert!(
-        host.wait_for_file("/run/new-build-ran"),
+        host.wait_for_file("/var/lib/stop-bots/new-build-ran"),
         "the service restarted but re-executed the old binary. journal:\n{}",
         host.journal("stop-bots-web.service")
     );
@@ -2743,7 +2743,10 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
     host.wait_for_console();
     let user_of_console = || {
         let pid = host.unit("stop-bots-web.service", "MainPID");
-        host.sh(&format!("ps -o user= -p {pid}")).trim().to_string()
+        // Not `ps`: the image has no procps.
+        host.sh(&format!("stat -c %U /proc/{pid}"))
+            .trim()
+            .to_string()
     };
     assert_eq!(
         user_of_console(),
@@ -2845,9 +2848,9 @@ fn the_helper_ignores_what_a_compromised_console_wrote_in_the_database() {
            ('nginx:test_command', 'touch /run/stop-bots-pwned-test'), \
            ('nginx:reload_command', 'touch /run/stop-bots-pwned-reload'), \
            ('nginx:root', '/etc');\n\
-         INSERT OR REPLACE INTO managed_files (path, kind) VALUES \
-           ('/etc/stop-bots-canary', 'limits'), \
-           ('/var/lib/stop-bots/stop-bots-limits.conf', 'limits');\n\
+         INSERT OR REPLACE INTO managed_files (path, kind, written_at, version) VALUES \
+           ('/etc/stop-bots-canary', 'nginx-limits', 0, 'x'), \
+           ('/var/lib/stop-bots/stop-bots-limits.conf', 'nginx-limits', 0, 'x');\n\
          UPDATE sites SET config_path = '/etc/cron.d/stop-bots-site';\n",
     );
     for (user_agent, _) in HOSTILE_USER_AGENTS {
