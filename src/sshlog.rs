@@ -463,8 +463,9 @@ fn failed_attempt_ips(log_text: &str) -> Vec<IpAddr> {
 /// screen is a defacement even when it is correctly escaped.
 const MAX_USERNAME_CHARS: usize = 48;
 
-/// A failed-auth line's username as it is safe to show: capped, and with
-/// control characters replaced. `None` for an empty one.
+/// A failed-auth line's username as it is safe to show: capped, with
+/// control characters replaced and invisible ones written out
+/// ([`crate::present::terminal_safe`]). `None` for an empty one.
 ///
 /// Takes the username [`parse_auth_line`] split out, so the address and
 /// the name always come from one reading of the line.
@@ -489,11 +490,10 @@ fn display_username(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
         return Some(std::borrow::Cow::Borrowed(raw));
     }
 
-    let mut user: String = raw
-        .chars()
-        .take(MAX_USERNAME_CHARS)
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect();
+    let mut user = String::with_capacity(raw.len().min(MAX_USERNAME_CHARS * 4));
+    for c in raw.chars().take(MAX_USERNAME_CHARS) {
+        crate::present::push_terminal_safe(&mut user, c);
+    }
     if raw.chars().count() > MAX_USERNAME_CHARS {
         user.push('\u{2026}');
     }

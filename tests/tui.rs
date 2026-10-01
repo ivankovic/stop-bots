@@ -944,7 +944,7 @@ fn nginx_screen_apply_failure_shows_a_dismissible_alert_with_a_root_suggestion()
     // Root bypasses file permission bits, so chmod-ing the file read-only
     // below wouldn't actually make the write fail there.
     if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipping: running as root, permission bits are unenforced");
+        stop_bots::say_err!("skipping: running as root, permission bits are unenforced");
         return;
     }
 

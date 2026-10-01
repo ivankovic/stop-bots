@@ -384,6 +384,8 @@ pub enum KeyOutcome {
 /// is where this tool is run from. Written straight to stdout, past
 /// ratatui, because it is not a cell on screen. A terminal that does not
 /// implement it drops the sequence; nothing is printed either way.
+// A deliberate escape sequence, around base64 that cannot carry one.
+#[allow(clippy::disallowed_methods)]
 pub fn copy_to_clipboard(text: &str) {
     use std::io::Write;
     let mut out = std::io::stdout().lock();

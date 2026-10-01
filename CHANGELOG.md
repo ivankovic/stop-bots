@@ -31,6 +31,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   and anyone who logged in over SSH or to the console in the last 7 days.
 - A console that is not root and has no `--helper` is read-only: it shows everything,
   and every action says it needs the helper.
+- **Nothing the CLI prints can drive the terminal.** Every line, error and warning
+  replaces control characters (C0, DEL, C1) with `�` and writes bidi and zero-width
+  characters out as `\u{…}`. A row the console wrote, or a log line, could set the title
+  or the clipboard of root's terminal through `list-*`, `status`, `apply-blocks` and `batch`.
 
 ### Changed
 

@@ -2232,7 +2232,7 @@ mod tests {
         layout.real = true;
         assert!(layout.binary.is_file(), "the fixture binary must exist");
         let Some(directive) = hidden_from_unit(&layout.binary) else {
-            eprintln!(
+            crate::say_err!(
                 "skipped: {} is not a directory the unit hides",
                 layout.binary.display()
             );

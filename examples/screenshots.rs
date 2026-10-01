@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
         app.screen = screen;
         let path = out.join(format!("{name}.svg"));
         std::fs::write(&path, render_svg(&mut app, rows)?)?;
-        println!("wrote {}", path.display());
+        stop_bots::say!("wrote {}", path.display());
     }
 
     // The same five screens again, as one animation. The stills show what
@@ -303,12 +303,12 @@ async fn web_screenshots(workspace: &Path, nginx_root: &Path, out: &Path) -> Res
         std::fs::write(&html_path, html)?;
 
         let Some(browser) = &browser else {
-            println!("no headless browser found — {name}.png left as it was");
+            stop_bots::say!("no headless browser found — {name}.png left as it was");
             continue;
         };
         let png = out.join(format!("{name}.png"));
         browser.screenshot(&html_path, &png, width, height, &html_dir)?;
-        println!("wrote {}", png.display());
+        stop_bots::say!("wrote {}", png.display());
     }
     Ok(())
 }
@@ -491,7 +491,7 @@ fn tour_gif(app: &mut App, path: &Path) -> Result<()> {
     }
     drop(encoder);
 
-    println!("wrote {}", path.display());
+    stop_bots::say!("wrote {}", path.display());
     Ok(())
 }
 

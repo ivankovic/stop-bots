@@ -96,7 +96,7 @@ impl Item {
             Some((at, _)) => &text[..at],
             None => text,
         };
-        Item::Seen(without_controls(text).into_owned())
+        Item::Seen(crate::present::without_controls(text).into_owned())
     }
 
     /// The bucket `at` falls in.
@@ -114,7 +114,7 @@ impl Item {
     /// as it came was read back as the observation that clears an address.
     pub fn key(&self) -> String {
         match self {
-            Item::Seen(text) => without_controls(text).into_owned(),
+            Item::Seen(text) => crate::present::without_controls(text).into_owned(),
             Item::Clear => "\nclear".to_string(),
             Item::Bucket(start) => format!("\nbucket {start}"),
         }
@@ -131,19 +131,6 @@ impl Item {
             Some(start) => Item::Bucket(start),
             None => Item::Seen(key.to_string()),
         }
-    }
-}
-
-/// `text` with each control character replaced by U+FFFD, borrowed when it
-/// has none, which is nearly always.
-fn without_controls(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.chars().any(char::is_control) {
-        text.chars()
-            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-            .collect::<String>()
-            .into()
-    } else {
-        text.into()
     }
 }
 

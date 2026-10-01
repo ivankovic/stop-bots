@@ -21,8 +21,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::path::{Path, PathBuf};
 use stop_bots::blocks::SourceFilter;
 use stop_bots::db::{Db, FirewallAction, FirewallRule, NewFirewallRule, RuleSource};
+use stop_bots::present::terminal_safe;
 use stop_bots::protection::Detector;
-use stop_bots::{accesslog, botlist, ipranges, nginx, sshlog};
+use stop_bots::{accesslog, botlist, ipranges, nginx, say, say_err, say_inline, sshlog};
 
 const DEFAULT_DB_PATH: &str = stop_bots::db::SYSTEM_PATH;
 
@@ -1529,13 +1530,30 @@ impl From<BlockResponseArg> for stop_bots::db::BlockResponse {
     }
 }
 
+/// Runs the command, and prints its error the way returning it from
+/// `main` would (`Error: ` and anyhow's chain, exit status 1), except
+/// through [`stop_bots::present::terminal_safe_text`]. An error quotes
+/// what it failed on: a site's server name, a path, a value read from the
+/// database or a log, any of which the unprivileged console or a client
+/// could have chosen.
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            say_err!("Error: {err:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     // A one-shot command's output is often piped into something that stops
     // reading early (`| head`). Rust ignores SIGPIPE, so the next write is
-    // an error, and `println!` turns that into a panic. Dying quietly, the
-    // default, is what every other command-line tool does. Not for the
+    // an error, and `say!` (`println!` underneath) turns that into a panic.
+    // Dying quietly, the default, is what every other command-line tool
+    // does. Not for the
     // long-running front-ends and the helper: they write to sockets and a
     // terminal, where a peer going away is an error to handle, not the end
     // of the process.
@@ -1854,7 +1872,7 @@ async fn main() -> Result<()> {
         Some(Command::GenerateDocs { out }) => {
             use clap::CommandFactory;
             for path in stop_bots::docs::generate(Cli::command(), &out)? {
-                println!("{}", path.display());
+                say!("{}", path.display());
             }
             Ok(())
         }
@@ -1889,7 +1907,7 @@ fn migrate_host_settings(db: &Db) -> Result<()> {
     let path = stop_bots::hostconf::path();
     let migrated = stop_bots::hostconf::migrate(db, &path)?;
     if let Some(note) = migrated.note(&path) {
-        eprintln!("{note}");
+        say_err!("{note}");
     }
     Ok(())
 }
@@ -1928,7 +1946,7 @@ fn open_or_fallback(primary: &Path, fallback: impl FnOnce() -> Result<PathBuf>) 
     // its mode, and this one runs before `Db::open` gets the chance.
     if let Err(dir_err) = stop_bots::db::create_private_dir_all(parent) {
         let fallback = fallback()?;
-        eprintln!(
+        say_err!(
             "Note: couldn't create {} ({dir_err}); using {} instead.",
             parent.display(),
             fallback.display()
@@ -1981,6 +1999,8 @@ fn resolve_user_db_path(
 /// first — a `\x1b[6n` query that blocks until the terminal answers, and
 /// errors out after a timeout on any terminal that doesn't. There is no
 /// cursor position worth preserving here.
+// The TUI's own escape sequence, written where ratatui writes its frames.
+#[allow(clippy::disallowed_methods)]
 fn clear_screen() -> Result<()> {
     crossterm::execute!(
         std::io::stdout(),
@@ -2073,20 +2093,20 @@ fn run_status(
         return Ok(());
     }
 
-    println!("{}", report.headline());
+    say!("{}", report.headline());
     if let Some(at) = taken_at {
-        println!("(from a probe taken {})", stop_bots::present::ago(at));
+        say!("(from a probe taken {})", stop_bots::present::ago(at));
     }
-    println!();
+    say!();
 
     for check in shown {
-        println!("  [{}] {}", check.level.tag(), check.title);
-        println!("      {}", check.detail);
+        say!("  [{}] {}", check.level.tag(), check.title);
+        say!("      {}", check.detail);
         if let Some(fix) = &check.fix {
-            println!("      -> {fix}");
+            say!("      -> {fix}");
         }
     }
-    println!();
+    say!();
 
     if report.worst() == Level::Critical {
         // `bail!` rather than `exit(1)`: it prints the reason, and the
@@ -2138,9 +2158,9 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
     let report = stop_bots::batch::run(&db, &options).await;
 
     if verbose {
-        println!("{}", report.full());
+        say!("{}", report.full());
     } else if report.failures() > 0 {
-        eprintln!("{}", report.failures_only());
+        say_err!("{}", report.failures_only());
     }
 
     let failures = report.failures();
@@ -2158,7 +2178,7 @@ fn scan_sites(root: Option<&Path>, db_path: Option<PathBuf>) -> Result<()> {
     for site in &sites {
         db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
     }
-    println!(
+    say!(
         "Discovered {} site(s) under {}",
         sites.len(),
         root.display()
@@ -2178,9 +2198,9 @@ async fn update_bot_lists(
         Some(path) => botlist::store_raw(&db, kind, &std::fs::read_to_string(&path)?)?,
         None => botlist::update(&db, kind).await?,
     };
-    println!("Stored {count} bot(s) from {}", kind.name());
+    say!("Stored {count} bot(s) from {}", kind.name());
     if let Some(note) = botlist::left_out_note(skipped) {
-        println!("It {note}.");
+        say!("It {note}.");
     }
     Ok(())
 }
@@ -2192,14 +2212,14 @@ fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: boo
     botlist::register_all_sources(&db)?;
     let root = nginx::root(&host_settings()?, root);
     let changes = nginx::preview_all_sites(&db, &root);
-    println!("Dry run: nothing is written or reloaded.");
+    say!("Dry run: nothing is written or reloaded.");
     let changes = changes.map_err(|err| format!("{err:#}"));
     for line in stop_bots::preview::nginx_lines(&changes) {
-        println!("{line}");
+        say!("{line}");
     }
     let changes = changes.map_err(|err| anyhow::anyhow!(err))?;
     if diff {
-        print!("{}", stop_bots::preview::nginx_diff(&changes));
+        say_inline!("{}", stop_bots::preview::nginx_diff(&changes));
     }
     print_skipped_entries(&db)
 }
@@ -2209,7 +2229,10 @@ fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: boo
 /// everything else, so this is a warning and not a failure.
 fn print_skipped_entries(db: &Db) -> Result<()> {
     for entry in nginx::skipped_entries(db)? {
-        eprintln!("warning: left out of the NGINX config: {entry}");
+        say_err!(
+            "warning: left out of the NGINX config: {}",
+            terminal_safe(&entry.to_string())
+        );
     }
     Ok(())
 }
@@ -2237,16 +2260,16 @@ fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) ->
         stop_bots::firewall::SshLog::Read(&source),
     );
 
-    println!(
+    say!(
         "Dry run: nothing is downloaded, scanned, written, applied or recorded. Against the \
          database as it is, `batch{}` would:",
         if request.apply { " --apply" } else { "" }
     );
     for line in preview.lines() {
-        println!("{line}");
+        say!("{line}");
     }
     if diff {
-        print!("{}", preview.diff());
+        say_inline!("{}", preview.diff());
     }
     Ok(())
 }
@@ -2263,12 +2286,14 @@ fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) 
     // actually changed on disk.
     let commands = (!no_reload).then(|| host.commands()).transpose()?;
     let outcome = nginx::apply_all_sites_and_reload(&db, &root, commands.as_ref())?;
-    println!(
+    say!(
         "Applied blocking rules to {} site(s) across {} file(s), {} file(s) changed",
-        outcome.sites, outcome.files, outcome.changed
+        outcome.sites,
+        outcome.files,
+        outcome.changed
     );
     if outcome.reloaded {
-        println!("Reloaded NGINX");
+        say!("Reloaded NGINX");
     }
     print_skipped_entries(&db)
 }
@@ -2302,7 +2327,7 @@ fn add_firewall_rule(
         source: RuleSource::Cli,
         evidence: None,
     })?;
-    println!("Added firewall rule #{id}");
+    say!("Added firewall rule #{id}");
     Ok(())
 }
 
@@ -2328,14 +2353,14 @@ fn list_firewall_rules(db_path: Option<PathBuf>, source: Option<SourceFilter>) -
     let rules = db.blocks_page(&query, 0, usize::MAX >> 1)?;
     if rules.is_empty() {
         match source {
-            Some(source) => println!("No firewall rules from {}.", source.name()),
-            None => println!("No firewall rules stored."),
+            Some(source) => say!("No firewall rules from {}.", source.name()),
+            None => say!("No firewall rules stored."),
         }
         return Ok(());
     }
     let now = now_secs();
     for rule in &rules {
-        println!("{}", rule_line(rule, now));
+        say!("{}", rule_line(rule, now));
     }
     Ok(())
 }
@@ -2343,6 +2368,12 @@ fn list_firewall_rules(db_path: Option<PathBuf>, source: Option<SourceFilter>) -
 /// One rule as `list-firewall-rules` prints it: what it does, then where
 /// it came from, then the evidence, which is last because it is the one
 /// part of unbounded length.
+///
+/// The address and the evidence go through [`terminal_safe`] here as well
+/// as through `say!`: `say!` keeps newlines, and a row the console wrote
+/// straight into the database has not been through
+/// [`stop_bots::blocks::evidence_line`], so a newline in it would forge a
+/// second rule underneath.
 fn rule_line(rule: &FirewallRule, now: i64) -> String {
     let port = rule.port.map(|p| format!(":{p}")).unwrap_or_default();
     let status = if rule.enabled { "" } else { " (disabled)" };
@@ -2357,13 +2388,13 @@ fn rule_line(rule: &FirewallRule, now: i64) -> String {
     let evidence = rule
         .evidence
         .as_deref()
-        .map(|line| format!(": {line}"))
+        .map(|line| format!(": {}", terminal_safe(line)))
         .unwrap_or_default();
     format!(
         "#{} {:?} {}{port}{status}{expiry} [{}{added}]{evidence}",
         rule.id,
         rule.action,
-        rule.address,
+        terminal_safe(&rule.address),
         stop_bots::blocks::source_name(rule.source)
     )
 }
@@ -2395,16 +2426,16 @@ fn remove_firewall_rule(
     match (id, source) {
         (Some(id), _) => {
             db.remove_firewall_rule(id)?;
-            println!("Removed firewall rule #{id}");
+            say!("Removed firewall rule #{id}");
         }
         (None, Some(source)) => {
             let count = db.remove_firewall_rules_from(source, dry_run)?;
             let name = source.name();
             if dry_run {
-                println!("Would remove {count} firewall rule(s) from {name} (dry run).");
+                say!("Would remove {count} firewall rule(s) from {name} (dry run).");
                 return Ok(());
             }
-            println!("Removed {count} firewall rule(s) from {name}.");
+            say!("Removed {count} firewall rule(s) from {name}.");
             if count == 0 {
                 return Ok(());
             }
@@ -2412,7 +2443,7 @@ fn remove_firewall_rule(
                 source,
                 SourceFilter::Source(RuleSource::Detector(_)) | SourceFilter::Legacy
             ) {
-                println!(
+                say!(
                     "The detectors leave those addresses alone for as long as each block was \
                      meant to last."
                 );
@@ -2420,18 +2451,18 @@ fn remove_firewall_rule(
         }
         (None, None) => unreachable!("clap requires --id or --source"),
     }
-    println!("Run `stop-bots render-firewall` and apply the script to put it in effect.");
+    say!("Run `stop-bots render-firewall` and apply the script to put it in effect.");
     Ok(())
 }
 
 fn set_firewall_rule(db_path: Option<PathBuf>, id: i64, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_firewall_rule_enabled(id, enabled)?;
-    println!(
+    say!(
         "Firewall rule #{id} is now {}.",
         if enabled { "enabled" } else { "disabled" }
     );
-    println!("Run `stop-bots render-firewall` and apply the script to put it in effect.");
+    say!("Run `stop-bots render-firewall` and apply the script to put it in effect.");
     Ok(())
 }
 
@@ -2439,7 +2470,7 @@ fn set_firewall_backend(db_path: Option<PathBuf>, backend: FirewallBackend) -> R
     let db = open_db(db_path)?;
     let backend: stop_bots::firewall::FirewallBackend = backend.into();
     stop_bots::firewall::store_backend(&db, backend)?;
-    println!(
+    say!(
         "Firewall backend set to {}. Scripts go to {} unless told otherwise.",
         backend.stored(),
         stop_bots::firewall::default_output_path(backend).display()
@@ -2459,7 +2490,7 @@ async fn update_ip_ranges(
         Some(path) => ipranges::store(&db, kind, &kind.parse(&read_source_file(&path)?)?)?,
         None => ipranges::update(&db, kind).await?,
     };
-    println!("Stored {count} CIDR range(s) from {}", kind.name());
+    say!("Stored {count} CIDR range(s) from {}", kind.name());
     Ok(())
 }
 
@@ -2473,7 +2504,7 @@ async fn update_country_ranges(
         Some(path) => ipranges::store_country(&db, &country, &read_source_file(&path)?)?,
         None => ipranges::update_country(&db, &country).await?,
     };
-    println!("Stored {count} CIDR range(s) for country {country}");
+    say!("Stored {count} CIDR range(s) for country {country}");
     Ok(())
 }
 
@@ -2488,7 +2519,7 @@ fn set_geo_mode(db_path: Option<PathBuf>, mode: GeoModeArg) -> Result<()> {
     let db = open_db(db_path)?;
     let mode: stop_bots::db::GeoMode = mode.into();
     db.set_geo_mode(mode)?;
-    println!("Geo mode set to {mode:?}");
+    say!("Geo mode set to {mode:?}");
     Ok(())
 }
 
@@ -2508,7 +2539,7 @@ async fn update_reputation_source(
         Some(path) => reputation::store(&db, kind, &kind.parse(&read_source_file(&path)?)?)?,
         None => reputation::update(&db, kind).await?,
     };
-    println!("Stored {count} range(s) for {}", kind.name());
+    say!("Stored {count} range(s) for {}", kind.name());
     // Fetching and enabling are separate on purpose; say so, or a fetch
     // that appears to succeed but changes nothing reads as a bug.
     let enabled = db
@@ -2516,7 +2547,7 @@ async fn update_reputation_source(
         .into_iter()
         .any(|s| s.id == kind.id() && s.enabled);
     if !enabled {
-        println!(
+        say!(
             "This feed is currently OFF — run `stop-bots set-reputation-source --source-id {} \
              --enabled true` to apply it.",
             kind.id()
@@ -2535,14 +2566,14 @@ fn set_reputation_source(db_path: Option<PathBuf>, source_id: String, enabled: b
     };
     db.register_reputation_source(&kind.as_source())?;
     db.set_reputation_source_enabled(kind.id(), enabled)?;
-    println!(
+    say!(
         "{} is now {}",
         kind.name(),
         if enabled { "ON" } else { "OFF" }
     );
     if enabled {
         if let Some(warning) = kind.warning() {
-            println!("Warning: {warning}.");
+            say!("Warning: {warning}.");
         }
         let count = db
             .list_reputation_sources()?
@@ -2551,13 +2582,13 @@ fn set_reputation_source(db_path: Option<PathBuf>, source_id: String, enabled: b
             .map(|s| s.range_count)
             .unwrap_or(0);
         if count == 0 {
-            println!(
+            say!(
                 "No ranges stored yet — run `stop-bots update-reputation-source --source-id {}` \
                  first, or this does nothing.",
                 kind.id()
             );
         }
-        println!("Run render-firewall, then apply the script, to enforce it.");
+        say!("Run render-firewall, then apply the script, to enforce it.");
     }
     Ok(())
 }
@@ -2577,7 +2608,10 @@ fn list_reputation_sources(db_path: Option<PathBuf>) -> Result<()> {
             .and_then(|k| k.warning())
             .map(|w| format!("  [{w}]"))
             .unwrap_or_default();
-        println!("[{state}] {:<22} {fetched}{note}", source.id);
+        say!(
+            "[{state}] {:<22} {fetched}{note}",
+            terminal_safe(&source.id)
+        );
     }
     Ok(())
 }
@@ -2600,15 +2634,15 @@ fn set_rate_limit(
     }
     db.set_rate_limit_enabled(enabled)?;
     if enabled {
-        println!(
+        say!(
             "Rate limiting on: {} req/s per client, burst {}, then 429.",
             db.get_rate_limit_rps()?,
             db.get_rate_limit_burst()?
         );
     } else {
-        println!("Rate limiting off.");
+        say!("Rate limiting off.");
     }
-    println!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
     Ok(())
 }
 
@@ -2652,16 +2686,16 @@ fn set_site_rule(
         anyhow::bail!("unknown rule: {rule} (known: {})", known.join(", "));
     };
     db.set_site_request_rule(site.id, rule.id(), enabled)?;
-    println!(
+    say!(
         "{}: {} is now {}",
         site.server_name,
         rule.label(),
         if enabled { "blocked" } else { "allowed" }
     );
     if enabled {
-        println!("Note: {}.", rule.caveat());
+        say!("Note: {}.", rule.caveat());
     }
-    println!("Run `stop-bots apply-blocks` to write it into the site config.");
+    say!("Run `stop-bots apply-blocks` to write it into the site config.");
     Ok(())
 }
 
@@ -2685,27 +2719,27 @@ fn exempt_path(
     match (user_agent, remove) {
         (None, true) => {
             db.remove_site_path_exemption(site.id, trimmed)?;
-            println!("{name}: {trimmed} is no longer exempt");
+            say!("{name}: {trimmed} is no longer exempt");
         }
         (None, false) => {
             db.add_site_path_exemption(site.id, trimmed)?;
-            println!("{name}: {trimmed} is exempt from blocking");
+            say!("{name}: {trimmed} is exempt from blocking");
         }
         (Some(user_agent), true) => {
             if !db.remove_site_agent_exemption(site.id, trimmed, &user_agent)? {
                 anyhow::bail!("{name}: {trimmed} was not exempt for {user_agent:?}");
             }
-            println!("{name}: {trimmed} is no longer exempt for {user_agent:?}");
+            say!("{name}: {trimmed} is no longer exempt for {user_agent:?}");
         }
         (Some(user_agent), false) => {
             let stored = db.add_site_agent_exemption(site.id, trimmed, &user_agent)?;
-            println!(
+            say!(
                 "{name}: {trimmed} is exempt from blocking for clients whose user agent \
                  contains {stored:?}"
             );
         }
     }
-    println!("Run `stop-bots apply-blocks` to write it into the site config.");
+    say!("Run `stop-bots apply-blocks` to write it into the site config.");
     Ok(())
 }
 
@@ -2719,8 +2753,8 @@ fn trust(
     match (address, user_agent, remove) {
         (Some(address), _, false) => {
             let stored = db.trust_address(&address)?;
-            println!("Trusting {stored}: never blocked by the firewall or NGINX.");
-            println!(
+            say!("Trusting {stored}: never blocked by the firewall or NGINX.");
+            say!(
                 "Run `stop-bots render-firewall` and apply the script, and `stop-bots \
                  apply-blocks`, to put it in effect."
             );
@@ -2729,33 +2763,33 @@ fn trust(
             if !db.untrust_address(&address)? {
                 anyhow::bail!("{address} is not trusted (see `stop-bots list-trusted`)");
             }
-            println!("No longer trusting {address}.");
-            println!(
+            say!("No longer trusting {address}.");
+            say!(
                 "Run `stop-bots render-firewall` and apply the script, and `stop-bots \
                  apply-blocks`, to put it in effect."
             );
         }
         (None, Some(user_agent), false) => {
             let stored = db.trust_user_agent(&user_agent)?;
-            println!(
+            say!(
                 "Trusting any user agent containing {stored:?}, ignoring case: never blocked \
                  by NGINX."
             );
             // Said every time, because it is the part that surprises: the
             // firewall and the detectors still treat this client by its
             // address.
-            println!(
+            say!(
                 "The detectors and the firewall still judge it by its address — trust that \
                  too with `stop-bots trust --address` if it must never be blocked at all."
             );
-            println!("Run `stop-bots apply-blocks` to put it in effect.");
+            say!("Run `stop-bots apply-blocks` to put it in effect.");
         }
         (None, Some(user_agent), true) => {
             if !db.untrust_user_agent(&user_agent)? {
                 anyhow::bail!("{user_agent:?} is not trusted (see `stop-bots list-trusted`)");
             }
-            println!("No longer trusting {user_agent:?}.");
-            println!("Run `stop-bots apply-blocks` to put it in effect.");
+            say!("No longer trusting {user_agent:?}.");
+            say!("Run `stop-bots apply-blocks` to put it in effect.");
         }
         // clap requires one of the two.
         (None, None, _) => unreachable!("clap requires --address or --user-agent"),
@@ -2771,36 +2805,36 @@ fn list_turned_away(db_path: Option<PathBuf>, access_log: Option<PathBuf>) -> Re
         stop_bots::accesslog::turned_away_user_agents(&log_text, response.status_code());
 
     if turned_away.is_empty() {
-        println!("Nothing in this log was turned away.");
+        say!("Nothing in this log was turned away.");
         return Ok(());
     }
 
     // Said before the table, not after: on a host answering 403 the
     // numbers include the application's own refusals, and a reader who
     // learns that at the bottom has already drawn conclusions.
-    println!(
+    say!(
         "Counting responses of {} \u{2014} this host's block response.",
         response.label()
     );
     if response.status_code() != stop_bots::db::BlockResponse::Close.status_code() {
-        println!(
+        say!(
             "That code is one an application can send too, so compare the columns: refusals \
              with nothing served is a client being stopped at the door."
         );
     }
-    println!();
-    println!("{:>8}  {:>8}  USER AGENT", "REFUSED", "SERVED");
+    say!();
+    say!("{:>8}  {:>8}  USER AGENT", "REFUSED", "SERVED");
     for entry in &turned_away {
         // Client-chosen text on its way to a terminal; see `printable`.
-        println!(
+        say!(
             "{:>8}  {:>8}  {}",
             entry.refused,
             entry.served,
-            stop_bots::uadetail::printable(&entry.user_agent)
+            terminal_safe(&entry.user_agent)
         );
     }
-    println!();
-    println!("Allow one with: stop-bots trust --user-agent \"<part of the agent>\"");
+    say!();
+    say!("Allow one with: stop-bots trust --user-agent \"<part of the agent>\"");
     Ok(())
 }
 
@@ -2808,10 +2842,10 @@ fn list_trusted(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     let entries = stop_bots::dynamic::trusted_entries(&db)?;
     if entries.is_empty() {
-        println!("Nothing is trusted.");
+        say!("Nothing is trusted.");
     }
     for entry in entries {
-        println!("{:<11} {}", entry.kind(), entry.value());
+        say!("{:<11} {}", entry.kind(), terminal_safe(entry.value()));
     }
     Ok(())
 }
@@ -2819,7 +2853,7 @@ fn list_trusted(db_path: Option<PathBuf>) -> Result<()> {
 fn set_auto_apply(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_auto_apply(enabled)?;
-    println!(
+    say!(
         "Automatic NGINX applying {}",
         if enabled { "enabled" } else { "disabled" }
     );
@@ -2828,7 +2862,7 @@ fn set_auto_apply(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
         // sets this from a shell on a host with no console running has
         // turned on a switch nothing will ever read, and the only sign
         // would be that nothing happens.
-        println!(
+        say!(
             "The internal cron applies and reloads within the hour \u{2014} it runs inside \
              `stop-bots web` or the TUI, so one of those has to be running. The firewall \
              script is not covered: apply it yourself, or with `stop-bots batch --apply`."
@@ -2841,30 +2875,30 @@ fn set_humans_only(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_humans_only(enabled)?;
     if enabled {
-        println!("Humans only is ON.");
-        println!(
+        say!("Humans only is ON.");
+        say!(
             "  \u{2022} Every catalogued bot is blocked, whatever its category. On a host with \
              the usual lists that is over 1,600 patterns, including the several hundred that \
              carry no category at all."
         );
-        println!(
+        say!(
             "  \u{2022} Let's Encrypt is the one exception, because blocking it breaks \
              certificate renewal \u{2014} which surfaces as an expired certificate two months \
              later, not as an error now."
         );
-        println!(
+        say!(
             "  \u{2022} Any address that fetches /robots.txt is blocked for a day. Note that \
              this catches the crawlers polite enough to ask."
         );
-        println!(
+        say!(
             "  \u{2022} The three category policies are forced and cannot be edited until this \
              is off. Their stored values are kept."
         );
-        println!(
+        say!(
             "\nRun apply-blocks (or the NGINX screen's `a`/`A`) to write it into the NGINX config."
         );
     } else {
-        println!("Humans only is OFF. The stored category policies are back in force.");
+        say!("Humans only is OFF. The stored category policies are back in force.");
     }
     Ok(())
 }
@@ -2872,18 +2906,18 @@ fn set_humans_only(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
 fn set_auto_apply_firewall(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_auto_apply_firewall(enabled)?;
-    println!(
+    say!(
         "Automatic firewall applying {}",
         if enabled { "enabled" } else { "disabled" }
     );
     if enabled {
-        println!(
+        say!(
             "The internal cron will run the script it renders, daily \u{2014} it runs inside \
              `stop-bots web` or the TUI, so one of those has to be running."
         );
         // The condition that most often stops this doing anything, said
         // up front rather than discovered in a summary line a day later.
-        println!(
+        say!(
             "It refuses to apply unless the anti-lockout check ran, which needs a readable \
              SSH log. If the job reports that, point --ssh-log at one."
         );
@@ -2894,17 +2928,17 @@ fn set_auto_apply_firewall(db_path: Option<PathBuf>, enabled: bool) -> Result<()
 fn set_robots_txt(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_serve_robots_txt(enabled)?;
-    println!(
+    say!(
         "robots.txt generation {}",
         if enabled { "enabled" } else { "disabled" }
     );
     if enabled {
-        println!(
+        say!(
             "It replaces whatever each site currently serves at /robots.txt. Preview it with \
              `stop-bots show-robots-txt`."
         );
     }
-    println!("Run `stop-bots apply-blocks` to write it into the site configs.");
+    say!("Run `stop-bots apply-blocks` to write it into the site configs.");
     Ok(())
 }
 
@@ -2941,20 +2975,24 @@ fn detector_line(db: &Db, detector: DetectorArg) -> Result<String> {
 
 fn list_detectors(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
-    println!(
+    say!(
         "{:<17} {:<4} {:>6} {:>9} {:>6}",
-        "DETECTOR", "ON", "TTL", "THRESHOLD", "WINDOW"
+        "DETECTOR",
+        "ON",
+        "TTL",
+        "THRESHOLD",
+        "WINDOW"
     );
     for detector in DetectorArg::ALL {
-        println!("{}", detector_line(&db, detector)?);
+        say!("{}", detector_line(&db, detector)?);
     }
-    println!();
-    println!(
+    say!();
+    say!(
         "IPv4 /24 escalation: {}, at {} flagged address(es) in one /24.",
         on_off(stop_bots::protection::subnet_escalation(&db)?.is_some()),
         stop_bots::protection::subnet_escalation_min(&db)?
     );
-    println!(
+    say!(
         "The internal cron (inside `stop-bots web` or the TUI) and `batch` run the ones that \
          are on."
     );
@@ -3014,14 +3052,18 @@ fn set_detector(
         d.set_enabled(&db, on)?;
     }
 
-    println!(
+    say!(
         "{:<17} {:<4} {:>6} {:>9} {:>6}",
-        "DETECTOR", "ON", "TTL", "THRESHOLD", "WINDOW"
+        "DETECTOR",
+        "ON",
+        "TTL",
+        "THRESHOLD",
+        "WINDOW"
     );
-    println!("{}", detector_line(&db, detector)?);
+    say!("{}", detector_line(&db, detector)?);
     if enabled == Some(false) {
         // The distinction the README draws, said where it bites.
-        println!(
+        say!(
             "Blocks it already added stay until they expire; remove one with \
              `stop-bots remove-firewall-rule`."
         );
@@ -3037,13 +3079,13 @@ fn set_subnet_escalation(
     let db = open_db(db_path)?;
     stop_bots::protection::set_subnet_escalation(&db, enabled, min)?;
     let on = stop_bots::protection::subnet_escalation(&db)?.is_some();
-    println!(
+    say!(
         "IPv4 /24 escalation is {}, at {} flagged address(es) in one /24.",
         on_off(on),
         stop_bots::protection::subnet_escalation_min(&db)?
     );
     if on {
-        println!(
+        say!(
             "A detector pass that flags that many addresses in one /24 now blocks all 256 \
              addresses in it."
         );
@@ -3093,18 +3135,18 @@ fn set_category(
                 );
             };
             db.set_category_default(category.into(), policy)?;
-            println!("Category {name} is now {} host-wide.", policy_word(policy));
+            say!("Category {name} is now {} host-wide.", policy_word(policy));
         }
         Some(site) => {
             let site = find_site(&db, &site)?;
             db.set_site_category_override(site.id, category.into(), policy.policy())?;
             match policy.policy() {
-                Some(policy) => println!(
+                Some(policy) => say!(
                     "{}: category {name} is now {}, whatever the host-wide policy says.",
                     site.server_name,
                     policy_word(policy)
                 ),
-                None => println!(
+                None => say!(
                     "{}: category {name} follows the host-wide policy again.",
                     site.server_name
                 ),
@@ -3112,9 +3154,9 @@ fn set_category(
         }
     }
     if db.get_humans_only()? {
-        println!("{HUMANS_ONLY_NOTE}");
+        say!("{HUMANS_ONLY_NOTE}");
     }
-    println!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
     Ok(())
 }
 
@@ -3123,19 +3165,24 @@ fn list_categories(db_path: Option<PathBuf>, site: Option<String>) -> Result<()>
     let site = site.map(|name| find_site(&db, &name)).transpose()?;
 
     match &site {
-        None => println!("{:<9} POLICY", "CATEGORY"),
-        Some(site) => println!("{:<9} {:<9} {}", "CATEGORY", "HOST-WIDE", site.server_name),
+        None => say!("{:<9} POLICY", "CATEGORY"),
+        Some(site) => say!(
+            "{:<9} {:<9} {}",
+            "CATEGORY",
+            "HOST-WIDE",
+            terminal_safe(&site.server_name)
+        ),
     }
     for category in CATEGORIES {
         let stored = db.get_stored_category_default(category.into())?;
         match &site {
-            None => println!("{:<9} {}", category_name(category), policy_word(stored)),
+            None => say!("{:<9} {}", category_name(category), policy_word(stored)),
             Some(site) => {
                 let over = db
                     .get_site_category_override(site.id, category.into())?
                     .map(policy_word)
                     .unwrap_or("(host-wide)");
-                println!(
+                say!(
                     "{:<9} {:<9} {over}",
                     category_name(category),
                     policy_word(stored)
@@ -3148,21 +3195,21 @@ fn list_categories(db_path: Option<PathBuf>, site: Option<String>) -> Result<()>
         let overrides = db.site_bot_overrides(site.id)?;
         if !overrides.is_empty() {
             let bots = db.list_bots()?;
-            println!();
-            println!("Bot overrides on {}:", site.server_name);
+            say!();
+            say!("Bot overrides on {}:", terminal_safe(&site.server_name));
             for over in overrides {
                 let slug = bots
                     .iter()
                     .find(|b| b.id == over.bot_id)
                     .map(|b| b.slug.as_str())
                     .unwrap_or("(unknown bot)");
-                println!("  {slug:<30} {}", policy_word(over.policy));
+                say!("  {:<30} {}", terminal_safe(slug), policy_word(over.policy));
             }
         }
     }
     if db.get_humans_only()? {
-        println!();
-        println!("{HUMANS_ONLY_NOTE}");
+        say!();
+        say!("{HUMANS_ONLY_NOTE}");
     }
     Ok(())
 }
@@ -3199,31 +3246,32 @@ fn set_bot(
             };
             db.set_bot_status(&bot.slug, status)?;
             match policy.policy() {
-                Some(policy) => println!("{} is now {} host-wide.", bot.slug, policy_word(policy)),
-                None => println!("{} follows its category again.", bot.slug),
+                Some(policy) => say!("{} is now {} host-wide.", bot.slug, policy_word(policy)),
+                None => say!("{} follows its category again.", bot.slug),
             }
         }
         Some(site) => {
             let site = find_site(&db, &site)?;
             db.set_site_bot_override(site.id, bot.id, policy.policy())?;
             match policy.policy() {
-                Some(policy) => println!(
+                Some(policy) => say!(
                     "{}: {} is now {}, whatever the host-wide setting says.",
                     site.server_name,
                     bot.slug,
                     policy_word(policy)
                 ),
-                None => println!(
+                None => say!(
                     "{}: {} follows the host-wide setting again.",
-                    site.server_name, bot.slug
+                    site.server_name,
+                    bot.slug
                 ),
             }
         }
     }
     if db.get_humans_only()? {
-        println!("{HUMANS_ONLY_NOTE}");
+        say!("{HUMANS_ONLY_NOTE}");
     }
-    println!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
+    say!("Run `stop-bots apply-blocks` to write it into the NGINX config.");
     Ok(())
 }
 
@@ -3242,12 +3290,12 @@ fn list_bots(db_path: Option<PathBuf>, search: Option<String>) -> Result<()> {
         .collect();
     if bots.is_empty() {
         match &search {
-            Some(s) => println!("No bot matches {s:?}."),
-            None => println!("No bots stored yet — run `stop-bots update-bot-lists` first."),
+            Some(s) => say!("No bot matches {s:?}."),
+            None => say!("No bots stored yet — run `stop-bots update-bot-lists` first."),
         }
         return Ok(());
     }
-    println!("{:<9} {:<22} {:<30} NAME", "STATUS", "CATEGORIES", "SLUG");
+    say!("{:<9} {:<22} {:<30} NAME", "STATUS", "CATEGORIES", "SLUG");
     for bot in bots {
         let status = match bot.status {
             BotStatus::Default => "category",
@@ -3269,10 +3317,10 @@ fn list_bots(db_path: Option<PathBuf>, search: Option<String>) -> Result<()> {
         } else {
             categories.join(",")
         };
-        println!(
+        say!(
             "{status:<9} {categories:<22} {:<30} {}",
-            bot.slug,
-            stop_bots::uadetail::printable(&bot.name)
+            terminal_safe(&bot.slug),
+            terminal_safe(&bot.name)
         );
     }
     Ok(())
@@ -3280,7 +3328,7 @@ fn list_bots(db_path: Option<PathBuf>, search: Option<String>) -> Result<()> {
 
 fn show_robots_txt(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
-    print!("{}", nginx::robots_txt_body(&db)?);
+    say_inline!("{}", nginx::robots_txt_body(&db)?);
     Ok(())
 }
 
@@ -3412,7 +3460,7 @@ impl DeprecatedWebFlags {
             used.push("--save");
         }
         if !used.is_empty() {
-            eprintln!(
+            say_err!(
                 "Note: `stop-bots web {}` is deprecated and goes away in the next release. \
                  Store settings with `stop-bots set-web` instead; flags on `web` apply to one \
                  run.",
@@ -3427,7 +3475,7 @@ fn set_web(db_path: Option<PathBuf>, settings: WebSettings) -> Result<()> {
 
     let db = open_db(db_path)?;
     if settings.is_empty() {
-        println!("Nothing to change. Current settings:");
+        say!("Nothing to change. Current settings:");
     } else {
         settings.store(&db)?;
     }
@@ -3437,13 +3485,13 @@ fn set_web(db_path: Option<PathBuf>, settings: WebSettings) -> Result<()> {
     let base = web::BasePath::from_db(&db)?;
     let hosts = web::configured_hosts(&db)?;
     let on_off = |on: bool| if on { "on" } else { "off" };
-    println!("  bind:                {addr}");
-    println!("  expose:              {}", on_off(exposed));
-    println!(
+    say!("  bind:                {addr}");
+    say!("  expose:              {}", on_off(exposed));
+    say!(
         "  base path:           {}",
         if base.is_root() { "/" } else { base.as_str() }
     );
-    println!(
+    say!(
         "  allowed hosts:       {}",
         if hosts.is_empty() {
             "(loopback names only)".to_string()
@@ -3451,25 +3499,25 @@ fn set_web(db_path: Option<PathBuf>, settings: WebSettings) -> Result<()> {
             hosts.join(", ")
         }
     );
-    println!(
+    say!(
         "  trust forwarded-for: {}",
         on_off(db.get_bool_setting(web::TRUST_FORWARDED_KEY, false)?)
     );
-    println!(
+    say!(
         "  secure cookie:       {}",
         on_off(db.get_bool_setting(web::SECURE_COOKIE_KEY, false)?)
     );
     if !web::is_loopback(&addr) && !exposed {
         // Only reachable by switching exposure off under a stored
         // non-loopback bind, which is the safe direction and so allowed.
-        println!(
+        say!(
             "\n`stop-bots web` will refuse to start on {addr} until exposure is back on or the \
              bind is loopback."
         );
     }
     if !settings.is_empty() {
-        println!("\nA running console reads the host list and proxy settings on every request;");
-        println!("the bind address and path prefix take effect when it is next started.");
+        say!("\nA running console reads the host list and proxy settings on every request;");
+        say!("the bind address and path prefix take effect when it is next started.");
     }
     Ok(())
 }
@@ -3498,7 +3546,7 @@ fn run_set_log_paths(
     let path = stop_bots::hostconf::path();
     let mut host = stop_bots::hostconf::HostConf::load_from(&path)?;
     if access_log.is_none() && ssh_log.is_none() {
-        println!("Nothing to change. Current settings:");
+        say!("Nothing to change. Current settings:");
     } else {
         // An empty value clears one; a path is stored absolute, because
         // the service that reads it does not run where this did.
@@ -3522,15 +3570,15 @@ fn run_set_log_paths(
 
     let paths = host.log_paths();
     match &paths.access {
-        Some(path) => println!("  access log: {}", path.display()),
-        None => println!(
+        Some(path) => say!("  access log: {}", path.display()),
+        None => say!(
             "  access log: {} (default — nothing stored)",
             stop_bots::accesslog::DEFAULT_LOG_PATH
         ),
     }
     match &paths.ssh {
-        Some(path) => println!("  ssh log:    {}", path.display()),
-        None => println!("  ssh log:    auto-detected (auth.log, secure, then journalctl)"),
+        Some(path) => say!("  ssh log:    {}", path.display()),
+        None => say!("  ssh log:    auto-detected (auth.log, secure, then journalctl)"),
     }
     Ok(())
 }
@@ -3567,10 +3615,10 @@ fn run_install_firewall(
 
     let steps = stop_bots::install::install_firewall(&layout, &options)?;
     for step in steps.iter() {
-        println!("  {step}");
+        say!("  {step}");
     }
     if dry_run {
-        println!("\nDry run — nothing was changed.");
+        say!("\nDry run — nothing was changed.");
     }
     Ok(())
 }
@@ -3607,7 +3655,7 @@ fn run_uninstall(
     let plan = Plan::resolve(prefix.as_deref(), db, root.as_deref())?;
     let report = uninstall::run(&plan, target.into(), &uninstall::Options { dry_run, purge });
 
-    println!(
+    say!(
         "{}",
         if dry_run {
             "Dry run — nothing was changed. Would:"
@@ -3617,21 +3665,21 @@ fn run_uninstall(
     );
     for step in &report.steps {
         match &step.outcome {
-            Outcome::Done => println!("  done     {}", step.what),
-            Outcome::Planned => println!("  would    {}", step.what),
-            Outcome::Skipped(why) => println!("  skipped  {} ({why})", step.what),
+            Outcome::Done => say!("  done     {}", step.what),
+            Outcome::Planned => say!("  would    {}", step.what),
+            Outcome::Skipped(why) => say!("  skipped  {} ({why})", step.what),
             Outcome::Failed(why) => {
-                println!("  FAILED   {}", step.what);
+                say!("  FAILED   {}", step.what);
                 for line in why.lines() {
-                    println!("           {line}");
+                    say!("           {line}");
                 }
             }
         }
     }
     if !report.kept.is_empty() {
-        println!("\nLeft in place:");
+        say!("\nLeft in place:");
         for kept in &report.kept {
-            println!("  {kept}");
+            say!("  {kept}");
         }
     }
     let failed = report.failures();
@@ -3642,7 +3690,7 @@ fn run_uninstall(
         );
     }
     if dry_run {
-        println!("\nRe-run without --dry-run to do it.");
+        say!("\nRe-run without --dry-run to do it.");
     }
     Ok(())
 }
@@ -3840,29 +3888,29 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     }
 
     if options.dry_run {
-        println!("Dry run — nothing was changed. Would:");
+        say!("Dry run — nothing was changed. Would:");
     } else {
-        println!("Installed:");
+        say!("Installed:");
     }
     for step in &steps {
-        println!("  {step}");
+        say!("  {step}");
     }
-    println!();
+    say!();
 
     if let Some(password) = password {
-        println!("Console password:\n");
-        println!("    {password}\n");
-        println!("Shown once. Only an Argon2 hash of it is stored — write it down now.");
-        println!("`stop-bots web --set-password` issues a new one.\n");
+        say!("Console password:\n");
+        say!("    {password}\n");
+        say!("Shown once. Only an Argon2 hash of it is stored — write it down now.");
+        say!("`stop-bots web --set-password` issues a new one.\n");
     }
 
     if options.dry_run {
-        println!("Re-run without --dry-run to do it.");
+        say!("Re-run without --dry-run to do it.");
         return Ok(());
     }
 
     if prefixed {
-        println!(
+        say!(
             "Written under {}. Review it, then install for real.",
             prefix.display()
         );
@@ -3870,39 +3918,35 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     }
 
     if options.start {
-        println!("The console is on loopback. Reach it over an SSH tunnel:\n");
-        println!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
-        println!("then open http://127.0.0.1:8787/.\n");
-        println!(
-            "To put it behind the NGINX it is protecting, see \"Behind NGINX\" in the README."
-        );
+        say!("The console is on loopback. Reach it over an SSH tunnel:\n");
+        say!("    ssh -L 8787:127.0.0.1:8787 <this-host>\n");
+        say!("then open http://127.0.0.1:8787/.\n");
+        say!("To put it behind the NGINX it is protecting, see \"Behind NGINX\" in the README.");
     } else {
         // Telling someone to open a URL for a service that is not running
         // is how a working install gets reported as broken.
-        println!("Enabled for the next boot but not started, as asked. Start it with:\n");
-        println!("    systemctl start {}\n", stop_bots::install::WEB_UNIT);
-        println!("then reach it over an SSH tunnel:\n");
-        println!("    ssh -L 8787:127.0.0.1:8787 <this-host>");
+        say!("Enabled for the next boot but not started, as asked. Start it with:\n");
+        say!("    systemctl start {}\n", stop_bots::install::WEB_UNIT);
+        say!("then reach it over an SSH tunnel:\n");
+        say!("    ssh -L 8787:127.0.0.1:8787 <this-host>");
     }
-    println!();
-    println!(
+    say!();
+    say!(
         "The console runs as the {} user. What needs root -- the NGINX config, the",
         layout.user
     );
-    println!(
+    say!(
         "firewall -- it asks of {}, which systemd starts when it",
         stop_bots::install::HELPER_UNIT
     );
-    println!("is first needed. The internal cron's daily firewall render writes");
-    println!(
+    say!("is first needed. The internal cron's daily firewall render writes");
+    say!(
         "{}/firewall.next.*, for review.",
         layout.output_dir.display()
     );
-    println!("Nothing is enforced, or loaded at boot, until something applies it: \"Apply");
-    println!("everything\" in the console, `stop-bots render-firewall --apply`, `stop-bots");
-    println!(
-        "batch --apply` from a crontab, or `stop-bots set-auto-apply-firewall --enabled true`."
-    );
+    say!("Nothing is enforced, or loaded at boot, until something applies it: \"Apply");
+    say!("everything\" in the console, `stop-bots render-firewall --apply`, `stop-bots");
+    say!("batch --apply` from a crontab, or `stop-bots set-auto-apply-firewall --enabled true`.");
 
     Ok(())
 }
@@ -4041,9 +4085,9 @@ async fn run_web(
     if set_password {
         let password = auth::generate_password()?;
         auth::set_password(&db, &password)?;
-        println!("New password: {password}");
-        println!();
-        println!("Shown once. Only an Argon2 hash of it is stored.");
+        say!("New password: {password}");
+        say!();
+        say!("Shown once. Only an Argon2 hash of it is stored.");
         return Ok(());
     }
 
@@ -4053,13 +4097,13 @@ async fn run_web(
     if !auth::password_is_set(&db)? {
         let password = auth::generate_password()?;
         auth::set_password(&db, &password)?;
-        println!("A password has been generated for the web UI:");
-        println!();
-        println!("    {password}");
-        println!();
-        println!("Shown once. Only an Argon2 hash of it is stored — write it down now.");
-        println!("`stop-bots web --set-password` issues a new one.");
-        println!();
+        say!("A password has been generated for the web UI:");
+        say!();
+        say!("    {password}");
+        say!();
+        say!("Shown once. Only an Argon2 hash of it is stored — write it down now.");
+        say!("`stop-bots web --set-password` issues a new one.");
+        say!();
     }
 
     let hosts = web::configured_hosts(&db)?;
@@ -4069,7 +4113,7 @@ async fn run_web(
         // putting it behind NGINX on a hostname and then finding every
         // request refused. It used to say a bare address would be
         // accepted, which is only true of a loopback one.
-        eprintln!(
+        say_err!(
             "Warning: bound to {addr} with no allowed hosts set. Only requests for \n\
              localhost or a loopback address will be answered; a host name, or this \n\
              machine's own network address, is refused. This is the DNS-rebinding guard \n\
@@ -4078,23 +4122,23 @@ async fn run_web(
         );
     }
 
-    println!("stop-bots web UI on http://{addr}{}", base.url("/"));
+    say!("stop-bots web UI on http://{addr}{}", base.url("/"));
     if !base.is_root() {
-        println!(
+        say!(
             "Served under {}. The proxy in front must not strip it:",
             base.as_str()
         );
-        println!("    proxy_pass http://{addr};   # no trailing slash");
+        say!("    proxy_pass http://{addr};   # no trailing slash");
     }
     if web::is_loopback(&addr) {
-        println!("Loopback only — reachable from this machine.");
+        say!("Loopback only — reachable from this machine.");
     } else {
-        println!("Exposed on {addr}. Put TLS and this tool's own protection in front of it.");
+        say!("Exposed on {addr}. Put TLS and this tool's own protection in front of it.");
         if !db.get_bool_setting(web::SECURE_COOKIE_KEY, false)? {
             // Not fatal: this process cannot tell whether there is TLS in
             // front of it, and refusing would break the plaintext-behind-a-
             // proxy case that is otherwise fine.
-            eprintln!(
+            say_err!(
                 "Note: the session cookie is not marked Secure, so a browser will also send \n\
                  it to an http:// URL for this host. Behind TLS, run \n\
                  `stop-bots set-web --secure-cookie true`."
@@ -4105,13 +4149,13 @@ async fn run_web(
     let privilege = privilege_for(helper, stop_bots::hint::is_root());
     match &privilege {
         web::state::Privilege::Helper(socket) => {
-            println!(
+            say!(
                 "Changes to the host go through the helper at {}.",
                 socket.display()
             )
         }
         web::state::Privilege::Local => {}
-        web::state::Privilege::ReadOnly => eprintln!(
+        web::state::Privilege::ReadOnly => say_err!(
             "Note: not running as root and given no --helper, so this console is read-only: \
              it shows everything and changes nothing on the host. `sudo stop-bots install \
              web` sets up the service and its helper."
@@ -4174,9 +4218,9 @@ fn set_nginx_commands(
     }
 
     let commands = NginxCommands::from_host(&host)?;
-    println!("Test command:   {}", commands.test.join(" "));
-    println!("Reload command: {}", commands.reload.join(" "));
-    println!("Config root:    {}", host.root(None).display());
+    say!("Test command:   {}", commands.test.join(" "));
+    say!("Reload command: {}", commands.reload.join(" "));
+    say!("Config root:    {}", host.root(None).display());
     Ok(())
 }
 
@@ -4184,18 +4228,18 @@ fn set_block_response(db_path: Option<PathBuf>, response: BlockResponseArg) -> R
     let db = open_db(db_path)?;
     let response: stop_bots::db::BlockResponse = response.into();
     db.set_block_response(response)?;
-    println!("Block response set to {}", response.label());
+    say!("Block response set to {}", response.label());
     // Nothing on disk has changed yet, and silently leaving that implicit
     // is exactly how an admin ends up believing 444 is live while every
     // site still returns 403.
-    println!("Run `stop-bots apply-blocks` to write it into the site configs.");
+    say!("Run `stop-bots apply-blocks` to write it into the site configs.");
     Ok(())
 }
 
 fn set_country_selected(db_path: Option<PathBuf>, country: String, selected: bool) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_country_selected(&country, selected)?;
-    println!(
+    say!(
         "{} country {country}",
         if selected { "Added" } else { "Removed" }
     );
@@ -4206,13 +4250,13 @@ fn list_selected_countries(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     let mode = db.get_geo_mode()?;
     let countries = db.list_selected_countries()?;
-    println!("Geo mode: {mode:?}");
+    say!("Geo mode: {mode:?}");
     if countries.is_empty() {
-        println!("No countries selected.");
+        say!("No countries selected.");
         return Ok(());
     }
     for country in countries {
-        println!("{country}");
+        say!("{}", terminal_safe(&country));
     }
     Ok(())
 }
@@ -4222,7 +4266,7 @@ fn list_selected_countries(db_path: Option<PathBuf>) -> Result<()> {
 /// log is a note on a write and a refusal on an apply.
 fn report_lockout_guard(outcome: &stop_bots::firewall::FirewallOutcome) {
     match &outcome.guard {
-        stop_bots::firewall::Guard::LogUnreadable => eprintln!(
+        stop_bots::firewall::Guard::LogUnreadable => say_err!(
             "Note: couldn't read any SSH log (tried the stored path, /var/log/auth.log, \
              /var/log/secure and journalctl), so the lockout safety check could not run.{} Run as root, or pass \
              --ssh-log, for this check to work.",
@@ -4238,14 +4282,14 @@ fn report_lockout_guard(outcome: &stop_bots::firewall::FirewallOutcome) {
 }
 
 fn print_lockout_warning(risks: &[(String, String)]) {
-    eprintln!(
+    say_err!(
         "WARNING: these firewall rules would block {} currently-connected SSH client IP address(es):",
         risks.len()
     );
     for (ip, cidr) in risks {
-        eprintln!("  {ip} (blocked by {cidr})");
+        say_err!("  {ip} (blocked by {cidr})");
     }
-    eprintln!("Applying them could lock you out of remote access to this machine.");
+    say_err!("Applying them could lock you out of remote access to this machine.");
 }
 
 impl From<FirewallBackend> for stop_bots::firewall::FirewallBackend {
@@ -4328,14 +4372,14 @@ fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<(
         // Running this file by hand would enforce it until the next boot
         // and no longer: the boot unit loads the applied script, which only
         // `--apply` replaces. So the hint names the apply, not `nft -f`.
-        (WriteStep::Written, ApplyStep::NotAsked) if request.out.is_some() => println!(
+        (WriteStep::Written, ApplyStep::NotAsked) if request.out.is_some() => say!(
             "Wrote {} rule(s) to {rendered}, which nothing loads at boot. Not applied — to \
              apply them, run `stop-bots render-firewall --apply`: it checks for a lockout again, \
              runs the script, and makes it the one loaded at boot ({}).",
             outcome.entries,
             outcome.applied_path.display()
         ),
-        (WriteStep::Written, ApplyStep::NotAsked) => println!(
+        (WriteStep::Written, ApplyStep::NotAsked) => say!(
             "Wrote {} rule(s) to {rendered}. Not applied — review it, then run \
              `stop-bots render-firewall --apply`, which checks for a lockout again, runs it, and \
              makes it the script loaded at boot ({}).",
@@ -4345,7 +4389,7 @@ fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<(
         (WriteStep::Written, ApplyStep::Refused) => {
             anyhow::bail!("{}. --force overrides this.", outcome.summary())
         }
-        _ if outcome.succeeded() => println!("{}", capitalised(&outcome.summary())),
+        _ if outcome.succeeded() => say!("{}", capitalised(&outcome.summary())),
         _ => anyhow::bail!("{}", outcome.summary()),
     }
     Ok(())
@@ -4390,7 +4434,7 @@ fn block_scanners(
     let outcome =
         stop_bots::scanblock::block_ssh_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
-        println!("No scanning IPs found (threshold: {threshold} failed attempt(s)).");
+        say!("No scanning IPs found (threshold: {threshold} failed attempt(s)).");
         return Ok(());
     }
     print_scan_block_outcome(&outcome);
@@ -4418,25 +4462,25 @@ fn block_web_scanners(
     let outcome =
         stop_bots::scanblock::block_web_scanners(&db, threshold, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
-        println!("No scanning IPs found (threshold: {threshold} distinct 404'd path(s)).");
+        say!("No scanning IPs found (threshold: {threshold} distinct 404'd path(s)).");
         return Ok(());
     }
     if !outcome.crawler_exclusion_active {
-        println!(
+        say!(
             "Warning: no crawler IP ranges fetched yet (run update-ip-ranges --source-id \
              googlebot/bingbot/gptbot first) — known-crawler exclusion is inactive, so a \
              legitimate search crawler chasing stale links could be flagged below."
         );
     }
     if outcome.skipped_known_crawlers > 0 {
-        println!(
+        say!(
             "Skipped {} IP(s) matching known crawler ranges (Googlebot/Bingbot/GPTBot) — never \
              auto-blocked here, even when their 404 behavior looks scan-like.",
             outcome.skipped_known_crawlers
         );
     }
     if outcome.newly_blocked.is_empty() && outcome.already_covered == 0 {
-        println!("No scanning IPs left to block after excluding known crawlers.");
+        say!("No scanning IPs left to block after excluding known crawlers.");
         return Ok(());
     }
     print_scan_block_outcome(&outcome);
@@ -4463,14 +4507,14 @@ fn block_spoofed_crawlers(
     // nothing to check against, so a clean result here means the detector
     // never ran, not that the log is clean.
     if !outcome.crawler_exclusion_active {
-        println!(
+        say!(
             "No crawler IP ranges fetched yet — run `stop-bots update-ip-ranges --source-id \
              googlebot` (and bingbot/gptbot) first. Nothing was checked."
         );
         return Ok(());
     }
     if outcome.candidates == 0 {
-        println!("No forged crawler user agents found.");
+        say!("No forged crawler user agents found.");
         return Ok(());
     }
     print_scan_block_outcome(&outcome);
@@ -4493,7 +4537,7 @@ fn block_probe_paths(
 
     let outcome = stop_bots::scanblock::block_probe_paths(&db, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
-        println!("No probe-path requests found.");
+        say!("No probe-path requests found.");
         return Ok(());
     }
     print_scan_block_outcome(&outcome);
@@ -4504,7 +4548,7 @@ fn set_probe_paths(db_path: Option<PathBuf>, paths: String) -> Result<()> {
     let db = open_db(db_path)?;
     db.set_text_setting(stop_bots::protection::PROBE_PATHS_EXTRA, &paths)?;
     let accepted = stop_bots::protection::extra_probe_paths(&db)?;
-    println!("Extra probe paths set ({} accepted).", accepted.len());
+    say!("Extra probe paths set ({} accepted).", accepted.len());
     // Report what was dropped rather than silently ignoring it: an entry
     // that doesn't start with `/` can never match, and finding that out
     // from a detector that quietly never fires is much worse.
@@ -4514,7 +4558,7 @@ fn set_probe_paths(db_path: Option<PathBuf>, paths: String) -> Result<()> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .count();
     if offered > accepted.len() {
-        println!(
+        say!(
             "Ignored {} entr(y/ies) that don't start with '/' — matching is anchored at the \
              start of the request path.",
             offered - accepted.len()
@@ -4526,16 +4570,16 @@ fn set_probe_paths(db_path: Option<PathBuf>, paths: String) -> Result<()> {
 fn list_probe_paths(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     let extra = stop_bots::protection::extra_probe_paths(&db)?;
-    println!("Built-in (always checked):");
+    say!("Built-in (always checked):");
     for path in stop_bots::accesslog::DEFAULT_PROBE_PATHS {
-        println!("  {path}");
+        say!("  {path}");
     }
     if extra.is_empty() {
-        println!("Extra: none (set with set-probe-paths)");
+        say!("Extra: none (set with set-probe-paths)");
     } else {
-        println!("Extra:");
+        say!("Extra:");
         for path in &extra {
-            println!("  {path}");
+            say!("  {}", terminal_safe(path));
         }
     }
     Ok(())
@@ -4557,7 +4601,7 @@ fn block_honeypot(
 
     let outcome = stop_bots::scanblock::block_honeypot(&db, ttl_days, &log_text, dry_run)?;
     if outcome.candidates == 0 {
-        println!(
+        say!(
             "Nothing fetched the honeypot path ({}).",
             stop_bots::protection::honeypot_path(&db)?
         );
@@ -4573,8 +4617,8 @@ fn set_honeypot_path(db_path: Option<PathBuf>, path: String) -> Result<()> {
     // `validate_honeypot_path` for what each refusal protects.
     let trimmed = &stop_bots::protection::validate_honeypot_path(&path)?;
     db.set_text_setting(stop_bots::protection::HONEYPOT_PATH, trimmed)?;
-    println!("Honeypot path set to {trimmed}");
-    println!(
+    say!("Honeypot path set to {trimmed}");
+    say!(
         "It only catches anything once it's published — enable robots.txt generation, or add a \
          Disallow line for it yourself."
     );
@@ -4685,35 +4729,35 @@ fn read_ssh_log(db: &Db, ssh_log: Option<&Path>) -> Result<String> {
 fn print_scan_block_outcome(outcome: &stop_bots::scanblock::ScanBlockOutcome) {
     for ip in &outcome.newly_blocked {
         if outcome.dry_run {
-            println!("Would block {ip} for {} day(s) (dry run)", outcome.ttl_days);
+            say!("Would block {ip} for {} day(s) (dry run)", outcome.ttl_days);
         } else {
-            println!(
+            say!(
                 "Added block rule for {ip}, expiring in {} day(s)",
                 outcome.ttl_days
             );
         }
     }
     if outcome.skipped_unblocked > 0 {
-        println!(
+        say!(
             "Left {} alone: unblocked by hand recently (trust an address to exempt it for good).",
             outcome.skipped_unblocked
         );
     }
     if outcome.newly_blocked.is_empty() {
-        println!(
+        say!(
             "Found {} {}(s), all already covered by an existing firewall rule.",
             outcome.already_covered,
             outcome.kind.noun()
         );
     } else if outcome.dry_run {
-        println!(
+        say!(
             "Would add {} new block rule(s), each expiring after {} day(s). Re-run without \
              --dry-run to apply.",
             outcome.newly_blocked.len(),
             outcome.ttl_days
         );
     } else {
-        println!(
+        say!(
             "Added {} new block rule(s), each expiring after {} day(s). Not applied \
              automatically — run render-firewall, then apply the generated script, to actually \
              enforce them (and again after they expire, to actually lift the block).",
@@ -4746,7 +4790,7 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
              `stop-bots set-log-paths --access-log <path>`, or run as root"
         );
     }
-    println!("{}", applied.stats.summary());
+    say!("{}", applied.stats.summary());
     Ok(())
 }
 
@@ -4756,15 +4800,11 @@ fn list_access_stats(db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
     let stats = db.list_user_agent_stats()?;
     if stats.is_empty() {
-        println!("No user-agent stats recorded yet — run record-access-stats first.");
+        say!("No user-agent stats recorded yet — run record-access-stats first.");
         return Ok(());
     }
     for stat in stats {
-        println!(
-            "{:>8}  {}",
-            stat.hit_count,
-            stop_bots::uadetail::printable(&stat.user_agent)
-        );
+        say!("{:>8}  {}", stat.hit_count, terminal_safe(&stat.user_agent));
     }
     Ok(())
 }
@@ -4780,7 +4820,7 @@ fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
 
     let before = db.size_on_disk()?;
     if let Some(size) = before {
-        println!(
+        say!(
             "Database is {} ({} reclaimable).",
             stop_bots::health::human_bytes(size.bytes),
             stop_bots::health::human_bytes(size.free_bytes)
@@ -4788,7 +4828,7 @@ fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
     }
 
     let summary = stop_bots::cron::maintenance(&db);
-    println!("{summary}");
+    say!("{summary}");
 
     // `cron::maintenance` compacts only when the slack is worth the
     // rewrite. `--force-compact` is for the case its thresholds are wrong
@@ -4797,7 +4837,7 @@ fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
     // the file at its old size for a day.
     if force_compact {
         let reclaimed = db.vacuum()?;
-        println!(
+        say!(
             "Compacted anyway: reclaimed {}.",
             stop_bots::health::human_bytes(reclaimed)
         );
@@ -4805,7 +4845,7 @@ fn maintain(db_path: Option<PathBuf>, force_compact: bool) -> Result<()> {
 
     if let (Some(before), Ok(Some(after))) = (before, db.size_on_disk()) {
         if after.bytes < before.bytes {
-            println!(
+            say!(
                 "Now {} — down from {}.",
                 stop_bots::health::human_bytes(after.bytes),
                 stop_bots::health::human_bytes(before.bytes)

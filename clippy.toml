@@ -1,0 +1,14 @@
+# Everything the program prints goes through `stop_bots::say!` and its
+# siblings, which make a value safe for a terminal (see `src/present.rs`).
+# What is printed is often attacker-chosen: a log line, or a row the
+# unprivileged console wrote into the database root's CLI reads.
+disallowed-macros = [
+    { path = "std::println", reason = "use say!, which makes data safe for a terminal" },
+    { path = "std::print", reason = "use say_inline!, which makes data safe for a terminal" },
+    { path = "std::eprintln", reason = "use say_err!, which makes data safe for a terminal" },
+    { path = "std::eprint", reason = "use say_err!, which makes data safe for a terminal" },
+]
+disallowed-methods = [
+    { path = "std::io::stdout", reason = "print with say!; a raw stdout bypasses terminal_safe" },
+    { path = "std::io::stderr", reason = "print with say_err!; a raw stderr bypasses terminal_safe" },
+]

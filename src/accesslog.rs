@@ -1263,16 +1263,16 @@ impl Survey {
 /// The longest sample line a report quotes, in characters.
 pub const SAMPLE_CHARS: usize = 160;
 
-/// `text` as it is safe to quote in a report: control characters replaced,
-/// and cut at [`SAMPLE_CHARS`]. The line is whatever a client made NGINX
+/// `text` as it is safe to quote in a report: control characters replaced
+/// and invisible ones written out ([`crate::present::terminal_safe`]), and
+/// cut at [`SAMPLE_CHARS`]. The line is whatever a client made NGINX
 /// write, so it is treated as hostile.
 pub fn printable_sample(text: &str) -> String {
     let text = text.trim_end_matches(['\r', '\n']);
-    let mut sample: String = text
-        .chars()
-        .take(SAMPLE_CHARS)
-        .map(|c| if c.is_control() { '\u{fffd}' } else { c })
-        .collect();
+    let mut sample = String::with_capacity(text.len().min(SAMPLE_CHARS * 4));
+    for c in text.chars().take(SAMPLE_CHARS) {
+        crate::present::push_terminal_safe(&mut sample, c);
+    }
     if text.chars().count() > SAMPLE_CHARS {
         sample.push('\u{2026}');
     }

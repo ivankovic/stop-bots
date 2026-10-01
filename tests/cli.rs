@@ -3757,7 +3757,9 @@ fn uninstall_refuses_purge_on_a_part() {
 #[test]
 fn uninstall_needs_root_without_a_prefix() {
     if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipped: running as root, where this would uninstall the test machine");
+        stop_bots::say_err!(
+            "skipped: running as root, where this would uninstall the test machine"
+        );
         return;
     }
     stop_bots_bin()
@@ -4726,4 +4728,325 @@ fn apply_blocks_names_what_it_leaves_out() {
     ));
     let site = fs::read_to_string(fx.nginx_root.join("old.example.conf")).unwrap();
     assert!(!site.contains("/x"), "the exemption was written:\n{site}");
+}
+
+// ---- nothing a database row or a log line holds drives the terminal ----
+
+/// What a value would carry to take over the terminal of the root operator
+/// who reads it, or to make what is printed read as something else. The
+/// console runs unprivileged and writes the database these commands read,
+/// and a client writes the logs, so each of these can arrive in a row.
+const HOSTILE: &[(&str, &str)] = &[
+    ("an OSC title change", "\u{1b}]0;PWNED\u{7}"),
+    ("a CSI as the C1 U+009B", "\u{9b}31mred"),
+    ("a bare ESC", "\u{1b}[2J"),
+    ("a BEL", "bell\u{7}"),
+    ("a DEL", "del\u{7f}"),
+    ("a CR that prints over the start", "real\rfake"),
+    ("a right-to-left override", "\u{202e}lmth.tob"),
+    ("a zero-width space", "Google\u{200b}bot"),
+];
+
+/// Each of [`HOSTILE`], as one value inside some ordinary text, so that
+/// every one of them reaches every field it is planted in.
+fn hostile_values() -> impl Iterator<Item = String> {
+    HOSTILE
+        .iter()
+        .enumerate()
+        .map(|(n, (_, chars))| format!("h{n}{chars}x"))
+}
+
+/// Fails, naming the character and where, if `bytes` holds anything a
+/// terminal acts on other than the program's own newlines and tabs: a C0
+/// control, DEL, a C1 control (as its UTF-8 or as a lone byte, which is
+/// not UTF-8 at all), or a bidirectional or zero-width character.
+fn assert_terminal_safe(command: &str, stream: &str, bytes: &[u8]) {
+    let text = std::str::from_utf8(bytes).unwrap_or_else(|err| {
+        panic!(
+            "`{command}` wrote bytes that are not UTF-8 to {stream} ({err}):\n{}",
+            String::from_utf8_lossy(bytes)
+        )
+    });
+    for (at, c) in text.char_indices() {
+        let drives_the_terminal = c.is_control() && !matches!(c, '\n' | '\t');
+        let reorders_or_hides = stop_bots::present::is_invisible_format(c);
+        assert!(
+            !drives_the_terminal && !reorders_or_hides,
+            "`{command}` wrote {c:?} to {stream} at byte {at}:\n{text}"
+        );
+    }
+}
+
+/// [`assert_terminal_safe`] on both streams of one run.
+fn assert_output_terminal_safe(command: &str, output: &std::process::Output) {
+    assert_terminal_safe(command, "stdout", &output.stdout);
+    assert_terminal_safe(command, "stderr", &output.stderr);
+}
+
+impl Fixture {
+    /// This fixture with every [`HOSTILE`] value planted where a `list-*`
+    /// or `status` command prints it: in the rows themselves, written with
+    /// plain SQL past every check, as the console could; in a site's
+    /// server name; and in an access log that `host.conf` points at.
+    fn hostile() -> Fixture {
+        let fx = Fixture::new();
+        let log = fx.nginx_root.join("access.log");
+        let mut lines = String::new();
+        for value in hostile_values() {
+            lines += &serde_json::json!({
+                "remote_addr": "203.0.113.5",
+                "request_uri": format!("/{value}"),
+                "status": "444",
+                "http_user_agent": value,
+            })
+            .to_string();
+            lines += "\n";
+        }
+        fs::write(&log, lines).unwrap();
+        fs::write(
+            fx.host_conf(),
+            format!(
+                "access_log = {}\nssh_log = {}/tests/fixtures/logs/auth.log\n",
+                log.display(),
+                env!("CARGO_MANIFEST_DIR")
+            ),
+        )
+        .unwrap();
+        // Through the library rather than the CLI: a run of the binary
+        // costs a tenth of a second on a loaded machine, and this fixture
+        // is set up five times.
+        let db = stop_bots::db::Db::open(&fx.db).unwrap();
+        db.set_block_response(stop_bots::db::BlockResponse::Close)
+            .unwrap();
+        let hits = hostile_values().map(|value| (value, 1)).collect();
+        db.record_user_agent_hits(&hits, 0).unwrap();
+        drop(db);
+
+        let mut conn = rusqlite::Connection::open(&fx.db).unwrap();
+        // One transaction: a commit per row is a sync per row, seconds.
+        let db = conn.transaction().unwrap();
+        db.execute(
+            "INSERT OR IGNORE INTO sources (id, name, url) VALUES ('evil', 'evil', 'x')",
+            [],
+        )
+        .unwrap();
+        for (n, value) in hostile_values().enumerate() {
+            let site_id: i64 = db
+                .query_row(
+                    "INSERT INTO sites (server_name, config_path, discovered_at) \
+                     VALUES (?1, ?2, 0) RETURNING id",
+                    rusqlite::params![value, format!("/nowhere/{n}.conf")],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            for sql in [
+                "INSERT INTO firewall_rules (address, action, enabled, created_at, source, evidence) \
+                 VALUES (?1, 'block', 1, 0, 'manual', ?1)",
+                "INSERT INTO trusted_addresses (address, trusted_at) VALUES (?1, 0)",
+                "INSERT INTO trusted_user_agents (user_agent, trusted_at) VALUES (?1, 0)",
+                "INSERT INTO blocked_user_agents (user_agent, blocked_at) VALUES (?1, 0)",
+                "INSERT INTO reputation_sources (id, name, url) VALUES (?1, ?1, ?1)",
+                "INSERT INTO selected_countries (country_code, added_at) VALUES (?1, 0)",
+                "INSERT INTO bots (slug, name, user_agent_pattern, status, source_id, updated_at) \
+                 VALUES (?1, ?1, ?1, 'blocked', 'evil', 0)",
+            ] {
+                db.execute(sql, [&value]).unwrap();
+            }
+            // An exempt path NGINX cannot take, so that the site's name
+            // is quoted in the warning that says it was left out.
+            db.execute(
+                "INSERT INTO site_path_exemptions (site_id, path) VALUES (?1, ?2)",
+                rusqlite::params![site_id, format!("/x\\|{value}")],
+            )
+            .unwrap();
+        }
+        let paths: Vec<String> = hostile_values().map(|v| format!("/{v}")).collect();
+        db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('detect_probe_paths_extra', ?1)",
+            [paths.join("\n")],
+        )
+        .unwrap();
+        db.commit().unwrap();
+        fx
+    }
+}
+
+/// The confirmed attack: a title-set OSC and a C1 CSI in a firewall rule
+/// the console wrote reached root's terminal through `list-firewall-rules`.
+/// The rule is still listed, one line each, with the characters replaced.
+#[test]
+fn list_firewall_rules_prints_a_hostile_rule_defanged_on_one_line() {
+    let fx = Fixture::hostile();
+
+    let output = fx.cmd(&["list-firewall-rules"]).output().unwrap();
+
+    assert_output_terminal_safe("list-firewall-rules", &output);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("h0\u{fffd}]0;PWNED\u{fffd}x") && stdout.contains("h6\\u{202E}lmth.tobx"),
+        "the rule should still be listed, defanged:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        HOSTILE.len(),
+        "one line per rule:\n{stdout}"
+    );
+}
+
+/// Every `list-*` and `show-*` command `--help` lists, so that one added
+/// later is walked too, against a database and a log holding every
+/// [`HOSTILE`] value. And `status --cached`, which re-assesses the stored
+/// probe against the same database.
+#[test]
+fn every_list_and_show_command_prints_hostile_rows_terminal_safe() {
+    let fx = Fixture::hostile();
+    let help = fx.cmd(&["--help"]).output().unwrap();
+    let help = String::from_utf8(help.stdout).unwrap();
+    let commands: Vec<&str> = help
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|word| word.starts_with("list-") || word.starts_with("show-"))
+        .collect();
+    assert!(
+        commands.len() >= 10,
+        "the walk found too few commands, so --help changed shape: {commands:?}"
+    );
+
+    // All at once: they only read, and one after another is seconds.
+    let outputs: Vec<_> = std::thread::scope(|scope| {
+        let runs: Vec<_> = commands
+            .iter()
+            .map(|&command| {
+                let fx = &fx;
+                scope.spawn(move || (command, fx.cmd(&[command]).output().unwrap()))
+            })
+            .collect();
+        runs.into_iter().map(|run| run.join().unwrap()).collect()
+    });
+    for (command, output) in outputs {
+        assert!(
+            output.status.code() != Some(2),
+            "`{command}` needs an argument this walk does not give it:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_output_terminal_safe(command, &output);
+    }
+}
+
+/// `status --cached` prints the strings of a probe the console stored,
+/// as stored, and the checks it derives from the database: what is
+/// trusted by hand, and what the NGINX config leaves out.
+#[test]
+fn status_cached_prints_a_hostile_probe_and_database_terminal_safe() {
+    let fx = Fixture::hostile();
+    let value = hostile_values().collect::<Vec<_>>().join(" ");
+    let probe = stop_bots::health::Probe {
+        access_log_readable: Some(false),
+        access_log_path: Some(value.clone()),
+        access_log_unparsed_sample: Some(value.clone()),
+        stray_generated_files: vec![value.clone()],
+        console_unreadable_logs: vec![value.clone()],
+        conf_d_path: Some(value),
+        ..Default::default()
+    };
+    let db = stop_bots::db::Db::open(&fx.db).unwrap();
+    stop_bots::health::store_probe(&db, &probe).unwrap();
+    drop(db);
+
+    let output = fx.cmd(&["status", "--cached"]).output().unwrap();
+
+    assert_output_terminal_safe("status --cached", &output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("h0\u{fffd}]0;PWNED\u{fffd}x"),
+        "the stored path should still be named, defanged:\n{stdout}"
+    );
+}
+
+/// A site's server name, printed by `list-categories --site`, and quoted
+/// by the error that lists the known sites when the name matches none,
+/// which goes out through the top-level error printer.
+#[test]
+fn list_categories_and_its_unknown_site_error_print_server_names_terminal_safe() {
+    let fx = Fixture::hostile();
+    let site = hostile_values().next().unwrap();
+
+    let found = fx
+        .cmd(&["list-categories", "--site", &site])
+        .output()
+        .unwrap();
+    assert!(found.status.success(), "{found:?}");
+    assert_output_terminal_safe("list-categories --site", &found);
+
+    let unknown = fx
+        .cmd(&["list-categories", "--site", "nope.example"])
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    assert_output_terminal_safe("list-categories --site nope.example", &unknown);
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(
+        stderr.starts_with("Error: unknown site: nope.example (known: ")
+            && stderr.contains("h5real\u{fffd}fakex"),
+        "the error should still list the sites, defanged:\n{stderr}"
+    );
+}
+
+/// `apply-blocks --dry-run` warns about every entry it would leave out of
+/// the config, naming the site and quoting the value.
+#[test]
+fn apply_blocks_dry_run_names_hostile_skipped_entries_terminal_safe() {
+    let fx = Fixture::hostile();
+
+    let output = fx
+        .cmd(&[
+            "apply-blocks",
+            "--root",
+            fx.nginx_root.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+
+    assert_output_terminal_safe("apply-blocks --dry-run", &output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: left out of the NGINX config: h0\u{fffd}]0;PWNED\u{fffd}x"),
+        "the skipped entries should still be named, defanged:\n{stderr}"
+    );
+}
+
+/// `batch` prints every step's error with its whole chain, and a step's
+/// error quotes what it failed on: here, an NGINX root whose name is
+/// [`HOSTILE`], which the site scan cannot find.
+#[test]
+fn batch_prints_hostile_step_errors_terminal_safe() {
+    let fx = Fixture::hostile();
+    let root = fx.nginx_root.join(hostile_values().collect::<String>());
+    let out = fx.firewall_script();
+
+    let output = fx
+        .cmd(&[
+            "batch",
+            "--no-fetch",
+            "--root",
+            root.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--ssh-log",
+            "tests/fixtures/logs/auth.log",
+            "--access-log",
+            "/dev/null",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "the site scan should fail");
+    assert_output_terminal_safe("batch", &output);
+    let printed = [output.stdout, output.stderr].concat();
+    let printed = String::from_utf8_lossy(&printed);
+    assert!(
+        printed.contains("FAIL") && printed.contains("h0\u{fffd}]0;PWNED\u{fffd}x"),
+        "the failing step should still name the root, defanged:\n{printed}"
+    );
 }

@@ -46,6 +46,11 @@ Code must always be formatted using the automated standard Rust formatter.
 
 No Rust check errors are allowed. Rust check should be run frequently.
 
+Print with `say!`, `say_inline!` and `say_err!`, never `println!` and its siblings,
+which `clippy.toml` forbids. They pass the line through `present::terminal_safe_text`,
+because much of what this program prints was chosen by a client or by the unprivileged
+console, and it is read by root in a terminal.
+
 ### The pre-commit hook
 
 Opt-in, one command:

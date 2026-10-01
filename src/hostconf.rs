@@ -346,7 +346,7 @@ pub fn migrate_from_db_if_absent(db: &Db) -> Result<HostConf> {
 pub fn migrate_from_db_if_absent_at(db: &Db, host_conf: &Path) -> Result<HostConf> {
     let migrated = migrate(db, host_conf)?;
     if let Some(note) = migrated.note(host_conf) {
-        eprintln!("{note}");
+        crate::say_err!("{note}");
     }
     HostConf::load_from(host_conf)
 }

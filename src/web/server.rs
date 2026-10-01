@@ -219,7 +219,7 @@ pub async fn serve_on(
                 // Out of descriptors, or a connection reset before it was
                 // accepted: nothing to do but try again shortly, rather
                 // than spin or stop serving.
-                eprintln!("stop-bots web: accept failed: {err}");
+                crate::say_err!("stop-bots web: accept failed: {err}");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
@@ -692,7 +692,7 @@ async fn record_console_login(state: &AppState, ip: IpAddr) {
         .with_db(move |db| db.record_console_login(ip, at))
         .await
     {
-        eprintln!("stop-bots: could not record the console login from {ip}: {err:#}");
+        crate::say_err!("stop-bots: could not record the console login from {ip}: {err:#}");
     }
 }
 
@@ -895,7 +895,7 @@ pub fn internal_error(message: &str) -> Response {
 /// database is, what failed to parse and which setting it was reading.
 /// That is for the operator's log, not for whoever is probing the port.
 pub fn unauthenticated_error(doing: &str, err: &anyhow::Error) -> Response {
-    eprintln!("stop-bots web: {doing}: {err:#}");
+    crate::say_err!("stop-bots web: {doing}: {err:#}");
     let page = maud::html! {
         (maud::DOCTYPE)
         html lang="en" {

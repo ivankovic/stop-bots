@@ -106,7 +106,7 @@ impl Config {
         let mut allowed_uids = vec![0];
         match crate::account::user(crate::account::USER) {
             Some(account) => allowed_uids.push(account.uid),
-            None => eprintln!(
+            None => crate::say_err!(
                 "stop-bots helper: there is no `{}` user, so only root is answered \
                  (`sudo stop-bots install web` creates it)",
                 crate::account::USER
@@ -422,7 +422,7 @@ fn reply(mut stream: &UnixStream, answer: &std::result::Result<Reply, String>) -
 fn log(uid: Option<u32>, op: &str, site: Option<i64>, outcome: &str, took: Duration) {
     let uid = uid.map_or_else(|| "?".to_string(), |uid| uid.to_string());
     let site = site.map(|id| format!(" site={id}")).unwrap_or_default();
-    eprintln!(
+    crate::say_err!(
         "stop-bots helper: uid={uid} op={op}{site} {outcome} in {:.3}s",
         took.as_secs_f64()
     );
@@ -559,19 +559,21 @@ pub fn run(db_path: PathBuf, socket: Option<PathBuf>) -> Result<()> {
         })?,
     };
     if !crate::hint::is_root() {
-        eprintln!("stop-bots helper: not running as root, so nothing that needs root will work");
+        crate::say_err!(
+            "stop-bots helper: not running as root, so nothing that needs root will work"
+        );
     }
     let config = Config::for_host(db_path);
     // It never migrates: the database is the console's, and nothing in it
     // is read for these. Without the file, every default applies.
     if std::fs::symlink_metadata(&config.settings.host_conf).is_err() {
-        eprintln!(
+        crate::say_err!(
             "stop-bots helper: there is no {}, so the built-in defaults apply and the \
              database's old host settings are ignored (`sudo stop-bots install web` writes it)",
             config.settings.host_conf.display()
         );
     }
-    eprintln!(
+    crate::say_err!(
         "stop-bots helper: serving {} for uids {:?}",
         config.db_path.display(),
         config.allowed_uids

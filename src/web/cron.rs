@@ -84,7 +84,7 @@ pub async fn tick(state: &AppState) -> usize {
     let due = match state.with_db(cron::due_jobs).await {
         Ok(due) => due,
         Err(err) => {
-            eprintln!("stop-bots: cron could not read its schedule: {err:#}");
+            crate::say_err!("stop-bots: cron could not read its schedule: {err:#}");
             return 0;
         }
     };
@@ -100,7 +100,7 @@ pub async fn tick(state: &AppState) -> usize {
     if !log_jobs.is_empty() {
         match run_log_jobs(state, log_jobs.clone()).await {
             Ok(()) => ran += log_jobs.len(),
-            Err(err) => eprintln!("stop-bots: the log pass failed: {err:#}"),
+            Err(err) => crate::say_err!("stop-bots: the log pass failed: {err:#}"),
         }
     }
     for job in due.into_iter().filter(|j| !cron::is_log_job(*j)) {
@@ -118,7 +118,7 @@ pub async fn tick(state: &AppState) -> usize {
         };
         match result {
             Ok(()) => ran += 1,
-            Err(err) => eprintln!("stop-bots: cron job {} failed: {err:#}", job.id()),
+            Err(err) => crate::say_err!("stop-bots: cron job {} failed: {err:#}", job.id()),
         }
     }
     ran

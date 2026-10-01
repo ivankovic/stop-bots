@@ -1796,7 +1796,7 @@ mod tests {
         // Root bypasses file permission bits, so this check would never
         // actually fail to write and the test would be meaningless there.
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipping: running as root, permission bits are unenforced");
+            crate::say_err!("skipping: running as root, permission bits are unenforced");
             return;
         }
 
@@ -1941,7 +1941,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         if unsafe { libc::geteuid() } == 0 {
-            eprintln!("skipping: running as root, permission bits are unenforced");
+            crate::say_err!("skipping: running as root, permission bits are unenforced");
             return;
         }
 

@@ -82,7 +82,7 @@ fn enabled() -> bool {
     if std::env::var_os("STOP_BOTS_CONTAINER_TESTS").is_some() {
         return true;
     }
-    eprintln!(
+    stop_bots::say_err!(
         "skipping: container tests are off. Set STOP_BOTS_CONTAINER_TESTS=1 \
          (or run `make integration-test`) to enable them."
     );
@@ -2261,7 +2261,7 @@ fn the_console_sandbox_holds_under_real_systemd() {
     }
     let host = Host::units_installed("stop-bots-console-sandbox");
     if host.sh("uname -m").trim() != "x86_64" {
-        eprintln!("skipping: the probes call system calls by their x86_64 numbers");
+        stop_bots::say_err!("skipping: the probes call system calls by their x86_64 numbers");
         return;
     }
     host.sh("systemctl start dbus.socket dbus.service");
@@ -5214,7 +5214,7 @@ fn stranger_deb() -> Option<String> {
             Some(path)
         }
         _ => {
-            eprintln!(
+            stop_bots::say_err!(
                 "skipping: the stranger test installs a .deb. Set STOP_BOTS_STRANGER_DEB to one \
                  built for x86_64-unknown-linux-musl, or run `make stranger-test`."
             );
