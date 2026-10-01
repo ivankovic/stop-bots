@@ -186,6 +186,20 @@ pub(crate) fn write_script(path: &std::path::Path, body: &str) {
     );
 }
 
+/// Makes a FIFO at `path`: what a root process that opened it to read
+/// would wait on for ever, with nobody writing.
+pub(crate) fn mkfifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path, for the length of the call.
+    assert_eq!(
+        unsafe { libc::mkfifo(name.as_ptr(), 0o600) },
+        0,
+        "could not make a FIFO at {}",
+        path.display()
+    );
+}
+
 /// Now, in Unix seconds.
 pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
