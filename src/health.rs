@@ -2023,10 +2023,14 @@ fn skipped_entries(db: &Db) -> Result<Option<Check>> {
 /// - **The proxy target.** `webaccess` writes the console's own bind
 ///   address into `proxy_pass`, and `127.0.0.1` inside a container is the
 ///   container. Loud — a 502 the first time anyone opens the console — so
-///   Warn.
+///   Warn. Only on a console set up behind NGINX (`web::is_proxied`): one
+///   reached over an SSH tunnel has no `proxy_pass`, and a warning about it
+///   is advice to change a bind that works.
 /// - **The managed directory.** The generated config names it absolutely;
 ///   NGINX resolves it against its own filesystem. Caught at apply time by
 ///   `write_validated` running `nginx -t` inside the container, so Warn.
+///   Only while `robots.txt` is served: that `alias` is the one thing the
+///   generated config reads from it.
 fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
     let commands = probe.nginx_commands.clone().unwrap_or_default();
     let targets_a_container = |argv: &[String]| {
@@ -2099,7 +2103,7 @@ fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
 
     let upstream = crate::web::resolve_bind(db, None)?;
     let host_networked = probe.container_shares_host_network == Some(true);
-    if upstream.ip().is_loopback() && !host_networked {
+    if upstream.ip().is_loopback() && !host_networked && crate::web::is_proxied(db)? {
         problems.push(format!(
             "the console binds {upstream}, which inside the container means the container itself, so the generated proxy_pass cannot reach it"
         ));
@@ -2109,7 +2113,7 @@ fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
         );
     }
 
-    if probe.managed_dir_in_container == Some(false) {
+    if probe.managed_dir_in_container == Some(false) && db.get_serve_robots_txt()? {
         problems.push(format!(
             "{} does not exist inside the container, and the generated config names it absolutely",
             crate::nginx::managed_dir().display()
@@ -2976,6 +2980,8 @@ mod tests {
     #[test]
     fn a_loopback_console_bind_is_flagged_for_a_bridged_container() {
         let db = db();
+        db.set_text_setting(crate::web::BASE_PATH_KEY, "/stop-bots")
+            .unwrap();
 
         let check = assess(&db, &configured_for_docker(in_container())).unwrap();
         let check = check2(&check, "nginx-deployment");
@@ -3008,6 +3014,7 @@ mod tests {
     #[test]
     fn a_managed_directory_missing_from_the_container_is_flagged() {
         let db = db();
+        db.set_serve_robots_txt(true).unwrap();
 
         let report = assess(
             &db,
@@ -3023,6 +3030,51 @@ mod tests {
         assert_eq!(check.level, Level::Warn);
         assert!(
             check.detail.contains("does not exist inside the container"),
+            "was: {}",
+            check.detail
+        );
+    }
+
+    /// A console nobody proxies to — reached over an SSH tunnel — has no
+    /// `proxy_pass` for a loopback bind to break, and a host that serves no
+    /// generated `robots.txt` reads nothing from the managed directory. Both
+    /// were reported anyway, on a real host using neither.
+    #[test]
+    fn a_container_host_using_neither_feature_is_not_warned_about_them() {
+        let report = assess(
+            &db(),
+            &configured_for_docker(Probe {
+                managed_dir_in_container: Some(false),
+                ..in_container()
+            }),
+        )
+        .unwrap();
+
+        let check = check2(&report, "nginx-deployment");
+        assert_eq!(check.level, Level::Ok, "was: {}", check.detail);
+    }
+
+    /// Each warning follows its own feature: serving `robots.txt` brings
+    /// back the managed directory's, and not the console's.
+    #[test]
+    fn serving_robots_txt_brings_back_only_the_managed_directory_warning() {
+        let db = db();
+        db.set_serve_robots_txt(true).unwrap();
+
+        let report = assess(
+            &db,
+            &configured_for_docker(Probe {
+                managed_dir_in_container: Some(false),
+                ..in_container()
+            }),
+        )
+        .unwrap();
+
+        let check = check2(&report, "nginx-deployment");
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.detail.contains("does not exist inside the container")
+                && !check.detail.contains("proxy_pass"),
             "was: {}",
             check.detail
         );
