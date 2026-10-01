@@ -69,6 +69,49 @@ impl ApplyPreview {
     }
 }
 
+/// Lines of diff a [`Summary`] carries before it stops and says where the
+/// rest is. A first apply on a host with reputation feeds is a 44,000-line
+/// script; a page that size helps nobody review anything, and the web
+/// console's helper should not have to send it.
+pub const DIFF_LINES_SHOWN: usize = 4_000;
+
+/// What the web console's confirm page shows: the summary lines, and the
+/// diff when asked for, cut at [`DIFF_LINES_SHOWN`]. All a front-end that
+/// does not hold the files gets — the root helper returns this and no
+/// file's contents beyond the diff.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Summary {
+    pub lines: Vec<String>,
+    pub diff: Option<String>,
+}
+
+impl ApplyPreview {
+    /// The [`Summary`] of this preview, with the diff if `diff`.
+    pub fn summary(&self, diff: bool) -> Summary {
+        Summary {
+            lines: self.lines(),
+            diff: diff.then(|| truncated(&self.diff(), DIFF_LINES_SHOWN)),
+        }
+    }
+}
+
+/// `full`'s first `max` lines, and a line saying how many more there were.
+pub fn truncated(full: &str, max: usize) -> String {
+    let total = full.lines().count();
+    let mut shown: String = full
+        .lines()
+        .take(max)
+        .flat_map(|line| [line, "\n"])
+        .collect();
+    if total > max {
+        shown.push_str(&format!(
+            "\u{2026} {} more line(s). `stop-bots batch --dry-run --diff` prints all of it.\n",
+            total - max
+        ));
+    }
+    shown
+}
+
 /// The NGINX half of a summary: how many files would change, and which.
 pub fn nginx_lines(changes: &Result<Vec<FileChange>, String>) -> Vec<String> {
     match changes {

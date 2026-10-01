@@ -1887,10 +1887,12 @@ fn uninstall_puts_the_host_back_as_it_was() {
         before,
         "the host is not as it was. uninstall said:\n{said}"
     );
+    // Only the host settings, which, like the database, stay unless
+    // `--purge`.
     assert_eq!(
         host.sh("find /etc/stop-bots -type f 2>/dev/null || true")
             .trim(),
-        "",
+        "/etc/stop-bots/host.conf",
         "{said}"
     );
     let (valid, out, err) = host.run("nginx -t");
@@ -2574,9 +2576,10 @@ fn the_installed_console_runs_as_its_own_user_with_nothing_of_roots() {
 }
 
 /// The request a test sends the helper, when the bytes do not matter but
-/// the answer does. PRIVSEP-CORE: one well-formed request of the core's
-/// protocol, for something that changes nothing.
-const HELPER_PROBE_REQUEST: &str = r#"{"op":"NginxCheck"}"#;
+/// the answer does. One well-formed request of the helper's protocol
+/// (`privileged::Op`, as JSON), for something that changes nothing: the
+/// statuses of the scanned sites.
+const HELPER_PROBE_REQUEST: &str = r#""SiteStatuses""#;
 
 /// Sends [`HELPER_PROBE_REQUEST`] to the helper's socket as `user`, and
 /// returns what came back: the reply line, or `"<no connection>"`. Perl,
@@ -2731,6 +2734,10 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
            ('nginx:reload_command', '/usr/sbin/nginx -s reload'), \
            ('nginx:root', '/etc/nginx')\""
     ));
+    // rc.2 had no host settings file. The `scan-sites` above is this
+    // release's, and as root it made one, before there was anything to
+    // move into it; an rc.2 host has the rows and no file.
+    host.sh("rm -f /etc/stop-bots/host.conf");
     host.seed_bot("badbot", "BadBot");
     host.sh("systemctl daemon-reload && systemctl enable --now stop-bots-web.service");
     host.wait_for_console();
@@ -2764,7 +2771,7 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
             "{path} is not the console's"
         );
     }
-    // PRIVSEP-CORE: the keys `hostconf` writes.
+    // `hostconf`'s keys: `nginx_test_command = /usr/sbin/nginx -t`, and so on.
     let conf = host.sh("cat /etc/stop-bots/host.conf");
     for command in ["/usr/sbin/nginx -t", "/usr/sbin/nginx -s reload"] {
         assert!(

@@ -962,6 +962,15 @@ enum Command {
         /// script. The same escape hatch the TUI's --no-reload is.
         #[arg(long)]
         no_apply: bool,
+        /// Do everything that needs root through the stop-bots helper
+        /// listening on this socket, rather than in this process.
+        ///
+        /// How the service runs: as its own unprivileged user, with
+        /// `--helper /run/stop-bots/helper.sock` (`install web` sets both
+        /// up). Without it, a console running as root does those things
+        /// itself, and one that is not root is read-only.
+        #[arg(long, value_name = "SOCKET")]
+        helper: Option<PathBuf>,
     },
     /// Set how the web console starts and whom it answers.
     ///
@@ -1298,6 +1307,19 @@ enum Command {
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
     },
+    /// Serve the web console's privileged operations, as root
+    ///
+    /// Hidden: `stop-bots-helper.service` runs it, socket-activated by
+    /// `stop-bots-helper.socket`, which `install web` writes. It answers
+    /// only root and the `stop-bots` user, and only the console's closed
+    /// set of operations.
+    #[command(hide = true)]
+    Helper {
+        /// Listen on this socket instead of the one systemd passes, which
+        /// is /run/stop-bots/helper.sock.
+        #[arg(long, value_name = "PATH")]
+        socket: Option<PathBuf>,
+    },
     /// Write the man pages and shell completions for packaging
     ///
     /// Hidden: the release pipeline runs it, and the `.deb` ships what it
@@ -1513,14 +1535,15 @@ async fn main() -> Result<()> {
     // A one-shot command's output is often piped into something that stops
     // reading early (`| head`). Rust ignores SIGPIPE, so the next write is
     // an error, and `println!` turns that into a panic. Dying quietly, the
-    // default, is what every other command-line tool does. Not for the two
-    // long-running front-ends: they write to sockets and a terminal, where a
-    // peer going away is an error to handle, not the end of the process.
+    // default, is what every other command-line tool does. Not for the
+    // long-running front-ends and the helper: they write to sockets and a
+    // terminal, where a peer going away is an error to handle, not the end
+    // of the process.
     // Nothing a one-shot command runs writes to a child's stdin, which is
     // the other place the signal could come from.
     if !matches!(
         cli.command,
-        None | Some(Command::Tui { .. }) | Some(Command::Web { .. })
+        None | Some(Command::Tui { .. }) | Some(Command::Web { .. }) | Some(Command::Helper { .. })
     ) {
         // SAFETY: called before any thread this program starts writes to a
         // pipe, and SIG_DFL is async-signal-safe to install.
@@ -1742,25 +1765,34 @@ async fn main() -> Result<()> {
             save,
             set_password,
             no_apply,
+            helper,
         }) => {
             run_web(
                 db,
-                root,
-                ssh_log,
-                firewall_out,
-                bind,
-                base_path,
-                expose,
+                WebRun {
+                    root,
+                    ssh_log,
+                    firewall_out,
+                    bind,
+                    base_path,
+                    expose,
+                    set_password,
+                    no_apply,
+                    helper,
+                },
                 DeprecatedWebFlags {
                     allowed_hosts,
                     trust_forwarded_for,
                     secure_cookie,
                     save,
                 },
-                set_password,
-                no_apply,
             )
             .await
+        }
+        // Its own database open: no migration (it never reads the host
+        // settings' old rows) and nothing created, made private or trusted.
+        Some(Command::Helper { socket }) => {
+            stop_bots::helper::run(db.unwrap_or_else(|| PathBuf::from(DEFAULT_DB_PATH)), socket)
         }
         Some(Command::SetWeb {
             bind,
@@ -1837,10 +1869,34 @@ async fn main() -> Result<()> {
 /// nginx/firewall changes needs anyway, but just exploring with `cargo run`
 /// or the TUI shouldn't require it.
 fn open_db(explicit: Option<PathBuf>) -> Result<Db> {
-    let Some(path) = explicit else {
-        return open_default_db();
-    };
-    Db::open(path)
+    let db = open_db_as_is(explicit)?;
+    migrate_host_settings(&db)?;
+    Ok(db)
+}
+
+/// [`open_db`] without moving the host settings: for the web console.
+fn open_db_as_is(explicit: Option<PathBuf>) -> Result<Db> {
+    match explicit {
+        Some(path) => Db::open(path),
+        None => open_default_db(),
+    }
+}
+
+/// Moves the host settings out of the database into their own file, the
+/// first time a root process opens one (see [`stop_bots::hostconf`]). A
+/// no-op for anyone else, and once the file exists.
+fn migrate_host_settings(db: &Db) -> Result<()> {
+    let path = stop_bots::hostconf::path();
+    let migrated = stop_bots::hostconf::migrate(db, &path)?;
+    if let Some(note) = migrated.note(&path) {
+        eprintln!("{note}");
+    }
+    Ok(())
+}
+
+/// The host settings: the NGINX commands and root, and the logs.
+fn host_settings() -> Result<stop_bots::hostconf::HostConf> {
+    stop_bots::hostconf::HostConf::load()
 }
 
 fn open_default_db() -> Result<Db> {
@@ -1942,7 +1998,7 @@ async fn run_tui(
     let defaulted = db_path.is_none();
     let db = open_db(db_path)?;
     stop_bots::firewall::seed_backend(&db, stop_bots::firewall::Installed::detect())?;
-    let root = nginx::root(&db, root.as_deref())?;
+    let root = nginx::root(&host_settings()?, root.as_deref());
     let notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
     let mut app = stop_bots::app::App::new(db, root, !no_reload, ssh_log)?;
     app.db_notice = notice;
@@ -1995,18 +2051,12 @@ fn run_status(
         let path = db
             .path()
             .unwrap_or_else(|| PathBuf::from("./stop-bots.sqlite3"));
-        let paths = stop_bots::logpaths::LogPaths::from_db(&db).unwrap_or_default();
-        let conf_d = stop_bots::nginx::conf_d_dir(
-            &stop_bots::nginx::root(&db, None)
-                .unwrap_or_else(|_| PathBuf::from(stop_bots::nginx::DEFAULT_ROOT)),
-        );
         let block_status = db.get_block_response()?.status_code();
         let probe = health::probe(
             backend,
             &path,
             ssh_log.as_deref(),
-            &paths,
-            &conf_d,
+            &host_settings()?,
             block_status,
         );
         health::store_probe(&db, &probe)?;
@@ -2066,8 +2116,9 @@ struct BatchRequest {
 
 async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: bool) -> Result<()> {
     let db = open_db(db_path)?;
+    let host = host_settings()?;
     let request = BatchRequest {
-        root: Some(nginx::root(&db, request.root.as_deref())?),
+        root: Some(nginx::root(&host, request.root.as_deref())),
         ..request
     };
 
@@ -2081,6 +2132,7 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
         access_log: request.access_log,
         force: request.force,
         no_fetch: request.no_fetch,
+        host,
     };
 
     let report = stop_bots::batch::run(&db, &options).await;
@@ -2100,7 +2152,7 @@ async fn run_batch(db_path: Option<PathBuf>, request: BatchRequest, verbose: boo
 
 fn scan_sites(root: Option<&Path>, db_path: Option<PathBuf>) -> Result<()> {
     let db = open_db(db_path)?;
-    let root = nginx::root(&db, root)?;
+    let root = nginx::root(&host_settings()?, root);
     let root = root.as_path();
     let sites = nginx::discover_sites(root)?;
     for site in &sites {
@@ -2138,7 +2190,7 @@ async fn update_bot_lists(
 fn preview_apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, diff: bool) -> Result<()> {
     let db = open_db(db_path)?;
     botlist::register_all_sources(&db)?;
-    let root = nginx::root(&db, root)?;
+    let root = nginx::root(&host_settings()?, root);
     let changes = nginx::preview_all_sites(&db, &root);
     println!("Dry run: nothing is written or reloaded.");
     let changes = changes.map_err(|err| format!("{err:#}"));
@@ -2170,13 +2222,14 @@ fn preview_batch(db_path: Option<PathBuf>, request: BatchRequest, diff: bool) ->
     // The run stores this first (see `batch::run`), so a preview without
     // it would show a fresh host an NGINX plane with nothing to change.
     botlist::register_all_sources(&db)?;
-    let root = nginx::root(&db, request.root.as_deref())?;
+    let host = host_settings()?;
+    let root = nginx::root(&host, request.root.as_deref());
     let (backend, out) = firewall_target(&db, request.backend, request.out)?;
     let run = stop_bots::firewall::FirewallRun::new(backend, out)
         .apply(request.apply)
         .force(request.force);
     // The flag, else the path `set-log-paths` stored, else the search.
-    let source = stop_bots::logpaths::LogPaths::from_db(&db)?.ssh(request.ssh_log.as_deref());
+    let source = host.log_paths().ssh(request.ssh_log.as_deref());
     let preview = stop_bots::preview::apply_everything(
         &db,
         &root,
@@ -2204,12 +2257,11 @@ fn apply_blocks(root: Option<&Path>, db_path: Option<PathBuf>, no_reload: bool) 
     // console store it on start: on a host driven by the CLI alone,
     // nothing else ever would.
     botlist::register_all_sources(&db)?;
-    let root = nginx::root(&db, root)?;
+    let host = host_settings()?;
+    let root = nginx::root(&host, root);
     // Tested, put back if the test fails, and reloaded only when something
     // actually changed on disk.
-    let commands = (!no_reload)
-        .then(|| nginx::NginxCommands::from_db(&db))
-        .transpose()?;
+    let commands = (!no_reload).then(|| host.commands()).transpose()?;
     let outcome = nginx::apply_all_sites_and_reload(&db, &root, commands.as_ref())?;
     println!(
         "Applied blocking rules to {} site(s) across {} file(s), {} file(s) changed",
@@ -3439,14 +3491,36 @@ fn run_set_log_paths(
     access_log: Option<String>,
     ssh_log: Option<String>,
 ) -> Result<()> {
-    let db = open_db(db_path)?;
+    // Opened for the migration only: these settings are the host's now
+    // (see `hostconf`), and a database left holding the old rows moves
+    // them first, so that what is changed here is what is already there.
+    let _db = open_db(db_path)?;
+    let path = stop_bots::hostconf::path();
+    let mut host = stop_bots::hostconf::HostConf::load_from(&path)?;
     if access_log.is_none() && ssh_log.is_none() {
         println!("Nothing to change. Current settings:");
     } else {
-        stop_bots::logpaths::LogPaths::save(&db, access_log.as_deref(), ssh_log.as_deref())?;
+        // An empty value clears one; a path is stored absolute, because
+        // the service that reads it does not run where this did.
+        let resolve = |raw: &str| -> Result<Option<PathBuf>> {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(std::path::absolute(raw).with_context(|| {
+                format!("{raw} is not a path this host can resolve")
+            })?))
+        };
+        if let Some(raw) = &access_log {
+            host.access_log = resolve(raw)?;
+        }
+        if let Some(raw) = &ssh_log {
+            host.ssh_log = resolve(raw)?;
+        }
+        host.save_to(&path)?;
     }
 
-    let paths = stop_bots::logpaths::LogPaths::from_db(&db)?;
+    let paths = host.log_paths();
     match &paths.access {
         Some(path) => println!("  access log: {}", path.display()),
         None => println!(
@@ -3647,7 +3721,22 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     // running.
     let mut password = None;
     if !options.dry_run {
-        let db = open_db(options.db.or(Some(layout.db_path.clone())))?;
+        // The host settings file of the tree being installed: the host's
+        // own, or the one under `--prefix`.
+        let host_path = if prefixed {
+            prefix.join(stop_bots::hostconf::DEFAULT_PATH.trim_start_matches('/'))
+        } else {
+            stop_bots::hostconf::path()
+        };
+        // Opened without `open_db`'s migration, which moves the rows into
+        // the host's own file: under `--prefix` they belong in the tree's.
+        // Before anything else touches it, and before the database is made
+        // the console's: a database the console's user owns is never
+        // migrated from.
+        let db = Db::open(options.db.clone().unwrap_or_else(|| layout.db_path.clone()))?;
+        if let Some(note) = stop_bots::hostconf::migrate(&db, &host_path)?.note(&host_path) {
+            steps.push(note);
+        }
 
         let addr = web::resolve_bind(&db, options.bind.as_deref())?;
         let exposed = options.expose || db.get_bool_setting(web::EXPOSE_KEY, false)?;
@@ -3678,22 +3767,26 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
             "bind {addr} recorded in {}",
             layout.db_path.display()
         ));
+        // A host setting, like `set-nginx-commands --root`: in the file
+        // only root writes, not in the database the console writes.
+        let mut host = stop_bots::hostconf::HostConf::load_from(&host_path)?;
         if let Some(root) = &options.root {
-            // As given, like `set-nginx-commands --root`.
-            db.set_text_setting(nginx::NginxCommands::ROOT_KEY, &root.display().to_string())?;
+            host.nginx_root = Some(std::path::absolute(root)?);
+            host.save_to(&host_path)?;
             steps.push(format!(
                 "NGINX root {} recorded in {}",
                 root.display(),
-                layout.db_path.display()
+                host_path.display()
             ));
         } else if let Some(root) = &legacy_root {
-            let key = nginx::NginxCommands::ROOT_KEY;
-            if db.get_text_setting(key)?.is_none() {
-                db.set_text_setting(key, &root.to_string_lossy())?;
+            if host.nginx_root.is_none() {
+                host.nginx_root = Some(std::path::absolute(root)?);
+                host.save_to(&host_path)?;
                 steps.push(format!(
-                    "kept the old unit's --root {} as the stored NGINX root \
+                    "kept the old unit's --root {} as the NGINX root in {} \
                      (`set-nginx-commands --root`)",
-                    root.display()
+                    root.display(),
+                    host_path.display()
                 ));
             }
         }
@@ -3707,12 +3800,11 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
             steps.push("a console password is already set, keeping it".to_string());
         }
 
-        // PRIVSEP-HOOK(hostconf): move the host settings — the NGINX test
-        // and reload commands, the NGINX root and the log paths — out of
-        // the database into /etc/stop-bots/host.conf here, with the core's
-        // migration, once `hostconf` lands. Here: as root, after this
-        // run's own `--root` is stored, and before the console that could
-        // rewrite those rows is restarted as its own user.
+        // The host settings file exists from here on, whatever there was to
+        // move into it (the migration above made it, as root): once the
+        // database below is the console's, nothing may be migrated from it,
+        // and the file's existence is what says so.
+        stop_bots::hostconf::ensure_written_at(&host_path)?;
 
         // After the writes, and while the path is still to hand. The
         // database, its companions and any pre-upgrade copies become the
@@ -3815,28 +3907,78 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     Ok(())
 }
 
-/// Starts the web UI, after the checks that decide whether it may bind
-/// where it was asked to.
-#[allow(clippy::too_many_arguments)]
-async fn run_web(
-    db_path: Option<PathBuf>,
+/// `stop-bots web`'s flags for this run.
+struct WebRun {
     root: Option<PathBuf>,
     ssh_log: Option<PathBuf>,
     firewall_out: Option<PathBuf>,
     bind: Option<String>,
     base_path: Option<String>,
     expose: bool,
-    deprecated: DeprecatedWebFlags,
     set_password: bool,
     no_apply: bool,
+    helper: Option<PathBuf>,
+}
+
+/// How a console started with `helper` does what needs root: through it;
+/// else itself, if `root`; else not at all.
+fn privilege_for(helper: Option<PathBuf>, root: bool) -> stop_bots::web::state::Privilege {
+    use stop_bots::web::state::Privilege;
+    match helper {
+        Some(socket) => Privilege::Helper(socket),
+        None if root => Privilege::Local,
+        None => Privilege::ReadOnly,
+    }
+}
+
+/// Starts the web UI, after the checks that decide whether it may bind
+/// where it was asked to.
+async fn run_web(
+    db_path: Option<PathBuf>,
+    run: WebRun,
+    deprecated: DeprecatedWebFlags,
 ) -> Result<()> {
     use stop_bots::web::{self, auth, server, state::AppState};
+    let WebRun {
+        root,
+        ssh_log,
+        firewall_out,
+        bind,
+        base_path,
+        expose,
+        set_password,
+        no_apply,
+        helper,
+    } = run;
+
+    // The helper takes nothing from the console but the operation: where
+    // NGINX is and where the script goes are root's to say, in the host
+    // settings. A flag that would be ignored is refused instead.
+    if helper.is_some() {
+        for (given, flag) in [
+            (root.is_some(), "--root"),
+            (firewall_out.is_some(), "--firewall-out"),
+            (no_apply, "--no-apply"),
+        ] {
+            if given {
+                anyhow::bail!(
+                    "{flag} cannot be combined with --helper: the helper does what needs root \
+                     with the host's own settings (`stop-bots set-nginx-commands`), and \
+                     takes none from the console"
+                );
+            }
+        }
+    }
 
     deprecated.warn();
     let defaulted = db_path.is_none();
-    let db = open_db(db_path)?;
+    // Never migrated from here: the console is not one of the root
+    // processes an administrator runs by hand, and once it runs as its own
+    // user its database is not root's to trust. `install web`, the TUI and
+    // every other verb run as root move the host settings.
+    let db = open_db_as_is(db_path)?;
     stop_bots::firewall::seed_backend(&db, stop_bots::firewall::Installed::detect())?;
-    let root = nginx::root(&db, root.as_deref())?;
+    let root = nginx::root(&host_settings()?, root.as_deref());
     let db_notice = stop_bots::db::location_notice(db.path().as_deref(), defaulted);
 
     // The same registration the TUI does on startup, and for the same
@@ -3960,11 +4102,28 @@ async fn run_web(
         }
     }
 
+    let privilege = privilege_for(helper, stop_bots::hint::is_root());
+    match &privilege {
+        web::state::Privilege::Helper(socket) => {
+            println!(
+                "Changes to the host go through the helper at {}.",
+                socket.display()
+            )
+        }
+        web::state::Privilege::Local => {}
+        web::state::Privilege::ReadOnly => eprintln!(
+            "Note: not running as root and given no --helper, so this console is read-only: \
+             it shows everything and changes nothing on the host. `sudo stop-bots install \
+             web` sets up the service and its helper."
+        ),
+    }
+
     let mut state = AppState::with_base(db, root, ssh_log, !no_apply, base);
     // `None` unless the operator named a path: without one the destination
     // follows the backend, so an iptables render lands in `.sh`.
     state.firewall_out = firewall_out;
     state.db_notice = db_notice;
+    state.privilege = privilege;
     server::serve(state, addr).await
 }
 
@@ -3977,39 +4136,47 @@ fn set_nginx_commands(
 ) -> Result<()> {
     use stop_bots::nginx::NginxCommands;
 
-    let db = open_db(db_path)?;
+    // Opened for the migration only, as in `set-log-paths`: these are the
+    // host's settings now, in `hostconf::path()`, which only root writes.
+    let _db = open_db(db_path)?;
+    let path = stop_bots::hostconf::path();
+    let mut host = stop_bots::hostconf::HostConf::load_from(&path)?;
+    let changing = reset || root.is_some() || test.is_some() || reload.is_some();
 
     if reset {
-        db.set_text_setting(NginxCommands::TEST_KEY, NginxCommands::DEFAULT_TEST)?;
-        db.set_text_setting(NginxCommands::RELOAD_KEY, NginxCommands::DEFAULT_RELOAD)?;
-        db.set_text_setting(NginxCommands::ROOT_KEY, stop_bots::nginx::DEFAULT_ROOT)?;
+        host.nginx_test_command = None;
+        host.nginx_reload_command = None;
+        host.nginx_root = None;
     }
     if let Some(root) = &root {
-        // Stored as given, not canonicalised: the path has to mean the same
-        // thing later, and a symlink an operator chose deliberately is not
-        // this command's to resolve.
-        db.set_text_setting(NginxCommands::ROOT_KEY, &root.display().to_string())?;
+        // Made absolute, because the service that reads it does not run
+        // where this did; not canonicalised, because a symlink an operator
+        // chose deliberately is not this command's to resolve.
+        host.nginx_root =
+            Some(std::path::absolute(root).with_context(|| {
+                format!("{} is not a path this host can resolve", root.display())
+            })?);
     }
-    for (key, value) in [
-        (NginxCommands::TEST_KEY, &test),
-        (NginxCommands::RELOAD_KEY, &reload),
+    for (name, value, field) in [
+        ("--test", &test, &mut host.nginx_test_command),
+        ("--reload", &reload, &mut host.nginx_reload_command),
     ] {
         let Some(value) = value else { continue };
         // Parsed before it is stored, so an unbalanced quote is rejected
         // here rather than at the next reload — which could be a cron run
         // hours later with nobody watching.
         stop_bots::nginx::split_command(value)
-            .with_context(|| format!("refusing to store an unusable command for `{key}`"))?;
-        db.set_text_setting(key, value)?;
+            .with_context(|| format!("refusing to store an unusable command for {name}"))?;
+        *field = Some(value.clone());
+    }
+    if changing {
+        host.save_to(&path)?;
     }
 
-    let commands = NginxCommands::from_db(&db)?;
+    let commands = NginxCommands::from_host(&host)?;
     println!("Test command:   {}", commands.test.join(" "));
     println!("Reload command: {}", commands.reload.join(" "));
-    println!(
-        "Config root:    {}",
-        stop_bots::nginx::root(&db, None)?.display()
-    );
+    println!("Config root:    {}", host.root(None).display());
     Ok(())
 }
 
@@ -4143,7 +4310,7 @@ fn render_firewall(db_path: Option<PathBuf>, request: RenderRequest) -> Result<(
         run = run.rendered_at(out);
     }
     // The flag, else the path `set-log-paths` stored, else the search.
-    let source = stop_bots::logpaths::LogPaths::from_db(&db)?.ssh(request.ssh_log.as_deref());
+    let source = host_settings()?.log_paths().ssh(request.ssh_log.as_deref());
     let outcome = stop_bots::firewall::render_and_apply(
         &db,
         run,
@@ -4450,7 +4617,8 @@ fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
     // the internal cron do. Before this, `set-log-paths` could be set and a
     // detector invoked by hand would still go to the default -- two answers
     // to one question, which is the shape of bug this whole type removes.
-    let paths = stop_bots::logpaths::LogPaths::from_db(db).unwrap_or_default();
+    let _ = db;
+    let paths = host_settings().unwrap_or_default().log_paths();
     match paths.access_source(access_log) {
         accesslog::LogSource::Found(text) => Ok(text),
         // Name the path that was actually tried, not the one the reader
@@ -4484,7 +4652,8 @@ fn read_access_log(db: &Db, access_log: Option<&Path>) -> Result<String> {
 fn read_ssh_log(db: &Db, ssh_log: Option<&Path>) -> Result<String> {
     // Through `LogPaths`, like `read_access_log`: a stored path is read
     // when no flag names one. The journal is read back a week, not whole.
-    let paths = stop_bots::logpaths::LogPaths::from_db(db).unwrap_or_default();
+    let _ = db;
+    let paths = host_settings().unwrap_or_default().log_paths();
     let named = ssh_log.or(paths.ssh.as_deref());
     match paths.ssh(ssh_log).read(sshlog::recent_since()) {
         sshlog::LogSource::Found(text) => Ok(text),
@@ -4567,6 +4736,7 @@ fn record_access_stats(db_path: Option<PathBuf>, access_log: Option<PathBuf>) ->
     let flags = stop_bots::logscan::Flags {
         ssh_log: None,
         access_log,
+        stored: host_settings()?.log_paths(),
     };
     let applied =
         stop_bots::logscan::run(&db, &[stop_bots::cron::CronJob::RecordAccessStats], &flags)?;

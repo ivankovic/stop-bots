@@ -72,9 +72,13 @@ mod golden;
 #[doc(hidden)]
 pub mod health;
 #[doc(hidden)]
+pub mod helper;
+#[doc(hidden)]
 pub mod hint;
 #[doc(hidden)]
 pub mod host;
+#[doc(hidden)]
+pub mod hostconf;
 #[doc(hidden)]
 pub mod injection;
 #[doc(hidden)]
@@ -101,6 +105,8 @@ pub mod nginx;
 pub mod present;
 #[doc(hidden)]
 pub mod preview;
+#[doc(hidden)]
+pub mod privileged;
 #[doc(hidden)]
 pub mod protection;
 #[doc(hidden)]

@@ -215,6 +215,11 @@ pub struct App {
     /// harmless. The render *popup* takes its path from the admin instead,
     /// which is why this only covers the one-key path.
     pub firewall_out: Option<std::path::PathBuf>,
+    /// The host settings file ([`crate::hostconf`]): the NGINX commands and
+    /// the logs. A field, read at each use, so a test can point it at a
+    /// file of its own and `set-nginx-commands` takes effect without a
+    /// restart.
+    pub host_conf: std::path::PathBuf,
     /// An "update everything" run in progress: the sources still to fetch
     /// and what the finished ones came to. `None` when none is running.
     ///
@@ -370,6 +375,7 @@ impl App {
             apply_firewall: reload_nginx,
             ssh_log,
             firewall_out: None,
+            host_conf: crate::hostconf::path(),
             update_all: None,
             ip_ranges_lease: None,
             crawler_refresh_lease: None,
@@ -971,6 +977,7 @@ impl App {
         let flags = crate::logscan::Flags {
             ssh_log: self.ssh_log.clone(),
             access_log: None,
+            stored: self.host().unwrap_or_default().log_paths(),
         };
         let plan = match crate::logscan::plan(&self.db, &jobs, &flags) {
             Ok(plan) => plan,
@@ -1075,7 +1082,7 @@ impl App {
                 // here, like every other `Db` read the apply needs.
                 let validate = self
                     .reload_nginx_for_real
-                    .then(|| nginx::NginxCommands::from_db(&self.db))
+                    .then(|| self.host().and_then(|host| host.commands()))
                     .transpose();
                 let plan = match (self.nginx.plan_apply(&self.db, action), validate) {
                     (Ok(plan), Ok(validate)) => crate::tui::nginx::ApplyPlan { validate, ..plan },
@@ -1157,7 +1164,7 @@ impl App {
         // cannot reach a `Db` — the same split every other `start_*` makes.
         // A malformed stored command surfaces as the reload failing, which
         // is where the admin is already looking.
-        let commands = match nginx::NginxCommands::from_db(&self.db) {
+        let commands = match self.host().and_then(|host| host.commands()) {
             Ok(commands) => commands,
             Err(err) => {
                 self.jobs_in_flight.remove(&Job::ReloadNginx);
@@ -1187,6 +1194,11 @@ impl App {
         }
     }
 
+    /// The host settings, read now: see [`App::host_conf`].
+    fn host(&self) -> Result<crate::hostconf::HostConf> {
+        crate::hostconf::HostConf::load_from(&self.host_conf)
+    }
+
     /// Reads the SSH log into [`App::ssh_log_text`], in the background, if
     /// the copy on hand has gone stale ([`SSH_LOG_MAX_AGE`]) and no read is
     /// already out.
@@ -1208,8 +1220,10 @@ impl App {
         let sender = self.events.sender();
         // Through the stored paths, like every other reader of this log:
         // `set-log-paths --ssh-log` used to be ignored here.
-        let source = crate::logpaths::LogPaths::from_db(&self.db)
+        let source = self
+            .host()
             .unwrap_or_default()
+            .log_paths()
             .ssh(self.ssh_log.as_deref());
         tokio::task::spawn_blocking(move || {
             let text = match source.read(crate::sshlog::recent_since()) {
@@ -1306,8 +1320,10 @@ impl App {
 
         self.jobs_in_flight.insert(Job::RenderFirewall);
         // Through the stored paths, like every other reader of this log.
-        let ssh_log = crate::logpaths::LogPaths::from_db(&self.db)
+        let ssh_log = self
+            .host()
             .unwrap_or_default()
+            .log_paths()
             .ssh(self.ssh_log.as_deref());
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
@@ -1560,8 +1576,10 @@ impl App {
         });
 
         self.jobs_in_flight.insert(Job::PreviewApply);
-        let ssh_log = crate::logpaths::LogPaths::from_db(&self.db)
+        let ssh_log = self
+            .host()
             .unwrap_or_default()
+            .log_paths()
             .ssh(self.ssh_log.as_deref());
         let sender = self.events.sender();
         tokio::task::spawn_blocking(move || {
@@ -1653,7 +1671,10 @@ impl App {
             return;
         }
 
-        let plan = match crate::webaccess::plan(&self.db, &request) {
+        let plan = match self
+            .host()
+            .and_then(|host| crate::webaccess::plan(&self.db, &host, self.nginx.root(), &request))
+        {
             Ok(plan) => plan,
             Err(err) => {
                 self.message = Some(format!("{err:#}"));
@@ -1722,25 +1743,15 @@ impl App {
         self.jobs_in_flight.insert(job);
         let ssh_log = self.ssh_log.clone();
         let sender = self.events.sender();
-        let paths = crate::logpaths::LogPaths::from_db(&self.db).unwrap_or_default();
-        let conf_d = crate::nginx::conf_d_dir(
-            &crate::nginx::root(&self.db, None)
-                .unwrap_or_else(|_| std::path::PathBuf::from(crate::nginx::DEFAULT_ROOT)),
-        );
+        let host = self.host().unwrap_or_default();
         let block_status = self
             .db
             .get_block_response()
             .map(|r| r.status_code())
             .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
         tokio::task::spawn_blocking(move || {
-            let probe = crate::health::probe(
-                backend,
-                &db_path,
-                ssh_log.as_deref(),
-                &paths,
-                &conf_d,
-                block_status,
-            );
+            let probe =
+                crate::health::probe(backend, &db_path, ssh_log.as_deref(), &host, block_status);
             let _ = sender.send(Event::App(AppEvent::HealthProbed {
                 probe: Box::new(probe),
             }));
@@ -2983,6 +2994,18 @@ mod tests {
         }
     }
 
+    /// A host settings file in `dir` whose NGINX test command is `test`.
+    fn test_command_host_conf(dir: &std::path::Path, test: &str) -> std::path::PathBuf {
+        let path = dir.join("host.conf");
+        crate::hostconf::HostConf {
+            nginx_test_command: Some(test.to_string()),
+            ..Default::default()
+        }
+        .save_to(&path)
+        .unwrap();
+        path
+    }
+
     /// The whole Web Access chain, in the order the split demands: plan
     /// on the main thread, write and validate off it, record the new
     /// address back on it. Recording only after the config validated is
@@ -3001,10 +3024,6 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.upsert_site("example.com", site.to_str().unwrap())
             .unwrap();
-        // `nginx -t` would be the real one on whatever host runs the
-        // suite, so point the check at a command that always agrees.
-        db.set_text_setting(crate::nginx::NginxCommands::TEST_KEY, "/bin/true")
-            .unwrap();
         let mut app = App::new(
             db,
             dir.path().to_path_buf(),
@@ -3012,6 +3031,9 @@ mod tests {
             Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
         )
         .unwrap();
+        // `nginx -t` would be the real one on whatever host runs the
+        // suite, so point the check at a command that always agrees.
+        app.host_conf = test_command_host_conf(dir.path(), "/bin/true");
 
         app.start_web_access(crate::webaccess::Request::Path {
             site: "example.com".to_string(),
@@ -3047,8 +3069,6 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.upsert_site("example.com", site.to_str().unwrap())
             .unwrap();
-        db.set_text_setting(crate::nginx::NginxCommands::TEST_KEY, "/bin/false")
-            .unwrap();
         let mut app = App::new(
             db,
             dir.path().to_path_buf(),
@@ -3056,6 +3076,7 @@ mod tests {
             Some(std::path::PathBuf::from("tests/fixtures/logs/auth.log")),
         )
         .unwrap();
+        app.host_conf = test_command_host_conf(dir.path(), "/bin/false");
 
         app.start_web_access(crate::webaccess::Request::Path {
             site: "example.com".to_string(),

@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
             console_identity: None,
             console_helper: None,
             console_unreadable_logs: Vec::new(),
+            nginx_commands: None,
         },
     )?;
 

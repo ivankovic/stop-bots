@@ -98,9 +98,21 @@ pub struct Plan {
 ///
 /// Every failure here is written for the operator reading it in a status
 /// line, because that is the only place any of them appears.
-pub fn plan(db: &Db, request: &Request) -> Result<Plan> {
+///
+/// **The file a path-mode location goes into is found on disk**, under
+/// `root`, by the site's name: the database only says which site was
+/// meant. Its row's `config_path` is a hint for telling two files that
+/// declare the same name apart, never a path to write — the web console
+/// can write every row, and this runs as root. The commands come from the
+/// host settings, `host`, for the same reason.
+pub fn plan(
+    db: &Db,
+    host: &crate::hostconf::HostConf,
+    root: &Path,
+    request: &Request,
+) -> Result<Plan> {
     let upstream = crate::web::resolve_bind(db, None)?;
-    let commands = NginxCommands::from_db(db)?;
+    let commands = NginxCommands::from_host(host)?;
 
     match request {
         Request::Subdomain { host } => {
@@ -122,14 +134,8 @@ pub fn plan(db: &Db, request: &Request) -> Result<Plan> {
             if server_name.is_empty() {
                 anyhow::bail!("Pick a site to mount the console under, or scan for sites first.");
             }
-            let prefix = BasePath::parse(prefix.trim())?;
-            if prefix.is_root() {
-                anyhow::bail!(
-                    "Path mode needs a prefix, like /stop-bots/ — mounting the console at \
-                     the site root would take over the whole site."
-                );
-            }
-            let config_path = db
+            let prefix = path_prefix(prefix)?;
+            let recorded = db
                 .list_sites()
                 .context("could not read the scanned sites")?
                 .into_iter()
@@ -138,6 +144,7 @@ pub fn plan(db: &Db, request: &Request) -> Result<Plan> {
                 .with_context(|| {
                     format!("No scanned site called {server_name}. Re-scan sites first.")
                 })?;
+            let config_path = nginx::locate_site(root, &server_name, Some(&recorded))?;
             // Every name on the block this location is going into, not
             // just the one the database happens to store.
             let hosts = nginx::server_names_for(&config_path, &server_name);
@@ -156,6 +163,19 @@ pub fn plan(db: &Db, request: &Request) -> Result<Plan> {
             })
         }
     }
+}
+
+/// The prefix path mode mounts the console under, checked: a usable
+/// [`BasePath`], and not the site root.
+pub fn path_prefix(raw: &str) -> Result<BasePath> {
+    let prefix = BasePath::parse(raw.trim())?;
+    if prefix.is_root() {
+        anyhow::bail!(
+            "Path mode needs a prefix, like /stop-bots/ — mounting the console at \
+             the site root would take over the whole site."
+        );
+    }
+    Ok(prefix)
 }
 
 /// Writes the config change and validates it, rolling the file back if
@@ -246,10 +266,43 @@ mod tests {
         Db::open_in_memory().unwrap()
     }
 
+    /// [`plan`] with the default host settings, against `root`.
+    fn plan(db: &Db, root: &Path, request: &Request) -> Result<Plan> {
+        super::plan(db, &crate::hostconf::HostConf::default(), root, request)
+    }
+
+    /// A root holding `example.conf` with `content`, scanned into a
+    /// database as `example.com`.
+    fn scanned(content: &str) -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("example.conf");
+        std::fs::write(&config, content).unwrap();
+        let db = db();
+        db.upsert_site("example.com", config.to_str().unwrap())
+            .unwrap();
+        (dir, db)
+    }
+
+    const PLAIN: &str = "server {\n    listen 80;\n    server_name example.com;\n}\n";
+
+    fn path_mode() -> Request {
+        Request::Path {
+            site: "example.com".to_string(),
+            prefix: "/stop-bots/".to_string(),
+        }
+    }
+
+    fn subdomain() -> Request {
+        Request::Subdomain {
+            host: "console.example.com".to_string(),
+        }
+    }
+
     #[test]
     fn a_blank_subdomain_is_refused_before_anything_is_written() {
         let err = plan(
             &db(),
+            Path::new("/nonexistent"),
             &Request::Subdomain {
                 host: "  ".to_string(),
             },
@@ -263,6 +316,7 @@ mod tests {
     fn a_subdomain_plans_its_own_server_block() {
         let plan = plan(
             &db(),
+            Path::new("/nonexistent"),
             &Request::Subdomain {
                 host: " console.example.com ".to_string(),
             },
@@ -276,26 +330,20 @@ mod tests {
 
     #[test]
     fn path_mode_needs_a_site_that_was_actually_scanned() {
-        let err = plan(
-            &db(),
-            &Request::Path {
-                site: "example.com".to_string(),
-                prefix: "/stop-bots/".to_string(),
-            },
-        )
-        .unwrap_err()
-        .to_string();
+        let (dir, _) = scanned(PLAIN);
+        let err = plan(&db(), dir.path(), &path_mode())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("Re-scan sites"), "was: {err}");
     }
 
     #[test]
     fn path_mode_refuses_the_site_root() {
-        let db = db();
-        db.upsert_site("example.com", "/etc/nginx/sites-enabled/example")
-            .unwrap();
+        let (dir, db) = scanned(PLAIN);
 
         let err = plan(
             &db,
+            dir.path(),
             &Request::Path {
                 site: "example.com".to_string(),
                 prefix: "/".to_string(),
@@ -307,19 +355,10 @@ mod tests {
     }
 
     #[test]
-    fn path_mode_plans_a_location_on_the_scanned_site_s_own_file() {
-        let db = db();
-        db.upsert_site("example.com", "/etc/nginx/sites-enabled/example")
-            .unwrap();
+    fn path_mode_plans_a_location_on_the_site_s_own_file() {
+        let (dir, db) = scanned(PLAIN);
 
-        let plan = plan(
-            &db,
-            &Request::Path {
-                site: "example.com".to_string(),
-                prefix: "/stop-bots/".to_string(),
-            },
-        )
-        .unwrap();
+        let plan = plan(&db, dir.path(), &path_mode()).unwrap();
 
         match &plan.access {
             ConsoleAccess::Path {
@@ -328,15 +367,51 @@ mod tests {
                 server_name,
             } => {
                 assert_eq!(prefix, "/stop-bots/");
-                assert_eq!(
-                    config_path,
-                    std::path::Path::new("/etc/nginx/sites-enabled/example")
-                );
+                assert_eq!(config_path, &dir.path().join("example.conf"));
                 assert_eq!(server_name, "example.com");
             }
             other => panic!("expected path mode, got {other:?}"),
         }
         assert_eq!(plan.base_path.as_ref().unwrap().as_str(), "/stop-bots");
+    }
+
+    /// The row says where the site was when it was scanned. The web console
+    /// can write that row, so the file written is the one found on disk
+    /// under the root for that name, and a row pointing anywhere else
+    /// changes nothing.
+    #[test]
+    fn path_mode_writes_the_file_found_on_disk_not_the_one_the_row_names() {
+        let (dir, db) = scanned(PLAIN);
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("victim.conf");
+        std::fs::write(&elsewhere, PLAIN).unwrap();
+        db.upsert_site("example.com", elsewhere.to_str().unwrap())
+            .unwrap();
+
+        let plan = plan(&db, dir.path(), &path_mode()).unwrap();
+
+        let ConsoleAccess::Path { config_path, .. } = &plan.access else {
+            panic!("expected path mode");
+        };
+        assert_eq!(config_path, &dir.path().join("example.conf"));
+    }
+
+    /// And a name with no `server` block under the root is refused rather
+    /// than written wherever the row says.
+    #[test]
+    fn a_site_that_is_not_on_disk_under_the_root_is_refused() {
+        let db = db();
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("victim.conf");
+        std::fs::write(&elsewhere, PLAIN).unwrap();
+        db.upsert_site("example.com", elsewhere.to_str().unwrap())
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+
+        let err = format!("{:#}", plan(&db, root.path(), &path_mode()).unwrap_err());
+
+        assert!(err.contains("example.com"), "was: {err}");
+        assert!(err.contains("re-scan"), "was: {err}");
     }
 
     /// **The bug this found on a real host.** `server_name www.example.com
@@ -361,6 +436,7 @@ mod tests {
 
         let plan = plan(
             &db,
+            dir.path(),
             &Request::Path {
                 site: "www.example.com".to_string(),
                 prefix: "/stop-bots/".to_string(),
@@ -386,44 +462,14 @@ mod tests {
         );
     }
 
-    /// A config that cannot be read still yields the name the database
-    /// has, so a missing file degrades to the old behaviour rather than to
-    /// an empty allowlist.
-    #[test]
-    fn an_unreadable_config_still_allowlists_the_stored_name() {
-        let db = db();
-        db.upsert_site("example.com", "/nonexistent/example.conf")
-            .unwrap();
-
-        let plan = plan(
-            &db,
-            &Request::Path {
-                site: "example.com".to_string(),
-                prefix: "/stop-bots/".to_string(),
-            },
-        )
-        .unwrap();
-
-        assert_eq!(plan.hosts, vec!["example.com".to_string()]);
-    }
-
     /// The console has to start answering to the name NGINX will now send
     /// it, and under the prefix NGINX will now keep — or the operator
     /// applies the change and locks themselves out of the page they were
     /// looking at.
     #[test]
     fn recording_teaches_the_console_its_new_address() {
-        let db = db();
-        db.upsert_site("example.com", "/etc/nginx/sites-enabled/example")
-            .unwrap();
-        let plan = plan(
-            &db,
-            &Request::Path {
-                site: "example.com".to_string(),
-                prefix: "/stop-bots/".to_string(),
-            },
-        )
-        .unwrap();
+        let (dir, db) = scanned(PLAIN);
+        let plan = plan(&db, dir.path(), &path_mode()).unwrap();
 
         record(&db, &plan).unwrap();
 
@@ -441,19 +487,9 @@ mod tests {
     /// key for the operator and every attacker.
     #[test]
     fn recording_either_mode_trusts_the_proxy_s_forwarded_header() {
-        for request in [
-            Request::Subdomain {
-                host: "console.example.com".to_string(),
-            },
-            Request::Path {
-                site: "example.com".to_string(),
-                prefix: "/stop-bots/".to_string(),
-            },
-        ] {
-            let db = db();
-            db.upsert_site("example.com", "/nonexistent/example.conf")
-                .unwrap();
-            let plan = plan(&db, &request).unwrap();
+        for request in [subdomain(), path_mode()] {
+            let (dir, db) = scanned(PLAIN);
+            let plan = plan(&db, dir.path(), &request).unwrap();
 
             record(&db, &plan).unwrap();
 
@@ -466,20 +502,8 @@ mod tests {
     }
 
     fn site_config(content: &str) -> (tempfile::TempDir, Db, Plan) {
-        let dir = tempfile::tempdir().unwrap();
-        let config = dir.path().join("example.conf");
-        std::fs::write(&config, content).unwrap();
-        let db = db();
-        db.upsert_site("example.com", config.to_str().unwrap())
-            .unwrap();
-        let plan = plan(
-            &db,
-            &Request::Path {
-                site: "example.com".to_string(),
-                prefix: "/stop-bots/".to_string(),
-            },
-        )
-        .unwrap();
+        let (dir, db) = scanned(content);
+        let plan = plan(&db, dir.path(), &path_mode()).unwrap();
         (dir, db, plan)
     }
 
@@ -506,8 +530,7 @@ mod tests {
     /// anyone logged in. And one set by hand is never turned off.
     #[test]
     fn a_plain_http_site_leaves_the_cookie_setting_as_it_was() {
-        let (_dir, db, plan) =
-            site_config("server {\n    listen 80;\n    server_name example.com;\n}\n");
+        let (dir, db, plan) = site_config(PLAIN);
         assert!(!plan.tls);
 
         record(&db, &plan).unwrap();
@@ -522,13 +545,7 @@ mod tests {
             .get_bool_setting(crate::web::SECURE_COOKIE_KEY, false)
             .unwrap());
 
-        let subdomain = super::plan(
-            &db,
-            &Request::Subdomain {
-                host: "console.example.com".to_string(),
-            },
-        )
-        .unwrap();
+        let subdomain = super::tests::plan(&db, dir.path(), &subdomain()).unwrap();
         assert!(!subdomain.tls, "plain HTTP until certbot has run");
     }
 
@@ -537,13 +554,7 @@ mod tests {
     #[test]
     fn recording_the_same_host_twice_lists_it_once() {
         let db = db();
-        let plan = plan(
-            &db,
-            &Request::Subdomain {
-                host: "console.example.com".to_string(),
-            },
-        )
-        .unwrap();
+        let plan = plan(&db, Path::new("/nonexistent"), &subdomain()).unwrap();
 
         record(&db, &plan).unwrap();
         record(&db, &plan).unwrap();

@@ -41,6 +41,8 @@ struct View {
     nginx_reload: String,
     apply_for_real: bool,
     nginx_root: String,
+    /// How this console does what needs root.
+    privileged: String,
 }
 
 pub async fn page(
@@ -50,11 +52,16 @@ pub async fn page(
 ) -> Response {
     let apply_for_real = state.apply_for_real;
     let nginx_root = state.nginx_root.display().to_string();
+    let privileged = state.privileged().describe();
+    // Shown, never acted on here: the host settings are root's, and this
+    // console only reads them.
+    let commands =
+        crate::hostconf::HostConf::load_from(&state.host_conf).and_then(|host| host.commands());
 
     let view = state
         .with_db(move |db| {
             let bind = crate::web::resolve_bind(db, None)?;
-            let commands = crate::nginx::NginxCommands::from_db(db)?;
+            let commands = commands?;
             Ok(View {
                 loopback: crate::web::is_loopback(&bind),
                 bind: bind.to_string(),
@@ -65,6 +72,7 @@ pub async fn page(
                 nginx_reload: commands.reload.join(" "),
                 apply_for_real,
                 nginx_root,
+                privileged,
             })
         })
         .await;
@@ -217,6 +225,7 @@ fn body(view: &View) -> Markup {
             html! {
                 table { tbody {
                     tr { td { "NGINX config root" } td .mono { (view.nginx_root) } }
+                    tr { td { "Changes to the host" } td { "made " (view.privileged) } }
                     tr { td { "Config test" } td .mono { (view.nginx_test) } }
                     tr { td { "Reload" } td .mono { (view.nginx_reload) } }
                     tr {
@@ -429,6 +438,7 @@ mod tests {
             nginx_reload: "systemctl reload nginx".into(),
             apply_for_real: true,
             nginx_root: "/etc/nginx".into(),
+            privileged: "in this process, which runs as root".into(),
         }
     }
 

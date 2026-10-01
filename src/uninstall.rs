@@ -140,6 +140,9 @@ pub struct Plan {
     pub nginx: NginxCommands,
     /// The database, kept unless `--purge`.
     pub db_path: PathBuf,
+    /// The host settings file (see [`crate::hostconf`]), kept unless
+    /// `--purge`, like the database whose settings it took over.
+    pub host_conf: PathBuf,
     pub systemctl: PathBuf,
     /// `userdel` and `groupdel`, for `--purge`.
     pub userdel: PathBuf,
@@ -169,12 +172,17 @@ impl Plan {
         let base = prefix.unwrap_or(Path::new("/"));
         let db_path = db_path.unwrap_or_else(|| base.join("var/lib/stop-bots/db.sqlite3"));
         let stored = Stored::read(&db_path)?;
+        let host_conf = match prefix {
+            Some(_) => base.join(crate::hostconf::DEFAULT_PATH.trim_start_matches('/')),
+            None => crate::hostconf::path(),
+        };
+        let host = stored.host_settings(&host_conf, &db_path)?;
 
-        let nginx_root = match (root_flag, &stored.root) {
+        let nginx_root = match (root_flag, &host.nginx_root) {
             (Some(flag), _) => flag.to_path_buf(),
             // A stored root names the host's own path; under a prefix it
             // is taken to mean the same path inside the tree.
-            (None, Some(root)) => base.join(root.trim_start_matches('/')),
+            (None, Some(root)) => base.join(root.strip_prefix("/").unwrap_or(root)),
             (None, None) => base.join("etc/nginx"),
         };
         let output_dir = base.join("etc/stop-bots");
@@ -189,9 +197,6 @@ impl Plan {
         ];
         conf_d_dirs.dedup();
 
-        let command = |raw: &Option<String>, fallback: &str| -> Result<Vec<String>> {
-            nginx::split_command(raw.as_deref().unwrap_or(fallback))
-        };
         Ok(Plan {
             prefix: prefix.map(Path::to_path_buf),
             host: prefix.is_none(),
@@ -201,11 +206,9 @@ impl Plan {
             nginx_root,
             conf_d_dirs,
             recorded: stored.recorded,
-            nginx: NginxCommands {
-                test: command(&stored.test, NginxCommands::DEFAULT_TEST)?,
-                reload: command(&stored.reload, NginxCommands::DEFAULT_RELOAD)?,
-            },
+            nginx: host.commands()?,
             db_path,
+            host_conf,
             systemctl: crate::host::program("systemctl"),
             userdel: crate::host::program("userdel"),
             groupdel: crate::host::program("groupdel"),
@@ -228,6 +231,12 @@ impl Plan {
 }
 
 /// What an uninstall needs from the database.
+///
+/// The NGINX root and commands are read only for a database that was
+/// never migrated to the host settings file ([`crate::hostconf`]), and
+/// only from one this user owns, in a directory this user owns: an
+/// uninstall runs the commands as root, and the console's database may
+/// hold rows written by whoever compromised it.
 #[derive(Debug, Default)]
 struct Stored {
     root: Option<String>,
@@ -237,6 +246,25 @@ struct Stored {
 }
 
 impl Stored {
+    /// The host settings: the file at `host_conf` if there is one, else
+    /// this database's rows if it is to be trusted, else the defaults.
+    fn host_settings(&self, host_conf: &Path, db_path: &Path) -> Result<crate::hostconf::HostConf> {
+        if std::fs::symlink_metadata(host_conf).is_ok() {
+            return crate::hostconf::HostConf::load_from(host_conf);
+        }
+        if !crate::hostconf::is_trusted_database(db_path) {
+            return Ok(crate::hostconf::HostConf::default());
+        }
+        let legacy = crate::hostconf::HostConf {
+            nginx_test_command: self.test.clone(),
+            nginx_reload_command: self.reload.clone(),
+            nginx_root: self.root.as_ref().map(PathBuf::from),
+            ..Default::default()
+        };
+        legacy.validate()?;
+        Ok(legacy)
+    }
+
     fn read(db_path: &Path) -> Result<Stored> {
         use rusqlite::{OpenFlags, OptionalExtension};
 
@@ -281,10 +309,10 @@ impl Stored {
         } else {
             Vec::new()
         };
-        // PRIVSEP-HOOK(hostconf): the root and the two commands come from
-        // /etc/stop-bots/host.conf once the core's `hostconf` lands. Rows
-        // the console can write must not choose what this root process
-        // runs or which tree it rewrites.
+        // The root and the two commands are read for `host_settings`, which
+        // uses them only for a database never migrated and owned by this
+        // user: rows the console can write must not choose what this root
+        // process runs or which tree it rewrites.
         Ok(Stored {
             root: setting(NginxCommands::ROOT_KEY)?,
             test: setting(NginxCommands::TEST_KEY)?,
@@ -415,6 +443,7 @@ pub fn run(plan: &Plan, target: Target, options: &Options) -> Report {
         }
     }
     if target == Target::All {
+        host_settings(plan, options, &mut report);
         remove_dir_if_empty(plan, options, &mut report, &plan.output_dir);
         database(plan, options, &mut report);
         account(plan, options, &mut report);
@@ -802,6 +831,22 @@ fn database_files(db: &Path) -> Vec<PathBuf> {
         .unwrap_or_default();
     files.sort();
     files
+}
+
+/// The host settings file: kept, like the database, unless `--purge`.
+fn host_settings(plan: &Plan, options: &Options, report: &mut Report) {
+    if std::fs::symlink_metadata(&plan.host_conf).is_err() {
+        return;
+    }
+    if options.purge {
+        remove_file_step(plan, options, report, &plan.host_conf);
+    } else {
+        report.kept.push(format!(
+            "the host settings (the NGINX commands and root, the log paths): {}. `--purge` \
+             removes it too.",
+            plan.host_conf.display()
+        ));
+    }
 }
 
 fn database(plan: &Plan, options: &Options, report: &mut Report) {

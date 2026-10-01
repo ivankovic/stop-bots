@@ -277,21 +277,17 @@ impl Layout {
                 .log_groups
                 .retain(|name| crate::account::group(name).is_some());
         }
-        // PRIVSEP-HOOK(hostconf): read these two from
-        // /etc/stop-bots/host.conf once the core's `hostconf` lands; the
-        // database is the console's to write. Until then, `grantable` is
-        // what keeps a row the console chose from becoming a write grant
-        // for the root helper.
-        //
+        let (stored_root, stored_access_log) = self.stored_host_settings();
         // A stored root inside /etc/nginx is given back already, and any
-        // other one only if it is `grantable`: the console writes this row.
+        // other one only if it is `grantable`: a database row may have been
+        // written by the console.
         layout.nginx_roots.extend(
-            stored_setting_at(&self.db_path, crate::db::keys::NGINX_ROOT)
+            stored_root
                 .map(PathBuf::from)
                 .filter(|root| root.starts_with(&self.nginx_dir) || grantable(root)),
         );
         layout.log_dirs.extend(
-            stored_setting_at(&self.db_path, crate::db::keys::LOGS_ACCESS_PATH)
+            stored_access_log
                 .as_deref()
                 .and_then(|log| Path::new(log).parent())
                 .filter(|dir| grantable(dir))
@@ -302,6 +298,28 @@ impl Layout {
             .collect();
         layout.log_dirs.extend(nginx_log_dirs(&roots));
         layout
+    }
+}
+
+impl Layout {
+    /// The NGINX root and the access log the host settings name
+    /// ([`crate::hostconf`]); from the database's rows only while there is
+    /// no host settings file yet, which is a database from before it.
+    fn stored_host_settings(&self) -> (Option<String>, Option<String>) {
+        let host_conf = if self.real {
+            crate::hostconf::path()
+        } else {
+            self.output_dir.join("host.conf")
+        };
+        if std::fs::symlink_metadata(&host_conf).is_ok() {
+            let host = crate::hostconf::HostConf::load_from(&host_conf).unwrap_or_default();
+            let text = |path: Option<PathBuf>| path.map(|path| path.display().to_string());
+            return (text(host.nginx_root), text(host.access_log));
+        }
+        (
+            stored_setting_at(&self.db_path, crate::db::keys::NGINX_ROOT),
+            stored_setting_at(&self.db_path, crate::db::keys::LOGS_ACCESS_PATH),
+        )
     }
 }
 

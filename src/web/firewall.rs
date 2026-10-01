@@ -177,23 +177,13 @@ pub async fn page(
     let ua_page = params.ua_page.unwrap_or(1).max(1);
     let ssh_log = state.ssh_log.clone();
 
-    // Where the log is comes from the database (`set-log-paths` used to be
-    // ignored here); reading it does not, and happens outside the lock.
-    // It has to be off the async runtime either way -- on a host with no
-    // readable auth.log it runs `journalctl` -- and it used to run inside
-    // `with_db`, holding the database against every other request for as
-    // long as the whole journal took to print.
-    let source = match state
-        .with_db(move |db| {
-            Ok(crate::logpaths::LogPaths::from_db(db)
-                .unwrap_or_default()
-                .ssh(ssh_log.as_deref()))
-        })
-        .await
-    {
-        Ok(source) => source,
-        Err(err) => return internal_error(&err.to_string()),
-    };
+    // Where the log is comes from the host settings (`set-log-paths` used
+    // to be ignored here). This console reads it itself, with its own
+    // user's access: off the async runtime -- on a host with no readable
+    // auth.log it runs `journalctl` -- and outside the database lock,
+    // which it used to hold against every other request for as long as
+    // the whole journal took to print.
+    let source = state.host().log_paths().ssh(ssh_log.as_deref());
     let text =
         tokio::task::spawn_blocking(move || match source.read(crate::sshlog::recent_since()) {
             crate::sshlog::LogSource::Found(text) => Some(text),

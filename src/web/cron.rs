@@ -40,8 +40,6 @@
 //! this stays possible: the plan is made under the lock, the read happens
 //! outside it, and only storing what it found goes back in.
 
-use std::path::PathBuf;
-
 use crate::cron::{self, CronJob};
 use crate::web::state::AppState;
 
@@ -129,24 +127,22 @@ pub async fn tick(state: &AppState) -> usize {
 /// Re-applies site configs and reloads NGINX, when the admin has switched
 /// auto-apply on.
 ///
-/// Off the async runtime rather than merely off the lock: `apply_all_sites`
-/// walks the whole config root and the reload shells out to `nginx -t` and
-/// `systemctl`, none of which belongs on a thread that is meant to be
-/// serving requests. `with_db` already runs its closure via
-/// `spawn_blocking`, so putting the whole job inside one closure is both
-/// the simplest shape and the right one — the config write and the reload
-/// that publishes it should not be separated by a window in which another
-/// request can write the same files.
-///
-/// `apply_for_real` is honoured, so `stop-bots web --no-apply` keeps
-/// writing configs without ever reloading, exactly as it does for a reload
-/// an operator asks for by hand.
+/// The switch is read here, before any work, as `cron::apply_nginx` does;
+/// the apply itself is the console's privileged operation (see
+/// [`crate::privileged`]), in this process or in the root helper. Under
+/// `stop-bots web --no-apply` it writes configs without ever reloading,
+/// exactly as it does for an apply an operator asks for by hand.
 async fn apply_nginx(state: &AppState) -> anyhow::Result<()> {
-    let root = state.nginx_root.clone();
-    let reload = state.apply_for_real;
+    let summary = match state.with_db(|db| db.get_auto_apply()).await {
+        Ok(false) => "auto-apply is off".to_string(),
+        Err(err) => format!("error: {err}"),
+        Ok(true) => match state.privileged().apply_all(true).await {
+            Ok(applied) => cron::apply_nginx_summary(&applied),
+            Err(err) => format!("error: {err:#}"),
+        },
+    };
     state
         .with_db(move |db| {
-            let summary = cron::apply_nginx(db, &root, reload);
             cron::record_run(db, CronJob::ApplyNginx, &summary);
             Ok(())
         })
@@ -177,6 +173,7 @@ async fn run_log_jobs(state: &AppState, jobs: Vec<CronJob>) -> anyhow::Result<()
     let flags = crate::logscan::Flags {
         ssh_log: state.ssh_log.clone(),
         access_log: None,
+        stored: state.host().log_paths(),
     };
     let planned = jobs.clone();
     let plan = state
@@ -203,49 +200,54 @@ async fn run_log_jobs(state: &AppState, jobs: Vec<CronJob>) -> anyhow::Result<()
         }
     };
 
+    // The firewall render writes `/etc/stop-bots`, so it is the console's
+    // privileged operation rather than one of the jobs run here.
+    let render = jobs.contains(&CronJob::RenderFirewall);
+    let logins = applied.logins.clone();
+    let jobs: Vec<CronJob> = jobs
+        .into_iter()
+        .filter(|job| *job != CronJob::RenderFirewall)
+        .collect();
     let out = state.firewall_out.clone();
     let apply = state.apply_for_real;
     state
         .with_db(move |db| cron::run_log_jobs(db, &jobs, &applied, out.as_deref(), apply))
         .await?;
+    if render {
+        render_firewall(state, logins).await?;
+    }
     Ok(())
 }
 
-/// Probes the host off the database lock, then records what it found.
-///
-/// The probe shells out to `nft`, `systemctl` and `df`, and `nft list` on
-/// a large ruleset is megabytes of text — none of which has any business
-/// happening while the database lock is held, or on the async runtime.
-async fn health_check(state: &AppState) -> anyhow::Result<()> {
-    let (backend, db_path, paths, conf_d, block_status) = state
-        .with_db(|db| {
-            Ok((
-                crate::firewall::stored_backend(db)?,
-                db.path()
-                    .unwrap_or_else(|| PathBuf::from("./stop-bots.sqlite3")),
-                crate::logpaths::LogPaths::from_db(db).unwrap_or_default(),
-                crate::nginx::conf_d_dir(
-                    &crate::nginx::root(db, None)
-                        .unwrap_or_else(|_| PathBuf::from(crate::nginx::DEFAULT_ROOT)),
-                ),
-                db.get_block_response()?.status_code(),
-            ))
+/// The `RenderFirewall` job: renders and writes the script, and applies it
+/// when `set-auto-apply-firewall` says so, through the console's
+/// privileged operation. The guard also protects whoever this pass saw log
+/// in, besides those the SSH log and the database name.
+async fn render_firewall(state: &AppState, logins: Vec<String>) -> anyhow::Result<()> {
+    let apply = state.with_db(|db| db.get_auto_apply_firewall()).await?;
+    let protect = logins
+        .iter()
+        .filter_map(|address| address.parse::<std::net::IpAddr>().ok())
+        .collect();
+    let summary = match state.privileged().firewall(apply, protect).await {
+        Ok(report) => cron::render_summary(&report.write, &report.summary),
+        Err(err) => format!("error: {err:#}"),
+    };
+    state
+        .with_db(move |db| {
+            cron::record_run(db, CronJob::RenderFirewall, &summary);
+            Ok(())
         })
-        .await?;
+        .await
+}
 
-    let ssh_log = state.ssh_log.clone();
-    let probe = tokio::task::spawn_blocking(move || {
-        crate::health::probe(
-            backend,
-            &db_path,
-            ssh_log.as_deref(),
-            &paths,
-            &conf_d,
-            block_status,
-        )
-    })
-    .await
-    .map_err(|err| anyhow::anyhow!("the health-probe thread panicked: {err}"))?;
+/// Probes the host, then records what it found.
+///
+/// The probe shells out to `nft`, `systemctl` and `df`, and `nft list`
+/// needs root: it is the console's privileged operation, in this process
+/// or in the root helper, and off the database lock either way.
+async fn health_check(state: &AppState) -> anyhow::Result<()> {
+    let probe = state.privileged().probe().await?;
 
     state
         .with_db(move |db| {

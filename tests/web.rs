@@ -20,6 +20,8 @@ use stop_bots::web::server;
 use stop_bots::web::state::AppState;
 use tower::ServiceExt;
 
+mod common;
+
 /// A router over a fresh database, plus the password that opens it.
 fn app() -> (Router, String, tempfile::TempDir) {
     let (router, password, tmp, _) = app_with_db();
@@ -37,6 +39,14 @@ fn app_with_db() -> (Router, String, tempfile::TempDir, std::path::PathBuf) {
 
 /// The same, served under a path prefix.
 fn app_under(base: &str) -> (Router, String, tempfile::TempDir, std::path::PathBuf) {
+    app_configured(base, |_| {})
+}
+
+/// The same, with `configure` given the state before the router is built.
+fn app_configured(
+    base: &str,
+    configure: impl FnOnce(&mut AppState),
+) -> (Router, String, tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let db_path = tmp.path().join("db.sqlite3");
     let db = Db::open(&db_path).unwrap();
@@ -74,6 +84,10 @@ fn app_under(base: &str) -> (Router, String, tempfile::TempDir, std::path::PathB
     // path wins over the backend's own default — the iptables tests below
     // still find their script at this `.nft` name.
     state.firewall_out = Some(tmp.path().join("firewall.nft"));
+    // The host settings file is `/etc/stop-bots/host.conf` otherwise; a
+    // test reads and writes one of its own.
+    state.host_conf = tmp.path().join("host.conf");
+    configure(&mut state);
     (server::router(state), password, tmp, db_path)
 }
 
@@ -3344,12 +3358,16 @@ async fn setting_up_path_access_writes_the_config_and_both_settings() {
     )
     .unwrap();
 
-    let db = Db::open(&db_path).unwrap();
     // `nginx -t` is what validates the generated config, and a test must
     // never run the developer's real one — this is the same
     // `set-nginx-commands` escape hatch the container tests use.
-    db.set_text_setting(stop_bots::nginx::NginxCommands::TEST_KEY, "true")
-        .unwrap();
+    stop_bots::hostconf::HostConf {
+        nginx_test_command: Some("true".into()),
+        ..Default::default()
+    }
+    .save_to(&tmp.path().join("host.conf"))
+    .unwrap();
+    let db = Db::open(&db_path).unwrap();
     let scanned = stop_bots::nginx::discover_sites(&tmp.path().join("nginx")).unwrap();
     for found in &scanned {
         db.upsert_site(&found.server_name, &found.config_path.to_string_lossy())
@@ -3625,4 +3643,254 @@ async fn the_blocks_page_stays_fast_with_fifty_thousand_rules() {
         last.contains("Rules 49901\u{2013}50000 of 50000"),
         "the last page"
     );
+}
+
+// ---- privilege: through the helper, and read-only ----
+
+/// A console whose every privileged operation goes through a real helper
+/// on a socket in this process, serving `HelperHost`'s tree. The console's
+/// own idea of the NGINX root names nothing, and its own firewall path is
+/// the default under `/etc`: whatever lands in the host's tree got there
+/// through the helper, because nothing else knew where it is.
+fn app_through_helper() -> (Router, String, common::HelperHost) {
+    let host = common::HelperHost::new();
+    let socket = host.serve();
+    let password = stop_bots::web::auth::generate_password().unwrap();
+    {
+        let db = host.open_db();
+        stop_bots::web::auth::set_password(&db, &password).unwrap();
+        common::block_a_bot(&db, "BadBot");
+    }
+    let mut state = AppState::new(
+        host.open_db(),
+        std::path::PathBuf::from("/nonexistent/console-root"),
+        Some(host.dir.path().join("auth.log")),
+        false,
+    );
+    state.privilege = stop_bots::web::state::Privilege::Helper(socket);
+    state.host_conf = host.host_conf.clone();
+    (server::router(state), password, host)
+}
+
+#[tokio::test]
+async fn through_the_helper_a_scan_finds_the_host_s_sites() {
+    let (app, password, host) = app_through_helper();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/nginx/scan", "").await;
+
+    assert!(flash.contains("Found 1 site(s)"), "was: {flash}");
+    let sites = host.open_db().list_sites().unwrap();
+    assert_eq!(sites[0].config_path, host.site.display().to_string());
+}
+
+#[tokio::test]
+async fn through_the_helper_the_nginx_page_shows_each_site_s_status() {
+    let (app, password, host) = app_through_helper();
+    let (cookie, _) = login(&app, &password).await;
+    host.open_db()
+        .upsert_site("example.com", host.site.to_str().unwrap())
+        .unwrap();
+
+    let page = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/nginx"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert!(page.contains("STALE"), "page was:\n{page}");
+}
+
+#[tokio::test]
+async fn through_the_helper_applying_writes_the_host_s_sites() {
+    let (app, password, host) = app_through_helper();
+    let (cookie, csrf) = login(&app, &password).await;
+    let id = {
+        let db = host.open_db();
+        db.upsert_site("example.com", host.site.to_str().unwrap())
+            .unwrap();
+        db.list_sites().unwrap()[0].id
+    };
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/nginx/apply", &format!("id={id}")).await;
+    assert!(flash.contains("Applied to example.com"), "was: {flash}");
+    assert!(std::fs::read_to_string(&host.site)
+        .unwrap()
+        .contains("BadBot"));
+
+    std::fs::write(&host.site, common::HELPER_SITE).unwrap();
+    let (_, flash) = act(&app, &cookie, &csrf, "/nginx/apply-all", "").await;
+    assert!(flash.contains("1 file(s) changed"), "was: {flash}");
+    assert!(std::fs::read_to_string(&host.site)
+        .unwrap()
+        .contains("BadBot"));
+}
+
+#[tokio::test]
+async fn through_the_helper_the_firewall_script_is_written_where_the_helper_says() {
+    let (app, password, host) = app_through_helper();
+    let (cookie, csrf) = login(&app, &password).await;
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/render-firewall", "backend=nftables").await;
+
+    assert!(flash.contains("Wrote"), "was: {flash}");
+    assert!(
+        stop_bots::firewall::rendered_path(&host.firewall).exists(),
+        "the helper's script was not written"
+    );
+}
+
+#[tokio::test]
+async fn through_the_helper_apply_everything_confirms_then_applies() {
+    let (app, password, host) = app_through_helper();
+    let (cookie, csrf) = login(&app, &password).await;
+    host.open_db()
+        .upsert_site("example.com", host.site.to_str().unwrap())
+        .unwrap();
+
+    let confirm = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/apply-all?diff=1"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        confirm.contains("NGINX: 1 file(s) would change"),
+        "page was:\n{confirm}"
+    );
+    assert!(
+        confirm.contains("BadBot"),
+        "the diff is missing:\n{confirm}"
+    );
+
+    let (_, flash) = act(&app, &cookie, &csrf, "/apply-all", "").await;
+    assert!(flash.contains("NGINX: 1 file(s) changed"), "was: {flash}");
+    assert!(std::fs::read_to_string(&host.site)
+        .unwrap()
+        .contains("BadBot"));
+    assert!(stop_bots::firewall::rendered_path(&host.firewall).exists());
+}
+
+#[tokio::test]
+async fn through_the_helper_web_access_writes_the_host_s_site() {
+    let (app, password, host) = app_through_helper();
+    let (cookie, csrf) = login(&app, &password).await;
+    host.open_db()
+        .upsert_site("example.com", host.site.to_str().unwrap())
+        .unwrap();
+
+    let (_, flash) = act(
+        &app,
+        &cookie,
+        &csrf,
+        "/web-access",
+        "mode=path&site=example.com&prefix=/stop-bots/&host=",
+    )
+    .await;
+
+    assert!(flash.contains("Wrote"), "was: {flash}");
+    assert!(std::fs::read_to_string(&host.site)
+        .unwrap()
+        .contains(r#"location "/stop-bots/""#));
+}
+
+/// The Help page says how this console changes the host.
+#[tokio::test]
+async fn the_help_page_names_the_helper() {
+    let (app, password, _host) = app_through_helper();
+    let (cookie, _) = login(&app, &password).await;
+
+    let page = body_string(
+        app.clone()
+            .oneshot(with_cookie(get("/help"), &cookie))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert!(
+        page.contains("through the root helper at"),
+        "page was:\n{page}"
+    );
+}
+
+/// A console that is neither root nor given a helper: everything it shows,
+/// it still shows, and every action that would change the host says what
+/// it needs instead — and changes nothing.
+#[tokio::test]
+async fn without_root_or_a_helper_every_action_says_it_needs_the_helper() {
+    let (app, password, tmp, db_path) = app_configured("", |state| {
+        state.privilege = stop_bots::web::state::Privilege::ReadOnly;
+    });
+    let (cookie, csrf) = login(&app, &password).await;
+    let site = tmp.path().join("nginx/sites-enabled/example.com");
+    std::fs::write(&site, common::HELPER_SITE).unwrap();
+    let id = {
+        let db = Db::open(&db_path).unwrap();
+        common::block_a_bot(&db, "BadBot");
+        db.upsert_site("example.com", site.to_str().unwrap())
+            .unwrap();
+        db.list_sites().unwrap()[0].id
+    };
+
+    for (path, body) in [
+        ("/nginx/scan", String::new()),
+        ("/nginx/apply", format!("id={id}")),
+        ("/nginx/apply-all", String::new()),
+        ("/apply-all", String::new()),
+        ("/render-firewall", "backend=nftables&apply=1".to_string()),
+        (
+            "/web-access",
+            "mode=path&site=example.com&prefix=/stop-bots/&host=".to_string(),
+        ),
+    ] {
+        let (_, flash) = act(&app, &cookie, &csrf, path, &body).await;
+        assert!(flash.contains("needs the helper"), "{path} said: {flash}");
+    }
+    let confirm = app
+        .clone()
+        .oneshot(with_cookie(get("/apply-all"), &cookie))
+        .await
+        .unwrap();
+    let location = confirm
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let flash = flash_shown(&app, &cookie, &location).await;
+    assert!(
+        flash.contains("needs the helper"),
+        "the confirm page said: {flash}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&site).unwrap(),
+        common::HELPER_SITE,
+        "a read-only console wrote a site"
+    );
+    assert!(!tmp.path().join("firewall.next.nft").exists());
+}
+
+/// And its views still work, each saying it is read-only.
+#[tokio::test]
+async fn without_root_or_a_helper_every_view_still_works_and_says_so() {
+    let (app, password, _tmp, _db) = app_configured("", |state| {
+        state.privilege = stop_bots::web::state::Privilege::ReadOnly;
+    });
+    let (cookie, _) = login(&app, &password).await;
+
+    for path in ["/", "/bots", "/nginx", "/firewall", "/blocks", "/help"] {
+        let response = app
+            .clone()
+            .oneshot(with_cookie(get(path), &cookie))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let page = body_string(response).await;
+        assert!(page.contains("needs the helper"), "{path} did not say so");
+    }
 }

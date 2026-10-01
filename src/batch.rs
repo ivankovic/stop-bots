@@ -111,6 +111,9 @@ pub struct BatchOptions {
     /// `--no-fetch --apply` is a reasonable pair. It also makes this whole
     /// module testable without a network.
     pub no_fetch: bool,
+    /// The host settings: the NGINX commands, and the logs to read where
+    /// no flag names them. See [`crate::hostconf`].
+    pub host: crate::hostconf::HostConf,
 }
 
 /// One step's outcome. `Err` holds a message rather than an
@@ -287,6 +290,7 @@ fn scan_logs(db: &Db, options: &BatchOptions) -> Vec<Step> {
     let flags = crate::logscan::Flags {
         ssh_log: options.ssh_log.clone(),
         access_log: options.access_log.clone(),
+        stored: options.host.log_paths(),
     };
     let applied = match crate::logscan::run(db, &jobs, &flags) {
         Ok(applied) => applied,
@@ -355,7 +359,7 @@ fn apply_nginx(db: &Db, options: &BatchOptions) -> Step {
         // next reload to find.
         let commands = options
             .apply
-            .then(|| nginx::NginxCommands::from_db(db))
+            .then(|| nginx::NginxCommands::from_host(&options.host))
             .transpose()?;
         let applied = nginx::apply_all_sites_and_reload(db, &options.root, commands.as_ref())?;
         let mut summary = format!(
@@ -394,10 +398,9 @@ fn render_and_apply_firewall(db: &Db, options: &BatchOptions) -> Step {
         .force(options.force);
     // Wherever `LogPaths` says the SSH log is: `--ssh-log` first, then the
     // stored path, then a search.
-    let outcome = crate::logpaths::LogPaths::from_db(db)
-        .map(|paths| paths.ssh(options.ssh_log.as_deref()))
-        .and_then(|source| firewall::render_and_apply(db, run, firewall::SshLog::Read(&source)))
-        .and_then(|outcome| {
+    let source = options.host.log_paths().ssh(options.ssh_log.as_deref());
+    let outcome =
+        firewall::render_and_apply(db, run, firewall::SshLog::Read(&source)).and_then(|outcome| {
             let summary = outcome.summary();
             if outcome.succeeded() {
                 Ok(summary)
@@ -432,6 +435,7 @@ mod tests {
             access_log: Some(dir.join("no-access.log")),
             force: false,
             no_fetch: true,
+            host: crate::hostconf::HostConf::default(),
         }
     }
 
@@ -466,9 +470,12 @@ mod tests {
             "Accepted publickey for m from 203.0.113.9 port 55000 ssh2\n",
         )
         .unwrap();
-        crate::logpaths::LogPaths::save(&db, None, Some(ssh_log.to_str().unwrap())).unwrap();
         let options = BatchOptions {
             ssh_log: None,
+            host: crate::hostconf::HostConf {
+                ssh_log: Some(ssh_log.clone()),
+                ..Default::default()
+            },
             ..reading_ssh_log(dir.path(), &ssh_log)
         };
 

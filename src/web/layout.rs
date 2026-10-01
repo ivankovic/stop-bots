@@ -80,10 +80,18 @@ impl Ctx {
             .flatten()
             .map(|(report, _)| report);
         let mut ctx = Self::new(csrf, state.base.clone());
+        // A console that cannot change the host says so on every page, not
+        // only when an action is refused.
+        let read_only = (state.privilege == crate::web::state::Privilege::ReadOnly)
+            .then_some(crate::privileged::NEEDS_HELPER);
+        let db_notice = match (state.db_notice.as_deref(), read_only) {
+            (Some(notice), Some(read_only)) => Some(format!("{notice}. {read_only}")),
+            (notice, read_only) => notice.or(read_only).map(str::to_string),
+        };
         ctx.chrome = Chrome {
             host: crate::host::name().map(str::to_string),
             health,
-            db_notice: state.db_notice.clone(),
+            db_notice,
         };
         ctx
     }

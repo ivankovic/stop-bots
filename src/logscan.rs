@@ -78,6 +78,9 @@ use crate::sshlog::{self, Located, SshSource};
 pub struct Flags {
     pub ssh_log: Option<PathBuf>,
     pub access_log: Option<PathBuf>,
+    /// The paths the host settings name ([`crate::hostconf`]), used where
+    /// no flag is given.
+    pub stored: crate::logpaths::LogPaths,
 }
 
 /// What a pass will read, resolved from the database. Holds no handle to
@@ -156,7 +159,7 @@ fn wants_ssh_log(job: CronJob) -> bool {
 /// Works out what a pass over `jobs` reads.
 pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
     let now = now();
-    let paths = crate::logpaths::LogPaths::from_db(db).unwrap_or_default();
+    let paths = &flags.stored;
 
     let mut wants_access = false;
     for job in jobs {
@@ -662,6 +665,8 @@ mod tests {
         db: Db,
         access: PathBuf,
         auth: PathBuf,
+        /// No flags, and both logs named by the host settings.
+        flags: Flags,
     }
 
     fn host() -> Host {
@@ -671,17 +676,19 @@ mod tests {
         std::fs::write(&access, "").unwrap();
         std::fs::write(&auth, "").unwrap();
         let db = Db::open_in_memory().unwrap();
-        crate::logpaths::LogPaths::save(
-            &db,
-            Some(access.to_str().unwrap()),
-            Some(auth.to_str().unwrap()),
-        )
-        .unwrap();
+        let flags = Flags {
+            stored: crate::logpaths::LogPaths {
+                access: Some(access.clone()),
+                ssh: Some(auth.clone()),
+            },
+            ..Flags::default()
+        };
         Host {
             _dir: dir,
             db,
             access,
             auth,
+            flags,
         }
     }
 
@@ -693,7 +700,7 @@ mod tests {
                 CronJob::Detect(Detector::SshScanners),
                 CronJob::RecordAccessStats,
             ],
-            &Flags::default(),
+            &host.flags,
         )
         .unwrap()
     }
@@ -749,7 +756,7 @@ mod tests {
         let plan = plan(
             &host.db,
             &[CronJob::Detect(Detector::ProbePaths)],
-            &Flags::default(),
+            &host.flags,
         )
         .unwrap();
         let read = read(&plan);
@@ -785,7 +792,7 @@ mod tests {
         let plan = plan(
             &host.db,
             &[CronJob::Detect(Detector::ProbePaths)],
-            &Flags::default(),
+            &host.flags,
         )
         .unwrap();
 
@@ -862,7 +869,7 @@ mod tests {
             );
         }
 
-        run(&host.db, &[CronJob::Detect(detector)], &Flags::default()).unwrap();
+        run(&host.db, &[CronJob::Detect(detector)], &host.flags).unwrap();
 
         let rows = host.db.evidence_rows(detector, 0, Rule::Once).unwrap();
         assert!(
@@ -967,8 +974,8 @@ mod tests {
         let host = host();
         append(&host.access, &probe("203.0.113.5", now()));
         let jobs = [CronJob::Detect(Detector::ProbePaths)];
-        let first = plan(&host.db, &jobs, &Flags::default()).unwrap();
-        let second = plan(&host.db, &jobs, &Flags::default()).unwrap();
+        let first = plan(&host.db, &jobs, &host.flags).unwrap();
+        let second = plan(&host.db, &jobs, &host.flags).unwrap();
 
         let a = apply(&host.db, read(&first)).unwrap();
         let b = apply(&host.db, read(&second)).unwrap();
@@ -998,8 +1005,8 @@ mod tests {
             .collect();
         append(&host.access, &lines);
         let jobs = [CronJob::RecordAccessStats];
-        let mut a = store(read(&plan(&host.db, &jobs, &Flags::default()).unwrap())).chunked(3);
-        let mut b = store(read(&plan(&host.db, &jobs, &Flags::default()).unwrap())).chunked(3);
+        let mut a = store(read(&plan(&host.db, &jobs, &host.flags).unwrap())).chunked(3);
+        let mut b = store(read(&plan(&host.db, &jobs, &host.flags).unwrap())).chunked(3);
 
         let (mut done_a, mut done_b, mut steps) = (None, None, 0);
         while done_a.is_none() || done_b.is_none() {

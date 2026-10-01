@@ -627,24 +627,35 @@ pub fn maintenance(db: &Db) -> String {
 /// `run_due_jobs`, which prints to stderr and moves on — so on the one
 /// host where this matters, a broken config would fail silently every
 /// hour.
-pub fn apply_nginx(db: &Db, root: &std::path::Path, reload: bool) -> String {
+///
+/// The commands come from `host`, the host settings, never from `db`.
+pub fn apply_nginx(
+    db: &Db,
+    host: &crate::hostconf::HostConf,
+    root: &std::path::Path,
+    reload: bool,
+) -> String {
     match db.get_auto_apply() {
         Ok(false) => return "auto-apply is off".to_string(),
         Ok(true) => {}
         Err(err) => return format!("error: {err}"),
     }
 
-    let commands = match reload.then(|| NginxCommands::from_db(db)).transpose() {
+    let commands = match reload.then(|| NginxCommands::from_host(host)).transpose() {
         Ok(commands) => commands,
         Err(err) => return format!("error: {err:#}"),
     };
     // Tested before the reload, and put back if the test fails — see
     // `apply_all_sites_and_reload`. Unattended is where that matters most.
-    let applied = match crate::nginx::apply_all_sites_and_reload(db, root, commands.as_ref()) {
-        Ok(applied) => applied,
-        Err(err) => return format!("error: {err:#}"),
-    };
+    match crate::nginx::apply_all_sites_and_reload(db, root, commands.as_ref()) {
+        Ok(applied) => apply_nginx_summary(&applied),
+        Err(err) => format!("error: {err:#}"),
+    }
+}
 
+/// The `ApplyNginx` job's summary of what an apply did: shared with the
+/// web console, whose apply may happen in its root helper.
+pub fn apply_nginx_summary(applied: &crate::nginx::ApplyAllOutcome) -> String {
     // Writing the sentinel block does nothing until NGINX re-reads it, so
     // there is nothing to reload when nothing changed on disk — the same
     // condition `apply-blocks` and `batch` both gate on, and the reason
@@ -672,7 +683,11 @@ pub fn apply_nginx(db: &Db, root: &std::path::Path, reload: bool) -> String {
 /// rather than storing a finished report: the probe is the expensive half
 /// and the slow-moving half, and re-deriving the report at render time is
 /// what keeps the panel agreeing with the rules on the screen above it.
-pub fn health_check(db: &Db, ssh_log: Option<&std::path::Path>) -> String {
+pub fn health_check(
+    db: &Db,
+    host: &crate::hostconf::HostConf,
+    ssh_log: Option<&std::path::Path>,
+) -> String {
     let backend = match crate::firewall::stored_backend(db) {
         Ok(backend) => backend,
         Err(err) => return format!("error: {err}"),
@@ -684,16 +699,11 @@ pub fn health_check(db: &Db, ssh_log: Option<&std::path::Path>) -> String {
         .path()
         .unwrap_or_else(|| std::path::PathBuf::from("./stop-bots.sqlite3"));
 
-    let paths = crate::logpaths::LogPaths::from_db(db).unwrap_or_default();
-    let conf_d = crate::nginx::conf_d_dir(
-        &crate::nginx::root(db, None)
-            .unwrap_or_else(|_| std::path::PathBuf::from(crate::nginx::DEFAULT_ROOT)),
-    );
     let block_status = db
         .get_block_response()
         .map(|r| r.status_code())
         .unwrap_or_else(|_| crate::db::BlockResponse::default().status_code());
-    let probe = crate::health::probe(backend, &db_path, ssh_log, &paths, &conf_d, block_status);
+    let probe = crate::health::probe(backend, &db_path, ssh_log, host, block_status);
     if let Err(err) = crate::health::store_probe(db, &probe) {
         return format!("error: {err}");
     }
@@ -776,15 +786,7 @@ fn render_firewall(
             run,
             crate::firewall::SshLog::Connected(connected),
         )?;
-        // The write's own failure names the file, because this is the one
-        // failure here an operator has to act on outside stop-bots: the
-        // default is under `/etc`, so an unprivileged `stop-bots web` hits
-        // it on every run until someone grants the write.
-        Ok(match outcome.write {
-            crate::firewall::WriteStep::Written => outcome.summary(),
-            crate::firewall::WriteStep::Refused => format!("skipped: {}", outcome.summary()),
-            crate::firewall::WriteStep::Failed(_) => format!("error: {}", outcome.summary()),
-        })
+        Ok(render_summary(&outcome.write, &outcome.summary()))
     })();
     match result {
         Ok(summary) => summary,
@@ -792,6 +794,20 @@ fn render_firewall(
         // outermost message is the context and the cause is what says
         // what actually went wrong.
         Err(err) => format!("error: {err:#}"),
+    }
+}
+
+/// The `RenderFirewall` job's summary of a run that wrote (or did not
+/// write) `summary`: shared with the web console, whose run may happen in
+/// its root helper.
+///
+/// The write's own failure names the file, because this is the one
+/// failure here an operator has to act on outside stop-bots.
+pub fn render_summary(write: &crate::firewall::WriteStep, summary: &str) -> String {
+    match write {
+        crate::firewall::WriteStep::Written => summary.to_string(),
+        crate::firewall::WriteStep::Refused => format!("skipped: {summary}"),
+        crate::firewall::WriteStep::Failed(_) => format!("error: {summary}"),
     }
 }
 
@@ -938,7 +954,12 @@ mod tests {
         let db = test_db();
         assert!(!db.get_auto_apply().unwrap(), "off is the default");
 
-        let summary = apply_nginx(&db, std::path::Path::new("/nonexistent/nginx"), false);
+        let summary = apply_nginx(
+            &db,
+            &crate::hostconf::HostConf::default(),
+            std::path::Path::new("/nonexistent/nginx"),
+            false,
+        );
 
         assert_eq!(summary, "auto-apply is off");
     }
@@ -1257,6 +1278,7 @@ mod tests {
         let flags = crate::logscan::Flags {
             ssh_log: Some(dir.join("auth.log")),
             access_log: Some(dir.join("access.log")),
+            ..Default::default()
         };
         let applied = crate::logscan::run(db, jobs, &flags).unwrap();
         run_log_jobs(db, jobs, &applied, Some(&dir.join("fw.nft")), false).unwrap()

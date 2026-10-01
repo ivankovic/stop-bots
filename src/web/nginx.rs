@@ -22,10 +22,9 @@
 //! setting belongs here if applying it rewrites a `server { ... }` block.
 //!
 //! Unlike the TUI, the status check runs inline. It reads and re-parses
-//! every site's config file, which is why the TUI pushes it to a
-//! background thread — but a web request is already off the async runtime
-//! by the time a handler touches the database, so there is nothing to
-//! protect here that `with_db` has not protected already.
+//! every site's config file — files this console's user may not be able
+//! to read — so it is the console's privileged operation (see
+//! [`crate::privileged`]), like scanning and applying.
 
 use std::path::{Path, PathBuf};
 
@@ -37,7 +36,7 @@ use maud::{html, Markup};
 use serde::Deserialize;
 
 use crate::db::{BlockResponse, Bot, Category, Db, Policy, Site};
-use crate::nginx::{self, RequestRule, SiteApplyStatus};
+use crate::nginx::{RequestRule, SiteApplyStatus};
 use crate::web::layout::{self, Ctx, PillKind, Tab};
 use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
 use crate::web::state::AppState;
@@ -51,24 +50,38 @@ struct View {
     rate_limit: bool,
     rate_rps: i64,
     rate_burst: i64,
-    sites: Vec<(Site, SiteApplyStatus)>,
+    /// Each site, and its status: `None` when it could not be found out.
+    sites: Vec<(Site, Option<SiteApplyStatus>)>,
+    /// Why no status could be found out, if none could.
+    status_problem: Option<String>,
     root: PathBuf,
 }
 
+/// The page, with each site's status worked out here.
+#[cfg(test)]
 fn load(db: &Db, root: &Path) -> anyhow::Result<View> {
-    let sites = db.list_sites()?;
-    let conf_d = nginx::conf_d_dir(&nginx::root(db, None)?);
-    let mut with_status = Vec::with_capacity(sites.len());
-    for site in sites {
-        let config = nginx::block_config_for_site(db, site.id)?;
-        let status = nginx::site_apply_status(
-            Path::new(&site.config_path),
-            &site.server_name,
-            &config,
-            &conf_d,
-        );
-        with_status.push((site, status));
-    }
+    let statuses = crate::nginx::site_statuses(db, root)?;
+    load_with(db, root, Ok(statuses))
+}
+
+/// The page, with the statuses the console's privileged operation gave.
+fn load_with(
+    db: &Db,
+    root: &Path,
+    statuses: Result<Vec<(i64, SiteApplyStatus)>, String>,
+) -> anyhow::Result<View> {
+    let (statuses, status_problem) = match statuses {
+        Ok(statuses) => (statuses, None),
+        Err(problem) => (Vec::new(), Some(problem)),
+    };
+    let with_status = db
+        .list_sites()?
+        .into_iter()
+        .map(|site| {
+            let status = status_of(&statuses, site.id);
+            (site, status)
+        })
+        .collect();
 
     Ok(View {
         block_response: db.get_block_response()?,
@@ -78,8 +91,16 @@ fn load(db: &Db, root: &Path) -> anyhow::Result<View> {
         rate_rps: db.get_rate_limit_rps()?,
         rate_burst: db.get_rate_limit_burst()?,
         sites: with_status,
+        status_problem,
         root: root.to_path_buf(),
     })
+}
+
+fn status_of(statuses: &[(i64, SiteApplyStatus)], id: i64) -> Option<SiteApplyStatus> {
+    statuses
+        .iter()
+        .find(|(site, _)| *site == id)
+        .map(|(_, status)| *status)
 }
 
 pub async fn page(
@@ -88,7 +109,15 @@ pub async fn page(
     Query(flash): Query<FlashQuery>,
 ) -> Response {
     let root = state.nginx_root.clone();
-    let view = match state.with_db(move |db| load(db, &root)).await {
+    let statuses = state
+        .privileged()
+        .site_statuses()
+        .await
+        .map_err(|err| format!("{err:#}"));
+    let view = match state
+        .with_db(move |db| load_with(db, &root, statuses))
+        .await
+    {
         Ok(view) => view,
         Err(err) => return internal_error(&err.to_string()),
     };
@@ -272,6 +301,9 @@ fn sites_panel(view: &View, ctx: &Ctx) -> Markup {
                     }
                 }
             }
+            @if let Some(problem) = &view.status_problem {
+                p .hint { "Whether each site is up to date could not be checked: " (problem) }
+            }
             @if view.sites.is_empty() {
                 (layout::empty("No sites yet. Rescan to look for server blocks under the NGINX root."))
             } @else {
@@ -306,11 +338,12 @@ fn sites_panel(view: &View, ctx: &Ctx) -> Markup {
     )
 }
 
-fn status_pill(status: SiteApplyStatus) -> Markup {
+fn status_pill(status: Option<SiteApplyStatus>) -> Markup {
     match status {
-        SiteApplyStatus::UpToDate => layout::pill("UP TO DATE", PillKind::Allowed),
-        SiteApplyStatus::Stale => layout::pill("STALE", PillKind::Warn),
-        SiteApplyStatus::NotFound => layout::pill("NOT FOUND", PillKind::Blocked),
+        Some(SiteApplyStatus::UpToDate) => layout::pill("UP TO DATE", PillKind::Allowed),
+        Some(SiteApplyStatus::Stale) => layout::pill("STALE", PillKind::Warn),
+        Some(SiteApplyStatus::NotFound) => layout::pill("NOT FOUND", PillKind::Blocked),
+        None => layout::pill("UNKNOWN", PillKind::Neutral),
     }
 }
 
@@ -318,7 +351,7 @@ fn status_pill(status: SiteApplyStatus) -> Markup {
 
 struct Detail {
     site: Site,
-    status: SiteApplyStatus,
+    status: Option<SiteApplyStatus>,
     scanner: Option<Policy>,
     search: Option<Policy>,
     ai: Option<Policy>,
@@ -396,19 +429,33 @@ fn site_bots(
     Ok((rows, truncated))
 }
 
-/// The site page's view, or `None` if no site has that id.
+/// The site page's view, or `None` if no site has that id, with its
+/// status worked out here.
+#[cfg(test)]
 fn load_detail(db: &Db, id: i64, bot_query: &str) -> anyhow::Result<Option<Detail>> {
+    // The site's own directory as the root: what the fixtures scan.
     let Some(site) = db.list_sites()?.into_iter().find(|s| s.id == id) else {
         return Ok(None);
     };
+    let root = Path::new(&site.config_path)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("a scanned site has no directory"))?
+        .to_path_buf();
+    let status = status_of(&crate::nginx::site_statuses(db, &root)?, id);
+    load_detail_with(db, id, bot_query, status)
+}
 
-    let config = nginx::block_config_for_site(db, site.id)?;
-    let status = nginx::site_apply_status(
-        Path::new(&site.config_path),
-        &site.server_name,
-        &config,
-        &nginx::conf_d_dir(&nginx::root(db, None)?),
-    );
+/// The site page's view, or `None` if no site has that id, with the
+/// status the console's privileged operation gave.
+fn load_detail_with(
+    db: &Db,
+    id: i64,
+    bot_query: &str,
+    status: Option<SiteApplyStatus>,
+) -> anyhow::Result<Option<Detail>> {
+    let Some(site) = db.list_sites()?.into_iter().find(|s| s.id == id) else {
+        return Ok(None);
+    };
     let enabled = db.site_request_rules(site.id)?;
     let scanner = db.get_site_category_override(site.id, Category::Scanner)?;
     let search = db.get_site_category_override(site.id, Category::Search)?;
@@ -449,7 +496,16 @@ pub async fn detail(
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let flash = params.flash;
-    let detail = match state.with_db(move |db| load_detail(db, id, &query)).await {
+    let status = state
+        .privileged()
+        .site_statuses()
+        .await
+        .ok()
+        .and_then(|statuses| status_of(&statuses, id));
+    let detail = match state
+        .with_db(move |db| load_detail_with(db, id, &query, status))
+        .await
+    {
         Ok(Some(detail)) => detail,
         // A site that was never scanned, or was removed by a rescan: the
         // URL names nothing, which is a 404, not a server fault.
@@ -904,20 +960,9 @@ async fn set_rate_limit(
 }
 
 async fn scan(State(state): State<AppState>, _auth: Auth) -> Response {
-    let root = state.nginx_root.clone();
-    let found = state
-        .with_db(move |db| {
-            let sites = nginx::discover_sites(&root)?;
-            for site in &sites {
-                db.upsert_site(&site.server_name, &site.config_path.to_string_lossy())?;
-            }
-            Ok(sites.len())
-        })
-        .await;
-
-    match found {
+    match state.privileged().scan_sites().await {
         Ok(count) => back_with(&state, "/nginx", &format!("Found {count} site(s)."), true),
-        Err(err) => back_with(&state, "/nginx", &format!("Scan failed: {err}"), false),
+        Err(err) => back_with(&state, "/nginx", &format!("Scan failed: {err:#}"), false),
     }
 }
 
@@ -931,27 +976,7 @@ async fn apply_one(
     _auth: Auth,
     Form(form): Form<IdForm>,
 ) -> Response {
-    let id = form.id;
-    let for_real = state.apply_for_real;
-    let applied = state
-        .with_db(move |db| {
-            let site = db
-                .list_sites()?
-                .into_iter()
-                .find(|s| s.id == id)
-                .ok_or_else(|| anyhow::anyhow!("no site with id {id}"))?;
-            let commands = for_real
-                .then(|| nginx::NginxCommands::from_db(db))
-                .transpose()?;
-            let (changed, reloaded) = nginx::apply_site_and_reload(
-                db,
-                &nginx::root(db, None)?,
-                &site,
-                commands.as_ref(),
-            )?;
-            Ok((site.server_name, changed, reloaded))
-        })
-        .await;
+    let applied = state.privileged().apply_site(form.id, true).await;
 
     match applied {
         Ok((name, changed, reloaded)) => {
@@ -967,16 +992,7 @@ async fn apply_one(
 }
 
 async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
-    let root = state.nginx_root.clone();
-    let for_real = state.apply_for_real;
-    let applied = state
-        .with_db(move |db| {
-            let commands = for_real
-                .then(|| nginx::NginxCommands::from_db(db))
-                .transpose()?;
-            nginx::apply_all_sites_and_reload(db, &root, commands.as_ref())
-        })
-        .await;
+    let applied = state.privileged().apply_all(true).await;
 
     match applied {
         Ok(outcome) => applied_message(
@@ -1299,7 +1315,7 @@ mod tests {
 
         let view = load(&db, tmp.path()).unwrap();
         assert_eq!(view.sites.len(), 1);
-        assert_eq!(view.sites[0].1, SiteApplyStatus::Stale);
+        assert_eq!(view.sites[0].1, Some(SiteApplyStatus::Stale));
     }
 
     #[test]
@@ -1309,7 +1325,7 @@ mod tests {
         std::fs::remove_file(tmp.path().join("sites-enabled/example.com")).unwrap();
 
         let view = load(&db, tmp.path()).unwrap();
-        assert_eq!(view.sites[0].1, SiteApplyStatus::NotFound);
+        assert_eq!(view.sites[0].1, Some(SiteApplyStatus::NotFound));
     }
 
     #[test]

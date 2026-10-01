@@ -34,7 +34,7 @@ use crate::firewall::{FirewallBackend, ScriptState};
 use crate::health;
 use crate::protection::Detector;
 use crate::web::layout::{self, Ctx, PillKind, Tab};
-use crate::web::server::{back_with, internal_error, render, Auth, FlashQuery};
+use crate::web::server::{back_with, internal_error, render, Auth, ClientAddr, FlashQuery};
 use crate::web::state::AppState;
 
 /// Everything the page shows, read in one pass.
@@ -964,42 +964,77 @@ async fn set_web_access(
     _auth: Auth,
     Form(form): Form<WebAccessForm>,
 ) -> Response {
-    let request = match form.mode.as_str() {
-        "subdomain" => crate::webaccess::Request::Subdomain { host: form.host },
-        _ => crate::webaccess::Request::Path {
-            site: form.site,
-            prefix: form.prefix,
-        },
+    // The site by its id: the operation names a scanned site, never a
+    // file. Which file that is, is found on disk by whoever writes it.
+    let mode = if form.mode == "subdomain" {
+        crate::privileged::WebAccessMode::Subdomain
+    } else {
+        crate::privileged::WebAccessMode::Path
+    };
+    let site = form.site.trim().to_string();
+    let site_id = match mode {
+        crate::privileged::WebAccessMode::Subdomain => None,
+        crate::privileged::WebAccessMode::Path => {
+            // Said before the site is looked up, as `webaccess::plan`
+            // does: a bad prefix is the mistake to report first.
+            if let Err(err) = crate::webaccess::path_prefix(&form.prefix) {
+                return back_with(&state, "/", &format!("{err:#}"), false);
+            }
+            let lookup = site.clone();
+            match state
+                .with_db(move |db| {
+                    Ok(db
+                        .list_sites()?
+                        .into_iter()
+                        .find(|s| s.server_name == lookup)
+                        .map(|s| s.id))
+                })
+                .await
+            {
+                Ok(Some(id)) => Some(id),
+                Ok(None) if site.is_empty() => {
+                    return back_with(
+                        &state,
+                        "/",
+                        "Pick a site to mount the console under, or scan for sites first.",
+                        false,
+                    )
+                }
+                Ok(None) => {
+                    return back_with(
+                        &state,
+                        "/",
+                        &format!("No scanned site called {site}. Re-scan sites first."),
+                        false,
+                    )
+                }
+                Err(err) => return back_with(&state, "/", &format!("{err:#}"), false),
+            }
+        }
+    };
+    let op = crate::privileged::Op::WebAccess {
+        mode,
+        site_id,
+        prefix: form.prefix,
+        host: form.host,
+        reload: true,
     };
 
-    // Plan, apply and record in one hop onto the blocking pool: all three
-    // are synchronous, and the two that touch `Db` cannot cross an
-    // `.await` anyway. The TUI splits them, because its `Db` lives on the
-    // main thread; here the split would buy nothing.
-    let root = state.nginx_root.clone();
-    let written = state
-        .with_db(move |db| {
-            let plan = crate::webaccess::plan(db, &request)?;
-            let path = crate::webaccess::apply(&plan, &root)?;
-            crate::webaccess::record(db, &plan)?;
-            anyhow::Ok((path, plan.recorded_note()))
-        })
-        .await;
-
-    match written {
-        Ok((path, recorded)) => {
-            let reload = reload_nginx(&state).await;
-            let note = match reload {
-                Ok(note) => note,
-                Err(err) => format!("reload failed: {err:#}"),
+    match state.privileged().web_access(op).await {
+        Ok(report) => {
+            let note = match &report.reloaded {
+                Ok(true) => "reloaded".to_string(),
+                Ok(false) => "not reloaded (--no-apply)".to_string(),
+                Err(err) => format!("reload failed: {err}"),
             };
             back_with(
                 &state,
                 "/",
                 &format!(
-                    "Wrote {} and recorded the host. NGINX {note}. {recorded} Restart the \
+                    "Wrote {} and recorded the host. NGINX {note}. {} Restart the \
                      console for a changed path prefix to take effect.",
-                    path.display()
+                    report.path.display(),
+                    report.note
                 ),
                 true,
             )
@@ -1446,11 +1481,6 @@ async fn update_crawler_ranges(
     }
 }
 
-/// Lines of diff the confirm page shows before it stops and says where the
-/// rest is. A first apply on a host with reputation feeds is a 44,000-line
-/// script; a page that size helps nobody review anything.
-const DIFF_LINES_SHOWN: usize = 4_000;
-
 #[derive(Deserialize)]
 struct ConfirmQuery {
     diff: Option<String>,
@@ -1469,48 +1499,20 @@ async fn confirm_apply_all(
     auth: Auth,
     Query(query): Query<ConfirmQuery>,
 ) -> Response {
-    let root = state.nginx_root.clone();
-    let out_override = state.firewall_out.clone();
-    let for_real = state.apply_for_real;
-    let ssh_log = state.ssh_log.clone();
-    let read = state
-        .with_db(move |db| {
-            let nginx =
-                crate::nginx::preview_all_sites(db, &root).map_err(|err| format!("{err:#}"));
-            let backend = crate::firewall::stored_backend(db)?;
-            let run = crate::firewall::FirewallRun::new(
-                backend,
-                crate::firewall::output_path(out_override.as_deref(), backend),
+    let show_diff = query.diff.is_some();
+    let preview = match state.privileged().preview(show_diff).await {
+        Ok(preview) => preview,
+        Err(err) => {
+            return back_with(
+                &state,
+                "/",
+                &format!("Could not work out what would change: {err:#}"),
+                false,
             )
-            .apply(true)
-            .for_real(for_real)
-            .dry_run(true);
-            let source = crate::logpaths::LogPaths::from_db(db)
-                .unwrap_or_default()
-                .ssh(ssh_log.as_deref());
-            anyhow::Ok((
-                nginx,
-                crate::firewall::prepare(db, run).map_err(|err| format!("{err:#}")),
-                source,
-            ))
-        })
-        .await;
-    let (nginx, prepared, source) = match read {
-        Ok(read) => read,
-        Err(err) => return internal_error(&err.to_string()),
+        }
     };
-    let firewall = match prepared {
-        Ok(prepared) => tokio::task::spawn_blocking(move || {
-            crate::firewall::execute(prepared, crate::firewall::SshLog::Read(&source))
-        })
-        .await
-        .map_err(|err| format!("the preview thread panicked: {err}")),
-        Err(err) => Err(err),
-    };
-    let preview = crate::preview::ApplyPreview { nginx, firewall };
 
     let ctx = Ctx::for_request(&auth.csrf, &state).await;
-    let show_diff = query.diff.is_some();
     render(
         Tab::Dashboard,
         &ctx,
@@ -1519,22 +1521,9 @@ async fn confirm_apply_all(
     )
 }
 
-fn confirm_body(preview: &crate::preview::ApplyPreview, show_diff: bool, ctx: &Ctx) -> Markup {
+fn confirm_body(preview: &crate::preview::Summary, show_diff: bool, ctx: &Ctx) -> Markup {
     let diff = if show_diff {
-        let full = preview.diff();
-        let total = full.lines().count();
-        let mut shown: String = full
-            .lines()
-            .take(DIFF_LINES_SHOWN)
-            .flat_map(|line| [line, "\n"])
-            .collect();
-        if total > DIFF_LINES_SHOWN {
-            shown.push_str(&format!(
-                "\u{2026} {} more line(s). `stop-bots batch --dry-run --diff` prints all of it.\n",
-                total - DIFF_LINES_SHOWN
-            ));
-        }
-        Some(shown)
+        preview.diff.clone()
     } else {
         None
     };
@@ -1548,7 +1537,7 @@ fn confirm_body(preview: &crate::preview::ApplyPreview, show_diff: bool, ctx: &C
                      writes the firewall script and runs it as root. The two are independent: \
                      whichever fails, the other still gets its turn."
                 }
-                pre .preview { (preview.lines().join("\n")) }
+                pre .preview { (preview.lines.join("\n")) }
                 .row {
                     form .inline method="post" action=(ctx.url("/apply-all")) {
                         (layout::csrf_field(ctx))
@@ -1579,21 +1568,15 @@ fn confirm_body(preview: &crate::preview::ApplyPreview, show_diff: bool, ctx: &C
 /// fails, the other still gets its turn, because a half-applied host is
 /// better than one where an NGINX syntax error also left the firewall
 /// stale.
-async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
+async fn apply_all(
+    State(state): State<AppState>,
+    _auth: Auth,
+    axum::Extension(client): axum::Extension<ClientAddr>,
+) -> Response {
     let mut parts: Vec<String> = Vec::new();
     let mut ok = true;
 
-    let root = state.nginx_root.clone();
-    let for_real = state.apply_for_real;
-    match state
-        .with_db(move |db| {
-            let commands = for_real
-                .then(|| crate::nginx::NginxCommands::from_db(db))
-                .transpose()?;
-            crate::nginx::apply_all_sites_and_reload(db, &root, commands.as_ref())
-        })
-        .await
-    {
+    match state.privileged().apply_all(true).await {
         Ok(outcome) => {
             parts.push(format!("NGINX: {} file(s) changed", outcome.changed));
             if outcome.reloaded {
@@ -1608,7 +1591,7 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
         }
     }
 
-    match write_and_apply_firewall(&state).await {
+    match write_firewall(&state, true, client.0).await {
         Ok(note) => parts.push(note),
         Err(err) => {
             ok = false;
@@ -1619,7 +1602,7 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
     back_with(&state, "/", &parts.join(". "), ok)
 }
 
-/// Renders the firewall script, writes it, and runs it.
+/// Renders and writes the firewall script, and runs it when `apply`.
 ///
 /// The console refusing to *apply* the script used to be one of its three
 /// deliberate omissions. That was reversed on request, and what makes it
@@ -1630,55 +1613,24 @@ async fn apply_all(State(state): State<AppState>, _auth: Auth) -> Response {
 /// the run itself, so `stop-bots web --no-apply` keeps the write-only
 /// behaviour.
 ///
-/// The lockout guard covers SSH, not this console: the console's own
-/// address is protected separately by the "refusing to block the address
-/// you are connected from" check on the block handlers, which is what
-/// keeps a blocked rule from reaching the table in the first place.
-async fn write_and_apply_firewall(state: &AppState) -> anyhow::Result<String> {
-    write_firewall(state, true).await
-}
-
-/// Renders and writes the script, and runs it when `apply` is set.
+/// The guard also protects `client`, the address this request came from,
+/// and whoever logged in to the console recently: the operator's browser
+/// is as much a lockout as their SSH session. The block handlers refuse
+/// that address too, which keeps a rule from reaching the table at all.
 ///
-/// Three hops rather than one: the database half under the lock, the guard,
-/// write and `nft -f` outside it (a subprocess, and on a big ruleset a slow
-/// one), and the signatures back under it.
-async fn write_firewall(state: &AppState, apply: bool) -> anyhow::Result<String> {
-    let out_override = state.firewall_out.clone();
-    let for_real = state.apply_for_real;
-    let ssh_log = state.ssh_log.clone();
-    let (prepared, source) = state
-        .with_db(move |db| {
-            let backend = crate::firewall::stored_backend(db)?;
-            // Derived from the backend inside the same closure that chose
-            // it, so the two cannot disagree — an iptables script in a
-            // `.nft` file is what happens when they are decided apart.
-            let applied = crate::firewall::output_path(out_override.as_deref(), backend);
-            let run = crate::firewall::FirewallRun::new(backend, applied)
-                .apply(apply)
-                .for_real(for_real);
-            // Where the SSH log is, as `LogPaths` resolves it: the console's
-            // `--ssh-log` first, then the stored path, then a search.
-            let source = crate::logpaths::LogPaths::from_db(db)
-                .unwrap_or_default()
-                .ssh(ssh_log.as_deref());
-            anyhow::Ok((crate::firewall::prepare(db, run)?, source))
-        })
+/// The console's privileged operation (see [`crate::privileged`]), in this
+/// process or in the root helper.
+async fn write_firewall(
+    state: &AppState,
+    apply: bool,
+    client: Option<std::net::IpAddr>,
+) -> anyhow::Result<String> {
+    let report = state
+        .privileged()
+        .firewall(apply, client.into_iter().collect())
         .await?;
-
-    let outcome = tokio::task::spawn_blocking(move || {
-        crate::firewall::execute(prepared, crate::firewall::SshLog::Read(&source))
-    })
-    .await
-    .map_err(|err| anyhow::anyhow!("the firewall thread panicked: {err}"))?;
-
-    let recorded = outcome.clone();
-    state
-        .with_db(move |db| crate::firewall::record(db, &recorded))
-        .await?;
-
-    let summary = capitalised(&outcome.summary());
-    if outcome.succeeded() {
+    let summary = capitalised(&report.summary);
+    if report.succeeded {
         Ok(summary)
     } else {
         Err(anyhow::anyhow!("{summary}"))
@@ -1693,20 +1645,6 @@ fn capitalised(text: &str) -> String {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => String::new(),
     }
-}
-
-/// Reloads NGINX, honouring `--no-apply`.
-async fn reload_nginx(state: &AppState) -> anyhow::Result<String> {
-    if !state.apply_for_real {
-        return Ok("not reloaded (--no-apply)".to_string());
-    }
-    state
-        .with_db(|db| {
-            let commands = crate::nginx::NginxCommands::from_db(db)?;
-            crate::nginx::reload_with(&commands)
-        })
-        .await?;
-    Ok("reloaded".to_string())
 }
 
 #[derive(Deserialize)]
@@ -1767,6 +1705,7 @@ struct AutoApplyForm {
 async fn render_firewall(
     State(state): State<AppState>,
     _auth: Auth,
+    axum::Extension(client): axum::Extension<ClientAddr>,
     Form(form): Form<RenderForm>,
 ) -> Response {
     let backend = FirewallBackend::from_stored(&form.backend);
@@ -1786,7 +1725,7 @@ async fn render_firewall(
     // build-guard-write that differed only in the last step, which is how
     // the write-only one kept deriving its destination separately from the
     // backend it rendered for.
-    match write_firewall(&state, form.apply.is_some()).await {
+    match write_firewall(&state, form.apply.is_some(), client.0).await {
         Ok(note) => back_with(&state, "/", &note, true),
         Err(err) => back_with(&state, "/", &format!("{err:#}"), false),
     }
@@ -1814,7 +1753,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = firewall_state(tmp.path(), tmp.path().join("no-such-auth.log"));
 
-        let err = format!("{:#}", write_firewall(&state, true).await.unwrap_err());
+        let err = format!(
+            "{:#}",
+            write_firewall(&state, true, None).await.unwrap_err()
+        );
 
         assert!(err.contains("SSH log"), "error was: {err}");
         assert!(err.contains("not applied"), "error was: {err}");
@@ -1833,7 +1775,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = firewall_state(tmp.path(), tmp.path().join("no-such-auth.log"));
 
-        let note = write_firewall(&state, false).await.unwrap();
+        let note = write_firewall(&state, false, None).await.unwrap();
         assert!(note.contains("Wrote"), "note was: {note}");
     }
 
@@ -1846,7 +1788,7 @@ mod tests {
 
         // `--no-apply` in tests, so this is as far as it can get: past the
         // guard, and stopped by the switch rather than by the refusal.
-        let note = write_firewall(&state, true).await.unwrap();
+        let note = write_firewall(&state, true, None).await.unwrap();
         assert!(note.contains("--no-apply"), "note was: {note}");
     }
 

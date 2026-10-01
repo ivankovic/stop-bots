@@ -1313,11 +1313,12 @@ mod tests {
                     "/secret-admin/".into(),
                 ),
                 (
+                    // Kept as the row it was; the first root process moves it
+                    // into the host settings file (see `hostconf::migrate`).
                     "nginx test",
-                    crate::nginx::NginxCommands::from_db(&db)
+                    db.get_text_setting(keys::NGINX_TEST_COMMAND)
                         .unwrap()
-                        .test
-                        .join(" "),
+                        .unwrap_or_default(),
                     "/bin/true".into(),
                 ),
                 (
@@ -1427,8 +1428,11 @@ mod tests {
         assert_eq!(db.list_trusted_user_agents().unwrap(), ["MyUptimeChecker"]);
         assert!(db.get_auto_apply().unwrap());
         assert_eq!(
-            crate::logpaths::LogPaths::from_db(&db).unwrap().access,
-            Some("/srv/log/access.log".into())
+            db.get_text_setting(keys::LOGS_ACCESS_PATH)
+                .unwrap()
+                .as_deref(),
+            Some("/srv/log/access.log"),
+            "kept for `hostconf::migrate` to move"
         );
     }
 

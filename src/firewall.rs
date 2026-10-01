@@ -412,6 +412,19 @@ pub enum SshLog<'a> {
 /// one guard between a keypress and a server that can no longer be
 /// reached, and a cached copy could be minutes old.
 pub fn check_lockout(rules: &[FirewallRule], log: SshLog<'_>) -> Guard {
+    check_lockout_protecting(rules, log, &[])
+}
+
+/// [`check_lockout`], with `protect` counted among the connected clients
+/// whenever the log could be read: addresses a front-end knows are in use
+/// (the browser driving the console, a recent login) that the rules must
+/// not block either. It can only make the guard stricter. It does not make
+/// a guard that could not read the log run.
+pub fn check_lockout_protecting(
+    rules: &[FirewallRule],
+    log: SshLog<'_>,
+    protect: &[String],
+) -> Guard {
     let connected = match log {
         SshLog::Read(source) => match source.read(sshlog::recent_since()) {
             sshlog::LogSource::Found(text) => Some(sshlog::parse_accepted_ips(&text)),
@@ -421,7 +434,14 @@ pub fn check_lockout(rules: &[FirewallRule], log: SshLog<'_>) -> Guard {
         SshLog::Connected(connected) => connected.map(<[String]>::to_vec),
     };
     match connected {
-        Some(connected) => Guard::Ran(lockout_risks(rules, &connected)),
+        Some(mut connected) => {
+            for address in protect {
+                if !connected.contains(address) {
+                    connected.push(address.clone());
+                }
+            }
+            Guard::Ran(lockout_risks(rules, &connected))
+        }
         None => Guard::LogUnreadable,
     }
 }
@@ -1010,6 +1030,9 @@ pub struct FirewallRun {
     pub force: bool,
     /// Decide and describe everything, and write, run and record nothing.
     pub dry_run: bool,
+    /// Addresses the guard must treat as connected besides those the SSH
+    /// log shows: see [`check_lockout_protecting`].
+    pub protect: Vec<String>,
 }
 
 impl FirewallRun {
@@ -1024,6 +1047,7 @@ impl FirewallRun {
             for_real: true,
             force: false,
             dry_run: false,
+            protect: Vec::new(),
         }
     }
 
@@ -1041,6 +1065,12 @@ impl FirewallRun {
 
     pub fn dry_run(self, dry_run: bool) -> Self {
         FirewallRun { dry_run, ..self }
+    }
+
+    /// Adds `addresses` to what the guard must not block.
+    pub fn protect(mut self, addresses: impl IntoIterator<Item = String>) -> Self {
+        self.protect.extend(addresses);
+        self
     }
 
     /// Writes the rendered script to `path` rather than beside the applied
@@ -1077,7 +1107,7 @@ pub fn prepare(db: &Db, run: FirewallRun) -> Result<Prepared> {
 }
 
 /// What happened to the rendered script.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WriteStep {
     /// Written (or, in a dry run, would be).
     Written,
@@ -1152,7 +1182,7 @@ pub fn execute(prepared: Prepared, ssh_log: SshLog<'_>) -> FirewallOutcome {
         built,
         signature,
     } = prepared;
-    let guard = check_lockout(&built.rules, ssh_log);
+    let guard = check_lockout_protecting(&built.rules, ssh_log, &run.protect);
     let previous = std::fs::read_to_string(&run.applied_path).ok();
     let change = rule_change(previous.as_deref(), &built.script);
 

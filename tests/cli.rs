@@ -7,7 +7,9 @@ use predicates::prelude::*;
 use std::fs;
 use std::path::Path;
 mod common;
-use common::{copy_dir_all, path_with, scan_sites, seed_bots, stop_bots, stop_bots_bin};
+use common::{
+    copy_dir_all, path_with, scan_sites, seed_bots, stop_bots, stop_bots_bin, stop_bots_with_host,
+};
 
 // Every end-to-end test below drives the real binary against a throwaway
 // database and NGINX root. The helpers here wrap the incantations that made
@@ -61,6 +63,7 @@ impl Fixture {
         let mut cmd = stop_bots_bin();
         cmd.env("STOP_BOTS_NGINX_DIR", &self.managed)
             .env("STOP_BOTS_NGINX_CONF_D", &self.conf_d)
+            .env("STOP_BOTS_HOST_CONF", self.host_conf())
             .args(args)
             .args(["--db", self.db.to_str().unwrap()]);
         cmd
@@ -99,6 +102,11 @@ impl Fixture {
 
     fn robots_txt(&self) -> std::path::PathBuf {
         self.managed.join("robots.txt")
+    }
+
+    /// This fixture's host settings file.
+    fn host_conf(&self) -> std::path::PathBuf {
+        self._tmp.path().join("host.conf")
     }
 
     fn rate_limit_conf(&self) -> std::path::PathBuf {
@@ -1265,6 +1273,7 @@ fn a_failing_nginx_config_check_stops_the_reload() {
 #[test]
 fn a_configured_reload_command_replaces_systemctl_entirely() {
     let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().join("host.conf");
     let db_path = tmp.path().join("db.sqlite3");
     let nginx_root = tmp.path().join("nginx");
     fs::create_dir_all(&nginx_root).unwrap();
@@ -1274,17 +1283,21 @@ fn a_configured_reload_command_replaces_systemctl_entirely() {
     seed_bots(&db_path);
     scan_sites(&db_path, &nginx_root);
 
-    stop_bots(&[
-        "set-nginx-commands",
-        "--db",
-        db_path.to_str().unwrap(),
-        "--test",
-        "docker exec web nginx -t",
-        "--reload",
-        "docker exec web nginx -s reload",
-    ]);
+    stop_bots_with_host(
+        &host,
+        &[
+            "set-nginx-commands",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--test",
+            "docker exec web nginx -t",
+            "--reload",
+            "docker exec web nginx -s reload",
+        ],
+    );
 
     stop_bots_bin()
+        .env("STOP_BOTS_HOST_CONF", &host)
         .env("PATH", path_with(&bin))
         .args([
             "apply-blocks",
@@ -1313,6 +1326,7 @@ fn a_configured_reload_command_replaces_systemctl_entirely() {
 #[test]
 fn a_configured_test_command_that_fails_stops_the_reload() {
     let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().join("host.conf");
     let db_path = tmp.path().join("db.sqlite3");
     let nginx_root = tmp.path().join("nginx");
     fs::create_dir_all(&nginx_root).unwrap();
@@ -1327,17 +1341,21 @@ fn a_configured_test_command_that_fails_stops_the_reload() {
     seed_bots(&db_path);
     scan_sites(&db_path, &nginx_root);
 
-    stop_bots(&[
-        "set-nginx-commands",
-        "--db",
-        db_path.to_str().unwrap(),
-        "--test",
-        "docker exec web nginx -t",
-        "--reload",
-        "docker exec web nginx -s reload",
-    ]);
+    stop_bots_with_host(
+        &host,
+        &[
+            "set-nginx-commands",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--test",
+            "docker exec web nginx -t",
+            "--reload",
+            "docker exec web nginx -s reload",
+        ],
+    );
 
     stop_bots_bin()
+        .env("STOP_BOTS_HOST_CONF", &host)
         .env("PATH", path_with(&bin))
         .args([
             "apply-blocks",
@@ -1364,30 +1382,41 @@ fn a_configured_test_command_that_fails_stops_the_reload() {
 #[test]
 fn set_nginx_commands_reports_both_and_defaults_the_unset_one() {
     let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().join("host.conf");
     let db_path = tmp.path().join("db.sqlite3");
 
-    stop_bots(&[
-        "set-nginx-commands",
-        "--db",
-        db_path.to_str().unwrap(),
-        "--reload",
-        "docker exec web nginx -s reload",
-    ])
+    stop_bots_with_host(
+        &host,
+        &[
+            "set-nginx-commands",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--reload",
+            "docker exec web nginx -s reload",
+        ],
+    )
     .stdout(predicate::str::contains("Test command:   nginx -t"))
     .stdout(predicate::str::contains(
         "Reload command: docker exec web nginx -s reload",
     ));
 
-    stop_bots(&["set-nginx-commands", "--db", db_path.to_str().unwrap()]).stdout(
-        predicate::str::contains("Reload command: docker exec web nginx -s reload"),
-    );
+    stop_bots_with_host(
+        &host,
+        &["set-nginx-commands", "--db", db_path.to_str().unwrap()],
+    )
+    .stdout(predicate::str::contains(
+        "Reload command: docker exec web nginx -s reload",
+    ));
 
-    stop_bots(&[
-        "set-nginx-commands",
-        "--db",
-        db_path.to_str().unwrap(),
-        "--reset",
-    ])
+    stop_bots_with_host(
+        &host,
+        &[
+            "set-nginx-commands",
+            "--db",
+            db_path.to_str().unwrap(),
+            "--reset",
+        ],
+    )
     .stdout(predicate::str::contains(
         "Reload command: systemctl reload nginx",
     ));
@@ -1687,6 +1716,7 @@ fn render_firewall_refuses_to_lock_out_a_connected_ssh_client() {
 #[test]
 fn the_lockout_guard_reads_the_stored_ssh_log() {
     let tmp = tempfile::tempdir().unwrap();
+    let host = tmp.path().join("host.conf");
     let db_path = tmp.path().join("db.sqlite3");
     let db_path = db_path.to_str().unwrap();
     let log_path = tmp.path().join("elsewhere-auth.log");
@@ -1713,11 +1743,16 @@ fn the_lockout_guard_reads_the_stored_ssh_log() {
             log_path.to_str().unwrap(),
         ],
     ] {
-        stop_bots_bin().args(args).assert().success();
+        stop_bots_bin()
+            .env("STOP_BOTS_HOST_CONF", &host)
+            .args(args)
+            .assert()
+            .success();
     }
 
     let script_path = tmp.path().join("stop-bots.nft");
     let output = stop_bots_bin()
+        .env("STOP_BOTS_HOST_CONF", &host)
         .args([
             "render-firewall",
             "--db",
@@ -3532,8 +3567,8 @@ fn install_web_stores_the_proxy_settings() {
 }
 
 /// `install web --root` is stored, as `set-nginx-commands --root` would
-/// store it, because the service reads the root from the database — and
-/// the helper's unit lets the helper, which writes NGINX config for the
+/// store it, in the host settings file the helper reads the root from —
+/// and the helper's unit lets the helper, which writes NGINX config for the
 /// console, write there. It used to be accepted and then ignored.
 #[test]
 fn install_web_stores_the_nginx_root_and_lets_the_helper_write_it() {
@@ -3552,11 +3587,10 @@ fn install_web_stores_the_nginx_root_and_lets_the_helper_write_it() {
         .assert()
         .success();
 
-    let db = stop_bots::db::Db::open(tmp.path().join("var/lib/stop-bots/db.sqlite3")).unwrap();
-    assert_eq!(
-        stop_bots::nginx::root(&db, None).unwrap(),
-        std::path::PathBuf::from("/srv/nginx")
-    );
+    let host =
+        stop_bots::hostconf::HostConf::load_from(&tmp.path().join("etc/stop-bots/host.conf"))
+            .unwrap();
+    assert_eq!(host.root(None), std::path::PathBuf::from("/srv/nginx"));
     let unit = fs::read_to_string(
         tmp.path()
             .join("etc/systemd/system/stop-bots-helper.service"),
@@ -3811,7 +3845,8 @@ fn auto_apply_rewrites_a_stale_site_config_and_then_leaves_it_alone() {
     let db = stop_bots::db::Db::open(&fixture.db).unwrap();
     db.set_auto_apply(true).unwrap();
 
-    let summary = stop_bots::cron::apply_nginx(&db, &fixture.nginx_root, false);
+    let summary =
+        stop_bots::cron::apply_nginx(&db, &Default::default(), &fixture.nginx_root, false);
     assert!(summary.contains("applied 1 site(s)"), "{summary}");
     assert!(summary.contains("1 file(s) changed"), "{summary}");
     // The reload is the step with a side effect outside this project's
@@ -3824,7 +3859,7 @@ fn auto_apply_rewrites_a_stale_site_config_and_then_leaves_it_alone() {
 
     // Nothing changed on disk the second time, so there is nothing to
     // reload — what makes an hourly job cheap on a quiet host.
-    let again = stop_bots::cron::apply_nginx(&db, &fixture.nginx_root, false);
+    let again = stop_bots::cron::apply_nginx(&db, &Default::default(), &fixture.nginx_root, false);
     assert_eq!(again, "1 site(s) already up to date");
 }
 

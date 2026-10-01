@@ -82,6 +82,27 @@ pub struct AppState {
     /// may be open: see [`crate::web::server::serve_on`]. A field so that
     /// a test can shorten the timeouts rather than wait them out.
     pub limits: crate::web::server::ServeLimits,
+    /// The host settings file ([`crate::hostconf`]): read for what the
+    /// Help page shows and for the logs this console reads itself, and by
+    /// an in-process executor for everything else. A field so a test can
+    /// point it at a file of its own.
+    pub host_conf: PathBuf,
+    /// How this console does what needs root: see [`Privilege`].
+    pub privilege: Privilege,
+}
+
+/// How a console does what needs root — see [`crate::privileged`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Privilege {
+    /// In this process, which is root: `stop-bots web` started by hand as
+    /// root, and the tests.
+    #[default]
+    Local,
+    /// Through the root helper on this socket: `stop-bots web --helper`,
+    /// which is how the service runs.
+    Helper(PathBuf),
+    /// Not at all: no root and no helper. Views work; actions say so.
+    ReadOnly,
 }
 
 impl AppState {
@@ -120,7 +141,41 @@ impl AppState {
             firewall_out: None,
             db_notice: None,
             limits: crate::web::server::ServeLimits::default(),
+            host_conf: crate::hostconf::path(),
+            privilege: Privilege::default(),
         }
+    }
+
+    /// The way to do what needs root, as this state is set up now.
+    ///
+    /// Built per call rather than kept, so a field a test or `main.rs`
+    /// sets after [`AppState::new`] — `firewall_out`, `host_conf` — is the
+    /// one an in-process executor uses.
+    pub fn privileged(&self) -> crate::privileged::Privileged {
+        use crate::privileged::{Local, Privileged, Settings};
+        let local = || {
+            std::sync::Arc::new(Local {
+                db: Arc::clone(&self.db),
+                settings: Settings {
+                    host_conf: self.host_conf.clone(),
+                    root: Some(self.nginx_root.clone()),
+                    ssh_log: self.ssh_log.clone(),
+                    firewall_out: self.firewall_out.clone(),
+                    for_real: self.apply_for_real,
+                },
+            })
+        };
+        match &self.privilege {
+            Privilege::Local => Privileged::Local(local()),
+            Privilege::Helper(socket) => Privileged::Helper(socket.clone()),
+            Privilege::ReadOnly => Privileged::ReadOnly(local()),
+        }
+    }
+
+    /// The host settings, read now. A file that cannot be read is the
+    /// defaults: everything that reads this only shows or reads with it.
+    pub fn host(&self) -> crate::hostconf::HostConf {
+        crate::hostconf::HostConf::load_from(&self.host_conf).unwrap_or_default()
     }
 
     /// Runs `f` against the database on a blocking thread.

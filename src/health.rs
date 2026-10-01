@@ -255,6 +255,12 @@ pub struct Probe {
     /// root itself can read everything.
     #[serde(default)]
     pub console_unreadable_logs: Vec<String>,
+    /// The NGINX test and reload commands the host settings name, for
+    /// [`nginx_deployment`] to check against where NGINX runs. `None` from
+    /// a probe taken before they were carried here, or when the setting
+    /// does not parse; read as the defaults.
+    #[serde(default)]
+    pub nginx_commands: Option<crate::nginx::NginxCommands>,
 }
 
 /// How much of the access log a probe reads: its last 32 MB. Every
@@ -329,14 +335,19 @@ fn access_log_sample(path: &Path, block_status: u16) -> Option<crate::accesslog:
 /// `None`, because "I could not check" is a result the report has to be
 /// able to show. An error here would mean no report at all, which is the
 /// least useful outcome available.
+///
+/// Where to look comes from `host` ([`crate::hostconf`]): the logs, the
+/// NGINX root whose `conf.d` is checked, and the NGINX commands, which are
+/// carried in the probe for [`assess`] to judge.
 pub fn probe(
     backend: FirewallBackend,
     db_path: &Path,
     ssh_log: Option<&Path>,
-    paths: &crate::logpaths::LogPaths,
-    conf_d: &Path,
+    host: &crate::hostconf::HostConf,
     block_status: u16,
 ) -> Probe {
+    let paths = &host.log_paths();
+    let conf_d = &crate::nginx::conf_d_dir(&host.root(None));
     let live = live_firewall(backend);
     let (live_rules, live_backend) = match &live {
         Some(state) => (Some(state.rules), Some(backend.stored().to_string())),
@@ -357,6 +368,7 @@ pub fn probe(
         _ => None,
     };
     Probe {
+        nginx_commands: host.commands().ok(),
         live_rules,
         live_backend,
         // From the same read as every other access-log answer below.
@@ -925,7 +937,7 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     checks.push(firewall_enforced(probe, loadable, applied));
     checks.push(firewall_persistence(probe, backend));
     checks.push(script_freshness(db, expected, backend)?);
-    checks.push(nginx_applied(db)?);
+    checks.push(nginx_applied(db, probe)?);
     checks.push(generated_files_reachable(probe));
     checks.push(service_health(probe));
     checks.extend(console_account(probe));
@@ -1384,7 +1396,7 @@ pub fn format_utc(secs: i64) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
-fn nginx_applied(db: &Db) -> Result<Check> {
+fn nginx_applied(db: &Db, probe: &Probe) -> Result<Check> {
     use crate::nginx::{self, SiteApplyStatus};
 
     let sites = db.list_sites()?;
@@ -1394,7 +1406,12 @@ fn nginx_applied(db: &Db) -> Result<Check> {
     // `assess` rather than from `probe`, because it needs a per-site
     // `BlockConfig` that only the database can produce.
     let mut stale: Vec<String> = Vec::new();
-    let conf_d = nginx::conf_d_dir(&nginx::root(db, None)?);
+    // The `conf.d` the probe looked at, which is the host settings' root's.
+    let conf_d = probe
+        .conf_d_path
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| nginx::conf_d_dir(Path::new(nginx::DEFAULT_ROOT)));
     for site in sites {
         let config = nginx::block_config_for_site(db, site.id)?;
         let status = nginx::site_apply_status(
@@ -1950,7 +1967,7 @@ fn skipped_entries(db: &Db) -> Result<Option<Check>> {
 ///   NGINX resolves it against its own filesystem. Caught at apply time by
 ///   `write_validated` running `nginx -t` inside the container, so Warn.
 fn nginx_deployment(db: &Db, probe: &Probe) -> Result<Option<Check>> {
-    let commands = crate::nginx::NginxCommands::from_db(db)?;
+    let commands = probe.nginx_commands.clone().unwrap_or_default();
     let targets_a_container = |argv: &[String]| {
         argv.iter()
             .any(|word| word.contains("docker") || word.contains("podman"))
@@ -2269,6 +2286,7 @@ mod tests {
             console_identity: Some(console_user()),
             console_helper: Some(true),
             console_unreadable_logs: Vec::new(),
+            nginx_commands: None,
         }
     }
 
@@ -2454,17 +2472,16 @@ mod tests {
         }
     }
 
-    fn configured_for_docker(db: &Db) {
-        db.set_text_setting(
-            crate::nginx::NginxCommands::RELOAD_KEY,
-            "docker exec web nginx -s reload",
-        )
-        .unwrap();
-        db.set_text_setting(
-            crate::nginx::NginxCommands::TEST_KEY,
-            "docker exec web nginx -t",
-        )
-        .unwrap();
+    /// `probe`, taken on a host whose settings point the NGINX commands at
+    /// the container `web`.
+    fn configured_for_docker(probe: Probe) -> Probe {
+        Probe {
+            nginx_commands: Some(crate::nginx::NginxCommands {
+                test: crate::nginx::split_command("docker exec web nginx -t").unwrap(),
+                reload: crate::nginx::split_command("docker exec web nginx -s reload").unwrap(),
+            }),
+            ..probe
+        }
     }
 
     /// The host arrangement is stated out loud, not left to silence: the
@@ -2699,9 +2716,8 @@ mod tests {
     #[test]
     fn container_commands_on_a_host_nginx_are_critical() {
         let db = db();
-        configured_for_docker(&db);
 
-        let check = assess(&db, &healthy()).unwrap();
+        let check = assess(&db, &configured_for_docker(healthy())).unwrap();
         let check = check2(&check, "nginx-deployment");
 
         assert_eq!(check.level, Level::Critical);
@@ -2848,9 +2864,8 @@ mod tests {
     #[test]
     fn a_loopback_console_bind_is_flagged_for_a_bridged_container() {
         let db = db();
-        configured_for_docker(&db);
 
-        let check = assess(&db, &in_container()).unwrap();
+        let check = assess(&db, &configured_for_docker(in_container())).unwrap();
         let check = check2(&check, "nginx-deployment");
 
         assert_eq!(check.level, Level::Warn);
@@ -2863,14 +2878,13 @@ mod tests {
     #[test]
     fn a_host_networked_container_is_happy_with_a_loopback_bind() {
         let db = db();
-        configured_for_docker(&db);
 
         let report = assess(
             &db,
-            &Probe {
+            &configured_for_docker(Probe {
                 container_shares_host_network: Some(true),
                 ..in_container()
-            },
+            }),
         )
         .unwrap();
 
@@ -2882,15 +2896,14 @@ mod tests {
     #[test]
     fn a_managed_directory_missing_from_the_container_is_flagged() {
         let db = db();
-        configured_for_docker(&db);
 
         let report = assess(
             &db,
-            &Probe {
+            &configured_for_docker(Probe {
                 managed_dir_in_container: Some(false),
                 container_shares_host_network: Some(true),
                 ..in_container()
-            },
+            }),
         )
         .unwrap();
 

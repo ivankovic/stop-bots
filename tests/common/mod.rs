@@ -60,7 +60,11 @@ pub fn stop_bots_bin() -> Command {
     // forgot `--db` writes to.
     cmd.env_remove("STOP_BOTS_DB")
         .env("STOP_BOTS_NGINX_CONF_D", generated_dir("conf.d"))
-        .env("STOP_BOTS_NGINX_DIR", generated_dir("managed"));
+        .env("STOP_BOTS_NGINX_DIR", generated_dir("managed"))
+        // The host settings file is `/etc/stop-bots/host.conf` otherwise,
+        // which a test must neither read nor write. A test that sets one
+        // points this at a file of its own.
+        .env("STOP_BOTS_HOST_CONF", generated_dir("host.conf"));
     for name in NetworkTripwire::UNSET {
         cmd.env_remove(name);
     }
@@ -164,6 +168,15 @@ pub fn stop_bots(args: &[&str]) -> assert_cmd::assert::Assert {
     stop_bots_bin().args(args).assert().success()
 }
 
+/// [`stop_bots`], with the host settings file at `host_conf`.
+pub fn stop_bots_with_host(host_conf: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
+    stop_bots_bin()
+        .env("STOP_BOTS_HOST_CONF", host_conf)
+        .args(args)
+        .assert()
+        .success()
+}
+
 /// Seeds the bot list from the checked-in sample, so tests never touch the
 /// network.
 pub fn seed_bots(db: &Path) {
@@ -214,4 +227,181 @@ pub fn copy_dir_all(src: &Path, dst: &Path) {
             fs::copy(entry.path(), &target).unwrap();
         }
     }
+}
+
+/// Writes an executable `#!/bin/sh` script at `path`.
+///
+/// Through a short-lived `sh` rather than `fs::write`: these test binaries
+/// run many threads, and one that forks while another holds the script
+/// open for writing hands that descriptor to its child, so running the
+/// script fails with "Text file busy" one time in a few.
+pub fn write_script(path: &Path, body: &str) {
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"printf '%s' "$2" > "$1" && chmod 755 "$1""#)
+        .arg("sh")
+        .arg(path)
+        .arg(format!("#!/bin/sh\n{body}"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "could not write {}", path.display());
+}
+
+/// A host for the root helper to serve, all of it in a temp directory: a
+/// database, an NGINX root with one site, an empty SSH log, and the host
+/// settings file naming them, whose NGINX test and reload are `true`.
+pub struct HelperHost {
+    pub dir: tempfile::TempDir,
+    pub db: PathBuf,
+    pub root: PathBuf,
+    pub site: PathBuf,
+    pub host_conf: PathBuf,
+    /// The applied firewall script: a test's own, never `/etc/stop-bots`.
+    pub firewall: PathBuf,
+}
+
+/// The one site every [`HelperHost`] has.
+pub const HELPER_SITE: &str = "server {\n    listen 80;\n    server_name example.com;\n}\n";
+
+impl HelperHost {
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("nginx");
+        fs::create_dir_all(root.join("conf.d")).unwrap();
+        fs::create_dir_all(root.join("sites-enabled")).unwrap();
+        let site = root.join("sites-enabled/example.com");
+        fs::write(&site, HELPER_SITE).unwrap();
+        let ssh_log = dir.path().join("auth.log");
+        fs::write(&ssh_log, "").unwrap();
+        let host_conf = dir.path().join("host.conf");
+        stop_bots::hostconf::HostConf {
+            nginx_test_command: Some("true".into()),
+            nginx_reload_command: Some("true".into()),
+            nginx_root: Some(root.clone()),
+            access_log: Some(dir.path().join("access.log")),
+            ssh_log: Some(ssh_log),
+        }
+        .save_to(&host_conf)
+        .unwrap();
+        let db = dir.path().join("db.sqlite3");
+        fs::copy(helper_db_template(), &db).unwrap();
+        let firewall = dir.path().join("firewall.nft");
+        HelperHost {
+            dir,
+            db,
+            root,
+            site,
+            host_conf,
+            firewall,
+        }
+    }
+
+    /// What an executor serving this host is configured with: the host
+    /// settings file, and the firewall script redirected into the temp
+    /// directory. Nothing for real: no `nft`, no reload.
+    pub fn settings(&self) -> stop_bots::privileged::Settings {
+        stop_bots::privileged::Settings {
+            host_conf: self.host_conf.clone(),
+            root: None,
+            ssh_log: None,
+            firewall_out: Some(self.firewall.clone()),
+            for_real: false,
+        }
+    }
+
+    /// The helper's configuration for this host, answering `allowed`.
+    pub fn config(&self, allowed: Vec<u32>) -> stop_bots::helper::Config {
+        stop_bots::helper::Config {
+            db_path: self.db.clone(),
+            settings: self.settings(),
+            allowed_uids: allowed,
+            request_deadline: std::time::Duration::from_millis(500),
+            op_deadline: std::time::Duration::from_secs(10),
+            max_connections: 8,
+        }
+    }
+
+    /// Starts a real helper on a socket in the temp directory, answering
+    /// this process's own user, and returns the socket.
+    pub fn serve(&self) -> PathBuf {
+        self.serve_with(self.config(vec![own_uid()]))
+    }
+
+    /// The same, with `config`.
+    pub fn serve_with(&self, config: stop_bots::helper::Config) -> PathBuf {
+        let socket = self.dir.path().join(format!(
+            "helper-{}.sock",
+            SOCKETS.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let listener = stop_bots::helper::bind(&socket).unwrap();
+        let server = stop_bots::helper::Server::new(config);
+        std::thread::spawn(move || server.serve(listener));
+        socket
+    }
+
+    /// An in-process executor over this host, the way a console running
+    /// as root does it.
+    pub fn local(&self) -> stop_bots::privileged::Privileged {
+        stop_bots::privileged::Privileged::Local(std::sync::Arc::new(
+            stop_bots::privileged::Local {
+                db: std::sync::Arc::new(std::sync::Mutex::new(self.open_db())),
+                settings: self.settings(),
+            },
+        ))
+    }
+
+    pub fn open_db(&self) -> stop_bots::db::Db {
+        stop_bots::db::Db::open(&self.db).unwrap()
+    }
+}
+
+static SOCKETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A database for a [`HelperHost`], made once per test binary and copied:
+/// creating one is a schema and a dozen fsyncs, most of a second on a busy
+/// disk, and every host would otherwise pay it. The bot sources this binary
+/// ships with, and one permanently blocked address so the firewall has a
+/// rule to write.
+fn helper_db_template() -> &'static Path {
+    static TEMPLATE: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> = std::sync::OnceLock::new();
+    &TEMPLATE
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db.sqlite3");
+            let db = stop_bots::db::Db::open(&path).unwrap();
+            stop_bots::botlist::register_all_sources(&db).unwrap();
+            db.block_address_permanently("192.0.2.10", stop_bots::db::RuleSource::Tui, None)
+                .unwrap();
+            // Checkpointed before it is copied, so the one file is the
+            // whole database and no `-wal` holds part of it.
+            db.vacuum().unwrap();
+            drop(db);
+            (dir, path)
+        })
+        .1
+}
+
+/// Blocks a bot whose user agent pattern is `pattern`, as it is stored:
+/// what an apply then writes into every site.
+pub fn block_a_bot(db: &stop_bots::db::Db, pattern: &str) {
+    let source = db.list_sources().unwrap()[0].id.clone();
+    let slug = format!("bot-{}", db.list_bots().unwrap().len());
+    db.upsert_bot(&stop_bots::db::NewBot {
+        slug: slug.clone(),
+        name: slug.clone(),
+        is_ai: false,
+        is_search_engine: false,
+        is_scanner: false,
+        user_agent_pattern: pattern.to_string(),
+        source_id: source,
+    })
+    .unwrap();
+    db.set_bot_status(&slug, stop_bots::db::BotStatus::Blocked)
+        .unwrap();
+}
+
+/// This process's effective uid.
+pub fn own_uid() -> u32 {
+    // SAFETY: no preconditions; reads the process's own credentials.
+    unsafe { libc::geteuid() }
 }

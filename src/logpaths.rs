@@ -45,12 +45,12 @@
 //! real thing to want and must not need the stored value changed and put
 //! back. The stored value is what the console and the internal cron get,
 //! since they have no way to be passed a flag.
+//!
+//! "Stored" means the host settings file ([`crate::hostconf`]), not the
+//! database: the lockout guard runs as root on the SSH log named here, and
+//! the web console can write every row of the database.
 
 use std::path::{Path, PathBuf};
-
-use anyhow::Result;
-
-use crate::db::Db;
 
 /// The stored location of each log this project reads.
 ///
@@ -67,38 +67,6 @@ pub struct LogPaths {
 }
 
 impl LogPaths {
-    /// `settings` keys. A `logs:` family, alongside `nginx:`.
-    pub const ACCESS_KEY: &'static str = crate::db::keys::LOGS_ACCESS_PATH;
-    pub const SSH_KEY: &'static str = crate::db::keys::LOGS_SSH_PATH;
-
-    /// Reads both from `db`. A row that is present but empty reads as
-    /// unset, so clearing one is `set-log-paths --access-log ""` rather
-    /// than a second verb.
-    pub fn from_db(db: &Db) -> Result<Self> {
-        let stored = |key: &str| -> Result<Option<PathBuf>> {
-            Ok(db
-                .get_text_setting(key)?
-                .map(|raw| raw.trim().to_string())
-                .filter(|raw| !raw.is_empty())
-                .map(PathBuf::from))
-        };
-        Ok(Self {
-            access: stored(Self::ACCESS_KEY)?,
-            ssh: stored(Self::SSH_KEY)?,
-        })
-    }
-
-    /// Stores `access` and `ssh`, each `None` leaving that key untouched
-    /// and each `Some("")` clearing it.
-    pub fn save(db: &Db, access: Option<&str>, ssh: Option<&str>) -> Result<()> {
-        for (key, value) in [(Self::ACCESS_KEY, access), (Self::SSH_KEY, ssh)] {
-            if let Some(value) = value {
-                db.set_text_setting(key, value.trim())?;
-            }
-        }
-        Ok(())
-    }
-
     /// The access log this run should read: the flag if given, else the
     /// stored path, else the module default.
     pub fn access_path(&self, flag: Option<&Path>) -> PathBuf {
@@ -144,27 +112,21 @@ impl LogPaths {
 mod tests {
     use super::*;
 
-    fn db() -> Db {
-        Db::open_in_memory().unwrap()
+    /// The paths the host settings name, as every reader gets them.
+    fn stored(access: Option<&str>, ssh: Option<&str>) -> LogPaths {
+        crate::hostconf::HostConf {
+            access_log: access.map(PathBuf::from),
+            ssh_log: ssh.map(PathBuf::from),
+            ..Default::default()
+        }
+        .log_paths()
     }
 
     #[test]
     fn nothing_stored_reads_as_nothing_configured() {
-        assert_eq!(LogPaths::from_db(&db()).unwrap(), LogPaths::default());
-    }
-
-    #[test]
-    fn a_stored_path_round_trips() {
-        let db = db();
-        LogPaths::save(&db, Some("/srv/domaci/nginx/logs/access.log"), None).unwrap();
-        let paths = LogPaths::from_db(&db).unwrap();
         assert_eq!(
-            paths.access.as_deref(),
-            Some(Path::new("/srv/domaci/nginx/logs/access.log"))
-        );
-        assert_eq!(
-            paths.ssh, None,
-            "the ssh key was not named, so it is untouched"
+            crate::hostconf::HostConf::default().log_paths(),
+            LogPaths::default()
         );
     }
 
@@ -173,13 +135,11 @@ mod tests {
     /// alike, and a flag still beats it.
     #[test]
     fn the_ssh_log_is_the_flag_then_the_stored_path_then_a_search() {
-        let db = db();
         assert_eq!(
-            LogPaths::from_db(&db).unwrap().ssh(None),
+            stored(None, None).ssh(None),
             crate::sshlog::SshSource::Search
         );
-        LogPaths::save(&db, None, Some("/srv/log/auth.log")).unwrap();
-        let paths = LogPaths::from_db(&db).unwrap();
+        let paths = stored(None, Some("/srv/log/auth.log"));
         assert_eq!(
             paths.ssh(None),
             crate::sshlog::SshSource::File("/srv/log/auth.log".into())
@@ -202,9 +162,7 @@ mod tests {
         )
         .unwrap();
 
-        let db = db();
-        LogPaths::save(&db, Some(log.to_str().unwrap()), None).unwrap();
-        let paths = LogPaths::from_db(&db).unwrap();
+        let paths = stored(log.to_str(), None);
 
         assert!(
             matches!(
@@ -233,9 +191,7 @@ mod tests {
         )
         .unwrap();
 
-        let db = db();
-        LogPaths::save(&db, Some(stored.to_str().unwrap()), None).unwrap();
-        let paths = LogPaths::from_db(&db).unwrap();
+        let paths = super::tests::stored(stored.to_str(), None);
 
         match paths.access_source(Some(&asked)) {
             crate::accesslog::LogSource::Found(text) => assert!(
@@ -246,20 +202,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_empty_value_clears_a_stored_path() {
-        let db = db();
-        LogPaths::save(&db, Some("/somewhere/access.log"), None).unwrap();
-        LogPaths::save(&db, Some(""), None).unwrap();
-        assert_eq!(LogPaths::from_db(&db).unwrap().access, None);
-    }
-
     /// The health check's whole improvement: naming the file it tried.
     #[test]
     fn the_description_names_the_path_that_would_be_read() {
-        let db = db();
-        LogPaths::save(&db, Some("/srv/domaci/nginx/logs/access.log"), None).unwrap();
-        let paths = LogPaths::from_db(&db).unwrap();
+        let paths = stored(Some("/srv/domaci/nginx/logs/access.log"), None);
 
         assert_eq!(
             paths.access_description(None),

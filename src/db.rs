@@ -1344,6 +1344,61 @@ impl Db {
         Ok(Db { conn })
     }
 
+    /// Opens a database that another, less privileged user can write: the
+    /// web console's, from the root helper (see [`crate::helper`]).
+    ///
+    /// Everything in it is read as hostile, and so is the directory it is
+    /// in. Unlike [`Db::open`], this:
+    ///
+    /// - never creates the file or the directory, and changes no mode;
+    /// - refuses a database path that is a link (`SQLITE_OPEN_NOFOLLOW`).
+    ///   SQLite itself opens the `-wal`, `-shm` and `-journal` files with
+    ///   `O_NOFOLLOW`, so a link planted at one of those fails the open
+    ///   rather than having root write through it;
+    /// - turns on SQLite's defensive mode, which refuses the statements
+    ///   that can corrupt a database file deliberately, and
+    ///   `cell_size_check`, which checks pages for the malformations a
+    ///   crafted file would carry;
+    /// - turns triggers and views off, and `trusted_schema` off. This
+    ///   schema has neither triggers nor views, so one in the file was put
+    ///   there by somebody else, and none of it may run as root.
+    pub fn open_untrusted<P: AsRef<Path>>(path: P) -> Result<Self> {
+        use rusqlite::config::DbConfig;
+        use rusqlite::OpenFlags;
+
+        let path = path.as_ref();
+        let meta = std::fs::symlink_metadata(path)
+            .with_context(|| format!("failed to open database: {}", path.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "refusing to open {}: it is not a regular file",
+                path.display()
+            );
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .with_context(|| format!("failed to open database: {}", path.display()))?;
+        for (config, on) in [
+            (DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true),
+            (DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false),
+            (DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false),
+            (DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false),
+        ] {
+            conn.set_db_config(config, on).with_context(|| {
+                format!("failed to harden the connection to {}", path.display())
+            })?;
+        }
+        conn.pragma_update(None, "cell_size_check", true)?;
+        conn.busy_timeout(BUSY_TIMEOUT)
+            .context("failed to set the database busy timeout")?;
+        schema::migrate(&conn, Some(path))?;
+        Ok(Db { conn })
+    }
+
     /// Where this database lives on disk, or `None` for an in-memory one.
     ///
     /// Asked of the connection rather than remembered from `open`, so it
@@ -1866,6 +1921,14 @@ impl Db {
 
     pub fn set_text_setting(&self, key: &str, value: &str) -> Result<()> {
         self.set_raw_setting(key, value)
+    }
+
+    /// Removes a setting, so that it reads as never set.
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM settings WHERE key = ?1", params![key])
+            .with_context(|| format!("failed to delete the setting `{key}`"))?;
+        Ok(())
     }
 
     // ---- per-site path exemptions ----

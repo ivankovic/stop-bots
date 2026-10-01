@@ -1813,12 +1813,15 @@ pub fn unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<PathB
         .map(|(path, _)| path)
         .collect();
     let mut paths = fallback_unused_managed_files(db, root)?;
+    let within = managed_directories(root);
     for row in db.managed_files()? {
-        let known = ManagedKind::from_id(&row.kind).is_some();
-        if known
-            && !planned.contains(&row.path)
+        let Some(kind) = ManagedKind::from_id(&row.kind) else {
+            continue;
+        };
+        if !planned.contains(&row.path)
             && !paths.contains(&row.path)
-            && is_generated_file(&row.path)
+            && ManagedKind::of(&row.path) == Some(kind)
+            && is_removable_record(&row.path, &within)
         {
             paths.push(row.path);
         }
@@ -1826,6 +1829,48 @@ pub fn unused_managed_files(db: &crate::db::Db, root: &Path) -> Result<Vec<PathB
     // Stable, so the fixed list's own order survives within a kind.
     paths.sort_by_key(|path| ManagedKind::of(path));
     Ok(paths)
+}
+
+/// The directories a recorded file may be removed from: the `conf.d`
+/// this root's files go into, and [`managed_dir`], each with its links
+/// resolved. A directory that does not exist is left out.
+fn managed_directories(root: &Path) -> Vec<PathBuf> {
+    [conf_d_dir(root), managed_dir()]
+        .iter()
+        .filter_map(|dir| fs::canonicalize(dir).ok())
+        .collect()
+}
+
+/// Whether the `managed_files` row naming `path` may be acted on: a
+/// regular file, not a link, directly inside one of `within` once the
+/// links in its directory are resolved, with this project's header.
+///
+/// **The record is not trusted.** The web console can write every row of
+/// the database, and this runs as root: a row naming `/etc/passwd`, a
+/// link to it, or `<conf.d>/../../passwd` must delete nothing. The
+/// directories are root's, so what is checked here cannot change before
+/// the removal.
+fn is_removable_record(path: &Path, within: &[PathBuf]) -> bool {
+    let Some((parent, name)) = path.parent().zip(path.file_name()) else {
+        return false;
+    };
+    let Ok(parent) = fs::canonicalize(parent) else {
+        return false;
+    };
+    within.contains(&parent)
+        && fs::symlink_metadata(parent.join(name)).is_ok_and(|meta| meta.is_file())
+        && is_generated_file(&parent.join(name))
+}
+
+/// Whether a recorded `path` is a file this project generated, by its
+/// name, its type and its header — wherever it is. For `uninstall`, which
+/// removes what an earlier root left behind and so cannot bound it to
+/// today's directories, but must still never remove a file of somebody
+/// else's that a row was made to name.
+pub fn is_recorded_generated_file(path: &Path) -> bool {
+    ManagedKind::of(path).is_some()
+        && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+        && is_generated_file(path)
 }
 
 /// The fixed list: where each file the current settings do not call for
@@ -2701,6 +2746,25 @@ pub fn apply_console_access(
     upstream: &std::net::SocketAddr,
     commands: &NginxCommands,
 ) -> Result<PathBuf> {
+    // Checked again here, where they are written into a file a root NGINX
+    // loads, whatever checked them before: a front-end, or a request that
+    // came over the helper's socket.
+    match access {
+        ConsoleAccess::Subdomain { host } if !crate::webaccess::is_plausible_host(host) => {
+            anyhow::bail!("refusing to write a server block for {host:?}: it is not a host name")
+        }
+        ConsoleAccess::Path { prefix, .. }
+            if crate::web::BasePath::parse(prefix)
+                .ok()
+                .filter(|base| !base.is_root())
+                .map(|base| base.url("/"))
+                .as_deref()
+                != Some(prefix.as_str()) =>
+        {
+            anyhow::bail!("refusing to write a location for {prefix:?}: it is not a path prefix")
+        }
+        _ => {}
+    }
     match access {
         ConsoleAccess::Subdomain { host } => {
             let path = console_site_path(root);
@@ -2778,6 +2842,82 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
         }
     }
     Ok(sites)
+}
+
+/// The file under `root` that declares `server_name`, found on disk.
+///
+/// The database records where a site was when it was scanned, and the
+/// web console can write that record. Whatever writes a site's file as
+/// root therefore asks the disk, and uses `recorded` only to tell apart
+/// two files that both declare the name: the one at the recorded path if
+/// it is among them, the only one if there is one, and otherwise none.
+pub fn locate_site(root: &Path, server_name: &str, recorded: Option<&Path>) -> Result<PathBuf> {
+    let discovered = discover_sites(root)?;
+    if let Some(found) = pick_site(&discovered, server_name, recorded) {
+        return Ok(found.to_path_buf());
+    }
+    let candidates = discovered
+        .iter()
+        .filter(|site| site.server_name == server_name)
+        .count();
+    match candidates {
+        0 => anyhow::bail!(
+            "no `server` block under {} is named {server_name} — re-scan sites and try again",
+            root.display()
+        ),
+        _ => anyhow::bail!(
+            "{candidates} files under {} declare {server_name}, and none is the one scanned — \
+             re-scan sites and try again",
+            root.display()
+        ),
+    }
+}
+
+/// [`locate_site`]'s choice among sites already discovered: the one named
+/// `server_name` at `recorded`, else the only one named `server_name`.
+fn pick_site<'a>(
+    discovered: &'a [DiscoveredSite],
+    server_name: &str,
+    recorded: Option<&Path>,
+) -> Option<&'a Path> {
+    let mut named = discovered
+        .iter()
+        .filter(|site| site.server_name == server_name)
+        .map(|site| site.config_path.as_path());
+    let all: Vec<&Path> = named.by_ref().collect();
+    if let Some(found) = recorded.and_then(|recorded| all.iter().find(|p| **p == recorded)) {
+        return Some(found);
+    }
+    match all.as_slice() {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
+/// The status of every scanned site, each judged against the file found
+/// for it on disk under `root` (see [`locate_site`]) rather than the one
+/// its row names. A site with no file there is [`SiteApplyStatus::NotFound`].
+pub fn site_statuses(db: &crate::db::Db, root: &Path) -> Result<Vec<(i64, SiteApplyStatus)>> {
+    let discovered = discover_sites(root).unwrap_or_default();
+    let conf_d = conf_d_dir(root);
+    let mut statuses = Vec::new();
+    for site in db.list_sites()? {
+        let status = match pick_site(
+            &discovered,
+            &site.server_name,
+            Some(Path::new(&site.config_path)),
+        ) {
+            Some(path) => site_apply_status(
+                path,
+                &site.server_name,
+                &block_config_for_site(db, site.id)?,
+                &conf_d,
+            ),
+            None => SiteApplyStatus::NotFound,
+        };
+        statuses.push((site.id, status));
+    }
+    Ok(statuses)
 }
 
 /// Applies the bot-blocking rule to every `server { ... }` block found in
@@ -2866,7 +3006,7 @@ fn nth_block<'a>(
 /// Whether a site's on-disk config currently matches the blocking rule
 /// that would be computed for it right now — backs the TUI's per-site
 /// status tag in NGINX.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SiteApplyStatus {
     /// Every `server` block for this name already carries the expected
     /// rule (or none is expected and none is present).
@@ -3103,7 +3243,7 @@ pub fn preview_all_sites(db: &crate::db::Db, root: &Path) -> Result<Vec<FileChan
 }
 
 /// What [`apply_all_sites_and_reload`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ApplyAllOutcome {
     pub sites: usize,
     pub files: usize,
@@ -3236,13 +3376,15 @@ pub fn apply_site_and_reload(
     commands: Option<&NginxCommands>,
 ) -> Result<(bool, bool)> {
     let _lock = crate::applylock::hold()?;
+    // The file found on disk for this site, not the one its row names:
+    // see `locate_site`.
+    let config_path = &locate_site(root, &site.server_name, Some(Path::new(&site.config_path)))?;
     let managed = planned_managed_files(db, root)?;
     record_managed_files(db, &managed)?;
-    let config_path = Path::new(&site.config_path);
     let snapshot = Snapshot::of_apply(
         root,
         managed.iter().map(|(path, _)| path.clone()),
-        [config_path],
+        [config_path.as_path()],
     )?;
 
     let written = (|| -> Result<bool> {
@@ -3534,9 +3676,9 @@ pub fn test_or_restore(snapshot: &Snapshot, commands: &NginxCommands) -> Result<
 /// a different config than the one the container will read. Both become
 /// `docker exec <name> nginx ...` there.
 ///
-/// Resolved from `Db` on the main thread and passed to the blocking half,
-/// which by the rule in `app.rs` cannot reach a `Db` at all.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Read from the host's settings ([`crate::hostconf`]), never from the
+/// database: these run as root, and the web console can write every row.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NginxCommands {
     /// Argv for the config check. Must exit non-zero on a bad config.
     pub test: Vec<String>,
@@ -3550,28 +3692,16 @@ impl NginxCommands {
     pub const DEFAULT_TEST: &'static str = "nginx -t";
     pub const DEFAULT_RELOAD: &'static str = "systemctl reload nginx";
 
-    /// `settings` keys, alongside the rest of the `nginx:` family.
+    /// The `settings` keys these were stored under before they became host
+    /// settings. Read only by [`crate::hostconf::migrate`], once.
     pub const TEST_KEY: &'static str = crate::db::keys::NGINX_TEST_COMMAND;
     pub const RELOAD_KEY: &'static str = crate::db::keys::NGINX_RELOAD_COMMAND;
     /// Where this host's site configs actually live.
     pub const ROOT_KEY: &'static str = crate::db::keys::NGINX_ROOT;
 
-    /// Reads both from `db`, falling back to the defaults for either one
-    /// that was never set. A stored command that no longer parses is an
-    /// error rather than a silent fallback: silently reloading the host's
-    /// NGINX because the container command had an unbalanced quote is
-    /// exactly the surprise this type exists to prevent.
-    pub fn from_db(db: &crate::db::Db) -> Result<Self> {
-        let stored = |key: &str, fallback: &str| -> Result<Vec<String>> {
-            let raw = db.get_text_setting(key)?;
-            let raw = raw.as_deref().unwrap_or(fallback);
-            split_command(raw)
-                .with_context(|| format!("the setting `{key}` is not a valid command"))
-        };
-        Ok(Self {
-            test: stored(Self::TEST_KEY, Self::DEFAULT_TEST)?,
-            reload: stored(Self::RELOAD_KEY, Self::DEFAULT_RELOAD)?,
-        })
+    /// The same, from the host's settings — see [`crate::hostconf`].
+    pub fn from_host(host: &crate::hostconf::HostConf) -> Result<Self> {
+        host.commands()
     }
 }
 
@@ -3579,30 +3709,15 @@ impl NginxCommands {
 pub const DEFAULT_ROOT: &str = "/etc/nginx";
 
 /// Where to look for site configs: the flag if one was given, else the
-/// stored setting, else the stock path.
+/// host setting, else the stock path. See [`crate::hostconf::HostConf::root`].
 ///
-/// The third member of the same family as `NginxCommands` and
-/// `LogPaths`. An NGINX in a container moves three things away from their
-/// defaults — the commands that drive it, the logs it writes, and the
-/// directory its config lives in — and the first two were already stored
-/// while this one had to be repeated on `scan-sites`, `apply-blocks`,
-/// `install web`, `batch` and `tui`. Forgetting it on any one of them did
-/// not error; it scanned `/etc/nginx`, found nothing, and reported
-/// success over an empty set.
-///
-/// Flag beats setting, for the same reason it does for the log paths: a
-/// one-off run against a checkout or a staging tree must not require the
-/// stored value to be changed and put back.
-pub fn root(db: &crate::db::Db, flag: Option<&Path>) -> Result<PathBuf> {
-    if let Some(path) = flag {
-        return Ok(path.to_path_buf());
-    }
-    Ok(db
-        .get_text_setting(NginxCommands::ROOT_KEY)?
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_ROOT)))
+/// An NGINX in a container moves three things away from their defaults —
+/// the commands that drive it, the logs it writes, and the directory its
+/// config lives in — and all three are host settings now. Flag beats
+/// setting: a one-off run against a checkout or a staging tree must not
+/// require the stored value to be changed and put back.
+pub fn root(host: &crate::hostconf::HostConf, flag: Option<&Path>) -> PathBuf {
+    host.root(flag)
 }
 
 impl Default for NginxCommands {
@@ -3738,20 +3853,16 @@ mod tests {
     /// empty /etc/nginx and reported success over nothing.
     #[test]
     fn a_stored_root_is_used_when_no_flag_is_given() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::ROOT_KEY, "/srv/domaci/nginx")
-            .unwrap();
         assert_eq!(
-            root(&db, None).unwrap(),
+            root(&host_with_root("/srv/domaci/nginx"), None),
             std::path::PathBuf::from("/srv/domaci/nginx")
         );
     }
 
     #[test]
     fn nothing_stored_falls_back_to_the_stock_path() {
-        let db = crate::db::Db::open_in_memory().unwrap();
         assert_eq!(
-            root(&db, None).unwrap(),
+            root(&crate::hostconf::HostConf::default(), None),
             std::path::PathBuf::from(DEFAULT_ROOT)
         );
     }
@@ -3760,24 +3871,21 @@ mod tests {
     /// to be changed and put back -- the same precedence `LogPaths` uses.
     #[test]
     fn an_explicit_flag_beats_the_stored_root() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::ROOT_KEY, "/srv/domaci/nginx")
-            .unwrap();
         assert_eq!(
-            root(&db, Some(std::path::Path::new("/tmp/fixture"))).unwrap(),
+            root(
+                &host_with_root("/srv/domaci/nginx"),
+                Some(std::path::Path::new("/tmp/fixture"))
+            ),
             std::path::PathBuf::from("/tmp/fixture")
         );
     }
 
-    #[test]
-    fn an_empty_stored_root_reads_as_unset() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::ROOT_KEY, "   ").unwrap();
-        assert_eq!(
-            root(&db, None).unwrap(),
-            std::path::PathBuf::from(DEFAULT_ROOT),
-            "whitespace should not become a path that scans nothing"
-        );
+    /// Host settings whose NGINX root is `root`.
+    fn host_with_root(root: &str) -> crate::hostconf::HostConf {
+        crate::hostconf::HostConf {
+            nginx_root: Some(root.into()),
+            ..Default::default()
+        }
     }
 
     use super::*;
@@ -3862,11 +3970,12 @@ mod tests {
 
     #[test]
     fn nginx_commands_fall_back_per_setting() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::RELOAD_KEY, "docker exec web nginx -s reload")
-            .unwrap();
+        let host = crate::hostconf::HostConf {
+            nginx_reload_command: Some("docker exec web nginx -s reload".into()),
+            ..Default::default()
+        };
 
-        let commands = NginxCommands::from_db(&db).unwrap();
+        let commands = NginxCommands::from_host(&host).unwrap();
         assert_eq!(
             commands.reload,
             ["docker", "exec", "web", "nginx", "-s", "reload"]
@@ -3880,16 +3989,17 @@ mod tests {
 
     #[test]
     fn nginx_commands_reject_a_stored_command_that_does_not_parse() {
-        let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::TEST_KEY, r#"docker exec "web nginx -t"#)
-            .unwrap();
+        let host = crate::hostconf::HostConf {
+            nginx_test_command: Some(r#"docker exec "web nginx -t"#.into()),
+            ..Default::default()
+        };
 
         // Not a silent fallback: reloading the host's NGINX because the
         // container command had an unbalanced quote is the exact surprise
         // worth failing loudly over.
-        let err = NginxCommands::from_db(&db).unwrap_err();
+        let err = NginxCommands::from_host(&host).unwrap_err();
         assert!(
-            err.to_string().contains(NginxCommands::TEST_KEY),
+            err.to_string().contains("nginx_test_command"),
             "the error must name the setting at fault; it was: {err}"
         );
     }
@@ -6106,12 +6216,11 @@ mod tests {
     fn the_generated_http_files_land_in_the_roots_own_conf_d() {
         let dir = root_with_a_conf_d();
         let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::ROOT_KEY, dir.path().to_str().unwrap())
-            .unwrap();
         db.trust_user_agent("Nextcloud").unwrap();
         db.set_rate_limit_enabled(true).unwrap();
+        let host = host_with_root(dir.path().to_str().unwrap());
 
-        let planned: Vec<PathBuf> = planned_managed_files(&db, &root(&db, None).unwrap())
+        let planned: Vec<PathBuf> = planned_managed_files(&db, &root(&host, None))
             .unwrap()
             .into_iter()
             .map(|(path, _)| path)
@@ -6137,10 +6246,9 @@ mod tests {
     fn the_removal_half_looks_in_the_same_directory() {
         let dir = root_with_a_conf_d();
         let db = crate::db::Db::open_in_memory().unwrap();
-        db.set_text_setting(NginxCommands::ROOT_KEY, dir.path().to_str().unwrap())
-            .unwrap();
+        let host = host_with_root(dir.path().to_str().unwrap());
 
-        let unused = unused_managed_files(&db, &root(&db, None).unwrap()).unwrap();
+        let unused = unused_managed_files(&db, &root(&host, None)).unwrap();
         for name in ["stop-bots-trusted.conf", "stop-bots-limits.conf"] {
             let expected = dir.path().join("conf.d").join(name);
             assert!(
@@ -6158,11 +6266,13 @@ mod tests {
         write_planned_managed_files(&[(path.to_path_buf(), body.to_string())]).unwrap();
     }
 
-    /// What the fixed list of names cannot find: a set left in the
-    /// `conf.d` of a root the host no longer uses, where NGINX may well
-    /// still read it.
+    /// The record is a row the web console can write, and an apply runs as
+    /// root. So it is acted on only inside the directories this tree's
+    /// files go into: a set left in the `conf.d` of a root the host no
+    /// longer uses is `uninstall`'s to collect, not an apply's, because
+    /// a row naming *anywhere* is exactly what an attacker would write.
     #[test]
-    fn a_recorded_file_left_under_an_old_root_is_collected() {
+    fn a_recorded_file_outside_the_managed_directories_is_never_collected() {
         let (old, new) = (root_with_a_conf_d(), root_with_a_conf_d());
         let db = crate::db::Db::open_in_memory().unwrap();
         db.set_rate_limit_enabled(true).unwrap();
@@ -6172,12 +6282,67 @@ mod tests {
         let unused = unused_managed_files(&db, new.path()).unwrap();
 
         assert!(
-            unused.contains(&left_behind),
-            "the old root's file was not collected: {unused:#?}"
+            !unused.contains(&left_behind),
+            "a file outside this root's conf.d was collected: {unused:#?}"
         );
         assert!(
             !unused.contains(&rate_limit_conf_path(&new.path().join("conf.d"))),
             "the file the settings call for was collected: {unused:#?}"
+        );
+        assert!(
+            is_recorded_generated_file(&left_behind),
+            "uninstall, which an administrator runs, still knows it for ours"
+        );
+    }
+
+    /// Hostile rows, each written straight into `managed_files` as a
+    /// compromised console could: none of them may be deleted, even though
+    /// every target carries this project's header, so the header alone is
+    /// not what protects them.
+    #[test]
+    fn a_hostile_managed_files_row_deletes_nothing() {
+        let root = root_with_a_conf_d();
+        let conf_d = root.path().join("conf.d");
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("stop-bots-limits.conf");
+        let header = rate_limit_conf_body(10, 10);
+        fs::write(&victim, &header).unwrap();
+        let linked = conf_d.join("stop-bots-trusted.conf");
+        std::os::unix::fs::symlink(&victim, &linked).unwrap();
+        let misnamed = conf_d.join("default.conf");
+        fs::write(&misnamed, &header).unwrap();
+
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let climbing = conf_d
+            .join("..")
+            .join("..")
+            .join(outside.path().strip_prefix("/").unwrap())
+            .join("stop-bots-limits.conf");
+        for (path, kind) in [
+            (victim.clone(), ManagedKind::Limits),
+            (climbing.clone(), ManagedKind::Limits),
+            (linked.clone(), ManagedKind::Trusted),
+            (misnamed.clone(), ManagedKind::Limits),
+            (PathBuf::from("/etc/passwd"), ManagedKind::Limits),
+        ] {
+            db.record_managed_file(&path, kind.id()).unwrap();
+        }
+
+        let unused = unused_managed_files(&db, root.path()).unwrap();
+        remove_planned_managed_files(&unused).unwrap();
+
+        for path in [&victim, &climbing, &misnamed] {
+            assert!(!unused.contains(path), "{} was collected", path.display());
+        }
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            header,
+            "the target was deleted"
+        );
+        assert_eq!(fs::read_to_string(&misnamed).unwrap(), header);
+        assert!(
+            !unused.contains(&PathBuf::from("/etc/passwd")),
+            "{unused:#?}"
         );
     }
 
@@ -6204,9 +6369,9 @@ mod tests {
     /// file that reads the trust file's variable goes before it.
     #[test]
     fn recorded_files_are_removed_in_dependency_order() {
-        let (old, new) = (root_with_a_conf_d(), root_with_a_conf_d());
+        let root = root_with_a_conf_d();
         let db = crate::db::Db::open_in_memory().unwrap();
-        let conf_d = old.path().join("conf.d");
+        let conf_d = root.path().join("conf.d");
         for (path, body) in [
             (
                 trusted_conf_path(&conf_d),
@@ -6220,7 +6385,7 @@ mod tests {
             written_and_recorded(&db, &path, &body);
         }
 
-        let unused = unused_managed_files(&db, new.path()).unwrap();
+        let unused = unused_managed_files(&db, root.path()).unwrap();
 
         let at = |path: PathBuf| unused.iter().position(|p| p == &path).unwrap();
         assert!(
@@ -6302,9 +6467,8 @@ mod tests {
     /// setting existing at all.
     #[test]
     fn conf_d_falls_back_to_the_stock_path_when_no_root_is_stored() {
-        let db = crate::db::Db::open_in_memory().unwrap();
         assert_eq!(
-            conf_d_dir(&root(&db, None).unwrap()),
+            conf_d_dir(&root(&crate::hostconf::HostConf::default(), None)),
             PathBuf::from(CONF_D_DIR)
         );
     }
