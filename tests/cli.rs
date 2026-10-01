@@ -3399,10 +3399,10 @@ fn fake_debian_root() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, binary)
 }
 
-/// The whole installer, end to end, into a prefix: a unit, the two
-/// directories, a generated password, and no `systemctl` — a unit under a
-/// prefix is not a path systemd reads, and saying so beats running
-/// `daemon-reload` and implying the file took effect.
+/// The whole installer, end to end, into a prefix: the three units, the
+/// two directories, a generated password, and no `systemctl` and no
+/// `useradd` — a unit under a prefix is not a path systemd reads, nor the
+/// tree a user database, and saying so beats implying either took effect.
 #[test]
 fn install_web_writes_a_unit_and_a_password_under_a_prefix() {
     let (tmp, binary) = fake_debian_root();
@@ -3423,22 +3423,50 @@ fn install_web_writes_a_unit_and_a_password_under_a_prefix() {
     assert!(stdout.contains("Console password"), "was: {stdout}");
     assert!(stdout.contains("skipping systemctl"), "was: {stdout}");
 
-    let unit = fs::read_to_string(tmp.path().join("etc/systemd/system/stop-bots-web.service"))
-        .expect("no unit written");
-    assert!(unit.contains(&format!("ExecStart={} web", binary.display())));
-    // Directive lines only: the unit's own comments name directives to
+    assert!(
+        stdout.contains("not this host's user database"),
+        "was: {stdout}"
+    );
+
+    let unit_file = |name: &str| {
+        fs::read_to_string(tmp.path().join("etc/systemd/system").join(name))
+            .unwrap_or_else(|_| panic!("no {name} written"))
+    };
+    // Directive lines only: the units' own comments name directives to
     // explain them, so a plain substring search finds them in the prose.
-    let directives: Vec<&str> = unit
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#') && !line.is_empty())
-        .collect();
-    // Strict, with the NGINX config given back: without that line the
-    // first NGINX apply fails on a read-only /etc. Under the prefix, like
-    // every other path in the unit.
+    let directives = |unit: &str| -> Vec<String> {
+        unit.lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(String::from)
+            .collect()
+    };
+    let console = directives(&unit_file("stop-bots-web.service"));
+    let socket = tmp.path().join("run/stop-bots/helper.sock");
+    let exec = format!(
+        "ExecStart={} web --db {} --helper {}",
+        binary.display(),
+        tmp.path().join("var/lib/stop-bots/db.sqlite3").display(),
+        socket.display()
+    );
+    for line in [exec.as_str(), "User=stop-bots", "ProtectSystem=strict"] {
+        assert!(
+            console.contains(&line.to_string()),
+            "no {line}: {console:?}"
+        );
+    }
+    assert!(
+        directives(&unit_file("stop-bots-helper.socket"))
+            .contains(&format!("ListenStream={}", socket.display())),
+        "the socket listens somewhere else"
+    );
+    // The helper's: strict, with the NGINX config given back. Without that
+    // line the first NGINX apply fails on a read-only /etc. Under the
+    // prefix, like every other path in the unit.
+    let helper = directives(&unit_file("stop-bots-helper.service"));
     let nginx = format!("ReadWritePaths=-{}", tmp.path().join("etc/nginx").display());
     for line in ["ProtectSystem=strict", nginx.as_str()] {
-        assert!(directives.contains(&line), "no {line}: {directives:?}");
+        assert!(helper.contains(&line.to_string()), "no {line}: {helper:?}");
     }
     assert!(tmp.path().join("var/lib/stop-bots/db.sqlite3").exists());
     assert!(tmp.path().join("etc/stop-bots").is_dir());
@@ -3505,10 +3533,10 @@ fn install_web_stores_the_proxy_settings() {
 
 /// `install web --root` is stored, as `set-nginx-commands --root` would
 /// store it, because the service reads the root from the database — and
-/// the unit lets the service write there. It used to be accepted and
-/// then ignored.
+/// the helper's unit lets the helper, which writes NGINX config for the
+/// console, write there. It used to be accepted and then ignored.
 #[test]
-fn install_web_stores_the_nginx_root_and_lets_the_service_write_it() {
+fn install_web_stores_the_nginx_root_and_lets_the_helper_write_it() {
     let (tmp, binary) = fake_debian_root();
     stop_bots_bin()
         .args([
@@ -3529,8 +3557,11 @@ fn install_web_stores_the_nginx_root_and_lets_the_service_write_it() {
         stop_bots::nginx::root(&db, None).unwrap(),
         std::path::PathBuf::from("/srv/nginx")
     );
-    let unit =
-        fs::read_to_string(tmp.path().join("etc/systemd/system/stop-bots-web.service")).unwrap();
+    let unit = fs::read_to_string(
+        tmp.path()
+            .join("etc/systemd/system/stop-bots-helper.service"),
+    )
+    .unwrap();
     assert!(
         unit.lines()
             .any(|line| line == "ReadWritePaths=-/srv/nginx"),

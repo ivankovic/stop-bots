@@ -47,28 +47,32 @@
 //! Units from 0.0.x carry no hash. They are compared against every text
 //! those releases wrote instead — see [`legacy`].
 //!
-//! ## Why the service runs as root
+//! ## Three units, and who runs as whom
 //!
-//! Because the console rewrites `/etc/nginx`, writes the firewall script
-//! to `/etc/stop-bots`, and runs `nginx -t` and `systemctl reload nginx`.
-//! There is no unprivileged split that leaves the feature set intact —
-//! dropping privilege would mean the web UI silently losing the ability to
-//! apply anything, which is worse than saying plainly what it needs.
+//! The console is the part of stop-bots that listens on a network, so it
+//! is the part that must not be root. `install web` writes three units:
 //!
-//! What the unit can do is keep that root to the files it is for.
+//! - [`WEB_UNIT`], the console, as the `stop-bots` system user this
+//!   creates ([`crate::account`]). It can bind its port, read the logs
+//!   through the groups its unit adds, and write its own database. It has
+//!   no capability, cannot write `/etc`, cannot load firewall rules and
+//!   cannot see systemd's sockets — see [`web_unit`].
+//! - [`HELPER_SOCKET_UNIT`] and [`HELPER_UNIT`], the root helper, started
+//!   by systemd when the console first connects to its socket. It does the
+//!   handful of things that need root — write the NGINX config and the
+//!   firewall script, run `nginx -t`, the reload and `nft` — as a closed
+//!   set of operations with typed parameters. No path, command or config
+//!   text ever crosses the socket.
+//!
+//! The helper keeps the sandbox the console had while it ran as root:
 //! `ProtectSystem=strict` makes the whole tree read-only, and
-//! `ReadWritePaths=` gives back exactly what the console writes — see
+//! `ReadWritePaths=` gives back exactly what the helper writes — see
 //! [`writable_paths`]. The list has to be complete: a path missing from it
 //! is not a failed start but an apply that fails an hour later with "Read-only
 //! file system", so every entry is there because the container suite
-//! watched something fail without it.
-//!
-//! It is defence in depth, not a boundary against code running as the
-//! service: root that can reach systemd over D-Bus, which `systemctl reload
-//! nginx` needs, can ask systemd to start anything outside it, and NGINX
-//! itself runs as root on the config the console writes. What it does stop
-//! is a stray or tricked write landing in `/etc/cron.d`, a systemd unit or
-//! a binary — the persistent footholds.
+//! watched something fail without it. For root that is defence in depth,
+//! not a boundary: root can reach systemd, which `systemctl reload nginx`
+//! needs. What makes the split a boundary is the console's side of it.
 //!
 //! The firewall boot unit is sandboxed harder, because it needs less: it
 //! loads one script and has no business with systemd at all, so it gets no
@@ -92,6 +96,16 @@ pub const TEMPLATE_MARKER: &str = "# stop-bots-template: ";
 /// The unit this installs. Named for the thing it runs rather than the
 /// project, because a later `install tui`-shaped target would want its own.
 pub const WEB_UNIT: &str = "stop-bots-web.service";
+
+/// The socket the console reaches the root helper on. systemd listens on
+/// it and starts [`HELPER_UNIT`] at the first connection.
+pub const HELPER_SOCKET_UNIT: &str = "stop-bots-helper.socket";
+
+/// The root helper, socket-activated by [`HELPER_SOCKET_UNIT`].
+pub const HELPER_UNIT: &str = "stop-bots-helper.service";
+
+/// Where the helper's socket is, as the console's `--helper` names it.
+pub const HELPER_SOCKET: &str = "/run/stop-bots/helper.sock";
 
 /// The unit that re-applies the rendered firewall script at boot.
 ///
@@ -179,6 +193,18 @@ pub struct Layout {
     /// untested. Injecting it beats putting a fake on `PATH`, which is
     /// process-global and races under a threaded test runner.
     pub systemctl: PathBuf,
+    /// `useradd` and `groupadd`, injected for the same reason.
+    pub useradd: PathBuf,
+    pub groupadd: PathBuf,
+    /// The user and group the console runs as.
+    pub user: String,
+    /// The groups the console's unit adds so it can read the logs. All of
+    /// [`crate::account::LOG_GROUPS`] here; [`install_web`] keeps only the
+    /// ones the host has, because a unit naming a missing group does not
+    /// start.
+    pub log_groups: Vec<String>,
+    /// [`HELPER_SOCKET`], under the prefix.
+    pub helper_socket: PathBuf,
     /// Whether this describes the running host rather than a staging tree,
     /// i.e. whether the prefix was `/`.
     ///
@@ -216,6 +242,11 @@ impl Layout {
             systemd_marker: prefix.join("run/systemd/system"),
             debian_marker: prefix.join("etc/debian_version"),
             systemctl: PathBuf::from("systemctl"),
+            useradd: crate::host::program("useradd"),
+            groupadd: crate::host::program("groupadd"),
+            user: crate::account::USER.to_string(),
+            log_groups: crate::account::LOG_GROUPS.map(String::from).to_vec(),
+            helper_socket: prefix.join(HELPER_SOCKET.trim_start_matches('/')),
             // Derived, not a parameter: `main.rs` builds every layout —
             // prefixed or not — with `under`, so a flag a caller had to
             // remember to set would have been `false` on the one path
@@ -239,6 +270,19 @@ impl Layout {
     /// create or migrate the file.
     fn with_host_settings(&self) -> Layout {
         let mut layout = self.clone();
+        // On the host, only the groups it has: `SupplementaryGroups=`
+        // naming a missing one fails the start with 216/GROUP.
+        if self.real {
+            layout
+                .log_groups
+                .retain(|name| crate::account::group(name).is_some());
+        }
+        // PRIVSEP-HOOK(hostconf): read these two from
+        // /etc/stop-bots/host.conf once the core's `hostconf` lands; the
+        // database is the console's to write. Until then, `grantable` is
+        // what keeps a row the console chose from becoming a write grant
+        // for the root helper.
+        //
         // A stored root inside /etc/nginx is given back already, and any
         // other one only if it is `grantable`: the console writes this row.
         layout.nginx_roots.extend(
@@ -273,8 +317,9 @@ fn stored_setting_at(db_path: &Path, key: &str) -> Option<String> {
     }
     // Not READ_ONLY, for the reason `uninstall` gives: a read-only
     // connection to a WAL database creates `-wal` and `-shm` and then
-    // cannot delete them. Nor `Db::open`, which would migrate.
-    let conn = rusqlite::Connection::open_with_flags(
+    // cannot delete them. Nor `Db::open`, which would migrate. Guarded:
+    // this is root, in what is by now the console's directory.
+    let conn = crate::db::guard::open_connection(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
@@ -289,7 +334,9 @@ fn stored_setting_at(db_path: &Path, key: &str) -> Option<String> {
     .filter(|value| !value.is_empty())
 }
 
-/// Every path the web console writes, in the order the unit lists them.
+/// Every path the root helper writes, in the order its unit lists them.
+/// (Until 0.1 the console wrote them itself, as root; the list moved with
+/// the writes.)
 ///
 /// What each one is for:
 ///
@@ -305,11 +352,11 @@ fn stored_setting_at(db_path: &Path, key: &str) -> Option<String> {
 /// - `/run`, whole. `nginx -t` creates `/run/nginx.pid`, and granting just
 ///   that file does not work: a grant is a bind mount of that one inode,
 ///   NGINX deletes and recreates the file whenever it restarts, and the
-///   next `nginx -t` fails on a read-only `/run` until the console is
+///   next `nginx -t` fails on a read-only `/run` until the helper is
 ///   restarted too. `/run` is also where the apply lock is
 ///   ([`crate::applylock`]) and where legacy `iptables` takes
 ///   `xtables.lock`. It is a tmpfs, so nothing written there outlives a
-///   boot, and what it could otherwise offer is systemd, which the console
+///   boot, and what it could otherwise offer is systemd, which the helper
 ///   reaches over D-Bus regardless.
 ///
 /// Every one is optional (`-`): a missing path is skipped instead of
@@ -572,10 +619,61 @@ fn hidden_binary_error(binary: &Path, directive: &str) -> String {
     )
 }
 
-/// The unit file's exact contents.
+/// The header every unit `install web` writes opens with.
+fn web_header(generated_by: &str) -> String {
+    format!(
+        "# {generated_by}, with `stop-bots install web`.\n\
+         #\n\
+         # Re-running that command replaces this file for as long as it is\n\
+         # unedited: the stop-bots-template line is a hash of everything else\n\
+         # here, and is how it tells. An edited copy is left alone, and the\n\
+         # installer says so; `--force` replaces it anyway.\n"
+    )
+}
+
+/// The resource limits both the console and the helper run under.
+const YIELD_TO_THE_HOST: &str = "\
+# stop-bots is here to protect the sites on this host, so it must never be\n\
+# what starves them: a detector pass or a firewall render on a busy host\n\
+# holds tens of megabytes, on a machine that may have 1 GB in all. Lower\n\
+# CPU and I/O priority than NGINX, so that work waits for a quiet moment\n\
+# rather than competing.\n\
+Nice=10\n\
+IOSchedulingClass=idle\n\
+# MemoryHigh throttles and reclaims; it never kills. Past it the service\n\
+# slows down, which background work can afford. MemoryMax is only the\n\
+# backstop for a runaway: at that point the kernel stops this service\n\
+# rather than choosing a victim host-wide. Percentages are of physical\n\
+# RAM: 256 MB and 512 MB on a 1 GB VPS, and more on a machine that has it.\n\
+MemoryHigh=25%\n\
+MemoryMax=50%\n\
+# A descriptor per connection: the default soft limit of 1024 ran out at\n\
+# about 1,100 held connections. TasksMax bounds threads and child\n\
+# processes together, well above the 512 blocking threads tokio may use.\n\
+LimitNOFILE=16384\n\
+TasksMax=1024\n";
+
+/// The console's unit: the web console, as the `stop-bots` user, with
+/// nothing of root's.
 ///
 /// Pure, and takes every path it names — so the golden test locks the
 /// bytes an operator will actually get rather than a rendering of them.
+///
+/// What it can do is what a logged-in operator can do: everything else
+/// it asks of the helper over [`Layout::helper_socket`], and the helper
+/// treats what it is asked, and the database, as hostile. What it cannot
+/// do is the point of the unit, and the container suite checks each one
+/// under real systemd:
+///
+/// - write anywhere but its database (`ProtectSystem=strict`, and one
+///   `ReadWritePaths=`), and it could not anyway: it is not root;
+/// - hold or gain a capability (`CapabilityBoundingSet=` empty,
+///   `NoNewPrivileges=`);
+/// - load firewall rules (no `AF_NETLINK`, no `CAP_NET_ADMIN`);
+/// - ask systemd for anything: polkit refuses an unprivileged caller, and
+///   `InaccessiblePaths=` hides the D-Bus and systemd sockets as well;
+/// - map memory writable and executable, or make a system call outside
+///   `@system-service`.
 pub fn web_unit(layout: &Layout) -> String {
     let mut exec = format!(
         "{} web --db {}",
@@ -589,34 +687,32 @@ pub fn web_unit(layout: &Layout) -> String {
     if let Some(path) = &layout.ssh_log {
         exec.push_str(&format!(" --ssh-log {}", systemd_arg(path)));
     }
-    exec.push('\n');
-
-    let writable: String = writable_paths(layout)
-        .iter()
-        .map(|path| format!("ReadWritePaths={}\n", read_write_path(path)))
-        .collect();
+    exec.push_str(&format!(
+        " --helper {}\n",
+        systemd_arg(&layout.helper_socket)
+    ));
+    let groups = match layout.log_groups.as_slice() {
+        [] => String::new(),
+        groups => format!("SupplementaryGroups={}\n", groups.join(" ")),
+    };
 
     seal(&format!(
-        "# {generated_by}, with `stop-bots install web`.\n\
-         #\n\
-         # Re-running that command replaces this file for as long as it is\n\
-         # unedited: the stop-bots-template line is a hash of everything else\n\
-         # here, and is how it tells. An edited copy is left alone, and the\n\
-         # installer says so; `--force` replaces it anyway.\n\
+        "{header}\
          #\n\
          # Settings deliberately absent from ExecStart: the bind address, the host\n\
-         # allowlist, the path prefix, whether exposure is permitted, and the NGINX\n\
-         # config root all live in the `settings` table, because the running server\n\
-         # re-reads them. Adding a flag for one here gives it two sources of truth\n\
-         # and the database wins on the next restart. Change them with\n\
-         # `stop-bots set-web ...` and `stop-bots set-nginx-commands --root ...`.\n\
+         # allowlist, the path prefix and whether exposure is permitted live in the\n\
+         # `settings` table, because the running server re-reads them. Adding a flag\n\
+         # for one here gives it two sources of truth and the database wins on the\n\
+         # next restart. Change them with `stop-bots set-web ...`.\n\
          [Unit]\n\
          Description=stop-bots web console\n\
          Documentation=https://github.com/ivankovic/stop-bots\n\
-         # Wants rather than Requires: the console is most worth looking at when\n\
-         # NGINX is down, so it must not be stopped along with it.\n\
-         After=network-online.target nginx.service\n\
+         # Wants rather than Requires for NGINX: the console is most worth looking\n\
+         # at when NGINX is down, so it must not be stopped along with it. Requires\n\
+         # for the helper's socket: without it the console can show, not apply.\n\
+         After=network-online.target nginx.service {HELPER_SOCKET_UNIT}\n\
          Wants=network-online.target\n\
+         Requires={HELPER_SOCKET_UNIT}\n\
          \n\
          [Service]\n\
          Type=exec\n\
@@ -624,16 +720,134 @@ pub fn web_unit(layout: &Layout) -> String {
          Restart=on-failure\n\
          RestartSec=5s\n\
          \n\
-         # Runs as root, and has to: it rewrites this host's NGINX config, writes\n\
-         # the firewall script, and runs `nginx -t` and `systemctl reload nginx`.\n\
-         # The directives below keep that root to those files. ProtectSystem=strict\n\
-         # makes everything read-only, and ReadWritePaths= gives back what the\n\
-         # console writes: its database, /etc/stop-bots, the NGINX config, the\n\
-         # NGINX logs (`nginx -t` opens them for writing), and /run (`nginx -t`\n\
+         # Not root. Everything that needs root -- writing the NGINX config and\n\
+         # the firewall script, `nginx -t`, the reload, nft -- the console asks of\n\
+         # {HELPER_UNIT} over the socket above, which takes a fixed set of\n\
+         # operations and no paths, commands or config text. Code running as this\n\
+         # service runs as {user}, not as root.\n\
+         User={user}\n\
+         Group={user}\n\
+         # The logs the detectors read: /var/log/nginx and auth.log belong to adm,\n\
+         # the journal to systemd-journal. Here rather than in /etc/group, so the\n\
+         # membership holds for this service and nothing else running as {user}.\n\
+         {groups}\
+         \n\
+         # It writes its database and nothing else, holds no capability and can\n\
+         # gain none, cannot reach netlink to change the firewall, and cannot see\n\
+         # the sockets it would ask systemd anything over -- polkit refuses an\n\
+         # unprivileged caller anyway; hiding them is defence in depth.\n\
+         NoNewPrivileges=yes\n\
+         PrivateTmp=yes\n\
+         ProtectSystem=strict\n\
+         ReadWritePaths={state}\n\
+         ProtectHome=yes\n\
+         PrivateDevices=yes\n\
+         ProtectClock=yes\n\
+         ProtectHostname=yes\n\
+         ProtectKernelTunables=yes\n\
+         ProtectKernelModules=yes\n\
+         ProtectKernelLogs=yes\n\
+         ProtectControlGroups=yes\n\
+         RestrictSUIDSGID=yes\n\
+         RestrictRealtime=yes\n\
+         RestrictNamespaces=yes\n\
+         LockPersonality=yes\n\
+         MemoryDenyWriteExecute=yes\n\
+         SystemCallArchitectures=native\n\
+         SystemCallFilter=@system-service\n\
+         SystemCallErrorNumber=EPERM\n\
+         CapabilityBoundingSet=\n\
+         # AF_UNIX for the helper's socket and journalctl, AF_INET/AF_INET6 for the\n\
+         # console itself and the list downloads.\n\
+         RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n\
+         InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private\n\
+         # The database holds the console's password hash.\n\
+         UMask=0077\n\
+         \n\
+         {yield_to_the_host}\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        header = web_header(&crate::generated::generated_by()),
+        user = layout.user,
+        state = read_write_path(&layout.state_dir),
+        yield_to_the_host = YIELD_TO_THE_HOST,
+    ))
+}
+
+/// The socket the console reaches the helper on.
+///
+/// Root's, in the console's group, `0660`: the console can connect and
+/// nobody else on the host can. The helper checks each peer's uid as well
+/// (`SO_PEERCRED`), so a mode loosened by hand still lets no one else in.
+/// One listening socket handed to one long-running helper (`Accept=no`).
+pub fn helper_socket_unit(layout: &Layout) -> String {
+    seal(&format!(
+        "{header}\
+         [Unit]\n\
+         Description=stop-bots root helper socket\n\
+         Documentation=https://github.com/ivankovic/stop-bots\n\
+         \n\
+         [Socket]\n\
+         ListenStream={socket}\n\
+         SocketUser=root\n\
+         SocketGroup={user}\n\
+         SocketMode=0660\n\
+         DirectoryMode=0755\n\
+         Accept=no\n\
+         \n\
+         [Install]\n\
+         WantedBy=sockets.target\n",
+        header = web_header(&crate::generated::generated_by()),
+        // A socket path takes the rest of the line, unquoted; it does
+        // expand specifiers.
+        socket = layout
+            .helper_socket
+            .display()
+            .to_string()
+            .replace('%', "%%"),
+        user = layout.user,
+    ))
+}
+
+/// The root helper, started by [`helper_socket_unit`] when the console
+/// first connects.
+///
+/// The sandbox the console had while it ran as root, because it now does
+/// what the console did then: `ProtectSystem=strict` with the paths it
+/// writes given back ([`writable_paths`]), and the capabilities applying
+/// takes. It binds nothing, so not `CAP_NET_BIND_SERVICE`, and talks to
+/// no network, so `AF_UNIX` (the console, D-Bus for the NGINX reload, a
+/// Docker socket for `docker exec`) and `AF_NETLINK` (nft) only. No
+/// `[Install]`: the socket is what is enabled.
+pub fn helper_unit(layout: &Layout) -> String {
+    let writable: String = writable_paths(layout)
+        .iter()
+        .map(|path| format!("ReadWritePaths={}\n", read_write_path(path)))
+        .collect();
+    seal(&format!(
+        "{header}\
+         [Unit]\n\
+         Description=stop-bots root helper\n\
+         Documentation=https://github.com/ivankovic/stop-bots\n\
+         Requires={HELPER_SOCKET_UNIT}\n\
+         After={HELPER_SOCKET_UNIT}\n\
+         \n\
+         [Service]\n\
+         Type=exec\n\
+         ExecStart={binary} helper --db {db}\n\
+         \n\
+         # Root, and has to be: it rewrites this host's NGINX config, writes the\n\
+         # firewall script, and runs `nginx -t`, the reload and nft. It takes\n\
+         # requests only from root and the console's user, and only a fixed set\n\
+         # of operations, none of which carries a path, a command or config\n\
+         # text. ProtectSystem=strict and ReadWritePaths= keep it to the files\n\
+         # it writes: the database, /etc/stop-bots, the NGINX config, the NGINX\n\
+         # logs (`nginx -t` opens them for writing), and /run (`nginx -t`\n\
          # creates /run/nginx.pid, which NGINX replaces whenever it restarts, so\n\
          # granting that one file stops working after the next restart). Cron,\n\
          # the systemd units and every binary stay out of reach. `-`: a missing\n\
-         # path is skipped, rather than keeping the console from starting.\n\
+         # path is skipped, rather than keeping the helper from starting.\n\
          NoNewPrivileges=yes\n\
          PrivateTmp=yes\n\
          ProtectSystem=strict\n\
@@ -654,57 +868,27 @@ pub fn web_unit(layout: &Layout) -> String {
          SystemCallArchitectures=native\n\
          # CAP_NET_ADMIN and CAP_NET_RAW to load the firewall. CAP_DAC_OVERRIDE\n\
          # because the logs it reads and `nginx -t` opens belong to www-data and\n\
-         # adm, not root. CAP_CHOWN and CAP_FOWNER because a site file keeps its\n\
-         # owner and mode when it is rewritten. CAP_NET_BIND_SERVICE for a console\n\
-         # bound below port 1024. Nothing else, and above all not CAP_SYS_ADMIN,\n\
-         # with which root can remount what ProtectSystem made read-only.\n\
-         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_NET_BIND_SERVICE\n\
-         # AF_UNIX for the dbus socket `systemctl reload nginx` talks over,\n\
-         # AF_INET/AF_INET6 for the console itself and the list downloads,\n\
-         # and AF_NETLINK because the console applies the firewall script:\n\
-         # both `nft` and Debian's nft-backed `iptables` talk to the kernel\n\
-         # over netlink. Without it the apply fails with\n\
-         # \"Unable to initialize Netlink socket: Address family not\n\
-         # supported by protocol\", which names neither this file nor the\n\
-         # reason. This line said the opposite until applying arrived; a\n\
-         # comment asserting what a service does not need is a comment that\n\
-         # goes stale the moment it starts needing it.\n\
-         RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n\
-         # The database holds the console's password hash.\n\
+         # adm, and the database to the console's user. CAP_CHOWN and CAP_FOWNER\n\
+         # because a site file keeps its owner and mode when it is rewritten, and\n\
+         # because SQLite gives a -wal it creates to the database's owner. Nothing\n\
+         # else, and above all not CAP_SYS_ADMIN, with which root can remount what\n\
+         # ProtectSystem made read-only.\n\
+         CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER\n\
+         # AF_UNIX for the console's requests, the D-Bus socket `systemctl reload\n\
+         # nginx` talks over and a Docker socket for `docker exec`; AF_NETLINK\n\
+         # because both `nft` and Debian's nft-backed `iptables` reach the kernel\n\
+         # over netlink. It downloads nothing, so no AF_INET.\n\
+         RestrictAddressFamilies=AF_UNIX AF_NETLINK\n\
          UMask=0077\n\
          \n\
-         # The console is here to protect the sites on this host, so it must\n\
-         # never be what starves them. A detector pass reads the whole access\n\
-         # log, which on a busy host is tens of megabytes held twice over, on a\n\
-         # machine that may have 1 GB in all. Lower CPU and I/O priority than\n\
-         # NGINX, so a pass waits for a quiet moment rather than competing.\n\
-         Nice=10\n\
-         IOSchedulingClass=idle\n\
-         # MemoryHigh throttles and reclaims; it never kills. Past it the\n\
-         # console slows down, which a background pass can afford. MemoryMax\n\
-         # is only the backstop for a runaway: at that point the kernel stops\n\
-         # this service rather than choosing a victim host-wide, and\n\
-         # Restart=on-failure brings it back. Percentages are of physical RAM:\n\
-         # 256 MB and 512 MB on a 1 GB VPS, and more on a machine that has it.\n\
-         MemoryHigh=25%\n\
-         MemoryMax=50%\n\
-         # A descriptor per connection: the default soft limit of 1024 ran out\n\
-         # at about 1,100 held connections. TasksMax bounds threads and child\n\
-         # processes together, well above the 512 blocking threads tokio may use.\n\
-         LimitNOFILE=16384\n\
-         TasksMax=1024\n\
-         \n\
-         # What this does not stop: root that can reach systemd over D-Bus, as\n\
-         # `systemctl reload nginx` must, can have systemd run anything outside\n\
-         # this sandbox, and NGINX runs as root on the config written here. It\n\
-         # turns a stray or tricked write into nothing; it is not a boundary\n\
-         # against code running as this service. Also absent on purpose: User=,\n\
-         # see above, and SystemCallFilter=, because the NGINX commands this runs\n\
-         # are the operator's (`docker exec ...`) and untested under a filter.\n\
-         \n\
-         [Install]\n\
-         WantedBy=multi-user.target\n",
-        generated_by = crate::generated::generated_by(),
+         {yield_to_the_host}\
+         # Also absent on purpose: SystemCallFilter=, because the NGINX commands\n\
+         # this runs are the operator's (`docker exec ...`) and untested under a\n\
+         # filter.\n",
+        header = web_header(&crate::generated::generated_by()),
+        binary = systemd_arg(&layout.binary),
+        db = systemd_arg(&layout.db_path),
+        yield_to_the_host = YIELD_TO_THE_HOST,
     ))
 }
 
@@ -1146,33 +1330,64 @@ pub fn install_firewall(layout: &Layout, options: &Options) -> Result<Steps> {
     Ok(steps)
 }
 
-/// Writes the unit and the directories it depends on.
+/// One unit `install web` writes: where, what, and what is there now.
+struct PlannedUnit {
+    path: PathBuf,
+    text: String,
+    state: Existing,
+}
+
+/// Writes the three units, the console's user, and the directories they
+/// depend on.
 ///
 /// Does not run `systemctl` — that is [`activate`], kept separate so the
 /// filesystem half is testable without a service manager and so a
 /// `--dry-run` can describe both without a special case in either.
+///
+/// The order is what keeps the console's directory the console's from the
+/// first moment: the user exists before the state directory is given to
+/// it, and the directory is given to it before the installer writes the
+/// database there — so a database root creates is the console's from the
+/// start (see [`crate::db::guard`]), and [`secure_database`] only has to
+/// hand over what an earlier, root-run release left.
 pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
     preflight(layout, options)?;
 
-    // The unit has to let the service write wherever the database says the
+    // The helper's unit has to let it write wherever the database says the
     // NGINX config and its logs are, not only the stock paths.
-    let unit = web_unit(&layout.with_host_settings());
-    let unit_path = layout.unit_path();
-    let existing = std::fs::read_to_string(&unit_path).ok();
+    let host = layout.with_host_settings();
+    let retry = format!("{} install web", layout.binary.display());
 
     // Refusing beats overwriting: a unit somebody has edited is a
     // decision. An unedited one, from this version or any earlier one, is
     // replaced; byte-identical is a no-op, which is what makes re-running
-    // `install web` safe. Decided before anything is written.
-    let state = classify(existing.as_deref(), &unit, |text| {
-        legacy::web_unit(text).map(|unit| unit.releases)
-    });
-    let retry = format!("{} install web", layout.binary.display());
-    let unit_step = plan_unit(&state, &unit_path, options.force, &retry)?;
+    // `install web` safe. Decided for all three before anything is written.
+    let mut units = Vec::new();
+    let mut unit_steps = Steps::new();
+    for (name, text) in [
+        (WEB_UNIT, web_unit(&host)),
+        (HELPER_SOCKET_UNIT, helper_socket_unit(&host)),
+        (HELPER_UNIT, helper_unit(&host)),
+    ] {
+        let path = layout.unit_dir.join(name);
+        let existing = std::fs::read_to_string(&path).ok();
+        let state = classify(existing.as_deref(), &text, |text| {
+            // Only the console's unit predates the template hash.
+            (name == WEB_UNIT)
+                .then(|| legacy::web_unit(text).map(|unit| unit.releases))
+                .flatten()
+        });
+        unit_steps.push(plan_unit(&state, &path, options.force, &retry)?);
+        units.push(PlannedUnit { path, text, state });
+    }
 
     let mut steps = Steps::new();
+    let account = ensure_service_account(layout, options, &mut steps)?;
 
-    for (dir, mode) in [(&layout.state_dir, 0o700), (&layout.output_dir, 0o755)] {
+    for (dir, mode, owned) in [
+        (&layout.state_dir, 0o700, true),
+        (&layout.output_dir, 0o755, false),
+    ] {
         if dir.is_dir() {
             steps.push(format!("{} already exists", dir.display()));
         } else {
@@ -1182,49 +1397,249 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
                     .with_context(|| format!("creating {}", dir.display()))?;
             }
         }
+        if owned {
+            steps.push(format!(
+                "give {} to {user}:{user}, mode {mode:04o}",
+                dir.display(),
+                user = layout.user
+            ));
+        }
         // Set unconditionally, not only on create: 0700 on the state
         // directory is what keeps the password hash off a shared host, and
         // a directory that predates this (from a `stop-bots` run as root)
         // will be 0755.
         if !options.dry_run {
-            set_mode(dir, mode)?;
+            match account.filter(|_| owned) {
+                Some(account) => hand_over(dir, account, mode)?,
+                None => set_mode(dir, mode)?,
+            }
         }
     }
 
-    steps.push(unit_step);
-    if !options.dry_run && state != Existing::Current {
-        std::fs::write(&unit_path, &unit)
-            .with_context(|| format!("writing {}", unit_path.display()))?;
+    for (unit, step) in units.iter().zip(unit_steps) {
+        steps.push(step);
+        if !options.dry_run && unit.state != Existing::Current {
+            std::fs::write(&unit.path, &unit.text)
+                .with_context(|| format!("writing {}", unit.path.display()))?;
+        }
     }
 
     Ok(steps)
 }
 
-/// Tightens the database file itself to 0600.
+/// The console's user and group, created if this host has neither, or
+/// `None` where there is none to have: under `--prefix`, whose tree is not
+/// this host's user database, and in a dry run that would have created
+/// them.
+///
+/// `useradd --system`, from Debian's `passwd`, which every Debian and
+/// Ubuntu has, rather than a `sysusers.d` file: that would be one more
+/// file to own and remove, for a user `uninstall --purge` has to remove
+/// with `userdel` either way. Its group comes with it; a group of that
+/// name already there is used rather than refused.
+///
+/// An existing user is used as it is, unless it is root's uid or gid:
+/// then the console would be root after all, and this refuses.
+fn ensure_service_account(
+    layout: &Layout,
+    options: &Options,
+    steps: &mut Steps,
+) -> Result<Option<crate::account::Account>> {
+    let name = layout.user.as_str();
+    if !layout.real {
+        steps.push(format!(
+            "skipping the {name} user: {} is not this host's user database",
+            layout.unit_dir.display()
+        ));
+        return Ok(None);
+    }
+    let lookup = || {
+        crate::account::user(name)
+            .zip(crate::account::group(name))
+            .map(|(user, gid)| crate::account::Account { uid: user.uid, gid })
+    };
+    if lookup().is_none() {
+        let mut commands: Vec<(&Path, Vec<String>)> = Vec::new();
+        if crate::account::group(name).is_none() && crate::account::user(name).is_some() {
+            commands.push((&layout.groupadd, vec!["--system".into(), name.into()]));
+        }
+        if crate::account::user(name).is_none() {
+            let group = if crate::account::group(name).is_some() {
+                vec!["--gid".to_string(), name.to_string()]
+            } else {
+                vec!["--user-group".to_string()]
+            };
+            let mut args = vec!["--system".to_string()];
+            args.extend(group);
+            args.extend([
+                "--no-create-home".to_string(),
+                "--home-dir".to_string(),
+                layout.state_dir.display().to_string(),
+                "--shell".to_string(),
+                "/usr/sbin/nologin".to_string(),
+                "--comment".to_string(),
+                "stop-bots web console".to_string(),
+                name.to_string(),
+            ]);
+            commands.push((&layout.useradd, args));
+        }
+        for (program, args) in commands {
+            steps.push(format!("{} {}", name_of(program), args.join(" ")));
+            if !options.dry_run {
+                run_checked(program, &args)?;
+            }
+        }
+        if options.dry_run {
+            return Ok(None);
+        }
+    } else {
+        steps.push(format!("the {name} user already exists"));
+    }
+    let account = lookup().with_context(|| {
+        format!("created the {name} user and group, and the system still does not know them")
+    })?;
+    if account.uid == 0 || account.gid == 0 {
+        anyhow::bail!(
+            "the {name} user has uid {} and gid {}: the console would run as root after \
+             all. Give it a system uid and group of its own, or remove it and run this \
+             again to have one created.",
+            account.uid,
+            account.gid
+        );
+    }
+    Ok(Some(account))
+}
+
+/// The console's user and group as the host knows them, or `None` under
+/// `--prefix` or before [`install_web`] has created them.
+pub fn service_account(layout: &Layout) -> Option<crate::account::Account> {
+    if !layout.real {
+        return None;
+    }
+    let user = crate::account::user(&layout.user)?;
+    let gid = crate::account::group(&layout.user)?;
+    Some(crate::account::Account { uid: user.uid, gid })
+}
+
+/// The name a program is known by, for a step.
+fn name_of(program: &Path) -> String {
+    program
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.display().to_string())
+}
+
+/// Runs `program` with `args`, never through a shell, and fails with its
+/// stderr if it does.
+fn run_checked(program: &Path, args: &[String]) -> Result<()> {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("failed to run `{}`", program.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`{} {}` exited with {}: {}",
+            program.display(),
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Gives `path` to `account` with `mode`, through a descriptor opened
+/// without following a link.
+///
+/// The console's directory is the console's to fill, so by the second
+/// `install web` every name in it is one a compromised console could have
+/// chosen: `chown` by path on a `db.sqlite3-wal` linked to `/etc/shadow`
+/// hands `/etc/shadow` to the console. A link, a second name (a hard link
+/// to someone else's file) or anything but a plain file or directory is
+/// refused, and named.
+fn hand_over(path: &Path, account: crate::account::Account, mode: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let file = crate::db::guard::open_nofollow(path)
+        .with_context(|| {
+            format!(
+                "refusing to hand {} to the console's user: it could not be opened without \
+                 following a link",
+                path.display()
+            )
+        })?
+        .with_context(|| format!("{} is not there", path.display()))?;
+    let meta = file.metadata()?;
+    if !(meta.is_dir() || (meta.is_file() && meta.nlink() == 1)) {
+        anyhow::bail!(
+            "refusing to hand {} to the console's user: it is not a plain file or directory",
+            path.display()
+        );
+    }
+    std::os::unix::fs::fchown(&file, Some(account.uid), Some(account.gid))
+        .with_context(|| format!("giving {} to uid {}", path.display(), account.uid))?;
+    crate::db::guard::fchmod(&file, mode)
+        .with_context(|| format!("setting mode {mode:04o} on {}", path.display()))
+}
+
+/// Makes the database the console's, and private: its owner the console's
+/// user under `account`, its mode 0600 either way. With it its `-wal`,
+/// `-shm` and `-journal`, and every copy an upgrade kept (`.bak-v*`).
 ///
 /// The state *directory* is already 0700, which is what actually keeps the
 /// console's password hash off a shared host — but the file inside it is
 /// created by whichever process got there first, under that process's
-/// umask, and so is usually 0644. The unit's `UMask=0077` does not help:
-/// it applies to files the *service* creates, and this one is created by
-/// the installer. A mode travels with a file through a backup or a `cp`
-/// in a way the directory it used to live in does not.
+/// umask, and so is usually 0644. A mode travels with a file through a
+/// backup or a `cp` in a way the directory it used to live in does not.
+/// The `-wal` holds recently committed rows, the password hash included,
+/// until they are checkpointed into the main file.
 ///
-/// Its `-wal` and `-shm` too, when they are there: the database runs in
-/// WAL mode, and the `-wal` holds recently committed rows, the password
-/// hash included, until they are checkpointed into the main file.
-///
-/// Called after the database has been written, because it has to exist.
-pub fn secure_database(path: &Path) -> Result<()> {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut file = path.as_os_str().to_owned();
-        file.push(suffix);
-        let file = PathBuf::from(file);
-        if file.exists() {
-            set_mode(&file, 0o600)?;
+/// The owner is what an upgrade from 0.1.0-rc.2 needs: there everything
+/// here was root's, and a console running as its own user could open none
+/// of it. Every change goes through [`hand_over`], for the reason it
+/// gives. Called after the installer's own writes, because the database
+/// has to exist.
+pub fn secure_database(path: &Path, account: Option<crate::account::Account>) -> Result<()> {
+    for file in database_files(path) {
+        match account {
+            Some(account) => hand_over(&file, account, 0o600)?,
+            None => {
+                // Under `--prefix`, where there is no user to give it to,
+                // still never through a link.
+                if let Some(open) = crate::db::guard::open_nofollow(&file)
+                    .with_context(|| format!("opening {}", file.display()))?
+                {
+                    crate::db::guard::fchmod(&open, 0o600)
+                        .with_context(|| format!("setting mode 0600 on {}", file.display()))?;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// The database at `path`, its SQLite companions and the copies upgrades
+/// kept beside it, as far as they exist.
+fn database_files(path: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = crate::db::guard::with_companions(path)
+        .into_iter()
+        .filter(|file| std::fs::symlink_metadata(file).is_ok())
+        .collect();
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return files;
+    };
+    let mut prefix = name.to_os_string();
+    prefix.push(".bak-v");
+    let prefix = prefix.to_string_lossy().into_owned();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut copies: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .map(|entry| entry.path())
+            .collect();
+        copies.sort();
+        files.extend(copies);
+    }
+    files
 }
 
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
@@ -1233,31 +1648,39 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("setting mode {mode:04o} on {}", path.display()))
 }
 
-/// Tells systemd about the unit, and optionally starts it.
+/// Tells systemd about the units, and optionally starts them.
+///
+/// The helper's socket is enabled and started; the helper itself is not,
+/// because systemd starts it at the console's first request. A helper
+/// already running is restarted (`try-restart`), so it runs the binary
+/// and unit just installed. The console is *restarted*, not merely
+/// started: on an upgrade the old console is running, and `enable --now`
+/// would leave it running — as root, if the old one was 0.1.0-rc.2's.
 ///
 /// `systemctl` is run directly rather than through a shell, the same rule
 /// [`crate::nginx`] follows for its configurable commands: nothing here is
 /// operator-supplied, but the habit is what keeps it that way.
 pub fn activate(layout: &Layout, options: &Options) -> Result<Steps> {
     let mut steps = Steps::new();
-
-    steps.push("systemctl daemon-reload".to_string());
-    if !options.dry_run {
-        systemctl(layout, &["daemon-reload"])?;
-    }
-
-    // `enable` without `--now` leaves the unit set to start at the next
+    let mut calls: Vec<&[&str]> = vec![&["daemon-reload"]];
+    // `enable` without starting leaves the units set to start at the next
     // boot but not running, which is what --no-start is for.
-    let action: &[&str] = if options.start {
-        &["enable", "--now", WEB_UNIT]
+    if options.start {
+        calls.extend([
+            &["enable", "--now", HELPER_SOCKET_UNIT][..],
+            &["try-restart", HELPER_UNIT],
+            &["enable", WEB_UNIT],
+            &["restart", WEB_UNIT],
+        ]);
     } else {
-        &["enable", WEB_UNIT]
-    };
-    steps.push(format!("systemctl {}", action.join(" ")));
-    if !options.dry_run {
-        systemctl(layout, action)?;
+        calls.extend([&["enable", HELPER_SOCKET_UNIT][..], &["enable", WEB_UNIT]]);
     }
-
+    for args in calls {
+        steps.push(format!("systemctl {}", args.join(" ")));
+        if !options.dry_run {
+            systemctl(layout, args)?;
+        }
+    }
     Ok(steps)
 }
 
@@ -1274,19 +1697,30 @@ fn systemctl(layout: &Layout, args: &[&str]) -> Result<()> {
         })?;
     if !output.status.success() {
         // `enable --now` is two operations, and the first one sticks even
-        // when the second fails: the unit ends up enabled, failing, and
-        // enabled again at the next boot. Systemd's own start limit stops
-        // the restart loop after a few tries, so this is untidy rather
-        // than dangerous — but an operator reading this needs to be told
-        // the state they are now in, and the one command that undoes it.
-        let cleanup = if args.contains(&"enable") {
+        // when the second fails, as does an `enable` before a failed
+        // `restart`: the unit ends up enabled, failing, and enabled again
+        // at the next boot. Systemd's own start limit stops the restart
+        // loop after a few tries, so this is untidy rather than dangerous —
+        // but an operator reading this needs to be told the state they are
+        // now in, and the one command that undoes it.
+        let units: Vec<&str> = if args.contains(&"enable") || args.contains(&"restart") {
+            match args.iter().find(|arg| arg.starts_with("stop-bots-")) {
+                Some(&FIREWALL_UNIT) => vec![FIREWALL_UNIT],
+                Some(_) => vec![WEB_UNIT, HELPER_SOCKET_UNIT],
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let cleanup = if units.is_empty() {
+            String::new()
+        } else {
             format!(
                 "\n\nThe unit was written and enabled before this failed, so it will \
                  try again at the next boot. To undo that:\n\n    \
-                 systemctl disable --now {WEB_UNIT}"
+                 systemctl disable --now {}",
+                units.join(" ")
             )
-        } else {
-            String::new()
         };
         anyhow::bail!(
             "`systemctl {}` exited with {}: {}{}",
@@ -1338,22 +1772,32 @@ mod tests {
         crate::golden::assert_golden("stop-bots-web.service", &web_unit(&system_layout()));
     }
 
-    /// Under WAL the `-wal` holds rows not yet checkpointed, the password
-    /// hash among them, so it is tightened with the database.
     #[test]
-    fn securing_the_database_covers_its_wal_companions() {
+    fn the_generated_helper_units_are_what_they_were() {
+        crate::golden::assert_golden(
+            "stop-bots-helper.socket",
+            &helper_socket_unit(&system_layout()),
+        );
+        crate::golden::assert_golden("stop-bots-helper.service", &helper_unit(&system_layout()));
+    }
+
+    /// Under WAL the `-wal` holds rows not yet checkpointed, the password
+    /// hash among them, so it is tightened with the database — and so is
+    /// a copy an upgrade kept, which holds everything the database did.
+    #[test]
+    fn securing_the_database_covers_its_wal_companions_and_copies() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("db.sqlite3");
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".bak-v5"] {
             let file = dir.path().join(format!("db.sqlite3{suffix}"));
             std::fs::write(&file, "").unwrap();
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
 
-        secure_database(&db).unwrap();
+        secure_database(&db, None).unwrap();
 
-        for suffix in ["", "-wal", "-shm"] {
+        for suffix in ["", "-wal", "-shm", ".bak-v5"] {
             let file = dir.path().join(format!("db.sqlite3{suffix}"));
             let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "db.sqlite3{suffix} was left {mode:04o}");
@@ -1410,6 +1854,7 @@ mod tests {
             &layout.nginx_dir,
             &layout.nginx_log_dir,
             &layout.run_dir,
+            &layout.helper_socket,
             &layout.systemd_marker,
             &layout.debian_marker,
         ] {
@@ -1491,6 +1936,12 @@ mod tests {
             !layout.output_dir.exists(),
             "the dry run made the output directory"
         );
+        for unit in [HELPER_SOCKET_UNIT, HELPER_UNIT] {
+            assert!(
+                !layout.unit_dir.join(unit).exists(),
+                "the dry run wrote {unit}"
+            );
+        }
     }
 
     #[test]
@@ -1504,6 +1955,14 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(layout.unit_path()).unwrap(),
             web_unit(&layout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.unit_dir.join(HELPER_SOCKET_UNIT)).unwrap(),
+            helper_socket_unit(&layout)
+        );
+        assert_eq!(
+            std::fs::read_to_string(layout.unit_dir.join(HELPER_UNIT)).unwrap(),
+            helper_unit(&layout)
         );
         // 0700 because this directory holds the database, and the database
         // holds the console's password hash.
@@ -1559,8 +2018,12 @@ mod tests {
     /// The exact calls, in order. An argument-order slip or a typo in the
     /// unit name is invisible to every other test here, because they all
     /// go through `--prefix`, which skips systemctl entirely.
+    ///
+    /// The console is restarted rather than started: on an upgrade the old
+    /// one is running, as root if it was 0.1.0-rc.2's, and `enable --now`
+    /// would leave it so.
     #[test]
-    fn activating_reloads_systemd_then_enables_and_starts_the_unit() {
+    fn activating_reloads_systemd_then_starts_the_socket_and_restarts_the_console() {
         let dir = tempfile::tempdir().unwrap();
         let mut layout = staged(dir.path());
         let (script, log) = recording_systemctl(dir.path());
@@ -1577,7 +2040,12 @@ mod tests {
 
         let calls = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
-            calls, "daemon-reload\nenable --now stop-bots-web.service\n",
+            calls,
+            "daemon-reload\n\
+             enable --now stop-bots-helper.socket\n\
+             try-restart stop-bots-helper.service\n\
+             enable stop-bots-web.service\n\
+             restart stop-bots-web.service\n",
             "steps reported were: {steps:?}"
         );
     }
@@ -1594,7 +2062,10 @@ mod tests {
         activate(&layout, &Options::default()).unwrap();
 
         let calls = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(calls, "daemon-reload\nenable stop-bots-web.service\n");
+        assert_eq!(
+            calls,
+            "daemon-reload\nenable stop-bots-helper.socket\nenable stop-bots-web.service\n"
+        );
     }
 
     /// A dry run must not reach systemd either — that is the whole promise
@@ -1618,7 +2089,9 @@ mod tests {
 
         assert!(!log.exists(), "systemctl ran during a dry run");
         assert!(
-            steps.iter().any(|s| s.contains("enable --now")),
+            steps
+                .iter()
+                .any(|s| s.contains("restart stop-bots-web.service")),
             "a dry run still describes what it would do: {steps:?}"
         );
     }
@@ -1759,10 +2232,12 @@ mod tests {
             );
             let dir = tempfile::tempdir().unwrap();
             let layout = staged(dir.path());
-            assert!(
-                web_unit(&layout).contains(directive),
-                "{directive} is no longer in the unit, so this refusal is stale"
-            );
+            for unit in [web_unit(&layout), helper_unit(&layout)] {
+                assert!(
+                    unit.contains(directive),
+                    "{directive} is no longer in the unit, so this refusal is stale"
+                );
+            }
         }
     }
 
@@ -1799,8 +2274,37 @@ mod tests {
 
         let message = format!("{err:#}");
         assert!(
-            message.contains(&format!("systemctl disable --now {WEB_UNIT}")),
+            message.contains(&format!(
+                "systemctl disable --now {WEB_UNIT} {HELPER_SOCKET_UNIT}"
+            )),
             "message was: {message}"
+        );
+    }
+
+    /// The same when it is the restart that fails, which is where a console
+    /// that cannot start shows up.
+    #[test]
+    fn a_failed_restart_says_how_to_undo_the_enable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        with_fake_systemctl(
+            &mut layout,
+            dir.path(),
+            "case \"$1\" in restart) echo 'Job failed' >&2; exit 1 ;; *) exit 0 ;; esac",
+        );
+
+        let err = activate(
+            &layout,
+            &Options {
+                start: true,
+                ..Options::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("systemctl disable --now"),
+            "message was: {err:#}"
         );
     }
 
@@ -1947,7 +2451,7 @@ mod tests {
         let exec = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
         assert_eq!(
             exec,
-            r#"ExecStart="/opt/stop bots/stop-bots" web --db /var/lib/100%%/db.sqlite3 --ssh-log "/srv/a \"b\"\\c.log""#
+            r#"ExecStart="/opt/stop bots/stop-bots" web --db /var/lib/100%%/db.sqlite3 --ssh-log "/srv/a \"b\"\\c.log" --helper /run/stop-bots/helper.sock"#
         );
     }
 
@@ -1997,6 +2501,8 @@ mod tests {
         for unit in [
             web_unit(&system_layout()),
             web_unit(&staged(dir.path())),
+            helper_socket_unit(&system_layout()),
+            helper_unit(&staged(dir.path())),
             firewall_unit(
                 crate::firewall::FirewallBackend::Iptables,
                 Path::new("/etc/stop-bots/firewall.sh"),
@@ -2223,31 +2729,40 @@ mod tests {
     /// these is root at the next boot, or the next cron minute, outside the
     /// sandbox. The container suite checks the same against real systemd.
     #[test]
-    fn the_unit_gives_back_nothing_that_would_outlive_the_service() {
-        let unit = web_unit(&system_layout());
-        assert!(directives(&unit).contains(&"ProtectSystem=strict"));
-        for path in [
-            "/etc/cron.d/x",
-            "/etc/crontab",
-            "/var/spool/cron/crontabs/root",
-            "/etc/systemd/system/x.service",
-            "/usr/lib/systemd/system/x.service",
-            "/etc/sudoers.d/x",
-            "/etc/ld.so.preload",
-            "/usr/local/bin/stop-bots",
-            "/root/.ssh/authorized_keys",
-            "/var/lib/dpkg/info/x.postinst",
-        ] {
-            assert!(!writable_in(&unit, path), "{path} is writable:\n{unit}");
+    fn neither_unit_gives_back_anything_that_would_outlive_the_service() {
+        for unit in [web_unit(&system_layout()), helper_unit(&system_layout())] {
+            assert!(directives(&unit).contains(&"ProtectSystem=strict"));
+            for path in [
+                "/etc/cron.d/x",
+                "/etc/crontab",
+                "/var/spool/cron/crontabs/root",
+                "/etc/systemd/system/x.service",
+                "/usr/lib/systemd/system/x.service",
+                "/etc/sudoers.d/x",
+                "/etc/ld.so.preload",
+                "/usr/local/bin/stop-bots",
+                "/root/.ssh/authorized_keys",
+                "/var/lib/dpkg/info/x.postinst",
+            ] {
+                assert!(!writable_in(&unit, path), "{path} is writable:\n{unit}");
+            }
         }
     }
 
-    /// And everything the console does write stays writable. Missing one is
+    /// The console, which is not root, writes its database and nothing
+    /// else, so that is all its unit gives back.
+    #[test]
+    fn the_console_gets_back_its_database_and_nothing_else() {
+        let unit = web_unit(&system_layout());
+        assert_eq!(granted(&unit), vec![PathBuf::from("/var/lib/stop-bots")]);
+    }
+
+    /// And everything the helper does write stays writable. Missing one is
     /// not a failed start but an apply failing with "Read-only file
     /// system" an hour later.
     #[test]
-    fn the_unit_gives_back_everything_the_console_writes() {
-        let unit = web_unit(&system_layout());
+    fn the_helper_gets_back_everything_it_writes() {
+        let unit = helper_unit(&system_layout());
         for (what, path) in [
             ("the database", "/var/lib/stop-bots/db.sqlite3"),
             ("its write-ahead log", "/var/lib/stop-bots/db.sqlite3-wal"),
@@ -2271,9 +2786,10 @@ mod tests {
     /// Without CAP_SYS_ADMIN in the bounding set, root in the sandbox
     /// cannot remount what `ProtectSystem` made read-only.
     #[test]
-    fn neither_unit_keeps_the_capability_that_undoes_the_sandbox() {
+    fn no_unit_keeps_the_capability_that_undoes_the_sandbox() {
         let units = [
             web_unit(&system_layout()),
+            helper_unit(&system_layout()),
             firewall_unit(
                 crate::firewall::FirewallBackend::Nftables,
                 Path::new("/etc/stop-bots/firewall.nft"),
@@ -2319,10 +2835,90 @@ mod tests {
 
     #[test]
     fn the_file_descriptor_and_task_limits_are_set() {
-        let unit = web_unit(&system_layout());
-        for line in ["LimitNOFILE=16384", "TasksMax=1024"] {
-            assert!(directives(&unit).contains(&line), "no {line} in:\n{unit}");
+        for unit in [web_unit(&system_layout()), helper_unit(&system_layout())] {
+            for line in ["LimitNOFILE=16384", "TasksMax=1024"] {
+                assert!(directives(&unit).contains(&line), "no {line} in:\n{unit}");
+            }
         }
+    }
+
+    /// The directives that make the console's compromise its user's and
+    /// not root's, each one checked under real systemd by the container
+    /// suite. A table rather than the golden alone, so that losing one is
+    /// a failure that names it.
+    #[test]
+    fn the_console_runs_unprivileged_and_asks_the_helper() {
+        let unit = web_unit(&system_layout());
+        let lines = directives(&unit);
+        for (what, line) in [
+            ("its own user", "User=stop-bots"),
+            ("its own group", "Group=stop-bots"),
+            ("the log groups", "SupplementaryGroups=adm systemd-journal"),
+            ("no capability at all", "CapabilityBoundingSet="),
+            ("none gained either", "NoNewPrivileges=yes"),
+            (
+                "no netlink",
+                "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            ),
+            (
+                "systemd's sockets hidden",
+                "InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private",
+            ),
+            ("W^X", "MemoryDenyWriteExecute=yes"),
+            ("a syscall filter", "SystemCallFilter=@system-service"),
+            ("the helper's socket", "Requires=stop-bots-helper.socket"),
+        ] {
+            assert!(lines.contains(&line), "{what}: no {line:?} in:\n{unit}");
+        }
+        let exec = lines
+            .iter()
+            .find(|line| line.starts_with("ExecStart="))
+            .unwrap();
+        assert!(
+            exec.ends_with(" --helper /run/stop-bots/helper.sock"),
+            "{exec}"
+        );
+    }
+
+    /// The socket is root's and the console's group's, and nobody else's.
+    #[test]
+    fn only_the_console_can_reach_the_helpers_socket() {
+        let unit = helper_socket_unit(&system_layout());
+        let lines = directives(&unit);
+        for line in [
+            "ListenStream=/run/stop-bots/helper.sock",
+            "SocketUser=root",
+            "SocketGroup=stop-bots",
+            "SocketMode=0660",
+            "Accept=no",
+        ] {
+            assert!(lines.contains(&line), "no {line:?} in:\n{unit}");
+        }
+    }
+
+    /// A unit naming a group the host lacks fails to start with
+    /// 216/GROUP; with neither group there is no line at all.
+    #[test]
+    fn only_the_log_groups_the_host_has_are_named() {
+        let mut layout = system_layout();
+        layout.log_groups = vec!["adm".to_string()];
+        assert!(directives(&web_unit(&layout)).contains(&"SupplementaryGroups=adm"));
+        layout.log_groups.clear();
+        assert!(!web_unit(&layout).contains("\nSupplementaryGroups="));
+    }
+
+    /// The helper reaches the kernel's firewall and systemd and nothing
+    /// on any network.
+    #[test]
+    fn the_helper_talks_to_the_kernel_and_systemd_but_no_network() {
+        let unit = helper_unit(&system_layout());
+        assert!(
+            directives(&unit).contains(&"RestrictAddressFamilies=AF_UNIX AF_NETLINK"),
+            "{unit}"
+        );
+        assert!(!directives(&unit)
+            .iter()
+            .any(|line| line.starts_with("User=")));
     }
 
     /// A host whose NGINX lives elsewhere — in a container's bind mount —
@@ -2345,7 +2941,7 @@ mod tests {
 
         install_web(&layout, &Options::default()).unwrap();
 
-        let unit = std::fs::read_to_string(layout.unit_path()).unwrap();
+        let unit = std::fs::read_to_string(layout.unit_dir.join(HELPER_UNIT)).unwrap();
         for path in [
             "/srv/nginx/conf/sites-enabled/a",
             "/srv/nginx/logs/error.log",
@@ -2405,7 +3001,7 @@ mod tests {
 
         install_web(&layout, &Options::default()).unwrap();
 
-        let unit = std::fs::read_to_string(layout.unit_path()).unwrap();
+        let unit = std::fs::read_to_string(layout.unit_dir.join(HELPER_UNIT)).unwrap();
         for path in ["/etc/cron.d/x", "/var/spool/cron/crontabs/root"] {
             assert!(!writable_in(&unit, path), "{path} was given back:\n{unit}");
         }
@@ -2418,7 +3014,7 @@ mod tests {
         let mut layout = system_layout();
         layout.nginx_roots = vec![PathBuf::from("/opt/nginx")];
 
-        assert!(writable_in(&web_unit(&layout), "/opt/nginx/nginx.conf"));
+        assert!(writable_in(&helper_unit(&layout), "/opt/nginx/nginx.conf"));
     }
 
     /// One line per place, not per spelling of it.
@@ -2577,5 +3173,280 @@ mod tests {
             message.contains("--binary /"),
             "it should suggest the absolute form: {message}"
         );
+    }
+
+    // ---- upgrading from 0.1.0-rc.2 ----
+
+    /// rc.2's units, the bytes it wrote. Its console ran as root; the
+    /// upgrade is what replaces that unit, so it has to be recognised as
+    /// unedited, by its hash.
+    #[test]
+    fn every_0_1_0_rc_2_unit_is_sealed_and_unedited() {
+        for fixture in [
+            include_str!("../tests/fixtures/units/stop-bots-web-0.1.0-rc.2.service"),
+            include_str!("../tests/fixtures/units/stop-bots-firewall-nftables-0.1.0-rc.2.service"),
+            include_str!("../tests/fixtures/units/stop-bots-firewall-iptables-0.1.0-rc.2.service"),
+        ] {
+            assert!(
+                is_sealed_and_unedited(fixture),
+                "not recognised:\n{fixture}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_0_1_0_rc_2_web_unit_is_replaced_by_the_unprivileged_one_without_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::create_dir_all(&layout.unit_dir).unwrap();
+        let rc2 = include_str!("../tests/fixtures/units/stop-bots-web-0.1.0-rc.2.service");
+        assert!(
+            !rc2.contains("\nUser="),
+            "the fixture is not rc.2's root unit"
+        );
+        std::fs::write(layout.unit_path(), rc2).unwrap();
+
+        let steps = install_web(&layout, &Options::default()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(layout.unit_path()).unwrap(),
+            web_unit(&layout)
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("unedited since stop-bots 0.1.0-rc.2")),
+            "steps: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn an_0_1_0_rc_2_firewall_unit_is_upgraded_without_force() {
+        assert_firewall_unit_upgrades(
+            include_str!("../tests/fixtures/units/stop-bots-firewall-nftables-0.1.0-rc.2.service"),
+            crate::firewall::FirewallBackend::Nftables,
+        );
+        assert_firewall_unit_upgrades(
+            include_str!("../tests/fixtures/units/stop-bots-firewall-iptables-0.1.0-rc.2.service"),
+            crate::firewall::FirewallBackend::Iptables,
+        );
+    }
+
+    /// An edited helper unit is refused like an edited console unit, and
+    /// before anything at all is written.
+    #[test]
+    fn an_edited_helper_unit_is_refused_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::create_dir_all(&layout.unit_dir).unwrap();
+        let edited = format!("{}# an operator's edit\n", helper_unit(&layout));
+        std::fs::write(layout.unit_dir.join(HELPER_UNIT), &edited).unwrap();
+
+        let err = install_web(&layout, &Options::default()).unwrap_err();
+
+        assert!(format!("{err:#}").contains("--force"), "was: {err:#}");
+        assert!(
+            !layout.unit_path().exists(),
+            "wrote the console's unit anyway"
+        );
+        assert!(
+            !layout.state_dir.exists(),
+            "made the state directory anyway"
+        );
+    }
+
+    // ---- the console's user ----
+
+    /// A recording stand-in for `useradd`.
+    fn recording(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let log = dir.join(format!("{name}.log"));
+        let script = dir.join(format!("fake-{name}"));
+        crate::testing::write_script(
+            &script,
+            &format!("echo \"$@\" >> {}\nexit 0", log.display()),
+        );
+        (script, log)
+    }
+
+    /// Whoever runs the tests, standing in for the console's user: it
+    /// exists, and handing a file to it needs no privilege.
+    fn me() -> String {
+        // SAFETY: no preconditions; reads the process's own credentials.
+        crate::account::user_name(unsafe { libc::geteuid() })
+    }
+
+    /// The user is made the way the design says: a system account, with
+    /// no home and no shell, and its own group.
+    #[test]
+    fn a_missing_user_is_created_as_a_system_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        layout.real = true;
+        layout.user = "stop-bots-test-no-such-user".to_string();
+        let (useradd, log) = recording(dir.path(), "useradd");
+        layout.useradd = useradd;
+        let mut steps = Steps::new();
+
+        let dry = ensure_service_account(
+            &layout,
+            &Options {
+                dry_run: true,
+                ..Options::default()
+            },
+            &mut steps,
+        )
+        .unwrap();
+        assert_eq!(dry, None);
+        assert!(!log.exists(), "a dry run ran useradd");
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.starts_with("fake-useradd --system")),
+            "the dry run did not say it would: {steps:?}"
+        );
+
+        let err = ensure_service_account(&layout, &Options::default(), &mut steps).unwrap_err();
+
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            format!(
+                "--system --user-group --no-create-home --home-dir {} --shell \
+                 /usr/sbin/nologin --comment stop-bots web console stop-bots-test-no-such-user\n",
+                layout.state_dir.display()
+            )
+        );
+        // The stand-in made nobody, and that is said rather than assumed.
+        assert!(
+            format!("{err:#}").contains("still does not know"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn an_existing_user_is_used_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        layout.real = true;
+        layout.user = me();
+        let (useradd, log) = recording(dir.path(), "useradd");
+        layout.useradd = useradd;
+        if crate::account::group(&layout.user).is_none() {
+            return; // a user without a group of its own name
+        }
+        let mut steps = Steps::new();
+
+        let account = ensure_service_account(&layout, &Options::default(), &mut steps);
+
+        assert!(!log.exists(), "ran useradd for a user that exists");
+        if crate::hint::is_root() {
+            let err = account.unwrap_err();
+            assert!(format!("{err:#}").contains("root after all"), "{err:#}");
+        } else {
+            assert!(account.unwrap().is_some());
+        }
+    }
+
+    /// Under `--prefix` there is no user database to add to.
+    #[test]
+    fn a_prefixed_install_makes_no_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        let (useradd, log) = recording(dir.path(), "useradd");
+        layout.useradd = useradd;
+
+        let steps = install_web(&layout, &Options::default()).unwrap();
+
+        assert!(!log.exists(), "ran useradd under --prefix");
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("not this host's user database")),
+            "{steps:?}"
+        );
+    }
+
+    /// The state directory is handed to the console's user when there is
+    /// one — here, whoever runs the test.
+    #[test]
+    fn the_state_directory_is_handed_to_the_console() {
+        use std::os::unix::fs::MetadataExt;
+        if crate::hint::is_root() {
+            return; // the test's user would be root, which is refused
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut layout = staged(dir.path());
+        layout.real = true;
+        layout.user = me();
+        if crate::account::group(&layout.user).is_none() {
+            return;
+        }
+        // On the host, `real` also checks the binary against the unit's
+        // sandbox, and the fixture's binary lives in a temp directory.
+        layout.binary = PathBuf::from("/bin/sh");
+
+        let steps = install_web(&layout, &Options::default()).unwrap();
+
+        let meta = std::fs::metadata(&layout.state_dir).unwrap();
+        assert_eq!(meta.uid(), crate::account::user(&layout.user).unwrap().uid);
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        assert!(
+            steps
+                .iter()
+                .any(|step| step.contains("give ") && step.contains(&layout.user)),
+            "{steps:?}"
+        );
+    }
+
+    /// The attack this hands over by descriptor for: the console, owning
+    /// its directory, links a companion to a root file, and the next
+    /// `install web` would `chown` the link's target.
+    #[test]
+    fn handing_over_the_database_does_not_follow_a_link() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, "").unwrap();
+        let shadow = dir.path().join("shadow");
+        std::fs::write(&shadow, "root:*:\n").unwrap();
+        std::fs::set_permissions(&shadow, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&shadow, dir.path().join("db.sqlite3-wal")).unwrap();
+        let mine = std::fs::metadata(&shadow).unwrap();
+        let account = crate::account::Account {
+            uid: mine.uid(),
+            gid: mine.gid(),
+        };
+
+        let handed = secure_database(&db, Some(account));
+        let chmodded = secure_database(&db, None);
+
+        assert!(handed.is_err() && chmodded.is_err(), "followed the link");
+        assert_eq!(
+            std::fs::metadata(&shadow).unwrap().mode() & 0o777,
+            0o640,
+            "the link's target was changed"
+        );
+    }
+
+    /// A second name for someone else's file is refused the same way.
+    #[test]
+    fn handing_over_refuses_a_hard_link() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db.sqlite3");
+        std::fs::write(&db, "").unwrap();
+        std::fs::hard_link(&db, dir.path().join("elsewhere")).unwrap();
+        let mine = std::fs::metadata(&db).unwrap();
+
+        let err = hand_over(
+            &db,
+            crate::account::Account {
+                uid: mine.uid(),
+                gid: mine.gid(),
+            },
+            0o600,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("not a plain file"), "{err:#}");
     }
 }

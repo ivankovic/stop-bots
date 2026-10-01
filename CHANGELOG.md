@@ -10,12 +10,27 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ### Security
 
+- **The web console no longer runs as root.** `install web` creates a `stop-bots`
+  system user and runs the console as it, with no capability, no write access outside
+  its database, and systemd's sockets hidden. What needs root it asks of a new root
+  helper, `stop-bots-helper.service`, started by `stop-bots-helper.socket`.
+- The console reads the logs through `SupplementaryGroups=adm systemd-journal` in its
+  unit; nothing is added to `/etc/group`.
 - Root opening the console's database (the CLI, the TUI, the helper, `install web`,
   `uninstall`) follows no link in its directory, refuses a database or `-wal`/`-shm`
   that is a link or has a second name, and changes owners and modes only by descriptor.
+- `uninstall` deletes a file the database's record names only if it is a plain file
+  in a `conf.d` or `/etc/stop-bots/nginx` that starts with the stop-bots header.
 
 ### Changed
 
+- Upgrading from rc.2: re-run `sudo stop-bots install web`. It replaces the unedited
+  rc.2 unit without `--force`, gives `/var/lib/stop-bots` and the database to
+  `stop-bots` (0700/0600), and restarts the console as that user.
+- `install web` restarts a running console instead of leaving it as it was, so a new
+  unit takes effect.
+- `uninstall` removes the helper's socket and service with the console's unit;
+  `uninstall --purge` also removes the `stop-bots` user and group.
 - A copy taken before a schema upgrade (`.bak-v*`), and a database root creates in the
   console's directory, belong to the database's owner, not root.
 

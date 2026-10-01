@@ -34,6 +34,8 @@ pub mod accesslog;
 #[doc(hidden)]
 pub mod accessstats;
 #[doc(hidden)]
+pub mod account;
+#[doc(hidden)]
 pub mod app;
 #[doc(hidden)]
 pub mod applylock;
