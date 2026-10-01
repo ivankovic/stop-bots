@@ -7,8 +7,7 @@ rather than being backported.
 
 | Version        | Supported |
 | -------------- | --------- |
-| latest `0.0.x` | yes, until `0.1.0` is released |
-| latest `0.1.x` | yes, once released |
+| latest `0.1.x` | yes       |
 | anything older | no        |
 
 From `0.1.0` on, a patch release keeps the command line, the database and the

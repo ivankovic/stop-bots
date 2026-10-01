@@ -8,6 +8,27 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-10-01
+
+The first release whose command line, database, generated files and paths are a
+contract: from here, a `0.1.x` patch release breaks none of them (see "Versioning" in
+`RELEASING.md`). It is 0.1.0-rc.3 with no further changes to what it does; what changed
+since 0.0.15 is under the three release candidates below. In short:
+
+- **Safe for a stranger to run:** a quick start, tested end to end on fresh Debian 12
+  and Ubuntu 24.04; `uninstall`; every apply previewed and confirmed; a firewall that
+  only changes when something applies it; every block saying why it exists.
+- **Bounded on a small server:** the log read once a minute, incrementally, with time
+  windows; nftables sets with expiry in the kernel; iptables loaded atomically.
+- **Upgrades that don't hurt:** a versioned database copied before each upgrade; a
+  detector added later arrives off; an unedited unit replaced without `--force`.
+- **A web console that is not root:** it runs as its own user and asks a small root
+  helper, which treats its database as hostile, for each privileged action. Every
+  finding of two security reviews is fixed.
+
+Upgrading from 0.0.x or an earlier 0.1.0 candidate: install the new binary or package,
+then run `sudo stop-bots install web` and `sudo stop-bots install firewall`.
+
 ## [0.1.0-rc.3] — 2026-10-01
 
 **The web console no longer runs as root.** Under rc.2, code running in the console
@@ -1875,7 +1896,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.3...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...v0.1.0
 [0.1.0-rc.3]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.2...v0.1.0-rc.3
 [0.1.0-rc.2]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.1...v0.1.0-rc.2
 [0.1.0-rc.1]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...v0.1.0-rc.1

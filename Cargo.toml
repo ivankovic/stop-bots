@@ -6,7 +6,7 @@ name = "stop-bots"
 # integration tests can reach the internals, its modules are #[doc(hidden)],
 # and it can change in any release. 0.0.x while even the binary's contract is
 # still moving; from 0.1.0, a patch release breaks none of it.
-version = "0.1.0-rc.3"
+version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Marko Ivankovic <marko@ivankovic.me>"]

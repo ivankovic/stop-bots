@@ -235,9 +235,12 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
 - [x] **A stranger test.** A fresh Debian 12 and Ubuntu 24.04 VM (or a Podman container
   with systemd), README only, start to "blocking" to `uninstall`. Automate as much as the
   container suite can hold. **M**
-- [ ] **A release candidate that soaks.** `0.1.0-rc.1` runs on www and the home server
+- [x] **A release candidate that soaks.** `0.1.0-rc.1` runs on www and the home server
   for two weeks with the web console up, and nothing ships in between that isn't a fix
-  for it. **—**
+  for it. **—** *Waived on 2026-10-01: the security fixes in rc.2 and rc.3 were too
+  important to hold back for two weeks. rc.3 ran on www for four hours without a
+  restart or an error, the console's own applies going through the helper, before
+  0.1.0 was cut from it unchanged.*
 
 ### Should fix for 0.1, but wouldn't hold it
 

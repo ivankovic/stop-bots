@@ -25,6 +25,12 @@ list — which meant the open items below were unfindable inside it.
   need to keep it. (The health probe's `systemctl`/`docker ps` calls from
   unit tests, the worse case, are fixed.)
 
+* **The web console holds ~125 MB after its first log pass.** Measured on www
+  under 0.1.0-rc.3: steady at 124,872 KB RSS hours later, not growing, where rc.2's
+  console sat near 6 MB. Probably what the allocator kept from the first pass's 4 MB
+  chunks through the helper; worth a heap profile, and a smaller chunk or a trim
+  after the first pass. Well under the unit's `MemoryHigh=`.
+
 ## Known gaps
 
 Deliberate omissions rather than oversights — each is a thing someone will
