@@ -53,6 +53,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - `install web` skips, with a warning, a `.bak-v*` beside the database that is a link,
   not a regular file, or a hard link, without following it, instead of failing the
   upgrade half way.
+- The console's unit makes `/run` read-only outright (`ReadOnlyPaths=/run`), which
+  `ProtectSystem=strict` alone did not under `ProtectKernelTunables=`. It hides
+  `/run/dbus` rather than the socket, made first by a root `ExecStartPre=` if D-Bus has
+  not made it, so D-Bus started after the console is out of its reach too.
 
 ### Changed
 

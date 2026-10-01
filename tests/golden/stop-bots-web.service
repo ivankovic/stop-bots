@@ -17,12 +17,18 @@ Documentation=https://github.com/ivankovic/stop-bots
 # Wants rather than Requires for NGINX: the console is most worth looking
 # at when NGINX is down, so it must not be stopped along with it. Requires
 # for the helper's socket: without it the console can show, not apply.
-After=network-online.target nginx.service stop-bots-helper.socket
+# After D-Bus, without wanting it: see ExecStartPre= below.
+After=network-online.target nginx.service stop-bots-helper.socket dbus.socket dbus.service
 Wants=network-online.target
 Requires=stop-bots-helper.socket
 
 [Service]
 Type=exec
+# As root (`+`), and nothing else: D-Bus's directory, made if D-Bus has
+# not made it yet, so that InaccessiblePaths= below has it to hide. A
+# path that is not there when the console starts is not hidden, and
+# D-Bus started after the console would otherwise be reachable from it.
+ExecStartPre=+/bin/mkdir -p -m 0755 /run/dbus
 ExecStart=/usr/local/bin/stop-bots web --db /var/lib/stop-bots/db.sqlite3 --helper /run/stop-bots/helper.sock
 Restart=on-failure
 RestartSec=5s
@@ -47,6 +53,10 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ReadWritePaths=-/var/lib/stop-bots
+# Said outright: ProtectSystem=strict alone has been seen to leave /run
+# writable once ProtectKernelTunables= or ProtectControlGroups= add a
+# mount under it. Connecting to the helper's socket needs no write.
+ReadOnlyPaths=/run
 ProtectHome=yes
 PrivateDevices=yes
 ProtectClock=yes
@@ -67,7 +77,9 @@ CapabilityBoundingSet=
 # AF_UNIX for the helper's socket and journalctl, AF_INET/AF_INET6 for the
 # console itself and the list downloads.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private
+# D-Bus's directory rather than its socket, which comes and goes with
+# D-Bus while the console runs; the directory stays.
+InaccessiblePaths=-/run/dbus -/run/systemd/private
 # The database holds the console's password hash.
 UMask=0077
 

@@ -731,12 +731,18 @@ pub fn web_unit(layout: &Layout) -> String {
          # Wants rather than Requires for NGINX: the console is most worth looking\n\
          # at when NGINX is down, so it must not be stopped along with it. Requires\n\
          # for the helper's socket: without it the console can show, not apply.\n\
-         After=network-online.target nginx.service {HELPER_SOCKET_UNIT}\n\
+         # After D-Bus, without wanting it: see ExecStartPre= below.\n\
+         After=network-online.target nginx.service {HELPER_SOCKET_UNIT} dbus.socket dbus.service\n\
          Wants=network-online.target\n\
          Requires={HELPER_SOCKET_UNIT}\n\
          \n\
          [Service]\n\
          Type=exec\n\
+         # As root (`+`), and nothing else: D-Bus's directory, made if D-Bus has\n\
+         # not made it yet, so that InaccessiblePaths= below has it to hide. A\n\
+         # path that is not there when the console starts is not hidden, and\n\
+         # D-Bus started after the console would otherwise be reachable from it.\n\
+         ExecStartPre=+/bin/mkdir -p -m 0755 /run/dbus\n\
          ExecStart={exec}\
          Restart=on-failure\n\
          RestartSec=5s\n\
@@ -761,6 +767,10 @@ pub fn web_unit(layout: &Layout) -> String {
          PrivateTmp=yes\n\
          ProtectSystem=strict\n\
          ReadWritePaths={state}\n\
+         # Said outright: ProtectSystem=strict alone has been seen to leave /run\n\
+         # writable once ProtectKernelTunables= or ProtectControlGroups= add a\n\
+         # mount under it. Connecting to the helper's socket needs no write.\n\
+         ReadOnlyPaths=/run\n\
          ProtectHome=yes\n\
          PrivateDevices=yes\n\
          ProtectClock=yes\n\
@@ -781,7 +791,9 @@ pub fn web_unit(layout: &Layout) -> String {
          # AF_UNIX for the helper's socket and journalctl, AF_INET/AF_INET6 for the\n\
          # console itself and the list downloads.\n\
          RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n\
-         InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private\n\
+         # D-Bus's directory rather than its socket, which comes and goes with\n\
+         # D-Bus while the console runs; the directory stays.\n\
+         InaccessiblePaths=-/run/dbus -/run/systemd/private\n\
          # The database holds the console's password hash.\n\
          UMask=0077\n\
          \n\
@@ -2982,6 +2994,10 @@ mod tests {
         let lines = directives(&unit);
         for (what, line) in [
             ("its own user", "User=stop-bots"),
+            (
+                "D-Bus's directory there to hide",
+                "ExecStartPre=+/bin/mkdir -p -m 0755 /run/dbus",
+            ),
             ("its own group", "Group=stop-bots"),
             ("the log groups", "SupplementaryGroups=adm systemd-journal"),
             ("no capability at all", "CapabilityBoundingSet="),
@@ -2992,8 +3008,9 @@ mod tests {
             ),
             (
                 "systemd's sockets hidden",
-                "InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private",
+                "InaccessiblePaths=-/run/dbus -/run/systemd/private",
             ),
+            ("/run read-only", "ReadOnlyPaths=/run"),
             ("W^X", "MemoryDenyWriteExecute=yes"),
             ("a syscall filter", "SystemCallFilter=@system-service"),
             ("the helper's socket", "Requires=stop-bots-helper.socket"),

@@ -1209,6 +1209,64 @@ impl Host {
         ));
         self.try_start(&format!("{probe}.service"))
     }
+
+    /// Runs `script` with `sh` **as the console's own unit**:
+    /// `stop-bots-web.service` exactly as `install web` wrote it, with a
+    /// drop-in that replaces only its `ExecStart=` (and makes it a oneshot
+    /// that is not restarted). Every other line is the real unit's, so
+    /// nothing a copy could get wrong stands between the probe and what is
+    /// under test. Returns whether the script exited 0, and what it
+    /// printed.
+    ///
+    /// `background` starts it without waiting, for a probe that has to
+    /// be running while the test changes something on the host; then
+    /// [`Self::console_probe_result`] collects it.
+    fn probe_in_console_unit(&self, probe: &str, script: &str) -> (bool, String) {
+        self.start_console_probe(probe, script, false);
+        self.console_probe_result(probe)
+    }
+
+    fn start_console_probe(&self, probe: &str, script: &str, background: bool) {
+        // The output goes where the console may write: its own directory.
+        self.sh(&format!(
+            "cat > /run/{probe}.sh <<'STOP_BOTS_PROBE'\n\
+             exec > /var/lib/stop-bots/{probe}.out 2>&1\n\
+             {script}\n\
+             STOP_BOTS_PROBE\n\
+             chmod 644 /run/{probe}.sh\n\
+             rm -f /var/lib/stop-bots/{probe}.out /var/lib/stop-bots/{probe}.status\n\
+             mkdir -p /etc/systemd/system/stop-bots-web.service.d\n\
+             cat > /etc/systemd/system/stop-bots-web.service.d/zz-probe.conf <<'STOP_BOTS_PROBE'\n\
+             [Service]\n\
+             Type=oneshot\n\
+             Restart=no\n\
+             ExecStart=\n\
+             ExecStart=/bin/sh -c '/bin/sh /run/{probe}.sh; echo $$? > /var/lib/stop-bots/{probe}.status'\n\
+             STOP_BOTS_PROBE\n\
+             systemctl daemon-reload\n\
+             systemctl reset-failed stop-bots-web.service 2>/dev/null || true"
+        ));
+        let block = if background { "--no-block " } else { "" };
+        self.sh(&format!("systemctl start {block}stop-bots-web.service"));
+    }
+
+    /// Waits for the probe [`Self::start_console_probe`] started to
+    /// finish, takes the drop-in away again, and returns what it did.
+    fn console_probe_result(&self, probe: &str) -> (bool, String) {
+        let status = format!("/var/lib/stop-bots/{probe}.status");
+        assert!(
+            self.wait_for_file(&status),
+            "the probe {probe} never finished. journal:\n{}",
+            self.journal("stop-bots-web.service")
+        );
+        let code = self.sh(&format!("cat {status}"));
+        let out = self.run(&format!("cat /var/lib/stop-bots/{probe}.out")).1;
+        self.sh(
+            "rm /etc/systemd/system/stop-bots-web.service.d/zz-probe.conf \
+             && systemctl daemon-reload",
+        );
+        (code.trim() == "0", out)
+    }
 }
 
 /// A logged-in session against the console running inside a [`Host`].
@@ -2312,6 +2370,81 @@ fn the_console_sandbox_holds_under_real_systemd() {
             host.oneshot_under_web_sandbox(&without, probe, &format!("| sed -e '/^{directive}/d'")),
             "{what} is refused even without {directive}, so this row proves nothing. journal:\n{}",
             host.journal(&format!("{without}.service"))
+        );
+    }
+}
+
+/// The D-Bus call every probe of the bus makes: harmless, and answered to
+/// any user who can reach the bus at all.
+const PING_SYSTEMD: &str =
+    "busctl --system call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+     org.freedesktop.DBus.Peer Ping";
+
+/// **`/run` is read-only to the console, and D-Bus out of its reach,
+/// whichever starts first.** `ProtectSystem=strict` alone left `/run`
+/// writable here (`ProtectKernelTunables=` and `ProtectControlGroups=`
+/// mount under it); the unit says `ReadOnlyPaths=/run`. And
+/// `InaccessiblePaths=` hides nothing that is not there when the console
+/// starts, so D-Bus started after it would have been reachable; the unit
+/// hides D-Bus's directory, made first if need be.
+///
+/// Inside the real unit: `/run/lock` — which anyone may write outside it,
+/// the control — and `/run` are read-only; and the bus, reachable from
+/// outside as the console's user, is not reachable from inside, with
+/// D-Bus started before the console and with D-Bus started while it runs.
+#[test]
+fn the_console_sees_run_read_only_and_no_bus_whichever_starts_first() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-console-run");
+    let as_console = |cmd: &str| {
+        host.run(&format!("/usr/sbin/runuser -u stop-bots -- {cmd}"))
+            .0
+    };
+    assert!(
+        as_console("touch /run/lock/stop-bots-control"),
+        "the console's user cannot write /run/lock even outside its unit, so the check below \
+         proves nothing"
+    );
+
+    // D-Bus after the console: not running, its directory not there.
+    host.sh("systemctl stop dbus.socket dbus.service; rm -rf /run/dbus");
+    host.start_console_probe(
+        "probe-bus-later",
+        &format!(
+            "while [ ! -e /var/lib/stop-bots/go ]; do sleep 0.1; done\n\
+             {PING_SYSTEMD} && exit 0\n\
+             exit 1"
+        ),
+        true,
+    );
+    host.sh("systemctl start dbus.socket dbus.service");
+    assert!(
+        as_console(PING_SYSTEMD),
+        "the console's user cannot reach the bus even outside its unit, so the checks below \
+         prove nothing"
+    );
+    host.sh("touch /var/lib/stop-bots/go && chown stop-bots: /var/lib/stop-bots/go");
+    let (reached, said) = host.console_probe_result("probe-bus-later");
+    assert!(
+        !reached,
+        "the console reached D-Bus started after it:\n{said}"
+    );
+
+    // D-Bus before the console, as on a host that boots with it.
+    let (reached, said) = host.probe_in_console_unit("probe-bus-first", PING_SYSTEMD);
+    assert!(!reached, "the console reached D-Bus:\n{said}");
+
+    for path in ["/run/stop-bots-probe", "/run/lock/stop-bots-probe"] {
+        let (wrote, said) = host.probe_in_console_unit("probe-run", &format!("touch {path}"));
+        assert!(
+            !wrote && !host.run(&format!("test -e {path}")).0,
+            "the console wrote {path}"
+        );
+        assert!(
+            said.contains("Read-only file system"),
+            "{path} was refused, but not by the sandbox:\n{said}"
         );
     }
 }
