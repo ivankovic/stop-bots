@@ -40,6 +40,7 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   it, and only through its directory, held open from the check on: removed, read and
   put back after a refused test by `openat`/`unlinkat`/`renameat`, never by path.
   This covers applies, previews, the TUI and `uninstall`. A FIFO there is not read.
+- The trust file gets each trusted address trimmed, as it was validated.
 
 ### Changed
 

@@ -1546,8 +1546,11 @@ pub fn trusted_conf_body(addresses: &[String], user_agents: &[String]) -> Option
         .filter(|ua| is_stored_as_valid(ua, crate::db::validate_trusted_user_agent))
         .map(|ua| nginx_quoted(&format!("~*{}", crate::db::escape_regex_literal(ua))))
         .collect();
-    let addresses: Vec<&String> = addresses
+    // Trimmed before it is checked and written alike: the check trims, so
+    // what it passed is the trimmed text, and that is all that is written.
+    let addresses: Vec<&str> = addresses
         .iter()
+        .map(|a| a.trim())
         .filter(|a| crate::db::is_valid_address(a))
         .collect();
     if addresses.is_empty() && user_agents.is_empty() {
@@ -6163,6 +6166,14 @@ mod tests {
     #[test]
     fn nothing_trusted_means_no_trust_file() {
         assert_eq!(trusted_conf_body(&[], &[]), None);
+    }
+
+    /// What is written is what was validated: the trimmed address. The
+    /// whitespace around one a console wrote never reaches the file.
+    #[test]
+    fn a_trusted_address_is_written_as_it_was_checked() {
+        let body = trusted_conf_body(&[" \t192.0.2.9\n ".to_string()], &[]).unwrap();
+        assert!(body.contains("\n    192.0.2.9 1;\n"), "body was:\n{body}");
     }
 
     /// Validated at entry, and filtered here again: one quote in a `map`
