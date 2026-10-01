@@ -400,7 +400,10 @@ as single keys:
   [Behind NGINX](#behind-nginx-a-subdomain-or-a-path-prefix).
 
 `stop-bots web --no-apply` starts a console that writes the config and the script but
-reloads and runs neither.
+reloads and runs neither. It runs everything in its own process, so it needs root, and it
+cannot be combined with `--helper`, which the service uses (see below). A console that is
+neither root nor given a helper is read-only: every page works, and every action says why
+it can't.
 
 ### As a service (Debian)
 
@@ -622,7 +625,7 @@ scan the logs, write the NGINX blocking rules and the firewall script.
 
 The SSH log is found on its own: `/var/log/auth.log` where rsyslog writes one (Ubuntu), the
 journal where it doesn't (Debian 12 and later). Name a file with `--ssh-log`, or store one
-with `set-log-paths`, only if yours is somewhere else — a named file that does not exist
+with `sudo stop-bots set-log-paths`, only if yours is somewhere else — a named file that does not exist
 makes `--apply` refuse, because the lockout check cannot run.
 
 It says nothing when everything worked, so a healthy nightly run doesn't mail you. A failed
@@ -656,7 +659,11 @@ a failed NGINX reload still leaves the firewall applied, and the other way round
 
 # Upgrading and uninstalling
 
-Upgrading needs nothing but the new binary. Before it changes the database's layout, stop-bots
+Upgrading needs the new binary and, if the web console runs as a service, `sudo stop-bots
+install web` (below). The first root run of stop-bots after an upgrade from 0.1.0-rc.2 or
+older moves the host settings — the NGINX commands and config root, and the log paths — out
+of the database into `/etc/stop-bots/host.conf`, which only root can write. Before it changes
+the database's layout, stop-bots
 copies the database to `<db>.bak-v<N>` (mode 0600), where `N` is the old schema version. A
 database written by a newer stop-bots is refused rather than misread; run the newer one.
 
@@ -666,22 +673,25 @@ existing install, marked "new" in the Automatic blocking panel until you switch 
 After an upgrade, re-run `sudo stop-bots install web` (and `install firewall`) to pick up the
 new units; an unedited unit is replaced without `--force`.
 
-`sudo stop-bots uninstall` puts the host back as it was: it stops and removes both units,
+`sudo stop-bots uninstall` puts the host back as it was: it stops and removes its units (the
+console, its helper and socket, and the firewall's),
 deletes the nft table or iptables chain, takes the blocks out of every NGINX site (tested with
 `nginx -t`, and put back if that fails), and deletes the generated files. `nginx`, `firewall`
-or `web` removes one part; `all` is the default. The database is kept unless you pass
-`--purge`. Run it with `--dry-run` first.
+or `web` removes one part; `all` is the default. The database and `/etc/stop-bots/host.conf`
+are kept unless you pass `--purge`, which also removes the `stop-bots` user and group. Run it
+with `--dry-run` first.
 
 # Reference
 
 ## Running NGINX in a container
 
 If NGINX is in Docker and its config is on a bind mount, `systemctl reload nginx` reloads
-nothing. Point the two commands at the container instead — this applies to the CLI and the
-TUI as well:
+nothing. Point the two commands at the container instead — this applies to the CLI, the TUI
+and the console's helper alike. They are stored in `/etc/stop-bots/host.conf`, which only
+root can write, because they are commands root runs:
 
 ```
-stop-bots set-nginx-commands \
+sudo stop-bots set-nginx-commands \
   --test   "docker exec web nginx -t" \
   --reload "docker exec web nginx -s reload"
 ```
