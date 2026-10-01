@@ -47,6 +47,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 - The root helper never upgrades the database: one at another schema version is
   refused until `sudo stop-bots install web` (or any root command) upgrades it. It also
   refuses a database with a second name (a hard link).
+- `install web` moves the host settings into `host.conf` before it hands the database's
+  directory to the console. The other order deleted an rc.2 host's NGINX commands, root
+  and log paths instead of moving them.
 
 ### Changed
 

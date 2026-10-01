@@ -205,6 +205,9 @@ pub struct Layout {
     pub log_groups: Vec<String>,
     /// [`HELPER_SOCKET`], under the prefix.
     pub helper_socket: PathBuf,
+    /// The host settings file of this tree: the host's own
+    /// ([`crate::hostconf::path`]), or the one under `--prefix`.
+    pub host_conf: PathBuf,
     /// Whether this describes the running host rather than a staging tree,
     /// i.e. whether the prefix was `/`.
     ///
@@ -247,6 +250,11 @@ impl Layout {
             user: crate::account::USER.to_string(),
             log_groups: crate::account::LOG_GROUPS.map(String::from).to_vec(),
             helper_socket: prefix.join(HELPER_SOCKET.trim_start_matches('/')),
+            host_conf: if prefix == Path::new("/") {
+                crate::hostconf::path()
+            } else {
+                prefix.join(crate::hostconf::DEFAULT_PATH.trim_start_matches('/'))
+            },
             // Derived, not a parameter: `main.rs` builds every layout —
             // prefixed or not — with `under`, so a flag a caller had to
             // remember to set would have been `false` on the one path
@@ -306,13 +314,8 @@ impl Layout {
     /// ([`crate::hostconf`]); from the database's rows only while there is
     /// no host settings file yet, which is a database from before it.
     fn stored_host_settings(&self) -> (Option<String>, Option<String>) {
-        let host_conf = if self.real {
-            crate::hostconf::path()
-        } else {
-            self.output_dir.join("host.conf")
-        };
-        if std::fs::symlink_metadata(&host_conf).is_ok() {
-            let host = crate::hostconf::HostConf::load_from(&host_conf).unwrap_or_default();
+        if std::fs::symlink_metadata(&self.host_conf).is_ok() {
+            let host = crate::hostconf::HostConf::load_from(&self.host_conf).unwrap_or_default();
             let text = |path: Option<PathBuf>| path.map(|path| path.display().to_string());
             return (text(host.nginx_root), text(host.access_log));
         }
@@ -1374,8 +1377,29 @@ struct PlannedUnit {
 /// database there — so a database root creates is the console's from the
 /// start (see [`crate::db::guard`]), and [`secure_database`] only has to
 /// hand over what an earlier, root-run release left.
+///
+/// Before anything is handed over, the host settings are moved out of an
+/// existing database into the host settings file ([`move_host_settings`]):
+/// once the directory is the console's, its rows are not trusted, and
+/// would be deleted rather than moved.
 pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
+    install_web_from(layout, options, &layout.db_path)
+}
+
+/// [`install_web`], moving the host settings out of the database at
+/// `settings_db` (`--db`) rather than the layout's.
+pub fn install_web_from(layout: &Layout, options: &Options, settings_db: &Path) -> Result<Steps> {
     preflight(layout, options)?;
+
+    // First, while the database and its directory are still whoever's
+    // they were — root's, on an upgrade from 0.1.0-rc.2. The hand-over
+    // below makes them the console's, and from then on `hostconf` will
+    // not take a row from them: an operator's NGINX commands, root and
+    // log paths would be deleted instead of moved.
+    let mut steps = Steps::new();
+    if !options.dry_run {
+        steps.extend(move_host_settings(settings_db, &layout.host_conf)?);
+    }
 
     // The helper's unit has to let it write wherever the database says the
     // NGINX config and its logs are, not only the stock paths.
@@ -1405,7 +1429,6 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
         units.push(PlannedUnit { path, text, state });
     }
 
-    let mut steps = Steps::new();
     let account = ensure_service_account(layout, options, &mut steps)?;
 
     for (dir, mode, owned) in [
@@ -1455,6 +1478,31 @@ pub fn install_web(layout: &Layout, options: &Options) -> Result<Steps> {
         }
     }
 
+    Ok(steps)
+}
+
+/// Moves the host settings out of the database at `db_path`, if there is
+/// one, into `host_conf`, and writes `host_conf` either way, so that from
+/// here on its existence says "migrated" (see [`crate::hostconf`]).
+///
+/// Trusts the database only if it and its directory belong to this
+/// process's user — root, on a host; the user staging a `--prefix` tree,
+/// which is the only place such a run can write. Run before the
+/// directory is handed to the console, which is what makes it
+/// untrusted.
+fn move_host_settings(db_path: &Path, host_conf: &Path) -> Result<Steps> {
+    let mut steps = Steps::new();
+    if std::fs::symlink_metadata(host_conf).is_ok() {
+        return Ok(steps);
+    }
+    if db_path.is_file() {
+        let db = crate::db::Db::open(db_path)?;
+        // SAFETY: no preconditions; reads the process's own credentials.
+        let me = unsafe { libc::geteuid() };
+        let migrated = crate::hostconf::move_settings(&db, host_conf, me)?;
+        steps.extend(migrated.note(host_conf));
+    }
+    crate::hostconf::ensure_written_at(host_conf)?;
     Ok(steps)
 }
 
@@ -2981,6 +3029,46 @@ mod tests {
         ] {
             assert!(writable_in(&unit, path), "{path} is read-only:\n{unit}");
         }
+    }
+
+    /// **The upgrade from rc.2 keeps the operator's host settings.** They
+    /// are moved out of the database before its directory is handed to the
+    /// console: once it is the console's, its rows are deleted, not moved.
+    /// So the move comes first among the steps, ahead of every hand-over,
+    /// and the rows are in the host settings file afterwards, not lost.
+    #[test]
+    fn the_host_settings_are_moved_before_anything_is_handed_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = staged(dir.path());
+        std::fs::create_dir_all(&layout.state_dir).unwrap();
+        {
+            let db = crate::db::Db::open(&layout.db_path).unwrap();
+            db.set_text_setting(
+                crate::db::keys::NGINX_RELOAD_COMMAND,
+                "/usr/sbin/nginx -s reload",
+            )
+            .unwrap();
+        }
+
+        let steps = install_web(&layout, &Options::default()).unwrap();
+
+        let moved = steps
+            .iter()
+            .position(|step| step.contains(crate::db::keys::NGINX_RELOAD_COMMAND))
+            .unwrap_or_else(|| panic!("no step moved the settings: {steps:#?}"));
+        let handed = steps
+            .iter()
+            .position(|step| step.starts_with("give "))
+            .unwrap_or_else(|| panic!("no hand-over step: {steps:#?}"));
+        assert!(moved < handed, "handed over before moving: {steps:#?}");
+        let conf = std::fs::read_to_string(&layout.host_conf).unwrap();
+        assert!(conf.contains("/usr/sbin/nginx -s reload"), "{conf}");
+        let db = crate::db::Db::open(&layout.db_path).unwrap();
+        assert_eq!(
+            db.get_text_setting(crate::db::keys::NGINX_RELOAD_COMMAND)
+                .unwrap(),
+            None
+        );
     }
 
     /// `nginx -t` opens every log the config names, so a site logging

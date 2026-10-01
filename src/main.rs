@@ -3748,7 +3748,10 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     // service write there; `install_web` adds the root already stored.
     layout.nginx_roots = options.root.iter().chain(&legacy_root).cloned().collect();
 
-    let mut steps = install::install_web(&layout, &opts)?;
+    let db_path = options.db.clone().unwrap_or_else(|| layout.db_path.clone());
+    // Moves the host settings into host.conf first of all, before the
+    // database's directory is the console's; see `install_web`.
+    let mut steps = install::install_web_from(&layout, &opts, &db_path)?;
 
     let prefixed = prefix != Path::new("/");
 
@@ -3770,21 +3773,12 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
     let mut password = None;
     if !options.dry_run {
         // The host settings file of the tree being installed: the host's
-        // own, or the one under `--prefix`.
-        let host_path = if prefixed {
-            prefix.join(stop_bots::hostconf::DEFAULT_PATH.trim_start_matches('/'))
-        } else {
-            stop_bots::hostconf::path()
-        };
-        // Opened without `open_db`'s migration, which moves the rows into
-        // the host's own file: under `--prefix` they belong in the tree's.
-        // Before anything else touches it, and before the database is made
-        // the console's: a database the console's user owns is never
-        // migrated from.
-        let db = Db::open(options.db.clone().unwrap_or_else(|| layout.db_path.clone()))?;
-        if let Some(note) = stop_bots::hostconf::migrate(&db, &host_path)?.note(&host_path) {
-            steps.push(note);
-        }
+        // own, or the one under `--prefix`. `install_web` has written it.
+        let host_path = layout.host_conf.clone();
+        // Opened without `open_db`'s migration, which would move rows into
+        // the host's own file; `install_web` already moved them into this
+        // tree's, before the database's directory became the console's.
+        let db = Db::open(&db_path)?;
 
         let addr = web::resolve_bind(&db, options.bind.as_deref())?;
         let exposed = options.expose || db.get_bool_setting(web::EXPOSE_KEY, false)?;
@@ -3847,12 +3841,6 @@ fn run_install_web(options: InstallWeb) -> Result<()> {
         } else {
             steps.push("a console password is already set, keeping it".to_string());
         }
-
-        // The host settings file exists from here on, whatever there was to
-        // move into it (the migration above made it, as root): once the
-        // database below is the console's, nothing may be migrated from it,
-        // and the file's existence is what says so.
-        stop_bots::hostconf::ensure_written_at(&host_path)?;
 
         // After the writes, and while the path is still to hand. The
         // database, its companions and any pre-upgrade copies become the

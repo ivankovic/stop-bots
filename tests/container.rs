@@ -2723,10 +2723,15 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
         ),
         "/etc/systemd/system/stop-bots-web.service",
     );
-    // rc.2's database, as rc.2's root console and CLI made it.
+    // rc.2's database, as rc.2's root console and CLI made it. Every root
+    // CLI run comes before the rows below: this release's CLI moves them
+    // into host.conf, and no root command may run between them and
+    // `install web`, or the test exercises that move instead of the
+    // upgrade's.
     host.sh(&format!(
         "mkdir -p -m 700 /var/lib/stop-bots && stop-bots scan-sites --root /etc/nginx/sites-enabled --db {HOST_DB}"
     ));
+    host.seed_bot("badbot", "BadBot");
     // Not the defaults, so that what reaches host.conf is these.
     host.sh(&format!(
         "sqlite3 {HOST_DB} \"INSERT OR REPLACE INTO settings (key, value) VALUES \
@@ -2734,11 +2739,10 @@ fn an_rc_2_host_upgrades_to_an_unprivileged_console() {
            ('nginx:reload_command', '/usr/sbin/nginx -s reload'), \
            ('nginx:root', '/etc/nginx')\""
     ));
-    // rc.2 had no host settings file. The `scan-sites` above is this
-    // release's, and as root it made one, before there was anything to
-    // move into it; an rc.2 host has the rows and no file.
+    // rc.2 had no host settings file. The root commands above are this
+    // release's, and made one, before there was anything to move into
+    // it; an rc.2 host has the rows and no file.
     host.sh("rm -f /etc/stop-bots/host.conf");
-    host.seed_bot("badbot", "BadBot");
     host.sh("systemctl daemon-reload && systemctl enable --now stop-bots-web.service");
     host.wait_for_console();
     let user_of_console = || {
