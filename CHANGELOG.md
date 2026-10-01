@@ -21,8 +21,27 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   that is a link or has a second name, and changes owners and modes only by descriptor.
 - `uninstall` deletes a file the database's record names only if it is a plain file
   in a `conf.d` or `/etc/stop-bots/nginx` that starts with the stop-bots header.
+- The root helper answers only root and the `stop-bots` user (`SO_PEERCRED`), and only
+  seven typed operations — never a command, a path or config text. It reads the NGINX
+  commands, root and log paths from `/etc/stop-bots/host.conf`, finds sites on disk
+  rather than where a database row says they are, removes a recorded generated file only
+  inside this root's `conf.d` or `/etc/stop-bots/nginx`, and re-validates what it
+  renders.
+- The console's firewall render and apply also refuse to block the browser's own address
+  and anyone who logged in over SSH or to the console in the last 7 days.
+- A console that is not root and has no `--helper` is read-only: it shows everything,
+  and every action says it needs the helper.
 
 ### Changed
+
+- **The NGINX test and reload commands, the NGINX root and the log paths move from the
+  database to `/etc/stop-bots/host.conf`** (`key = value`, root's, 0644).
+  `set-nginx-commands`, `set-log-paths` and `install web --root` write it. The first
+  `sudo stop-bots` command after the upgrade (or `install web`) moves the stored values
+  into it and deletes them from the database, once, and only from a database root owns.
+- `stop-bots web --helper <socket>` does everything that needs root through the helper;
+  it cannot be combined with `--root`, `--firewall-out` or `--no-apply`.
+- `uninstall` keeps `/etc/stop-bots/host.conf` unless `--purge`, like the database.
 
 - Upgrading from rc.2: re-run `sudo stop-bots install web`. It replaces the unedited
   rc.2 unit without `--force`, gives `/var/lib/stop-bots` and the database to
