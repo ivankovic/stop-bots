@@ -51,8 +51,10 @@ CRATES="
 	chacha20@0.10.2
 	clap@4.6.7
 	clap_builder@4.6.7
+	clap_complete@4.6.11
 	clap_derive@4.6.7
 	clap_lex@1.1.1
+	clap_mangen@0.3.3
 	cmake@0.1.58
 	cmov@0.5.4
 	color_quant@1.1.0
@@ -247,7 +249,7 @@ CRATES="
 	quote@1.0.47
 	r-efi@5.3.0
 	r-efi@6.0.0
-	rand@0.10.2
+	rand@0.10.3
 	rand@0.8.8
 	rand_core@0.10.1
 	rand_core@0.6.4
@@ -268,6 +270,7 @@ CRATES="
 	resvg@0.48.1
 	rgb@0.8.53
 	ring@0.17.14
+	roff@1.1.1
 	roxmltree@0.20.0
 	roxmltree@0.21.1
 	rsqlite-vfs@0.1.1
