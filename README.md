@@ -423,18 +423,17 @@ restarts the console, so a new unit takes effect.
 
 **Two processes, and only one of them is root:**
 
-- **The console**, `stop-bots-web.service`, runs as the `stop-bots` user. It reads the NGINX
-  and SSH logs through the `adm` and `systemd-journal` groups, which its unit adds (nothing is
-  added to `/etc/group`), and writes its database and nothing else. It holds no Linux
-  capability, has no access to netlink, so it cannot change the firewall, and cannot see
-  systemd's sockets.
+- **The console**, `stop-bots-web.service`, runs as the `stop-bots` user. It writes its
+  database and nothing else, and reads no host file: `/var/log` is hidden from it, and it
+  gets the two logs its detectors need from the helper. It holds no Linux capability, has no
+  access to netlink, so it cannot change the firewall, and cannot see systemd's sockets.
 - **The helper**, `stop-bots-helper.service`, runs as root. systemd starts it when the console
   first connects to `/run/stop-bots/helper.sock` (`stop-bots-helper.socket`). Only root and the
   `stop-bots` group can open that socket, and the helper also checks the user of each caller.
   It writes the NGINX config and the firewall script, and runs `nginx -t`, the NGINX reload
   and `nft`. It accepts a fixed set of requests: apply NGINX, apply the firewall, set up Web
-  Access, find the sites, check the host's health. No request contains a path, a command or
-  config text. The NGINX commands, the NGINX config root and the log paths come from
+  Access, find the sites, check the host's health, and read the next part of the NGINX access
+  log or of sshd's login lines. No request contains a path, a command or config text. The NGINX commands, the NGINX config root and the log paths come from
   `/etc/stop-bots/host.conf`, which only root can write, not from the database.
 
 **What someone who takes over the console can do, and what they cannot.** If an attacker gets
@@ -443,7 +442,9 @@ code running in the console, they have the `stop-bots` user and what it can reac
 - They can do what a logged-in operator can do: change the blocking policy, block or unblock
   any address, and apply. The detectors run in the console, so they can also make it block or
   unblock anything.
-- They can read what the console reads: the logs, and the database with the password hash.
+- They can read what the console reads: the NGINX access log and sshd's authentication lines,
+  through the helper, and the database with the password hash. Not the rest of `/var/log`, and
+  not the journal of any other service.
 - They cannot get root through the console. They cannot write to `/etc`, cron, systemd units
   or binaries, cannot ask systemd to start anything, and cannot choose what the helper runs or
   which files it writes or deletes. The helper treats the database as hostile: it finds the
@@ -460,7 +461,8 @@ unit grants it.
 
 Both processes yield to the host: they run at `Nice=10` with idle I/O priority, and systemd
 throttles each at a quarter of RAM and stops it at half. `sudo stop-bots status` warns if the
-console runs as root, if it has no helper, or if its user cannot read a log it must read.
+console runs as root, if it has no helper, or if the helper cannot read a log the detectors
+need.
 
 Only Debian is checked for, because that is what has been tested; the units are very likely
 correct on any systemd distribution, but the SSH log path the console assumes is Debian's.
