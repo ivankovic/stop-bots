@@ -372,9 +372,9 @@ fn helper_db_template() -> &'static Path {
             stop_bots::botlist::register_all_sources(&db).unwrap();
             db.block_address_permanently("192.0.2.10", stop_bots::db::RuleSource::Tui, None)
                 .unwrap();
-            // Checkpointed before it is copied, so the one file is the
-            // whole database and no `-wal` holds part of it.
-            db.vacuum().unwrap();
+            // Closed before it is copied: the last connection to close
+            // checkpoints the `-wal` into the file and removes it, so the
+            // one file is the whole database.
             drop(db);
             (dir, path)
         })

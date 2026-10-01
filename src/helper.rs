@@ -42,10 +42,11 @@
 //!
 //! ## One at a time
 //!
-//! Requests are served one at a time, behind a mutex, and an apply also
-//! takes [`crate::applylock`], which the CLI and the TUI share. Each
-//! operation has [`OP_DEADLINE`] to finish; past it the client is told so.
-//! At most [`MAX_CONNECTIONS`] are open at once.
+//! Requests are served one at a time, and an apply also takes
+//! [`crate::applylock`], which the CLI and the TUI share. A request waits
+//! at most [`OP_DEADLINE`] for its turn, and is then refused rather than
+//! run late; one that has started has as long again to finish, past which
+//! the client is told so. At most [`MAX_CONNECTIONS`] are open at once.
 //!
 //! ## What is logged
 //!
@@ -58,7 +59,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -145,13 +146,56 @@ pub fn peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     Ok(credentials.uid)
 }
 
+/// Whose turn it is to run an operation: one at a time.
+///
+/// A flag and a condition variable rather than a `Mutex<()>`, because the
+/// turn is taken on the connection's thread — so a request that waits too
+/// long is answered "busy" and never runs at all — and given back by the
+/// worker that runs the operation, which may outlive the wait for it.
+#[derive(Default)]
+struct Turns {
+    taken: Mutex<bool>,
+    freed: Condvar,
+}
+
+/// A turn, given back when dropped.
+struct Turn(Arc<Turns>);
+
+impl Turns {
+    /// Waits at most `wait` for the turn.
+    fn take(self: &Arc<Self>, wait: Duration) -> Option<Turn> {
+        let until = Instant::now() + wait;
+        let mut taken = self.taken.lock().unwrap_or_else(|p| p.into_inner());
+        while *taken {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            taken = self
+                .freed
+                .wait_timeout(taken, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        *taken = true;
+        Some(Turn(Arc::clone(self)))
+    }
+}
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        *self.0.taken.lock().unwrap_or_else(|p| p.into_inner()) = false;
+        self.0.freed.notify_one();
+    }
+}
+
 /// The server: [`Server::serve`] answers connections until the listener
 /// fails.
 #[derive(Clone)]
 pub struct Server {
     config: Arc<Config>,
-    /// Held while an operation runs: one at a time.
-    busy: Arc<Mutex<()>>,
+    /// One operation at a time.
+    turns: Arc<Turns>,
     /// Connections being served now.
     open: Arc<AtomicUsize>,
 }
@@ -160,7 +204,7 @@ impl Server {
     pub fn new(config: Config) -> Self {
         Server {
             config: Arc::new(config),
-            busy: Arc::default(),
+            turns: Arc::default(),
             open: Arc::default(),
         }
     }
@@ -176,15 +220,19 @@ impl Server {
             };
             if self.open.fetch_add(1, Ordering::SeqCst) >= self.config.max_connections {
                 self.open.fetch_sub(1, Ordering::SeqCst);
+                let uid = peer_uid(&stream).ok();
                 log(
-                    peer_uid(&stream).ok(),
+                    uid,
                     "-",
                     None,
                     "refused: too many connections",
                     Duration::ZERO,
                 );
-                let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-                let _ = reply(&stream, &Err("the helper is busy; try again".to_string()));
+                // Said only to a peer it would have answered.
+                if uid.is_some_and(|uid| self.config.allowed_uids.contains(&uid)) {
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+                    let _ = reply(&stream, &Err("the helper is busy; try again".to_string()));
+                }
                 continue;
             }
             let server = self.clone();
@@ -242,18 +290,30 @@ impl Server {
         log(Some(uid), name, site, &outcome, started.elapsed());
     }
 
-    /// Runs `op` on a thread of its own, behind [`Server::busy`], and waits
-    /// at most [`Config::op_deadline`] for it.
+    /// Runs `op` on a thread of its own once it is its turn (see [`Turns`]),
+    /// waiting at most [`Config::op_deadline`] for the turn and as long
+    /// again for the operation.
+    ///
+    /// A request still waiting for its turn at the deadline is answered
+    /// "busy" and is not run later: whoever asked has been told no. One
+    /// that has started finishes even if its client has stopped waiting —
+    /// an apply abandoned half-way is worse than one that ends late — and
+    /// the next waits for it.
     fn run(&self, op: Op) -> std::result::Result<Reply, String> {
+        let Some(turn) = self.turns.take(self.config.op_deadline) else {
+            return Err(format!(
+                "the helper has been busy with another request for {} seconds; nothing was \
+                 done, try again",
+                self.config.op_deadline.as_secs()
+            ));
+        };
         let (done, result) = mpsc::channel();
         let server = self.clone();
         std::thread::spawn(move || {
-            // A panic while holding it leaves nothing half-done that the
-            // next operation could trip over: each opens its own database.
-            let _busy = server
-                .busy
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Given back however this ends, a panic included: each
+            // operation opens its own database, so nothing is left
+            // half-done for the next to trip over.
+            let _turn = turn;
             let answer = crate::db::Db::open_untrusted(&server.config.db_path)
                 .and_then(|db| crate::privileged::execute(&server.config.settings, &db, op))
                 .map_err(|err| format!("{err:#}"));
@@ -368,9 +428,10 @@ fn log(uid: Option<u32>, op: &str, site: Option<i64>, outcome: &str, took: Durat
     );
 }
 
-/// Asks the helper on `socket` to do `op`, and waits for the answer.
+/// Asks the helper on `socket` to do `op`, and waits for the answer: as
+/// long as the helper may take to give it a turn and then to run it.
 pub fn call(socket: &Path, op: &Op) -> Result<Reply> {
-    call_with(socket, op, OP_DEADLINE + REQUEST_DEADLINE)
+    call_with(socket, op, 2 * OP_DEADLINE + REQUEST_DEADLINE)
 }
 
 /// [`call`], waiting at most `timeout` for the answer.

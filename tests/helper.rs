@@ -206,6 +206,67 @@ async fn concurrent_clients_are_served_one_at_a_time() {
     }
 }
 
+/// A request that waits past the deadline for its turn is told the helper
+/// is busy, and is never run afterwards: whoever asked has been told no.
+/// The first request here takes longer than the deadline; the second asks
+/// while it runs.
+#[tokio::test]
+async fn a_request_that_waits_too_long_for_its_turn_is_refused_and_never_run() {
+    let host = HelperHost::new();
+    let log = host.dir.path().join("tests.log");
+    let check = host.dir.path().join("check");
+    write_script(
+        &check,
+        &format!(
+            "echo start >> {log}\nsleep 0.4\necho end >> {log}\n",
+            log = log.display()
+        ),
+    );
+    stop_bots::hostconf::HostConf {
+        nginx_test_command: Some(check.display().to_string()),
+        ..stop_bots::hostconf::HostConf::load_from(&host.host_conf).unwrap()
+    }
+    .save_to(&host.host_conf)
+    .unwrap();
+    let socket = host.serve_with(stop_bots::helper::Config {
+        op_deadline: Duration::from_millis(150),
+        ..host.config(vec![own_uid()])
+    });
+    let console = |name: &str| Op::WebAccess {
+        mode: WebAccessMode::Subdomain,
+        site_id: None,
+        prefix: String::new(),
+        host: format!("{name}.example.com"),
+        reload: false,
+    };
+
+    let first = tokio::spawn({
+        let client = helper(&socket);
+        let op = console("first");
+        async move { client.web_access(op).await }
+    });
+    while !std::fs::read_to_string(&log).is_ok_and(|log| log.contains("start")) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second = helper(&socket).web_access(console("second")).await;
+    let first = first.await.unwrap();
+
+    let second = format!("{:#}", second.unwrap_err());
+    assert!(second.contains("nothing was done"), "{second}");
+    assert!(
+        format!("{:#}", first.unwrap_err()).contains("did not finish"),
+        "the first outran its deadline"
+    );
+    // The first finishes in its own time; the second never starts.
+    while !std::fs::read_to_string(&log).is_ok_and(|log| log.contains("end")) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "start\nend\n");
+    let written = std::fs::read_to_string(stop_bots::nginx::console_site_path(&host.root)).unwrap();
+    assert!(written.contains("first.example.com"), "{written}");
+}
+
 // ---- the same outcome in process and through the helper ----
 
 /// Two identical hosts, one driven in process and one through the helper:
