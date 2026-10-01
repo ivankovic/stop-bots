@@ -357,10 +357,12 @@ mod tests {
         Connection::open(&path)
             .unwrap()
             .execute_batch(
-                "CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+                "BEGIN;
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
                  CREATE TABLE fired (what TEXT);
                  CREATE TRIGGER planted AFTER INSERT ON settings
-                   BEGIN INSERT INTO fired VALUES ('insert'); END;",
+                   BEGIN INSERT INTO fired VALUES ('insert'); END;
+                 COMMIT;",
             )
             .unwrap();
         let fired = |guard: Option<Guard>, key: &str| -> i64 {

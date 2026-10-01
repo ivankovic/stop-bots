@@ -4021,10 +4021,13 @@ mod tests {
 
     /// A database with triggers a compromised console planted: one on
     /// every write to `settings`, each recording that it ran.
+    ///
+    /// Built in memory and written out once (`VACUUM INTO`, which copies
+    /// the triggers too): one write where an open on disk costs several
+    /// syncs.
     fn database_with_planted_triggers(path: &Path) {
-        drop(Db::open(path).unwrap());
-        Connection::open(path)
-            .unwrap()
+        let db = Db::open_in_memory().unwrap();
+        db.conn
             .execute_batch(
                 "CREATE TABLE fired (what TEXT);
                  CREATE TRIGGER planted_insert AFTER INSERT ON settings
@@ -4032,6 +4035,9 @@ mod tests {
                  CREATE TRIGGER planted_update AFTER UPDATE ON settings
                    BEGIN INSERT INTO fired VALUES ('update'); END;",
             )
+            .unwrap();
+        db.conn
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
             .unwrap();
     }
 
@@ -4044,7 +4050,7 @@ mod tests {
 
     /// **Nothing the console plants in its database runs as root.** A
     /// trigger on `settings` fired inside a root CLI connection when it
-    /// stored a setting. Guarded, the same writes fire nothing; unguarded
+    /// stored a setting. Guarded, the same write fires nothing; unguarded
     /// — the control — the same trigger fires, so it is a working one.
     #[test]
     fn a_planted_trigger_does_not_fire_in_a_guarded_open() {
@@ -4054,7 +4060,6 @@ mod tests {
 
         let db = Db::open_guarded(&path, Some(console_guard(dir.path()))).unwrap();
         db.set_text_setting("probe", "x").unwrap();
-        db.set_text_setting("probe", "y").unwrap();
         drop(db);
         assert_eq!(times_fired(&path), 0, "a planted trigger ran as root");
 

@@ -899,62 +899,84 @@ mod tests {
     /// Root in the console's directory opens with triggers, views and the
     /// schema's trust off and defensive mode on — and every old release
     /// still upgrades under that, copy and all.
+    fn upgrades_through_a_hardened_connection(sql: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        pre_0_1_database(&path, sql);
+
+        let db = Db::open_guarded(&path, Some(guard_of(dir.path()))).unwrap();
+
+        assert_eq!(version_of(&db), CURRENT_VERSION);
+        assert!(backup_path(&path, 0).exists(), "no copy");
+    }
+
     #[test]
-    fn every_old_release_upgrades_through_a_hardened_connection() {
-        for (release, sql) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("db.sqlite3");
-            pre_0_1_database(&path, sql);
+    fn a_0_0_1_database_upgrades_through_a_hardened_connection() {
+        upgrades_through_a_hardened_connection(DB_0_0_1);
+    }
 
-            let db = Db::open_guarded(&path, Some(guard_of(dir.path()))).unwrap();
-
-            assert_eq!(version_of(&db), CURRENT_VERSION, "{release}");
-            assert!(backup_path(&path, 0).exists(), "{release}: no copy");
-        }
+    #[test]
+    fn a_0_0_15_database_upgrades_through_a_hardened_connection() {
+        upgrades_through_a_hardened_connection(DB_0_0_15);
     }
 
     /// **The helper never migrates.** A database at any version but this
-    /// binary's is refused, with the command that upgrades it, and left
-    /// exactly as it was: no copy beside it, the version unchanged.
+    /// binary's is refused, with what `says` (the command that upgrades
+    /// it), and left exactly as it was: no copy beside it, the version
+    /// unchanged.
+    fn the_helper_refuses(make: impl FnOnce(&Path), says: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        make(&path);
+        let before = version_on_disk(&path);
+
+        let err = Db::open_untrusted(&path).err().expect("opened it");
+
+        assert!(format!("{err:#}").contains(says), "{err:#}");
+        assert_eq!(version_on_disk(&path), before, "migrated");
+        let copies: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".bak-v"))
+            .collect();
+        assert!(copies.is_empty(), "copied to {copies:?}");
+    }
+
+    /// A current database with its version set to `version`.
+    /// Built in memory and written out once (`VACUUM INTO`), which costs
+    /// one write where an open on disk costs several syncs.
+    fn current_database_claiming(path: &Path, version: u32) {
+        let db = Db::open_in_memory().unwrap();
+        db.conn
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        db.conn
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+    }
+
     #[test]
-    fn the_helper_refuses_a_database_at_another_version_and_changes_nothing() {
-        let older = |path: &Path| pre_0_1_database(path, DB_0_0_15);
-        let lowered = |path: &Path| {
-            drop(Db::open(path).unwrap());
-            Connection::open(path)
-                .unwrap()
-                .pragma_update(None, "user_version", CURRENT_VERSION - 1)
-                .unwrap();
-        };
-        let newer = |path: &Path| {
-            drop(Db::open(path).unwrap());
-            Connection::open(path)
-                .unwrap()
-                .pragma_update(None, "user_version", CURRENT_VERSION + 1)
-                .unwrap();
-        };
-        for (what, make, says) in [
-            ("a 0.0.15 database", &older as &dyn Fn(&Path), "install web"),
-            ("a lowered version", &lowered, "install web"),
-            ("a newer version", &newer, "only knows versions up to"),
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("db.sqlite3");
-            make(&path);
-            let before = version_on_disk(&path);
+    fn the_helper_refuses_an_old_release_s_database_and_changes_nothing() {
+        the_helper_refuses(|path| pre_0_1_database(path, DB_0_0_15), "install web");
+    }
 
-            let err = Db::open_untrusted(&path).err().expect(what);
+    /// A console that lowers the version to have root copy and rewrite
+    /// its database on every request gets a refusal instead.
+    #[test]
+    fn the_helper_refuses_a_lowered_version_and_changes_nothing() {
+        the_helper_refuses(
+            |path| current_database_claiming(path, CURRENT_VERSION - 1),
+            "install web",
+        );
+    }
 
-            assert!(format!("{err:#}").contains(says), "{what}: {err:#}");
-            assert_eq!(version_on_disk(&path), before, "{what}: migrated");
-            let copies: Vec<_> = std::fs::read_dir(dir.path())
-                .unwrap()
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.contains(".bak-v"))
-                .collect();
-            assert!(copies.is_empty(), "{what}: copied to {copies:?}");
-        }
+    #[test]
+    fn the_helper_refuses_a_newer_version_and_changes_nothing() {
+        the_helper_refuses(
+            |path| current_database_claiming(path, CURRENT_VERSION + 1),
+            "only knows versions up to",
+        );
     }
 
     #[test]
