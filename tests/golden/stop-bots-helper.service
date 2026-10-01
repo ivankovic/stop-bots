@@ -59,8 +59,10 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_OVERRIDE CAP_CHOWN CAP_F
 # AF_UNIX for the console's requests, the D-Bus socket `systemctl reload
 # nginx` talks over and a Docker socket for `docker exec`; AF_NETLINK
 # because both `nft` and Debian's nft-backed `iptables` reach the kernel
-# over netlink. It downloads nothing, so no AF_INET.
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+# over netlink. AF_INET and AF_INET6 not for downloads -- it makes none --
+# but for `nginx -t`, which opens a socket for every `listen` and fails
+# without them.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 UMask=0077
 
 # stop-bots is here to protect the sites on this host, so it must never be

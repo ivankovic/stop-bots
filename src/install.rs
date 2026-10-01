@@ -816,10 +816,14 @@ pub fn helper_socket_unit(layout: &Layout) -> String {
 /// The sandbox the console had while it ran as root, because it now does
 /// what the console did then: `ProtectSystem=strict` with the paths it
 /// writes given back ([`writable_paths`]), and the capabilities applying
-/// takes. It binds nothing, so not `CAP_NET_BIND_SERVICE`, and talks to
-/// no network, so `AF_UNIX` (the console, D-Bus for the NGINX reload, a
-/// Docker socket for `docker exec`) and `AF_NETLINK` (nft) only. No
-/// `[Install]`: the socket is what is enabled.
+/// takes. It binds nothing, so not `CAP_NET_BIND_SERVICE`. Its address
+/// families are the console's old ones, and none fewer: `AF_INET` and
+/// `AF_INET6` look like a helper with no business on a network, but
+/// `nginx -t`, which runs inside this unit, opens a socket for every
+/// `listen` it checks and resolves host names in `proxy_pass`, and fails
+/// with "Address family not supported by protocol" without them — the
+/// container suite watched it. No `[Install]`: the socket is what is
+/// enabled.
 pub fn helper_unit(layout: &Layout) -> String {
     let writable: String = writable_paths(layout)
         .iter()
@@ -877,8 +881,10 @@ pub fn helper_unit(layout: &Layout) -> String {
          # AF_UNIX for the console's requests, the D-Bus socket `systemctl reload\n\
          # nginx` talks over and a Docker socket for `docker exec`; AF_NETLINK\n\
          # because both `nft` and Debian's nft-backed `iptables` reach the kernel\n\
-         # over netlink. It downloads nothing, so no AF_INET.\n\
-         RestrictAddressFamilies=AF_UNIX AF_NETLINK\n\
+         # over netlink. AF_INET and AF_INET6 not for downloads -- it makes none --\n\
+         # but for `nginx -t`, which opens a socket for every `listen` and fails\n\
+         # without them.\n\
+         RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n\
          UMask=0077\n\
          \n\
          {yield_to_the_host}\
@@ -2907,13 +2913,15 @@ mod tests {
         assert!(!web_unit(&layout).contains("\nSupplementaryGroups="));
     }
 
-    /// The helper reaches the kernel's firewall and systemd and nothing
-    /// on any network.
+    /// The helper is root and has no `User=`; it reaches the kernel's
+    /// firewall over netlink, and keeps the internet families only because
+    /// `nginx -t` will not run without them (see [`helper_unit`]).
     #[test]
-    fn the_helper_talks_to_the_kernel_and_systemd_but_no_network() {
+    fn the_helper_is_root_with_the_families_nginx_t_needs() {
         let unit = helper_unit(&system_layout());
         assert!(
-            directives(&unit).contains(&"RestrictAddressFamilies=AF_UNIX AF_NETLINK"),
+            directives(&unit)
+                .contains(&"RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"),
             "{unit}"
         );
         assert!(!directives(&unit)
