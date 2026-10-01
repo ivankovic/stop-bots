@@ -1337,6 +1337,11 @@ impl Db {
         let conn = Connection::open_with_flags(path, flags)
             .with_context(|| format!("failed to open database: {}", path.display()))
             .map_err(|err| not_yours(path, err, crate::hint::is_root()))?;
+        // Root in the console's directory: the file, its schema included,
+        // is the console's to write, so nothing in it may run here.
+        if guard.is_some() {
+            guard::harden(&conn, path)?;
+        }
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("failed to set the database busy timeout")?;
         use_write_ahead_log(&conn);
@@ -1351,30 +1356,37 @@ impl Db {
     /// in. Unlike [`Db::open`], this:
     ///
     /// - never creates the file or the directory, and changes no mode;
-    /// - refuses a database path that is a link (`SQLITE_OPEN_NOFOLLOW`).
-    ///   SQLite itself opens the `-wal`, `-shm` and `-journal` files with
-    ///   `O_NOFOLLOW`, so a link planted at one of those fails the open
-    ///   rather than having root write through it;
-    /// - turns on SQLite's defensive mode, which refuses the statements
-    ///   that can corrupt a database file deliberately, and
-    ///   `cell_size_check`, which checks pages for the malformations a
-    ///   crafted file would carry;
-    /// - turns triggers and views off, and `trusted_schema` off. This
-    ///   schema has neither triggers nor views, so one in the file was put
-    ///   there by somebody else, and none of it may run as root.
+    /// - refuses a database, `-wal`, `-shm` or `-journal` that is a link,
+    ///   not a regular file, or has a second name (a hard link), as
+    ///   [`guard::Guard::check`] does, and opens with
+    ///   `SQLITE_OPEN_NOFOLLOW`. SQLite itself opens the companions with
+    ///   `O_NOFOLLOW`, so a link planted at one after the check fails the
+    ///   open rather than having root write through it;
+    /// - hardens the connection ([`guard::harden`]): no trigger, view or
+    ///   untrusted schema function runs, and defensive mode is on;
+    /// - **never migrates.** A database at any schema version but this
+    ///   binary's is refused: an upgrade copies the file (`VACUUM INTO`)
+    ///   into the console's directory and rewrites its schema, and root
+    ///   does that only when an administrator runs it, through
+    ///   [`Db::open`] — `install web` or any root CLI command.
     pub fn open_untrusted<P: AsRef<Path>>(path: P) -> Result<Self> {
-        use rusqlite::config::DbConfig;
         use rusqlite::OpenFlags;
+        use std::os::unix::fs::MetadataExt;
 
         let path = path.as_ref();
-        let meta = std::fs::symlink_metadata(path)
+        std::fs::symlink_metadata(path)
             .with_context(|| format!("failed to open database: {}", path.display()))?;
-        if !meta.is_file() {
-            anyhow::bail!(
-                "refusing to open {}: it is not a regular file",
-                path.display()
-            );
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        let owner =
+            std::fs::metadata(dir).with_context(|| format!("failed to read {}", dir.display()))?;
+        guard::Guard {
+            uid: owner.uid(),
+            gid: owner.gid(),
         }
+        .check(path)?;
         let conn = Connection::open_with_flags(
             path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -1382,20 +1394,10 @@ impl Db {
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )
         .with_context(|| format!("failed to open database: {}", path.display()))?;
-        for (config, on) in [
-            (DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true),
-            (DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false),
-            (DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false),
-            (DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false),
-        ] {
-            conn.set_db_config(config, on).with_context(|| {
-                format!("failed to harden the connection to {}", path.display())
-            })?;
-        }
-        conn.pragma_update(None, "cell_size_check", true)?;
+        guard::harden(&conn, path)?;
         conn.busy_timeout(BUSY_TIMEOUT)
             .context("failed to set the database busy timeout")?;
-        schema::migrate(&conn, Some(path))?;
+        schema::require_current(&conn, path)?;
         Ok(Db { conn })
     }
 
@@ -4015,6 +4017,71 @@ mod tests {
 
         assert_eq!(db.get_text_setting("probe").unwrap().as_deref(), Some("x"));
         assert_eq!(mode_of(&path), 0o600);
+    }
+
+    /// A database with triggers a compromised console planted: one on
+    /// every write to `settings`, each recording that it ran.
+    fn database_with_planted_triggers(path: &Path) {
+        drop(Db::open(path).unwrap());
+        Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE fired (what TEXT);
+                 CREATE TRIGGER planted_insert AFTER INSERT ON settings
+                   BEGIN INSERT INTO fired VALUES ('insert'); END;
+                 CREATE TRIGGER planted_update AFTER UPDATE ON settings
+                   BEGIN INSERT INTO fired VALUES ('update'); END;",
+            )
+            .unwrap();
+    }
+
+    fn times_fired(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM fired", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// **Nothing the console plants in its database runs as root.** A
+    /// trigger on `settings` fired inside a root CLI connection when it
+    /// stored a setting. Guarded, the same writes fire nothing; unguarded
+    /// — the control — the same trigger fires, so it is a working one.
+    #[test]
+    fn a_planted_trigger_does_not_fire_in_a_guarded_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        database_with_planted_triggers(&path);
+
+        let db = Db::open_guarded(&path, Some(console_guard(dir.path()))).unwrap();
+        db.set_text_setting("probe", "x").unwrap();
+        db.set_text_setting("probe", "y").unwrap();
+        drop(db);
+        assert_eq!(times_fired(&path), 0, "a planted trigger ran as root");
+
+        Db::open(&path)
+            .unwrap()
+            .set_text_setting("probe", "z")
+            .unwrap();
+        assert!(times_fired(&path) > 0, "the control did not fire either");
+    }
+
+    /// The helper's open: the same, and a database with a second name is
+    /// refused as the guard refuses one.
+    #[test]
+    fn the_helper_runs_no_planted_trigger_and_refuses_a_hard_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        database_with_planted_triggers(&path);
+
+        Db::open_untrusted(&path)
+            .unwrap()
+            .set_text_setting("probe", "x")
+            .unwrap();
+        assert_eq!(times_fired(&path), 0, "a planted trigger ran in the helper");
+
+        std::fs::hard_link(&path, dir.path().join("second-name")).unwrap();
+        let err = Db::open_untrusted(&path).err().expect("opened a hard link");
+        assert!(format!("{err:#}").contains("hard link"), "{err:#}");
     }
 
     /// Tightening a mode goes through a descriptor that does not follow a

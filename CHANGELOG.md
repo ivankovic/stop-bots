@@ -41,6 +41,12 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   put back after a refused test by `openat`/`unlinkat`/`renameat`, never by path.
   This covers applies, previews, the TUI and `uninstall`. A FIFO there is not read.
 - The trust file gets each trusted address trimmed, as it was validated.
+- Root opening the console's database (every CLI verb, the TUI, `install`, `uninstall`)
+  runs no trigger or view in it: defensive mode on, triggers, views and
+  `trusted_schema` off, as the helper already had.
+- The root helper never upgrades the database: one at another schema version is
+  refused until `sudo stop-bots install web` (or any root command) upgrades it. It also
+  refuses a database with a second name (a hard link).
 
 ### Changed
 

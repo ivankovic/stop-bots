@@ -206,6 +206,27 @@ pub(super) fn migrate(conn: &Connection, path: Option<&Path>) -> Result<()> {
     }
 }
 
+/// Refuses the database on `conn` unless it is at [`CURRENT_VERSION`],
+/// and changes nothing either way. For the root helper, which opens a
+/// database the console's user can write and must never upgrade it: an
+/// upgrade copies the file into the console's directory and rewrites its
+/// schema, which root does only when an administrator asks.
+pub(super) fn require_current(conn: &Connection, path: &Path) -> Result<()> {
+    let found = user_version(conn)?;
+    refuse_if_newer(found, Some(path))?;
+    if found != CURRENT_VERSION {
+        bail!(
+            "the database {} is at schema version {found}, and this stop-bots ({}) works on \
+             version {CURRENT_VERSION}. The root helper never upgrades a database the console \
+             can write; run `sudo stop-bots install web` (or any `sudo stop-bots` command) to \
+             upgrade it, then try again",
+            path.display(),
+            env!("CARGO_PKG_VERSION"),
+        );
+    }
+    Ok(())
+}
+
 fn user_version(conn: &Connection) -> Result<u32> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -858,6 +879,93 @@ mod tests {
         let conn = Connection::open(path).unwrap();
         conn.execute_batch("PRAGMA synchronous = OFF").unwrap();
         conn.execute_batch(sql).unwrap();
+    }
+
+    /// The guard root opens the console's database under, as if `dir`
+    /// were the console's.
+    fn guard_of(dir: &Path) -> crate::db::guard::Guard {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(dir).unwrap();
+        crate::db::guard::Guard {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        }
+    }
+
+    fn version_on_disk(path: &Path) -> u32 {
+        user_version(&Connection::open(path).unwrap()).unwrap()
+    }
+
+    /// Root in the console's directory opens with triggers, views and the
+    /// schema's trust off and defensive mode on — and every old release
+    /// still upgrades under that, copy and all.
+    #[test]
+    fn every_old_release_upgrades_through_a_hardened_connection() {
+        for (release, sql) in [("0.0.1", DB_0_0_1), ("0.0.15", DB_0_0_15)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db.sqlite3");
+            pre_0_1_database(&path, sql);
+
+            let db = Db::open_guarded(&path, Some(guard_of(dir.path()))).unwrap();
+
+            assert_eq!(version_of(&db), CURRENT_VERSION, "{release}");
+            assert!(backup_path(&path, 0).exists(), "{release}: no copy");
+        }
+    }
+
+    /// **The helper never migrates.** A database at any version but this
+    /// binary's is refused, with the command that upgrades it, and left
+    /// exactly as it was: no copy beside it, the version unchanged.
+    #[test]
+    fn the_helper_refuses_a_database_at_another_version_and_changes_nothing() {
+        let older = |path: &Path| pre_0_1_database(path, DB_0_0_15);
+        let lowered = |path: &Path| {
+            drop(Db::open(path).unwrap());
+            Connection::open(path)
+                .unwrap()
+                .pragma_update(None, "user_version", CURRENT_VERSION - 1)
+                .unwrap();
+        };
+        let newer = |path: &Path| {
+            drop(Db::open(path).unwrap());
+            Connection::open(path)
+                .unwrap()
+                .pragma_update(None, "user_version", CURRENT_VERSION + 1)
+                .unwrap();
+        };
+        for (what, make, says) in [
+            ("a 0.0.15 database", &older as &dyn Fn(&Path), "install web"),
+            ("a lowered version", &lowered, "install web"),
+            ("a newer version", &newer, "only knows versions up to"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("db.sqlite3");
+            make(&path);
+            let before = version_on_disk(&path);
+
+            let err = Db::open_untrusted(&path).err().expect(what);
+
+            assert!(format!("{err:#}").contains(says), "{what}: {err:#}");
+            assert_eq!(version_on_disk(&path), before, "{what}: migrated");
+            let copies: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.contains(".bak-v"))
+                .collect();
+            assert!(copies.is_empty(), "{what}: copied to {copies:?}");
+        }
+    }
+
+    #[test]
+    fn the_helper_opens_a_current_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.sqlite3");
+        drop(Db::open(&path).unwrap());
+
+        let db = Db::open_untrusted(&path).unwrap();
+
+        assert_eq!(version_of(&db), CURRENT_VERSION);
     }
 
     /// Under WAL, committed rows can still be in the `-wal` rather than
