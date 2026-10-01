@@ -2597,6 +2597,77 @@ fn the_console_unit_refuses_every_way_up() {
     );
 }
 
+/// **A trigger the console plants runs nowhere as root.** Written as the
+/// console's user straight into its database: one trigger on every write
+/// to `settings`. Root CLI runs that write a setting then store theirs,
+/// and the trigger's table stays empty. The control is the console's user
+/// writing a setting the same way, which fires it.
+#[test]
+fn a_trigger_the_console_plants_does_not_fire_in_a_root_cli_run() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-planted-trigger");
+    host.sh(&format!(
+        "cat > /run/plant.sql <<'SQL'\n\
+         CREATE TABLE fired (what TEXT);\n\
+         CREATE TRIGGER planted_insert AFTER INSERT ON settings\n\
+           BEGIN INSERT INTO fired VALUES ('insert'); END;\n\
+         CREATE TRIGGER planted_update AFTER UPDATE ON settings\n\
+           BEGIN INSERT INTO fired VALUES ('update'); END;\n\
+         SQL\n\
+         chmod 644 /run/plant.sql && \
+         /usr/sbin/runuser -u stop-bots -- sqlite3 {HOST_DB} < /run/plant.sql"
+    ));
+    let fired = || {
+        host.sh(&format!("sqlite3 {HOST_DB} 'SELECT count(*) FROM fired'"))
+            .trim()
+            .to_string()
+    };
+
+    host.stop_bots("set-auto-apply --enabled true");
+    host.stop_bots("trust --address 192.0.2.5");
+    assert_eq!(fired(), "0", "a planted trigger ran in a root CLI run");
+
+    host.sh(&format!(
+        "/usr/sbin/runuser -u stop-bots -- sqlite3 {HOST_DB} \
+         \"INSERT OR REPLACE INTO settings (key, value) VALUES ('probe', 'x')\""
+    ));
+    assert_ne!(fired(), "0", "the control did not fire either");
+}
+
+/// **A link the console names like a pre-upgrade copy does not stop an
+/// upgrade.** `install web` skips it, says so, follows nothing, and
+/// finishes.
+#[test]
+fn a_planted_copy_beside_the_database_does_not_stop_install_web() {
+    if !enabled() {
+        return;
+    }
+    let host = Host::units_installed("stop-bots-planted-copy");
+    let canary = "/etc/stop-bots-canary";
+    host.sh(&format!("echo secret > {canary} && chmod 600 {canary}"));
+    host.sh(&format!(
+        "/usr/sbin/runuser -u stop-bots -- ln -s {canary} {HOST_DB}.bak-v99"
+    ));
+
+    let (ok, stdout, stderr) = host.run("stop-bots install web --no-start");
+
+    assert!(
+        ok,
+        "install web failed over the planted copy:\n{stdout}{stderr}"
+    );
+    assert!(
+        stdout.contains(&format!("{HOST_DB}.bak-v99")),
+        "it did not say it skipped it:\n{stdout}"
+    );
+    assert_eq!(
+        host.sh(&format!("stat -c '%U %a' {canary}")).trim(),
+        "root 600",
+        "the link's target was handed over"
+    );
+}
+
 /// The logs the detectors read are readable through the groups the unit
 /// adds, and only through them: NGINX's access log is `www-data:adm
 /// 0640`, the journal the `systemd-journal` group's.
