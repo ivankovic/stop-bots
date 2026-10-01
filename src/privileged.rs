@@ -435,6 +435,11 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
+/// What a console that has neither root nor a helper says on every page.
+pub const READ_ONLY_NOTICE: &str =
+    "Read-only: this console has neither root nor its helper, so every change to the host \
+     needs the helper — run `sudo stop-bots install web`.";
+
 /// What a console that has neither root nor a helper says to every action.
 pub const NEEDS_HELPER: &str =
     "This console runs without root and without its helper, so it cannot change the host: \

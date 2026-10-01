@@ -83,7 +83,7 @@ impl Ctx {
         // A console that cannot change the host says so on every page, not
         // only when an action is refused.
         let read_only = (state.privilege == crate::web::state::Privilege::ReadOnly)
-            .then_some(crate::privileged::NEEDS_HELPER);
+            .then_some(crate::privileged::READ_ONLY_NOTICE);
         let db_notice = match (state.db_notice.as_deref(), read_only) {
             (Some(notice), Some(read_only)) => Some(format!("{notice}. {read_only}")),
             (notice, read_only) => notice.or(read_only).map(str::to_string),
