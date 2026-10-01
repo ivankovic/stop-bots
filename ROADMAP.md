@@ -120,6 +120,14 @@ Sizes are rough: **S** an afternoon, **M** a day or two, **L** most of a week.
   switch to `iptables-restore --noflush` for the one chain, or refuse feeds and geo
   blocking on iptables and label it IPv4-only in the UI. **S** (label) / **M** (restore)
 
+- [ ] **The web console runs unprivileged.** A compromised console must not be root
+  on the host. Under rc.2's sandbox it still could be: it reaches systemd over D-Bus,
+  and it writes the NGINX config that NGINX's root master loads. The console runs as
+  a `stop-bots` user; a small root helper, reached over a local socket, does each
+  privileged action from a closed list, and treats the database as hostile. Host
+  settings that tell root what to run or where to write move into the root-owned
+  `/etc/stop-bots/host.conf`. **L**
+
 ### B. Upgrades don't break you
 
 - [x] **Schema versioning.**
