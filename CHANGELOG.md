@@ -33,6 +33,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   `uninstall --purge` also removes the `stop-bots` user and group.
 - A copy taken before a schema upgrade (`.bak-v*`), and a database root creates in the
   console's directory, belong to the database's owner, not root.
+- `status` warns when the console runs as root, when it has no root helper, and when
+  its user cannot read a log it is set up to read (`console-account`,
+  `console-helper`, `console-log-access`).
 
 ## [0.1.0-rc.2] — 2026-09-30
 
