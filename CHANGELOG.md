@@ -8,6 +8,16 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-10-01
+
+### Fixed
+
+- `status` no longer warns, on a host whose NGINX runs in a container, about two
+  things only some setups use: the console's loopback bind (now only when NGINX
+  proxies to the console, i.e. Web Access is set up) and `/etc/stop-bots/nginx` missing
+  inside the container (now only while a generated `robots.txt` is served, the one
+  thing the generated config reads from it).
+
 ## [0.1.0] — 2026-10-01
 
 The first release whose command line, database, generated files and paths are a
@@ -1896,7 +1906,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ivankovic/stop-bots/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ivankovic/stop-bots/compare/v0.0.15...v0.1.0
 [0.1.0-rc.3]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.2...v0.1.0-rc.3
 [0.1.0-rc.2]: https://github.com/ivankovic/stop-bots/compare/v0.1.0-rc.1...v0.1.0-rc.2
