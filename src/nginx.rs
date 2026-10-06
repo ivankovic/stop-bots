@@ -3089,6 +3089,62 @@ pub fn serves_tls(config_path: &Path, server_name: &str) -> bool {
     })
 }
 
+/// The application that answers for `server_name` in `config_path`, as
+/// [`crate::services::recognise`] reads it from the directives of every
+/// `server` block there that declares one of the site's names: the
+/// HTTPS block is the one that passes requests on, and it is not always
+/// the one the site was scanned from.
+///
+/// This project's own blocks are taken out first. The bot block quotes
+/// upstream user-agent patterns, which could name anything, and the
+/// console's `location` passes to the console.
+///
+/// `None` when the file cannot be read, which allows nothing.
+pub fn site_service(config_path: &Path, server_name: &str) -> Option<crate::services::Service> {
+    let content = without_injected_blocks(&fs::read_to_string(config_path).ok()?);
+    let blocks = parse_server_blocks(&content);
+    let names = blocks
+        .iter()
+        .find(|block| block.names.iter().any(|name| name == server_name))?
+        .names
+        .clone();
+    let tokens = lex(&content).tokens;
+    let mut directives = Vec::new();
+    for block in blocks
+        .iter()
+        .filter(|block| block.names.iter().any(|name| names.contains(name)))
+    {
+        directives.extend(directives_within(&tokens, block.open, block.close));
+    }
+    crate::services::recognise(&directives)
+}
+
+/// Each directive whose tokens lie between the byte offsets `open` and
+/// `close`, as its name and its arguments: a word at the start of a
+/// statement, and the words after it up to its `;` or `{`. Those of
+/// nested blocks (`location`, `if`) included.
+fn directives_within(
+    tokens: &[(String, usize)],
+    open: usize,
+    close: usize,
+) -> Vec<(String, Vec<String>)> {
+    let mut directives = Vec::new();
+    let mut current: Option<(String, Vec<String>)> = None;
+    for (token, _) in tokens
+        .iter()
+        .filter(|(_, offset)| *offset > open && *offset < close)
+    {
+        match token.as_str() {
+            ";" | "{" | "}" => directives.extend(current.take()),
+            word => match &mut current {
+                Some((_, arguments)) => arguments.push(word.to_string()),
+                None => current = Some((word.to_string(), Vec::new())),
+            },
+        }
+    }
+    directives
+}
+
 /// Compares what's actually written in `config_path` for `server_name`
 /// against `config` (the currently computed blocking rule for that site)
 /// without changing anything on disk.
@@ -7695,5 +7751,44 @@ server {
             );
         }
         assert_eq!(skipped.len(), 3, "{skipped:#?}");
+    }
+
+    /// The redirect block declares the name first; the HTTPS block is
+    /// the one that says what answers.
+    #[test]
+    fn site_service_reads_every_block_that_declares_the_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("media.conf");
+        std::fs::write(
+            &config,
+            "server {\n    listen 80;\n    server_name media.example.com;\n    \
+             return 301 https://$host$request_uri;\n}\n\
+             server {\n    listen 443 ssl;\n    server_name media.example.com www.media.example.com;\n    \
+             location / {\n        proxy_pass http://jellyfin:8096;\n    }\n}\n\
+             server {\n    listen 443 ssl;\n    server_name photos.example.com;\n    \
+             location / {\n        proxy_pass http://immich:2283;\n    }\n}\n",
+        )
+        .unwrap();
+
+        let cases = [
+            (
+                "media.example.com",
+                Some(crate::services::Service::Jellyfin),
+            ),
+            ("photos.example.com", Some(crate::services::Service::Immich)),
+            ("elsewhere.example.com", None),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(site_service(&config, name), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn site_service_of_an_unreadable_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            site_service(&dir.path().join("missing.conf"), "a.example.com"),
+            None
+        );
     }
 }

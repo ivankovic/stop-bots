@@ -45,6 +45,7 @@
 use crate::evidence::{Evidence, Item, Rule};
 use crate::ipranges::{cidr_contains, is_local_or_private};
 use crate::protection::Detector;
+use crate::services::Hosted;
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::Path;
@@ -150,6 +151,15 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
     // not the same as `None`.
     let referer = Some(quoted.get(1).copied().unwrap_or("").to_string());
     let user_agent = quoted.get(3).copied().unwrap_or("").to_string();
+    // Every quoted field after the user agent: [.., ua, " ", field, " ",
+    // field, ..]. What they hold is the format's business; see
+    // [`ParsedLine::trailing`].
+    let trailing = quoted
+        .iter()
+        .skip(5)
+        .step_by(2)
+        .map(|field| field.to_string())
+        .collect();
 
     Some(ParsedLine {
         ip,
@@ -161,6 +171,7 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
         time,
         // The combined format does not log the `Host`.
         host: None,
+        trailing,
     })
 }
 
@@ -241,6 +252,7 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
         // `$host` or `$http_host`, when the format logs either: what tells
         // a subdomain console's lines apart (see [`Console`]).
         host: json_field(obj, "host").or_else(|| json_field(obj, "http_host")),
+        trailing: Vec::new(),
     })
 }
 
@@ -343,6 +355,24 @@ struct ParsedLine {
     /// The `Host` the request was for, when the format logs it: a JSON
     /// format's `host` or `http_host`. The combined format does not.
     host: Option<String>,
+    /// The quoted fields a combined-style format appends after the user
+    /// agent, such as `"$host"`. Nothing says which variable each one is,
+    /// and `"$http_x_forwarded_for"`, which the client writes, is as
+    /// common as `"$host"`. So they are only ever compared against the
+    /// names of this server's sites, to tell which site a request was for
+    /// (see [`crate::services::Hosted`]) — never taken for the host the
+    /// console is recognised by, where a client naming the console would
+    /// have its every line skipped.
+    trailing: Vec<String>,
+}
+
+impl ParsedLine {
+    /// Whether this is one of an application's own clients' requests on
+    /// its data routes: see [`crate::services`].
+    fn is_app_request(&self, hosted: &Hosted) -> bool {
+        let hosts = self.host.iter().chain(&self.trailing).map(String::as_str);
+        hosted.app_request(hosts, &self.path)
+    }
 }
 
 /// Every IP with at least `threshold` *distinct* paths that returned 404
@@ -357,9 +387,18 @@ struct ParsedLine {
 /// (see the module docs for why there's no "had a 200" exclusion to go
 /// with it). Deduplicated and sorted for deterministic output.
 pub fn scanning_ips(log_text: &str, threshold: usize) -> Vec<String> {
+    scanning_ips_hosted(log_text, threshold, Hosted::default())
+}
+
+/// [`scanning_ips`], not counting the 404s of the applications `hosted`
+/// says run here on their own data routes (see [`crate::services`]).
+pub fn scanning_ips_hosted(log_text: &str, threshold: usize, hosted: Hosted) -> Vec<String> {
     addresses(convicted_in_text(
         log_text,
-        Watch::only(Detector::WebScanners),
+        Watch {
+            hosted,
+            ..Watch::only(Detector::WebScanners)
+        },
         Rule::Distinct(threshold),
     ))
 }
@@ -763,6 +802,10 @@ pub struct Watch {
     /// Where this host's web console is served: its lines are the
     /// operator's, and are not read at all (see [`Console`]).
     pub console: Console,
+    /// The applications behind this server's sites, whose own clients'
+    /// requests the 404 and behavioural detectors do not count (see
+    /// [`crate::services`]).
+    pub hosted: Hosted,
 }
 
 impl Watch {
@@ -775,6 +818,7 @@ impl Watch {
             honeypot: crate::protection::HONEYPOT_PATH_DEFAULT.to_string(),
             claims: Vec::new(),
             console: Console::default(),
+            hosted: Hosted::default(),
         }
     }
 
@@ -850,13 +894,7 @@ impl Console {
         let Some(host) = line.host.as_deref() else {
             return false;
         };
-        let name = match host.rsplit_once(':') {
-            Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-                name
-            }
-            _ => host,
-        };
-        let name = name.trim_start_matches('[').trim_end_matches(']');
+        let name = crate::services::host_name(host);
         self.hosts.iter().any(|h| h.eq_ignore_ascii_case(name))
     }
 }
@@ -866,7 +904,7 @@ impl Console {
 /// one before it. Not the `%u` forms [`crate::injection`] also decodes:
 /// NGINX does not, and a path read as the console's must be one NGINX
 /// sent there.
-fn path_segments(path: &str) -> Vec<String> {
+pub(crate) fn path_segments(path: &str) -> Vec<String> {
     let bytes = path.as_bytes();
     let hex = |b: u8| (b as char).to_digit(16);
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -1017,9 +1055,16 @@ impl Observer {
             },
             Clock::Ordinal(n) => n,
         };
+        // Worked out once, and only if a detector it matters to asks.
+        let mut app_request = None;
         let detectors = std::mem::take(&mut self.watch.detectors);
         for (detector, cutoff) in &detectors {
             if cutoff.is_some_and(|cutoff| at < cutoff) {
+                continue;
+            }
+            if allows_app_requests(*detector)
+                && *app_request.get_or_insert_with(|| line.is_app_request(&self.watch.hosted))
+            {
                 continue;
             }
             if let Some(item) = self.observe(*detector, &line) {
@@ -1140,6 +1185,27 @@ impl Observer {
             self.user_agents.unwrap_or_default(),
             self.counts,
         )
+    }
+}
+
+/// Whether `detector` leaves an application's own clients' requests on
+/// its data routes alone (see [`crate::services`]): the four whose tell —
+/// many distinct missing paths, no assets, no referer, several user
+/// agents on one address — is also what a sync or media app looks like.
+/// A probe, a payload, the honeypot or a forged crawler is judged on
+/// those routes as anywhere else.
+fn allows_app_requests(detector: Detector) -> bool {
+    match detector {
+        Detector::WebScanners
+        | Detector::AssetRatio
+        | Detector::RotatingUserAgent
+        | Detector::RefererlessCrawl => true,
+        Detector::SpoofedCrawlers
+        | Detector::ProbePaths
+        | Detector::Injection
+        | Detector::Honeypot
+        | Detector::RobotsTxt
+        | Detector::SshScanners => false,
     }
 }
 
@@ -2405,5 +2471,107 @@ mod tests {
         let sample = printable_sample(&"x".repeat(1_000));
         assert_eq!(sample.chars().count(), SAMPLE_CHARS + 1);
         assert!(sample.ends_with('\u{2026}'));
+    }
+
+    /// A combined-style line with `"$host"` appended, as an authenticated
+    /// sync client writes one.
+    fn webdav_404(ip: &str, path: &str, host: &str) -> String {
+        format!(
+            "{ip} - alice [10/Jul/2026:12:00:00 +0000] \"PROPFIND {path} HTTP/2.0\" 404 223 \
+             \"-\" \"Mozilla/5.0 (iOS) Nextcloud-iOS/35.0.0\" \"{host}\" 0.466"
+        )
+    }
+
+    fn nextcloud_at(name: &str) -> Hosted {
+        Hosted::new(vec![
+            (name.to_string(), Some(crate::services::Service::Nextcloud)),
+            ("blog.example.com".to_string(), None),
+        ])
+    }
+
+    fn observed_with(lines: &[String], detector: Detector, hosted: Hosted) -> Vec<String> {
+        let watch = Watch {
+            hosted,
+            ..Watch::only(detector)
+        };
+        observed(lines, watch, Clock::Ordinal(0))
+            .rows_for(detector)
+            .into_iter()
+            .map(|row| row.address)
+            .collect()
+    }
+
+    #[test]
+    fn a_combined_line_keeps_the_fields_after_the_user_agent() {
+        let line = webdav_404("203.0.113.5", "/remote.php/dav/a", "cloud.example.com");
+        let parsed = parse_line(&line).unwrap();
+        assert_eq!(parsed.trailing, ["cloud.example.com"]);
+        assert_eq!(
+            parsed.host, None,
+            "a trailing field is never the console's host"
+        );
+    }
+
+    /// What locked an owner out: their phone catching up on photos
+    /// deleted elsewhere.
+    #[test]
+    fn a_sync_clients_404s_on_its_sites_data_routes_are_not_scanning() {
+        let lines: Vec<String> = (0..100)
+            .map(|i| {
+                let path = format!("/remote.php/dav/files/alice/Photos/IMG_{i}.jpg");
+                webdav_404("203.0.113.5", &path, "cloud.example.com")
+            })
+            .collect();
+        let found = observed_with(
+            &lines,
+            Detector::WebScanners,
+            nextcloud_at("cloud.example.com"),
+        );
+        assert!(found.is_empty(), "counted as scanning: {found:?}");
+    }
+
+    #[test]
+    fn the_same_404s_for_a_site_without_the_application_still_count() {
+        let lines = vec![webdav_404(
+            "203.0.113.5",
+            "/remote.php/dav/a",
+            "blog.example.com",
+        )];
+        let found = observed_with(
+            &lines,
+            Detector::WebScanners,
+            nextcloud_at("cloud.example.com"),
+        );
+        assert_eq!(found, ["203.0.113.5"]);
+    }
+
+    #[test]
+    fn a_json_lines_host_names_its_site_too() {
+        let lines = vec![
+            r#"{"remote_addr":"203.0.113.5","request_uri":"/remote.php/dav/a","status":"404","host":"cloud.example.com"}"#.to_string(),
+        ];
+        let found = observed_with(
+            &lines,
+            Detector::WebScanners,
+            nextcloud_at("cloud.example.com"),
+        );
+        assert!(found.is_empty(), "counted as scanning: {found:?}");
+    }
+
+    /// The routes only excuse what a client app looks like, not what an
+    /// attacker sends.
+    #[test]
+    fn a_probe_on_an_app_route_is_still_a_probe() {
+        let lines = vec![webdav_404(
+            "203.0.113.5",
+            "/remote.php/.env",
+            "cloud.example.com",
+        )];
+        let found = observed_with(
+            &lines,
+            Detector::ProbePaths,
+            nextcloud_at("cloud.example.com"),
+        );
+        assert_eq!(found, ["203.0.113.5"]);
     }
 }

@@ -2185,6 +2185,17 @@ fn scan_sites(root: Option<&Path>, db_path: Option<PathBuf>) -> Result<()> {
         sites.len(),
         root.display()
     );
+    // What the detectors will make allowances for, so that it is seen
+    // before it matters: see `stop_bots::services`.
+    let mut named = std::collections::BTreeSet::new();
+    for site in &sites {
+        if let Some(service) = nginx::site_service(&site.config_path, &site.server_name) {
+            named.insert((site.server_name.as_str(), service.name()));
+        }
+    }
+    for (name, service) in named {
+        say!("  {name} runs {service}: its apps' requests for its own data are not taken for a bot's");
+    }
     Ok(())
 }
 

@@ -718,6 +718,28 @@ fn an_unknown_reputation_source_is_rejected_with_the_known_ids() {
         .stderr(predicate::str::contains("firehol-level1"));
 }
 
+/// What the detectors will make allowances for is said when the site is
+/// found, before it matters.
+#[test]
+fn scan_sites_says_which_application_runs_behind_a_site() {
+    let fx = Fixture::new();
+    fs::write(
+        fx.nginx_root.join("cloud.example"),
+        "server {\n    listen 443 ssl;\n    server_name cloud.example;\n    \
+         location / {\n        proxy_pass http://nextcloud:80;\n    }\n}\n",
+    )
+    .unwrap();
+    fx.write_site("blog.example");
+
+    let out = String::from_utf8(fx.scan_sites().get_output().stdout.clone()).unwrap();
+
+    assert!(
+        out.contains("cloud.example runs Nextcloud"),
+        "out was:\n{out}"
+    );
+    assert!(!out.contains("blog.example runs"), "out was:\n{out}");
+}
+
 /// robots.txt generation end to end: the file is written, the site config
 /// aliases it, and disabling removes both.
 #[test]

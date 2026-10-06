@@ -8,6 +8,22 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Fixed
+
+- The web scanner detector no longer blocks the owner of a Nextcloud, Jellyfin, Immich
+  or Navidrome server for what that application's own apps do. Nextcloud's iOS app,
+  catching up on a hundred photos deleted elsewhere, asks after each one and gets a
+  hundred 404s, which was enough to be blocked. The application behind each site is
+  now recognised from its NGINX config (what it passes requests to, or Nextcloud's
+  `/remote.php/dav` redirects), and its clients' requests on its own data routes, such
+  as `/remote.php/` or Jellyfin's `/Items/`, are not counted by the 404 detector or by
+  the three behavioural ones. The probe-path, injection, honeypot and forged-crawler
+  detectors still judge those routes as they judge any other. A request counts for the
+  site its `Host` names: a JSON format's `host`, or a quoted field appended after the
+  user agent in a combined-style format. A request whose host can't be tied to a site
+  gets the allowances of every application on the server. `scan-sites` says which
+  application it found behind each site.
+
 ## [0.1.1] — 2026-10-01
 
 ### Fixed

@@ -328,7 +328,8 @@ pub fn block_web_scanners(
 ) -> Result<ScanBlockOutcome> {
     let text = web_log(db, log_text)?;
     let log_text: &str = &text;
-    let candidates = accesslog::scanning_ips(log_text, threshold);
+    let hosted = crate::logscan::hosted(db)?;
+    let candidates = accesslog::scanning_ips_hosted(log_text, threshold, hosted);
     excluding_known_crawlers(
         db,
         Detector::WebScanners,
@@ -2506,5 +2507,58 @@ mod tests {
         let outcome = run_detector(&db, Detector::ProbePaths, 7, now, false).unwrap();
 
         assert_eq!(outcome.newly_blocked, ["198.51.100.10"]);
+    }
+
+    /// A site whose HTTPS block passes to `upstream`, scanned from its
+    /// port-80 redirect block, which comes first in the file.
+    fn site_passing_to(dir: &std::path::Path, db: &Db, upstream: &str) {
+        let config = dir.join("cloud.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "server {{\n    listen 80;\n    server_name cloud.example.com;\n    \
+                 return 301 https://$host$request_uri;\n}}\n\
+                 server {{\n    listen 443 ssl;\n    server_name cloud.example.com;\n    \
+                 location / {{\n        proxy_pass {upstream};\n    }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        db.upsert_site("cloud.example.com", config.to_str().unwrap())
+            .unwrap();
+    }
+
+    /// A hundred photos deleted elsewhere, and the phone asking after each.
+    fn phone_catching_up() -> String {
+        (0..100)
+            .map(|i| {
+                format!(
+                    "203.0.113.5 - alice [10/Jul/2026:12:00:00 +0000] \
+                     \"PROPFIND /remote.php/dav/files/alice/IMG_{i}.jpg HTTP/2.0\" 404 223 \
+                     \"-\" \"Mozilla/5.0 (iOS) Nextcloud-iOS/35.0.0\" \"cloud.example.com\"\n"
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn block_web_scanners_leaves_a_nextcloud_client_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        site_passing_to(dir.path(), &db, "http://nextcloud:80");
+
+        let outcome = block_web_scanners(&db, 7, 1, &phone_catching_up(), false).unwrap();
+
+        assert_eq!(outcome.candidates, 0, "{outcome:?}");
+    }
+
+    #[test]
+    fn block_web_scanners_still_counts_those_404s_where_nextcloud_does_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_in_memory().unwrap();
+        site_passing_to(dir.path(), &db, "http://calibre-web:8083");
+
+        let outcome = block_web_scanners(&db, 7, 1, &phone_catching_up(), false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.5"]);
     }
 }

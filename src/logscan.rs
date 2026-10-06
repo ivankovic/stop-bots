@@ -248,7 +248,27 @@ fn watch(db: &Db, now: i64) -> Result<Watch> {
         honeypot: crate::protection::honeypot_path(db)?,
         claims: crate::scanblock::crawler_claims(db)?,
         console: console(db)?,
+        hosted: hosted(db)?,
     })
+}
+
+/// Every name each scanned site answers to, with the application its
+/// config says runs behind it: see [`crate::services`].
+///
+/// Read from the configs as they are now, on every pass, rather than
+/// stored by `scan-sites`: what runs behind a site changes with its
+/// config, and a stored answer would go on allowing an application's
+/// requests after it moved. A handful of small files a minute.
+pub fn hosted(db: &Db) -> Result<crate::services::Hosted> {
+    let mut sites = Vec::new();
+    for site in db.list_sites()? {
+        let path = Path::new(&site.config_path);
+        let service = crate::nginx::site_service(path, &site.server_name);
+        for name in crate::nginx::server_names_for(path, &site.server_name) {
+            sites.push((name, service));
+        }
+    }
+    Ok(crate::services::Hosted::new(sites))
 }
 
 /// Where this host's web console is served, whose lines no detector reads
