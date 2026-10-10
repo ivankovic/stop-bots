@@ -9,7 +9,7 @@ pkgdesc="A TUI that helps you configure your server to stop bad bots and still a
 # lets one package() serve both.
 arch=('x86_64' 'aarch64')
 url="https://github.com/ivankovic/stop-bots"
-license=('AGPL-3.0-or-later')
+license=('AGPL-3.0-only')
 # None. The published binary is statically linked against musl, which is
 # what lets one build serve every distribution; there is no libc to depend
 # on. See .github/workflows/release.yml for why that target was chosen.

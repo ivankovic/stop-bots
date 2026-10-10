@@ -51,7 +51,7 @@ SRC_URI="
 # Gentoo requires listed and which this script does NOT compute — Cargo.lock
 # records no licences. Regenerate with `pycargoebuild` (app-portage/pycargoebuild)
 # and copy its LICENSE line here before submitting anywhere but a personal overlay.
-LICENSE="AGPL-3.0+"
+LICENSE="AGPL-3"
 LICENSE+=" Apache-2.0 BSD BSD-2 ISC MIT MPL-2.0 Unicode-3.0 ZLIB"
 
 SLOT="0"

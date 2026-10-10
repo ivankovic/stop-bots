@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: AGPL-3.0-only
 //! The one place this project makes an outbound request.
 //!
 //! Every bot list and IP-range feed is fetched from a third party, and

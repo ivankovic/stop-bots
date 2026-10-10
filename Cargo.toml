@@ -10,9 +10,9 @@ version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 authors = ["Marko Ivankovic <marko@ivankovic.me>"]
-# "or-later" to match the header on every source file, which grants
-# "version 3 of the License, or (at your option) any later version".
-license = "AGPL-3.0-or-later"
+# "only" to match the header on every source file, which grants
+# "version 3 of the License" and no later version.
+license = "AGPL-3.0-only"
 description = "A TUI, web console and CLI that help you configure your server to stop bad bots and still allow good bots."
 repository = "https://github.com/ivankovic/stop-bots"
 homepage = "https://github.com/ivankovic/stop-bots"
