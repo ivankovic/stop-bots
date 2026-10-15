@@ -375,3 +375,29 @@ Description: A TUI, web console and CLI that help you configure your server to s
  logs, recording why each one is blocked. For Debian and Ubuntu with systemd and
  NGINX. Nothing is applied without being asked.
 
+Package: stop-bots
+Architecture: arm64
+Version: 0.2.0-1
+Priority: optional
+Section: net
+Maintainer: Marko Ivankovic <marko@ivankovic.me>
+Installed-Size: 10827
+Depends:
+Recommends: nftables | iptables
+Suggests: nginx | apache2
+Filename: pool/main/s/stop-bots/stop-bots_0.2.0-1_arm64.deb
+Size: 3454040
+MD5sum: 9230b4f6a20b16022737b8adb7fea293
+SHA1: ced377cf564e45744ef28a269d8405973ecd2d29
+SHA256: b101586c90f28ad19374fdce41ff0839308d2866eba7d455192f300c5f5d3f71
+SHA512: 310db88a677c3e7225b4bcced315745576f602709030eb1240db84ead1a615c1ef95c8d9cf033677125ad9189dcec070bf3edec0dc17ffe887e14a5887b66687
+Homepage: https://github.com/ivankovic/stop-bots
+Description: A TUI and CLI that help you configure your server to stop bad bots without
+ hiding behind a CDN. Works with NGINX or Apache, and nftables or iptables.
+ A TUI and a CLI that help you configure your server to stop bad bots without
+ hiding behind a CDN. It classifies known bots by category and blocks them in
+ your NGINX or Apache config, and writes an nftables or iptables script that
+ blocks countries, datacenter ranges and addresses caught scanning your logs,
+ recording why each one is blocked. For Debian and Ubuntu with systemd, and
+ NGINX or Apache. Nothing is applied without being asked.
+
