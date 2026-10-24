@@ -71,14 +71,15 @@ falling back to a per-user location if that is not writable";
 
 /// Help text shared by every `--root` flag.
 pub(crate) const ROOT_HELP: &str = "The web server's config root. Defaults to the one stored by \
-`set-web-server --root`, else /etc/nginx, /etc/apache2 for Apache, or /etc/traefik/dynamic for \
-Traefik's file provider";
+`set-web-server --root`, else /etc/nginx, /etc/apache2 for Apache, /etc/traefik/dynamic for \
+Traefik's file provider, or /opt/npmplus for NPMplus's data directory";
 
 /// Help text shared by every detector subcommand's `--access-log`.
 pub(crate) const ACCESS_LOG_HELP: &str = "Read only this access log. Without it, the stored one \
 (`set-log-paths`) is read, else /var/log/nginx/access.log, for Apache \
-/var/log/apache2/access.log (/var/log/httpd/access_log in RHEL's /etc/httpd), or for Traefik \
-/var/log/traefik/access.log, and with it every other access log the web server's config names";
+/var/log/apache2/access.log (/var/log/httpd/access_log in RHEL's /etc/httpd), for Traefik \
+/var/log/traefik/access.log, or for NPMplus /opt/npmplus/nginx/logs/access.log, and with it \
+every other access log the web server's config names";
 
 /// Help text shared by `status --json` and every `list-* --json`.
 pub(crate) const JSON_HELP: &str =
@@ -126,7 +127,7 @@ more about one command.";
 #[command(
     name = "stop-bots",
     version,
-    about = "Configure your server to stop bad bots, in NGINX, Apache or Traefik and the firewall",
+    about = "Configure your server to stop bad bots, in NGINX, Apache, Traefik or NPMplus and the firewall",
     after_help = GETTING_STARTED
 )]
 pub(crate) struct Cli {
@@ -1175,6 +1176,20 @@ pub(crate) enum Command {
     ///
     ///   set-log-paths --access-log /srv/traefik/logs/access.log
     ///
+    /// `npmplus` reads the hosts NPMplus renders in its data directory,
+    /// /opt/npmplus unless `--root` says otherwise, and never writes them:
+    /// NPMplus rewrites a host's file whenever it is saved. It writes one
+    /// block into custom_nginx/server_http.conf, which every host includes,
+    /// and one line into custom_nginx/http_top.conf, keeping the rest of
+    /// each; every host gets the host-wide settings, and a site with
+    /// settings of its own is refused. It tests and reloads with `docker
+    /// exec npmplus nginx -t` and `docker exec npmplus nginx -s reload`.
+    /// NPMplus writes its access log only with `LOGROTATE=true`:
+    ///
+    ///   set-web-server npmplus --root /opt/npmplus
+    ///
+    ///   set-log-paths --access-log /opt/npmplus/nginx/logs/access.log
+    ///
     /// Also takes the server's own commands and config root, for a server
     /// that is not where a stock install puts it. On RHEL and its relatives, whose Apache
     /// reads conf.d and logs to /var/log/httpd:
@@ -1188,7 +1203,7 @@ pub(crate) enum Command {
     ///
     /// Pass no server to print what is in effect.
     SetWebServer {
-        /// `nginx`, `apache` or `traefik`.
+        /// `nginx`, `apache`, `traefik` or `npmplus`.
         #[arg(value_parser = parse_web_server)]
         server: Option<webserver::WebServer>,
         /// The config check. Must exit non-zero on a bad config.

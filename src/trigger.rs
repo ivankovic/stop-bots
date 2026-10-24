@@ -178,12 +178,35 @@ fn parse_request(line: &str) -> Option<Request> {
     }
 }
 
-/// `<ip> - <user> [<time>] "<request>" <status> <bytes> "<referer>" "<ua>"`.
+/// `<ip> - <user> [<time>] "<request>" <status> <bytes> "<referer>" "<ua>"`,
+/// or NPMplus's `[<time>] <host> <ip> <request_time> "<request>" ...`,
+/// whose address is the second word back from the request, as
+/// `accesslog` reads it. NPMplus's released format follows the request
+/// with `<status> <body_bytes> <bytes> <referer> <ua>`, unquoted.
 fn parse_combined(line: &str) -> Option<Request> {
-    let ip = line.split_whitespace().next()?.parse().ok()?;
     let quoted: Vec<&str> = line.split('"').collect();
+    let npmplus = line.trim_start().starts_with('[');
+    let mut prefix = quoted.first()?.split_whitespace();
+    let ip = if npmplus {
+        prefix.nth_back(1)
+    } else {
+        prefix.next()
+    }?
+    .parse()
+    .ok()?;
     let request = quoted.get(1)?.to_string();
     let status = quoted.get(2)?.split_whitespace().next()?.to_string();
+    if npmplus && quoted.len() == 3 {
+        let mut tail = quoted[2].trim().splitn(5, ' ').skip(3);
+        return Some(Request {
+            ip,
+            path: path_of(&request),
+            request,
+            status,
+            referer: tail.next().map(str::to_string),
+            user_agent: tail.next().unwrap_or_default().trim().to_string(),
+        });
+    }
     Some(Request {
         ip,
         path: path_of(&request),
@@ -342,6 +365,26 @@ mod tests {
         );
         let forged = r#"{"remote_addr":"203.0.113.9","http_user_agent":"","remote_addr":"192.0.2.1","request":"GET /.env HTTP/1.1","status":"404"}"#;
         assert_eq!(evidence(Detector::ProbePaths, forged, "192.0.2.1"), None);
+    }
+
+    #[test]
+    fn an_npmplus_release_log_gives_its_user_agent() {
+        let log = "[28/Sep/2026:10:00:00 +0000] a.example 203.0.113.9 0.001 \"GET / HTTP/1.1\" \
+                   200 5 300 - Mozilla/5.0 (compatible; Googlebot/2.1)\n";
+        assert_eq!(
+            evidence(Detector::SpoofedCrawlers, log, "203.0.113.9").as_deref(),
+            Some("\"GET / HTTP/1.1\" 200 as \"Mozilla/5.0 (compatible; Googlebot/2.1)\"")
+        );
+    }
+
+    #[test]
+    fn an_npmplus_log_gives_the_same_evidence() {
+        let log = "[28/Sep/2026:10:00:00 +0000] a.example 203.0.113.9 0.001 \"GET /.env HTTP/2.0\" \
+                   404 150 \"-\" \"x\" \"-\" \"text/html\" TLSv1.3 TLS_AES_128_GCM_SHA256 X25519 -\n";
+        assert_eq!(
+            evidence(Detector::ProbePaths, log, "203.0.113.9").as_deref(),
+            Some("\"GET /.env HTTP/2.0\" 404")
+        );
     }
 
     #[test]

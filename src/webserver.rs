@@ -23,8 +23,8 @@
 //! the transaction every apply runs in (lock, [`Snapshot`], write, test,
 //! put back on a failure, reload), the generated files' lifecycle, and
 //! taking everything out again. A backend module — [`crate::nginx`],
-//! [`crate::apache`], [`crate::traefik`] — owns only what is spelled in its
-//! own config language: finding sites,
+//! [`crate::apache`], [`crate::traefik`], [`crate::npmplus`] — owns only
+//! what is spelled in its own config language: finding sites,
 //! rendering and placing the sentinel block, and the generated files'
 //! bodies. [`WebServer`] is the one place that dispatches between them.
 //!
@@ -35,7 +35,7 @@
 
 use crate::db::BlockResponse;
 pub use crate::dirfd::DirFile;
-use crate::{apache, nginx, traefik};
+use crate::{apache, nginx, npmplus, traefik};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,10 +49,18 @@ pub enum WebServer {
     Nginx,
     Apache,
     Traefik,
+    /// NPMplus, the Nginx Proxy Manager fork: NGINX in a container that
+    /// writes its sites' config itself (see [`crate::npmplus`]).
+    Npmplus,
 }
 
 impl WebServer {
-    pub const ALL: [WebServer; 3] = [WebServer::Nginx, WebServer::Apache, WebServer::Traefik];
+    pub const ALL: [WebServer; 4] = [
+        WebServer::Nginx,
+        WebServer::Apache,
+        WebServer::Traefik,
+        WebServer::Npmplus,
+    ];
 
     /// The value in `host.conf`'s `web_server`. Stored, so never renamed.
     pub fn id(self) -> &'static str {
@@ -60,6 +68,7 @@ impl WebServer {
             WebServer::Nginx => "nginx",
             WebServer::Apache => "apache",
             WebServer::Traefik => "traefik",
+            WebServer::Npmplus => "npmplus",
         }
     }
 
@@ -83,6 +92,7 @@ impl WebServer {
             WebServer::Nginx => "NGINX",
             WebServer::Apache => "Apache",
             WebServer::Traefik => "Traefik",
+            WebServer::Npmplus => "NPMplus",
         }
     }
 
@@ -92,16 +102,19 @@ impl WebServer {
             WebServer::Nginx => nginx::DEFAULT_ROOT,
             WebServer::Apache => apache::DEFAULT_ROOT,
             WebServer::Traefik => traefik::DEFAULT_ROOT,
+            WebServer::Npmplus => npmplus::DEFAULT_ROOT,
         }
     }
 
     /// How to test its config on a stock install. Empty for Traefik,
     /// which has no config test: it checks what it reads as it reads it.
+    /// NPMplus's is in the container its compose file names `npmplus`.
     pub fn default_test(self) -> &'static str {
         match self {
             WebServer::Nginx => "nginx -t",
             WebServer::Apache => "apache2ctl configtest",
             WebServer::Traefik => "",
+            WebServer::Npmplus => "docker exec npmplus nginx -t",
         }
     }
 
@@ -112,6 +125,7 @@ impl WebServer {
             WebServer::Nginx => "systemctl reload nginx",
             WebServer::Apache => "systemctl reload apache2",
             WebServer::Traefik => "",
+            WebServer::Npmplus => "docker exec npmplus nginx -s reload",
         }
     }
 
@@ -123,6 +137,7 @@ impl WebServer {
             WebServer::Nginx => crate::accesslog::DEFAULT_LOG_PATH,
             WebServer::Apache => "/var/log/apache2/access.log",
             WebServer::Traefik => traefik::DEFAULT_ACCESS_LOG,
+            WebServer::Npmplus => npmplus::DEFAULT_ACCESS_LOG,
         }
     }
 
@@ -147,7 +162,7 @@ impl WebServer {
     /// a default that names `apache2ctl` on RHEL fails every apply.
     pub fn default_test_at(self, root: &Path) -> &'static str {
         match self {
-            WebServer::Nginx | WebServer::Traefik => self.default_test(),
+            WebServer::Nginx | WebServer::Traefik | WebServer::Npmplus => self.default_test(),
             WebServer::Apache => apache::layout(root).test(),
         }
     }
@@ -155,7 +170,7 @@ impl WebServer {
     /// [`Self::default_reload`] for the config under `root`, likewise.
     pub fn default_reload_at(self, root: &Path) -> &'static str {
         match self {
-            WebServer::Nginx | WebServer::Traefik => self.default_reload(),
+            WebServer::Nginx | WebServer::Traefik | WebServer::Npmplus => self.default_reload(),
             WebServer::Apache => apache::layout(root).reload(),
         }
     }
@@ -163,7 +178,7 @@ impl WebServer {
     /// [`Self::default_access_log`] for the config under `root`, likewise.
     pub fn default_access_log_at(self, root: &Path) -> &'static str {
         match self {
-            WebServer::Nginx | WebServer::Traefik => self.default_access_log(),
+            WebServer::Nginx | WebServer::Traefik | WebServer::Npmplus => self.default_access_log(),
             WebServer::Apache => apache::layout(root).access_log(),
         }
     }
@@ -175,6 +190,7 @@ impl WebServer {
             WebServer::Nginx => nginx::discover_sites(root),
             WebServer::Apache => apache::discover_sites(root),
             WebServer::Traefik => traefik::discover_sites(root),
+            WebServer::Npmplus => npmplus::discover_sites(root),
         }
     }
 
@@ -188,6 +204,7 @@ impl WebServer {
             WebServer::Nginx => nginx::access_logs(root),
             WebServer::Apache => apache::access_logs(root),
             WebServer::Traefik => traefik::access_logs(root),
+            WebServer::Npmplus => npmplus::access_logs(root),
         }
     }
 
@@ -198,6 +215,7 @@ impl WebServer {
             WebServer::Nginx => nginx::site_listens(root),
             WebServer::Apache => apache::site_listens(root),
             WebServer::Traefik => traefik::site_listens(root),
+            WebServer::Npmplus => npmplus::site_listens(root),
         }
     }
 
@@ -235,6 +253,7 @@ impl WebServer {
                 apache::blocks_for_file(content, config_path, root, site_configs, default_config)
             }
             WebServer::Traefik => traefik::blocks_for_file(content, site_configs),
+            WebServer::Npmplus => npmplus::blocks_for_file(content, site_configs, default_config),
         }
     }
 
@@ -262,6 +281,7 @@ impl WebServer {
                 apache::block_for_site(content, config_path, root, server_name, config)
             }
             WebServer::Traefik => traefik::block_for_site(content, server_name, config),
+            WebServer::Npmplus => npmplus::block_for_site(content, root, server_name, config),
         }
     }
 
@@ -299,6 +319,9 @@ impl WebServer {
             WebServer::Traefik => {
                 traefik::site_apply_status(config_path, server_name, config, root)
             }
+            WebServer::Npmplus => {
+                npmplus::site_apply_status(config_path, server_name, config, root)
+            }
         }
     }
 
@@ -309,7 +332,28 @@ impl WebServer {
             WebServer::Apache => apache::without_injected_blocks(content),
             // Nothing is injected into an operator's file on Traefik.
             WebServer::Traefik => content.to_string(),
+            WebServer::Npmplus => npmplus::without_injected_blocks(content),
         }
+    }
+
+    /// Every file under `root` stop-bots may have put a block into, which
+    /// [`Self::without_injected_blocks`] takes it out of: each site's own
+    /// file, and on NPMplus the two of its files every site includes.
+    pub fn injected_files(self, root: &Path) -> Result<Vec<PathBuf>> {
+        if self == WebServer::Npmplus {
+            return Ok(npmplus::injected_files(root)
+                .into_iter()
+                .filter(|path| path.is_file())
+                .collect());
+        }
+        let mut paths: Vec<PathBuf> = self
+            .discover_sites(root)?
+            .into_iter()
+            .map(|site| site.config_path)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
     }
 
     /// The generated files the current settings call for, as `(path,
@@ -323,6 +367,7 @@ impl WebServer {
             WebServer::Nginx => nginx::planned_managed_files(db, root),
             WebServer::Apache => apache::planned_managed_files(db, root),
             WebServer::Traefik => traefik::planned_managed_files(db, root),
+            WebServer::Npmplus => npmplus::planned_managed_files(db, root),
         }
     }
 
@@ -337,6 +382,7 @@ impl WebServer {
             WebServer::Nginx => nginx::fallback_unused_managed_files(db, root),
             WebServer::Apache => apache::fallback_unused_managed_files(db, root),
             WebServer::Traefik => traefik::fallback_unused_managed_files(db, root),
+            WebServer::Npmplus => npmplus::fallback_unused_managed_files(db, root),
         }
     }
 
@@ -347,6 +393,7 @@ impl WebServer {
             WebServer::Nginx => nginx::managed_directories(root),
             WebServer::Apache => apache::managed_directories(root),
             WebServer::Traefik => traefik::managed_directories(root),
+            WebServer::Npmplus => npmplus::managed_directories(root),
         }
     }
 
@@ -354,7 +401,9 @@ impl WebServer {
     /// included; just `server_name` when the file says otherwise.
     pub fn server_names_for(self, config_path: &Path, server_name: &str) -> Vec<String> {
         match self {
-            WebServer::Nginx => nginx::server_names_for(config_path, server_name),
+            WebServer::Nginx | WebServer::Npmplus => {
+                nginx::server_names_for(config_path, server_name)
+            }
             WebServer::Apache => apache::server_names_for(config_path, server_name),
             WebServer::Traefik => traefik::server_names_for(config_path, server_name),
         }
@@ -368,7 +417,7 @@ impl WebServer {
         server_name: &str,
     ) -> Option<crate::services::Service> {
         match self {
-            WebServer::Nginx => nginx::site_service(config_path, server_name),
+            WebServer::Nginx | WebServer::Npmplus => nginx::site_service(config_path, server_name),
             WebServer::Apache => apache::site_service(config_path, server_name),
             WebServer::Traefik => traefik::site_service(config_path, server_name),
         }
@@ -383,7 +432,9 @@ impl WebServer {
         server_name: &str,
     ) -> Option<Vec<(String, Vec<String>)>> {
         match self {
-            WebServer::Nginx => nginx::site_directives(config_path, server_name),
+            WebServer::Nginx | WebServer::Npmplus => {
+                nginx::site_directives(config_path, server_name)
+            }
             WebServer::Apache => apache::site_directives(config_path, server_name),
             WebServer::Traefik => traefik::site_directives(config_path, server_name),
         }
@@ -393,12 +444,14 @@ impl WebServer {
     /// `conf.d`, Apache's `conf-enabled`. An `Alias /phpmyadmin` there,
     /// which Debian's phpMyAdmin package puts in Apache's, serves the path
     /// on every site. Traefik's root, whose files every router is read
-    /// from alike.
+    /// from alike. NPMplus's `custom_nginx`, whose files every host
+    /// includes.
     pub fn global_conf_dir(self, root: &Path) -> PathBuf {
         match self {
             WebServer::Nginx => nginx::conf_d_dir(root),
             WebServer::Apache => apache::conf_enabled_dir(root),
             WebServer::Traefik => root.to_path_buf(),
+            WebServer::Npmplus => root.join("custom_nginx"),
         }
     }
 
@@ -409,6 +462,7 @@ impl WebServer {
             WebServer::Nginx => nginx::console_site_path(root),
             WebServer::Apache => apache::console_site_path(root),
             WebServer::Traefik => traefik::console_site_path(root),
+            WebServer::Npmplus => npmplus::console_site_path(root),
         }
     }
 
@@ -419,6 +473,7 @@ impl WebServer {
             WebServer::Nginx => "`server` block",
             WebServer::Apache => "<VirtualHost>",
             WebServer::Traefik => "router",
+            WebServer::Npmplus => "proxy host",
         }
     }
 
@@ -429,7 +484,7 @@ impl WebServer {
     /// as on and limits nothing.
     pub fn without_rate_limiting(self) -> Option<&'static str> {
         match self {
-            WebServer::Nginx => None,
+            WebServer::Nginx | WebServer::Npmplus => None,
             WebServer::Apache => Some(
                 "Apache has no rate limiting of its own, so stop-bots writes none there: \
                  turning it on would limit nothing.",
@@ -446,7 +501,7 @@ impl WebServer {
     /// offered, as [`Self::without_rate_limiting`] is.
     pub fn without_robots_txt(self) -> Option<&'static str> {
         match self {
-            WebServer::Nginx | WebServer::Apache => None,
+            WebServer::Nginx | WebServer::Apache | WebServer::Npmplus => None,
             WebServer::Traefik => Some(
                 "Traefik serves no files, so nothing would serve the generated robots.txt: \
                  turning it on would publish nothing.",
@@ -460,7 +515,7 @@ impl WebServer {
     /// `None` when it sends `response` itself.
     pub fn instead_of(self, response: BlockResponse) -> Option<u16> {
         let exact = match self {
-            WebServer::Nginx => true,
+            WebServer::Nginx | WebServer::Npmplus => true,
             WebServer::Apache => !matches!(
                 response,
                 BlockResponse::Close | BlockResponse::Teapot | BlockResponse::Tarpit
@@ -476,6 +531,7 @@ impl WebServer {
             WebServer::Nginx => "set-web-server nginx",
             WebServer::Apache => "set-web-server apache",
             WebServer::Traefik => "set-web-server traefik",
+            WebServer::Npmplus => "set-web-server npmplus",
         }
     }
 }
@@ -1096,15 +1152,42 @@ pub fn is_generated(file: &DirFile) -> bool {
 /// whole of an apply: trusting a second user agent rewrites the trust
 /// file and no site's block, and an apply that counted only site files
 /// would decide NGINX had nothing new to read and never reload it.
+///
+/// A file of no [`ManagedKind`] is one of the operator's that carries a
+/// block, NPMplus's `server_http.conf` (see [`crate::npmplus`]), and is
+/// written by [`write_operators_file`].
 pub fn write_planned_managed_files(files: &[(PathBuf, String)]) -> Result<usize> {
     let mut changed = 0;
     for (path, body) in files {
         if fs::read_to_string(path).ok().as_deref() != Some(body.as_str()) {
-            write_managed(path, body)?;
+            match ManagedKind::of(path) {
+                Some(_) => write_managed(path, body)?,
+                None => write_operators_file(path, body)?,
+            }
             changed += 1;
         }
     }
     Ok(changed)
+}
+
+/// Replaces `path`, a file of the operator's that a block is kept in,
+/// keeping its owner and mode, as a site file keeps them.
+///
+/// **Through its directory, following no link** ([`DirFile::exactly`]).
+/// The directory is one another user can write: NPMplus's data directory
+/// is its container's. A link planted at a directory on the way, between
+/// the check that made `path` and this write, fails the write instead of
+/// taking root's write somewhere else, and a link at the file itself is
+/// replaced, not written through.
+fn write_operators_file(path: &Path, body: &str) -> Result<()> {
+    let file =
+        DirFile::exactly(path).with_context(|| format!("refusing to write {}", path.display()))?;
+    let (mode, owner) = match file.mode_and_owner()? {
+        Some((mode, owner)) => (mode, Some(owner)),
+        None => (0o644, None),
+    };
+    file.write_atomically_owned(body.as_bytes(), mode, owner)
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Deletes every file this project owns that the current settings no
@@ -1975,6 +2058,14 @@ fn generated_file_places(server: WebServer, root: &Path) -> Vec<PathBuf> {
         }
         WebServer::Apache => vec![apache::trusted_conf_path(&apache::conf_enabled_dir(root))],
         WebServer::Traefik => vec![traefik::routers_path(root)],
+        WebServer::Npmplus => {
+            let own = npmplus::own_dir(root);
+            vec![
+                nginx::untrusted_rate_limit_conf_path(&own),
+                nginx::rate_limit_conf_path(&own),
+                nginx::trusted_conf_path(&own),
+            ]
+        }
     }
 }
 
@@ -1990,15 +2081,7 @@ fn generated_file_places(server: WebServer, root: &Path) -> Vec<PathBuf> {
 /// stop-bots that would ever take it out.
 pub fn leftovers(server: WebServer, root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut site_files: Vec<PathBuf> = server
-        .discover_sites(root)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|site| site.config_path)
-        .collect();
-    site_files.sort();
-    site_files.dedup();
-    for path in site_files {
+    for path in server.injected_files(root).unwrap_or_default() {
         if fs::read_to_string(&path)
             .is_ok_and(|content| server.without_injected_blocks(&content) != content)
         {
@@ -2066,14 +2149,7 @@ pub fn remove_everything(
         Some(crate::applylock::hold()?)
     };
     let mut edits = Vec::new();
-    let mut paths: Vec<PathBuf> = server
-        .discover_sites(root)?
-        .into_iter()
-        .map(|site| site.config_path)
-        .collect();
-    paths.sort();
-    paths.dedup();
-    for path in paths {
+    for path in server.injected_files(root)? {
         let content = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         let stripped = server.without_injected_blocks(&content);

@@ -597,6 +597,7 @@ impl Nginx {
                     WebServer::Nginx => "NGINX settings",
                     WebServer::Apache => "Apache settings",
                     WebServer::Traefik => "Traefik settings",
+                    WebServer::Npmplus => "NPMplus settings",
                 },
                 vec![
                     ("\u{2191}\u{2193}", "move"),
@@ -1224,6 +1225,15 @@ impl Nginx {
                 )
             } else {
                 "The Traefik routers were already up to date".to_string()
+            };
+        }
+        // Nor are NPMplus's: their block is the one in custom_nginx that
+        // every host includes.
+        if self.server == WebServer::Npmplus && failures.is_empty() {
+            message = if managed_changed > 0 {
+                format!("Updated the rule every NPMplus host includes ({total} host(s))")
+            } else {
+                "The rule every NPMplus host includes was already up to date".to_string()
             };
         }
         (message, applied > 0 || managed_changed > 0)

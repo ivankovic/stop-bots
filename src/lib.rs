@@ -105,6 +105,8 @@ pub mod nftables;
 #[doc(hidden)]
 pub mod nginx;
 #[doc(hidden)]
+pub mod npmplus;
+#[doc(hidden)]
 pub mod output;
 #[doc(hidden)]
 pub mod portscan;

@@ -39,6 +39,18 @@ eventually ask for, with the reason it isn't there.
   path (it is in a container), and its API, which would say, is often off.
 * **A Traefik site from a Docker label has no settings of its own** unless the
   file with the label is under the root. The host-wide routers protect it.
+* **An NPMplus host has no settings of its own.** Every host includes the one
+  `custom_nginx/server_http.conf`, so the block there is the host-wide one, and an
+  apply refuses a site with settings of its own. Per-site blocks would mean keying
+  each one on `$host` inside that file. The request-shape rules are per-site only,
+  so none of them is available on NPMplus.
+* **NPMplus's default site and admin UI are not covered.** A request for a host
+  NPMplus has no proxy host for is answered by its default server, and port 81 by
+  its admin UI; neither includes `server_http.conf`.
+* **Nothing checks that the root is the data directory NPMplus mounts.** `status`
+  says the block is applied once `custom_nginx/server_http.conf` carries it, as for
+  Traefik's root: whether the container mounts that directory at `/data` is in the
+  compose file, which is not on this host's path in general.
 
 ## Blocked on machinery this codebase doesn't have
 

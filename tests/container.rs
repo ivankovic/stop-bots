@@ -77,6 +77,12 @@
 //! tree. `Dockerfile.upgrade` is the [`Host`] image with the released 0.1.1
 //! binary beside the one under test, so the upgrade tests start from what
 //! 0.1.1 actually left on a host.
+//!
+//! ## And NPMplus, in its own image
+//!
+//! [`Npmplus`] runs NPMplus's released image rather than one of these, and
+//! stop-bots outside it, on the machine running the tests, as an operator
+//! runs it: see the section's own comment.
 
 use std::process::Command;
 
@@ -5756,4 +5762,468 @@ fn traefik_uninstall_takes_the_routers_away() {
         "200",
         "uninstall said:\n{said}"
     );
+}
+
+// ---- NPMplus ----
+//
+// The real NPMplus image, run as its compose file runs it, with its data
+// directory a bind mount of a directory on the host. stop-bots runs where
+// an operator runs it: on the host, outside the container, writing into
+// that directory and testing and reloading NPMplus's NGINX with
+// `<runtime> exec`. The hosts are created through NPMplus's own API, so
+// the config stop-bots reads is the config NPMplus renders.
+//
+// Nothing here builds an image. NPMplus's is Alpine's, on musl, which the
+// binary under test would not run in, and running it outside is the point.
+
+/// The NPMplus release these tests run, pinned: a new one can change what
+/// it renders, and that should be a change to this line, not a red build
+/// nobody asked for.
+const NPMPLUS_IMAGE: &str = "docker.io/zoeyvid/npmplus:2026-10-22-r1";
+
+/// The admin NPMplus creates on its first start, which the API is driven
+/// as.
+const NPMPLUS_ADMIN: &str = r#"{"identity":"admin@example.com","secret":"stop-bots-test"}"#;
+
+/// A running NPMplus with two proxy hosts, `a.example` and `b.example`,
+/// both handing requests to a server answering 200 on `127.0.0.1:8001`,
+/// and stop-bots told it is NPMplus's. Removed on drop.
+struct Npmplus {
+    name: String,
+    /// Holds NPMplus's data directory, `data/`, and stop-bots' own host
+    /// settings and database, where an uninstall under `--prefix` of it
+    /// reads them.
+    dir: tempfile::TempDir,
+}
+
+impl Npmplus {
+    fn start(name: &str) -> Npmplus {
+        use std::os::unix::fs::MetadataExt;
+        let name = scoped(name);
+        remove_container(&name);
+        let dir = tempfile::tempdir().expect("failed to make a data directory");
+        let data = dir.path().join("data");
+        // NPMplus registers an ACME account on its first start, and waits
+        // for ever if it cannot. A file under the account directory is
+        // what it checks, and with one there it never asks: these tests
+        // must not register an account with Let's Encrypt on every run,
+        // or reach the network at all.
+        let account = data.join("tls/certbot/accounts/acme-v02.api.letsencrypt.org/directory/test");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(account.join("regr.json"), "{}").unwrap();
+        // With no network, Podman leaves no `resolv.conf` in the
+        // container, and NPMplus's NGINX will not start without one.
+        let resolv = dir.path().join("resolv.conf");
+        std::fs::write(&resolv, "nameserver 127.0.0.1\n").unwrap();
+
+        let mut run = Command::new(runtime());
+        run.args(["run", "-d", "--name", &name, "--network", "none"])
+            .arg("-v")
+            .arg(format!("{}:/etc/resolv.conf:ro", resolv.display()))
+            .arg("-v")
+            .arg(format!("{}:/data", data.display()))
+            .args([
+                "-e",
+                "TZ=UTC",
+                "-e",
+                "LOGROTATE=true",
+                "-e",
+                "DISABLE_IPV6=true",
+            ])
+            .args(["-e", "INITIAL_ADMIN_EMAIL=admin@example.com"])
+            .args(["-e", "INITIAL_ADMIN_PASSWORD=stop-bots-test"]);
+        // Rootless Podman's root in the container is this user outside it,
+        // so what NPMplus writes is this user's already. Docker's is the
+        // daemon's root: told to run as this user instead, NPMplus writes
+        // files that stop-bots, running as this user, can write too.
+        if !runtime_is_podman() {
+            let owner = std::fs::metadata(dir.path()).unwrap();
+            run.args(["-e", &format!("PUID={}", owner.uid())])
+                .args(["-e", &format!("PGID={}", owner.gid())]);
+        }
+        let out = run
+            .arg(NPMPLUS_IMAGE)
+            .output()
+            .expect("failed to start the container");
+        assert!(
+            out.status.success(),
+            "{} run failed:\n{}",
+            runtime(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let npmplus = Npmplus { name, dir };
+        npmplus.wait_until_serving();
+        let backend = Command::new(runtime())
+            .args(["exec", "-d", &npmplus.name])
+            .args([
+                "python3",
+                "-m",
+                "http.server",
+                "8001",
+                "--bind",
+                "127.0.0.1",
+            ])
+            .args(["--directory", "/tmp"])
+            .output()
+            .expect("failed to start the backend");
+        assert!(backend.status.success(), "the backend did not start");
+        npmplus.api("POST", "/api/tokens", NPMPLUS_ADMIN);
+        for host in ["a.example", "b.example"] {
+            npmplus.api(
+                "POST",
+                "/api/nginx/proxy-hosts",
+                &format!(
+                    r#"{{"domain_names":["{host}"],"forward_scheme":"http","forward_host":"127.0.0.1","forward_port":8001,"locations":[],"meta":{{}}}}"#
+                ),
+            );
+        }
+        npmplus.wait_for_status("b.example", "/", BROWSER, "200");
+
+        let exec = |command: &str| format!("{} exec {} {command}", runtime(), npmplus.name);
+        let chosen = npmplus.stop_bots(&[
+            "set-web-server",
+            "npmplus",
+            "--root",
+            data.to_str().unwrap(),
+            "--test",
+            &exec("nginx -t"),
+            "--reload",
+            &exec("nginx -s reload"),
+        ]);
+        assert!(chosen.contains("NPMplus"), "set-web-server said:\n{chosen}");
+        let scanned = npmplus.stop_bots(&["scan-sites"]);
+        assert!(
+            scanned.contains("Discovered 2 site(s)"),
+            "scan-sites said:\n{scanned}"
+        );
+        npmplus
+    }
+
+    /// NPMplus's data directory, as the host sees it.
+    fn data(&self) -> std::path::PathBuf {
+        self.dir.path().join("data")
+    }
+
+    fn run(&self, cmd: &str) -> (bool, String, String) {
+        exec_in(&self.name, cmd)
+    }
+
+    fn sh(&self, cmd: &str) -> String {
+        sh_in(&self.name, cmd)
+    }
+
+    /// The binary under test, on the host, with this NPMplus's host
+    /// settings and database. Asserts it succeeded.
+    fn stop_bots(&self, args: &[&str]) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_stop-bots"))
+            .env(
+                "STOP_BOTS_HOST_CONF",
+                self.dir.path().join("etc/stop-bots/host.conf"),
+            )
+            .args(args)
+            .arg("--db")
+            .arg(self.dir.path().join("db.sqlite3"))
+            .output()
+            .expect("failed to run stop-bots");
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(
+            out.status.success(),
+            "stop-bots {args:?} failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        format!("{stdout}{stderr}")
+    }
+
+    /// A blocked bot, through the real bot-list parser.
+    fn seed_bot(&self, pattern: &str) {
+        let list = self.dir.path().join("bots.json");
+        std::fs::write(
+            &list,
+            format!(
+                r#"[{{"id":"listed","categories":["ai"],"pattern":{{"accepted":["{pattern}"],"forbidden":[]}},"url":"https://example.invalid/listed"}}]"#
+            ),
+        )
+        .unwrap();
+        self.stop_bots(&["update-bot-lists", "--source", list.to_str().unwrap()]);
+    }
+
+    /// `apply-blocks` as an operator runs it, and then the wait for the
+    /// reload: NGINX's old workers answer for a moment after it.
+    fn apply(&self) -> String {
+        let said = self.stop_bots(&["apply-blocks"]);
+        self.wait_for_status("a.example", "/", BAD_AGENT, "403");
+        said
+    }
+
+    /// One call to NPMplus's API, signed in by the cookie `/api/tokens`
+    /// sets, asserting it succeeded.
+    fn api(&self, method: &str, path: &str, body: &str) -> String {
+        let (_, out, err) = self.run(&format!(
+            "curl -sk -b /tmp/jar -c /tmp/jar -X {method} -H 'Content-Type: application/json' \
+             -w '\\n%{{http_code}}' -d '{body}' https://127.0.0.1:81{path}"
+        ));
+        let (answer, status) = out.rsplit_once('\n').unwrap_or((&out, ""));
+        assert!(
+            status.starts_with('2'),
+            "NPMplus answered {method} {path} with {status}:\n{answer}{err}"
+        );
+        answer.to_string()
+    }
+
+    fn wait_until_serving(&self) {
+        for _ in 0..300 {
+            let (_, status, _) =
+                self.run("curl -sk -o /dev/null -w '%{http_code}' https://127.0.0.1:81/api/");
+            if status == "200" {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let log = Command::new(runtime())
+            .args(["logs", &self.name])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stderr).to_string())
+            .unwrap_or_default();
+        panic!("NPMplus never started:\n{log}");
+    }
+
+    /// The status `host` answers `path` with, `000` for no answer.
+    fn status(&self, host: &str, path: &str, curl_args: &str) -> String {
+        let (_, stdout, _) = self.run(&format!(
+            "curl -s -o /dev/null -w '%{{http_code}}' -H 'Host: {host}' {curl_args} http://127.0.0.1{path}"
+        ));
+        stdout.trim().to_string()
+    }
+
+    /// [`Self::status`], polled until it is `want` or ten seconds have
+    /// passed, and asserted.
+    fn wait_for_status(&self, host: &str, path: &str, curl_args: &str, want: &str) {
+        let mut got = String::new();
+        for _ in 0..100 {
+            got = self.status(host, path, curl_args);
+            if got == want {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("{host}{path} with {curl_args} answered {got}, not {want}");
+    }
+}
+
+impl Drop for Npmplus {
+    fn drop(&mut self) {
+        remove_container(&self.name);
+    }
+}
+
+#[test]
+fn npmplus_turns_away_a_blocked_bot_on_every_host() {
+    if !enabled() {
+        return;
+    }
+    let npmplus = Npmplus::start("sb-npmplus-blocks");
+    let rendered = std::fs::read_to_string(npmplus.data().join("nginx/proxy_host/1.conf")).unwrap();
+    npmplus.seed_bot("EvilBot");
+    npmplus.apply();
+
+    let cases = [
+        ("a.example", BAD_AGENT, "403", "a listed bot"),
+        (
+            "a.example",
+            "-A 'evilbot'",
+            "403",
+            "case-insensitive, as NGINX's `~*` is",
+        ),
+        ("a.example", BROWSER, "200", "a browser"),
+        ("b.example", BAD_AGENT, "403", "the other host"),
+        ("b.example", BROWSER, "200", "a browser on the other host"),
+    ];
+    for (host, agent, expected, what) in cases {
+        assert_eq!(npmplus.status(host, "/", agent), expected, "{what}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(npmplus.data().join("nginx/proxy_host/1.conf")).unwrap(),
+        rendered,
+        "the host NPMplus rendered was written"
+    );
+}
+
+/// NPMplus renders a host's file again whenever the host is saved. The
+/// rule is not in that file, so it is still there afterwards.
+#[test]
+fn npmplus_keeps_the_rule_when_it_renders_a_host_again() {
+    if !enabled() {
+        return;
+    }
+    let npmplus = Npmplus::start("sb-npmplus-resave");
+    npmplus.seed_bot("EvilBot");
+    npmplus.apply();
+    let host = npmplus.data().join("nginx/proxy_host/1.conf");
+    let before = std::fs::read_to_string(&host).unwrap();
+
+    npmplus.api(
+        "PUT",
+        "/api/nginx/proxy-hosts/1",
+        r#"{"domain_names":["a.example","www.a.example"]}"#,
+    );
+
+    assert_ne!(
+        std::fs::read_to_string(&host).unwrap(),
+        before,
+        "NPMplus did not render the host again"
+    );
+    npmplus.wait_for_status("a.example", "/", BROWSER, "200");
+    assert_eq!(npmplus.status("a.example", "/", BAD_AGENT), "403");
+}
+
+/// The files in `custom_nginx` survive NPMplus's own start, which creates
+/// them when they are missing and must leave them alone when they are not.
+#[test]
+fn npmplus_keeps_the_rule_across_a_restart() {
+    if !enabled() {
+        return;
+    }
+    let npmplus = Npmplus::start("sb-npmplus-restart");
+    npmplus.seed_bot("EvilBot");
+    npmplus.apply();
+
+    let out = Command::new(runtime())
+        .args(["restart", &npmplus.name])
+        .output()
+        .expect("failed to restart the container");
+    assert!(out.status.success(), "the restart failed");
+    npmplus.wait_until_serving();
+
+    assert_eq!(npmplus.status("a.example", "/", BAD_AGENT), "403");
+}
+
+/// The `http`-level half, `custom_nginx/stop-bots/`, as the container reads
+/// it: the generated robots.txt, served to the bot it turns away, and the
+/// rate-limit zone.
+#[test]
+fn npmplus_serves_robots_txt_and_rate_limits() {
+    if !enabled() {
+        return;
+    }
+    let npmplus = Npmplus::start("sb-npmplus-robots");
+    npmplus.seed_bot("EvilBot");
+    npmplus.stop_bots(&["set-robots-txt", "--enabled", "true"]);
+    npmplus.stop_bots(&["set-rate-limit", "--enabled", "true"]);
+    npmplus.apply();
+
+    let robots = npmplus.sh(&format!(
+        "curl -s -H 'Host: a.example' {BAD_AGENT} http://127.0.0.1/robots.txt"
+    ));
+    assert!(
+        robots.starts_with("# Generated by stop-bots"),
+        "robots.txt was:\n{robots}"
+    );
+    let statuses = npmplus.sh("for i in $(seq 1 60); do \
+         curl -s -o /dev/null -w '%{http_code}\\n' -H 'Host: a.example' http://127.0.0.1/; done");
+    assert!(
+        statuses.lines().any(|status| status == "429"),
+        "60 requests at once were never limited:\n{statuses}"
+    );
+}
+
+/// A trusted client is let through whatever it is called: the trust file
+/// is in `custom_nginx/stop-bots/` and the block reads its variable, so
+/// this fails unless NPMplus's `http` block includes it.
+#[test]
+fn npmplus_lets_a_trusted_client_through() {
+    if !enabled() {
+        return;
+    }
+    let npmplus = Npmplus::start("sb-npmplus-trust");
+    npmplus.seed_bot("EvilBot");
+    npmplus.stop_bots(&["add-trusted", "--address", "203.0.113.7"]);
+    npmplus.apply();
+
+    // NPMplus takes the client from `X-Forwarded-For` when the request
+    // comes from loopback, as it does for a proxy in front of it.
+    let from = |address: &str| format!("-H 'X-Forwarded-For: {address}' {BAD_AGENT}");
+    let cases = [
+        ("203.0.113.7", "200", "the trusted address"),
+        ("203.0.113.8", "403", "any other"),
+    ];
+    for (address, expected, what) in cases {
+        assert_eq!(
+            npmplus.status("a.example", "/", &from(address)),
+            expected,
+            "{what}"
+        );
+    }
+}
+
+/// What NPMplus logs, in its own format, is what the detectors read: a
+/// probe in it is blocked.
+#[test]
+fn npmplus_access_log_is_read_by_the_detectors() {
+    if !enabled() {
+        return;
+    }
+    let npmplus = Npmplus::start("sb-npmplus-log");
+    let log = npmplus.data().join("nginx/logs/access.log");
+    npmplus.stop_bots(&["set-log-paths", "--access-log", log.to_str().unwrap()]);
+    let from = |address: &str| format!("-H 'X-Forwarded-For: {address}'");
+    npmplus.status(
+        "a.example",
+        "/",
+        &format!("{} -A 'NpmplusLogProbe/1.0'", from("203.0.113.9")),
+    );
+    npmplus.status("a.example", "/.env", &from("203.0.113.10"));
+
+    let recorded = npmplus.stop_bots(&["record-access-stats"]);
+    let stats = npmplus.stop_bots(&["list-access-stats"]);
+    assert!(
+        stats.contains("NpmplusLogProbe/1.0"),
+        "record-access-stats said:\n{recorded}\nlist-access-stats said:\n{stats}"
+    );
+    let detected = npmplus.stop_bots(&["run-detector", "probe-paths"]);
+    let rules = npmplus.stop_bots(&["list-firewall-rules"]);
+    assert!(
+        rules.contains("203.0.113.10") && !rules.contains("203.0.113.9"),
+        "run-detector probe-paths said:\n{detected}\nlist-firewall-rules said:\n{rules}"
+    );
+}
+
+/// `uninstall web-server` leaves NPMplus's two files as NPMplus made them,
+/// and an NGINX that still loads and serves. Under `--prefix`, since an
+/// uninstall on the host itself needs root: that runs no system program,
+/// so the test and the reload are this test's.
+#[test]
+fn npmplus_uninstall_puts_its_files_back() {
+    if !enabled() {
+        return;
+    }
+    let npmplus = Npmplus::start("sb-npmplus-uninstall");
+    let custom = npmplus.data().join("custom_nginx");
+    let read = |name: &str| std::fs::read_to_string(custom.join(name)).unwrap();
+    let before = (read("server_http.conf"), read("http_top.conf"));
+    npmplus.seed_bot("EvilBot");
+    npmplus.stop_bots(&["set-robots-txt", "--enabled", "true"]);
+    npmplus.apply();
+
+    let said = npmplus.stop_bots(&[
+        "uninstall",
+        "web-server",
+        "--prefix",
+        npmplus.dir.path().to_str().unwrap(),
+        "--root",
+        npmplus.data().to_str().unwrap(),
+    ]);
+
+    assert_eq!(
+        (read("server_http.conf"), read("http_top.conf")),
+        before,
+        "uninstall said:\n{said}"
+    );
+    assert!(
+        !custom.join("stop-bots").exists(),
+        "its own directory is still there:\n{said}"
+    );
+    npmplus.sh("nginx -t && nginx -s reload");
+    npmplus.wait_for_status("a.example", "/", BAD_AGENT, "200");
 }

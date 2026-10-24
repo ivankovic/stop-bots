@@ -2866,6 +2866,11 @@ fn store_server_settings(
             &mut host.traefik_reload_command,
             &mut host.traefik_root,
         ),
+        webserver::WebServer::Npmplus => (
+            &mut host.npmplus_test_command,
+            &mut host.npmplus_reload_command,
+            &mut host.npmplus_root,
+        ),
     };
 
     if reset {

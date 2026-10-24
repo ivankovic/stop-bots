@@ -8,6 +8,30 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Going back to 0.6.0.** An NGINX, Apache or Traefik host can. An NPMplus host cannot by
+installing the older release: 0.6.0 refuses a `/etc/stop-bots/host.conf` that names NPMplus.
+First run `sudo stop-bots uninstall web-server` with this release, which takes the blocks out
+of `custom_nginx/server_http.conf` and `custom_nginx/http_top.conf` and deletes
+`custom_nginx/stop-bots/`, then delete the `web_server` and `npmplus_*` lines from
+`host.conf`, then install 0.6.0.
+
+### Added
+
+- **NPMplus, beside NGINX, Apache and Traefik.** `sudo stop-bots set-web-server npmplus`
+  reads the hosts NPMplus renders under its data directory (`/opt/npmplus`, or `--root`) and
+  never writes them, since NPMplus rewrites a host's file whenever it is saved. It writes
+  one marked block into `custom_nginx/server_http.conf`, which every proxy, redirection and
+  404 host includes, and one include line into `custom_nginx/http_top.conf`; the rest of
+  each file is left as it was, and `uninstall web-server` takes both out again. The trusted
+  clients, the rate-limit zones and `robots.txt` go in `custom_nginx/stop-bots/`. It tests
+  and reloads with `docker exec npmplus nginx -t` and `docker exec npmplus nginx -s reload`.
+  Tested against NPMplus 2.15.1.
+  - Every host gets the host-wide settings. An apply refuses a site with settings of its
+    own, which includes the request-shape rules, since those are per-site only.
+- **NPMplus's access log is read**, in both the format its releases write (the referer and
+  the user agent unquoted) and the one its development branch writes (both quoted).
+  NPMplus writes it only with `LOGROTATE=true`, to `/opt/npmplus/nginx/logs/access.log`.
+
 ## [0.6.0] — 2026-10-21
 
 Traefik, beside NGINX and Apache.

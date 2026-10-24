@@ -1409,7 +1409,7 @@ pub fn trusted_conf_body(addresses: &[String], user_agents: &[String]) -> Option
 /// version that wrote the file, so comparing it would make every site on
 /// a host that trusts anything `STALE` after every upgrade, with nothing
 /// about what the file says having changed.
-fn trust_file_is_current(config: &BlockConfig, on_disk: Option<&str>) -> bool {
+pub(crate) fn trust_file_is_current(config: &BlockConfig, on_disk: Option<&str>) -> bool {
     match (&config.trust, block_text(config)) {
         (Some(trust), Some(_)) => {
             let expected = trusted_conf_body(&trust.addresses, &trust.user_agents);
@@ -1518,6 +1518,13 @@ pub(crate) fn fallback_unused_managed_files(
 /// written, and a pattern short enough for one chunk renders as a single
 /// `if`.
 fn block_text(config: &BlockConfig) -> Option<String> {
+    block_text_serving(config, &robots_txt_path())
+}
+
+/// [`block_text`], with the generated `robots.txt` served from `robots`:
+/// the path NGINX reads it at, which for an NGINX in a container is not
+/// where this process wrote it (see [`crate::npmplus`]).
+pub(crate) fn block_text_serving(config: &BlockConfig, robots: &Path) -> Option<String> {
     let chunks = chunk_patterns(&usable_patterns(&config.patterns), MAX_PATTERN_CHUNK_LEN);
     let pattern = (!chunks.is_empty()).then_some(chunks);
     // Nothing to block and nothing to serve means no block at all, which
@@ -1660,7 +1667,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         // feature removes the directive with it.
         out.push_str(&format!(
             "    location = /robots.txt {{\n        alias {};\n        default_type text/plain;\n    }}\n",
-            robots_txt_path().display()
+            robots.display()
         ));
     }
     out.push_str(&format!("    {BLOCK_END}\n"));
@@ -1818,10 +1825,34 @@ fn locate_marked(
     begin: &str,
     end: &str,
 ) -> Option<(usize, usize)> {
+    locate_marked_where(content, begin, end, |start| {
+        start > block.open && start < block.close
+    })
+}
+
+/// The sentinel block in a file that is included *into* a `server` block
+/// rather than holding one, found anywhere in the file the way
+/// [`locate_marked`] finds it inside a block: as real comments only.
+pub(crate) fn locate_marked_in_file(content: &str) -> Option<(usize, usize)> {
+    locate_marked_where(content, BLOCK_BEGIN, BLOCK_END, |_| true)
+}
+
+/// The markers of [`locate_marked_in_file`]'s block, around `body`.
+pub(crate) fn marked(body: &str) -> String {
+    format!("{BLOCK_BEGIN}\n{body}{BLOCK_END}\n")
+}
+
+/// [`locate_marked`], over the comments starting where `within` says.
+fn locate_marked_where(
+    content: &str,
+    begin: &str,
+    end: &str,
+    within: impl Fn(usize) -> bool,
+) -> Option<(usize, usize)> {
     let comments: Vec<(usize, usize)> = lex(content)
         .comments
         .into_iter()
-        .filter(|&(start, _)| start > block.open && start < block.close)
+        .filter(|&(start, _)| within(start))
         .collect();
     let is =
         |&(start, stop): &(usize, usize), marker: &str| content[start..stop].trim_end() == marker;

@@ -179,6 +179,7 @@ impl Plan {
             webserver::WebServer::Nginx => &host.nginx_root,
             webserver::WebServer::Apache => &host.apache_root,
             webserver::WebServer::Traefik => &host.traefik_root,
+            webserver::WebServer::Npmplus => &host.npmplus_root,
         };
         let nginx_root = match (root_flag, stored_root) {
             (Some(flag), _) => flag.to_path_buf(),
@@ -193,9 +194,13 @@ impl Plan {
             webserver::WebServer::Nginx => (Some(nginx::MANAGED_DIR_ENV), "nginx"),
             webserver::WebServer::Apache => (Some(crate::apache::MANAGED_DIR_ENV), "apache"),
             webserver::WebServer::Traefik => (None, "traefik"),
+            webserver::WebServer::Npmplus => (None, "npmplus"),
         };
         let managed_dir = match managed_env.and_then(std::env::var_os) {
             Some(dir) => PathBuf::from(dir),
+            // NPMplus's are in its data directory, where its container
+            // reads them.
+            None if server == webserver::WebServer::Npmplus => crate::npmplus::own_dir(&nginx_root),
             None => output_dir.join(managed_name),
         };
         let mut conf_d_dirs = match server {
@@ -214,6 +219,7 @@ impl Plan {
             ],
             // The routers file is in the root itself.
             webserver::WebServer::Traefik => vec![nginx_root.clone()],
+            webserver::WebServer::Npmplus => vec![crate::npmplus::own_dir(&nginx_root)],
         };
         conf_d_dirs.dedup();
 

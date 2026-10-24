@@ -1512,6 +1512,7 @@ fn nginx_applied(db: &Db, probe: &Probe) -> Result<Check> {
             webserver::WebServer::Nginx => "NGINX blocks are applied",
             webserver::WebServer::Apache => "Apache blocks are applied",
             webserver::WebServer::Traefik => "Traefik routers are applied",
+            webserver::WebServer::Npmplus => "NPMplus blocks are applied",
         },
         level,
         detail,
@@ -1689,6 +1690,7 @@ fn access_log_clients(probe: &Probe) -> Check {
                 webserver::WebServer::Nginx => "NGINX is logging its proxy's address, not the client's. If it runs behind a container port mapping, a load balancer or a CDN, set `set_real_ip_from` and `real_ip_header` so $remote_addr is the visitor again.",
                 webserver::WebServer::Apache => "Apache is logging its proxy's address, not the client's. If it runs behind a container port mapping, a load balancer or a CDN, enable mod_remoteip (`sudo a2enmod remoteip`), set `RemoteIPHeader` and `RemoteIPTrustedProxy`, and log `%a` in place of `%h` so the log names the visitor again.",
                 webserver::WebServer::Traefik => "Traefik is logging its proxy's address, not the client's. Behind a load balancer or a CDN, list its addresses in each entrypoint's `forwardedHeaders.trustedIPs`, and Traefik logs the visitor from `X-Forwarded-For`. In rootless Docker or a Swarm, publish its ports in `host` mode so connections reach it from the visitor.",
+                webserver::WebServer::Npmplus => "NPMplus is logging its proxy's address, not the client's. Behind a load balancer or a CDN, list its addresses in `TRUST_IP` in NPMplus's compose.yaml, and NPMplus logs the visitor from `X-Forwarded-For`. Run it with `network_mode: host`, as its compose file does, so connections reach it from the visitor.",
             }
             .to_string()),
         ),
@@ -1763,6 +1765,11 @@ fn cdn_edges(probe: &Probe) -> Option<Check> {
                 crate::cdn::NAME,
                 crate::cdn::traefik_real_ip_config()
             ),
+            webserver::WebServer::Npmplus => format!(
+                "Tell NPMplus to log the visitor's address, from the header {} adds: set \
+                 `TRUST_CLOUDFLARE=true` in its compose.yaml and recreate the container",
+                crate::cdn::NAME
+            ),
         }),
     })
 }
@@ -1804,7 +1811,7 @@ fn access_log_format(probe: &Probe) -> Check {
                             "log in NGINX's `combined` format, or a JSON `log_format ... \
                              escape=json` keyed by the variable names (remote_addr, status, \
                              request_uri or request, http_referer, http_user_agent, time_local \
-                             or time_iso8601)"
+                             or time_iso8601); NPMplus's own access.log format also reads"
                         }
                         // The JSON form is NGINX's `log_format` variables;
                         // Apache's stock format is the one to point at.
@@ -1818,6 +1825,12 @@ fn access_log_format(probe: &Probe) -> Check {
                             "point stop-bots at the file Traefik's `accessLog.filePath` names, \
                              in either of its formats (`common` or `json`): `stop-bots \
                              set-log-paths --access-log <file>`"
+                        }
+                        // Both of the formats NPMplus has written read.
+                        webserver::WebServer::Npmplus => {
+                            "point stop-bots at the access.log NPMplus writes with \
+                             `LOGROTATE=true`, in its data directory's nginx/logs: `stop-bots \
+                             set-log-paths --access-log /opt/npmplus/nginx/logs/access.log`"
                         }
                     }
                     .to_string(),
@@ -1873,6 +1886,10 @@ fn access_log_user_agents(probe: &Probe) -> Option<Check> {
                 }
                 webserver::WebServer::Nginx | webserver::WebServer::Apache => {
                     "log in the `combined` format, which records the user agent and the referer"
+                }
+                webserver::WebServer::Npmplus => {
+                    "point stop-bots at the access.log NPMplus writes, which records the user \
+                     agent and the referer"
                 }
             }
             .to_string(),
@@ -2078,9 +2095,9 @@ fn exposed_files(probe: &Probe) -> Option<Check> {
             (true, webserver::WebServer::Apache) => {
                 "deny dotfiles, `<LocationMatch \"/\\.(?!well-known)\"> Require all denied </LocationMatch>`, move dumps and backups out of the document root, and change every secret that was served"
             }
-            // Traefik serves no files: what answered is the application
-            // behind a router.
-            (true, webserver::WebServer::Traefik) => {
+            // Traefik serves no files, and NPMplus hands nearly every
+            // request on: what answered is the application behind it.
+            (true, webserver::WebServer::Traefik | webserver::WebServer::Npmplus) => {
                 "the application behind the site served them: deny dotfiles there, move dumps and backups out of its web root, and change every secret that was served"
             }
             (false, _) => "delete them from the web root: they describe the server to whoever asks",
@@ -2238,6 +2255,7 @@ fn skipped_entries(db: &Db, server: webserver::WebServer) -> Result<Option<Check
             webserver::WebServer::Nginx => "Entries left out of the NGINX config",
             webserver::WebServer::Apache => "Entries left out of the Apache config",
             webserver::WebServer::Traefik => "Entries left out of the Traefik routers",
+            webserver::WebServer::Npmplus => "Entries left out of the NPMplus config",
         },
         level: Level::Warn,
         detail: format!(
@@ -2393,6 +2411,7 @@ fn log_sources(probe: &Probe) -> Check {
                 webserver::WebServer::Nginx => "the NGINX access log",
                 webserver::WebServer::Apache => "the Apache access log",
                 webserver::WebServer::Traefik => "the Traefik access log",
+                webserver::WebServer::Npmplus => "the NPMplus access log",
             },
         ),
     ]
