@@ -1409,7 +1409,7 @@ pub fn trusted_conf_body(addresses: &[String], user_agents: &[String]) -> Option
 /// version that wrote the file, so comparing it would make every site on
 /// a host that trusts anything `STALE` after every upgrade, with nothing
 /// about what the file says having changed.
-fn trust_file_is_current(config: &BlockConfig, on_disk: Option<&str>) -> bool {
+pub(crate) fn trust_file_is_current(config: &BlockConfig, on_disk: Option<&str>) -> bool {
     match (&config.trust, block_text(config)) {
         (Some(trust), Some(_)) => {
             let expected = trusted_conf_body(&trust.addresses, &trust.user_agents);
@@ -1518,6 +1518,13 @@ pub(crate) fn fallback_unused_managed_files(
 /// written, and a pattern short enough for one chunk renders as a single
 /// `if`.
 fn block_text(config: &BlockConfig) -> Option<String> {
+    block_text_serving(config, &robots_txt_path())
+}
+
+/// [`block_text`], with the generated `robots.txt` served from `robots`:
+/// the path NGINX reads it at, which for an NGINX in a container is not
+/// where this process wrote it (see [`crate::npmplus`]).
+pub(crate) fn block_text_serving(config: &BlockConfig, robots: &Path) -> Option<String> {
     let chunks = chunk_patterns(&usable_patterns(&config.patterns), MAX_PATTERN_CHUNK_LEN);
     let pattern = (!chunks.is_empty()).then_some(chunks);
     // Nothing to block and nothing to serve means no block at all, which
@@ -1660,7 +1667,7 @@ fn block_text(config: &BlockConfig) -> Option<String> {
         // feature removes the directive with it.
         out.push_str(&format!(
             "    location = /robots.txt {{\n        alias {};\n        default_type text/plain;\n    }}\n",
-            robots_txt_path().display()
+            robots.display()
         ));
     }
     out.push_str(&format!("    {BLOCK_END}\n"));
@@ -1818,10 +1825,34 @@ fn locate_marked(
     begin: &str,
     end: &str,
 ) -> Option<(usize, usize)> {
+    locate_marked_where(content, begin, end, |start| {
+        start > block.open && start < block.close
+    })
+}
+
+/// The sentinel block in a file that is included *into* a `server` block
+/// rather than holding one, found anywhere in the file the way
+/// [`locate_marked`] finds it inside a block: as real comments only.
+pub(crate) fn locate_marked_in_file(content: &str) -> Option<(usize, usize)> {
+    locate_marked_where(content, BLOCK_BEGIN, BLOCK_END, |_| true)
+}
+
+/// The markers of [`locate_marked_in_file`]'s block, around `body`.
+pub(crate) fn marked(body: &str) -> String {
+    format!("{BLOCK_BEGIN}\n{body}{BLOCK_END}\n")
+}
+
+/// [`locate_marked`], over the comments starting where `within` says.
+fn locate_marked_where(
+    content: &str,
+    begin: &str,
+    end: &str,
+    within: impl Fn(usize) -> bool,
+) -> Option<(usize, usize)> {
     let comments: Vec<(usize, usize)> = lex(content)
         .comments
         .into_iter()
-        .filter(|&(start, _)| start > block.open && start < block.close)
+        .filter(|&(start, _)| within(start))
         .collect();
     let is =
         |&(start, stop): &(usize, usize), marker: &str| content[start..stop].trim_end() == marker;
@@ -1921,7 +1952,7 @@ pub fn discover_sites(root: &Path) -> Result<Vec<DiscoveredSite>> {
     let mut sites = Vec::new();
     for entry in crate::webserver::config_files(root) {
         let path = entry.path();
-        let Ok(content) = fs::read_to_string(path) else {
+        let Some(content) = crate::webserver::read_regular_file(path) else {
             continue;
         };
         for block in parse_server_blocks(&content) {
@@ -1945,7 +1976,7 @@ pub fn site_listens(root: &Path) -> Result<Vec<crate::webserver::SiteListens>> {
     }
     let mut sites = Vec::new();
     for entry in crate::webserver::config_files(root) {
-        let Ok(content) = fs::read_to_string(entry.path()) else {
+        let Some(content) = crate::webserver::read_regular_file(entry.path()) else {
             continue;
         };
         for block in parse_server_blocks(&content) {
@@ -2046,7 +2077,12 @@ pub fn server_names_for(config_path: &Path, server_name: &str) -> Vec<String> {
     let Ok(content) = fs::read_to_string(config_path) else {
         return vec![server_name.to_string()];
     };
-    parse_server_blocks(&content)
+    server_names_in(&content, server_name)
+}
+
+/// [`server_names_for`], over a file's `content` already read.
+pub(crate) fn server_names_in(content: &str, server_name: &str) -> Vec<String> {
+    parse_server_blocks(content)
         .into_iter()
         .find(|block| block.names.iter().any(|name| name == server_name))
         .map(|block| block.names)
@@ -2079,7 +2115,15 @@ pub fn site_directives(
     config_path: &Path,
     server_name: &str,
 ) -> Option<Vec<(String, Vec<String>)>> {
-    let content = without_injected_blocks(&fs::read_to_string(config_path).ok()?);
+    site_directives_in(&fs::read_to_string(config_path).ok()?, server_name)
+}
+
+/// [`site_directives`], over a file's `content` already read.
+pub(crate) fn site_directives_in(
+    content: &str,
+    server_name: &str,
+) -> Option<Vec<(String, Vec<String>)>> {
+    let content = without_injected_blocks(content);
     let blocks = parse_server_blocks(&content);
     let names = blocks
         .iter()
@@ -3296,7 +3340,12 @@ mod tests {
         let path = dir.path().join("stop-bots-trusted.conf");
         std::os::unix::fs::symlink(&victim, &path).unwrap();
 
-        write_planned_managed_files(&[(path.clone(), "ours\n".to_string())]).unwrap();
+        write_planned_managed_files(
+            WebServer::Nginx,
+            dir.path(),
+            &[(path.clone(), "ours\n".to_string())],
+        )
+        .unwrap();
 
         assert_eq!(fs::read_to_string(&victim).unwrap(), "precious\n");
         assert!(fs::symlink_metadata(&path).unwrap().is_file());
@@ -3392,7 +3441,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.conf");
         fs::write(&path, one_site()).unwrap();
-        let snapshot = Snapshot::of_apply(dir.path(), [], &[], [path.as_path()]).unwrap();
+        let snapshot =
+            Snapshot::of_apply(WebServer::Nginx, dir.path(), [], &[], [path.as_path()]).unwrap();
         apply_blocks_to_file(WebServer::Nginx, &path, dir.path(), &[], &cfg(&["BadBot"])).unwrap();
 
         let err = test_or_restore(WebServer::Nginx, &snapshot, &commands_that(false)).unwrap_err();
@@ -5091,9 +5141,12 @@ mod tests {
         let path = dir.path().join("conf.d/stop-bots-trusted.conf");
         let files = vec![(path.clone(), trust_body())];
 
-        assert_eq!(write_planned_managed_files(&files).unwrap(), 1);
         assert_eq!(
-            write_planned_managed_files(&files).unwrap(),
+            write_planned_managed_files(WebServer::Nginx, dir.path(), &files).unwrap(),
+            1
+        );
+        assert_eq!(
+            write_planned_managed_files(WebServer::Nginx, dir.path(), &files).unwrap(),
             0,
             "an unchanged file must not count, or every apply reloads NGINX"
         );
@@ -5181,7 +5234,12 @@ mod tests {
     /// A file written by a generated-file writer, recorded as one would be.
     fn written_and_recorded(db: &crate::db::Db, path: &Path, body: &str) {
         record_managed_files(db, &[(path.to_path_buf(), body.to_string())]).unwrap();
-        write_planned_managed_files(&[(path.to_path_buf(), body.to_string())]).unwrap();
+        write_planned_managed_files(
+            WebServer::Nginx,
+            Path::new("/"),
+            &[(path.to_path_buf(), body.to_string())],
+        )
+        .unwrap();
     }
 
     /// The record is a row in a database root does not always own, and an
@@ -5310,7 +5368,7 @@ mod tests {
         let db = crate::db::Db::open_in_memory().unwrap();
 
         let unused = unused_managed_files(WebServer::Nginx, &db, root.path()).unwrap();
-        let snapshot = Snapshot::of_apply(root.path(), [], &unused, []).unwrap();
+        let snapshot = Snapshot::of_apply(WebServer::Nginx, root.path(), [], &unused, []).unwrap();
         let checked = root.path().join("checked");
         fs::rename(&conf_d, &checked).unwrap();
         std::os::unix::fs::symlink(victim.path(), &conf_d).unwrap();

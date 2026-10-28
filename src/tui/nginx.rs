@@ -597,6 +597,7 @@ impl Nginx {
                     WebServer::Nginx => "NGINX settings",
                     WebServer::Apache => "Apache settings",
                     WebServer::Traefik => "Traefik settings",
+                    WebServer::Npmplus => "NPMplus settings",
                 },
                 vec![
                     ("\u{2191}\u{2193}", "move"),
@@ -1226,6 +1227,15 @@ impl Nginx {
                 "The Traefik routers were already up to date".to_string()
             };
         }
+        // Nor are NPMplus's: their block is the one in custom_nginx that
+        // every host includes.
+        if self.server == WebServer::Npmplus && failures.is_empty() {
+            message = if managed_changed > 0 {
+                format!("Updated the rule every NPMplus host includes ({total} host(s))")
+            } else {
+                "The rule every NPMplus host includes was already up to date".to_string()
+            };
+        }
         (message, applied > 0 || managed_changed > 0)
     }
 
@@ -1382,6 +1392,7 @@ pub struct ApplyOutcome {
 /// stopping at the first.
 pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     let snapshot = webserver::Snapshot::of_apply(
+        plan.server,
         &plan.root,
         plan.managed_writes.iter().map(|(path, _)| path.clone()),
         &plan.managed_removals,
@@ -1390,7 +1401,9 @@ pub fn run_apply(plan: ApplyPlan) -> ApplyOutcome {
     // Same ordering as the CLI's apply: a managed file has to exist before
     // a config that aliases it is reloaded.
     let managed = match &snapshot {
-        Ok(_) => webserver::write_planned_managed_files(&plan.managed_writes),
+        Ok(_) => {
+            webserver::write_planned_managed_files(plan.server, &plan.root, &plan.managed_writes)
+        }
         Err(err) => Err(anyhow::anyhow!("{err:#}")),
     };
     let results: Vec<SiteResult> = plan

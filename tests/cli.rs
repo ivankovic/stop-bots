@@ -4685,6 +4685,372 @@ fn traefik_uninstall_takes_the_routers_file_away() {
     );
 }
 
+// ---- NPMplus ----
+//
+// The same binary driving a fake NPMplus data directory: the one block
+// every host includes, NPMplus's own files left alone, and the container's
+// NGINX tested and reloaded through `docker exec`.
+
+/// A proxy host as NPMplus renders it, trimmed to what is read.
+const NPMPLUS_PROXY_HOST: &str = "server {\n  server_name a.example;\n  listen 0.0.0.0:80;\n  include /data/custom_nginx/server_http.conf;\n}\n";
+
+/// A line of the operator's own in `server_http.conf`.
+const NPMPLUS_OWN_LINE: &str = "add_header X-Mine 1;\n";
+
+/// An NPMplus data directory at `root`: one proxy host, and the
+/// `custom_nginx` files NPMplus creates, one with a line of the
+/// operator's. Returns the proxy host's file and `server_http.conf`.
+fn npmplus_data(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let proxy_host = root.join("nginx/proxy_host/1.conf");
+    let server_http = root.join("custom_nginx/server_http.conf");
+    fs::create_dir_all(proxy_host.parent().unwrap()).unwrap();
+    fs::create_dir_all(server_http.parent().unwrap()).unwrap();
+    fs::write(&proxy_host, NPMPLUS_PROXY_HOST).unwrap();
+    fs::write(&server_http, NPMPLUS_OWN_LINE).unwrap();
+    fs::write(root.join("custom_nginx/http_top.conf"), "").unwrap();
+    (proxy_host, server_http)
+}
+
+impl Fixture {
+    /// [`npmplus_data`] in this fixture, and NPMplus chosen in its host
+    /// settings.
+    fn npmplus(&self) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = self._tmp.path().join("npmplus");
+        let files = npmplus_data(&root);
+        fs::write(
+            self.host_conf(),
+            format!("web_server = npmplus\nnpmplus_root = {}\n", root.display()),
+        )
+        .unwrap();
+        files
+    }
+}
+
+#[test]
+fn npmplus_apply_writes_the_block_every_host_includes() {
+    let fx = Fixture::new();
+    let (proxy_host, server_http) = fx.npmplus();
+    let (bin, _) = fake_tools(fx._tmp.path());
+    fx.seed_bots();
+    fx.run(&["scan-sites"])
+        .stdout(predicate::str::contains("Discovered 1 site(s)"));
+
+    fx.apply_with(&bin).success();
+
+    let written = fs::read_to_string(&server_http).unwrap();
+    assert!(
+        written.starts_with("    # BEGIN stop-bots") && written.ends_with(NPMPLUS_OWN_LINE),
+        "server_http.conf was:\n{written}"
+    );
+    assert_eq!(
+        fs::read_to_string(&proxy_host).unwrap(),
+        NPMPLUS_PROXY_HOST,
+        "NPMplus's own file was written"
+    );
+}
+
+#[test]
+fn npmplus_tests_and_reloads_nginx_in_its_container() {
+    let fx = Fixture::new();
+    fx.npmplus();
+    let (bin, calls) = fake_tools(fx._tmp.path());
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+
+    fx.apply_with(&bin).success();
+
+    assert_eq!(
+        fs::read_to_string(&calls).unwrap_or_default(),
+        "docker exec npmplus nginx -t\ndocker exec npmplus nginx -s reload\n"
+    );
+}
+
+/// NPMplus's two files are the operator's: a config its NGINX refuses
+/// puts both back as they were.
+#[test]
+fn npmplus_puts_its_files_back_when_nginx_refuses_the_config() {
+    let fx = Fixture::new();
+    let (_, server_http) = fx.npmplus();
+    let (bin, _) = fake_tools(fx._tmp.path());
+    fs::write(fx._tmp.path().join("fail-docker"), "nginx: [emerg] no\n").unwrap();
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+
+    fx.apply_with(&bin).failure();
+
+    let http_top = server_http.with_file_name("http_top.conf");
+    let cases = [
+        ("server_http.conf", &server_http, NPMPLUS_OWN_LINE),
+        ("http_top.conf", &http_top, ""),
+    ];
+    for (what, path, expected) in cases {
+        assert_eq!(fs::read_to_string(path).unwrap(), expected, "{what}");
+    }
+}
+
+/// A config test that does what NPMplus's container can do while its own
+/// `nginx -t` runs: puts a link to `outside` where `custom_nginx` was,
+/// keeping the real directory as `custom_nginx.real`, and fails, so that
+/// whatever ran it puts its files back. Returns the script.
+fn test_that_plants_a_link(root: &Path, outside: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = root.with_file_name("plant-link-and-fail");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh
+             mv '{custom}' '{custom}.real' && ln -s '{outside}' '{custom}'
+             echo 'nginx: [emerg] planted' >&2
+             exit 1
+",
+            custom = root.join("custom_nginx").display(),
+            outside = outside.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script
+}
+
+/// Every name in `dir`, for an assertion that it is empty.
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The container decides whether `nginx -t` fails, and can swap
+/// `custom_nginx` for a link while it runs. Putting the files back then
+/// goes through the directory they were taken from, never through the
+/// link: nothing is written into the link's target, and the real files
+/// are as they were.
+#[test]
+fn npmplus_a_failed_test_puts_nothing_back_through_a_planted_link() {
+    let fx = Fixture::new();
+    let (_, server_http) = fx.npmplus();
+    let root = server_http.parent().unwrap().parent().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let script = test_that_plants_a_link(root, outside.path());
+    let mut host = fs::read_to_string(fx.host_conf()).unwrap();
+    host.push_str(&format!(
+        "npmplus_test_command = {}\nnpmplus_reload_command = true\n",
+        script.display()
+    ));
+    fs::write(fx.host_conf(), host).unwrap();
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+
+    fx.cmd(&["apply-blocks"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nginx: [emerg] planted"))
+        .stderr(predicate::str::contains(
+            "every file it changed was put back",
+        ));
+
+    assert_eq!(
+        names_in(outside.path()),
+        Vec::<String>::new(),
+        "written through the link"
+    );
+    let real = root.join("custom_nginx.real");
+    let cases = [
+        ("server_http.conf", NPMPLUS_OWN_LINE),
+        ("http_top.conf", ""),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(
+            fs::read_to_string(real.join(name)).unwrap(),
+            expected,
+            "{name}"
+        );
+    }
+}
+
+/// `uninstall web-server` runs the same test and the same putting back,
+/// through `remove_everything`, which is called here directly: the command
+/// needs root unless it is given `--prefix`, and under `--prefix` it runs
+/// no test.
+#[test]
+fn npmplus_a_failed_uninstall_puts_nothing_back_through_a_planted_link() {
+    let fx = Fixture::new();
+    let (_, server_http) = fx.npmplus();
+    let root = server_http
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+    fx.run(&["apply-blocks", "--no-reload"]);
+    let applied = fs::read_to_string(&server_http).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let commands = stop_bots::webserver::ServerCommands {
+        test: vec![test_that_plants_a_link(&root, outside.path())
+            .display()
+            .to_string()],
+        reload: Vec::new(),
+    };
+
+    let err = stop_bots::webserver::remove_everything(
+        stop_bots::webserver::WebServer::Npmplus,
+        &root,
+        &[],
+        Some(&commands),
+        false,
+    )
+    .expect_err("the test failed, so the uninstall must too");
+
+    assert!(
+        format!("{err:#}").contains("every file it changed was put back"),
+        "uninstall said: {err:#}"
+    );
+    assert_eq!(
+        names_in(outside.path()),
+        Vec::<String>::new(),
+        "written through the link"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("custom_nginx.real/server_http.conf")).unwrap(),
+        applied
+    );
+}
+
+/// Every host includes the one block, so a host's own settings have
+/// nowhere to go, and an apply says so rather than leave them out.
+#[test]
+fn npmplus_refuses_a_site_with_settings_of_its_own() {
+    let fx = Fixture::new();
+    let (_, server_http) = fx.npmplus();
+    let (bin, _) = fake_tools(fx._tmp.path());
+    fx.seed_bots();
+    fx.run(&["scan-sites"]);
+    fx.run(&[
+        "set-site-rule",
+        "--site",
+        "a.example",
+        "--rule",
+        "no-accept",
+        "--enabled",
+        "true",
+    ]);
+
+    fx.apply_with(&bin)
+        .failure()
+        .stderr(predicate::str::contains(
+            "a.example has settings of its own",
+        ));
+    assert_eq!(fs::read_to_string(&server_http).unwrap(), NPMPLUS_OWN_LINE);
+}
+
+/// `uninstall web-server` takes the block out of both of NPMplus's files,
+/// leaving each as it was, and removes the generated files. Under
+/// `--prefix`, which runs no system program.
+#[test]
+fn npmplus_uninstall_puts_its_files_back() {
+    let (tmp, root) = npmplus_applied_under_prefix();
+    let robots = root.join("custom_nginx/stop-bots/robots.txt");
+    assert!(robots.exists(), "nothing was applied");
+
+    let out = under_prefix(tmp.path(), &["uninstall", "web-server"]);
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    let cases = [
+        (
+            "server_http.conf",
+            fs::read_to_string(root.join("custom_nginx/server_http.conf")).unwrap(),
+            NPMPLUS_OWN_LINE,
+        ),
+        (
+            "http_top.conf",
+            fs::read_to_string(root.join("custom_nginx/http_top.conf")).unwrap(),
+            "",
+        ),
+    ];
+    for (what, got, expected) in cases {
+        assert_eq!(got, expected, "{what} after uninstall:\n{stdout}");
+    }
+    assert!(!robots.exists(), "robots.txt is still there:\n{stdout}");
+    assert!(
+        !root.join("custom_nginx/stop-bots").exists(),
+        "its emptied directory is still there:\n{stdout}"
+    );
+}
+
+/// `custom_nginx/stop-bots` is inside another application's data: an
+/// uninstall removes what it generated there, and the directory only if
+/// that leaves it empty.
+#[test]
+fn npmplus_uninstall_leaves_what_it_did_not_generate() {
+    let (tmp, root) = npmplus_applied_under_prefix();
+    let own = root.join("custom_nginx/stop-bots");
+    fs::write(own.join("mine.conf"), "# the operator's\n").unwrap();
+
+    let out = under_prefix(tmp.path(), &["uninstall", "web-server"]);
+
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    assert_eq!(names_in(&own), ["mine.conf"], "uninstall said:\n{stdout}");
+}
+
+/// The binary under test, against the host under `prefix` as `uninstall
+/// --prefix` reads it: its host settings and database there.
+fn under_prefix(prefix: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
+    let mut cmd = stop_bots_bin();
+    cmd.env(
+        "STOP_BOTS_HOST_CONF",
+        prefix.join("etc/stop-bots/host.conf"),
+    )
+    .args(args);
+    if args.first() == Some(&"uninstall") {
+        cmd.args(["--prefix", prefix.to_str().unwrap()]);
+    }
+    cmd.args([
+        "--db",
+        prefix
+            .join("var/lib/stop-bots/db.sqlite3")
+            .to_str()
+            .unwrap(),
+    ])
+    .assert()
+    .success()
+}
+
+/// A prefix with NPMplus chosen, its data directory at `opt/npmplus`, the
+/// generated robots.txt on and the blocks applied. Returns the prefix and
+/// the data directory.
+fn npmplus_applied_under_prefix() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let prefix = tmp.path();
+    let root = prefix.join("opt/npmplus");
+    npmplus_data(&root);
+    let host_conf = prefix.join("etc/stop-bots/host.conf");
+    fs::create_dir_all(host_conf.parent().unwrap()).unwrap();
+    fs::write(&host_conf, "web_server = npmplus\n").unwrap();
+    under_prefix(
+        prefix,
+        &[
+            "update-bot-lists",
+            "--source",
+            "tests/fixtures/botlists/well-known-bots-sample.json",
+        ],
+    );
+    under_prefix(prefix, &["set-robots-txt", "--enabled", "true"]);
+    under_prefix(
+        prefix,
+        &[
+            "apply-blocks",
+            "--root",
+            root.to_str().unwrap(),
+            "--no-reload",
+        ],
+    );
+    (tmp, root)
+}
+
 // ---- auto-apply ----
 
 /// The switch itself: off by default, settable, and readable back.

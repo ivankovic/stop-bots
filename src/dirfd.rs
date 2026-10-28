@@ -143,6 +143,15 @@ impl DirFile {
         }
     }
 
+    /// The permission bits and the owner of the regular file there, or
+    /// `None` for nothing, a link or anything but a regular file.
+    pub fn mode_and_owner(&self) -> io::Result<Option<(u32, (u32, u32))>> {
+        Ok(self
+            .lstat()?
+            .filter(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
+            .map(|stat| (stat.st_mode & 0o7777, (stat.st_uid, stat.st_gid))))
+    }
+
     /// Whether a plain file is there: not a link, a FIFO or a directory.
     pub fn is_regular(&self) -> bool {
         matches!(self.lstat(), Ok(Some(stat)) if stat.st_mode & libc::S_IFMT == libc::S_IFREG)
@@ -204,6 +213,23 @@ impl DirFile {
         Some(line)
     }
 
+    /// Removes the directory by this name if it is empty. `false` if there
+    /// was nothing, or something is still in it; an error for a link or
+    /// anything else that is not a directory.
+    pub fn remove_empty_dir(&self) -> io::Result<bool> {
+        // SAFETY: a valid descriptor and a NUL-terminated name.
+        let rc =
+            unsafe { libc::unlinkat(self.dir.as_raw_fd(), self.name.as_ptr(), libc::AT_REMOVEDIR) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        match io::Error::last_os_error() {
+            err if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            err if err.raw_os_error() == Some(libc::ENOTEMPTY) => Ok(false),
+            err => Err(err),
+        }
+    }
+
     /// Removes whatever is there by this name (a link itself, not what it
     /// points at). `false` if there was nothing.
     pub fn remove(&self) -> io::Result<bool> {
@@ -221,6 +247,17 @@ impl DirFile {
     /// created with `O_EXCL`, renamed over it. A link there is replaced,
     /// not written through.
     pub fn write_atomically(&self, content: &[u8], mode: u32) -> io::Result<()> {
+        self.write_atomically_owned(content, mode, None)
+    }
+
+    /// [`Self::write_atomically`], the new file given `owner` first: what
+    /// replaces a file of someone else's stays theirs.
+    pub fn write_atomically_owned(
+        &self,
+        content: &[u8],
+        mode: u32,
+        owner: Option<(u32, u32)>,
+    ) -> io::Result<()> {
         let dir = self.dir.as_raw_fd();
         let name = OsStr::from_bytes(self.name.as_bytes()).to_string_lossy();
         for _ in 0..8 {
@@ -252,6 +289,12 @@ impl DirFile {
             let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
             let written = (|| -> io::Result<()> {
                 file.write_all(content)?;
+                if let Some((uid, gid)) = owner {
+                    // Best effort, as for `webserver::write_atomically`:
+                    // only root can give a file away, and a run that is
+                    // not root owns what it replaces.
+                    let _ = std::os::unix::fs::fchown(&file, Some(uid), Some(gid));
+                }
                 crate::db::guard::fchmod(&file, mode)?;
                 file.sync_all()?;
                 // SAFETY: valid descriptors and NUL-terminated names.
@@ -270,6 +313,25 @@ impl DirFile {
             io::ErrorKind::AlreadyExists,
             "could not create a temporary file beside it",
         ))
+    }
+}
+
+/// Creates the directory at `path`, which must be absolute and resolved,
+/// unless it is there: through its parent, opened by
+/// [`open_dir_nofollow`], so no link on the way is followed. A link at
+/// `path` itself is left alone, and fails whatever is then opened through
+/// it.
+pub fn create_dir_nofollow(path: &Path) -> io::Result<()> {
+    let (parent, name) = split(path)?;
+    let parent = open_dir_nofollow(parent)?;
+    let name = c_name(name)?;
+    // SAFETY: a valid descriptor and a NUL-terminated name.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
+        return Ok(());
+    }
+    match io::Error::last_os_error() {
+        err if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        err => Err(err),
     }
 }
 

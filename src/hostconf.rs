@@ -86,6 +86,9 @@ const APACHE_ROOT: &str = "apache_root";
 const TRAEFIK_TEST: &str = "traefik_test_command";
 const TRAEFIK_RELOAD: &str = "traefik_reload_command";
 const TRAEFIK_ROOT: &str = "traefik_root";
+const NPMPLUS_TEST: &str = "npmplus_test_command";
+const NPMPLUS_RELOAD: &str = "npmplus_reload_command";
+const NPMPLUS_ROOT: &str = "npmplus_root";
 const ACCESS_LOG: &str = "access_log";
 const SSH_LOG: &str = "ssh_log";
 const KERNEL_LOG: &str = "kernel_log";
@@ -118,6 +121,12 @@ pub struct HostConf {
     pub traefik_reload_command: Option<String>,
     /// The directory Traefik's file provider reads.
     pub traefik_root: Option<PathBuf>,
+    /// How to test NPMplus's NGINX config, the same way as NGINX's.
+    pub npmplus_test_command: Option<String>,
+    /// How to reload NPMplus's NGINX.
+    pub npmplus_reload_command: Option<String>,
+    /// NPMplus's data directory, the one its container has at `/data`.
+    pub npmplus_root: Option<PathBuf>,
     /// The NGINX access log.
     pub access_log: Option<PathBuf>,
     /// The SSH log, which the lockout guard reads.
@@ -182,6 +191,9 @@ impl HostConf {
                 TRAEFIK_TEST => conf.traefik_test_command = value,
                 TRAEFIK_RELOAD => conf.traefik_reload_command = value,
                 TRAEFIK_ROOT => conf.traefik_root = value.map(PathBuf::from),
+                NPMPLUS_TEST => conf.npmplus_test_command = value,
+                NPMPLUS_RELOAD => conf.npmplus_reload_command = value,
+                NPMPLUS_ROOT => conf.npmplus_root = value.map(PathBuf::from),
                 ACCESS_LOG => conf.access_log = value.map(PathBuf::from),
                 SSH_LOG => conf.ssh_log = value.map(PathBuf::from),
                 KERNEL_LOG => conf.kernel_log = value.map(PathBuf::from),
@@ -205,6 +217,8 @@ impl HostConf {
             &self.apache_reload_command,
             &self.traefik_test_command,
             &self.traefik_reload_command,
+            &self.npmplus_test_command,
+            &self.npmplus_reload_command,
         ]
         .into_iter()
         .flatten()
@@ -216,6 +230,7 @@ impl HostConf {
             &self.nginx_root,
             &self.apache_root,
             &self.traefik_root,
+            &self.npmplus_root,
             &self.access_log,
             &self.ssh_log,
             &self.kernel_log,
@@ -256,6 +271,9 @@ impl HostConf {
             (TRAEFIK_TEST, self.traefik_test_command.clone()),
             (TRAEFIK_RELOAD, self.traefik_reload_command.clone()),
             (TRAEFIK_ROOT, path_text(&self.traefik_root)),
+            (NPMPLUS_TEST, self.npmplus_test_command.clone()),
+            (NPMPLUS_RELOAD, self.npmplus_reload_command.clone()),
+            (NPMPLUS_ROOT, path_text(&self.npmplus_root)),
             (ACCESS_LOG, path_text(&self.access_log)),
             (SSH_LOG, path_text(&self.ssh_log)),
             (KERNEL_LOG, path_text(&self.kernel_log)),
@@ -304,6 +322,10 @@ impl HostConf {
                 (&self.traefik_test_command, TRAEFIK_TEST),
                 (&self.traefik_reload_command, TRAEFIK_RELOAD),
             ),
+            WebServer::Npmplus => (
+                (&self.npmplus_test_command, NPMPLUS_TEST),
+                (&self.npmplus_reload_command, NPMPLUS_RELOAD),
+            ),
         };
         let root = self.root(None);
         Ok(ServerCommands {
@@ -320,6 +342,7 @@ impl HostConf {
             WebServer::Nginx => &self.nginx_root,
             WebServer::Apache => &self.apache_root,
             WebServer::Traefik => &self.traefik_root,
+            WebServer::Npmplus => &self.npmplus_root,
         };
         flag.map(Path::to_path_buf)
             .or_else(|| stored.clone())
@@ -336,6 +359,7 @@ impl HostConf {
             WebServer::Nginx => &mut self.nginx_root,
             WebServer::Apache => &mut self.apache_root,
             WebServer::Traefik => &mut self.traefik_root,
+            WebServer::Npmplus => &mut self.npmplus_root,
         }
     }
 
@@ -359,12 +383,13 @@ impl HostConf {
     ///
     /// Never on Traefik, which has no test command to tell by and is in a
     /// container far more often than not; nor does its dynamic config name
-    /// a document root or a log for this to matter to.
+    /// a document root or a log for this to matter to. Never on NPMplus,
+    /// which is always in one: its config names the container's `/data`.
     pub fn config_paths_are_here(&self) -> bool {
         match self.web_server() {
             WebServer::Nginx => self.nginx_test_command.is_none(),
             WebServer::Apache => self.apache_test_command.is_none(),
-            WebServer::Traefik => false,
+            WebServer::Traefik | WebServer::Npmplus => false,
         }
     }
 }
@@ -710,6 +735,9 @@ mod tests {
             traefik_test_command: None,
             traefik_reload_command: Some("docker restart traefik".into()),
             traefik_root: Some("/srv/traefik/dynamic".into()),
+            npmplus_test_command: Some("docker exec proxy nginx -t".into()),
+            npmplus_reload_command: None,
+            npmplus_root: Some("/srv/npmplus".into()),
             access_log: Some("/srv/logs/access.log".into()),
             ssh_log: None,
             kernel_log: Some("/srv/logs/kern.log".into()),
@@ -730,6 +758,27 @@ mod tests {
         assert_eq!(
             nginx.commands().unwrap().test,
             ["docker", "exec", "my web", "nginx", "-t"]
+        );
+    }
+
+    /// Its NGINX is in the container NPMplus's compose file names, with
+    /// the data directory that file mounts.
+    #[test]
+    fn npmplus_defaults_to_its_compose_files_container() {
+        let npmplus = HostConf {
+            web_server: Some(WebServer::Npmplus),
+            ..HostConf::default()
+        };
+        let commands = npmplus.commands().unwrap();
+        assert_eq!(commands.test, ["docker", "exec", "npmplus", "nginx", "-t"]);
+        assert_eq!(
+            commands.reload,
+            ["docker", "exec", "npmplus", "nginx", "-s", "reload"]
+        );
+        assert_eq!(npmplus.root(None), PathBuf::from("/opt/npmplus"));
+        assert!(
+            !npmplus.config_paths_are_here(),
+            "its config names the container's paths"
         );
     }
 

@@ -8,6 +8,45 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Before upgrading:** nothing to do. The database schema is unchanged, and an NGINX, Apache
+or Traefik host is configured as before.
+
+**After upgrading:** nothing changes on an NGINX, Apache or Traefik host.
+
+**Going back to 0.7.0.** An NGINX, Apache or Traefik host can. An NPMplus host cannot by
+installing the older release: 0.7.0 refuses a `/etc/stop-bots/host.conf` that names NPMplus.
+First run `sudo stop-bots uninstall web-server` with this release, which takes the blocks out
+of `custom_nginx/server_http.conf` and `custom_nginx/http_top.conf` and deletes what it
+generated in `custom_nginx/stop-bots/`, then delete the `web_server` and `npmplus_*` lines
+from `host.conf`, then install 0.7.0.
+
+### Added
+
+- **NPMplus, beside NGINX, Apache and Traefik.** `sudo stop-bots set-web-server npmplus`
+  reads the hosts NPMplus renders under its data directory (`/opt/npmplus`, or `--root`) and
+  never writes them, since NPMplus rewrites a host's file whenever it is saved. It writes
+  one marked block into `custom_nginx/server_http.conf`, which every proxy, redirection and
+  404 host includes, and one include line into `custom_nginx/http_top.conf`; the rest of
+  each file is left as it was, and `uninstall web-server` takes both out again. The trusted
+  clients, the rate-limit zones and `robots.txt` go in `custom_nginx/stop-bots/`. It tests
+  and reloads with `docker exec npmplus nginx -t` and `docker exec npmplus nginx -s reload`.
+  Tested against NPMplus 2.15.1.
+  - Every host gets the host-wide settings. An apply refuses a site with settings of its
+    own, which includes the request-shape rules, since those are per-site only.
+  - Everything else NGINX does, NPMplus does: every block response, the generated
+    `robots.txt`, rate limiting and trusted clients.
+  - stop-bots runs as root, and NPMplus's data directory is its container's to write, so
+    nothing below it is reached through a link. Every file there is read, written and,
+    after a failed config test, put back through its own directory; a link in the way
+    refuses the apply. A file put back keeps its owner and loses any setuid, setgid or
+    sticky bit. `uninstall web-server` removes only what it generated in
+    `custom_nginx/stop-bots/`, and the directory only if that leaves it empty.
+  - `stop-bots status` gives NPMplus's own fixes: `TRUST_CLOUDFLARE=true` behind
+    Cloudflare, `TRUST_IP` behind another proxy, and `LOGROTATE=true` for its access log.
+- **NPMplus's access log is read**, in both the format its releases write (the referer and
+  the user agent unquoted) and the one its development branch writes (both quoted).
+  NPMplus writes it only with `LOGROTATE=true`, to `/opt/npmplus/nginx/logs/access.log`.
+
 ### Fixed
 
 - **A config root holding logs no longer takes the host's memory.** Finding sites read

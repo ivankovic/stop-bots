@@ -5,9 +5,9 @@
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0--only-blue)](https://github.com/ivankovic/stop-bots/blob/main/LICENSE)
 
 A TUI and a CLI that help you configure your server to stop bad bots without hiding behind a
-CDN. It is a fancy UI for your existing web server (nginx, Apache or Traefik) and your
-firewall (nftables or iptables). For those of us that don't want to hide behind Cloudflare and give
-one company the keys to all kingdoms.
+CDN. It is a fancy UI for your existing web server (nginx, Apache, Traefik or NPMplus) and
+your firewall (nftables or iptables). For those of us that don't want to hide behind Cloudflare
+and give one company the keys to all kingdoms.
 
 It protects you in two ways:
 
@@ -52,6 +52,7 @@ And this is what gets written where:
 | The blocking rule | inside each site's `server` block, between `# BEGIN stop-bots` and `# END stop-bots` |
 | Files the rule needs, when a setting needs one (`robots.txt`, rate limiting) | `/etc/stop-bots/nginx/` and NGINX's `conf.d` (for Apache, `/etc/stop-bots/apache/` and `conf-enabled`) |
 | On Traefik, both of those | one file of its own, `stop-bots.yml`, in the directory Traefik's file provider reads; no file of yours is edited |
+| On NPMplus, both of those | one block in `custom_nginx/server_http.conf`, which every NPMplus host includes, one line in `custom_nginx/http_top.conf`, and its own files in `custom_nginx/stop-bots/`; the host files NPMplus writes are never edited |
 | The firewall script | `/etc/stop-bots/firewall.next.nft` (or `.next.sh` for iptables), copied to `firewall.nft` once applied; it only touches its own `inet stop_bots` table |
 | Settings, blocks and why each exists | `/var/lib/stop-bots/db.sqlite3` |
 
@@ -113,8 +114,9 @@ each with a checksum and a build provenance attestation
 ([verifying a download](https://github.com/ivankovic/stop-bots/blob/main/RELEASING.md#verifying-a-download)).
 Installing starts nothing.
 
-It is tested on **Debian and Ubuntu with systemd, and NGINX, Apache or Traefik**. It needs
-`nft`, or `iptables-restore` and `ip6tables-restore`, for the firewall. Caddy is not supported.
+It is tested on **Debian and Ubuntu with systemd, and NGINX, Apache, Traefik or NPMplus**. It
+needs `nft`, or `iptables-restore` and `ip6tables-restore`, for the firewall. Caddy is not
+supported.
 
 NGINX is the default. On an Apache host, say so once, and enable `mod_rewrite`, which the
 blocks are written in:
@@ -153,9 +155,28 @@ get the host-wide settings; a site gets settings of its own only when its router
 under that directory. Traefik can only answer 403, and cannot serve the generated `robots.txt`
 or rate limit.
 
-**Apache and Traefik are less well tested than NGINX.** I run NGINX myself, so that is the
-backend with real traffic behind it. Apache and Traefik are tested in containers against the
-real servers, but not in daily use. If something looks wrong on either, please
+On an [NPMplus](https://github.com/ZoeyVid/NPMplus) host, point it at NPMplus's data
+directory, the host directory its compose file mounts at `/data` (`/opt/npmplus` unless you
+changed it), and at the access log NPMplus writes once `LOGROTATE=true` is set in its
+`compose.yaml`:
+
+```
+sudo stop-bots set-web-server npmplus --root /opt/npmplus
+sudo stop-bots set-log-paths --access-log /opt/npmplus/nginx/logs/access.log
+```
+
+NPMplus writes each host's own config again whenever the host is saved, so stop-bots never
+edits those files. It writes one block into `custom_nginx/server_http.conf`, which every NPMplus
+host includes, and one line into `custom_nginx/http_top.conf`, and leaves the rest of both as
+it found them. It tests and reloads NGINX inside the container with
+`docker exec npmplus nginx -t` and `docker exec npmplus nginx -s reload`; for a container with
+another name, pass `--test` and `--reload` to `set-web-server`. Every host gets the host-wide
+settings, so a site with settings of its own is refused: NPMplus has no file for one host that
+stop-bots may write.
+
+**Apache, Traefik and NPMplus are less well tested than NGINX.** I run NGINX myself, so that is
+the backend with real traffic behind it. Apache, Traefik and NPMplus are tested in containers
+against the real servers, but not in daily use. If something looks wrong on any of them, please
 [open an issue](https://github.com/ivankovic/stop-bots/issues).
 
 ## Try it without a server
@@ -352,7 +373,7 @@ ruleset that is actually loaded does.
 ### Caddy, HAProxy?
 
 Not supported, and not on the [roadmap](https://github.com/ivankovic/stop-bots/blob/main/ROADMAP.md).
-NGINX, Apache and Traefik are the three it writes config for.
+NGINX, Apache, Traefik and NPMplus are the four it writes config for.
 
 ### I'm behind Cloudflare, or another reverse proxy.
 
@@ -410,6 +431,10 @@ traffic or misses a bot it should have caught, please
 [open an issue](https://github.com/ivankovic/stop-bots/issues). [CONTRIBUTING.md](CONTRIBUTING.md)
 describes how to report a bug, how to send a change, and how the project is built, tested and
 laid out. Code contributions need a one-time [Contributor License Agreement](CLA.md).
+
+## Contributors
+
+- [JohnFawkes](https://github.com/JohnFawkes): NPMplus support.
 
 # License
 

@@ -452,7 +452,19 @@ fn global_config(server: crate::webserver::WebServer, dir: &Path) -> crate::weba
         {
             continue;
         }
-        if let Ok(text) = std::fs::read_to_string(&path) {
+        // A root someone else can write is read only where it holds a
+        // regular file, without following a link or waiting on a FIFO;
+        // a link in `conf.d` is the operator's to make anywhere else.
+        let text = if server.root_is_hostile() {
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_file())
+                .then(|| crate::webserver::read_regular_file(&path))
+                .flatten()
+        } else {
+            std::fs::read_to_string(&path).ok()
+        };
+        if let Some(text) = text {
             files.push((
                 path.display().to_string(),
                 server.without_injected_blocks(&text),
