@@ -8,6 +8,10 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-10-28
+
+NPMplus, beside NGINX, Apache and Traefik.
+
 **Before upgrading:** nothing to do. The database schema is unchanged, and an NGINX, Apache
 or Traefik host is configured as before.
 
@@ -2785,7 +2789,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/ivankovic/stop-bots/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ivankovic/stop-bots/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/ivankovic/stop-bots/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ivankovic/stop-bots/compare/v0.4.0...v0.5.0
