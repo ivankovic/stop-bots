@@ -879,7 +879,7 @@ pub(crate) enum Command {
         #[arg(long)]
         site: String,
         /// One of http-1x, no-accept, no-accept-language, no-user-agent,
-        /// ip-literal-host, old-tls
+        /// ip-literal-host, old-tls, impossible-user-agent
         #[arg(long)]
         rule: String,
         /// Whether requests the rule matches are turned away
@@ -1742,6 +1742,17 @@ pub(crate) enum Command {
     /// line, user agent and referer, which the log records. The other
     /// headers the rules check are not logged, so this can only undercount.
     PreviewExploitRules {
+        #[arg(long, help = ACCESS_LOG_HELP)]
+        access_log: Option<PathBuf>,
+    },
+    /// Say what the impossible-user-agent rule would turn away in the access log.
+    ///
+    /// The rule reads only the user agent, which the log records, so this
+    /// is what it would do, request for request. It also names every
+    /// address it would turn away that fetched a page's styles, scripts or
+    /// images, as a browser does: look at those before switching it on
+    /// (`set-site-rule --rule impossible-user-agent`).
+    PreviewImpossibleUserAgents {
         #[arg(long, help = ACCESS_LOG_HELP)]
         access_log: Option<PathBuf>,
     },

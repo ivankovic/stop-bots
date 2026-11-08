@@ -1299,6 +1299,12 @@ fn condition(rule: RequestRule) -> String {
         // NGINX, which `$http_host` is not.
         RequestRule::IpLiteralHost => matches("$host", r"^(\d+\.\d+\.\d+\.\d+|\[)"),
         RequestRule::OldTls => matches("$ssl_protocol", r"^TLSv1(\.[01])?$"),
+        // Ignoring case, as the bot lists are matched and as the preview
+        // reads it (`impossible_ua::matching_shape`).
+        RequestRule::ImpossibleUserAgent => format!(
+            "$http_user_agent ~* {}",
+            nginx_quoted(&crate::impossible_ua::pattern())
+        ),
     }
 }
 

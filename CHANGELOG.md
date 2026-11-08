@@ -8,6 +8,26 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Going back to 0.9.0** works: it ignores a site's impossible-user-agent rule, which then
+turns nothing away until this release is back.
+
+### Added
+
+- **An impossible-user-agent rule**, a request-shape rule like No User-Agent, off by default
+  and per site: `stop-bots set-site-rule --site <site> --rule impossible-user-agent
+  --enabled true`. It turns away user agents no browser sends, the way a scanner dressed as
+  one gives itself away: a browser's string cut off after its engine, Chrome without its
+  engine's comment, a platform comment with nothing after it, an empty `(compatible)`, a
+  quote before the first word, no space after `Mozilla/5.0`. On one host's log since April
+  it matched 16,691 requests from 504 addresses, and not one of them fetched a page's
+  styles, scripts or images under the same user agent. A bare `Mozilla/5.0` is left alone:
+  an AI assistant fetching for its user, a VPN and home connections sent it too. NGINX,
+  Apache and Traefik; not NPMplus, which has no per-site rules.
+- **`stop-bots preview-impossible-user-agents`** says what the rule would turn away in the
+  access log, request for request, since the rule reads only the user agent the log
+  records, and names every address it would turn away that fetched a page's assets as a
+  browser does.
+
 ## [0.9.0] — 2026-11-02
 
 Outbound checks against C&C servers, and a web application firewall for NGINX.
