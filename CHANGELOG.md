@@ -8,6 +8,40 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Before upgrading:** nothing to do. The database schema is unchanged.
+
+**After upgrading:** the probe-paths detector knows more paths, so a request for one of
+them blocks its sender as `/.env` does. Everything else this release adds is off until
+switched on, apart from one more `status` check.
+
+### Added
+
+- **An HTTP-libraries switch**, off by default. `stop-bots set-http-libraries --enabled
+  true` blocks the user agents a program sends when nobody gave it one: `python-requests`,
+  `aiohttp`, `Go-http-client`, Java, OkHttp, axios, Perl's LWP, Guzzle, `curl`, `Wget` and
+  the like, at any version. The bot lists pin these to one version, so `python-requests`
+  at another asked for `/.env` unchallenged. One switch for every site, like old browsers,
+  because a site with an API is called by these; a client of your own goes through with
+  `add-trusted --user-agent`. Humans only turns it on. It is a row of the Dashboard's Policy
+  panel, and `list-categories` shows it.
+- **More probe paths.** Built in: Alibaba Cloud's CLI credentials (`/.aliyun/`,
+  `/.alibabacloud/`), AWS keys copied out as `/aws_credentials`, boto's config and Tencent
+  CloudBase's deploy config. As probes only where no site runs the application: Outlook on
+  the web's sign-in (`/owa/auth/`), FortiGate's `/remote/login` and `/remote/info`, and
+  Palo Alto GlobalProtect, Zabbix, Cacti's `remote_agent.php`, an IP camera's video stream
+  (`axis-cgi`, `mjpg`) and Apache's `server-status`.
+- **BytePlus** (AS150436, ByteDance's cloud) among the hosting providers offered by name.
+- **`status` says when the access log records no site** on a host with several, with the
+  `log_format` or `LogFormat` that adds it. Blocking is unaffected; what reads the log
+  judges a request against every site at once without it.
+
+### Changed
+
+- **A new block reaches the firewall within a minute.** A changed rule set waited five
+  minutes from the last render before it was rendered again, so a block found in the
+  middle of a burst could wait four minutes more. The wait now holds only after a render
+  that failed or was refused, which is what it was for.
+
 ## [0.9.0] — 2026-11-02
 
 Outbound checks against C&C servers, and a web application firewall for NGINX.
