@@ -1689,6 +1689,10 @@ pub struct Survey {
     /// does not record one — Traefik's, until told to keep the header —
     /// and every detector and tally that reads one is blind.
     pub with_user_agent: usize,
+    /// Parsed lines carrying a field that may name the site they were
+    /// for: a JSON format's `host`, or a quoted field after the user agent.
+    /// None of many means the format records no site at all.
+    pub with_host: usize,
     /// The first line that did not parse, as it is safe to show.
     pub unparsed_sample: Option<String>,
     /// Per agent, per address: `(refused, served)`. Kept by address until
@@ -1741,6 +1745,9 @@ impl Survey {
         self.counts.parsed += 1;
         if !line.user_agent.is_empty() && line.user_agent != "-" {
             self.with_user_agent += 1;
+        }
+        if line.host.is_some() || !line.trailing.is_empty() {
+            self.with_host += 1;
         }
         if is_local_or_private(&line.ip) {
             return;
