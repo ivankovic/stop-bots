@@ -404,6 +404,9 @@ pub struct Categories {
     pub categories: Vec<CategoryRow>,
     /// `blocked` or `allowed`, on every site (`set-old-browsers`).
     pub old_browsers: &'static str,
+    /// `blocked` or `allowed`, on every site: blocked while
+    /// `set-http-libraries` or humans only is on.
+    pub http_libraries: &'static str,
     /// While on, every category is blocked whatever is stored.
     pub humans_only: bool,
     /// With `--site`, that site's overrides; `null` without.

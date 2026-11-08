@@ -132,10 +132,11 @@ const STALE_AFTER_SECS: i64 = 7 * 24 * 60 * 60;
 const CATEGORIES: [Category; 3] = [Category::Scanner, Category::Search, Category::Ai];
 
 /// Rows in the Policy list: the humans-only switch, then the three
-/// categories it forces, then the old-browser switch. Humans only leads
-/// because it decides whether the three below it can be touched at all;
-/// old browsers comes last because it decides nothing about them.
-const POLICY_ROWS: usize = CATEGORIES.len() + 2;
+/// categories it forces, then the old-browser and HTTP-library switches.
+/// Humans only leads because it decides whether the three below it can be
+/// touched at all; the two lists come last because they decide nothing
+/// about them.
+const POLICY_ROWS: usize = CATEGORIES.len() + 3;
 
 /// Which of the Dashboard's three lists arrow keys currently move through.
 /// Ordered as focus flows: `Down` past the last row of one moves into the
@@ -461,8 +462,12 @@ pub struct Dashboard {
     /// Whether this host serves humans only. Drives both the extra
     /// detector row and the greying of the three category rows.
     humans_only: bool,
-    /// Whether the old-browser list is blocked: the Policy list's last row.
+    /// Whether the old-browser list is blocked: the Policy list's second
+    /// to last row.
     old_browsers: bool,
+    /// Whether the HTTP-library switch is on: the Policy list's last row.
+    /// Humans only blocks the list with it off, which the row shows.
+    http_libraries: bool,
     focus: Focus,
     /// The internal cron's per-job state (see `crate::cron`), read-only
     /// here — this panel only displays it, `App` is what actually runs due
@@ -520,6 +525,7 @@ impl Dashboard {
         self.sources = db.list_sources()?;
         self.humans_only = db.get_humans_only()?;
         self.old_browsers = db.get_block_old_browsers()?;
+        self.http_libraries = db.get_block_http_libraries()?;
         self.scanner_default = db.get_category_default(Category::Scanner)?;
         self.search_default = db.get_category_default(Category::Search)?;
         self.ai_default = db.get_category_default(Category::Ai)?;
@@ -732,6 +738,24 @@ impl Dashboard {
             Focus::Categories => match self.list_state.selected().unwrap_or(0) {
                 0 => self.explain_humans_only(),
                 i if i <= CATEGORIES.len() => self.explain_category(CATEGORIES[i - 1]),
+                i if i == POLICY_ROWS - 1 => Explanation::new("HTTP libraries")
+                    .para(
+                        "Blocks the user agents a program sends when nobody gave it one of \
+                         its own: python-requests, aiohttp, Go-http-client, Java, OkHttp, \
+                         axios, curl, Wget and the like, at any version. A site with nothing \
+                         for a program to call sees them only probing and scraping.",
+                    )
+                    .now(match (self.http_libraries, self.humans_only) {
+                        (true, _) => "blocked.",
+                        (false, true) => "blocked, by humans only.",
+                        (false, false) => "allowed.",
+                    })
+                    .warn(
+                        "A site with an API is called by these. Off by default for that \
+                         reason; a client of your own goes through once trusted.",
+                    )
+                    .para("Enter switches it. It applies to every site, in the web server.")
+                    .takes_effect(false),
                 _ => Explanation::new("Old browsers")
                     .para(
                         "Blocks the user agents of browsers too old for anyone to still run: \
@@ -1277,6 +1301,7 @@ impl Dashboard {
                     .map(|&category| ListItem::new(self.row_line(category))),
             )
             .chain(std::iter::once(ListItem::new(self.old_browsers_line())))
+            .chain(std::iter::once(ListItem::new(self.http_libraries_line())))
             .collect();
         let focused = self.focus == Focus::Categories;
         let list = crate::tui::select_in(
@@ -1533,6 +1558,20 @@ impl Dashboard {
         vec![
             Span::from(format!("{:<14}", "Old browsers")),
             policy_tag(if self.old_browsers {
+                Policy::Blocked
+            } else {
+                Policy::Allowed
+            }),
+        ]
+        .into()
+    }
+
+    /// The HTTP-library switch, tagged as old browsers is, but blocked
+    /// while humans only is on whatever the switch says.
+    fn http_libraries_line(&self) -> Line<'static> {
+        vec![
+            Span::from(format!("{:<14}", "HTTP libraries")),
+            policy_tag(if self.http_libraries || self.humans_only {
                 Policy::Blocked
             } else {
                 Policy::Allowed
@@ -3412,11 +3451,26 @@ impl Dashboard {
         }
     }
 
-    /// Enter on a Policy row: row 0 toggles humans-only, the last toggles
-    /// old browsers, and the rest open a category popup — unless
-    /// humans-only is on, in which case there is nothing to open.
+    /// Enter on a Policy row: row 0 toggles humans-only, the last two
+    /// toggle old browsers and HTTP libraries, and the rest open a
+    /// category popup — unless humans-only is on, in which case there is
+    /// nothing to open.
     fn activate_policy_row(&mut self, db: &Db, message: &mut Option<String>) -> Result<KeyOutcome> {
         if self.list_state.selected() == Some(POLICY_ROWS - 1) {
+            let on = !self.http_libraries;
+            db.set_block_http_libraries(on)?;
+            let server = crate::webserver::WebServer::configured().label();
+            *message = Some(match (on, self.humans_only) {
+                (true, _) => format!(
+                    "HTTP libraries are blocked on every site. Apply on the {server} screen \
+                     to enforce it."
+                ),
+                (false, true) => "HTTP libraries stay blocked while humans only is on.".to_string(),
+                (false, false) => "HTTP libraries are allowed again.".to_string(),
+            });
+            return Ok(KeyOutcome::Mutated);
+        }
+        if self.list_state.selected() == Some(POLICY_ROWS - 2) {
             let on = !self.old_browsers;
             db.set_block_old_browsers(on)?;
             *message = Some(if on {
@@ -3987,7 +4041,10 @@ mod tests {
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
 
-        let mut terminal = test_terminal();
+        // A line taller than `test_terminal`: at 32 the Policy panel's
+        // seven rows leave the schedule room for three jobs, and this
+        // checks the fourth's "due now".
+        let mut terminal = Terminal::new(TestBackend::new(100, 33)).unwrap();
         terminal
             .draw(|frame| {
                 dashboard.render(
@@ -4379,11 +4436,11 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_the_last_policy_row_toggles_old_browsers() {
+    fn enter_on_the_old_browsers_row_toggles_old_browsers() {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = Dashboard::default();
         dashboard.refresh(&db).unwrap();
-        dashboard.list_state.select(Some(POLICY_ROWS - 1));
+        dashboard.list_state.select(Some(POLICY_ROWS - 2));
 
         let mut message = None;
         let outcome = dashboard
@@ -4401,6 +4458,43 @@ mod tests {
         assert!(
             !db.get_block_old_browsers().unwrap(),
             "humans only kept the switch from turning off. message: {message:?}"
+        );
+    }
+
+    /// The last row is the HTTP-library switch: Enter turns it on, and
+    /// with humans only on it reads as blocked even once turned off.
+    #[test]
+    fn enter_on_the_last_policy_row_toggles_http_libraries() {
+        let db = Db::open_in_memory().unwrap();
+        let mut dashboard = Dashboard::default();
+        dashboard.refresh(&db).unwrap();
+        dashboard.list_state.select(Some(POLICY_ROWS - 1));
+
+        let mut message = None;
+        let outcome = dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(
+            db.get_block_http_libraries().unwrap(),
+            "message: {message:?}"
+        );
+
+        db.set_humans_only(true).unwrap();
+        dashboard.refresh(&db).unwrap();
+        dashboard
+            .handle_key(KeyEvent::from(KeyCode::Enter), &db, &mut message)
+            .unwrap();
+        assert!(
+            !db.get_block_http_libraries().unwrap(),
+            "message: {message:?}"
+        );
+        assert!(
+            dashboard
+                .http_libraries_line()
+                .to_string()
+                .contains("BLOCKED"),
+            "humans only is on, and the row says otherwise: {message:?}"
         );
     }
 
