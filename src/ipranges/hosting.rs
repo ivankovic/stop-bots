@@ -68,6 +68,11 @@ pub struct HostingProvider {
 pub const HOSTING_PROVIDERS: &[HostingProvider] = &[
     // ALIBABA-CN-NET Alibaba US Technology Co., Ltd.
     provider(45102, "Alibaba Cloud"),
+    // BYTEPLUS-AS-AP Byteplus Pte. Ltd., ByteDance's cloud. Checked on
+    // 2026-11-08, after eight of its addresses, in Singapore and
+    // Indonesia, sent one host about 2,400 requests probing for cloud
+    // configuration and credentials in October.
+    provider(150436, "BytePlus"),
     // CONTABO
     provider(51167, "Contabo"),
     // CONTABO-40021

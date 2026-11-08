@@ -11,6 +11,16 @@
       "note": null
     },
     {
+      "asn": 150436,
+      "name": "BytePlus",
+      "description": null,
+      "curated": true,
+      "blocked": false,
+      "last_fetched_at": null,
+      "range_count": 0,
+      "note": null
+    },
+    {
       "asn": 51167,
       "name": "Contabo",
       "description": null,
