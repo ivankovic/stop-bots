@@ -1087,8 +1087,9 @@ impl Dashboard {
             ProtectionRow::AutoApplyFirewall => Explanation::new(label)
                 .para(
                     "Whether the scheduled render also runs the firewall script it writes. \
-                     The render runs within five minutes of any change to the rules and at \
-                     least once a day, while the TUI is open or from cron.",
+                     The render runs within a minute of any change to the rules (five, after \
+                     one that failed) and at least once a day, while the TUI is open or from \
+                     cron.",
                 )
                 .now(if self.auto_apply_firewall {
                     "on: new blocks reach the firewall within minutes, with no preview."
@@ -3159,7 +3160,7 @@ impl Dashboard {
             Confirm::AutoApplyFirewall => (
                 "Apply the firewall script automatically?".to_string(),
                 vec![
-                    "The scheduled render runs within five minutes of any change to the rules, \
+                    "The scheduled render runs within a minute of any change to the rules, \
                      such as a detector's block or a setting changed here, and at least once a \
                      day. With this on, it also runs the script as root, with no preview."
                         .into(),
