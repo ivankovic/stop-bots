@@ -8,14 +8,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-11-08
+
+Scanners dressed as browsers turned away by their shape, and HTTP libraries on request.
+
 **Before upgrading:** nothing to do. The database schema is unchanged.
 
 **After upgrading:** the probe-paths detector knows more paths, so a request for one of
 them blocks its sender as `/.env` does, and 14 more scanners are blocked by name. Everything
 else this release adds is off until switched on, apart from one more `status` check.
 
-**Going back to 0.9.0** works: it ignores a site's impossible-user-agent rule, which then
-turns nothing away until this release is back.
+**Going back to 0.9.0** works: it ignores the HTTP-libraries switch and a site's
+impossible-user-agent rule, which then turn nothing away until this release is back.
 
 ### Added
 
@@ -2910,7 +2914,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/ivankovic/stop-bots/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ivankovic/stop-bots/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ivankovic/stop-bots/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/ivankovic/stop-bots/compare/v0.6.0...v0.7.0
