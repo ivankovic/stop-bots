@@ -27,6 +27,10 @@ eventually ask for, with the reason it isn't there.
   contributed which flag to a merged bot; nothing shows it.
 * **No override indicator on a site row.** Whether a site carries a category or
   bot override is only visible once you open its detail view.
+* **The HTTP-libraries switch is for every site, not one.** A host with an API
+  on one site and a static blog on another cannot block libraries on the blog
+  alone; it trusts the API's clients by user agent instead. Old browsers are
+  the same, and a per-site override for both would be one design, not two.
 * **`FirewallRule` has no protocol field.** Ports always render as TCP, in both
   backends, though bot traffic can be UDP.
 * **`Theme::detect` only reads `COLORFGBG`.** Everything else gets the dark

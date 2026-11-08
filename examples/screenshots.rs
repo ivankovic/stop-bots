@@ -142,6 +142,7 @@ async fn main() -> Result<()> {
             access_log_unparsed_sample: None,
             access_log_cdn: Some(0),
             access_log_user_agents: Some(11_310),
+            access_log_hosts: None,
             // The fiction is a host install, so the container checks have
             // nothing to say and add no line to the strip.
             nginx_home: stop_bots::health::NginxHome::Host,

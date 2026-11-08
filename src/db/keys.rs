@@ -58,6 +58,9 @@ pub const HUMANS_ONLY: &str = "humans_only";
 /// own rather than a category: those entries are not bots and have no
 /// `bots` rows to carry a category flag.
 pub const BLOCK_OLD_BROWSERS: &str = "block_old_browsers";
+/// Whether [`crate::botlist::http_libraries`] is blocked, for the same
+/// reason [`BLOCK_OLD_BROWSERS`] is a setting.
+pub const BLOCK_HTTP_LIBRARIES: &str = "block_http_libraries";
 /// `GeoMode`: what the selected countries mean. Seeded by the schema.
 pub const GEO_MODE: &str = "geo_mode";
 
@@ -193,6 +196,7 @@ pub const ALL: &[&str] = &[
     DEFAULT_STATUS_AI,
     HUMANS_ONLY,
     BLOCK_OLD_BROWSERS,
+    BLOCK_HTTP_LIBRARIES,
     GEO_MODE,
     BLOCK_RESPONSE,
     SERVE_ROBOTS_TXT,

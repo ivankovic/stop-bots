@@ -1842,6 +1842,21 @@ impl Db {
         self.set_bool_setting(keys::BLOCK_OLD_BROWSERS, on)
     }
 
+    /// Whether the HTTP-library list ([`crate::botlist::http_libraries`])
+    /// is blocked, on every site.
+    ///
+    /// Off by default, on new and existing hosts alike: a host with an API
+    /// is called by these, and a new way to turn requests away arrives
+    /// off. Humans-only turns it on regardless (see
+    /// [`Self::compute_blocked_patterns`]): none of these is a person.
+    pub fn get_block_http_libraries(&self) -> Result<bool> {
+        self.get_bool_setting(keys::BLOCK_HTTP_LIBRARIES, false)
+    }
+
+    pub fn set_block_http_libraries(&self, on: bool) -> Result<()> {
+        self.set_bool_setting(keys::BLOCK_HTTP_LIBRARIES, on)
+    }
+
     pub fn set_category_default(&self, category: Category, policy: Policy) -> Result<()> {
         self.conn.execute(
             "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -4132,6 +4147,11 @@ impl Db {
         // its one switch is the whole of its policy.
         if self.get_block_old_browsers()? {
             patterns.extend(crate::botlist::old_browsers::patterns());
+        }
+        // The same, except that humans only takes it in: these are
+        // programs, where an old browser may still be a person.
+        if humans_only || self.get_block_http_libraries()? {
+            patterns.extend(crate::botlist::http_libraries::patterns());
         }
         patterns.extend(
             self.list_blocked_user_agents()?
@@ -7218,6 +7238,58 @@ mod tests {
         assert!(
             !patterns.iter().any(|p| p == r"NetFront"),
             "humans only turned the old-browser list on: {patterns:?}"
+        );
+    }
+
+    /// The HTTP-library list is off until it is switched on, and then
+    /// joins the block on every site, whatever the categories say.
+    #[test]
+    fn http_libraries_are_blocked_only_once_switched_on() {
+        let db = db_with_a_mixed_bot_list();
+        let has_them = |db: &Db| {
+            db.compute_blocked_patterns(Policy::Allowed, Policy::Allowed, Policy::Allowed, &[])
+                .unwrap()
+                .iter()
+                .any(|p| p == r"python-requests/")
+        };
+        assert!(!has_them(&db), "on before anyone switched it on");
+        db.set_block_http_libraries(true).unwrap();
+        assert!(has_them(&db), "switched on and not in the block");
+        db.set_block_http_libraries(false).unwrap();
+        assert!(!has_them(&db), "still blocked after switching it off");
+    }
+
+    /// A site's own overrides cannot lift it, as they cannot lift the
+    /// old-browser list.
+    #[test]
+    fn http_libraries_are_blocked_on_a_site_that_allows_every_category() {
+        let db = db_with_a_mixed_bot_list();
+        db.upsert_site("a.example", "/tmp/a").unwrap();
+        let site = db.list_sites().unwrap()[0].id;
+        for category in [Category::Ai, Category::Search, Category::Scanner] {
+            db.set_site_category_override(site, category, Some(Policy::Allowed))
+                .unwrap();
+        }
+        db.set_block_http_libraries(true).unwrap();
+        let patterns = db.blocked_user_agent_patterns_for_site(site).unwrap();
+        assert!(
+            patterns.iter().any(|p| p == r"python-requests/"),
+            "the site's overrides lifted the HTTP-library list: {patterns:?}"
+        );
+    }
+
+    /// Where old browsers may be people, these are programs: humans only
+    /// blocks them with its own switch left off.
+    #[test]
+    fn humans_only_blocks_http_libraries() {
+        let db = db_with_a_mixed_bot_list();
+        db.set_humans_only(true).unwrap();
+        let patterns = db
+            .compute_blocked_patterns(Policy::Blocked, Policy::Blocked, Policy::Blocked, &[])
+            .unwrap();
+        assert!(
+            patterns.iter().any(|p| p == r"python-requests/"),
+            "humans only let python-requests through: {patterns:?}"
         );
     }
 

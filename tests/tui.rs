@@ -1250,9 +1250,10 @@ fn dashboard_geo_blocking_add_and_remove_a_country() {
     session.exp_string("country,").unwrap();
 
     // Down past the last Policy row — the humans-only switch, then
-    // Scanners/Search Bots/AI Bots, then Old browsers — flows
-    // focus over into the Countries list, landing on its first row — the
-    // fixed "add a country" action.
+    // Scanners/Search Bots/AI Bots, then Old browsers and HTTP libraries
+    // — flows focus over into the Countries list, landing on its first
+    // row — the fixed "add a country" action.
+    send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B");
     send_key(&mut session, "\x1b[B");

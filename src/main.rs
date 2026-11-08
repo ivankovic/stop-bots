@@ -442,6 +442,7 @@ async fn run() -> Result<()> {
         Some(Command::SetSshLockoutCheck { enabled }) => set_ssh_lockout_check(db, enabled),
         Some(Command::SetHumansOnly { enabled }) => set_humans_only(db, enabled),
         Some(Command::SetOldBrowsers { enabled }) => set_old_browsers(db, enabled),
+        Some(Command::SetHttpLibraries { enabled }) => set_http_libraries(db, enabled),
         Some(Command::SetUiMode { mode }) => set_ui_mode(db, mode),
         Some(Command::ShowRobotsTxt) => show_robots_txt(db),
         Some(Command::SetEgress { mode }) => egress_cmd::set_egress(db, mode),
@@ -1862,6 +1863,25 @@ fn set_old_browsers(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
     Ok(())
 }
 
+fn set_http_libraries(db_path: Option<PathBuf>, enabled: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.set_block_http_libraries(enabled)?;
+    let count = stop_bots::botlist::http_libraries::substrings().len();
+    if enabled {
+        say!("HTTP libraries are BLOCKED on every site: {count} user-agent strings.");
+        say!("A client of your own goes through with `stop-bots add-trusted --user-agent`.");
+    } else if db.get_humans_only()? {
+        say!("HTTP libraries are still blocked: humans only is on.");
+    } else {
+        say!("HTTP libraries are allowed again.");
+    }
+    say!(
+        "Run `stop-bots apply-blocks` to write it into the {} config.",
+        server_label()
+    );
+    Ok(())
+}
+
 fn set_ui_mode(db_path: Option<PathBuf>, mode: UiModeArg) -> Result<()> {
     let db = open_db(db_path)?;
     let mode: stop_bots::db::UiMode = mode.into();
@@ -2361,6 +2381,14 @@ fn list_categories(db_path: Option<PathBuf>, site: Option<String>, json: bool) -
             "allowed"
         }
     );
+    say!(
+        "HTTP libraries: {} on every site (set-http-libraries)",
+        match (db.get_block_http_libraries()?, db.get_humans_only()?) {
+            (true, _) => "blocked",
+            (false, true) => "blocked by humans only",
+            (false, false) => "allowed",
+        }
+    );
 
     if let Some(site) = &site {
         let overrides = db.site_bot_overrides(site.id)?;
@@ -2436,6 +2464,11 @@ fn categories_json(
     Ok(Categories {
         categories,
         old_browsers: if db.get_block_old_browsers()? {
+            "blocked"
+        } else {
+            "allowed"
+        },
+        http_libraries: if db.get_block_http_libraries()? || db.get_humans_only()? {
             "blocked"
         } else {
             "allowed"

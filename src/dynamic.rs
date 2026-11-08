@@ -590,12 +590,15 @@ pub struct UaVerdicts {
     /// Whether the old-browser list is blocked: see
     /// [`crate::botlist::old_browsers`].
     old_browsers: bool,
+    /// Whether the HTTP-library list is blocked, by its switch or by
+    /// humans only: see [`crate::botlist::http_libraries`].
+    http_libraries: bool,
 }
 
 impl UaVerdicts {
     /// The status `user_agent` would have as a row: the same precedence
     /// [`build_ua_rows`] applies, trust over all of it, and the old-browser
-    /// list as one more blocked list when it is switched on.
+    /// and HTTP-library lists as more blocked lists when they are on.
     pub fn status_of(&self, user_agent: &str) -> RowStatus {
         if user_agent_is_trusted(user_agent, &self.trusted) {
             return RowStatus::Trusted;
@@ -608,6 +611,11 @@ impl UaVerdicts {
         ) {
             RowStatus::Pending | RowStatus::Unknown
                 if self.old_browsers && crate::botlist::old_browsers::matches(user_agent) =>
+            {
+                RowStatus::Blocklist
+            }
+            RowStatus::Pending | RowStatus::Unknown
+                if self.http_libraries && crate::botlist::http_libraries::matches(user_agent) =>
             {
                 RowStatus::Blocklist
             }
@@ -655,6 +663,7 @@ impl LiveInputs {
                 scanner: db.get_category_default(Category::Scanner)?,
                 trusted: db.list_trusted_user_agents()?,
                 old_browsers: db.get_block_old_browsers()?,
+                http_libraries: db.get_block_http_libraries()? || db.get_humans_only()?,
             },
         })
     }
@@ -1269,6 +1278,31 @@ mod tests {
         assert_eq!(status(&db), RowStatus::Pending, "blocked with the list off");
         db.set_block_old_browsers(true).unwrap();
         assert_eq!(status(&db), RowStatus::Blocklist, "not blocked with it on");
+    }
+
+    /// An HTTP library reads as blocked once its list is on, or once
+    /// humans only is, and as nothing in particular before.
+    #[test]
+    fn an_http_library_is_on_the_blocklist_once_its_list_or_humans_only_is_on() {
+        let library = "python-requests/2.34.2";
+        let status = |db: &Db| {
+            LiveInputs::read(db, Vec::new())
+                .unwrap()
+                .verdicts()
+                .status_of(library)
+        };
+        let db = Db::open_in_memory().unwrap();
+        assert_eq!(status(&db), RowStatus::Pending, "blocked with the list off");
+        db.set_block_http_libraries(true).unwrap();
+        assert_eq!(status(&db), RowStatus::Blocklist, "not blocked with it on");
+
+        let db = Db::open_in_memory().unwrap();
+        db.set_humans_only(true).unwrap();
+        assert_eq!(
+            status(&db),
+            RowStatus::Blocklist,
+            "humans only let it through"
+        );
     }
 
     /// The row itself says which detector blocked it; a block by hand

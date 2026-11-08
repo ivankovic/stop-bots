@@ -260,14 +260,21 @@ fn now() -> i64 {
 }
 
 /// The shortest gap between two renders triggered by a rule *change*
-/// rather than by the clock.
+/// rather than by the clock, after one that failed or was refused.
 ///
 /// Without a floor, a render that keeps failing — an unwritable
 /// `/etc/stop-bots`, which is the common one — would leave the rules
 /// permanently unrendered and so permanently "changed", and the cron would
 /// retry it on every tick, forever, once a minute. The floor turns that
-/// into a retry every five minutes, and costs at most five minutes of
-/// enforcement lag on the path it exists to speed up.
+/// into a retry every five minutes.
+///
+/// It once held after a render that worked too, which is the wrong place
+/// for it: one address sent a host 1,133 requests over five minutes, and
+/// a block found in its first minute could wait out the floor from
+/// whatever render came before. After a render that worked, a change now
+/// renders on the next tick; on that host, with 52,000 rules, that is
+/// under two seconds of render and load a minute, and only while the
+/// rules keep changing.
 const RENDER_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Whether `job` is due: it's never run, or its interval has elapsed since
@@ -303,8 +310,13 @@ pub fn is_due(db: &Db, job: CronJob) -> Result<bool> {
     // cheap time check has already said no — `needs_render` walks every
     // rule, and there is no reason to pay that for a job that is due
     // anyway or for one this does not apply to.
-    if job == CronJob::RenderFirewall && elapsed >= RENDER_MIN_INTERVAL.as_secs() as i64 {
-        return crate::firewall::needs_render(db);
+    if job == CronJob::RenderFirewall {
+        let backing_off = db
+            .get_cron_last_summary(job.id())?
+            .is_some_and(|summary| render_failed(&summary));
+        if !backing_off || elapsed >= RENDER_MIN_INTERVAL.as_secs() as i64 {
+            return crate::firewall::needs_render(db);
+        }
     }
     Ok(false)
 }
@@ -939,6 +951,13 @@ pub fn render_summary(write: &crate::firewall::WriteStep, summary: &str) -> Stri
         crate::firewall::WriteStep::Refused => format!("skipped: {summary}"),
         crate::firewall::WriteStep::Failed(_) => format!("error: {summary}"),
     }
+}
+
+/// Whether a `RenderFirewall` summary is one that wrote nothing: a write
+/// that failed or was refused ([`render_summary`]), or an error before it
+/// ([`render_firewall`]). What [`RENDER_MIN_INTERVAL`] backs off after.
+fn render_failed(summary: &str) -> bool {
+    summary.starts_with("error:") || summary.starts_with("skipped:")
 }
 
 /// The network half of `UpdateIpRanges`: fetches and parses all three
@@ -1955,6 +1974,61 @@ mod tests {
         assert!(
             !is_due(&db, CronJob::RenderFirewall).unwrap(),
             "a failing render must back off, not spin"
+        );
+    }
+
+    /// A refused write backs off the same way: the guard that refused it
+    /// will refuse again a minute later.
+    #[test]
+    fn a_refused_render_backs_off_too() {
+        let db = test_db();
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.7".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
+        })
+        .unwrap();
+        db.set_cron_last_run(
+            CronJob::RenderFirewall.id(),
+            now() - 60,
+            "skipped: the SSH log could not be read",
+        )
+        .unwrap();
+
+        assert!(!is_due(&db, CronJob::RenderFirewall).unwrap());
+    }
+
+    /// After a render that worked, a block found a minute later is
+    /// rendered on the next tick rather than four minutes on: the floor is
+    /// for retrying failures, not for a burst that is still arriving.
+    #[test]
+    fn a_change_a_minute_after_a_render_that_worked_is_due_at_once() {
+        let db = test_db();
+        db.set_firewall_rendered_signature(&crate::firewall::rules_signature(
+            &crate::firewall::all_rules(&db).unwrap(),
+        ))
+        .unwrap();
+        db.set_cron_last_run(CronJob::RenderFirewall.id(), now() - 60, "rendered")
+            .unwrap();
+        assert!(
+            !is_due(&db, CronJob::RenderFirewall).unwrap(),
+            "nothing changed, so nothing is due"
+        );
+
+        db.add_firewall_rule(&crate::db::NewFirewallRule {
+            address: "198.51.100.7".to_string(),
+            port: None,
+            action: crate::db::FirewallAction::Block,
+            source: crate::db::RuleSource::Cli,
+            evidence: None,
+        })
+        .unwrap();
+
+        assert!(
+            is_due(&db, CronJob::RenderFirewall).unwrap(),
+            "a block found a minute after a good render waited out the floor"
         );
     }
 
