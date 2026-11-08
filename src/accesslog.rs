@@ -814,15 +814,24 @@ fn impersonates(line: &ParsedLine, claims: &[CrawlerClaim]) -> Option<&'static s
 /// What's left is credential and source-tree exposure — files that only
 /// ever exist because of a deployment mistake, and that only ever get
 /// requested by something looking for that mistake.
-pub const DEFAULT_PROBE_PATHS: [&str; 15] = [
-    "/.env",            // and /.env.local, /api/.env, ... (see the matching note)
-    "/.git/",           // /.git/config, /.git/HEAD, ...
-    "/.svn/",           //
-    "/.hg/",            //
-    "/.aws/",           // /.aws/credentials
-    "/.ssh/",           // /.ssh/id_rsa
-    "/wp-config.php",   // never served as content, only ever probed
-    "/vendor/phpunit/", // the eval-stdin.php RCE probe and friends
+pub const DEFAULT_PROBE_PATHS: [&str; 20] = [
+    "/.env",  // and /.env.local, /api/.env, ... (see the matching note)
+    "/.git/", // /.git/config, /.git/HEAD, ...
+    "/.svn/", //
+    "/.hg/",  //
+    "/.aws/", // /.aws/credentials
+    "/.ssh/", // /.ssh/id_rsa
+    // The other clouds' command-line credentials, and the same keys
+    // copied out of `~/.aws/` under names of their own. One host's log
+    // since April: 627 requests for these from 75 addresses, none
+    // answered with content.
+    "/.aliyun/",         // Alibaba Cloud's CLI: /.aliyun/config.json
+    "/.alibabacloud/",   // and its newer one: /.alibabacloud/credentials
+    "/aws_credentials",  // /aws_credentials, /aws_credentials.json
+    "/boto.cfg",         // boto's config, keys and all
+    "/cloudbaserc.json", // Tencent CloudBase's deploy config
+    "/wp-config.php",    // never served as content, only ever probed
+    "/vendor/phpunit/",  // the eval-stdin.php RCE probe and friends
     // The same probe wherever the scanner guesses PHPUnit was unpacked:
     // `/phpunit/phpunit/src/Util/PHP/eval-stdin.php`, `/lib/phpunit/...`.
     // DShield's honeypots see 5.3 million a month outside `/vendor/`.
@@ -2803,6 +2812,26 @@ mod tests {
             "/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh",
             "/$(pwd)/%2eenv%2elocal",
             "/%2frobots%2etxt",
+        ] {
+            let log = probe_line("203.0.113.9", path, 404);
+            assert_eq!(
+                probe_path_ips(&log, &default_probes()).len(),
+                1,
+                "missed {path}"
+            );
+        }
+    }
+
+    /// The other clouds' credential files, each as a request that was
+    /// actually made for it.
+    #[test]
+    fn probe_path_ips_flags_the_other_clouds_credentials() {
+        for path in [
+            "/.aliyun/credentials.json",
+            "/.alibabacloud/config",
+            "/aws_credentials.json",
+            "/boto.cfg",
+            "/cloudbaserc.json",
         ] {
             let log = probe_line("203.0.113.9", path, 404);
             assert_eq!(
