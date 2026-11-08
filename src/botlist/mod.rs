@@ -25,6 +25,7 @@
 //! fourth source means adding a variant here plus one new sibling module.
 
 pub mod ai_robots_txt;
+pub mod http_libraries;
 pub mod nginx_bad_bots;
 pub mod old_browsers;
 pub mod stop_bots_extras;

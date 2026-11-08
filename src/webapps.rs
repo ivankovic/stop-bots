@@ -83,7 +83,7 @@ pub struct WebApp {
 /// A path listed under two applications (`xmlrpc.php`) is a probe only
 /// where both are absent. Any path here that exists in a document root is
 /// served there, whatever application put it there.
-pub const APPS: [WebApp; 11] = [
+pub const APPS: [WebApp; 16] = [
     WebApp {
         name: "WordPress",
         config_names: &["wordpress"],
@@ -115,6 +115,8 @@ pub const APPS: [WebApp; 11] = [
         files: &[],
         paths: &[
             "auth.owa",
+            // Outlook on the web's sign-in page, `/owa/auth/logon.aspx`.
+            "owa/auth",
             "rpcproxy.dll",
             "emsmdb",
             "microsoft-server-activesync",
@@ -125,7 +127,12 @@ pub const APPS: [WebApp; 11] = [
         name: "FortiGate SSL VPN",
         config_names: &["fortigate", "fortinet"],
         files: &[],
-        paths: &["remote/logincheck", "remote/fgt_lang"],
+        paths: &[
+            "remote/logincheck",
+            "remote/fgt_lang",
+            "remote/login",
+            "remote/info",
+        ],
     },
     WebApp {
         name: "Tomcat manager",
@@ -169,6 +176,41 @@ pub const APPS: [WebApp; 11] = [
         config_names: &["geoserver"],
         files: &[],
         paths: &["geoserver"],
+    },
+    // What one host's log was asked for, 2026-09-28 to 2026-11-07, that
+    // nothing above covered: VPN logins, monitoring, and camera streams.
+    WebApp {
+        name: "Palo Alto GlobalProtect",
+        config_names: &["globalprotect", "global-protect"],
+        files: &[],
+        paths: &["global-protect"],
+    },
+    WebApp {
+        name: "Zabbix",
+        config_names: &["zabbix"],
+        files: &[],
+        paths: &["zabbix"],
+    },
+    // `/remote_agent.php`, the unauthenticated command injection
+    // (CVE-2022-46169).
+    WebApp {
+        name: "Cacti",
+        config_names: &["cacti"],
+        files: &["remote_agent.php"],
+        paths: &["remote_agent.php"],
+    },
+    WebApp {
+        name: "an IP camera's video stream",
+        config_names: &["axis-cgi", "mjpg", "zoneminder"],
+        files: &[],
+        paths: &["axis-cgi", "mjpg"],
+    },
+    // Apache's mod_status, which a host that runs it names in its config.
+    WebApp {
+        name: "Apache's server-status",
+        config_names: &["server-status"],
+        files: &[],
+        paths: &["server-status"],
     },
 ];
 
@@ -895,11 +937,17 @@ mod tests {
             ("/remote/logincheck", true),
             ("/REMOTE/LoginCheck", true),
             ("/vpn/remote/logincheck", true),
-            ("/remote/login", false),
+            ("/remote/login", true),
+            ("/remote/log", false),
             ("/remote/", false),
             ("/logincheck/remote", false),
             ("/owa/auth.owa", true),
+            ("/owa/auth/logon.aspx", true),
+            ("/owa/", false),
             ("/cgi-bin/luci/;stok=/locale", true),
+            ("/global-protect/login.esp", true),
+            ("/axis-cgi/mjpg/video.cgi", true),
+            ("/cgi-bin/mjpg/video.cgi", true),
         ];
         for (path, probe) in cases {
             assert_eq!(probes.probe([], path).is_some(), probe, "{path}");

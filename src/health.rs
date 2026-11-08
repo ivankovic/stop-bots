@@ -270,6 +270,11 @@ pub struct Probe {
     /// from before this was counted.
     #[serde(default)]
     pub access_log_user_agents: Option<usize>,
+    /// Of the parsed lines in [`Self::access_log_lines`], how many carry a
+    /// field that may name their site. `None` when the log could not be
+    /// read, and in a probe from before this was counted.
+    #[serde(default)]
+    pub access_log_hosts: Option<usize>,
     /// The NGINX test and reload commands the host settings name, for
     /// [`nginx_deployment`] to check against where NGINX runs. `None` from
     /// a probe taken before they were carried here, or when the setting
@@ -466,6 +471,7 @@ pub fn probe(
         access_log_unparsed_sample: survey.unparsed_sample.clone(),
         access_log_cdn: access_readable.then_some(survey.cdn),
         access_log_user_agents: access_readable.then_some(survey.with_user_agent),
+        access_log_hosts: access_readable.then_some(survey.with_host),
         nginx_home,
         managed_dir_in_container: container.as_ref().map(|name| {
             // `test -d` inside the container, at the path the generated
@@ -963,6 +969,9 @@ pub fn assess(db: &Db, probe: &Probe) -> Result<Report> {
     }
     checks.push(access_log_format(probe));
     if let Some(check) = access_log_user_agents(probe) {
+        checks.push(check);
+    }
+    if let Some(check) = access_log_sites(probe, db.list_sites()?.len()) {
         checks.push(check);
     }
     checks.push(access_log_clients(probe));
@@ -2096,6 +2105,47 @@ fn access_log_user_agents(probe: &Probe) -> Option<Check> {
     })
 }
 
+/// Whether the access log says which site each request was for, when a
+/// host has more than one and plainly it does not: not one of many lines
+/// carries a field that could. NGINX's and Apache's `combined` format
+/// records none. Blocking is unaffected, as each site's block is its own;
+/// what reads the log is not, and judges a request against every site at
+/// once: a probe for an application's path counts only where no site runs
+/// it, and an application's own clients are told apart by the site.
+///
+/// Traefik's and NPMplus's formats record the host, so neither is asked.
+fn access_log_sites(probe: &Probe, sites: usize) -> Option<Check> {
+    let (_, parsed) = probe.access_log_lines?;
+    let named = probe.access_log_hosts?;
+    if sites < 2 || parsed < ACCESS_LOG_MIN_FOR_USER_AGENTS || named > 0 {
+        return None;
+    }
+    let fix = match probe.web_server {
+        webserver::WebServer::Nginx => {
+            "append the site to NGINX's log format, after the user agent: \
+             `log_format combined_host '$remote_addr - $remote_user [$time_local] \"$request\" \
+             $status $body_bytes_sent \"$http_referer\" \"$http_user_agent\" \"$host\"';` and \
+             `access_log /var/log/nginx/access.log combined_host;`"
+        }
+        webserver::WebServer::Apache => {
+            "append the site to Apache's log format, after the user agent: `LogFormat \
+             \"%h %l %u %t \\\"%r\\\" %>s %O \\\"%{Referer}i\\\" \\\"%{User-Agent}i\\\" \
+             \\\"%{Host}i\\\"\" combined_host` and `CustomLog <path> combined_host`"
+        }
+        webserver::WebServer::Traefik | webserver::WebServer::Npmplus => return None,
+    };
+    Some(Check {
+        id: "access-log-sites",
+        title: "Access log records the site",
+        level: Level::Warn,
+        detail: format!(
+            "none of {parsed} recent request(s) in the log says which of the {sites} sites it \
+             was for, so what reads the log judges each one against all of them at once"
+        ),
+        fix: Some(fix.to_string()),
+    })
+}
+
 /// Which addresses currently cannot be blocked, and why.
 ///
 /// This exists because the anti-lockout allowlist is otherwise invisible:
@@ -2851,6 +2901,7 @@ mod tests {
             access_log_unparsed_sample: None,
             access_log_cdn: Some(0),
             access_log_user_agents: Some(41),
+            access_log_hosts: Some(0),
             // The ordinary host: NGINX is a unit here, and the two
             // container fields have nothing to answer. Every
             // container-arrangement test below states its own.
@@ -4849,6 +4900,49 @@ mod tests {
                 access_log_user_agents(&probe(named, parsed)).is_none(),
                 "{why}"
             );
+        }
+    }
+
+    /// NGINX's `combined` format on a host with several sites: every line
+    /// parses, and not one says which site it was for.
+    #[test]
+    fn a_log_that_names_no_site_says_how_to_add_it_once_there_are_two() {
+        let probe = |named: usize, parsed: usize| Probe {
+            web_server: webserver::WebServer::Nginx,
+            access_log_lines: Some((parsed, parsed)),
+            access_log_hosts: Some(named),
+            ..Probe::default()
+        };
+
+        let check = access_log_sites(&probe(0, 100), 3).expect("a warning");
+
+        assert_eq!(check.level, Level::Warn);
+        let fix = check.fix.clone().unwrap_or_default();
+        assert!(fix.contains("\"$host\""), "{fix}");
+        assert_eq!(crate::present::check_label(&check), "sites");
+        for (named, parsed, sites, why) in [
+            (1, 100, 3, "one line names its site"),
+            (0, 5, 3, "too few lines"),
+            (0, 100, 1, "one site has nothing to tell apart"),
+        ] {
+            assert!(
+                access_log_sites(&probe(named, parsed), sites).is_none(),
+                "{why}"
+            );
+        }
+    }
+
+    /// Traefik's and NPMplus's formats record the host: never asked.
+    #[test]
+    fn traefik_and_npmplus_are_never_told_to_log_the_site() {
+        for web_server in [webserver::WebServer::Traefik, webserver::WebServer::Npmplus] {
+            let probe = Probe {
+                web_server,
+                access_log_lines: Some((100, 100)),
+                access_log_hosts: Some(0),
+                ..Probe::default()
+            };
+            assert!(access_log_sites(&probe, 3).is_none(), "{web_server:?}");
         }
     }
 

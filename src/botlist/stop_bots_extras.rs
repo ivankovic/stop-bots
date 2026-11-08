@@ -481,6 +481,53 @@ const EXTRAS: &[(&str, &str, Kind)] = &[
     // A search engine the upstream list spells `yacybot`; its crawler now
     // sends `yacycrawler`, which that pattern cannot match.
     ("YaCy crawler", "yacycrawler", Kind::Search),
+    // ---- a fourth pass, 2026-11-07 ----
+    // The same host's log from 2026-09-28 to 2026-11-07: 57,305 requests
+    // and 2,153 distinct user agents, against all 1,845 patterns it
+    // carried. 506 matched none and did not read as a browser; these are
+    // the ones that named themselves.
+    //
+    // Probes: IP-camera streams, `/.env` and `/.git/HEAD`, VPN-appliance
+    // logins, and two that call themselves audits.
+    ("CameraScanner", "CameraScanner", Kind::Scanner),
+    (
+        "VantageResearchScanner",
+        "VantageResearchScanner",
+        Kind::Scanner,
+    ),
+    ("scanfleet", "scanfleet", Kind::Scanner),
+    ("authorized-exposure-audit", "exposure-audit", Kind::Scanner),
+    ("DefaultsExposed", "DefaultsExposed", Kind::Scanner),
+    // Lead, SEO and directory crawlers. The Statamic one fingerprints
+    // the CMS (`/cp`, its build manifest) to sell the result.
+    (
+        "statamic-lead-research",
+        "statamic-lead-research",
+        Kind::Scanner,
+    ),
+    ("cold-email-radar", "cold-email-radar", Kind::Scanner),
+    ("HackerRepos", "HackerRepos", Kind::Scanner),
+    ("CopyMightBot", "CopyMightBot", Kind::Scanner),
+    ("webXtrendBot", "webXtrendBot", Kind::Scanner),
+    ("WPDirectoryBot", "WPDirectoryBot", Kind::Scanner),
+    ("scrape_central", "scrape_central", Kind::Scanner),
+    (
+        "Reacon-Technology-Worker",
+        "Reacon-Technology",
+        Kind::Scanner,
+    ),
+    ("goodbot.sh", "goodbot.sh", Kind::Scanner),
+    // Asked for `/.well-known/tdmrep.json`, the text-and-data-mining
+    // opt-out, beside the posts: a crawler gathering text to train on.
+    ("TernCrawler", "TernCrawler", Kind::Ai),
+    // Google's prefetch proxy, asking `/.well-known/traffic-advice` from 28
+    // addresses whether Chrome may prefetch this site for its users. Not a
+    // visitor, but nothing to block either: it is how a site opts out.
+    (
+        "Chrome Privacy Preserving Prefetch Proxy",
+        "Privacy Preserving Prefetch Proxy",
+        Kind::Infrastructure,
+    ),
 ];
 
 /// The built-in list as `NewBot` rows.
@@ -1039,6 +1086,24 @@ mod tests {
             "app-ads-crawler/1.0",
             "Mozilla/5.0 (compatible; adscan/1.0)",
             "yacycrawler (+https://yacy.net)",
+            // The fourth pass, 2026-11-07.
+            "CameraScannerV3/1.0",
+            "VantageResearchScanner/1.0 (+https://vantage.dev.blesk.cloud/scanner)",
+            "Mozilla/5.0 scanfleet/1.0",
+            "authorized-exposure-audit/6",
+            "Mozilla/5.0 (compatible; DefaultsExposed/1.0; +https://defaults.exposed/headers)",
+            // Its contact address, a person's, left out.
+            "statamic-lead-research/1.0 (+https://stoffel.io)",
+            "Mozilla/5.0 (compatible; cold-email-radar/0.1)",
+            "HackerRepos-case-study-verification/1.0",
+            "Mozilla/5.0 (compatible; CopyMightBot/1.0; +https://copymight.org)",
+            "Mozilla/5.0 (compatible; webXtrendBot/1.1; +https://webxtrend.com/crawler)",
+            "Mozilla/5.0 (compatible; WPDirectoryBot/1.0)",
+            "Mozilla/5.0 (compatible; scrape_central/1.0)",
+            "Reacon-Technology-Worker/1",
+            "goodbot.sh research business@goodbot.sh",
+            "Mozilla/5.0 (compatible; TernCrawler/1.0)",
+            "Chrome Privacy Preserving Prefetch Proxy",
         ];
         for subject in SEEN {
             let lower = subject.to_lowercase();

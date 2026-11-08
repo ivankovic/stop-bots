@@ -1059,6 +1059,19 @@ pub(crate) enum Command {
         #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
         enabled: bool,
     },
+    /// Block HTTP libraries and command-line clients.
+    ///
+    /// The user agents a program sends when nobody gave it one of its own:
+    /// `python-requests`, `aiohttp`, `Go-http-client`, Java, OkHttp, axios,
+    /// Perl's LWP, Guzzle, `curl`, `Wget` and the like, at any version. One
+    /// switch for every site, off by default, because a site with an API
+    /// is called by these; a host with one client of its own lets it
+    /// through with `add-trusted --user-agent`. Humans only turns it on.
+    SetHttpLibraries {
+        /// Whether HTTP-library agents are blocked
+        #[arg(long, value_name = "true|false", action = clap::ArgAction::Set)]
+        enabled: bool,
+    },
     /// Print the robots.txt that would be generated now, without writing it
     ShowRobotsTxt,
     /// Set what the web server sends a blocked request.
