@@ -452,6 +452,12 @@ fn condition(rule: RequestRule) -> Option<String> {
         RequestRule::NoAccept => Some(absent("Accept")),
         RequestRule::NoAcceptLanguage => Some(absent("Accept-Language")),
         RequestRule::NoUserAgent => Some(absent("User-Agent")),
+        // Go's `regexp` reads every shape as PCRE does; `(?i)` ignores
+        // case, as NGINX's `~*` does.
+        RequestRule::ImpossibleUserAgent => Some(header_matches(
+            "User-Agent",
+            &format!("(?i){}", crate::impossible_ua::pattern()),
+        )),
     }
 }
 

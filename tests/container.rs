@@ -1462,6 +1462,19 @@ fn each_request_shape_rule_refuses_a_request_actually_shaped_that_way() {
             "ip-literal-host",
             "-H 'Accept: text/html' -H 'Accept-Language: en' -A 'Mozilla/5.0' -H 'Host: 127.0.0.1'",
         ),
+        // A browser's string cut off after its engine. `ordinary` sends a
+        // bare `Mozilla/5.0`, which the rule leaves alone on purpose.
+        (
+            "impossible-user-agent",
+            "-H 'Accept: text/html' -H 'Accept-Language: en' \
+             -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'",
+        ),
+        // And one that opens with a quote, which the config has to escape.
+        (
+            "impossible-user-agent",
+            "-H 'Accept: text/html' -H 'Accept-Language: en' \
+             -A '\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'",
+        ),
     ] {
         server.stop_bots(&format!(
             "set-site-rule --site test.example --rule {rule} --enabled true"
@@ -4188,6 +4201,33 @@ fn apache_turns_away_requests_by_their_shape() {
     );
 }
 
+/// The impossible-user-agent rule's one regex, as `mod_rewrite` reads it:
+/// a browser's string cut off after its engine, or opening with a quote,
+/// is turned away, and a browser is served.
+#[test]
+fn apache_turns_away_an_impossible_user_agent() {
+    if !enabled() {
+        return;
+    }
+    let apache = Apache::start("sb-apache-impossible");
+    apache
+        .stop_bots("set-site-rule --site test.example --rule impossible-user-agent --enabled true");
+    apache.apply();
+
+    let host = "-H 'Host: test.example'";
+    for offending in [
+        "-A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'",
+        "-A '\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'",
+    ] {
+        assert_eq!(
+            apache.status("/", &format!("{offending} {host}")),
+            "403",
+            "{offending} was served"
+        );
+    }
+    assert_eq!(apache.status("/", &format!("{BROWSER} {host}")), "200");
+}
+
 #[test]
 fn apache_without_mod_rewrite_refuses_and_puts_everything_back() {
     if !enabled() {
@@ -5688,6 +5728,32 @@ fn traefik_turns_away_a_request_without_a_user_agent_where_asked() {
         traefik.status("test.example", "/.well-known/acme-challenge/x", without),
         "200"
     );
+}
+
+/// The impossible-user-agent rule's one regex, as Go's `regexp` and
+/// Traefik's rule parser read it: a cut-off browser string and one opening
+/// with a quote are turned away, and a browser is served.
+#[test]
+fn traefik_turns_away_an_impossible_user_agent() {
+    if !enabled() {
+        return;
+    }
+    let traefik = Traefik::start("sb-traefik-impossible");
+    traefik
+        .stop_bots("set-site-rule --site test.example --rule impossible-user-agent --enabled true");
+    traefik.apply();
+
+    for offending in [
+        "-A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'",
+        "-A '\"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'",
+    ] {
+        assert_eq!(
+            traefik.status("test.example", "/", offending),
+            "403",
+            "{offending} was served"
+        );
+    }
+    assert_eq!(traefik.status("test.example", "/", BROWSER), "200");
 }
 
 /// Patterns with what YAML, Traefik's rule parser or Go's regular

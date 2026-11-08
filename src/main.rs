@@ -514,6 +514,9 @@ async fn run() -> Result<()> {
         Some(Command::PreviewExploitRules { access_log }) => {
             waf_cmd::preview_exploit_rules(db, access_log)
         }
+        Some(Command::PreviewImpossibleUserAgents { access_log }) => {
+            preview_impossible_user_agents(db, access_log)
+        }
         Some(Command::SetModsecurity {
             mode,
             paranoia,
@@ -1608,6 +1611,49 @@ fn set_site_rule(
         say!("Note: {}.", rule.caveat());
     }
     say!("Run `stop-bots apply-blocks` to write it into the site config.");
+    Ok(())
+}
+
+fn preview_impossible_user_agents(
+    db_path: Option<PathBuf>,
+    access_log: Option<PathBuf>,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    let log_text = read_access_log(&db, access_log.as_deref())?;
+    let preview = stop_bots::impossible_ua::preview(&log_text);
+    say!(
+        "Of {} request(s) in the log, the impossible-user-agent rule would have turned away \
+         {}, from {} address(es).",
+        preview.requests,
+        preview.matched,
+        preview.addresses
+    );
+    if preview.matched == 0 {
+        return Ok(());
+    }
+    say!(
+        "{} of those were answered with a success: the site served them.",
+        preview.answered
+    );
+    for (shape, count) in &preview.by_shape {
+        say!("  {count:>6}  {shape}");
+    }
+    if preview.browser_like.is_empty() {
+        say!("None of those addresses fetched a page's styles, scripts or images.");
+    } else {
+        say!(
+            "{} of those address(es) also fetched a page's styles, scripts or images, as a \
+             browser does. Look at what they asked for before switching the rule on:",
+            preview.browser_like.len()
+        );
+        for address in &preview.browser_like {
+            say!("  {address}");
+        }
+    }
+    say!("For example:");
+    for sample in &preview.samples {
+        say!("  {}", terminal_safe(sample));
+    }
     Ok(())
 }
 

@@ -744,16 +744,22 @@ pub enum RequestRule {
     /// deprecated and no current browser offers them. Inert outside a TLS
     /// block, where `$ssl_protocol` is empty.
     OldTls,
+    /// A user agent no browser sends: a browser's string cut short or
+    /// assembled wrong, which is how a scanner dressed as a browser gives
+    /// itself away ([`crate::impossible_ua`]). The one rule of these the
+    /// access log can show beforehand: `preview-impossible-user-agents`.
+    ImpossibleUserAgent,
 }
 
 impl RequestRule {
-    pub const ALL: [RequestRule; 6] = [
+    pub const ALL: [RequestRule; 7] = [
         RequestRule::Http1x,
         RequestRule::NoAccept,
         RequestRule::NoAcceptLanguage,
         RequestRule::NoUserAgent,
         RequestRule::IpLiteralHost,
         RequestRule::OldTls,
+        RequestRule::ImpossibleUserAgent,
     ];
 
     /// Stable id — a `site_request_rules.rule` value in every installed
@@ -766,6 +772,7 @@ impl RequestRule {
             RequestRule::NoUserAgent => "no_user_agent",
             RequestRule::IpLiteralHost => "ip_literal_host",
             RequestRule::OldTls => "old_tls",
+            RequestRule::ImpossibleUserAgent => "impossible_user_agent",
         }
     }
 
@@ -781,6 +788,7 @@ impl RequestRule {
             RequestRule::NoUserAgent => "No User-Agent",
             RequestRule::IpLiteralHost => "Host is an IP",
             RequestRule::OldTls => "TLS 1.0 / 1.1",
+            RequestRule::ImpossibleUserAgent => "Impossible user agent",
         }
     }
 
@@ -812,6 +820,13 @@ impl RequestRule {
                 "Turns away connections over TLS 1.0 and 1.1, which are formally deprecated \
                  and offered by no current browser."
             }
+            RequestRule::ImpossibleUserAgent => {
+                "Turns away user agents no browser sends: a browser's string cut off after \
+                 its engine, Chrome without its engine's comment, a platform with nothing \
+                 after it, a quote before the first word. Scanners dressed as browsers send \
+                 these. `stop-bots preview-impossible-user-agents` shows what it would turn \
+                 away in the access log before you switch it on."
+            }
         }
     }
 
@@ -826,6 +841,7 @@ impl RequestRule {
             RequestRule::NoUserAgent => "scripts and health checks often omit it",
             RequestRule::IpLiteralHost => "breaks reaching the site by IP",
             RequestRule::OldTls => "very old clients only",
+            RequestRule::ImpossibleUserAgent => "a script that made up a browser's string",
         }
     }
 

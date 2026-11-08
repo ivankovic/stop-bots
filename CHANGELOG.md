@@ -14,6 +14,9 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 them blocks its sender as `/.env` does, and 14 more scanners are blocked by name. Everything
 else this release adds is off until switched on, apart from one more `status` check.
 
+**Going back to 0.9.0** works: it ignores a site's impossible-user-agent rule, which then
+turns nothing away until this release is back.
+
 ### Added
 
 - **An HTTP-libraries switch**, off by default. `stop-bots set-http-libraries --enabled
@@ -43,6 +46,21 @@ else this release adds is off until switched on, apart from one more `status` ch
   Preserving Prefetch Proxy is added as infrastructure: recognised, and never blocked by a
   category. Every site reads as not applied until the
   next apply writes the new names in.
+
+- **An impossible-user-agent rule**, a request-shape rule like No User-Agent, off by default
+  and per site: `stop-bots set-site-rule --site <site> --rule impossible-user-agent
+  --enabled true`. It turns away user agents no browser sends, the way a scanner dressed as
+  one gives itself away: a browser's string cut off after its engine, Chrome without its
+  engine's comment, a platform comment with nothing after it, an empty `(compatible)`, a
+  quote before the first word, no space after `Mozilla/5.0`. On one host's log since April
+  it matched 16,691 requests from 504 addresses, and not one of them fetched a page's
+  styles, scripts or images under the same user agent. A bare `Mozilla/5.0` is left alone:
+  an AI assistant fetching for its user, a VPN and home connections sent it too. NGINX,
+  Apache and Traefik; not NPMplus, which has no per-site rules.
+- **`stop-bots preview-impossible-user-agents`** says what the rule would turn away in the
+  access log, request for request, since the rule reads only the user agent the log
+  records, and names every address it would turn away that fetched a page's assets as a
+  browser does.
 
 ### Changed
 

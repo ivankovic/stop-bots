@@ -1072,6 +1072,11 @@ fn condition(rule: RequestRule) -> String {
         // `HTTP_HOST` keeps a port, which an anchored match ignores.
         RequestRule::IpLiteralHost => matches("%{HTTP_HOST}", r"^(\d+\.\d+\.\d+\.\d+|\[)"),
         RequestRule::OldTls => matches("%{SSL:SSL_PROTOCOL}", r"^TLSv1(\.[01])?$"),
+        // Ignoring case, as the bot lists are matched here.
+        RequestRule::ImpossibleUserAgent => format!(
+            "{} [NC]",
+            matches("%{HTTP_USER_AGENT}", &crate::impossible_ua::pattern())
+        ),
     }
 }
 
