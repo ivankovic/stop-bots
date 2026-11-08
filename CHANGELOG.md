@@ -8,6 +8,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **16 more bots in the stop-bots enhanced list**, from a fourth pass over the same host's
+  log (2026-09-28 to 2026-11-07, 57,305 requests): scanners that name themselves
+  (`CameraScanner`, `VantageResearchScanner`, `scanfleet`, `DefaultsExposed`), lead, SEO and
+  directory crawlers (`statamic-lead-research`, `cold-email-radar`, `webXtrendBot`,
+  `WPDirectoryBot`), all 14 scanners for policy and so blocked by default; and `TernCrawler`,
+  which asks for the text-and-data-mining opt-out, as an AI crawler. Chrome's Privacy
+  Preserving Prefetch Proxy is added as infrastructure: recognised, and never blocked by a
+  category. Every site reads as not applied until the
+  next apply writes the new names in.
+
 ## [0.9.0] — 2026-11-02
 
 Outbound checks against C&C servers, and a web application firewall for NGINX.
