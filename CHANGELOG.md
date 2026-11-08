@@ -11,8 +11,8 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 **Before upgrading:** nothing to do. The database schema is unchanged.
 
 **After upgrading:** the probe-paths detector knows more paths, so a request for one of
-them blocks its sender as `/.env` does. Everything else this release adds is off until
-switched on, apart from one more `status` check.
+them blocks its sender as `/.env` does, and 14 more scanners are blocked by name. Everything
+else this release adds is off until switched on, apart from one more `status` check.
 
 ### Added
 
@@ -34,6 +34,15 @@ switched on, apart from one more `status` check.
 - **`status` says when the access log records no site** on a host with several, with the
   `log_format` or `LogFormat` that adds it. Blocking is unaffected; what reads the log
   judges a request against every site at once without it.
+- **16 more bots in the stop-bots enhanced list**, from a fourth pass over the same host's
+  log (2026-09-28 to 2026-11-07, 57,305 requests): scanners that name themselves
+  (`CameraScanner`, `VantageResearchScanner`, `scanfleet`, `DefaultsExposed`), lead, SEO and
+  directory crawlers (`statamic-lead-research`, `cold-email-radar`, `webXtrendBot`,
+  `WPDirectoryBot`), all 14 scanners for policy and so blocked by default; and `TernCrawler`,
+  which asks for the text-and-data-mining opt-out, as an AI crawler. Chrome's Privacy
+  Preserving Prefetch Proxy is added as infrastructure: recognised, and never blocked by a
+  category. Every site reads as not applied until the
+  next apply writes the new names in.
 
 ### Changed
 
