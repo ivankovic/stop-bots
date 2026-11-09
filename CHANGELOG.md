@@ -8,6 +8,18 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+**Before upgrading:** building from source needs Rust 1.89 or newer, one release more than
+0.10.0 did; the release binaries and packages need nothing.
+
+### Security
+
+- **The bundled SQLite is 3.54.1**, for RUSTSEC-2026-0459 (CVE-2026-119375): before 3.54.0,
+  opening a database beside a crafted `-wal` file whose page size differs could return
+  uninitialised memory in query results. stop-bots opens only its own database, in a
+  directory only its owner can write, so a local attacker would need that account already;
+  it is fixed all the same. `rusqlite` 0.40 → 0.41, which carries it, needs Rust 1.89, so the MSRV is
+  1.89, from 1.88.
+
 ## [0.10.0] — 2026-11-08
 
 Scanners dressed as browsers turned away by their shape, and HTTP libraries on request.
