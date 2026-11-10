@@ -188,7 +188,7 @@ pub const AUDIT_LOG_ENV: &str = "STOP_BOTS_MODSECURITY_AUDIT_LOG";
 
 /// Where the audit log is read from.
 pub fn audit_log_path() -> PathBuf {
-    std::env::var_os(AUDIT_LOG_ENV)
+    crate::host::path_override(AUDIT_LOG_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(AUDIT_LOG))
 }
@@ -254,7 +254,7 @@ pub fn installation(root: &Path) -> Installation {
                 .to_string(),
         );
     }
-    let (crs_setup, crs_rules) = match std::env::var_os(CRS_ENV) {
+    let (crs_setup, crs_rules) = match crate::host::path_override(CRS_ENV) {
         Some(dir) => {
             let dir = PathBuf::from(dir);
             (dir.join("crs-setup.conf"), dir.join("rules"))

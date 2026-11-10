@@ -94,6 +94,18 @@ pub fn read_log_file(path: &Path) -> LogSource {
 /// `log_format` leaves one file holding both kinds until it rotates, and
 /// an admin who adds a JSON format in order to switch these detectors on
 /// should not have to wait out that rotation to see anything detected.
+/// The client address a log line carries, as the address the client has.
+///
+/// NGINX listening on `[::]:80 ipv6only=off` logs an IPv4 client as
+/// `::ffff:203.0.113.5`. Read as the IPv6 address it is written as, that
+/// client is never private, never in a crawler's range, and is blocked as
+/// `::/64`, a rule no IPv4 packet matches: every detector found it and
+/// the firewall did nothing. So the mapped form is undone here, once,
+/// where the address is read.
+fn parse_address(text: &str) -> Option<IpAddr> {
+    text.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+}
+
 fn parse_line(line: &str) -> Option<ParsedLine> {
     let trimmed = line.trim_start();
     if trimmed.starts_with('{') {
@@ -126,7 +138,7 @@ fn parse_combined_line(line: &str) -> Option<ParsedLine> {
     // `$remote_user` comes first and is the client's to write, brackets
     // and all, while `$time_local` never has one.
     let (prefix, rest) = line.split_once('"')?;
-    let ip: IpAddr = prefix.split_whitespace().next()?.parse().ok()?;
+    let ip = parse_address(prefix.split_whitespace().next()?)?;
     let time = prefix
         .rsplit_once('[')
         .and_then(|(_, rest)| rest.split_once(']'))
@@ -165,7 +177,7 @@ fn parse_npmplus_line(line: &str) -> Option<ParsedLine> {
     let (stamp, after_time) = prefix.strip_prefix('[')?.split_once(']')?;
     let mut words = after_time.split_whitespace();
     words.next_back()?.parse::<f64>().ok()?;
-    let ip: IpAddr = words.next_back()?.parse().ok()?;
+    let ip = parse_address(words.next_back()?)?;
     let host = words.collect::<Vec<_>>().join(" ");
     let time = crate::logtime::nginx_time_local(stamp);
     let (request, tail) = rest.split_once('"')?;
@@ -320,10 +332,8 @@ fn parse_json_line(line: &str) -> Option<ParsedLine> {
     let LogObject(fields) = serde_json::from_str(line).ok()?;
     let obj = &fields;
 
-    let ip: IpAddr = json_field(obj, "remote_addr")
-        .or_else(|| json_field(obj, "ClientHost"))?
-        .parse()
-        .ok()?;
+    let ip =
+        parse_address(&json_field(obj, "remote_addr").or_else(|| json_field(obj, "ClientHost"))?)?;
     // What the client was sent: Traefik's `OriginStatus` is what the
     // service behind it answered, which a refused request never reached.
     let status: u16 = json_field(obj, "status")
@@ -1284,6 +1294,21 @@ impl Watch {
     }
 }
 
+/// `path` as the web server reads it, put back together from
+/// [`path_segments`]: what a matcher written for a plain path should see
+/// of one that arrived percent-encoded.
+fn decoded_path(path: &str) -> String {
+    let mut decoded = String::with_capacity(path.len());
+    for segment in path_segments(path) {
+        decoded.push('/');
+        decoded.push_str(&segment);
+    }
+    if path.ends_with('/') || decoded.is_empty() {
+        decoded.push('/');
+    }
+    decoded
+}
+
 /// The segments of `path` as NGINX matches a `location` against it: `%XX`
 /// decoded once, empty and `.` segments dropped, and `..` taking away the
 /// one before it. Not the `%u` forms [`crate::injection`] also decodes:
@@ -1460,16 +1485,28 @@ impl Observer {
     /// access-log detector's idea of a suspicious line is written down.
     fn observe(&mut self, detector: Detector, line: &ParsedLine, at: i64) -> Option<Item> {
         match detector {
-            // A distinct path that does not exist here.
-            Detector::WebScanners => (line.status == 404).then(|| Item::seen(&line.path)),
+            // A distinct path that does not exist here: not found, or
+            // gone, which is a site saying the same thing on purpose. Not
+            // 403, which is also what this project's own block answers,
+            // and a client refused by its user agent is not scanning.
+            Detector::WebScanners => {
+                matches!(line.status, 404 | 410).then(|| Item::seen(&line.path))
+            }
             Detector::SpoofedCrawlers => impersonates(line, &self.watch.claims).map(Item::seen),
             Detector::ProbePaths => {
                 let path = line.path.to_lowercase();
-                if self
-                    .needles
-                    .iter()
-                    .any(|needle| path.contains(needle.as_str()))
-                {
+                // As written, which is what the `%2e` needles are for,
+                // and as the web server reads it: `/.%65nv` is `/.env` to
+                // NGINX, which serves the file, and was no probe here.
+                let decoded = path
+                    .contains('%')
+                    .then(|| decoded_path(&path).to_lowercase());
+                if self.needles.iter().any(|needle| {
+                    path.contains(needle.as_str())
+                        || decoded
+                            .as_deref()
+                            .is_some_and(|d| d.contains(needle.as_str()))
+                }) {
                     return Some(Item::seen(&line.path));
                 }
                 let hosts = line.host.iter().chain(&line.trailing).map(String::as_str);
@@ -1481,9 +1518,16 @@ impl Observer {
             // Anchored, as the `Disallow:` line that publishes it is: a
             // crawler that obeys robots.txt avoids exactly the paths that
             // start with it.
-            Detector::Honeypot => (!self.honeypot.is_empty()
-                && line.path.to_lowercase().starts_with(&self.honeypot))
-            .then(|| Item::seen(&line.path)),
+            Detector::Honeypot => {
+                let path = line.path.to_lowercase();
+                (!self.honeypot.is_empty()
+                    && (path.starts_with(&self.honeypot)
+                        || (path.contains('%')
+                            && decoded_path(&path)
+                                .to_lowercase()
+                                .starts_with(&self.honeypot))))
+                .then(|| Item::seen(&line.path))
+            }
             Detector::RobotsTxt => line
                 .path
                 .to_lowercase()
@@ -1839,6 +1883,26 @@ mod tests {
         format!(
             "{ip} - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/1.1\" 404 162 \"-\" \"Mozilla/5.0\"\n"
         )
+    }
+
+    /// Gone is not found said on purpose; refused is something else.
+    #[test]
+    fn scanning_ips_counts_gone_as_missing_and_refused_as_neither() {
+        let asked = |status: u16| -> String {
+            (0..8)
+                .map(|n| {
+                    not_found_line("203.0.113.9", &format!("/old-{n}"))
+                        .replace(" 404 ", &format!(" {status} "))
+                })
+                .collect()
+        };
+        for (status, flagged) in [(404, true), (410, true), (403, false), (301, false)] {
+            assert_eq!(
+                !scanning_ips(&asked(status), 7).is_empty(),
+                flagged,
+                "eight distinct paths answered {status}"
+            );
+        }
     }
 
     /// The two columns are the whole point: refusals alone cannot tell a
@@ -2821,6 +2885,20 @@ mod tests {
             "/%2frobots%2etxt",
         ] {
             let log = probe_line("203.0.113.9", path, 404);
+            assert_eq!(
+                probe_path_ips(&log, &default_probes()).len(),
+                1,
+                "missed {path}"
+            );
+        }
+    }
+
+    /// Any letter of a path can be written as `%XX`, and the web server
+    /// reads it back before it looks for the file.
+    #[test]
+    fn probe_path_ips_flags_a_probe_with_its_letters_percent_encoded() {
+        for path in ["/.%65nv", "/.%45NV", "/.git%2fconfig", "/.%67it/config"] {
+            let log = probe_line("203.0.113.9", path, 200);
             assert_eq!(
                 probe_path_ips(&log, &default_probes()).len(),
                 1,

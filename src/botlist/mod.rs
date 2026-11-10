@@ -252,6 +252,54 @@ pub(crate) fn keeps_pattern(pattern: &str) -> bool {
             crate::nginx::pattern_problem(pattern),
             None | Some(crate::nginx::PatternProblem::TooLong)
         )
+        && !matches_a_browser(pattern)
+}
+
+/// What the browsers people use send, one of each engine on a desktop and
+/// on a phone. The version numbers date; the words a pattern would have to
+/// contain to match one do not.
+const BROWSERS: [&str; 7] = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/142.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) \
+     Version/26.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:144.0) Gecko/20100101 Firefox/144.0",
+    "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Chrome/142.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like \
+     Gecko) Version/26.0 Mobile/15E148 Safari/604.1",
+];
+
+/// Whether `pattern` matches a browser people use ([`BROWSERS`]), as the
+/// web server would match it.
+///
+/// `nginx::pattern_problem` refuses a pattern that matches nearly
+/// nothing, which is a mistake's shape. `Mozilla`, `AppleWebKit` and
+/// `Chrome/` are none of that: each is a well-formed name with plenty of
+/// letters, each passes `nginx -t`, and each in a list of scanners is a
+/// 403 for every visitor the site has, applied within the hour where
+/// applying is automatic. A list that is wrong, or that someone else got
+/// to write, is the only thing that would ever carry one, so it is left
+/// out where the list is read.
+///
+/// A pattern [`crate::uaregex`] cannot read is compared as the screens
+/// compare one: by its unescaped alternatives, as substrings.
+pub(crate) fn matches_a_browser(pattern: &str) -> bool {
+    match crate::uaregex::compiled(pattern) {
+        Some(compiled) => BROWSERS.iter().any(|browser| compiled.is_match(browser)),
+        None => {
+            let plain = crate::dynamic::unescape_pattern(pattern).to_lowercase();
+            BROWSERS.iter().any(|browser| {
+                let browser = browser.to_lowercase();
+                plain
+                    .split('|')
+                    .any(|alternative| !alternative.is_empty() && browser.contains(alternative))
+            })
+        }
+    }
 }
 
 /// Turns an arbitrary bot-name string into a lowercase, hyphen-separated
@@ -366,6 +414,39 @@ pub fn store_raw(db: &Db, kind: SourceKind, raw: &str) -> Result<(usize, usize)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name of this shape passes every other check and `nginx -t`.
+    #[test]
+    fn a_pattern_that_matches_a_browser_people_use_is_left_out() {
+        for pattern in [
+            "Mozilla",
+            "AppleWebKit",
+            "Chrome/",
+            "Safari",
+            "Gecko",
+            "Win64",
+        ] {
+            assert!(!keeps_pattern(pattern), "kept {pattern}");
+        }
+        for pattern in ["GPTBot", "HeadlessChrome", "Googlebot\\/", "curl"] {
+            assert!(keeps_pattern(pattern), "left out {pattern}");
+        }
+    }
+
+    /// Or the check would be dropping patterns the lists are right to carry.
+    #[test]
+    fn no_built_in_list_carries_a_pattern_that_matches_a_browser() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        register_all_sources(&db).unwrap();
+        let matching: Vec<String> = db
+            .list_bots()
+            .unwrap()
+            .into_iter()
+            .filter(|bot| matches_a_browser(&bot.user_agent_pattern))
+            .map(|bot| bot.user_agent_pattern)
+            .collect();
+        assert!(matching.is_empty(), "matched by {matching:?}");
+    }
     use crate::db::BotStatus;
 
     /// Far beyond any real list, so a source that crosses it has changed

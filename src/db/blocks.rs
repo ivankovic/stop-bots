@@ -259,6 +259,47 @@ impl Db {
         Ok(())
     }
 
+    /// Puts back `rules` as [`Self::remove_firewall_rule`] returned them:
+    /// the same address, verdict, source, evidence and times, and no
+    /// longer recorded as unblocked by hand. How many came back.
+    ///
+    /// For the Blocks screen's undo. One that has expired since is left
+    /// out, and so is one that something has blocked again in the
+    /// meantime: that rule is the newer account of the address. What the
+    /// removal made the detectors forget stays forgotten, which errs
+    /// towards a count that starts again.
+    pub fn restore_firewall_rules(&self, rules: &[FirewallRule]) -> Result<usize> {
+        let now = now();
+        self.batch(|| {
+            let mut restored = 0;
+            for rule in rules {
+                if rule.expires_at.is_some_and(|at| at <= now) {
+                    continue;
+                }
+                restored += self.conn.execute(
+                    "INSERT OR IGNORE INTO firewall_rules
+                         (address, port, action, enabled, created_at, expires_at, source, evidence)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        rule.address,
+                        rule.port,
+                        rule.action.as_str(),
+                        rule.enabled,
+                        rule.created_at,
+                        rule.expires_at,
+                        rule.source.map(RuleSource::stored),
+                        rule.evidence
+                    ],
+                )?;
+                self.conn.execute(
+                    "DELETE FROM unblocked_addresses WHERE address = ?1",
+                    params![rule.address],
+                )?;
+            }
+            Ok(restored)
+        })
+    }
+
     /// Every address an operator unblocked that the detectors must still
     /// leave alone, with when that ends. Lapsed rows are deleted first.
     pub fn unblocked_addresses(&self) -> Result<Vec<(String, i64)>> {

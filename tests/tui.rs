@@ -1593,6 +1593,9 @@ fn the_blocks_screen_lists_a_rule_with_its_source_and_unblocks_it() {
     session.exp_string("198.51.100.77").unwrap();
     session.exp_string("(CLI)").unwrap();
 
+    // Enter asks first, and a second one is the yes.
+    send_key(&mut session, "\r");
+    session.exp_string("cancel").unwrap();
     send_key(&mut session, "\r");
     // The screen says what happened on the Dashboard; here the row goes.
     session.exp_string("stored.").unwrap();

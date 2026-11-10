@@ -22,14 +22,14 @@
 <text x="852.0" y="43.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">v</text>
 <text x="860.4" y="43.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> simple</text>
 <text x="12.0" y="61.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">status</text>
-<text x="79.2" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
-<text x="96.0" y="61.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">kernel</text>
+<text x="79.2" y="61.5" fill="#d18f52" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▲</text>
+<text x="87.6" y="61.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> reboot  </text>
 <text x="163.2" y="61.5" fill="#d18f52" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▲</text>
-<text x="171.6" y="61.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> reboot  </text>
+<text x="171.6" y="61.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> script  </text>
 <text x="247.2" y="61.5" fill="#d18f52" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▲</text>
-<text x="255.6" y="61.5" fill="#c8d0da" textLength="75.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> script  </text>
-<text x="331.2" y="61.5" fill="#d18f52" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">▲</text>
-<text x="339.6" y="61.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> nginx  </text>
+<text x="255.6" y="61.5" fill="#c8d0da" textLength="67.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve"> nginx  </text>
+<text x="322.8" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
+<text x="339.6" y="61.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">kernel</text>
 <text x="406.8" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
 <text x="423.6" y="61.5" fill="#6b7c8c" textLength="42.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">files</text>
 <text x="482.4" y="61.5" fill="#8cc265" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">●</text>
@@ -150,10 +150,9 @@
 <text x="490.8" y="493.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">copy</text>
 <text x="541.2" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">f</text>
 <text x="558.0" y="493.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">filter</text>
-<text x="625.2" y="493.5" fill="#2ee6d6" textLength="25.2" lengthAdjust="spacingAndGlyphs" xml:space="preserve">Tab</text>
-<text x="658.8" y="493.5" fill="#6b7c8c" textLength="84.0" lengthAdjust="spacingAndGlyphs" xml:space="preserve">next panel</text>
-<text x="759.6" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">R</text>
-<text x="776.4" y="493.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">re-read</text>
-<text x="852.0" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">:</text>
-<text x="868.8" y="493.5" fill="#6b7c8c" textLength="50.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">comman</text>
+<text x="625.2" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">…</text>
+<text x="650.4" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">?</text>
+<text x="667.2" y="493.5" fill="#6b7c8c" textLength="58.8" lengthAdjust="spacingAndGlyphs" xml:space="preserve">explain</text>
+<text x="742.8" y="493.5" fill="#2ee6d6" textLength="8.4" lengthAdjust="spacingAndGlyphs" xml:space="preserve">q</text>
+<text x="759.6" y="493.5" fill="#6b7c8c" textLength="33.6" lengthAdjust="spacingAndGlyphs" xml:space="preserve">quit</text>
 </svg>

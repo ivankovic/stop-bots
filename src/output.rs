@@ -175,6 +175,23 @@ impl Status {
     }
 }
 
+/// `why --json`.
+#[derive(Debug, Serialize)]
+pub struct Why {
+    pub address: String,
+    /// The stored rules that cover it.
+    pub rules: Vec<FirewallRuleRow>,
+    /// Ranges of a country, feed, hosting provider or blocked crawler
+    /// that cover it: enforced, and not stored as rules.
+    pub lists: Vec<String>,
+    /// The trusted addresses or ranges that cover it.
+    pub trusted: Vec<String>,
+    /// Whether it logged in over SSH recently, and is allowed for that.
+    pub ssh_login: bool,
+    /// When the detectors stop leaving it alone after an unblock by hand.
+    pub unblocked_until: Option<i64>,
+}
+
 /// `list-firewall-rules --json`.
 #[derive(Debug, Serialize)]
 pub struct FirewallRules {

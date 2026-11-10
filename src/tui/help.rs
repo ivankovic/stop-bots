@@ -53,7 +53,7 @@ const LINES: [&str; MAX_LINES] = [
     "  Delete / Backspace remove the selected country from the Geo list",
     "",
     "Bot settings         /  searches the bots; type to filter, Enter opens, Esc leaves the box",
-    "Blocks               every rule and why: f source, / address, Enter unblock, U all from source",
+    "Blocks               f source, / address, Enter unblock, T and trust it, z undo, U all from source",
     "",
     "Firewall",
     "  Enter / T          block or unblock the selected row / trust it, never to be blocked",
@@ -65,7 +65,7 @@ const LINES: [&str; MAX_LINES] = [
     "  Enter, /           open a site's category, request-rule and bot overrides; / searches bots",
     "",
     "Global",
-    "  q Esc / t / ?      quit or back / theme / explain the selected row; ? again opens this screen",
+    "  q Esc / t / ?      back; q on the Dashboard quits / theme / explain; ? again opens this screen",
 ];
 
 /// Draws the reference. "NGINX" in [`LINES`] is the sites screen and the

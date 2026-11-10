@@ -386,6 +386,10 @@ pub enum KeyOutcome {
     /// `install::keep_running`). On writes to `/etc` as root, so `App` does
     /// it, for the reason [`Self::ReloadNginx`] gives.
     KeepRunning(bool),
+    /// The simple screen's "Block attackers in logs" row was opened: show
+    /// the checks themselves, which are the advanced Dashboard's
+    /// Automatic blocking list.
+    ShowDetectors,
     /// Firewall's `R`: read the SSH log again now, rather than
     /// when the 30-second cache says so. `App` owns that read (see
     /// `App::start_ssh_log_read`), for the same reason it owns every
@@ -499,6 +503,33 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
 
     render_footer(app, frame, footer);
+
+    if no_color() {
+        without_colour(frame.buffer_mut());
+    }
+}
+
+/// Whether the environment asks for no colour: `NO_COLOR` set to anything
+/// but nothing, as <https://no-color.org> has it.
+fn no_color() -> bool {
+    static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NO_COLOR.get_or_init(|| std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()))
+}
+
+/// Takes every colour out of what was drawn, once, here, rather than at
+/// each of the few hundred places a colour is chosen. Bold, dim and
+/// underline stay, and a cell that had a background (the selected row, a
+/// tag) is reversed instead, so that what the colour was saying is still
+/// said. Every state a colour marks also has a word or a shape beside it.
+fn without_colour(buffer: &mut ratatui::buffer::Buffer) {
+    use ratatui::style::Modifier;
+    for cell in &mut buffer.content {
+        if cell.bg != Color::Reset {
+            cell.modifier.insert(Modifier::REVERSED);
+        }
+        cell.fg = Color::Reset;
+        cell.bg = Color::Reset;
+    }
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -607,14 +638,28 @@ fn status_line(app: &App) -> Line<'static> {
         spans.push("not checked yet".fg(theme.dim()));
         return Line::from(spans);
     };
-    for (i, check) in report.checks.iter().enumerate() {
+    // What is wrong first. The line is cut at the terminal's width, and
+    // in the order the checks run the cut took `logs` and `log format`
+    // off an 80-column terminal whether or not they were the problem.
+    let mut checks: Vec<&crate::health::Check> = report.checks.iter().collect();
+    checks.sort_by_key(|check| match check.level {
+        Level::Critical => 0,
+        Level::Warn => 1,
+        Level::Unknown => 2,
+        Level::Ok => 3,
+    });
+    for (i, check) in checks.into_iter().enumerate() {
         if i > 0 {
             spans.push("  ".into());
         }
+        // A shape for each level as well as a colour: a critical check
+        // and a warning were the same triangle in red and in yellow,
+        // which a terminal without colour, or an eye without that
+        // distinction, shows as the same thing.
         let (mark, colour) = match check.level {
             Level::Ok => ("\u{25cf}", Color::Green),
             Level::Warn => ("\u{25b2}", Color::Yellow),
-            Level::Critical => ("\u{25b2}", Color::Red),
+            Level::Critical => ("\u{2716}", Color::Red),
             Level::Unknown => ("\u{25cb}", theme.dim()),
         };
         spans.push(mark.fg(colour));
@@ -671,15 +716,78 @@ fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
             ("q", "quit"),
         ],
     };
-    for (i, (key, label)) in hints.iter().chain(globals).enumerate() {
+    // A box that is taking every key typed, or a popup waiting for its
+    // answer: `?` there is a question mark in the search, and `q` closes
+    // the popup, so neither is offered as what it is elsewhere.
+    let modal = hints
+        .iter()
+        .any(|(key, label)| *key == "Esc" && MODAL_ESCAPES.contains(label));
+    let globals = if modal { &[] } else { globals };
+    let all: Vec<(&str, &str)> = hints.iter().chain(globals).copied().collect();
+    let used: usize = spans.iter().map(Span::width).sum();
+    let room = usize::from(area.width).saturating_sub(used);
+    for (i, (key, label)) in fitted(&all, hints.len(), room).into_iter().enumerate() {
         if i > 0 {
             spans.push("  ".into());
         }
-        spans.push((*key).fg(theme.accent()));
-        spans.push(" ".into());
-        spans.push((*label).fg(theme.dim()));
+        spans.push(key.fg(theme.accent()));
+        if !label.is_empty() {
+            spans.push(" ".into());
+            spans.push(label.fg(theme.dim()));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// What `Esc` is labelled while something has taken the keyboard.
+const MODAL_ESCAPES: [&str; 3] = ["cancel", "close", "leave search"];
+
+/// The width of one hint as the footer draws it.
+fn hint_width((key, label): &(&str, &str)) -> usize {
+    let width = |text: &str| Span::from(text).width();
+    width(key)
+        + if label.is_empty() {
+            0
+        } else {
+            1 + width(label)
+        }
+}
+
+/// `hints` as they fit in `room` columns, two spaces apart. The first
+/// `own` are the screen's and the rest work everywhere.
+///
+/// All of them where there is room. Where there is not, the line used to
+/// be cut at the right edge, and the right edge is where `? explain` and
+/// `q quit` are: the two keys that say what the others do and how to
+/// leave went first. Now the screen's own hints give way from the end,
+/// an ellipsis says so, and `?` and `q` stay.
+fn fitted<'a>(hints: &[(&'a str, &'a str)], own: usize, room: usize) -> Vec<(&'a str, &'a str)> {
+    let width = |hints: &[(&str, &str)]| {
+        hints.iter().map(hint_width).sum::<usize>() + 2 * hints.len().saturating_sub(1)
+    };
+    if width(hints) <= room {
+        return hints.to_vec();
+    }
+    let (own, global) = hints.split_at(own.min(hints.len()));
+    let kept: Vec<(&str, &str)> = global
+        .iter()
+        .filter(|(key, _)| matches!(*key, "?" | "q"))
+        .copied()
+        .collect();
+    let mut fitted: Vec<(&str, &str)> = Vec::new();
+    for hint in own {
+        let mut with = fitted.clone();
+        with.push(*hint);
+        with.push(("\u{2026}", ""));
+        with.extend(&kept);
+        if width(&with) > room {
+            break;
+        }
+        fitted.push(*hint);
+    }
+    fitted.push(("\u{2026}", ""));
+    fitted.extend(kept);
+    fitted
 }
 
 /// A screen's key hints for the footer: the name of the focused panel and
@@ -709,6 +817,54 @@ fn busy_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hints_that_fit_are_all_shown() {
+        let hints = [("a", "apply"), ("?", "explain"), ("q", "quit")];
+        assert_eq!(fitted(&hints, 1, 80), hints.to_vec());
+    }
+
+    /// The keys that explain the others, and that leave, are the last to go.
+    #[test]
+    fn hints_that_do_not_fit_give_way_from_the_screen_s_own_end() {
+        let hints = [
+            ("Enter", "block/unblock"),
+            ("T", "trust"),
+            ("i", "inspect"),
+            (":", "commands"),
+            ("?", "explain"),
+            ("t", "theme"),
+            ("q", "quit"),
+        ];
+        let shown = fitted(&hints, 3, 50);
+        assert_eq!(
+            shown,
+            vec![
+                ("Enter", "block/unblock"),
+                ("T", "trust"),
+                ("\u{2026}", ""),
+                ("?", "explain"),
+                ("q", "quit"),
+            ]
+        );
+        let width: usize = shown.iter().map(hint_width).sum::<usize>() + 2 * (shown.len() - 1);
+        assert!(width <= 50, "{width} columns: {shown:?}");
+    }
+
+    #[test]
+    fn without_colour_a_background_becomes_reverse_video() {
+        use ratatui::style::Modifier;
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 2, 1));
+        buffer.content[0].set_fg(Color::Red).set_bg(Color::Blue);
+        buffer.content[1].set_fg(Color::Green);
+
+        without_colour(&mut buffer);
+
+        let colours: Vec<_> = buffer.content.iter().map(|c| (c.fg, c.bg)).collect();
+        assert_eq!(colours, vec![(Color::Reset, Color::Reset); 2]);
+        assert!(buffer.content[0].modifier.contains(Modifier::REVERSED));
+        assert!(!buffer.content[1].modifier.contains(Modifier::REVERSED));
+    }
 
     #[test]
     fn the_sites_screen_is_named_for_the_hosts_web_server() {

@@ -7188,6 +7188,136 @@ fn list_trusted_json_keeps_addresses_and_user_agents_apart() {
     );
 }
 
+/// `journal` is the one log setting that is not a path.
+#[test]
+fn set_log_paths_takes_the_word_journal_for_the_ssh_and_kernel_logs_only() {
+    let fx = Fixture::new();
+    fx.run(&[
+        "set-log-paths",
+        "--ssh-log",
+        "journal",
+        "--kernel-log",
+        "journal",
+    ]);
+
+    let shown = fx.cmd(&["set-log-paths"]).output().unwrap();
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert_eq!(
+        shown
+            .matches("the journal (journalctl), and no file")
+            .count(),
+        2,
+        "set-log-paths printed:\n{shown}"
+    );
+
+    fx.cmd(&["set-log-paths", "--access-log", "journal"])
+        .assert()
+        .success();
+    let host = std::fs::read_to_string(fx.host_conf()).unwrap();
+    assert!(
+        !host.lines().any(|line| line == "access_log = journal"),
+        "an access log named journal is a path like any other, made absolute:\n{host}"
+    );
+}
+
+/// "Why is this address blocked?" has to find the range it is in, and
+/// say what would lift it.
+#[test]
+fn why_finds_the_range_an_address_is_in_and_what_keeps_it_from_being_blocked() {
+    let fx = Fixture::new();
+    fx.run(&["add-firewall-rule", "--address", "203.0.113.0/24"]);
+    fx.run(&["add-trusted", "--address", "198.51.100.7"]);
+
+    let blocked = fx.json(&["why", "203.0.113.77"]);
+    assert_eq!(
+        blocked["rules"][0]["address"], "203.0.113.0/24",
+        "{blocked}"
+    );
+    assert_eq!(blocked["trusted"], serde_json::json!([]));
+
+    let trusted = fx.json(&["why", "198.51.100.7"]);
+    assert_eq!(trusted["rules"], serde_json::json!([]));
+    assert_eq!(trusted["trusted"], serde_json::json!(["198.51.100.7"]));
+
+    let text = String::from_utf8(fx.cmd(&["why", "192.0.2.1"]).output().unwrap().stdout).unwrap();
+    assert!(text.contains("Nothing stop-bots holds blocks"), "{text}");
+}
+
+/// One command for a false positive: unblock it wherever it is covered,
+/// and keep it from coming back.
+#[test]
+fn remove_firewall_rule_by_address_lifts_every_block_covering_it_and_can_trust_it() {
+    let fx = Fixture::new();
+    fx.run(&["add-firewall-rule", "--address", "203.0.113.0/24"]);
+    fx.run(&["add-firewall-rule", "--address", "203.0.113.77"]);
+    fx.run(&["add-firewall-rule", "--address", "192.0.2.1"]);
+
+    let covering = fx.json(&["list-firewall-rules", "--address", "203.0.113.77"]);
+    assert_eq!(covering["rules"].as_array().unwrap().len(), 2, "{covering}");
+
+    fx.run(&[
+        "remove-firewall-rule",
+        "--address",
+        "203.0.113.77",
+        "--trust",
+    ]);
+
+    let left = fx.json(&["list-firewall-rules"]);
+    let left: Vec<&str> = left["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|rule| rule["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(left, ["192.0.2.1"]);
+    assert_eq!(
+        fx.json(&["list-trusted"])["addresses"],
+        serde_json::json!(["203.0.113.77"])
+    );
+}
+
+/// What the schedule did is still there after the next run has replaced
+/// each job's last summary.
+#[test]
+fn log_shows_what_the_schedule_did_and_only_what_failed_on_request() {
+    use stop_bots::cron::CronJob;
+    use stop_bots::protection::Detector;
+    let fx = Fixture::new();
+    let now = stop_bots_now();
+    let db = fx.db();
+    let ssh = CronJob::Detect(Detector::SshScanners);
+    stop_bots::activity::note(&db, ssh, "blocked 2 IP(s)", now - 7_200);
+    stop_bots::activity::note(
+        &db,
+        CronJob::ApplyNginx,
+        "error: nginx -t failed",
+        now - 600,
+    );
+    drop(db);
+
+    let summaries = |args: &[&str]| -> Vec<String> {
+        fx.json(args)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["summary"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let cases: [(&[&str], &[&str]); 3] = [
+        (&["log"], &["blocked 2 IP(s)", "error: nginx -t failed"]),
+        (&["log", "--since", "1h"], &["error: nginx -t failed"]),
+        (&["log", "--failed"], &["error: nginx -t failed"]),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(summaries(args), expected, "{args:?}");
+    }
+    let text = String::from_utf8(fx.cmd(&["log"]).output().unwrap().stdout).unwrap();
+    assert!(
+        text.contains("Block SSH scanners: blocked 2 IP(s)") && text.contains("! "),
+        "log printed:\n{text}"
+    );
+}
+
 /// The `--json` twin of the walk above: the same database and log, every
 /// command that takes `--json`. What a value carries reaches the terminal
 /// as a JSON escape, and a parser reads back exactly what was stored.

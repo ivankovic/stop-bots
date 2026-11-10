@@ -278,6 +278,7 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
         let mut candidates: Vec<String> = match &sources.ssh {
             SshSource::File(path) => vec![source_key(path)],
             SshSource::Search => sources.search.iter().map(|p| source_key(p)).collect(),
+            SshSource::Journal => Vec::new(),
         };
         candidates.push(sshlog::JOURNAL_SOURCE.to_string());
         let mut cursors = Vec::new();
@@ -310,6 +311,7 @@ pub fn plan(db: &Db, jobs: &[CronJob], flags: &Flags) -> Result<Plan> {
                 .iter()
                 .map(|p| source_key(p))
                 .collect(),
+            SshSource::Journal => Vec::new(),
         };
         candidates.push(crate::portscan::JOURNAL_SOURCE.to_string());
         let mut cursors = Vec::new();
@@ -997,6 +999,7 @@ impl Storing {
                 let window = detector.window_seconds(db)?;
                 db.prune_evidence(detector, now - window)?;
             }
+            db.cap_evidence(crate::db::evidence::MAX_EVIDENCE_ROWS)?;
             Ok(())
         })?;
         Ok(Some(self.applied.clone()))

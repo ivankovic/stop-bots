@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
             conf_d_exists: Some(true),
             stray_generated_files: Vec::new(),
             db_free_bytes: Some(140 * 1024 * 1024 * 1024),
+            ssh_log_forgeable: None,
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
             access_log_path: None,

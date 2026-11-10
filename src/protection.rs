@@ -753,7 +753,18 @@ impl Detector {
                 "A service you start later on a trap port is dropped until the firewall is \
                  rendered and applied again, which leaves it out. Choose the ports with \
                  `set-detector port-scanners --ports`. Needs the kernel log readable \
-                 (kern.log, or the journal) and `ss` to see what listens.",
+                 (kern.log, or the journal) and `ss` to see what listens. What it counts is \
+                 a first packet, which proves nothing about its sender: someone who can send \
+                 packets with a forged source can have that address blocked. It never blocks \
+                 a trusted address, one that logged in over SSH, or a verified search engine.",
+            ),
+            Detector::ProbePaths | Detector::Injection => Some(
+                "One request is enough, and a web page can make a visitor's browser send one: \
+                 an image whose address is /.env, on a page or in a mail someone else wrote, \
+                 gets the person who opens it blocked from this server. Nothing in an access \
+                 log tells that request from a scanner's. Trust the addresses that must never \
+                 be blocked. It never blocks a trusted address, one that logged in over SSH, \
+                 or a verified search engine.",
             ),
             _ => None,
         }

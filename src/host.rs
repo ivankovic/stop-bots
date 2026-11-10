@@ -98,10 +98,68 @@ fn find_program(name: &str, path: Option<&OsStr>, fallbacks: &[&str]) -> PathBuf
     }
     path.into_iter()
         .flat_map(std::env::split_paths)
+        // Root runs what this finds. A directory on `PATH` that someone
+        // else can write (`.`, a user's `~/bin` kept by `sudo -E`) is
+        // theirs to put an `nft` in, so root does not look there.
+        .filter(|dir| !replaceable_under_root(dir))
         .chain(fallbacks.iter().map(PathBuf::from))
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
         .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// Whether this process is root and `path`, or a directory on the way to
+/// it, could be replaced by someone who is not: the question to ask of
+/// anything root is about to run, or to believe, because the environment
+/// said so. Never true for anyone but root, who is the only one with
+/// something to lose by it.
+///
+/// What does not exist yet is judged by the directories that do. The
+/// rule for each is [`crate::firewall::unsafe_directory`].
+pub fn replaceable_under_root(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: no preconditions; reads the process's own credentials.
+    if unsafe { libc::geteuid() } != 0 {
+        return false;
+    }
+    if !path.is_absolute() {
+        return true;
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        if !meta.is_dir() && (meta.uid() != 0 || meta.mode() & 0o022 != 0) {
+            return true;
+        }
+    }
+    path.ancestors()
+        .filter_map(|dir| std::fs::metadata(dir).ok().filter(|meta| meta.is_dir()))
+        .any(|meta| {
+            crate::firewall::unsafe_directory(meta.uid(), meta.gid(), meta.mode(), 0, 0).is_some()
+        })
+}
+
+/// The path the environment variable `name` gives, for the settings that
+/// exist so that a test can keep the real binary out of `/etc`:
+/// `STOP_BOTS_HOST_CONF`, which decides what root runs to test and reload
+/// the web server, and the directories its files are written to.
+///
+/// `sudo` clears the environment, so on a host these are unset. Where
+/// they are not (`sudo -E`, `env_keep`, a wrapper script), root follows
+/// one only to a place no one else could have prepared
+/// ([`replaceable_under_root`]), and says so when it does not.
+pub fn path_override(name: &str) -> Option<OsString> {
+    let value = std::env::var_os(name).filter(|value| !value.is_empty())?;
+    if replaceable_under_root(Path::new(&value)) {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            crate::say_err!(
+                "warning: ignoring {name}={}: running as root, and that path could be \
+                 replaced by another user",
+                Path::new(&value).display()
+            );
+        });
+        return None;
+    }
+    Some(value)
 }
 
 fn is_executable(path: &Path) -> bool {

@@ -528,6 +528,64 @@ pub fn is_domain(name: &str) -> bool {
 pub struct Protected {
     pub address: IpAddr,
     pub why: String,
+    /// The name `address` was resolved from, when it was: an apt mirror,
+    /// the ACME server, a feed's host. What a domain feed is held to (see
+    /// [`guard_domains`]); `None` for a resolver, which has no name.
+    pub host: Option<String>,
+}
+
+/// Domains no feed may sinkhole, whatever this host's files name: where
+/// certificates are renewed, where Debian and Ubuntu's packages and their
+/// security updates come from, and where this project's lists and
+/// releases are served. A name under one of these is kept off too.
+///
+/// A domain feed used to be stored as it arrived. One that listed
+/// `raw.githubusercontent.com` would have sent the host's own feed
+/// fetches to the sinkhole, the corrected list among them: a mistake
+/// upstream that the next download could never undo.
+pub const NEVER_SINKHOLED: [&str; 7] = [
+    "letsencrypt.org",
+    "debian.org",
+    "ubuntu.com",
+    "canonical.com",
+    "github.com",
+    "githubusercontent.com",
+    "github.io",
+];
+
+/// The most domains one feed may carry. The lists this ships with hold a
+/// few thousand; a resolver given millions of lines stops answering.
+pub const MAX_FEED_DOMAINS: usize = 500_000;
+
+/// `entries` of a domain feed, without any that would send to the
+/// sinkhole a name this host needs: one of [`NEVER_SINKHOLED`] or below
+/// it, or a host `protected` names, or a parent of one (a resolver given
+/// `example.org` answers for `deb.example.org` too).
+pub fn guard_domains(entries: Vec<String>, protected: &[Protected]) -> Guarded {
+    let below = |name: &str, parent: &str| {
+        name == parent
+            || name
+                .strip_suffix(parent)
+                .is_some_and(|rest| rest.ends_with('.'))
+    };
+    let mut guarded = Guarded::default();
+    for entry in entries {
+        let why = NEVER_SINKHOLED
+            .iter()
+            .find(|base| below(&entry, base))
+            .map(|base| format!("is {base} or below it, which this host needs"))
+            .or_else(|| {
+                protected
+                    .iter()
+                    .find(|p| p.host.as_deref().is_some_and(|host| below(host, &entry)))
+                    .map(|p| format!("would sinkhole {}", p.why))
+            });
+        match why {
+            Some(why) => guarded.kept_off.push((entry, why)),
+            None => guarded.kept.push(entry),
+        }
+    }
+    guarded
 }
 
 /// Ranges no feed may reach into: this host's own networks, and the ones
@@ -624,9 +682,11 @@ const ACME_HOSTS: [&str; 1] = ["acme-v02.api.letsencrypt.org"];
 /// time, when the feeds are filtered by it.
 pub fn protected_destinations(around: &Surroundings, feed_urls: &[String]) -> Vec<Protected> {
     let mut out: Vec<Protected> = Vec::new();
-    let mut add = |address: IpAddr, why: String| {
-        if !out.iter().any(|p| p.address == address) {
-            out.push(Protected { address, why });
+    // One row for each name an address answers to: a shared address (a
+    // CDN's) is two hosts a domain feed must each leave alone.
+    let mut add = |address: IpAddr, why: String, host: Option<String>| {
+        if !out.iter().any(|p| p.address == address && p.host == host) {
+            out.push(Protected { address, why, host });
         }
     };
 
@@ -646,7 +706,7 @@ pub fn protected_destinations(around: &Surroundings, feed_urls: &[String]) -> Ve
                 .map(|w| w.split('%').next().unwrap_or(w).parse::<IpAddr>())
             {
                 if !address.is_loopback() {
-                    add(address, "a resolver this host uses".to_string());
+                    add(address, "a resolver this host uses".to_string(), None);
                 }
             }
         }
@@ -676,7 +736,7 @@ pub fn protected_destinations(around: &Surroundings, feed_urls: &[String]) -> Ve
             continue;
         }
         for address in (around.resolve)(&host) {
-            add(address, why.clone());
+            add(address, why.clone(), Some(host.clone()));
         }
     }
     out
@@ -746,10 +806,17 @@ pub fn store(db: &Db, feed: &EgressFeed, raw: &str, protected: &[Protected]) -> 
     }
     let guarded = match feed.kind {
         EntryKind::Ip => guard(entries, protected),
-        EntryKind::Domain => Guarded {
-            kept: entries,
-            kept_off: Vec::new(),
-        },
+        EntryKind::Domain => {
+            if entries.len() > MAX_FEED_DOMAINS {
+                bail!(
+                    "{} returned {} domains, more than the {MAX_FEED_DOMAINS} a feed may \
+                     hold; keeping what it held before",
+                    feed.name,
+                    entries.len()
+                );
+            }
+            guard_domains(entries, protected)
+        }
     };
     let count = db.replace_egress_entries(&feed.id, &guarded.kept, guarded.kept_off.len())?;
     Ok(Stored {
@@ -1248,7 +1315,44 @@ mod tests {
         Protected {
             address: address.parse().unwrap(),
             why: why.to_string(),
+            host: None,
         }
+    }
+
+    /// A feed that named where the feeds come from could never be
+    /// corrected by the next download.
+    #[test]
+    fn a_domain_feed_cannot_sinkhole_what_the_host_needs() {
+        let mirror = Protected {
+            host: Some("mirror.example.net".to_string()),
+            ..protected("192.0.2.80", "mirror.example.net, an apt mirror")
+        };
+        let entries = [
+            "evil.example.com",
+            "raw.githubusercontent.com",
+            "letsencrypt.org",
+            "example.net",
+            "mirror.example.net",
+            "notgithub.com",
+        ]
+        .map(String::from)
+        .to_vec();
+
+        let guarded = guard_domains(entries, &[mirror]);
+
+        assert_eq!(guarded.kept, vec!["evil.example.com", "notgithub.com"]);
+        let kept_off: Vec<&str> = guarded.kept_off.iter().map(|(e, _)| e.as_str()).collect();
+        assert_eq!(
+            kept_off,
+            vec![
+                "raw.githubusercontent.com",
+                "letsencrypt.org",
+                "example.net",
+                "mirror.example.net"
+            ],
+            "with reasons: {:?}",
+            guarded.kept_off
+        );
     }
 
     #[test]

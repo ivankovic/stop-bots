@@ -73,7 +73,7 @@
 //! implementation of "what counts" per detector, not one per caller.
 
 use crate::protection::Detector;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 
 /// The width of a line-count bucket. A window slides over these a bucket
@@ -199,6 +199,29 @@ pub struct Row {
     pub tally: Tally,
 }
 
+/// What a block of `address` would cover, as one address: the address
+/// itself for IPv4, and for IPv6 the first address of its `/64`.
+///
+/// A block is written for the `/64` (see
+/// [`crate::scanblock::blockable_address`]), because that is what one
+/// customer holds. Counting per `/128` while blocking per `/64` meant a
+/// client that took a new address for every request never reached a
+/// threshold: sixty addresses with six missing pages each were sixty
+/// clients under the limit, not one far over it. Evidence is kept under
+/// this, so the count and the block are about the same thing.
+///
+/// An IPv4-mapped address is its IPv4 address.
+pub fn unit(address: IpAddr) -> IpAddr {
+    match address.to_canonical() {
+        IpAddr::V6(v6) => {
+            let mut octets = v6.octets();
+            octets[8..].fill(0);
+            IpAddr::V6(std::net::Ipv6Addr::from(octets))
+        }
+        v4 => v4,
+    }
+}
+
 /// Evidence collected in memory, from one read of a log.
 #[derive(Debug, Clone, Default)]
 pub struct Evidence {
@@ -206,9 +229,11 @@ pub struct Evidence {
 }
 
 impl Evidence {
+    /// Records `item` against the [`unit`] `address` is in, not against
+    /// the address itself: what is counted is what would be blocked.
     pub fn add(&mut self, detector: Detector, address: IpAddr, item: Item, at: i64) {
         self.rows
-            .entry((detector, address, item))
+            .entry((detector, unit(address), item))
             .and_modify(|tally| tally.merge(Tally::once(at)))
             .or_insert_with(|| Tally::once(at));
     }
@@ -441,6 +466,92 @@ pub fn decide(rows: &[Row], rule: Rule, cutoff: Option<i64>) -> Vec<(String, Str
     convicted
 }
 
+/// How many times a detector's own threshold a `/24` has to reach,
+/// added up over its addresses, to be convicted as one: see
+/// [`decide_subnets`].
+pub const SUBNET_FACTOR: usize = 2;
+
+/// Every IPv4 `/24` that `rows` convict as a whole: at least
+/// `min_addresses` of its addresses have evidence against them, and
+/// together they reach [`SUBNET_FACTOR`] times what `rule` asks of one.
+/// Each comes back as `a.b.c.0/24` with the earliest thing seen from it.
+///
+/// What [`decide`] cannot see. It judges an address at a time, so forty
+/// addresses of one network asking for six missing pages each, 240 in
+/// all, were forty clients each under a limit of seven. A scan spread
+/// over a subnet the scanner holds is the same scan; this adds it up.
+///
+/// Twice the threshold, from several addresses, and only for the rules
+/// that count (never for one that acts on a single line: a `/24` is not
+/// blocked for one address's one request). Blocking 256 addresses is
+/// collateral by design, which is why the caller asks only where the
+/// operator switched subnet escalation on.
+pub fn decide_subnets(
+    rows: &[Row],
+    rule: Rule,
+    cutoff: Option<i64>,
+    min_addresses: usize,
+) -> Vec<(String, String)> {
+    let rule = match rule {
+        Rule::AtLeast(n) => Rule::AtLeast(n.saturating_mul(SUBNET_FACTOR)),
+        Rule::Distinct(n) | Rule::DistinctOrRepeated { distinct: n, .. } => {
+            Rule::Distinct(n.saturating_mul(SUBNET_FACTOR))
+        }
+        Rule::Once | Rule::OnceUnlessCleared | Rule::Rate { .. } | Rule::AfterWarning => {
+            return Vec::new();
+        }
+    };
+    let inside = |at: i64| cutoff.is_none_or(|c| at >= c);
+    // Per /24: who was seen, and each item once with its tallies merged,
+    // so that one page asked for from ten addresses is one distinct page.
+    type Subnet<'a> = (BTreeSet<&'a str>, HashMap<&'a Item, Tally>);
+    let mut subnets: BTreeMap<[u8; 3], Subnet> = BTreeMap::new();
+    for row in rows {
+        let Ok(IpAddr::V4(v4)) = row.address.parse::<IpAddr>() else {
+            continue;
+        };
+        if !inside(row.tally.last) {
+            continue;
+        }
+        let [a, b, c, _] = v4.octets();
+        let (addresses, items) = subnets.entry([a, b, c]).or_default();
+        if row.item != Item::Clear {
+            addresses.insert(row.address.as_str());
+        }
+        items
+            .entry(&row.item)
+            .and_modify(|tally| tally.merge(row.tally))
+            .or_insert(row.tally);
+    }
+    let mut convicted = Vec::new();
+    for ([a, b, c], (addresses, items)) in subnets {
+        if addresses.len() < min_addresses.max(2) {
+            continue;
+        }
+        let subnet = format!("{a}.{b}.{c}.0/24");
+        let merged: Vec<Row> = items
+            .into_iter()
+            .map(|(item, tally)| Row {
+                address: subnet.clone(),
+                item: item.clone(),
+                tally,
+            })
+            .collect();
+        for (subnet, reason) in decide(&merged, rule, cutoff) {
+            let from = format!("from {} addresses", addresses.len());
+            convicted.push((
+                subnet,
+                if reason.is_empty() {
+                    from
+                } else {
+                    format!("{reason} ({from})")
+                },
+            ));
+        }
+    }
+    convicted
+}
+
 /// Whether something inside the window clears the address.
 fn cleared(rows: &[&Row], inside: &impl Fn(i64) -> bool) -> bool {
     rows.iter()
@@ -509,6 +620,64 @@ mod tests {
 
     fn seen(address: &str, text: &str, at: i64) -> Row {
         row(address, Item::seen(text), at, at, 1)
+    }
+
+    /// Forty addresses of one network, six missing pages each: nobody
+    /// over the limit of seven, and 240 requests for what is not there.
+    #[test]
+    fn a_scan_spread_over_a_subnet_convicts_the_subnet() {
+        let rule = Rule::DistinctOrRepeated {
+            distinct: 7,
+            repeated: 50,
+        };
+        let rows: Vec<Row> = (1..=40)
+            .flat_map(|host| {
+                (0..6)
+                    .map(move |n| seen(&format!("203.0.113.{host}"), &format!("/p{host}-{n}"), 10))
+            })
+            .collect();
+
+        assert_eq!(decide(&rows, rule, None), Vec::new(), "none alone");
+        let subnets = decide_subnets(&rows, rule, None, 3);
+        assert_eq!(subnets.len(), 1, "{subnets:?}");
+        assert_eq!(subnets[0].0, "203.0.113.0/24");
+        assert!(subnets[0].1.contains("from 40 addresses"), "{subnets:?}");
+    }
+
+    #[test]
+    fn a_subnet_is_not_convicted_by_too_few_addresses_or_too_little() {
+        let rule = Rule::Distinct(7);
+        let from = |hosts: std::ops::RangeInclusive<u8>, each: usize| -> Vec<Row> {
+            hosts
+                .flat_map(|host| {
+                    (0..each).map(move |n| {
+                        seen(&format!("203.0.113.{host}"), &format!("/p{host}-{n}"), 10)
+                    })
+                })
+                .collect()
+        };
+        let cases = [
+            ("two addresses where three are asked for", from(1..=2, 6), 3),
+            ("three addresses, under twice the limit", from(1..=3, 4), 3),
+            (
+                "the same page from every address is one page",
+                {
+                    (1..=30)
+                        .map(|host| seen(&format!("203.0.113.{host}"), "/same", 10))
+                        .collect()
+                },
+                3,
+            ),
+        ];
+        for (what, rows, min) in cases {
+            assert_eq!(decide_subnets(&rows, rule, None, min), Vec::new(), "{what}");
+        }
+        let one_line = from(1..=30, 1);
+        assert_eq!(
+            decide_subnets(&one_line, Rule::Once, None, 3),
+            Vec::new(),
+            "a rule that acts on one line never widens"
+        );
     }
 
     #[test]

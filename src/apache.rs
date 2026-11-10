@@ -140,7 +140,7 @@ pub const MANAGED_DIR_ENV: &str = "STOP_BOTS_APACHE_DIR";
 
 /// The directory this project writes its own Apache files into.
 pub fn managed_dir() -> PathBuf {
-    std::env::var_os(MANAGED_DIR_ENV)
+    crate::host::path_override(MANAGED_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(MANAGED_DIR))
 }
@@ -174,7 +174,7 @@ pub const CONF_ENABLED_DIR_ENV: &str = "STOP_BOTS_APACHE_CONF_D";
 /// a link: `a2enconf` is how an operator enables their own files, and one
 /// file is one thing to remove.
 pub fn conf_enabled_dir(root: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os(CONF_ENABLED_DIR_ENV) {
+    if let Some(dir) = crate::host::path_override(CONF_ENABLED_DIR_ENV) {
         return PathBuf::from(dir);
     }
     let beside_the_sites = root.join("conf-enabled");

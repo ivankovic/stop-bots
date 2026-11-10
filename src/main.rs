@@ -257,12 +257,22 @@ async fn run() -> Result<()> {
             port,
             action,
         }) => add_firewall_rule(db, address, port, &action),
-        Some(Command::ListFirewallRules { source, json }) => list_firewall_rules(db, source, json),
+        Some(Command::ListFirewallRules {
+            source,
+            address,
+            json,
+        }) => list_firewall_rules(db, source, address, json),
+        Some(Command::Why { address, json }) => run_why(db, address, json),
         Some(Command::RemoveFirewallRule {
             id,
+            address,
+            trust,
             source,
             dry_run,
-        }) => remove_firewall_rule(db, id, source, dry_run),
+        }) => match address {
+            Some(address) => unblock_address(db, address, trust),
+            None => remove_firewall_rule(db, id, source, dry_run),
+        },
         Some(Command::SetFirewallRule { id, enabled }) => set_firewall_rule(db, id, enabled),
         Some(Command::RenderFirewall {
             backend,
@@ -435,6 +445,11 @@ async fn run() -> Result<()> {
             list_turned_away(db, access_log, json)
         }
         Some(Command::ListTrusted { json }) => list_trusted(db, json),
+        Some(Command::Log {
+            since,
+            failed,
+            json,
+        }) => run_log(db, since, failed, json),
         Some(Command::SetRobotsTxt { enabled }) => set_robots_txt(db, enabled),
         Some(Command::SetAutoApply { enabled }) => set_auto_apply(db, enabled),
         Some(Command::SetAutoApplyFirewall { enabled }) => set_auto_apply_firewall(db, enabled),
@@ -540,6 +555,18 @@ async fn run() -> Result<()> {
         }) => egress_cmd::check(db, kernel_log, dry_run),
         Some(Command::SetContainerRuntime { program }) => {
             egress_cmd::set_container_runtime(db, program)
+        }
+        Some(Command::Completions { shell }) => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            // Raw stdout, which `say!` exists to keep data away from: this
+            // is a script generated from the command line's own
+            // definition, with nothing in it that anyone else wrote, and
+            // its tabs and escapes have to arrive as they are.
+            #[allow(clippy::disallowed_methods)]
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
         }
         Some(Command::GenerateDocs { out }) => {
             use clap::CommandFactory;
@@ -1124,19 +1151,163 @@ fn add_firewall_rule(
         evidence: None,
     })?;
     say!("Added firewall rule #{id}");
+    say!("{NOT_IN_EFFECT_YET}");
+    Ok(())
+}
+
+/// What every command that changes a stored rule ends with. Adding one
+/// used to end with nothing, and removing one with a different sentence,
+/// though neither is enforced until the script is written and applied.
+const NOT_IN_EFFECT_YET: &str =
+    "Not in effect yet: `stop-bots render-firewall --apply` writes and applies the script.";
+
+/// Everything stop-bots holds about `address`, for `why`.
+fn run_why(db_path: Option<PathBuf>, address: std::net::IpAddr, json: bool) -> Result<()> {
+    use stop_bots::ipranges::{cidr_contains, cidrs_overlap};
+    let db = open_db(db_path)?;
+    db.prune_expired_firewall_rules()?;
+    let address = address.to_canonical();
+    let text = address.to_string();
+    let rules = db.blocks_page(
+        &stop_bots::db::BlockQuery {
+            source: None,
+            search: text.clone(),
+        },
+        0,
+        usize::MAX >> 1,
+    )?;
+    let trusted: Vec<String> = db
+        .list_trusted_addresses()?
+        .into_iter()
+        .filter(|range| cidrs_overlap(range, &text))
+        .collect();
+    let ssh_login = db.recent_ssh_login_ips()?.contains(&text);
+    let unblocked_until = db
+        .unblocked_addresses()?
+        .into_iter()
+        .find(|(range, _)| cidrs_overlap(range, &text))
+        .map(|(_, until)| until);
+    // The countries, feeds, hosting providers and crawler categories:
+    // enforced, and never stored as rules.
+    let lists: Vec<String> = db
+        .derived_firewall_entries()?
+        .into_iter()
+        .filter(|(cidr, _, action)| {
+            *action != stop_bots::db::FirewallAction::Allow && cidr_contains(cidr, address)
+        })
+        .map(|(cidr, _, _)| cidr)
+        .collect();
+    if json {
+        return stop_bots::output::print(&stop_bots::output::Why {
+            address: text,
+            rules: rules.iter().map(Into::into).collect(),
+            lists,
+            trusted,
+            ssh_login,
+            unblocked_until,
+        });
+    }
+
+    let now = now_secs();
+    let offences = db.repeat_offences(now)?;
+    let allowed = !trusted.is_empty() || ssh_login;
+    if rules.is_empty() && lists.is_empty() {
+        say!("Nothing stop-bots holds blocks {text}.");
+    }
+    for rule in &rules {
+        say!("{}", rule_line(rule, now, &offences));
+    }
+    for cidr in &lists {
+        say!(
+            "In {cidr}, from a country, a feed, a hosting provider or a blocked crawler's \
+             ranges: a setting, not a stored rule (see the Dashboard, or `list-countries`, \
+             `list-reputation-feeds`, `list-hosting-providers`)."
+        );
+    }
+    for range in &trusted {
+        say!("Trusted ({range}): allowed ahead of every block, and never blocked by a detector.");
+    }
+    if ssh_login {
+        say!("Logged in over SSH recently: allowed ahead of every block while that lasts.");
+    }
+    if let Some(until) = unblocked_until {
+        say!(
+            "Unblocked by hand: the detectors leave it alone ({}).",
+            format_expiry(until)
+        );
+    }
+    if allowed && !(rules.is_empty() && lists.is_empty()) {
+        say!("So it is not blocked, whatever the rules above say.");
+    } else if !rules.is_empty() {
+        say!(
+            "To lift it: `stop-bots remove-firewall-rule --address {text}` (add --trust to \
+             keep it from being blocked again), then `stop-bots render-firewall --apply`."
+        );
+    }
+    Ok(())
+}
+
+/// `remove-firewall-rule --address`: every stored block that covers
+/// `address`, and with `trust` the address trusted, in one step. The
+/// answer to a false positive used to be three commands and a `grep`.
+fn unblock_address(db_path: Option<PathBuf>, address: std::net::IpAddr, trust: bool) -> Result<()> {
+    let db = open_db(db_path)?;
+    db.prune_expired_firewall_rules()?;
+    let text = address.to_canonical().to_string();
+    let covering: Vec<FirewallRule> = db
+        .blocks_page(
+            &stop_bots::db::BlockQuery {
+                source: None,
+                search: text.clone(),
+            },
+            0,
+            usize::MAX >> 1,
+        )?
+        .into_iter()
+        .filter(|rule| rule.action != stop_bots::db::FirewallAction::Allow)
+        .collect();
+    if covering.is_empty() {
+        say!("No stored block covers {text}.");
+    }
+    for rule in &covering {
+        db.remove_firewall_rule(rule.id)?;
+        say!(
+            "Removed firewall rule #{} ({})",
+            rule.id,
+            terminal_safe(&rule.address)
+        );
+    }
+    if trust {
+        let stored = db.trust_address(&text)?;
+        say!("Trusted {stored}: nothing stop-bots writes blocks it again.");
+    } else if covering
+        .iter()
+        .any(|rule| rule.source.and_then(|s| s.detector()).is_some())
+    {
+        say!(
+            "The detectors leave it alone for as long as the block was meant to last; \
+             `--trust` exempts it for good."
+        );
+    }
+    if !covering.is_empty() || trust {
+        say!("{NOT_IN_EFFECT_YET}");
+    }
     Ok(())
 }
 
 fn list_firewall_rules(
     db_path: Option<PathBuf>,
     source: Option<SourceFilter>,
+    address: Option<std::net::IpAddr>,
     json: bool,
 ) -> Result<()> {
     let db = open_db(db_path)?;
     db.prune_expired_firewall_rules()?;
     let query = stop_bots::db::BlockQuery {
         source,
-        search: String::new(),
+        search: address
+            .map(|address| address.to_canonical().to_string())
+            .unwrap_or_default(),
     };
     let rules = db.blocks_page(&query, 0, usize::MAX >> 1)?;
     if json {
@@ -1145,9 +1316,13 @@ fn list_firewall_rules(
         });
     }
     if rules.is_empty() {
-        match source {
-            Some(source) => say!("No firewall rules from {}.", source.name()),
-            None => say!("No firewall rules stored."),
+        match (source, address) {
+            (_, Some(address)) => say!(
+                "No stored firewall rule covers {address}. `stop-bots why {address}` also \
+                 looks at the countries and lists."
+            ),
+            (Some(source), None) => say!("No firewall rules from {}.", source.name()),
+            (None, None) => say!("No firewall rules stored."),
         }
         return Ok(());
     }
@@ -1255,7 +1430,7 @@ fn remove_firewall_rule(
         }
         (None, None) => unreachable!("clap requires --id or --source"),
     }
-    say!("Run `stop-bots render-firewall` and apply the script to put it in effect.");
+    say!("{NOT_IN_EFFECT_YET}");
     Ok(())
 }
 
@@ -1266,7 +1441,7 @@ fn set_firewall_rule(db_path: Option<PathBuf>, id: i64, enabled: bool) -> Result
         "Firewall rule #{id} is now {}.",
         if enabled { "enabled" } else { "disabled" }
     );
-    say!("Run `stop-bots render-firewall` and apply the script to put it in effect.");
+    say!("{NOT_IN_EFFECT_YET}");
     Ok(())
 }
 
@@ -1815,6 +1990,52 @@ fn list_turned_away(
     }
     say!();
     say!("Allow one with: stop-bots add-trusted --user-agent \"<part of the agent>\"");
+    Ok(())
+}
+
+fn run_log(
+    db_path: Option<PathBuf>,
+    since: Option<String>,
+    failed: bool,
+    json: bool,
+) -> Result<()> {
+    let db = open_db(db_path)?;
+    let now = stop_bots::blocks::now();
+    let from = match &since {
+        Some(span) => {
+            let seconds = stop_bots::activity::parse_span(span).with_context(|| {
+                format!("--since takes a span such as 90m, 24h or 7d, and {span:?} is not one")
+            })?;
+            now - seconds
+        }
+        None => i64::MIN,
+    };
+    let events: Vec<_> = stop_bots::activity::since(&db, from)?
+        .into_iter()
+        .filter(|event| !failed || event.failed())
+        .collect();
+    if json {
+        return stop_bots::output::print(&events);
+    }
+    if events.is_empty() {
+        say!(
+            "Nothing recorded{}. The schedule records what it does when it runs: from cron \
+             (`stop-bots install cron`), or in the TUI while it is open.",
+            match &since {
+                Some(span) => format!(" in the last {span}"),
+                None => String::new(),
+            }
+        );
+    }
+    for event in events {
+        say!(
+            "{:>4} ago  {}{}: {}",
+            stop_bots::blocks::format_age(event.at, now),
+            if event.failed() { "! " } else { "  " },
+            event.label(),
+            terminal_safe(&event.summary)
+        );
+    }
     Ok(())
 }
 
@@ -2701,11 +2922,19 @@ fn run_set_log_paths(
         if let Some(raw) = &access_log {
             host.access_log = resolve(raw)?;
         }
+        // `journal` is not a path: it names the journal, read alone.
+        let or_journal = |raw: &str| -> Result<Option<PathBuf>> {
+            let journal = stop_bots::sshlog::JOURNAL_KEYWORD;
+            if raw.trim() == journal {
+                return Ok(Some(PathBuf::from(journal)));
+            }
+            resolve(raw)
+        };
         if let Some(raw) = &ssh_log {
-            host.ssh_log = resolve(raw)?;
+            host.ssh_log = or_journal(raw)?;
         }
         if let Some(raw) = &kernel_log {
-            host.kernel_log = resolve(raw)?;
+            host.kernel_log = or_journal(raw)?;
         }
         host.save_to(&path)?;
     }
@@ -2726,10 +2955,16 @@ fn run_set_log_paths(
         );
     }
     match &paths.ssh {
+        Some(path) if path == Path::new(stop_bots::sshlog::JOURNAL_KEYWORD) => {
+            say!("  ssh log:    the journal (journalctl), and no file")
+        }
         Some(path) => say!("  ssh log:    {}", path.display()),
         None => say!("  ssh log:    auto-detected (auth.log, secure, then journalctl)"),
     }
     match &paths.kernel {
+        Some(path) if path == Path::new(stop_bots::sshlog::JOURNAL_KEYWORD) => {
+            say!("  kernel log: the journal (journalctl), and no file")
+        }
         Some(path) => say!("  kernel log: {}", path.display()),
         None => say!("  kernel log: auto-detected (kern.log, messages, then journalctl)"),
     }

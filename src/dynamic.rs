@@ -340,7 +340,7 @@ fn alternative_matched(subject: &crate::uaregex::Subject, ua: &str, bot: &Bot) -
 /// (`AdsBot-Google([^-]|$)`) will not match as a literal. Such a pattern
 /// is matched by [`crate::uaregex`] instead; this comparison is only for
 /// one that uses something `uaregex` does not read.
-fn unescape_pattern(pattern: &str) -> String {
+pub(crate) fn unescape_pattern(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
     let mut chars = pattern.chars();
     while let Some(c) = chars.next() {

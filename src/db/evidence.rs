@@ -104,6 +104,11 @@ pub enum IngestStep {
     Done { stored: bool },
 }
 
+/// The most rows `log_evidence` is let grow to: see [`Db::cap_evidence`].
+/// A busy host's week of evidence is tens of thousands of rows; at a few
+/// hundred bytes each with their indexes, this is on the order of 100 MB.
+pub const MAX_EVIDENCE_ROWS: usize = 500_000;
+
 impl Ingest {
     /// A read of `source` from cursor `from` to `to`, as [`Ingested`]
     /// describes them, with what it found.
@@ -287,6 +292,30 @@ impl Db {
         )?)
     }
 
+    /// Drops the evidence seen longest ago until at most `most` rows are
+    /// left, and says how many went.
+    ///
+    /// The window bounds how long a row is kept, not how many there are:
+    /// every distinct missing path an address asks for is a row, and a
+    /// client that asks for a new one each time writes them as fast as the
+    /// log is read. This is the bound on the table, and so on the disk
+    /// the database is on. What goes is evidence, never a block, so the
+    /// worst a flood buys is a count that starts again.
+    pub fn cap_evidence(&self, most: usize) -> Result<usize> {
+        let rows: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM log_evidence", [], |row| row.get(0))?;
+        let over = rows - most as i64;
+        if over <= 0 {
+            return Ok(0);
+        }
+        Ok(self.conn.execute(
+            "DELETE FROM log_evidence WHERE rowid IN
+                 (SELECT rowid FROM log_evidence ORDER BY last_seen, rowid LIMIT ?1)",
+            params![over],
+        )?)
+    }
+
     /// Drops every detector's evidence against `address` from before
     /// `before`.
     ///
@@ -298,11 +327,54 @@ impl Db {
     ///
     /// A row that straddles the moment goes too, which can only make a
     /// later count smaller.
+    ///
+    /// `address` may be the range a block is written for. Evidence is kept
+    /// per address, or per `/64` under its first address (see
+    /// [`crate::evidence::unit`]), so a `/64` forgets that one and an IPv4
+    /// `/24` forgets every address in it; any other range has nothing
+    /// stored under it.
     pub fn forget_evidence_before(&self, address: &str, before: i64) -> Result<usize> {
+        if let Some((base, len)) = address.split_once('/') {
+            return match (base.parse::<std::net::IpAddr>(), len) {
+                (Ok(std::net::IpAddr::V4(v4)), "24") => {
+                    let [a, b, c, _] = v4.octets();
+                    Ok(self.conn.execute(
+                        "DELETE FROM log_evidence WHERE address LIKE ?1 AND first_seen <= ?2",
+                        params![format!("{a}.{b}.{c}.%"), before],
+                    )?)
+                }
+                (Ok(std::net::IpAddr::V6(_)), "64") => self.forget_evidence_before(base, before),
+                _ => Ok(0),
+            };
+        }
         Ok(self.conn.execute(
             "DELETE FROM log_evidence WHERE address = ?1 AND first_seen <= ?2",
             params![address, before],
         )?)
+    }
+
+    /// Everything `detector` has stored, seen at or after `since`, for
+    /// every address: what [`crate::evidence::decide_subnets`] adds up
+    /// across a `/24`, where [`Self::evidence_rows`] reads only the
+    /// addresses that could be convicted alone.
+    pub fn all_evidence_rows(&self, detector: Detector, since: i64) -> Result<Vec<Row>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT address, item, count, first_seen, last_seen FROM log_evidence
+             WHERE detector = ?1 AND last_seen >= ?2",
+        )?;
+        let rows = stmt.query_map(params![detector.id(), since], |row| {
+            Ok(Row {
+                address: row.get(0)?,
+                item: Item::from_key(&row.get::<_, String>(1)?),
+                tally: Tally {
+                    count: row.get::<_, i64>(2)?.max(0) as u64,
+                    first: row.get(3)?,
+                    last: row.get(4)?,
+                },
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("failed to read the stored evidence")
     }
 
     /// When the newest Block rule for exactly `address` was made, if there
@@ -442,6 +514,30 @@ mod tests {
 
     /// The read is narrowed to addresses that could meet the rule; the
     /// rest stay stored, still counting towards the next read.
+    #[test]
+    fn a_table_over_its_cap_loses_what_was_seen_longest_ago() {
+        let db = Db::open_in_memory().unwrap();
+        let mut from = None;
+        for (path, at) in [("/a", 100), ("/b", 300), ("/c", 200)] {
+            assert!(ingest(&db, from, path, &evidence("203.0.113.5", path, at)));
+            from = Some(path);
+        }
+
+        assert_eq!(db.cap_evidence(5).unwrap(), 0, "under the cap");
+        assert_eq!(db.cap_evidence(2).unwrap(), 1);
+
+        let left: Vec<String> = db
+            .evidence_rows(Detector::ProbePaths, 0, Rule::Once)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.item.key())
+            .collect();
+        assert!(
+            left.len() == 2 && !left.iter().any(|item| item.contains("/a")),
+            "left: {left:?}"
+        );
+    }
+
     #[test]
     fn only_addresses_that_could_meet_the_rule_are_read() {
         let db = Db::open_in_memory().unwrap();

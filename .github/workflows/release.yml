@@ -96,9 +96,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          key: ${{ matrix.target }}
+      # No build cache here, unlike the test workflows. What this job
+      # compiles is what gets signed and attested, and a cache is written
+      # by other runs of this repository's workflows: one poisoned entry
+      # would be linked into a release that says it was built from this
+      # commit. A release is rare enough to compile from nothing.
 
       # musl, and therefore one package that installs on every Debian and
       # Ubuntu still receiving updates. Linking against glibc instead would
