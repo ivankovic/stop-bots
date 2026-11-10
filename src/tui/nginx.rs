@@ -352,7 +352,10 @@ impl Nginx {
 
         if self.sites.is_empty() {
             let placeholder = Paragraph::new(format!(
-                "No sites discovered yet. Press r to scan {} (or run `stop-bots scan-sites`).",
+                "No sites discovered yet. Press r to scan {} (or run `stop-bots scan-sites`).\n\n\
+                 Another server, or its config somewhere else? That is set from the command \
+                 line: quit (q) and run `sudo stop-bots set-web-server \
+                 nginx|apache|traefik|npmplus --root DIR`.",
                 self.root.display()
             ))
             .wrap(Wrap { trim: true })

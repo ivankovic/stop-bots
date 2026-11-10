@@ -247,6 +247,9 @@ impl LogPaths {
     /// "nothing configured" is a real strategy here rather than one guess.
     pub fn ssh(&self, flag: Option<&Path>) -> crate::sshlog::SshSource {
         match flag.or(self.ssh.as_deref()) {
+            Some(path) if path == Path::new(crate::sshlog::JOURNAL_KEYWORD) => {
+                crate::sshlog::SshSource::Journal
+            }
             Some(path) => crate::sshlog::SshSource::File(path.to_path_buf()),
             None => crate::sshlog::SshSource::Search,
         }
@@ -257,6 +260,9 @@ impl LogPaths {
     /// `messages`, then the journal.
     pub fn kernel(&self, flag: Option<&Path>) -> crate::portscan::KernelSource {
         match flag.or(self.kernel.as_deref()) {
+            Some(path) if path == Path::new(crate::sshlog::JOURNAL_KEYWORD) => {
+                crate::sshlog::SshSource::Journal
+            }
             Some(path) => crate::sshlog::SshSource::File(path.to_path_buf()),
             None => crate::sshlog::SshSource::Search,
         }
@@ -330,6 +336,18 @@ mod tests {
     /// Every reader of the SSH log goes through here, so a stored path
     /// reaches the lockout guard, the Firewall screens and the detectors
     /// alike, and a flag still beats it.
+    #[test]
+    fn the_word_journal_in_place_of_a_path_is_the_journal_alone() {
+        assert_eq!(
+            stored(None, Some("journal")).ssh(None),
+            crate::sshlog::SshSource::Journal
+        );
+        assert_eq!(
+            stored(None, Some("/var/log/auth.log")).ssh(Some(Path::new("journal"))),
+            crate::sshlog::SshSource::Journal
+        );
+    }
+
     #[test]
     fn the_ssh_log_is_the_flag_then_the_stored_path_then_a_search() {
         assert_eq!(

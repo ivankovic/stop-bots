@@ -312,6 +312,20 @@ pub fn firewall_message(outcome: &crate::firewall::FirewallOutcome) -> String {
     message
 }
 
+/// The last day of what the schedule did (see `crate::activity`), as the
+/// Log's opening lines: the newest few, oldest first as the Log is kept.
+fn recent_activity(db: &Db) -> Vec<(i64, String)> {
+    const SHOWN: usize = 20;
+    let day_ago = crate::blocks::now() - 86_400;
+    let events = crate::activity::since(db, day_ago).unwrap_or_default();
+    let skip = events.len().saturating_sub(SHOWN);
+    events
+        .into_iter()
+        .skip(skip)
+        .map(|event| (event.at, format!("{}: {}", event.label(), event.summary)))
+        .collect()
+}
+
 impl App {
     /// The active screen's footer hints: the focused panel's name and its
     /// keys. Shared by the footer and by `?`, so the two list the same keys.
@@ -359,7 +373,10 @@ impl App {
             before_help: Screen::default(),
             message: None,
             message_in_footer: false,
-            log: Vec::new(),
+            // What the schedule did since this screen was last open, not
+            // nothing: the Log used to start empty every time, as if the
+            // night had been quiet.
+            log: recent_activity(&db),
             db_last_logged: None,
             palette: None,
             explain: None,
@@ -1902,6 +1919,15 @@ impl App {
                 self.start_apply_everything()?;
                 return Ok(());
             }
+            KeyOutcome::ShowDetectors => {
+                self.set_ui_mode(crate::db::UiMode::Advanced)?;
+                self.dashboard.focus_detectors();
+                self.message = Some(
+                    "Every check, each with its own switch. v goes back to the simple screen."
+                        .to_string(),
+                );
+                return Ok(());
+            }
             KeyOutcome::KeepRunning(on) => {
                 self.set_keep_running(on)?;
                 return Ok(());
@@ -1916,8 +1942,15 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') if self.screen == Screen::Dashboard => {
+            KeyCode::Char('q') if self.screen == Screen::Dashboard => {
                 self.events.send(AppEvent::Quit);
+            }
+            // Esc closes every popup, the palette, a search and each other
+            // screen, so the press after the last of those arrives here by
+            // momentum. It used to quit, and with it stopped the schedule
+            // on a host where only this screen runs it.
+            KeyCode::Esc if self.screen == Screen::Dashboard => {
+                self.message = Some("Nothing left to go back from. q quits.".to_string());
             }
             KeyCode::Esc | KeyCode::Char('q') => self.screen = Screen::Dashboard,
             // `t` is the documented theme key; `c` stays as the alias it
@@ -2686,6 +2719,19 @@ mod tests {
         assert!(app.palette.is_none());
         assert_eq!(app.theme, before);
         assert_eq!(app.screen, Screen::Dashboard);
+    }
+
+    #[tokio::test]
+    async fn escape_on_the_dashboard_does_not_quit() {
+        let mut app = test_app();
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(
+            app.message
+                .as_deref()
+                .is_some_and(|m| m.contains("q quits")),
+            "message was: {:?}",
+            app.message
+        );
     }
 
     #[tokio::test]

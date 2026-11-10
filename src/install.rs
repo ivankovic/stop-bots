@@ -381,6 +381,53 @@ pub fn cron_file(layout: &Layout) -> String {
 }
 
 /// Everything that must hold before the cron file is written.
+/// The first part of `binary`'s path that someone other than root or this
+/// process could replace, and why, or `None` if nobody could.
+///
+/// The cron file runs the binary as root every minute, so whoever can
+/// write the binary, or rename something over any directory on the way to
+/// it, is root. `cargo install` leaves it in `~/.cargo/bin`, the user's
+/// own, and `sudo ~/.cargo/bin/stop-bots install cron` then gave every
+/// program that user runs a root shell with no password asked. Both the
+/// path as given and the path its links resolve to are walked: a link in
+/// a directory someone else can write is theirs to point elsewhere.
+///
+/// The rule for each directory is [`crate::firewall::unsafe_directory`],
+/// the one the firewall script's directory is held to.
+fn replaceable_by_someone_else(binary: &Path) -> Option<(PathBuf, String)> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: neither call has preconditions; both only read the
+    // process's own credentials.
+    let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let resolved = std::fs::canonicalize(binary).ok();
+    for path in [Some(binary.to_path_buf()), resolved].into_iter().flatten() {
+        let meta = std::fs::metadata(&path).ok()?;
+        if meta.uid() != 0 && meta.uid() != euid {
+            return Some((path, format!("owned by uid {}", meta.uid())));
+        }
+        if meta.mode() & 0o002 != 0 {
+            return Some((path, "writable by every user".to_string()));
+        }
+        if meta.mode() & 0o020 != 0 && meta.gid() != egid {
+            return Some((path, format!("writable by group {}", meta.gid())));
+        }
+        for dir in path.ancestors().skip(1) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let Ok(meta) = std::fs::metadata(dir) else {
+                continue;
+            };
+            if let Some(why) =
+                crate::firewall::unsafe_directory(meta.uid(), meta.gid(), meta.mode(), euid, egid)
+            {
+                return Some((dir.to_path_buf(), why));
+            }
+        }
+    }
+    None
+}
+
 fn preflight_cron(layout: &Layout, options: &Options) -> Result<()> {
     if !layout.cron_dir.is_dir() || !layout.cron_daemons.iter().any(|path| path.is_file()) {
         anyhow::bail!(
@@ -409,6 +456,18 @@ fn preflight_cron(layout: &Layout, options: &Options) -> Result<()> {
         anyhow::bail!(
             "{} is not a file, so cron would run nothing",
             layout.binary.display()
+        );
+    }
+    if let Some((path, why)) = replaceable_by_someone_else(&layout.binary) {
+        anyhow::bail!(
+            "refusing to have cron run {} as root: {} is {why}, who could put another \
+             program in its place and have it run as root within the minute.\n\n\
+             Install the binary where only root can change it, and run that one:\n  \
+             sudo install -m 755 {} /usr/local/bin/stop-bots\n  \
+             sudo /usr/local/bin/stop-bots install cron",
+            layout.binary.display(),
+            path.display(),
+            layout.binary.display(),
         );
     }
     // Checked by trying, not by comparing euid to 0: what matters is
@@ -1178,6 +1237,35 @@ mod tests {
             "was: {err:#}"
         );
         assert!(!layout.cron_path().exists(), "wrote it anyway");
+    }
+
+    /// `cargo install` leaves the binary in the user's own directory, and
+    /// a cron line naming it there is a root shell for that user.
+    #[test]
+    fn a_binary_someone_else_could_replace_is_not_given_to_cron() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path, mode| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        for (what, loosen) in [
+            ("the binary itself", "bin/stop-bots"),
+            ("the directory it is in", "bin"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut layout = staged(dir.path());
+            std::fs::create_dir(dir.path().join("bin")).unwrap();
+            layout.binary = dir.path().join("bin/stop-bots");
+            std::fs::write(&layout.binary, b"#!/bin/true\n").unwrap();
+            mode(&dir.path().join(loosen), 0o777);
+
+            let err = install_cron(&layout, &Options::default()).unwrap_err();
+
+            assert!(
+                format!("{err:#}").contains("writable by every user"),
+                "{what}: {err:#}"
+            );
+            assert!(!layout.cron_path().exists(), "{what}: wrote it anyway");
+        }
     }
 
     #[test]

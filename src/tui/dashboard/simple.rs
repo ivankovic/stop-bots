@@ -116,8 +116,11 @@ pub(super) fn verdict(
         return Verdict {
             level: Level::Warn,
             headline: "No sites found yet".to_string(),
-            advice: "stop-bots looks for them when it starts. Press v to point it at your web \
-                     server's config on the advanced screens."
+            // The command, because no screen sets this: the server and
+            // where its config is are the host's settings, and the advice
+            // used to send people to the advanced screens to look for one.
+            advice: "Another server, or config somewhere else? Quit (q) and run: sudo \
+                     stop-bots set-web-server nginx|apache|traefik|npmplus --root DIR"
                 .to_string(),
         };
     }
@@ -193,6 +196,13 @@ impl Dashboard {
 
     pub fn is_simple(&self) -> bool {
         self.simple
+    }
+
+    /// Puts the cursor on the first row of the advanced screen's
+    /// Automatic blocking list.
+    pub fn focus_detectors(&mut self) {
+        self.focus = Focus::Protection;
+        self.protection_state.select(Some(0));
     }
 
     /// Whether it applies on its own: both auto-applies, and a cron file
@@ -484,9 +494,9 @@ impl Dashboard {
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     if self.essentials_state.selected() == Some(0) {
-                        *message = Some(
-                            "Each check is switched on the advanced screens: press v.".to_string(),
-                        );
+                        // The row counts the checks, so opening it shows
+                        // them. It used to say where they were instead.
+                        return Ok(KeyOutcome::ShowDetectors);
                     } else if self.keeps_running() {
                         return Ok(KeyOutcome::KeepRunning(false));
                     } else {
@@ -765,21 +775,17 @@ mod tests {
     }
 
     /// The detectors are shown, not switched: each has its own switch on
-    /// the advanced screen, and the row says where.
+    /// the advanced screen, and opening the row goes to them.
     #[test]
-    fn the_detector_row_changes_nothing_and_points_at_v() {
+    fn the_detector_row_changes_nothing_and_opens_the_checks() {
         let db = Db::open_in_memory().unwrap();
         let mut dashboard = simple(&db);
         dashboard.focus = Focus::Essentials;
         dashboard.essentials_state.select(Some(0));
 
-        let (outcome, message) = press(&mut dashboard, &db, KeyCode::Enter);
+        let (outcome, _) = press(&mut dashboard, &db, KeyCode::Enter);
 
-        assert_eq!(outcome, KeyOutcome::Consumed);
-        assert!(
-            message.as_deref().is_some_and(|m| m.contains("press v")),
-            "message: {message:?}"
-        );
+        assert_eq!(outcome, KeyOutcome::ShowDetectors);
         for d in Detector::ALL {
             assert_eq!(
                 d.is_enabled(&db).unwrap(),

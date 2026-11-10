@@ -11,14 +11,133 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 **Before upgrading:** building from source needs Rust 1.89 or newer, one release more than
 0.10.0 did; the release binaries and packages need nothing.
 
+**After upgrading:** five things act differently without being switched on. An IPv6 client
+is counted by its `/64`, which is what was always blocked, so one that changes address
+within it reaches a threshold it used to stay under. A probe path written with
+percent-escapes (`/.%65nv`) is a probe. A request answered 410 counts as a missing page.
+A verified search engine is never blocked by a single request. And in the TUI, Esc on the
+Dashboard no longer quits (`q` does) and Enter on Blocks asks before it unblocks.
+`sudo stop-bots install cron` refuses a binary another user could replace, which is what
+`cargo install` leaves: copy it to `/usr/local/bin` first, as the message says.
+
+**Going back to 0.10.0** works: the schema is unchanged, and it ignores what `stop-bots log`
+keeps. A stored `--ssh-log journal` is a file named `journal` to it, which is not there:
+clear it first with `stop-bots set-log-paths --ssh-log ""`.
+
 ### Security
 
+- **An IPv4 client logged as `::ffff:a.b.c.d` is blocked as the IPv4 address it is.** NGINX
+  on a dual-stack socket logs it that way, and it was widened like any IPv6 address into a
+  block of `::/64`: a rule no IPv4 packet matches, after which every other such client was
+  "already covered". On such a host the detectors found everything and the firewall did
+  nothing. The same address was also never private and never inside a crawler's range.
+- **`install cron` refuses a binary someone else could replace.** The cron file runs the
+  binary as root every minute, and `sudo ~/.cargo/bin/stop-bots install cron` wrote a path
+  the user owns into it: a root shell, with no password asked, for anything running as
+  that user. The binary and every directory on the way to it must be root's, and not
+  writable by others. "Keep running by itself" in the TUI is held to the same.
+- **A verified search engine is not blocked on one request.** Probe paths, injection
+  attempts, protocol probes, the honeypot and port scanners went straight to a block,
+  without the check the other detectors make against the crawlers' published ranges.
+  Anyone can publish a link to `/.env`, and a crawler follows links: the site was out of
+  the index for five days at the wish of whoever wrote the link. The request that does
+  the same to a person, an image whose address is `/.env` on someone else's page, cannot
+  be told from a scanner's in an access log; both detectors now say so (`?` in the TUI),
+  and `add-trusted` is the answer for addresses that must never be
+  blocked.
+- **A C&C domain feed cannot sinkhole what the host needs.** IP feeds were held back from
+  the resolvers, apt mirrors, Let's Encrypt and the feeds' own hosts; domain feeds were
+  stored as they arrived. One that listed `raw.githubusercontent.com` would have sent this
+  host's feed downloads to the sinkhole, the corrected list among them. A domain is now
+  left out if it is one of those hosts or a parent of one, or under a short built-in list
+  (Let's Encrypt, Debian, Ubuntu, GitHub), and a feed of more than 500,000 domains is
+  refused whole.
+- **A downloaded bot pattern that matches a browser people use is left out.** `Mozilla`,
+  `AppleWebKit` or `Chrome/` in a list of scanners passed every check and `nginx -t`, and
+  was a 403 for every visitor within the hour where applying is automatic. Each pattern
+  is tried against current Chrome, Edge, Firefox and Safari on a desktop and a phone as
+  the list is read.
+- **`status` warns when the SSH log is a text file a local user can write to.** A line
+  sent to syslog with `logger -t 'sshd[1]'` is indistinguishable from sshd's own in
+  `auth.log`: a forged login is an Allow ahead of every block for a week, and forged
+  failures get an address blocked. `stop-bots set-log-paths --ssh-log journal` reads the
+  journal alone, which is asked for sshd's unit and takes no such line; `--kernel-log
+  journal` does the same for the port-scan detector. Not switched for you: the source of
+  a running host's evidence does not change on an upgrade.
+- **Root ignores what the environment says where another user could have prepared it.**
+  `STOP_BOTS_HOST_CONF` and the other test overrides are followed by root only to a path
+  nobody else could replace, and a directory on `PATH` that someone else can write is
+  skipped when looking for `nft`, `nginx` and the rest. `sudo` clears both by default;
+  `sudo -E` and wrappers do not.
+- **The evidence table has a ceiling**, 500,000 rows, oldest out first. Its window bounded
+  how long a row was kept and nothing bounded how many: every distinct missing path is a
+  row, and a client asking for a new one each time wrote them as fast as the log is read.
+- **Release binaries are built without a shared build cache.** A cache is written by other
+  runs of the repository's workflows, and what the release job compiles is what gets
+  signed.
 - **The bundled SQLite is 3.54.1**, for RUSTSEC-2026-0459 (CVE-2026-119375): before 3.54.0,
   opening a database beside a crafted `-wal` file whose page size differs could return
   uninitialised memory in query results. stop-bots opens only its own database, in a
   directory only its owner can write, so a local attacker would need that account already;
   it is fixed all the same. `rusqlite` 0.40 → 0.41, which carries it, needs Rust 1.89, so the MSRV is
   1.89, from 1.88.
+
+### Added
+
+- **`stop-bots log`: what the schedule did while nobody was looking.** A successful `tick`
+  prints nothing, the cron file sends its output nowhere, and each job kept only its last
+  summary, overwritten a minute later, so an apply that failed at 03:12 could be seen
+  until 03:13. Every scheduled outcome worth reading afterwards is now kept, the last 300:
+  a block, an apply, an error, something skipped or refused, and never the same thing
+  twice running from one job. `--since 24h`, `--failed`, `--json`. The Dashboard's Log
+  opens with the last day of it, where it used to open empty.
+- **`stop-bots why <address>`**: the stored rules that cover it, with the range it is in
+  and the log line behind each; whether a country, feed or provider's range covers it; and
+  what keeps it from being blocked (trusted, a recent SSH login, unblocked by hand).
+  `list-firewall-rules --address` filters the same way.
+- **`remove-firewall-rule --address <address> [--trust]`** lifts every stored block that
+  covers an address and, with `--trust`, keeps it from being blocked again: one command
+  for a false positive, where there were three and a `grep`.
+- **On Blocks, `T` unblocks and trusts, and `z` undoes.** Trusting used to mean the
+  Firewall screen and typing the address again, since that screen lists only what failed
+  at SSH. `z` puts back what the last unblock removed, a whole source's rules included,
+  and takes back the trust.
+- **With subnet escalation on, a scan spread over a `/24` blocks the `/24`.** Escalation
+  used to need each address convicted alone, so forty addresses of one network asking for
+  six missing pages each were forty clients under the limit. The SSH, web-scanner and
+  login detectors now also add a `/24` up: several addresses with evidence, together at
+  twice the detector's threshold. Still off unless `set-subnet-escalation` turned it on,
+  and never a `/24` that holds a verified crawler, a trusted address or one that logged in.
+- **`stop-bots completions bash|zsh|fish`**, for a binary that did not come from the
+  package.
+- **`NO_COLOR`** is honoured by the TUI: no colours, and reverse video where a background
+  marked the selection.
+
+### Changed
+
+- **Evidence is counted per `/64` for IPv6**, as blocks are written. Sixty addresses of
+  one `/64` with six missing pages each were sixty clients under the limit, not one far
+  over it. Evidence already stored per address ages out with its window.
+- **A probe path is matched as the web server reads it.** `/.%65nv` is `/.env` to NGINX,
+  which serves the file, and was no probe here. The honeypot path is matched the same way.
+- **410 counts as a missing page** for the web-scanner detector, as 404 does. 403 does
+  not: it is also what a blocked user agent is answered.
+- **Esc on the Dashboard no longer quits.** Esc closes every popup, search and screen, so
+  the press after the last of them quit the TUI, and with it the schedule on a host where
+  only the TUI runs it. `q` quits.
+- **Enter on Blocks asks before it unblocks**; Delete still does it at once. Enter opens
+  or changes things on every other screen, and after a search two of them removed a rule.
+- **The footer keeps `? explain` and `q quit` on a narrow terminal**, dropping the
+  screen's own hints from the end instead, and offers neither while a search box or a
+  popup has the keyboard.
+- **The status strip shows what is wrong first**, and a critical check as `✖` where it and
+  a warning were the same triangle in two colours.
+- **"No sites found" names the command**, `set-web-server`, in place of pointing at the
+  advanced screens, which have no such setting.
+- **Opening "Block attackers in logs" on the simple screen shows the checks**, each with
+  its switch, where it said which key would.
+- **Every command that changes a stored rule ends with the same next step**;
+  `add-firewall-rule` used to end with none.
 
 ## [0.10.0] — 2026-11-08
 

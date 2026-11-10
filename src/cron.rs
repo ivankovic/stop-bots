@@ -437,6 +437,7 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
 /// makes one schedule apply to all of them.
 pub fn record_run(db: &Db, job: CronJob, summary: &str) {
     let _ = db.set_cron_last_run(job.id(), now(), summary);
+    crate::activity::note(db, job, summary, now());
 }
 
 /// Whether this job reads the SSH log rather than the NGINX access log.
@@ -541,6 +542,7 @@ pub fn run_log_jobs(
             }
         };
         db.set_cron_last_run(job.id(), now(), &summary)?;
+        crate::activity::note(db, job, &summary, now());
         summaries.push((job, summary));
     }
     Ok(summaries)
@@ -1018,6 +1020,7 @@ fn store_ip_ranges(
         format!("updated {updated} crawler source(s), {failed} failed")
     };
     db.set_cron_last_run(CronJob::UpdateIpRanges.id(), now(), &summary)?;
+    crate::activity::note(db, CronJob::UpdateIpRanges, &summary, now());
     Ok(summary)
 }
 

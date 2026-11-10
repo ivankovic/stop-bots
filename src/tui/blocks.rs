@@ -27,8 +27,10 @@
 //!
 //! `f` cycles the source filter through the sources that have rules;
 //! `/` searches by address, and an address finds the range it is in;
-//! `Enter` removes the selected rule; `U` removes every rule from the
-//! filtered source, after a popup that says how many. Removing a
+//! `Enter` removes the selected rule after asking, and `Delete` without;
+//! `T` removes it and trusts the address; `z` puts back what the last of
+//! those removed. `U` removes every rule from the filtered source, after
+//! a popup that says how many. Removing a
 //! detector's block keeps that detector off the address for a while (see
 //! [`crate::blocks`]); the popup says so.
 
@@ -62,8 +64,10 @@ pub struct Blocks {
     state: ListState,
     /// Whether keys go to the search box.
     searching: bool,
-    /// "Unblock all from this source" asked, and waiting for a yes.
-    confirm: Option<(SourceFilter, usize)>,
+    /// A removal asked for, and waiting for a yes.
+    confirm: Option<Confirm>,
+    /// What the last removal took, for `z` to put back.
+    undo: Option<Undo>,
     /// Addresses the detectors are leaving alone because they were
     /// unblocked by hand, for the header.
     unblocked: usize,
@@ -75,6 +79,25 @@ pub struct Blocks {
     /// Repeat offenders and their counts (`Db::repeat_offences`), for
     /// the "3rd offence" a detector's block of one shows under Why.
     offences: std::collections::HashMap<String, u32>,
+}
+
+/// What is being asked before it happens.
+#[derive(Debug, Clone, PartialEq)]
+enum Confirm {
+    /// "Unblock all from this source", and how many that is.
+    Source(SourceFilter, usize),
+    /// Enter on one rule. Every other screen's Enter opens or changes
+    /// what is under the cursor, so a hand that pressed it here twice
+    /// after a search had removed a rule it only meant to look at.
+    One(FirewallRule),
+}
+
+/// The last removal, as `z` reverses it.
+#[derive(Debug, Clone, PartialEq)]
+struct Undo {
+    rules: Vec<FirewallRule>,
+    /// The address `T` trusted while removing its rule, to stop trusting.
+    trusted: Option<String>,
 }
 
 impl Blocks {
@@ -155,9 +178,10 @@ impl Blocks {
             .now(until)
             .para(why)
             .para(
-                "Enter or Delete removes it; a detector that added it leaves the address \
-                 alone for a while after. U removes every rule from the source shown (f picks \
-                 the source). T on the Firewall screen trusts an address for good.",
+                "Enter removes it after asking, Delete at once; a detector that added it \
+                 leaves the address alone for a while after. T removes it and trusts the \
+                 address, so nothing blocks it again. z puts back what the last of these \
+                 removed. U removes every rule from the source shown (f picks the source).",
             )
             .takes_effect(false)
     }
@@ -184,11 +208,24 @@ impl Blocks {
     }
 
     pub fn hints(&self) -> crate::tui::Hints {
-        if self.confirm.is_some() {
-            return (
-                "Unblock all",
-                vec![("Enter", "unblock them"), ("Esc", "cancel")],
-            );
+        match self.confirm {
+            Some(Confirm::Source(..)) => {
+                return (
+                    "Unblock all",
+                    vec![("Enter", "unblock them"), ("Esc", "cancel")],
+                );
+            }
+            Some(Confirm::One(_)) => {
+                return (
+                    "Unblock",
+                    vec![
+                        ("Enter", "unblock"),
+                        ("T", "unblock and trust"),
+                        ("Esc", "cancel"),
+                    ],
+                );
+            }
+            None => {}
         }
         if self.searching {
             return ("Search", vec![("Enter", "done"), ("Esc", "leave search")]);
@@ -196,9 +233,13 @@ impl Blocks {
         let mut hints = vec![
             ("\u{2191}\u{2193}", "move"),
             ("Enter", "unblock"),
+            ("T", "unblock and trust"),
             ("f", "source"),
             ("/", "search"),
         ];
+        if self.undo.is_some() {
+            hints.push(("z", "undo"));
+        }
         if self.query.source.is_some() {
             hints.push(("U", "unblock all from the source"));
         }
@@ -229,19 +270,33 @@ impl Blocks {
         db: &Db,
         message: &mut Option<String>,
     ) -> Result<KeyOutcome> {
-        if let Some((filter, _)) = self.confirm {
-            return match key.code {
-                KeyCode::Enter | KeyCode::Char('y') => {
+        if let Some(confirm) = self.confirm.clone() {
+            return match (confirm, key.code) {
+                (Confirm::Source(filter, count), KeyCode::Enter | KeyCode::Char('y')) => {
                     self.confirm = None;
+                    // Read before they go, so that `z` has them to put back.
+                    let rules = db.blocks_page(&self.query_for(filter), 0, count.max(1))?;
                     let removed = db.remove_firewall_rules_from(filter, false)?;
+                    self.undo = Some(Undo {
+                        rules,
+                        trusted: None,
+                    });
                     *message = Some(format!(
                         "Removed {removed} rule(s) from {} — apply everything (a on the \
-                         Dashboard) to lift them.",
+                         Dashboard) to lift them, or z to put them back.",
                         filter.label()
                     ));
                     Ok(KeyOutcome::Mutated)
                 }
-                KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                (Confirm::One(rule), KeyCode::Enter | KeyCode::Char('y')) => {
+                    self.confirm = None;
+                    self.unblock(db, &rule, false, message)
+                }
+                (Confirm::One(rule), KeyCode::Char('T')) => {
+                    self.confirm = None;
+                    self.unblock(db, &rule, true, message)
+                }
+                (_, KeyCode::Esc | KeyCode::Char('n' | 'q')) => {
                     self.confirm = None;
                     Ok(KeyOutcome::Consumed)
                 }
@@ -279,27 +334,39 @@ impl Blocks {
                 self.query.source = next_filter(self.query.source, &self.sources);
                 self.reload(db, 0)?;
             }
-            KeyCode::Enter | KeyCode::Delete => {
-                let Some(rule) = self.selected_rule() else {
+            KeyCode::Enter => {
+                self.confirm = self.selected_rule().cloned().map(Confirm::One);
+            }
+            KeyCode::Delete | KeyCode::Char('T') => {
+                let Some(rule) = self.selected_rule().cloned() else {
                     return Ok(KeyOutcome::Consumed);
                 };
-                let (id, address) = (rule.id, rule.address.clone());
-                let by_detector = rule.source.and_then(|s| s.detector()).is_some();
-                db.remove_firewall_rule(id)?;
+                return self.unblock(db, &rule, key.code == KeyCode::Char('T'), message);
+            }
+            KeyCode::Char('z') => {
+                let Some(undo) = self.undo.take() else {
+                    *message = Some("Nothing to undo.".into());
+                    return Ok(KeyOutcome::Consumed);
+                };
+                if let Some(address) = &undo.trusted {
+                    db.untrust_address(address)?;
+                }
+                let restored = db.restore_firewall_rules(&undo.rules)?;
                 *message = Some(format!(
-                    "Removed the rule for {address}{} — apply everything (a on the \
-                     Dashboard) to lift it.",
-                    if by_detector {
-                        "; its detector leaves it alone for now (T on Firewall trusts it for good)"
-                    } else {
-                        ""
-                    }
+                    "Put back {restored} of {} rule(s){}.",
+                    undo.rules.len(),
+                    undo.trusted
+                        .map(|address| format!("; {address} is no longer trusted"))
+                        .unwrap_or_default()
                 ));
                 return Ok(KeyOutcome::Mutated);
             }
             KeyCode::Char('U') => {
                 if let Some(filter) = self.query.source {
-                    self.confirm = Some((filter, db.count_blocks(&self.query_for(filter))?));
+                    self.confirm = Some(Confirm::Source(
+                        filter,
+                        db.count_blocks(&self.query_for(filter))?,
+                    ));
                 } else {
                     *message =
                         Some("Pick a source with f first: U unblocks all from one source.".into());
@@ -313,6 +380,47 @@ impl Blocks {
             _ => return Ok(KeyOutcome::Ignored),
         }
         Ok(KeyOutcome::Consumed)
+    }
+
+    /// Removes `rule`, and with `trust` trusts its address too: the whole
+    /// answer to a block that was a mistake, where it is being looked at.
+    /// Trusting used to mean going to the Firewall screen and typing the
+    /// address again, since that screen lists only what failed at SSH.
+    fn unblock(
+        &mut self,
+        db: &Db,
+        rule: &FirewallRule,
+        trust: bool,
+        message: &mut Option<String>,
+    ) -> Result<KeyOutcome> {
+        let by_detector = rule.source.and_then(|s| s.detector()).is_some();
+        let removed = db.remove_firewall_rule(rule.id)?;
+        let address = &removed.address;
+        let trusted = if trust && removed.action != FirewallAction::Allow {
+            Some(db.trust_address(address)?)
+        } else {
+            None
+        };
+        *message = Some(match &trusted {
+            Some(trusted) => format!(
+                "Removed the rule for {address} and trusted {trusted}: nothing blocks it \
+                 again. Apply everything (a on the Dashboard) to lift it, or z to undo."
+            ),
+            None => format!(
+                "Removed the rule for {address}{} — apply everything (a on the Dashboard) \
+                 to lift it, or z to put it back.",
+                if by_detector {
+                    "; its detector leaves it alone for now (T trusts it for good)"
+                } else {
+                    ""
+                }
+            ),
+        });
+        self.undo = Some(Undo {
+            rules: vec![removed],
+            trusted,
+        });
+        Ok(KeyOutcome::Mutated)
     }
 
     /// Every rule from `filter`, whatever the search says: "unblock all
@@ -437,9 +545,46 @@ impl Blocks {
             why_area,
         );
 
-        if let Some((filter, count)) = self.confirm {
-            self.render_confirm(frame, area, filter, count, theme);
+        match &self.confirm {
+            Some(Confirm::Source(filter, count)) => {
+                self.render_confirm(frame, area, *filter, *count, theme);
+            }
+            Some(Confirm::One(rule)) => self.render_confirm_one(frame, area, rule, theme),
+            None => {}
         }
+    }
+
+    fn render_confirm_one(&self, frame: &mut Frame, area: Rect, rule: &FirewallRule, theme: Theme) {
+        let mut lines = vec![
+            Line::from(format!("Unblock {}?", rule.address).bold()),
+            Line::from(""),
+        ];
+        if rule.source.and_then(|s| s.detector()).is_some() {
+            lines.push(Line::from(
+                "Its detector leaves the address alone for as long as the block was meant to \
+                 last. T trusts it instead, so that nothing blocks it again.",
+            ));
+        }
+        lines.push(Line::from(
+            "Nothing changes on the host until the firewall script is written and applied.",
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            "Enter".fg(theme.accent()),
+            " unblock   ".into(),
+            "T".fg(theme.accent()),
+            " unblock and trust   ".into(),
+            "Esc".fg(theme.accent()),
+            " cancel".into(),
+        ]));
+        let popup = centered_rect(72, lines.len() as u16 + 4, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(crate::tui::popup("Unblock", theme)),
+            popup,
+        );
     }
 
     fn render_confirm(
@@ -660,20 +805,107 @@ mod tests {
         assert_eq!(screen.selected_rule().unwrap().address, "203.0.113.0/24");
     }
 
+    /// Enter opens or changes things on every other screen, so here it
+    /// asks; the search box's own Enter is one press before it.
     #[test]
-    fn enter_unblocks_the_selected_rule() {
+    fn enter_asks_before_it_unblocks_the_selected_rule() {
         let db = Db::open_in_memory().unwrap();
         add(&db, "203.0.113.5", PROBES, None);
         let mut screen = screen(&db);
 
-        let (outcome, message) = press(&mut screen, &db, KeyCode::Enter);
+        press(&mut screen, &db, KeyCode::Enter);
+        let drawn = drawn(&mut screen);
+        assert!(drawn.contains("Unblock 203.0.113.5?"), "{drawn}");
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1, "not yet");
 
+        let (outcome, message) = press(&mut screen, &db, KeyCode::Enter);
         assert_eq!(outcome, KeyOutcome::Mutated);
         assert!(db.list_firewall_rules().unwrap().is_empty());
         assert!(
             message.unwrap_or_default().contains("leaves it alone"),
             "a detector's block says it will not come straight back"
         );
+    }
+
+    #[test]
+    fn escape_leaves_the_rule_enter_asked_about() {
+        let db = Db::open_in_memory().unwrap();
+        add(&db, "203.0.113.5", PROBES, None);
+        let mut screen = screen(&db);
+
+        press(&mut screen, &db, KeyCode::Enter);
+        press(&mut screen, &db, KeyCode::Esc);
+
+        assert!(screen.confirm.is_none());
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_unblocks_without_asking_and_z_puts_the_rule_back_as_it_was() {
+        let db = Db::open_in_memory().unwrap();
+        add(&db, "203.0.113.5", PROBES, Some("GET /.env"));
+        let before = db.list_firewall_rules().unwrap();
+        let mut screen = screen(&db);
+
+        press(&mut screen, &db, KeyCode::Delete);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+        assert_eq!(db.unblocked_addresses().unwrap().len(), 1);
+
+        let (outcome, _) = press(&mut screen, &db, KeyCode::Char('z'));
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        let after = db.list_firewall_rules().unwrap();
+        let same = |rules: &[FirewallRule]| -> Vec<_> {
+            rules
+                .iter()
+                .map(|r| {
+                    (
+                        r.address.clone(),
+                        r.source,
+                        r.expires_at,
+                        r.evidence.clone(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(same(&after), same(&before));
+        assert!(
+            db.unblocked_addresses().unwrap().is_empty(),
+            "the detectors may block it again"
+        );
+    }
+
+    /// The whole answer to a false positive, on the screen that shows it.
+    #[test]
+    fn shift_t_unblocks_and_trusts_and_z_undoes_both() {
+        let db = Db::open_in_memory().unwrap();
+        add(&db, "203.0.113.5", PROBES, None);
+        let mut screen = screen(&db);
+
+        let (outcome, message) = press(&mut screen, &db, KeyCode::Char('T'));
+        assert_eq!(outcome, KeyOutcome::Mutated);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+        assert_eq!(db.list_trusted_addresses().unwrap(), vec!["203.0.113.5"]);
+        assert!(message.unwrap_or_default().contains("trusted"));
+
+        press(&mut screen, &db, KeyCode::Char('z'));
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 1);
+        assert!(db.list_trusted_addresses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unblocking_a_whole_source_can_be_undone_too() {
+        let db = Db::open_in_memory().unwrap();
+        add(&db, "203.0.113.5", PROBES, None);
+        add(&db, "203.0.113.6", PROBES, None);
+        let mut screen = screen(&db);
+        press(&mut screen, &db, KeyCode::Char('f'));
+        press(&mut screen, &db, KeyCode::Char('U'));
+        press(&mut screen, &db, KeyCode::Enter);
+        assert!(db.list_firewall_rules().unwrap().is_empty());
+
+        press(&mut screen, &db, KeyCode::Char('z'));
+
+        assert_eq!(db.list_firewall_rules().unwrap().len(), 2);
     }
 
     /// The count is in the question, and nothing happens before the yes.

@@ -1092,7 +1092,7 @@ pub const MANAGED_DIR_ENV: &str = "STOP_BOTS_NGINX_DIR";
 
 /// The directory this project writes its own NGINX files into.
 pub fn managed_dir() -> PathBuf {
-    std::env::var_os(MANAGED_DIR_ENV)
+    crate::host::path_override(MANAGED_DIR_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(MANAGED_DIR))
 }
@@ -1162,7 +1162,7 @@ pub const CONF_D_DIR_ENV: &str = "STOP_BOTS_NGINX_CONF_D";
 /// `/etc/nginx/conf.d/stop-bots-trusted.conf`. Such a root without a
 /// `conf.d` gets `<root>/conf.d`, which a write creates.
 pub fn conf_d_dir(root: &Path) -> PathBuf {
-    if let Some(dir) = std::env::var_os(CONF_D_DIR_ENV) {
+    if let Some(dir) = crate::host::path_override(CONF_D_DIR_ENV) {
         return PathBuf::from(dir);
     }
     let beside_the_sites = root.join("conf.d");

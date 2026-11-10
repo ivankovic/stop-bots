@@ -33,6 +33,8 @@ pub mod accesslog;
 #[doc(hidden)]
 pub mod accessstats;
 #[doc(hidden)]
+pub mod activity;
+#[doc(hidden)]
 pub mod apache;
 #[doc(hidden)]
 pub mod app;

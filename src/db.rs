@@ -1352,8 +1352,10 @@ pub fn location_notice(path: Option<&Path>, defaulted: bool) -> Option<String> {
             path.display()
         )
     } else {
+        // What it means before where it is: the header cuts this at the
+        // terminal's width, and a long path first left only the path.
         format!(
-            "Database {} — not the system one ({SYSTEM_PATH})",
+            "Not the system database ({SYSTEM_PATH}) — {}",
             path.display()
         )
     })
@@ -1912,6 +1914,16 @@ impl Db {
     // a key/value table is for. Every one of them reads through `Option`
     // and falls back to a caller-supplied default, so a database written
     // before a given setting existed keeps behaving the way it did.
+
+    /// The kept scheduled-job outcomes, as `crate::activity` stored them.
+    pub fn get_activity_log(&self) -> Result<Option<String>> {
+        self.get_raw_setting(keys::ACTIVITY_LOG)
+    }
+
+    /// Replaces them. `crate::activity::note` is the one writer.
+    pub fn set_activity_log(&self, events: &str) -> Result<()> {
+        self.set_raw_setting(keys::ACTIVITY_LOG, events)
+    }
 
     fn get_raw_setting(&self, key: &str) -> Result<Option<String>> {
         Ok(self
@@ -4547,7 +4559,7 @@ mod tests {
                 "one asked for",
                 Some(Path::new("/tmp/x.db")),
                 false,
-                Some("Database /tmp/x.db — not the system one (/var/lib/stop-bots/db.sqlite3)"),
+                Some("Not the system database (/var/lib/stop-bots/db.sqlite3) — /tmp/x.db"),
             ),
         ] {
             assert_eq!(

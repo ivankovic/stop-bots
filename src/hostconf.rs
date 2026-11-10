@@ -60,7 +60,7 @@ pub const PATH_ENV: &str = "STOP_BOTS_HOST_CONF";
 
 /// The file this process reads and writes.
 pub fn path() -> PathBuf {
-    if let Some(path) = std::env::var_os(PATH_ENV).filter(|path| !path.is_empty()) {
+    if let Some(path) = crate::host::path_override(PATH_ENV) {
         return PathBuf::from(path);
     }
     if cfg!(test) {
@@ -249,7 +249,15 @@ impl HostConf {
                 .to_str()
                 .with_context(|| format!("{} is not UTF-8", path.display()))?;
             no_control_characters(text)?;
-            if !path.is_absolute() {
+            // The one value that is not a path: the journal, by name, for
+            // the two logs that can be read from it (see
+            // `sshlog::SshSource::Journal`).
+            let journal = text == crate::sshlog::JOURNAL_KEYWORD
+                && [&self.ssh_log, &self.kernel_log]
+                    .into_iter()
+                    .flatten()
+                    .any(|log| std::ptr::eq(log, path));
+            if !path.is_absolute() && !journal {
                 bail!("{} is not an absolute path", path.display());
             }
         }

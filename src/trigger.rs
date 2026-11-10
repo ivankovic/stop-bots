@@ -60,7 +60,12 @@ pub fn evidence_for(
 ) -> HashMap<String, String> {
     let wanted: HashMap<IpAddr, (&String, Option<&str>)> = observed
         .iter()
-        .filter_map(|(address, hint)| Some((address.parse().ok()?, (address, hint.as_deref()))))
+        .filter_map(|(address, hint)| {
+            // By unit, as evidence is kept: for IPv6 the detector names a
+            // /64, and any address in it wrote the line that is wanted.
+            let unit = crate::evidence::unit(address.parse().ok()?);
+            Some((unit, (address, hint.as_deref())))
+        })
         .collect();
     if wanted.is_empty() {
         return HashMap::new();
@@ -76,6 +81,7 @@ pub fn evidence_for(
         // The last failure: the most recent of what earned the block.
         for line in log_text.lines() {
             if let Some(ip) = crate::sshlog::failed_login_address(line) {
+                let ip = crate::evidence::unit(ip);
                 if wanted.contains_key(&ip) {
                     found.insert(ip, line.trim().to_string());
                 }
@@ -92,14 +98,15 @@ pub fn evidence_for(
                 | Detector::RequestRate
         );
         for request in log_text.lines().filter_map(parse_request) {
-            let Some((_, hint)) = wanted.get(&request.ip) else {
+            let ip = crate::evidence::unit(request.ip);
+            let Some((_, hint)) = wanted.get(&ip) else {
                 continue;
             };
-            if !last && found.contains_key(&request.ip) {
+            if !last && found.contains_key(&ip) {
                 continue;
             }
             if let Some(line) = describe(detector, &request, *hint) {
-                found.insert(request.ip, line);
+                found.insert(ip, line);
             }
         }
     }
@@ -116,7 +123,7 @@ fn describe(detector: Detector, request: &Request, hint: Option<&str>) -> Option
     let plain = || format!("\"{}\" {}", request.request, request.status);
     let with_agent = || format!("{} as \"{}\"", plain(), request.user_agent);
     match detector {
-        Detector::WebScanners => (request.status == "404").then(plain),
+        Detector::WebScanners => matches!(request.status.as_str(), "404" | "410").then(plain),
         Detector::SpoofedCrawlers => {
             let agent = request.user_agent.to_lowercase();
             ["googlebot", "bingbot", "gptbot"]

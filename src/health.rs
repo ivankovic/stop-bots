@@ -171,6 +171,11 @@ pub struct Probe {
     pub cron_installed: Option<bool>,
     /// Bytes free on the filesystem holding the database.
     pub db_free_bytes: Option<u64>,
+    /// The text file the SSH log is read from by default, on a host whose
+    /// journal could be read in its place (see
+    /// [`crate::sshlog::SshSource::forgeable_file`]).
+    #[serde(default)]
+    pub ssh_log_forgeable: Option<String>,
     /// Whether each log source could actually be read.
     pub ssh_log_readable: Option<bool>,
     pub access_log_readable: Option<bool>,
@@ -422,6 +427,10 @@ pub fn probe(
     // Asked, not read: this used to read the whole log, which on a
     // journald host was the whole sshd journal, once an hour.
     let ssh_readable = paths.ssh(ssh_log).is_readable();
+    let ssh_forgeable = paths
+        .ssh(ssh_log)
+        .forgeable_file()
+        .map(|path| path.display().to_string());
     let container = match &nginx_home {
         NginxHome::Container { name } => Some(name.clone()),
         _ => None,
@@ -451,6 +460,7 @@ pub fn probe(
                 .is_file(),
         ),
         db_free_bytes: free_bytes(db_path),
+        ssh_log_forgeable: ssh_forgeable,
         ssh_log_readable: Some(ssh_readable),
         access_log_readable: Some(access_readable),
         access_log_path: Some(paths.access_description(None)),
@@ -1338,8 +1348,8 @@ fn generated_files_reachable(probe: &Probe) -> Check {
                 Level::Warn,
                 format!("{where_it_writes} does not exist"),
                 Some(
-                    "check `nginx:root` — the generated files go in `conf.d` under it, and NGINX \
-                     has to be the one reading that directory"
+                    "stop-bots set-web-server nginx --root <dir> — the generated files go in \
+                     `conf.d` under that root, and NGINX has to be the one reading it"
                         .to_string(),
                 ),
             ),
@@ -2684,6 +2694,21 @@ fn log_sources(probe: &Probe) -> Check {
             "could not check the log sources".to_string(),
             None,
         )
+    } else if let (true, true, Some(file)) = (
+        missing.is_empty(),
+        unopened.is_empty(),
+        &probe.ssh_log_forgeable,
+    ) {
+        (
+            Level::Warn,
+            format!(
+                "the SSH log is read from {file}, which any local user can write lines \
+                 into with `logger`: a forged login puts an address ahead of every block \
+                 for a week, and forged failures get one blocked. The journal is readable \
+                 here and takes only what sshd's own unit wrote"
+            ),
+            Some("stop-bots set-log-paths --ssh-log journal".to_string()),
+        )
     } else if missing.is_empty() && unopened.is_empty() {
         let also = match config_logs {
             [] => String::new(),
@@ -2889,6 +2914,7 @@ mod tests {
             conf_d_exists: Some(true),
             stray_generated_files: Vec::new(),
             db_free_bytes: Some(8 * 1024 * 1024 * 1024),
+            ssh_log_forgeable: None,
             ssh_log_readable: Some(true),
             access_log_readable: Some(true),
             access_log_path: None,
@@ -4288,6 +4314,23 @@ mod tests {
                 "{case}"
             );
         }
+    }
+
+    #[test]
+    fn a_text_ssh_log_beside_a_readable_journal_is_warned_about_with_the_command() {
+        let probe = Probe {
+            ssh_log_forgeable: Some("/var/log/auth.log".to_string()),
+            ..healthy()
+        };
+
+        let report = assess(&db(), &probe).unwrap();
+
+        let check = check(&report, "log-sources");
+        assert_eq!(check.level, Level::Warn, "was: {}", check.detail);
+        assert_eq!(
+            check.fix.as_deref(),
+            Some("stop-bots set-log-paths --ssh-log journal")
+        );
     }
 
     /// A log the detectors cannot read looks exactly like a log with

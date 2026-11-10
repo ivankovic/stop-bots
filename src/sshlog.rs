@@ -65,7 +65,17 @@ pub enum SshSource {
     /// Nothing named: the first of [`DEFAULT_LOG_PATHS`] that can be
     /// opened, and journald if none can.
     Search,
+    /// The journal and nothing else, asked for by name
+    /// ([`JOURNAL_KEYWORD`]). For a host that has both: a text log is
+    /// what syslog was sent, by anyone (see [`parse_auth_line`]), and the
+    /// journal is asked for sshd's own unit, which a local user's
+    /// `logger` is not in.
+    Journal,
 }
+
+/// What `set-log-paths --ssh-log` and `--kernel-log` take in place of a
+/// path to mean [`SshSource::Journal`].
+pub const JOURNAL_KEYWORD: &str = "journal";
 
 /// Where an [`SshSource`] turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +108,7 @@ impl SshSource {
                 .find(|path| std::fs::File::open(path).is_ok())
                 .map(|path| Located::File(path.clone()))
                 .unwrap_or(Located::Journal),
+            SshSource::Journal => Located::Journal,
         }
     }
 
@@ -118,6 +129,19 @@ impl SshSource {
         match crate::hostlog::ssh_since(&sources, since) {
             Some(text) => LogSource::Found(text),
             None => LogSource::Unavailable,
+        }
+    }
+
+    /// The text file this log is read from, when the journal could be
+    /// read in its place: a log any local user can write lines into, on a
+    /// host that has one they cannot. `None` for a file someone named,
+    /// which is their choice, and where there is no journal to prefer.
+    pub fn forgeable_file(&self) -> Option<PathBuf> {
+        match (self, self.locate()) {
+            (SshSource::Search, Located::File(path)) if SshSource::Journal.is_readable() => {
+                Some(path)
+            }
+            _ => None,
         }
     }
 
@@ -314,7 +338,7 @@ fn parse_auth_line(line: &str) -> Option<AuthLine<'_>> {
         return Some(AuthLine {
             kind: AuthKind::GaveUp,
             user,
-            ip: ip.parse().ok()?,
+            ip: ip.parse::<IpAddr>().ok()?.to_canonical(),
         });
     }
     let max_tries = message
@@ -371,7 +395,11 @@ fn split_address(rest: &str) -> Option<(&str, IpAddr)> {
     let at = rest.rfind(" from ")?;
     let after = rest.get(at + " from ".len()..)?;
     let (address, _) = split_port(after, after.find(" port ")?)?;
-    Some((rest.get(..at)?, address.parse().ok()?))
+    // Canonical, so that `::ffff:203.0.113.5`, which sshd writes for an
+    // IPv4 client of a v6 socket built without `AddressFamily` mapping
+    // undone, is the IPv4 address every other check knows it by.
+    let address: IpAddr = address.parse().ok()?;
+    Some((rest.get(..at)?, address.to_canonical()))
 }
 
 /// `text` split at the ` port ` found at `at`, which must be followed by a

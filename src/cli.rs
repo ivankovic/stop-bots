@@ -286,20 +286,46 @@ pub(crate) enum Command {
         /// takes it), `cli`, `tui`, `web` or `before-0.1`
         #[arg(long, value_parser = source_arg)]
         source: Option<SourceFilter>,
+        /// Only rules that cover this address: the rule for it, and any
+        /// range it is in
+        #[arg(long)]
+        address: Option<std::net::IpAddr>,
         #[arg(long, help = JSON_HELP)]
         json: bool,
     },
-    /// Remove a firewall rule by id, or every rule from one source.
+    /// Say why an address is blocked, or that nothing blocks it.
+    ///
+    /// Everything stop-bots holds about one address: the stored rules that
+    /// cover it, each with its source and the log line behind it; whether
+    /// a country, a feed or a hosting provider's range covers it; and what
+    /// keeps it from being blocked, if anything does (trusted, a recent
+    /// SSH login, unblocked by hand).
+    Why {
+        /// The address to ask about
+        address: std::net::IpAddr,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
+    /// Remove a firewall rule by id or by address, or every rule from one
+    /// source.
     ///
     /// Removing a detector's block also keeps that detector from adding
     /// it straight back from the same log lines: it leaves the address
     /// alone for as long as the block was meant to last. Trust the
-    /// address (`add-trusted --address`) to exempt it for good.
-    #[command(group(clap::ArgGroup::new("which").required(true).args(["id", "source"])))]
+    /// address (`add-trusted --address`, or `--trust` here) to exempt it
+    /// for good.
+    #[command(group(clap::ArgGroup::new("which").required(true).args(["id", "source", "address"])))]
     RemoveFirewallRule {
         /// The rule's id, as `list-firewall-rules` shows it
         #[arg(long)]
         id: Option<i64>,
+        /// Every stored block that covers this address instead: the rule
+        /// for it, and any range it is in
+        #[arg(long)]
+        address: Option<std::net::IpAddr>,
+        /// With --address: trust it as well, so nothing blocks it again
+        #[arg(long, requires = "address")]
+        trust: bool,
         /// Every rule from this source instead: a detector's name, `cli`,
         /// `tui`, `web` or `before-0.1`
         #[arg(long, value_parser = source_arg)]
@@ -1244,6 +1270,24 @@ pub(crate) enum Command {
         #[arg(long, requires = "server", conflicts_with_all = ["test", "reload", "root"])]
         reset: bool,
     },
+    /// What the schedule did: blocks, applies and failures, newest last.
+    ///
+    /// Every scheduled job's outcome that is worth reading afterwards is
+    /// kept, a few hundred of them: a block, an apply, an error, something
+    /// skipped or refused. A detector that found nothing is not, and
+    /// neither is a job saying the same thing as last time. This is where
+    /// to look for what happened overnight; `status` says how things are
+    /// now.
+    Log {
+        /// How far back: `90m`, `24h`, `7d`. Everything kept, if not given
+        #[arg(long)]
+        since: Option<String>,
+        /// Only what went wrong
+        #[arg(long)]
+        failed: bool,
+        #[arg(long, help = JSON_HELP)]
+        json: bool,
+    },
     /// Report whether this host is actually protected.
     ///
     /// Every other check in this tool compares what it would generate
@@ -1433,6 +1477,19 @@ pub(crate) enum Command {
         prefix: Option<PathBuf>,
         #[arg(long, help = ROOT_HELP)]
         root: Option<PathBuf>,
+    },
+    /// Print a shell's completion script.
+    ///
+    /// The package installs these already. For a binary from `cargo
+    /// install` or a release download:
+    ///
+    ///   stop-bots completions bash > /etc/bash_completion.d/stop-bots
+    ///   stop-bots completions zsh > "${fpath[1]}/_stop-bots"
+    ///   stop-bots completions fish > ~/.config/fish/completions/stop-bots.fish
+    #[command(verbatim_doc_comment)]
+    Completions {
+        /// bash, zsh or fish
+        shell: clap_complete::Shell,
     },
     /// Write the man pages and shell completions for packaging
     ///
