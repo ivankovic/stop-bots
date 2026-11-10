@@ -8,6 +8,11 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-11-10
+
+A security, detection and usability review, fixed: IPv4-mapped clients blocked as what they are,
+verified crawlers never blocked on one request, and `stop-bots log` and `why`.
+
 **Before upgrading:** building from source needs Rust 1.89 or newer, one release more than
 0.10.0 did; the release binaries and packages need nothing.
 
@@ -3045,7 +3050,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/ivankovic/stop-bots/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ivankovic/stop-bots/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ivankovic/stop-bots/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/ivankovic/stop-bots/compare/v0.7.0...v0.8.0
