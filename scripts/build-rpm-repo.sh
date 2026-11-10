@@ -78,6 +78,9 @@ if [ -n "${GPG_PASSPHRASE:-}" ]; then
 fi
 
 mkdir -p "${REPO_DIR}/${PACKAGES}"
+# Absolute, because the script changes directory twice below and the
+# workflow passes `pages`, relative to where it started.
+REPO_DIR=$(cd "${REPO_DIR}" && pwd)
 
 echo "Signing and adding new packages:"
 found_rpm=0
