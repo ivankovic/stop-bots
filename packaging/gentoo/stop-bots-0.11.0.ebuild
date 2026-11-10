@@ -171,9 +171,9 @@ CRATES="
 	kurbo@0.13.1
 	lab@0.11.0
 	lazy_static@1.5.0
-	libc@0.2.190
+	libc@0.2.191
 	libm@0.2.16
-	libsqlite3-sys@0.38.2
+	libsqlite3-sys@0.39.1
 	line-clipping@0.3.8
 	linux-raw-sys@0.12.1
 	litemap@0.8.3
@@ -265,7 +265,7 @@ CRATES="
 	roxmltree@0.20.0
 	roxmltree@0.21.1
 	rsqlite-vfs@0.1.1
-	rusqlite@0.40.2
+	rusqlite@0.41.1
 	rustc-hash@2.1.3
 	rustc_version@0.4.1
 	rustix@1.1.4
@@ -422,7 +422,7 @@ CRATES="
 
 # Cargo.toml's `rust-version`, which CI's MSRV job builds with. Set before
 # `inherit`, as rust.eclass requires.
-RUST_MIN_VER="1.88.0"
+RUST_MIN_VER="1.89.0"
 
 inherit cargo
 

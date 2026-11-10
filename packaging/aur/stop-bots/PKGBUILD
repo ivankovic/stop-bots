@@ -1,6 +1,6 @@
 # Maintainer: Marko Ivankovic <marko@ivankovic.me>
 pkgname=stop-bots
-pkgver=0.9.0
+pkgver=0.11.0
 pkgrel=1
 pkgdesc="A TUI and CLI that help you configure NGINX, Apache or Traefik and your firewall to stop bad bots and still allow good bots"
 arch=('x86_64')
@@ -25,7 +25,7 @@ optdepends=('nginx: to apply the generated site blocking rules'
 # `cargo install stop-bots` builds.
 source=("$pkgname-$pkgver.tar.gz::https://static.crates.io/crates/$pkgname/$pkgname-$pkgver.crate")
 # Written by packaging/bump.py: the checksum crates.io recorded at publish.
-sha256sums=('ccdf2b5cc9bf8faa37c303691ac778bbf877b988f5cc2082890cb978d061821f')
+sha256sums=('81164e2f0970eda3017313d0bb2bce43f35c588e35e025b8a45483afc074abe5')
 
 prepare() {
   cd "$pkgname-$pkgver"
