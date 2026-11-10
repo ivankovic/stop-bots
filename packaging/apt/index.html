@@ -1,8 +1,9 @@
 <!doctype html>
 <!--
-  The project's landing page, and the root of the APT repository: copied to
-  the root of the `gh-pages` branch by the `apt` job in
-  .github/workflows/release.yml, next to key.gpg, dists/ and pool/.
+  The project's landing page, and the root of the APT and dnf repositories:
+  copied to the root of the `gh-pages` branch by the `apt` job in
+  .github/workflows/release.yml, next to key.gpg, dists/ and pool/, and
+  the `dnf` job's key.asc, stop-bots.repo and rpm/.
 
   It is static and hand-written on purpose. Someone lands here either from
   a link or by pasting the repository URL into a browser to find out what
@@ -214,6 +215,11 @@ https://ivankovic.github.io/stop-bots stable main" \
 
 sudo apt update
 sudo apt install stop-bots</code></pre>
+      <p>On Fedora, RHEL, Rocky, AlmaLinux and the like (8 or newer):</p>
+      <pre><code>sudo curl -fsSL -o /etc/yum.repos.d/stop-bots.repo \
+  https://ivankovic.github.io/stop-bots/stop-bots.repo
+
+sudo dnf install stop-bots</code></pre>
       <p>
         Installing starts nothing. Then <code>sudo stop-bots</code> opens the
         TUI, and the
@@ -228,7 +234,9 @@ sudo apt install stop-bots</code></pre>
         <li>
           <code>/usr/bin/stop-bots</code>, statically linked against musl, so
           it depends on no system library and installs on any Debian or Ubuntu
-          still receiving updates. <code>amd64</code> and <code>arm64</code>.
+          still receiving updates. <code>amd64</code> and <code>arm64</code>
+          (<code>x86_64</code> and <code>aarch64</code> in the RPM), and the
+          same binary in both packages.
         </li>
         <li>
           Nothing scheduled. Run
@@ -241,14 +249,16 @@ sudo apt install stop-bots</code></pre>
       <h2>Verifying it yourself</h2>
       <p>
         Every index is signed with the key above, and <code>apt</code> checks
-        that signature on each <code>update</code>. To look at the fingerprint
-        before trusting it:
+        that signature on each <code>update</code>. The dnf repository uses the
+        same key, armoured as <code>key.asc</code>, for its index and for every
+        package; <code>dnf</code> shows the fingerprint and asks before it
+        imports it. To look at the fingerprint before trusting it:
       </p>
       <pre><code>curl -fsSL https://ivankovic.github.io/stop-bots/key.gpg | gpg --show-keys</code></pre>
 
       <h2>Other ways to install</h2>
       <ul>
-        <li><code>cargo install stop-bots</code>, with Rust 1.88 or newer.</li>
+        <li><code>cargo install stop-bots</code>, with Rust 1.89 or newer.</li>
         <li>
           A static binary for <code>x86_64</code> or <code>aarch64</code> Linux
           from the
@@ -258,7 +268,8 @@ sudo apt install stop-bots</code></pre>
         </li>
       </ul>
       <p>
-        Tested on Debian and Ubuntu with systemd, and NGINX or Apache.
+        Tested on Debian and Ubuntu with systemd, and NGINX or Apache. The RPM
+        is checked to install and upgrade on Fedora, Rocky Linux 8 and 9.
       </p>
 
       <footer>

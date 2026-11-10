@@ -1,0 +1,16 @@
+# The dnf repository for stop-bots, published by release.yml's `dnf` job
+# beside the APT one, signed with the same key. Served from the root of the
+# GitHub Pages site so that both of
+#
+#   sudo dnf config-manager addrepo --from-repofile=https://ivankovic.github.io/stop-bots/stop-bots.repo
+#   sudo dnf config-manager --add-repo https://ivankovic.github.io/stop-bots/stop-bots.repo
+#
+# (dnf5 and dnf4) find it. Both checks are on: the packages are signed and
+# so is the index; scripts/build-rpm-repo.sh says why each matters.
+[stop-bots]
+name=stop-bots
+baseurl=https://ivankovic.github.io/stop-bots/rpm
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://ivankovic.github.io/stop-bots/key.asc
