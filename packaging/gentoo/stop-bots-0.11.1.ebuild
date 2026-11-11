@@ -268,7 +268,7 @@ CRATES="
 	rusqlite@0.41.1
 	rustc-hash@2.1.3
 	rustc_version@0.4.1
-	rustix@1.1.4
+	rustix@1.1.6
 	rustls-native-certs@0.8.4
 	rustls-pki-types@1.15.1
 	rustls-platform-verifier-android@0.1.1
