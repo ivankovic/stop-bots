@@ -64,12 +64,28 @@ index (`repomd.xml.asc`), and publishes the key armoured as `key.asc`, which is 
 `rpm --import` reads. One key for both keeps one thing to back up and one fingerprint
 to announce.
 
-**2. The repository secret.** Pipe it rather than pasting it, so the private key never
-lands in a terminal, a clipboard or a shell history:
+**2. The environment and its secret.** The key is a secret of the `release`
+environment, not of the repository. A repository secret is readable by any workflow on
+any branch that names it — a pushed branch that edits a workflow is enough — while an
+environment secret reaches only the jobs that deploy to that environment, and `release`
+accepts deployments from `v*` tags alone. The `apt` and `dnf` jobs are its only users.
+
+Create the environment, once:
+
+```sh
+gh api -X PUT repos/ivankovic/stop-bots/environments/release \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/ivankovic/stop-bots/environments/release/deployment-branch-policies \
+  -f name='v*' -f type=tag
+```
+
+and set the secret in it. Pipe it rather than pasting it, so the private key never lands
+in a terminal, a clipboard or a shell history:
 
 ```sh
 gpg --armor --export-secret-keys '<fingerprint>' \
-  | gh secret set APT_GPG_PRIVATE_KEY --repo ivankovic/stop-bots
+  | gh secret set APT_GPG_PRIVATE_KEY --env release --repo ivankovic/stop-bots
 ```
 
 | Secret | Value |
@@ -77,8 +93,24 @@ gpg --armor --export-secret-keys '<fingerprint>' \
 | `APT_GPG_PRIVATE_KEY` | the armoured private key |
 | `APT_GPG_PASSPHRASE` | its passphrase — leave unset if the key has none, as this one does |
 
-A repository secret is enough; the `apt` job has no environment attached, and an
-environment secret would need one added first.
+There must be no repository secret of the same name besides it
+(`gh secret list --repo ivankovic/stop-bots` shows none): an environment secret wins
+over a repository one in the jobs that use the environment, but the repository copy
+would still be readable by every other workflow.
+
+**The tags.** A ruleset, *release tags*, lets only an admin create, move or delete a
+`v*` tag, since pushing one is what starts a release. It needs nothing per release: the
+admin bypasses it, which `gh api repos/ivankovic/stop-bots/rulesets` lists as
+`current_user_can_bypass: always`.
+
+**Actions.** Settings → Actions allows GitHub's own actions and
+`dtolnay/rust-toolchain`, `Swatinem/rust-cache` and `taiki-e/install-action`, and
+requires each to be pinned to a commit. An action added to a workflow has to be added
+there too, or the run fails before it starts:
+
+```sh
+gh api repos/ivankovic/stop-bots/actions/permissions/selected-actions
+```
 
 **Back the private key up somewhere you control.** It exists in the secret store and
 nowhere else otherwise. Losing it does not break installed clients immediately, but
