@@ -8,6 +8,14 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-11-11
+
+An RPM and a dnf repository for Fedora and RHEL, and a release pipeline that trusts less.
+
+**Before upgrading:** nothing to do. The program is unchanged apart from a dependency;
+the database, the command line and the files it writes are as 0.11.0 left them, and going
+back to 0.11.0 works.
+
 ### Added
 
 - **An RPM, and a dnf repository to install it from**, for Fedora, RHEL, Rocky, AlmaLinux
@@ -26,6 +34,19 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
   web server suggested. It is checked to install and upgrade on Fedora and Rocky Linux 8
   and 9; stop-bots itself is tested on Debian and Ubuntu, and `install cron` and
   `install firewall` assume what those have.
+
+### Security
+
+- **`rustix` 1.1.6**, for RUSTSEC-2026-0486: before it, the `xattr` functions marked
+  bytes they had not written as initialised when handed a zero-length buffer. stop-bots
+  reaches `rustix` only through the terminal library, which does not call them.
+- **The release pipeline holds less.** The repository signing key is a secret of an
+  environment only a `v*` tag can deploy to, rather than of the repository, where a
+  workflow on any branch could have asked for it; and only the maintainer can create a
+  `v*` tag. The job that writes the release runs GitHub's own CLI rather than a
+  third-party action, no job leaves its token in a checkout, and the token that pushes
+  the package repositories is no longer on git's command line. Every action must be
+  pinned to a commit, and only those in use are allowed.
 
 ## [0.11.0] — 2026-11-10
 
@@ -3069,7 +3090,8 @@ installable, starting with the blocking the crate was built for.
   now one shared client (60s total, 10s connect, 5 redirects) and a 32MB cap
   enforced against both the declared length and the bytes actually arriving.
 
-[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/ivankovic/stop-bots/compare/v0.11.1...HEAD
+[0.11.1]: https://github.com/ivankovic/stop-bots/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/ivankovic/stop-bots/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/ivankovic/stop-bots/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/ivankovic/stop-bots/compare/v0.8.0...v0.9.0
