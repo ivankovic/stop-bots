@@ -111,15 +111,22 @@ jobs:
       # Viable here only because the dependency tree has no C TLS in it —
       # `reqwest` resolves to `rustls` — so `musl-gcc` has exactly one thing
       # to compile: the SQLite that `rusqlite`'s `bundled` feature carries.
+      # `rpm` only to read the .rpm back in "Inspect the package"; it is
+      # built by cargo-generate-rpm, which needs nothing installed.
       - name: Install musl toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y musl-tools
+          sudo apt-get install --no-install-recommends -y musl-tools rpm
 
       - name: Install cargo-deb
         uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-deb
+
+      - name: Install cargo-generate-rpm
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-generate-rpm@0.21.1
 
       # The target-specific `CC_*` rather than a bare `CC`: build scripts and
       # proc macros are compiled for the *host*, and pointing their C compiler
@@ -175,6 +182,16 @@ jobs:
           cargo deb --no-build --no-strip --deb-version "$(scripts/deb-version.sh)"
           --target ${{ matrix.target }} --output dist/
 
+      # From the same binary, man pages and completions as the .deb, by
+      # `[package.metadata.generate-rpm]`. `--set-metadata` so a release
+      # candidate is `0.1.0~rc.1`, which sorts before `0.1.0`; see
+      # scripts/rpm-version.sh. Unsigned here, like everything else on the
+      # release page: the `dnf` job signs the copies it publishes.
+      - name: Build .rpm
+        run: >-
+          cargo generate-rpm --target ${{ matrix.target }}
+          --set-metadata "version = \"$(scripts/rpm-version.sh)\"" --output dist/
+
       # The tarball stays, for the AUR `-bin` package and for anyone who would
       # rather not add a repository to their machine. Same binary as the .deb.
       - name: Package tarball
@@ -198,7 +215,7 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: |
-          for asset in *.tar.gz *.deb; do
+          for asset in *.tar.gz *.deb *.rpm; do
             sha256sum "$asset" > "$asset.sha256"
           done
           cat ./*.sha256
@@ -207,6 +224,8 @@ jobs:
         run: |
           dpkg-deb --info dist/*.deb
           dpkg-deb --contents dist/*.deb
+          rpm -qpi dist/*.rpm
+          rpm -qpl dist/*.rpm
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -250,6 +269,7 @@ jobs:
           subject-path: |
             dist/*.tar.gz
             dist/*.deb
+            dist/*.rpm
 
   release:
     needs: [verify-version, build, attest]
@@ -283,7 +303,7 @@ jobs:
           for sum in *.sha256; do
             sha256sum --check --strict "$sum"
           done
-          sha256sum *.tar.gz *.deb > SHA256SUMS
+          sha256sum *.tar.gz *.deb *.rpm > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create release
@@ -435,4 +455,113 @@ jobs:
             exit 0
           fi
           git commit -m "apt: publish ${GITHUB_REF_NAME}"
+          git push "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+
+  # Republishes the dnf repository, rpm/ on the same `gh-pages` branch, with
+  # this release's .rpms signed and added. scripts/build-rpm-repo.sh says
+  # what is signed and why.
+  #
+  # After `apt`, because both push to `gh-pages` and the second push of two
+  # started together would be rejected. Whatever `apt` concluded, though:
+  # the two repositories are independent, and a failed `apt` should leave
+  # one of them published rather than neither. Each can be re-run alone.
+  # Not for a release candidate, for the reason `apt` gives.
+  dnf:
+    needs: [release, apt]
+    if: ${{ always() && needs.release.result == 'success' && !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: source
+
+      # Cloned now, after `apt` pushed, so this builds on its commit. Never
+      # an orphan here: `apt` creates the branch, and a branch that is
+      # missing at this point means something is wrong that a fresh one
+      # would hide.
+      - name: Check out gh-pages
+        run: |
+          git clone --branch gh-pages --single-branch \
+            "https://github.com/${GITHUB_REPOSITORY}.git" pages
+          echo "Found gh-pages with $(find pages/rpm -name '*.rpm' 2>/dev/null | wc -l) RPM(s)."
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+
+      - name: Install createrepo_c and rpmsign
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y createrepo-c rpm
+
+      - name: Import the signing key
+        id: gpg
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "${APT_GPG_PRIVATE_KEY}" ]; then
+            echo "::error::secret APT_GPG_PRIVATE_KEY is not set — see RELEASING.md"
+            exit 1
+          fi
+          printf '%s' "${APT_GPG_PRIVATE_KEY}" | gpg --batch --import
+          key="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')"
+          echo "key=${key}" >> "$GITHUB_OUTPUT"
+          echo "Imported ${key}"
+
+      - name: Build and sign the repository
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          mkdir rpms
+          cp dist/*.rpm rpms/
+          source/scripts/build-rpm-repo.sh pages rpms "${{ steps.gpg.outputs.key }}"
+          cp source/packaging/rpm/stop-bots.repo pages/stop-bots.repo
+
+      # What `apt`'s verify step is for the APT side: dnf refuses a bad
+      # repository, but every host configured for it would get that
+      # refusal, so prove it is right before pushing.
+      - name: Verify the signatures and the index
+        run: |
+          cd pages/rpm
+          gpg --verify repodata/repomd.xml.asc repodata/repomd.xml
+          db="$(mktemp -d)"
+          rpmkeys --dbpath "$db" --import ../key.asc
+          version="$(../../source/scripts/rpm-version.sh "${GITHUB_REF_NAME#v}")"
+          primary="$(zcat repodata/*-primary.xml.gz)"
+          for arch in x86_64 aarch64; do
+            package="packages/stop-bots-${version}-1.${arch}.rpm"
+            # `digests signatures OK`, and not merely `digests OK`, which is
+            # what an unsigned package says.
+            rpmkeys --dbpath "$db" --checksig "$package" | grep -q 'digests signatures OK$' \
+              || { echo "::error::${package} is not signed by the imported key"; rpmkeys --dbpath "$db" --checksig -v "$package"; exit 1; }
+            echo "$primary" | grep -q "href=\"${package}\"" \
+              || { echo "::error::the index does not list ${package}"; exit 1; }
+          done
+          # Every package the index lists must exist, or dnf fails at
+          # install time having already said it was available.
+          missing=""
+          for href in $(echo "$primary" | sed -n 's/.*<location href="\([^"]*\)".*/\1/p'); do
+            [ -f "$href" ] || missing="${missing} ${href}"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::the index points at missing file(s):${missing}"
+            exit 1
+          fi
+          echo "rpm/ lists ${version} for both architectures, signed, and every package resolves."
+
+      - name: Publish
+        run: |
+          cd pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Repository unchanged — nothing to publish."
+            exit 0
+          fi
+          git commit -m "dnf: publish ${GITHUB_REF_NAME}"
           git push "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" gh-pages

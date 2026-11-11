@@ -22,8 +22,9 @@
 //! same clap definition produces all three. A subcommand rather than a
 //! `build.rs`, because a build script cannot see the `Cli` in `main.rs`
 //! without splitting it out, and rather than an example, for the same
-//! reason. The release and CI `deb` jobs run it on the binary they just
-//! built, and `[package.metadata.deb]` ships what it writes.
+//! reason. The release workflow and CI's `deb` and `rpm` jobs run it on the
+//! binary they just built, and `[package.metadata.deb]` and
+//! `[package.metadata.generate-rpm]` ship what it writes.
 //!
 //! Layout under `out`, which is what `Cargo.toml`'s assets name:
 //!

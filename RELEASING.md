@@ -6,12 +6,13 @@ Two publications happen per release, and they are deliberately not the same step
 | -------- | -------------------------- | ----------------------------------------------- |
 | GitHub   | pushing a `v*` tag         | yes — delete the tag and the release, re-push    |
 | APT      | the same tag               | yes — revert the `gh-pages` commit               |
+| dnf      | the same tag               | yes — revert the `gh-pages` commit               |
 | crates.io| running `cargo publish`    | **no** — a version can be yanked, never replaced |
 
-The APT repository rides along with the GitHub release: the same workflow builds the
-`.deb`s and publishes them, so there is no third step to remember. It is listed
-separately only because it can fail on its own, and what to do about that is at the
-bottom of this file.
+The APT and dnf repositories ride along with the GitHub release: the same workflow
+builds the `.deb`s and `.rpm`s and publishes them, so there is no third step to
+remember. They are listed separately only because each can fail on its own, and what to
+do about that is at the bottom of this file.
 
 That asymmetry is why the tag-triggered workflow builds the GitHub release but does *not*
 run `cargo publish`. Yanking a bad version does not free its number, so `0.0.2` would have
@@ -56,6 +57,12 @@ the same secret store as the key it protects, so it defends only against the key
 leaking on its own.
 
 The key in use is `5760551466101E868D04F50235F63282482780A7`, generated 2026-09-20.
+
+The dnf repository is signed with the same key, by the `dnf` job, so it needs no setup
+of its own: the secrets below serve both. It signs each `.rpm` it publishes and the
+index (`repomd.xml.asc`), and publishes the key armoured as `key.asc`, which is what
+`rpm --import` reads. One key for both keeps one thing to back up and one fingerprint
+to announce.
 
 **2. The repository secret.** Pipe it rather than pasting it, so the private key never
 lands in a terminal, a clipboard or a shell history:
@@ -223,20 +230,23 @@ shipped with it. Step 2 is cheap to run and the only thing that catches that.
    `aarch64` Linux binaries — statically linked against musl, so one package serves
    every distribution. Then, in order:
 
-   - it attests build provenance for every tarball and `.deb` (see
+   - it attests build provenance for every tarball, `.deb` and `.rpm` (see
      [Verifying a download](#verifying-a-download));
    - it creates the GitHub release: per architecture a tarball (the binary, README,
-     licence, man pages and completions) and a `.deb`, a `.sha256` beside each, one
-     `SHA256SUMS` over all of them, and the changelog section as the notes;
-   - it republishes the APT repository with both `.deb`s added.
+     licence, man pages and completions), a `.deb` and an `.rpm`, a `.sha256` beside
+     each, one `SHA256SUMS` over all of them, and the changelog section as the notes;
+   - it republishes the APT repository with both `.deb`s added;
+   - and then the dnf repository with both `.rpm`s, signed, added.
 
    A release is marked pre-release if its tag starts with `v0.0.` or has a semver
    pre-release part — a release candidate, `v0.1.0-rc.1`. A candidate also stays out of
-   the APT repository, which has one channel, `stable`; its `.deb`s are on its GitHub
-   release.
+   both repositories, which have one channel each; its `.deb`s and `.rpm`s are on its
+   GitHub release.
 
-   Watch the `apt` job specifically. It runs last and is the only step that writes to
-   `gh-pages`, so it is the one whose failure leaves the two publications disagreeing.
+   Watch the `apt` and `dnf` jobs specifically. They run last and are the only steps
+   that write to `gh-pages`, so they are the ones whose failure leaves the publications
+   disagreeing. `dnf` waits for `apt`, so the two never push at once, but runs whether
+   or not `apt` succeeded.
 
 6. **Watch the release build finish**, then publish the crate:
 
@@ -300,10 +310,27 @@ The indices still list it until something regenerates them, so run
 script rebuilds every index from whatever is in `pool/`, which is what makes a removal
 take effect at all.
 
-## When only the `apt` job fails
+The dnf side is the same, under `rpm/packages/`:
 
-The GitHub release is complete and the `.deb`s are attached to it — the repository is
-simply a release behind. Re-run the failed job from the Actions tab; it re-downloads the
+```
+git rm rpm/packages/stop-bots-0.0.1-1.*.rpm
+git commit -m "dnf: withdraw 0.0.1" && git push
+```
+
+and then rebuild and re-sign the index, as `scripts/build-rpm-repo.sh` would (it stops
+when given no new package, so it cannot do a removal by itself):
+
+```
+createrepo_c --general-compress-type gz --update rpm/
+gpg --local-user 5760551466101E868D04F50235F63282482780A7 --yes \
+    --detach-sign --armor rpm/repodata/repomd.xml
+git add -A && git commit -m "dnf: reindex without 0.0.1" && git push
+```
+
+## When only the `apt` or `dnf` job fails
+
+The GitHub release is complete and the `.deb`s and `.rpm`s are attached to it — the
+repository is simply a release behind. Re-run the failed job from the Actions tab; it re-downloads the
 artefacts from the same run, so nothing has to be rebuilt and a second run publishes the
 same bytes. If the artefacts have expired, re-push the tag.
 
@@ -395,7 +422,8 @@ In particular an Apache host cannot go back from `0.2.0` to `0.1.x` without remo
 ### Supported platforms and Rust
 
 - **Platforms:** Debian and Ubuntu with systemd, from the APT repository, the release
-  binaries or `cargo install`. Arch Linux through the AUR and Gentoo through GURU, once
+  binaries or `cargo install`. The RPM is checked to install and upgrade on Fedora and
+  Rocky Linux 8 and 9 (CI's `rpm` job); stop-bots itself is not tested there. Arch Linux through the AUR and Gentoo through GURU, once
   each is published from `packaging/`. Anything else may work (the binaries are static)
   but is not tested.
 - **Security fixes** go into a new release of the latest minor only; nothing is
@@ -428,8 +456,10 @@ said.
 
 This section is written to be linked to from the README.
 
-The APT repository needs nothing from you: `apt` checks every package against the
-index that `signed-by` pins, and refuses one that does not match. What follows is for a
+The APT and dnf repositories need nothing from you: `apt` checks every package against
+the index that `signed-by` pins, and `dnf` checks both the index and each package's own
+signature against the key it asked you to import, and each refuses one that does not
+match. What follows is for a
 file downloaded from a GitHub release page by hand.
 
 **That it arrived intact.** Each asset has a `.sha256` beside it, and `SHA256SUMS`
@@ -439,7 +469,7 @@ covers all of them:
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-**That this repository's release workflow built it.** Every tarball and `.deb` has a
+**That this repository's release workflow built it.** Every tarball, `.deb` and `.rpm` has a
 build provenance attestation: a statement, signed through Sigstore with a certificate
 issued to `release.yml` in `ivankovic/stop-bots` and logged publicly, of which commit
 and which workflow run produced that exact file. GitHub's CLI checks it:
@@ -456,6 +486,9 @@ one on the release page; the attestation says where that one came from, which is
 question that matters if the release page itself were tampered with. `gh` has to be
 logged in (`gh auth login`) to fetch the attestation.
 
-Attestations exist from the release after `0.1.1` on. The assets are not GPG-signed:
-the only key the project has is the APT repository's, and it is kept to the one job
-that signs the repository index.
+Attestations exist from the release after `0.1.1` on, and for `.rpm`s from the first
+release that has them. The assets are not GPG-signed: the only key the project has is
+the repositories', and it is kept to the two jobs that sign them. That includes the
+`.rpm`s on the release page; the copies in the dnf repository are signed, and differ
+from them only in that signature, which lives in the RPM header and leaves the payload
+as attested.

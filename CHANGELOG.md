@@ -8,6 +8,25 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Added
+
+- **An RPM, and a dnf repository to install it from**, for Fedora, RHEL, Rocky, AlmaLinux
+  and the like, 8 or newer. The same static binary, man pages and completions as the
+  `.deb`, for `x86_64` and `aarch64`, attached to each release and published beside the
+  APT repository, signed with the same key:
+
+  ```
+  sudo curl -fsSL -o /etc/yum.repos.d/stop-bots.repo \
+    https://ivankovic.github.io/stop-bots/stop-bots.repo
+  sudo dnf install stop-bots
+  ```
+
+  dnf checks both the index and each package's signature. As with the `.deb`, installing
+  it starts nothing, and it depends on nothing: a firewall backend is recommended and a
+  web server suggested. It is checked to install and upgrade on Fedora and Rocky Linux 8
+  and 9; stop-bots itself is tested on Debian and Ubuntu, and `install cron` and
+  `install firewall` assume what those have.
+
 ## [0.11.0] — 2026-11-10
 
 A security, detection and usability review, fixed: IPv4-mapped clients blocked as what they are,

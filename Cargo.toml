@@ -114,6 +114,48 @@ assets = [
     ["target/assets/completions/stop-bots.fish", "usr/share/fish/vendor_completions.d/stop-bots.fish", "644"],
 ]
 
+# The RPM for Fedora, RHEL and its rebuilds, from the same static binary and
+# the same generated man pages and completions as the .deb, built by
+# `cargo generate-rpm` (see packaging/rpm/ and release.yml). The decisions
+# above hold here too: no scriptlets, no cron file, no unit.
+#
+# `version` is not set here: release.yml passes scripts/rpm-version.sh's,
+# which turns a release candidate's `-rc.1` into `~rc.1` so it sorts before
+# the release, as deb-version.sh does for the .deb. Building without it
+# uses Cargo.toml's version, which is right for everything but a candidate.
+[package.metadata.generate-rpm]
+summary = "Stop bad bots without hiding behind a CDN"
+release = "1"
+# Static against musl, so there is no shared library to find. Said outright
+# rather than left to the builtin `ldd` scan, which would reach the same
+# answer only as long as the binary stays static -- and release.yml's own
+# check is where that is enforced.
+auto-req = "no"
+# Nothing in the package is a shell script and there are no scriptlets, so
+# it needs no /bin/sh either.
+require-sh = false
+# Man pages are `doc`, as rpmbuild would mark them, so an image installed
+# with `tsflags=nodocs` leaves them out with the rest of the documentation.
+assets = [
+    { source = "target/release/stop-bots", dest = "/usr/bin/stop-bots", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/stop-bots/README.md", mode = "644", doc = true },
+    { source = "CHANGELOG.md", dest = "/usr/share/doc/stop-bots/CHANGELOG.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/stop-bots/LICENSE", mode = "644" },
+    { source = "target/assets/man/*.1", dest = "/usr/share/man/man1/", mode = "644", doc = true },
+    { source = "target/assets/completions/stop-bots.bash", dest = "/usr/share/bash-completion/completions/stop-bots", mode = "644" },
+    { source = "target/assets/completions/_stop-bots", dest = "/usr/share/zsh/site-functions/_stop-bots", mode = "644" },
+    { source = "target/assets/completions/stop-bots.fish", dest = "/usr/share/fish/vendor_completions.d/stop-bots.fish", mode = "644" },
+]
+
+# The same weak dependencies as the .deb, for the same reasons. Fedora and
+# RHEL ship `iptables-restore` in `iptables-nft` (or `iptables-legacy`);
+# Apache is `httpd`.
+[package.metadata.generate-rpm.recommends]
+"(nftables or iptables-nft or iptables-legacy)" = ""
+
+[package.metadata.generate-rpm.suggests]
+"(nginx or httpd)" = ""
+
 [dependencies]
 # For TUI
 ratatui = "0.30"

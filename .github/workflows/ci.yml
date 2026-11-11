@@ -355,6 +355,97 @@ jobs:
           stop-bots status --quiet || true
           sudo apt-get remove -y stop-bots
 
+  # The RPM, built the way release.yml builds it, then published to a
+  # throwaway dnf repository with a throwaway key by the same
+  # scripts/build-rpm-repo.sh the release uses, and installed from it on
+  # Fedora, Rocky 9 and Rocky 8 by packaging/rpm/check-install.sh. That is
+  # the only place the repository is exercised before a tag publishes it.
+  #
+  # Two packages go into it: this version as a release candidate, and this
+  # version. Installing the first and upgrading to the second proves the
+  # `~` in scripts/rpm-version.sh sorts a candidate before its release, on
+  # the rpm each distribution ships rather than on a comparison here.
+  rpm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: musl-rpm
+
+      # rpm for rpmsign and for reading the package back; createrepo-c for
+      # the repository. Both are what the release's `dnf` job installs.
+      - name: Install musl, rpm and createrepo_c
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools rpm createrepo-c
+
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-generate-rpm@0.21.1
+
+      - name: Build the packages
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          target/x86_64-unknown-linux-musl/release/stop-bots generate-docs --out target/assets
+          mkdir -p dist
+          release="$(scripts/rpm-version.sh)"
+          candidate="$(scripts/rpm-version.sh "${release}-ci.1")"
+          for version in "$candidate" "$release"; do
+            cargo generate-rpm --target x86_64-unknown-linux-musl \
+              --set-metadata "version = \"$version\"" -o dist/
+          done
+          echo "RPM_RELEASE=$release" >> "$GITHUB_ENV"
+          echo "RPM_CANDIDATE=$candidate" >> "$GITHUB_ENV"
+          ls -l dist
+
+      # As the `deb` job's check: the paths the rest of the project tells
+      # people about, and the man pages and completions where Fedora and
+      # RHEL look for them (zsh's site-functions, not Debian's
+      # vendor-completions). And no dependency beyond rpm's own features:
+      # the binary is static, so anything else would be a mistake.
+      - name: Check the contents
+        run: |
+          package="dist/stop-bots-${RPM_RELEASE}-1.x86_64.rpm"
+          rpm -qpi "$package"
+          echo "recommends: $(rpm -qp --recommends "$package")"
+          echo "suggests:   $(rpm -qp --suggests "$package")"
+          extra="$(rpm -qp --requires "$package" | grep -v '^rpmlib(' || true)"
+          [ -z "$extra" ] || { echo "::error::the package requires: $extra"; exit 1; }
+          contents="$(rpm -qpl "$package")"
+          for path in /usr/bin/stop-bots /usr/share/doc/stop-bots/README.md \
+              /usr/share/licenses/stop-bots/LICENSE \
+              /usr/share/man/man1/stop-bots-batch.1 \
+              /usr/share/bash-completion/completions/stop-bots \
+              /usr/share/zsh/site-functions/_stop-bots \
+              /usr/share/fish/vendor_completions.d/stop-bots.fish; do
+            echo "$contents" | grep -qx "$path" \
+              || { echo "::error::the package does not ship $path"; exit 1; }
+          done
+
+      - name: Publish to a throwaway repository
+        run: |
+          export GNUPGHOME="$(mktemp -d)"
+          gpg --batch --pinentry-mode loopback --passphrase '' \
+            --quick-gen-key 'stop-bots CI <ci@invalid>' rsa4096 sign never
+          key="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ { print $10; exit }')"
+          scripts/build-rpm-repo.sh pages dist "$key"
+
+      # No network inside: every package comes from the repository above,
+      # so a mirror being slow cannot fail this and cannot be what passed it.
+      - name: Install from it
+        run: |
+          for image in fedora:43 rockylinux:9 rockylinux:8; do
+            docker run --rm --network none \
+              -v "$PWD/pages:/pages:ro" -v "$PWD/packaging/rpm:/rpm:ro" \
+              "$image" sh /rpm/check-install.sh "$RPM_CANDIDATE" "$RPM_RELEASE"
+          done
+
   # The README's quick start, as a stranger would follow it, on a fresh
   # Debian 12 and a fresh Ubuntu 24.04 under real systemd: `apt install`
   # of the package the `deb` job just built, then `status`, `batch`,
