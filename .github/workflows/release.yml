@@ -15,10 +15,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Read-only by default; only the two jobs that publish get write, and only
-# `attest` can mint an OIDC token. The build job runs the third-party actions
-# that compile the binaries the apt job then signs, and none of them needs to
-# push anything or to prove who it is.
+# Read-only by default; only the three jobs that publish (`release`, `apt`,
+# `dnf`) get write, and only `attest` can mint an OIDC token. The build job
+# runs the third-party actions that compile the binaries the publishing jobs
+# then sign, and none of them needs to push anything or to prove who it is.
+#
+# Every checkout sets `persist-credentials: false`. Nothing here pushes
+# through a checkout, and left at its default it writes the job's token
+# into `.git/config` for anything that runs afterwards to read; in `apt`
+# and `dnf` that token can write to the repository.
 permissions:
   contents: read
 
@@ -30,6 +35,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Tag must match Cargo.toml version
         run: |
           manifest="$(cargo metadata --no-deps --format-version 1 \
@@ -91,6 +98,8 @@ jobs:
             cc: CC_aarch64_unknown_linux_musl
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
@@ -241,7 +250,7 @@ jobs:
   # Its own job, so the two permissions it needs are held by nothing but
   # first-party actions: `id-token: write` lets a job mint a token that
   # proves it is this workflow, and neither the build job's third-party
-  # toolchain actions nor the release action should be able to. Before
+  # toolchain actions nor anything in `release` should be able to. Before
   # `release` rather than after, so a published release always has its
   # attestations; a failure here stops the release instead of shipping
   # one that `gh attestation verify` rejects.
@@ -292,11 +301,11 @@ jobs:
       # proves the bytes survived the artifact round trip, and SHA256SUMS
       # puts every asset of the release in one file for `sha256sum -c`.
       #
-      # Not GPG-signed. The only key this workflow holds is the APT
-      # repository's, and it is imported in the `apt` job alone; bringing it
-      # into this job would hand it to the third-party release action for
-      # the sake of a second signature over what the provenance attestation
-      # already vouches for.
+      # Not GPG-signed. The only key this workflow holds is the
+      # repositories', and it is imported in the `apt` and `dnf` jobs alone,
+      # behind the `release` environment; bringing it into this job too
+      # would be one more place it is exposed, for the sake of a second
+      # signature over what the provenance attestation already vouches for.
       - name: Verify the checksums and write SHA256SUMS
         working-directory: dist
         run: |
@@ -306,21 +315,38 @@ jobs:
           sha256sum *.tar.gz *.deb *.rpm > SHA256SUMS
           cat SHA256SUMS
 
+      # With GitHub's own CLI, which the runner image ships, rather than a
+      # third-party action: this is the one job holding `contents: write`
+      # over the release, and nothing in it now runs code from outside
+      # GitHub and this repository.
+      #
+      # The notes are the changelog's section for this tag, as
+      # `verify-version` extracted it, rather than GitHub's generated notes:
+      # those are a list of commit titles, and the changelog is what is
+      # written for the people upgrading. It is marked as a pre-release
+      # while the version is 0.0.x — cargo treats every 0.0.z bump as
+      # breaking, and the release page should say the same thing the
+      # version number does — and for a release candidate (`v0.1.0-rc.1`:
+      # any tag with a semver pre-release part).
+      #
+      # A re-run of this job finds the release it made the first time, so it
+      # replaces the notes and the assets rather than failing on a release
+      # that exists.
       - name: Create release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          files: dist/*
-          fail_on_unmatched_files: true
-          # The changelog's section for this tag, as `verify-version`
-          # extracted it, rather than GitHub's generated notes: those are a
-          # list of commit titles, and the changelog is what is written for
-          # the people upgrading.
-          body_path: notes/release-notes.md
-          # Marked as a pre-release while the version is 0.0.x — cargo treats
-          # every 0.0.z bump as breaking, and the release page should say the
-          # same thing the version number does — and for a release candidate
-          # (`v0.1.0-rc.1`: any tag with a semver pre-release part).
-          prerelease: ${{ startsWith(github.ref_name, 'v0.0.') || contains(github.ref_name, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PRERELEASE: ${{ startsWith(github.ref_name, 'v0.0.') || contains(github.ref_name, '-') }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" \
+              --notes-file notes/release-notes.md --prerelease="$PRERELEASE"
+            gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber dist/*
+          else
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "$tag" --notes-file notes/release-notes.md \
+              --prerelease="$PRERELEASE" dist/*
+          fi
 
   # Republishes the APT repository with this release added to it.
   #
@@ -338,12 +364,16 @@ jobs:
     needs: release
     if: ${{ !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    # The signing key is an environment secret, which only a `v*` tag
+    # can deploy to; see RELEASING.md.
+    environment: release
     permissions:
       contents: write
     steps:
       # The tagged tree, for scripts/build-apt-repo.sh and the landing page.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: source
 
       # And the published repository, which holds every previously released
@@ -445,6 +475,8 @@ jobs:
           echo "Both indices carry ${version}, and every Filename: resolves."
 
       - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd pages
           git config user.name "github-actions[bot]"
@@ -455,7 +487,13 @@ jobs:
             exit 0
           fi
           git commit -m "apt: publish ${GITHUB_REF_NAME}"
-          git push "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+          # The token from the environment, through a credential helper,
+          # rather than in the URL, which is on git's command line where any
+          # process in the job can read it. The empty helper first clears
+          # any the runner configured.
+          git -c credential.helper= \
+            -c credential.helper='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f' \
+            push "https://github.com/${GITHUB_REPOSITORY}.git" gh-pages
 
   # Republishes the dnf repository, rpm/ on the same `gh-pages` branch, with
   # this release's .rpms signed and added. scripts/build-rpm-repo.sh says
@@ -470,11 +508,15 @@ jobs:
     needs: [release, apt]
     if: ${{ always() && needs.release.result == 'success' && !contains(github.ref_name, '-') }}
     runs-on: ubuntu-latest
+    # The signing key is an environment secret, which only a `v*` tag
+    # can deploy to; see RELEASING.md.
+    environment: release
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           path: source
 
       # Cloned now, after `apt` pushed, so this builds on its commit. Never
@@ -554,6 +596,8 @@ jobs:
           echo "rpm/ lists ${version} for both architectures, signed, and every package resolves."
 
       - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd pages
           git config user.name "github-actions[bot]"
@@ -564,4 +608,10 @@ jobs:
             exit 0
           fi
           git commit -m "dnf: publish ${GITHUB_REF_NAME}"
-          git push "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
+          # The token from the environment, through a credential helper,
+          # rather than in the URL, which is on git's command line where any
+          # process in the job can read it. The empty helper first clears
+          # any the runner configured.
+          git -c credential.helper= \
+            -c credential.helper='!f() { echo username=x-access-token; echo "password=${GH_TOKEN}"; }; f' \
+            push "https://github.com/${GITHUB_REPOSITORY}.git" gh-pages
