@@ -383,9 +383,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y musl-tools rpm createrepo-c
 
-      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
-        with:
-          tool: cargo-generate-rpm@0.21.1
+      # From source, as release.yml installs it and for its reason: it is not
+      # in install-action's checksummed manifest.
+      - name: Install cargo-generate-rpm
+        run: cargo install --locked cargo-generate-rpm --version 0.21.1
 
       - name: Build the packages
         env:

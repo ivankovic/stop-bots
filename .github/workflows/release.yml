@@ -123,10 +123,15 @@ jobs:
         with:
           tool: cargo-deb
 
+      # From source, not through install-action. install-action verifies a
+      # checksum only for the tools in its own manifest, and this is not one:
+      # it fell back to an unpinned cargo-binstall, which fetched a binary
+      # built by QuickInstall, a third party. That binary would write the
+      # .rpm this workflow attests. `cargo install --locked` builds the
+      # published crate against its own lockfile, every crate checked
+      # against the crates.io index, and costs about a minute.
       - name: Install cargo-generate-rpm
-        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
-        with:
-          tool: cargo-generate-rpm@0.21.1
+        run: cargo install --locked cargo-generate-rpm --version 0.21.1
 
       # The target-specific `CC_*` rather than a bare `CC`: build scripts and
       # proc macros are compiled for the *host*, and pointing their C compiler
