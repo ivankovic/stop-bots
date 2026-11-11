@@ -385,8 +385,15 @@ jobs:
 
       # From source, as release.yml installs it and for its reason: it is not
       # in install-action's checksummed manifest.
+      # Outside ~/.cargo/bin, which rust-cache restores: a cached copy is
+      # how the first version of this step ran QuickInstall's binary anyway.
+      # The `rm` removes that copy from caches saved before this change.
       - name: Install cargo-generate-rpm
-        run: cargo install --locked cargo-generate-rpm --version 0.21.1
+        run: |
+          rm -f "$HOME/.cargo/bin/cargo-generate-rpm"
+          cargo install --locked cargo-generate-rpm --version 0.21.1 \
+            --root "$RUNNER_TEMP/cargo-generate-rpm"
+          echo "$RUNNER_TEMP/cargo-generate-rpm/bin" >> "$GITHUB_PATH"
 
       - name: Build the packages
         env:
