@@ -230,7 +230,7 @@ regex = "1"
 # terminal and has no use for an SVG renderer, so `cargo install
 # stop-bots` never builds either of these. `resvg` re-exports the `usvg`
 # and `tiny-skia` it needs, so this is two entries rather than four.
-resvg = "0.48"
+resvg = "0.49"
 gif = "0.14"
 
 [profile.release]
