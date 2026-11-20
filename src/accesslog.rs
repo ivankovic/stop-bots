@@ -3666,6 +3666,31 @@ mod tests {
         );
     }
 
+    /// To an NGINX in a container behind a published port, the probe's
+    /// loopback connection arrives from the Docker bridge's gateway, which
+    /// Docker's proxy puts in its place.
+    #[test]
+    fn a_survey_leaves_out_the_health_probes_own_requests_through_docker() {
+        let own = |path: &str| {
+            format!(
+                "172.22.0.1 - - [10/Jul/2026:12:00:00 +0000] \"GET {path} HTTP/2.0\" 404 162 \"-\" \"{}\"\n",
+                crate::exposure::USER_AGENT
+            )
+        };
+        let mut survey = Survey::new(403);
+        survey.line(&own("/.env"));
+        survey.line(&own("/stop-bots-exposure-check-18e9d52a231df1bd"));
+
+        assert_eq!(
+            survey.counts,
+            Counts {
+                lines: 0,
+                parsed: 0
+            },
+            "the probe's requests through Docker's proxy are not traffic"
+        );
+    }
+
     #[test]
     fn a_long_sample_is_cut_and_says_so() {
         let sample = printable_sample(&"x".repeat(1_000));

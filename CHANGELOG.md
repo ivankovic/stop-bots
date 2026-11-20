@@ -8,6 +8,16 @@ covered: it can change in any release. `RELEASING.md` says what counts as breaki
 
 ## [Unreleased]
 
+### Fixed
+
+- **The exposure check's own requests are left out of the log behind Docker too.** It asks
+  every site for `/.env` and the like over loopback, and the log readers recognised its
+  requests only from a loopback address. To an NGINX in a container behind a published port
+  they arrive from the Docker bridge's gateway (`172.22.0.1`), so there they were counted as
+  traffic: twenty lines per site each hour, an hourly secrets scan from inside the host to
+  anyone reading the log. A local or private source now counts, the same addresses no
+  detector ever blocks.
+
 ## [0.11.1] — 2026-11-11
 
 An RPM and a dnf repository for Fedora and RHEL, and a release pipeline that trusts less.

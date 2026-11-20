@@ -126,15 +126,24 @@ const fn lesser(path: &'static str, looks_like: fn(&[u8]) -> bool) -> Sensitive 
 /// What the path that cannot exist starts with.
 const ABSENT_PREFIX: &str = "/stop-bots-exposure-check-";
 
-/// Whether a logged request is one of this check's own: from loopback,
-/// as [`USER_AGENT`], for one of [`PATHS`] or the path that cannot exist.
+/// Whether a logged request is one of this check's own: from a local or
+/// private address, as [`USER_AGENT`], for one of [`PATHS`] or the path
+/// that cannot exist.
 ///
 /// The access log's readers leave these out. Every probe adds twenty
-/// lines per site from `127.0.0.1`, and on a quiet host that is enough to
-/// make the log read as mostly a proxy's, and to count a Firefox nobody
-/// runs among the clients this host serves.
+/// lines per site, and on a quiet host that is enough to make the log
+/// read as mostly a proxy's, and to count a Firefox nobody runs among
+/// the clients this host serves.
+///
+/// The check connects over loopback, but the log does not always say so:
+/// to an NGINX in a container whose port Docker publishes, the request
+/// comes from the bridge's gateway (`172.22.0.1`), handed on by Docker's
+/// proxy. So any local or private source counts
+/// ([`crate::ipranges::is_local_or_private`]), the same addresses no
+/// detector ever blocks: leaving one of them out of a count hides nothing
+/// that could have been blocked.
 pub fn is_own_request(ip: &IpAddr, user_agent: &str, path: &str) -> bool {
-    ip.is_loopback()
+    crate::ipranges::is_local_or_private(ip)
         && user_agent == USER_AGENT
         && (path.starts_with(ABSENT_PREFIX) || PATHS.iter().any(|p| p.path == path))
 }
